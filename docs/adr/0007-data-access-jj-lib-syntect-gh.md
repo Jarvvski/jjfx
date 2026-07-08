@@ -18,4 +18,19 @@ and octocrab would add credential management for no real gain on "list my PRs".
   exchange, the graph is built from structured commit data instead of scraping
   `jj log --color always` output (as the original TUI did for its "world" view).
 
+## Note (2026-07-08, ticket 11)
+
+`jj-lib` is now a real dependency: the commit graph reads the on-disk store
+directly through it (pinned to the `jj` version in `mise.toml`, 0.43.0). The read
+surface is deliberately minimal - open the workspace, read heads/bookmarks/wc
+commits, walk parents by id - and trunk resolution is reimplemented in typed Rust
+mirroring `work::TRUNK_BASE` (real-remote `main`/`master` -> local -> root), so it
+never touches jj-lib's revset engine (the churny, alias-config-dependent surface).
+
+This changes the premise of the parked `jj-lib-reads` ticket, whose gate assumed
+no jj-lib in the tree: adopting it here was scoped to the graph (a new read site),
+not the five CLI reads that ticket covers. Those stay on the CLI `-T` path for now;
+the ticket is re-triaged to `needs-triage` to reassess the gate against the churn
+we actually observe on the next `jj` bump.
+
 Status: accepted

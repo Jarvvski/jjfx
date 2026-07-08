@@ -1,6 +1,6 @@
 [package]
 name = "jjfx"
-version = "0.10.0"
+version = "0.11.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -8,6 +8,11 @@ license = "GPL-3.0-or-later"
 anyhow = "1"
 ratatui = "0.29"
 notify = "8"
+# jj-lib reads the on-disk .jj store directly for the commit graph (ADR 0007),
+# so its version must equal the `jj` mise pin (0.43.0) and upgrade in lockstep.
+# pollster block_on's jj-lib's async RepoLoader inside spawn_blocking (spike 02).
+jj-lib = "0.43.0"
+pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # default-fancy swaps onig (a C dependency) for the pure-Rust fancy-regex engine,

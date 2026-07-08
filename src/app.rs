@@ -4,6 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -17,6 +18,7 @@ use crate::agent::{self, AgentState};
 use crate::attention::{self, Attention};
 use crate::diff::{self, FileDiff};
 use crate::forge::{self, Target};
+use crate::graph;
 use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
 use crate::work::{Work, WorkState};
@@ -34,6 +36,28 @@ enum Mode {
     Help,
     /// The full-screen diff-detail view for one workspace (ADR 0008).
     Detail(Detail),
+    /// The full-screen "world" commit graph: trunk plus every workspace's chain
+    /// (ticket 11).
+    Graph(GraphView),
+}
+
+/// Scroll state for the full-screen world graph. The rendered lines are rebuilt
+/// each draw from `App::graph`, so only the viewport offset is held here.
+#[derive(Debug, Default)]
+pub struct GraphView {
+    /// Top line of the graph viewport.
+    scroll: u16,
+    /// Inner height at the last render, for page/clamp math.
+    height: u16,
+    /// Total rendered line count at the last render, for scroll clamping.
+    total: u16,
+}
+
+impl GraphView {
+    /// The furthest the graph can scroll so its last line still shows.
+    fn max_scroll(&self) -> u16 {
+        self.total.saturating_sub(self.height)
+    }
 }
 
 /// Which pane of the diff-detail view owns the keyboard: the changed-file list or
@@ -132,6 +156,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Open workspace", "enter"),
     ("Open in background", "o"),
     ("Diff detail", "→ / l"),
+    ("Commit graph (world)", "w"),
     ("New workspace", "n"),
     ("Delete workspace", "d"),
     ("Forge selected", "f"),
@@ -165,6 +190,8 @@ pub enum Msg {
     Forge(forge::Update),
     /// The diff for a workspace finished loading (ticket 10).
     DiffLoaded { ws: String, files: Vec<FileDiff> },
+    /// The commit graph finished loading from jj-lib (ticket 11).
+    GraphLoaded(graph::Graph),
 }
 
 /// The live forge progress for one workspace: the four steps' statuses, whether a
@@ -205,6 +232,9 @@ pub struct App {
     /// swappable - ticket 07).
     terminal: Box<dyn Terminal>,
     mode: Mode,
+    /// The last-loaded commit graph (ticket 11), shared by the world view and the
+    /// per-workspace strip in the detail view. `None` until first loaded.
+    graph: Option<graph::Graph>,
     /// A transient one-line message shown in the footer (last action's result).
     status: Option<String>,
     /// Selection tracked by workspace name, not row index, so it follows a
@@ -233,6 +263,7 @@ impl App {
             tx,
             terminal,
             mode: Mode::Normal,
+            graph: None,
             status: None,
             selected: None,
             idle_collapsed: false,
@@ -253,6 +284,7 @@ impl App {
             Msg::WorkSnapshot(work) => self.work = work,
             Msg::Forge(update) => self.on_forge(update),
             Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
+            Msg::GraphLoaded(graph) => self.graph = Some(graph),
         }
     }
 
@@ -313,6 +345,8 @@ impl App {
                         self.status = Some(format!("{ws}: forged"));
                     }
                 }
+                // A forge moves revisions (weld/push); refresh the graph if shown.
+                self.refresh_graph_if_visible();
             }
             forge::Update::Aborted(reason) => {
                 // Drop every still-running overlay; the run did no per-ws work.
@@ -363,6 +397,7 @@ impl App {
             Mode::ConfirmTidy => self.on_key_confirm_tidy(key),
             Mode::Help => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
+            Mode::Graph(_) => self.on_key_graph(key),
         }
     }
 
@@ -378,6 +413,7 @@ impl App {
             KeyCode::Enter => self.open_selected(true),
             KeyCode::Char('o') => self.open_selected(false),
             KeyCode::Right | KeyCode::Char('l') => self.open_detail(),
+            KeyCode::Char('w') => self.open_graph(),
             KeyCode::Char('d') => self.begin_delete_selected(),
             KeyCode::Char('t') => self.tidyws(),
             KeyCode::Char('T') => self.begin_tidy(),
@@ -491,6 +527,58 @@ impl App {
                 .unwrap_or_default();
             let _ = tx.send(Msg::DiffLoaded { ws, files });
         });
+        // The detail view carries a per-workspace graph strip; load the graph
+        // alongside the diff so the strip fills in.
+        self.spawn_graph_load();
+    }
+
+    /// `w`: open the full-screen world graph and kick off an async jj-lib read.
+    /// The last-loaded graph shows immediately (if any) while the fresh one loads.
+    fn open_graph(&mut self) {
+        self.status = None;
+        self.mode = Mode::Graph(GraphView::default());
+        self.spawn_graph_load();
+    }
+
+    /// World-graph keys: `j`/`k` (and arrows/page) scroll; `esc`/`w`/`q` return to
+    /// the list. The highlighted chain is whatever workspace was selected.
+    fn on_key_graph(&mut self, key: KeyEvent) {
+        let Mode::Graph(g) = &mut self.mode else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => self.mode = Mode::Normal,
+            KeyCode::Char('j') | KeyCode::Down => g.scroll = (g.scroll + 1).min(g.max_scroll()),
+            KeyCode::Char('k') | KeyCode::Up => g.scroll = g.scroll.saturating_sub(1),
+            KeyCode::PageDown => g.scroll = (g.scroll + g.height).min(g.max_scroll()),
+            KeyCode::PageUp => g.scroll = g.scroll.saturating_sub(g.height),
+            KeyCode::Char('g') => g.scroll = 0,
+            KeyCode::Char('G') => g.scroll = g.max_scroll(),
+            _ => {}
+        }
+    }
+
+    /// Spawn a blocking jj-lib graph read on a worker thread (never the render
+    /// loop) and stream the result back as [`Msg::GraphLoaded`]. On error the last
+    /// graph simply stays; a graph read must never crash the TUI.
+    fn spawn_graph_load(&self) {
+        let tx = self.tx.clone();
+        let repo_root = self.store.repo_root.clone();
+        tokio::spawn(async move {
+            if let Ok(Ok(graph)) =
+                tokio::task::spawn_blocking(move || graph::load(&repo_root)).await
+            {
+                let _ = tx.send(Msg::GraphLoaded(graph));
+            }
+        });
+    }
+
+    /// Reload the graph if a graph-bearing view is on screen, so it tracks the
+    /// underlying revisions changing (new commits, fetch, forge).
+    fn refresh_graph_if_visible(&self) {
+        if matches!(self.mode, Mode::Graph(_) | Mode::Detail(_)) {
+            self.spawn_graph_load();
+        }
     }
 
     fn on_key_new_workspace(&mut self, key: KeyEvent) {
@@ -772,6 +860,9 @@ impl App {
     fn reload(&mut self) {
         self.store = Store::load(&self.store.repo_root);
         self.ensure_selection();
+        // The cache/op-log changed on disk (new commits, fetch, workspace edits);
+        // refresh the graph if a graph-bearing view is open.
+        self.refresh_graph_if_visible();
     }
 
     /// Point the selection at a real, currently-selectable workspace, falling
@@ -844,6 +935,10 @@ impl App {
 
         if matches!(self.mode, Mode::Detail(_)) {
             self.render_detail(frame);
+            return;
+        }
+        if matches!(self.mode, Mode::Graph(_)) {
+            self.render_graph_world(frame);
             return;
         }
 
@@ -955,7 +1050,10 @@ impl App {
     /// changed-file list (with +/- magnitude bars) and the selected file's
     /// highlighted diff, and a focus-sensitive footer.
     fn render_detail(&mut self, frame: &mut Frame) {
-        let Mode::Detail(d) = &mut self.mode else {
+        // Disjoint borrows: the diff panes need `&mut Detail`, the graph strip
+        // needs `&graph`. Split `self` into its fields so both are live at once.
+        let Self { mode, graph, .. } = self;
+        let Mode::Detail(d) = mode else {
             return;
         };
 
@@ -976,14 +1074,97 @@ impl App {
             title,
         );
 
-        let [files_area, diff_area] =
-            Layout::horizontal([Constraint::Length(FILES_PANE_WIDTH), Constraint::Min(0)])
-                .areas(body);
-
-        render_files_pane(frame, d, files_area);
-        render_diff_pane(frame, d, diff_area);
+        // The per-workspace graph strip rides on the right, but only when there is
+        // room for files + a usable diff + the strip; otherwise it is dropped so a
+        // narrow terminal keeps a readable diff (graceful degradation, AC 4).
+        let show_graph = body.width >= FILES_PANE_WIDTH + GRAPH_PANE_WIDTH + MIN_DIFF_WIDTH;
+        if show_graph {
+            let [files_area, diff_area, graph_area] = Layout::horizontal([
+                Constraint::Length(FILES_PANE_WIDTH),
+                Constraint::Min(0),
+                Constraint::Length(GRAPH_PANE_WIDTH),
+            ])
+            .areas(body);
+            render_files_pane(frame, d, files_area);
+            render_diff_pane(frame, d, diff_area);
+            render_graph_pane(frame, graph.as_ref(), &d.ws, graph_area);
+        } else {
+            let [files_area, diff_area] =
+                Layout::horizontal([Constraint::Length(FILES_PANE_WIDTH), Constraint::Min(0)])
+                    .areas(body);
+            render_files_pane(frame, d, files_area);
+            render_diff_pane(frame, d, diff_area);
+        }
 
         frame.render_widget(detail_footer(d.focus), footer);
+    }
+
+    /// The full-screen world graph: a title, the bordered graph (trunk plus every
+    /// workspace's chain, the selected chain highlighted), and a scroll footer.
+    fn render_graph_world(&mut self, frame: &mut Frame) {
+        // Disjoint borrows: scroll state is `&mut`, the graph and selection `&`.
+        let Self {
+            mode,
+            graph,
+            selected,
+            ..
+        } = self;
+        let Mode::Graph(g) = mode else {
+            return;
+        };
+
+        let [title, body, footer] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .horizontal_margin(2)
+        .areas(frame.area());
+
+        frame.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("graph  ", Style::default().add_modifier(Modifier::DIM)),
+                Span::styled("world", Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    "  trunk + every workspace",
+                    Style::default().add_modifier(Modifier::DIM),
+                ),
+            ])),
+            title,
+        );
+
+        g.height = body.height.saturating_sub(2);
+        let lines: Vec<Line> = match graph.as_ref() {
+            Some(gr) if !gr.chains.is_empty() => {
+                world_graph_lines(gr, selected.as_deref(), now_millis(), body.width)
+            }
+            Some(_) => vec![dim_line(" (no workspaces)")],
+            None => vec![dim_line(" loading…")],
+        };
+        g.total = lines.len() as u16;
+        if g.scroll > g.max_scroll() {
+            g.scroll = g.max_scroll();
+        }
+
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(pane_border(true))
+                        .title(" commit graph "),
+                )
+                .scroll((g.scroll, 0)),
+            body,
+        );
+
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                " j/k scroll · PgUp/PgDn page · g/G top/bottom · esc back ",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            footer,
+        );
     }
 
     /// A group-header row: the Attention heading, count, and a fold hint for idle.
@@ -1101,8 +1282,8 @@ impl App {
                 " j/k move  ? help  q quit ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
-            // Detail renders its own full-screen footer (this arm is unreachable).
-            Mode::Detail(_) => Paragraph::new(Span::raw("")),
+            // Detail and Graph render their own full-screen footers (unreachable).
+            Mode::Detail(_) | Mode::Graph(_) => Paragraph::new(Span::raw("")),
         }
     }
 }
@@ -1113,6 +1294,11 @@ fn display_path(path: &std::path::Path) -> String {
 
 /// Width of the changed-file list pane in the detail view (borders included).
 const FILES_PANE_WIDTH: u16 = 34;
+/// Width of the per-workspace graph strip in the detail view (borders included).
+const GRAPH_PANE_WIDTH: u16 = 34;
+/// Minimum diff width to keep the strip; below this the strip is dropped so a
+/// narrow terminal keeps a readable diff.
+const MIN_DIFF_WIDTH: u16 = 40;
 /// Width of a file's +/- magnitude bar, in cells.
 const BAR_W: usize = 8;
 
@@ -1278,6 +1464,290 @@ fn detail_footer(focus: DetailFocus) -> Paragraph<'static> {
         hint,
         Style::default().add_modifier(Modifier::DIM),
     ))
+}
+
+/// Milliseconds since the epoch, for freshness shading. Zero if the clock is
+/// before the epoch (impossible in practice) - a render helper must not panic.
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Freshness shading for a commit's change id: recently-moved commits read
+/// brightest and fade to dim with age (ticket 11's optional freshness cue).
+fn freshness_style(timestamp_ms: i64, now_ms: i64) -> Style {
+    const HOUR: i64 = 3_600_000;
+    const DAY: i64 = 24 * HOUR;
+    const WEEK: i64 = 7 * DAY;
+    let age = now_ms.saturating_sub(timestamp_ms);
+    if age < 2 * HOUR {
+        Style::default()
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else if age < WEEK {
+        Style::default().fg(Color::Gray)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    }
+}
+
+/// A single dim connector/spacer line.
+fn dim_line(s: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        s.to_string(),
+        Style::default().add_modifier(Modifier::DIM),
+    ))
+}
+
+/// Truncate to `max` columns keeping the head, with a trailing ellipsis.
+fn elide_right(s: &str, max: usize) -> String {
+    let len = s.chars().count();
+    if len <= max {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max.saturating_sub(1)).collect();
+    format!("{head}…")
+}
+
+/// One commit row: `<prefix><glyph><change-id>[ @]  <summary> <bookmarks>`. The
+/// change id is freshness-shaded (bold when on the highlighted chain); the
+/// summary is budgeted to the remaining width so a long line never wraps and
+/// corrupts the layout.
+#[allow(clippy::too_many_arguments)]
+fn commit_line(
+    prefix: &str,
+    glyph: &str,
+    glyph_color: Color,
+    node: &graph::Node,
+    is_head: bool,
+    selected: bool,
+    now_ms: i64,
+    width: u16,
+) -> Line<'static> {
+    let mut id_style = freshness_style(node.timestamp_ms, now_ms);
+    if selected {
+        id_style = id_style.add_modifier(Modifier::BOLD);
+    }
+    let mut spans = vec![
+        Span::raw(prefix.to_string()),
+        Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+        Span::styled(node.change_id.clone(), id_style),
+    ];
+    if is_head {
+        spans.push(Span::styled(
+            " @",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let bookmarks_w: usize = node.bookmarks.iter().map(|b| b.chars().count() + 1).sum();
+    let used = prefix.chars().count()
+        + glyph.chars().count()
+        + node.change_id.chars().count()
+        + if is_head { 2 } else { 0 }
+        + 1;
+    let budget = (width as usize)
+        .saturating_sub(used + bookmarks_w + 1)
+        .max(6);
+    let summary_style = if selected {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        elide_right(&node.summary, budget),
+        summary_style,
+    ));
+    for bm in &node.bookmarks {
+        spans.push(Span::styled(
+            format!(" {bm}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    Line::from(spans)
+}
+
+/// The world view: trunk (plus a little context) then each workspace's chain,
+/// the selected chain highlighted. Chains hang off trunk with `├─`/`╰─`
+/// connectors; commits stack directly under their branch header for compactness.
+fn world_graph_lines(
+    g: &graph::Graph,
+    selected: Option<&str>,
+    now_ms: i64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let w = width.saturating_sub(2);
+    let mut lines = Vec::new();
+
+    if let Some(tid) = &g.trunk_id {
+        if let Some(node) = g.nodes.get(tid) {
+            lines.push(commit_line(
+                "",
+                "● ",
+                Color::Cyan,
+                node,
+                false,
+                false,
+                now_ms,
+                w,
+            ));
+        }
+        for id in g.trunk_context.iter().skip(1).take(3) {
+            if let Some(node) = g.nodes.get(id) {
+                lines.push(commit_line(
+                    "│ ",
+                    "○ ",
+                    Color::DarkGray,
+                    node,
+                    false,
+                    false,
+                    now_ms,
+                    w,
+                ));
+            }
+        }
+    }
+    if !g.chains.is_empty() {
+        lines.push(dim_line("│"));
+    }
+
+    let last = g.chains.len().saturating_sub(1);
+    for (i, chain) in g.chains.iter().enumerate() {
+        let is_sel = selected == Some(chain.workspace.as_str());
+        let (conn, prefix) = if i == last {
+            ("╰─ ", "   ")
+        } else {
+            ("├─ ", "│  ")
+        };
+        let name_style = if is_sel {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        let mut header = vec![
+            Span::raw(conn.to_string()),
+            Span::styled(chain.workspace.clone(), name_style),
+        ];
+        if chain.commits.is_empty() && chain.child.is_none() {
+            header.push(Span::styled(
+                "  on trunk",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        lines.push(Line::from(header));
+
+        if let Some(cid) = &chain.child
+            && let Some(node) = g.nodes.get(cid)
+        {
+            let mut l = commit_line(prefix, "◆ ", Color::Yellow, node, false, is_sel, now_ms, w);
+            l.spans.push(Span::styled(
+                "  +1",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+            lines.push(l);
+        }
+        for id in &chain.commits {
+            if let Some(node) = g.nodes.get(id) {
+                let is_head = id == &chain.head;
+                let glyph = if is_head { "● " } else { "○ " };
+                let color = if is_sel { Color::Cyan } else { Color::Gray };
+                lines.push(commit_line(
+                    prefix, glyph, color, node, is_head, is_sel, now_ms, w,
+                ));
+            }
+        }
+        if i != last {
+            lines.push(dim_line("│"));
+        }
+    }
+    lines
+}
+
+/// The per-workspace strip in the detail view: the one child past `@` (if any),
+/// the workspace's own commits with connectors, and the trunk commit it attaches
+/// to. Always rendered as the highlighted chain (it is the workspace in view).
+fn workspace_graph_lines(
+    g: &graph::Graph,
+    chain: &graph::Chain,
+    now_ms: i64,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let w = width.saturating_sub(2);
+    let mut lines = Vec::new();
+
+    if let Some(cid) = &chain.child
+        && let Some(node) = g.nodes.get(cid)
+    {
+        let mut l = commit_line("", "◆ ", Color::Yellow, node, false, true, now_ms, w);
+        l.spans.push(Span::styled(
+            "  +1",
+            Style::default().add_modifier(Modifier::DIM),
+        ));
+        lines.push(l);
+        lines.push(dim_line("│"));
+    }
+
+    if chain.commits.is_empty() {
+        lines.push(dim_line(" on trunk (clean)"));
+    }
+    for id in &chain.commits {
+        if let Some(node) = g.nodes.get(id) {
+            let is_head = id == &chain.head;
+            let glyph = if is_head { "● " } else { "○ " };
+            lines.push(commit_line(
+                "",
+                glyph,
+                Color::Cyan,
+                node,
+                is_head,
+                true,
+                now_ms,
+                w,
+            ));
+            lines.push(dim_line("│"));
+        }
+    }
+
+    match chain.base.as_ref().and_then(|b| g.nodes.get(b)) {
+        Some(node) => lines.push(commit_line(
+            "",
+            "● ",
+            Color::DarkGray,
+            node,
+            false,
+            false,
+            now_ms,
+            w,
+        )),
+        // No trunk anchor loaded: drop the trailing connector so it doesn't dangle.
+        None => {
+            lines.pop();
+        }
+    }
+    lines
+}
+
+/// The per-workspace graph strip in the detail view.
+fn render_graph_pane(frame: &mut Frame, graph: Option<&graph::Graph>, ws: &str, area: Rect) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(pane_border(false))
+        .title(" graph ");
+    let lines: Vec<Line> = match graph {
+        Some(g) => match g.chain(ws) {
+            Some(chain) => workspace_graph_lines(g, chain, now_millis(), area.width),
+            None => vec![dim_line(" (no chain)")],
+        },
+        None => vec![dim_line(" loading…")],
+    };
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 /// A fixed-width +/- magnitude bar: green cells for insertions, red for
@@ -1995,6 +2465,91 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
         // A roomy one draws the full two-pane layout.
         let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+
+    /// A small graph: trunk `t1`, a `default` chain `t1 -> c1 -> c2(@)`, and a
+    /// `feat` chain with a child past `@`.
+    fn sample_graph() -> graph::Graph {
+        let node = |id: &str| graph::Node {
+            id: id.to_string(),
+            change_id: format!("ch{id}"),
+            summary: format!("summary for {id}"),
+            parents: vec![],
+            bookmarks: vec![],
+            timestamp_ms: 0,
+            wc_of: vec![],
+        };
+        let nodes = ["t1", "c1", "c2", "f1", "f2"]
+            .iter()
+            .map(|id| (id.to_string(), node(id)))
+            .collect();
+        graph::Graph {
+            nodes,
+            trunk_id: Some("t1".to_string()),
+            trunk_context: vec!["t1".to_string()],
+            chains: vec![
+                graph::Chain {
+                    workspace: "default".to_string(),
+                    head: "c2".to_string(),
+                    commits: vec!["c2".to_string(), "c1".to_string()],
+                    base: Some("t1".to_string()),
+                    child: None,
+                },
+                graph::Chain {
+                    workspace: "feat".to_string(),
+                    head: "f1".to_string(),
+                    commits: vec!["f1".to_string()],
+                    base: Some("t1".to_string()),
+                    child: Some("f2".to_string()),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn world_graph_renders_narrow_and_wide_without_panicking() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        app.selected = Some("feat".to_string());
+        app.mode = Mode::Graph(GraphView::default());
+        app.graph = Some(sample_graph());
+
+        // A tiny terminal must clamp its layout, not corrupt or panic (AC 4).
+        let mut term = Terminal::new(TestBackend::new(6, 3)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        // A roomy one draws the full graph.
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+
+    #[test]
+    fn world_graph_shows_loading_before_the_graph_arrives() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Graph(GraphView::default());
+        // graph is still None: must render a loading state, not panic.
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+
+    #[test]
+    fn detail_graph_strip_appears_only_when_wide_enough() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_in_detail("feat");
+        app.graph = Some(sample_graph());
+
+        // Wide: files + diff + strip all fit.
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        // Narrow: the strip is dropped so the diff stays readable (no panic).
+        let mut term = Terminal::new(TestBackend::new(70, 30)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
     }
 }

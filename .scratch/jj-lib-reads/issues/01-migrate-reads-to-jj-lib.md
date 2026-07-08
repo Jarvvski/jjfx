@@ -1,6 +1,15 @@
 # Migrate jj *reads* off the CLI onto jj-lib
 
-Status: ready-for-human
+Status: needs-triage
+
+> Re-triage (2026-07-08, ticket 11): `jj-lib` is now in the tree - the commit
+> graph reads the store through it (ADR 0007 note). This ticket's gate assumed no
+> jj-lib dependency yet; that premise no longer holds. The graph uses only a
+> minimal read surface (open + heads/bookmarks/wc + parent walk) and avoids the
+> revset engine, so it does not yet prove out the churny surface the five reads
+> below would need. Reassess the gate against the churn actually observed at the
+> next `jj` pin bump before promoting this back to `ready-for-agent`/`-human`.
+
 
 ## Gate (read this first)
 

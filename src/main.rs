@@ -11,6 +11,7 @@ mod cmd;
 mod diff;
 mod events;
 mod forge;
+mod graph;
 mod hooks;
 mod jj;
 mod repo;

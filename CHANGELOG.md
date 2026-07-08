@@ -6,6 +6,17 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Commit graph (v0.11.0): press `w` for a full-screen "world" graph -
+  `trunk()` plus every workspace's chain, each commit shown with its change id,
+  summary, and bookmarks, and the selected workspace's chain highlighted.
+  Recently-moved commits are shaded brighter (freshness). The per-workspace
+  detail view (`→`/`l`) gains a graph strip on the right showing just that
+  workspace's chain from `trunk()` up to `@` plus one commit beyond it; the strip
+  is dropped automatically on narrow terminals so the diff stays readable. The
+  graph is read directly from the on-disk jj store via `jj-lib` (not by scraping
+  `jj log`), and refreshes on its own as revisions change (new commits, fetch,
+  forge). `j/k`/`PgUp`/`PgDn`/`g`/`G` scroll the world graph; `esc` closes it.
+
 - 2026-07-08 - Diff detail view (v0.10.0): press `→`/`l` on a workspace to open a
   full-screen, two-pane detail - a changed-file list with per-file `+`/`-`
   magnitude bars on the left, the selected file's diff from `trunk()` on the
