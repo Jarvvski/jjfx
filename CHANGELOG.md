@@ -4,6 +4,16 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-07-08 - Correct the diff base in never-pushed repos (v0.8.1): `trunk()`
+  resolves to the root commit when no remote mainline bookmark exists yet, which
+  made every workspace diff the entire history - so an empty workspace read as
+  `dirty` and landed in "ready to forge". The work snapshot now measures a
+  workspace's chain and diff against `trunk()` when it is a real commit, else the
+  local `main`/`master`/`trunk` bookmark. Once main is pushed, `trunk()` wins and
+  behaviour is unchanged.
+
 ### Changed
 
 - 2026-07-08 - Minimal restyle of the workspace list (v0.8.0): dropped the box

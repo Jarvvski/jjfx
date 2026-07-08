@@ -194,10 +194,22 @@ struct Chain {
     bookmarks: Vec<String>,
 }
 
-/// Read `trunk()..<ws>@` for content flags + local bookmark names in one call,
+/// The mainline base a workspace's own work is measured against.
+///
+/// jj's `trunk()` resolves to the *remote* mainline, but a repo that has never
+/// been pushed has no remote bookmark, so `trunk()` falls back to the root
+/// commit - which would make every workspace diff the whole history and an empty
+/// workspace read as dirty. Prefer `trunk()` when it is a real commit, else fall
+/// back to the local `main`/`master`/`trunk` bookmark (whichever exists), taking
+/// the most recent. `present(...)` stops a missing bookmark from erroring the
+/// revset. Once main is pushed, `trunk()` wins and behaviour is unchanged.
+const TRUNK_BASE: &str =
+    "latest((trunk() ~ root()) | present(main) | present(master) | present(trunk))";
+
+/// Read `<base>..<ws>@` for content flags + local bookmark names in one call,
 /// plus a second call for real-remote presence. `None` on any jj failure.
 fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
-    let chain = format!("trunk()..{ws}@");
+    let chain = format!("({TRUNK_BASE})..{ws}@");
 
     // Per-commit: "E"/"N" for empty/non-empty, then comma-joined local bookmarks.
     let out = jj(
@@ -249,14 +261,15 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
     })
 }
 
-/// Insertions/deletions from `trunk()` to `<ws>@`, parsed from `jj diff --stat`.
+/// Insertions/deletions from the mainline base to `<ws>@`, parsed from
+/// `jj diff --stat`.
 fn diff_loc(repo_root: &Path, ws: &str) -> Option<(u32, u32)> {
     let out = jj(
         repo_root,
         &[
             "diff",
             "--from",
-            "trunk()",
+            TRUNK_BASE,
             "--to",
             &format!("{ws}@"),
             "--stat",
