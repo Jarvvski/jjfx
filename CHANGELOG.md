@@ -6,6 +6,17 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Maintenance: tidy, tidyws, and the behind indicator (v0.6.0):
+  native versions of the two maintenance aliases (ADR 0005). `t` runs `tidyws` -
+  rebasing every idle, empty, undescribed workspace working-copy onto latest
+  `trunk()` (non-destructive, no confirmation); `T` runs `tidy` after a
+  confirmation - abandoning junk mutable empties (undescribed, unbookmarked,
+  untagged, never `@`). Both report how many changes they touched and are no-ops
+  when nothing is eligible. Each row now also shows how far behind `trunk()` its
+  base is (`↓N`, highlighted once far enough behind to warrant a reset). The
+  proven revsets are ported from the `jj tidy` / `jj tidyws` aliases, which
+  remain untouched and usable standalone.
+
 - 2026-07-08 - Attention triage (v0.5.0): the list is now organized around the
   derived Attention badge (ADR 0008). Each workspace shows one signal - needs
   you / working / ready to forge / idle - derived from its (agent, work) pair,

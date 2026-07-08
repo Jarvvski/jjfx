@@ -16,7 +16,7 @@ use crate::agent::{self, AgentState};
 use crate::attention::{self, Attention};
 use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
-use crate::work::WorkState;
+use crate::work::{Work, WorkState};
 use crate::{cache, jj};
 
 /// What the key handler is currently collecting: normal navigation, a new
@@ -25,6 +25,8 @@ enum Mode {
     Normal,
     NewWorkspace(String),
     ConfirmDelete(String),
+    /// Confirming the destructive `tidy` sweep (abandon junk empties).
+    ConfirmTidy,
 }
 
 /// One rendered list line: a group header (non-selectable) or a workspace row.
@@ -43,7 +45,7 @@ pub enum Msg {
     /// A Claude Code hook event, appended to the global log (ADR 0004).
     AgentEvent(agent::Event),
     /// A freshly computed work-lifecycle snapshot, keyed by workspace name.
-    WorkSnapshot(HashMap<String, WorkState>),
+    WorkSnapshot(HashMap<String, Work>),
 }
 
 /// The whole application state - one owned value on the main task.
@@ -52,9 +54,9 @@ pub struct App {
     /// Current agent lifecycle state per workspace, keyed by canonicalized path
     /// (the `cwd` join from the hook log). Absent workspaces are simply missing.
     agents: HashMap<PathBuf, AgentState>,
-    /// Latest work-lifecycle state per workspace, keyed by workspace name.
+    /// Latest work-lifecycle snapshot per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
-    work: HashMap<String, WorkState>,
+    work: HashMap<String, Work>,
     /// The multiplexer jjfx drives for workspace tabs (behind a trait so kitty is
     /// swappable - ticket 07).
     terminal: Box<dyn Terminal>,
@@ -123,7 +125,15 @@ impl App {
 
     /// The work state for a workspace, `Unknown` until the first snapshot lands.
     fn work_state(&self, w: &Workspace) -> WorkState {
-        self.work.get(&w.name).copied().unwrap_or_default()
+        self.work
+            .get(&w.name)
+            .map(|wk| wk.state)
+            .unwrap_or_default()
+    }
+
+    /// How far the workspace is behind `trunk()`, `0` until the first snapshot.
+    fn behind(&self, w: &Workspace) -> u32 {
+        self.work.get(&w.name).map(|wk| wk.behind).unwrap_or(0)
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -135,6 +145,7 @@ impl App {
             Mode::Normal => self.on_key_normal(key),
             Mode::NewWorkspace(_) => self.on_key_new_workspace(key),
             Mode::ConfirmDelete(_) => self.on_key_confirm_delete(key),
+            Mode::ConfirmTidy => self.on_key_confirm_tidy(key),
         }
     }
 
@@ -150,6 +161,8 @@ impl App {
             KeyCode::Enter => self.open_selected(true),
             KeyCode::Char('o') => self.open_selected(false),
             KeyCode::Char('d') => self.begin_delete_selected(),
+            KeyCode::Char('t') => self.tidyws(),
+            KeyCode::Char('T') => self.begin_tidy(),
             KeyCode::Char('c') => {
                 self.idle_collapsed = !self.idle_collapsed;
                 self.ensure_selection();
@@ -187,6 +200,17 @@ impl App {
                 let name = name.clone();
                 self.mode = Mode::Normal;
                 self.delete_workspace(&name);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    fn on_key_confirm_tidy(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                self.tidy();
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Normal,
             _ => {}
@@ -295,6 +319,35 @@ impl App {
         let _ = self.persist_cache_remove(name);
         self.reload();
         self.status = Some(format!("deleted '{name}'"));
+    }
+
+    /// `t`: reset idle, empty, undescribed workspace working-copies onto latest
+    /// `trunk()`. Non-destructive (workspaces with real work are untouched), so it
+    /// runs without confirmation; the poller refreshes each row's `behind` count.
+    fn tidyws(&mut self) {
+        self.status = Some(match jj::tidyws(&self.store.repo_root) {
+            Ok(0) => "tidyws: nothing to reset".to_string(),
+            Ok(n) => format!("tidyws: reset {n} workspace(s) onto trunk"),
+            Err(e) => format!("tidyws failed: {e}"),
+        });
+        self.reload();
+    }
+
+    /// `T`: confirm before the destructive `tidy` sweep.
+    fn begin_tidy(&mut self) {
+        self.status = None;
+        self.mode = Mode::ConfirmTidy;
+    }
+
+    /// Abandon junk empties across the repo (mutable, empty, undescribed,
+    /// unbookmarked, untagged, never `@`), after confirmation.
+    fn tidy(&mut self) {
+        self.status = Some(match jj::tidy(&self.store.repo_root) {
+            Ok(0) => "tidy: nothing to abandon".to_string(),
+            Ok(n) => format!("tidy: abandoned {n} junk empty change(s)"),
+            Err(e) => format!("tidy failed: {e}"),
+        });
+        self.reload();
     }
 
     /// Upsert a `(name, path)` into the ws-cache so the path jj does not record
@@ -478,6 +531,13 @@ impl App {
     fn workspace_item(&self, w: &Workspace, att: Attention) -> ListItem<'static> {
         let agent = self.agent_state(w);
         let work = self.work_state(w);
+        let behind = self.behind(w);
+        // How far behind trunk: dimmed unless it is far enough to warrant tidyws.
+        let behind_label = if behind > 0 {
+            format!("↓{behind}")
+        } else {
+            String::new()
+        };
         let path = w
             .path
             .as_deref()
@@ -497,6 +557,10 @@ impl App {
                 format!("{:<16}", work.label()),
                 Style::default().fg(work_color(work)),
             ),
+            Span::styled(
+                format!("{behind_label:<5}"),
+                Style::default().fg(behind_color(behind)),
+            ),
             Span::raw(format!("{:<18} {}", w.name, path)),
         ]))
     }
@@ -513,13 +577,17 @@ impl App {
                 format!(" delete workspace '{name}'? (y/n) "),
                 Style::default().fg(Color::Red),
             )),
+            Mode::ConfirmTidy => Paragraph::new(Span::styled(
+                " tidy: abandon all junk empty changes? (y/n) ".to_string(),
+                Style::default().fg(Color::Red),
+            )),
             Mode::Normal => match &self.status {
                 Some(msg) => Paragraph::new(Span::styled(
                     format!(" {msg} "),
                     Style::default().fg(Color::Yellow),
                 )),
                 None => Paragraph::new(Span::styled(
-                    " j/k move  n new  enter open  o open-bg  d delete  c fold-idle  q quit ",
+                    " j/k move  n new  enter open  o open-bg  d delete  t tidyws  T tidy  c fold-idle  q quit ",
                     Style::default().add_modifier(Modifier::DIM),
                 )),
             },
@@ -549,6 +617,16 @@ fn agent_color(state: AgentState) -> Color {
         AgentState::Waiting => Color::Yellow,
         AgentState::NeedsAttention => Color::Red,
         AgentState::Ended => Color::DarkGray,
+    }
+}
+
+/// Colour cue for the behind-trunk count: dim when close, yellow once far enough
+/// behind that `tidyws` (or a weld) is worth running.
+fn behind_color(behind: u32) -> Color {
+    if behind >= 5 {
+        Color::Yellow
+    } else {
+        Color::DarkGray
     }
 }
 
@@ -733,14 +811,17 @@ mod tests {
 
     #[test]
     fn work_snapshot_updates_the_matching_row_by_name() {
-        use crate::work::WorkState;
+        use crate::work::Work;
         let mut app = app_with(&["default", "feat"]);
         let mut snap = HashMap::new();
         snap.insert(
             "feat".to_string(),
-            WorkState::Dirty {
-                added: 9,
-                removed: 2,
+            Work {
+                state: WorkState::Dirty {
+                    added: 9,
+                    removed: 2,
+                },
+                behind: 4,
             },
         );
         app.handle(Msg::WorkSnapshot(snap));
@@ -757,7 +838,8 @@ mod tests {
                 removed: 2
             }
         );
-        // A workspace absent from the snapshot stays Unknown.
+        assert_eq!(app.behind(feat), 4);
+        // A workspace absent from the snapshot stays Unknown with zero behind.
         let def = app
             .store
             .workspaces
@@ -765,6 +847,18 @@ mod tests {
             .find(|w| w.name == "default")
             .unwrap();
         assert_eq!(app.work_state(def), WorkState::Unknown);
+        assert_eq!(app.behind(def), 0);
+    }
+
+    #[test]
+    fn capital_t_confirms_before_tidy_and_esc_cancels() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('T')));
+        assert!(matches!(app.mode, Mode::ConfirmTidy));
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+        // The status is untouched by a cancelled tidy (no mutation ran).
+        assert!(app.status.is_none());
     }
 
     #[test]
@@ -783,7 +877,7 @@ mod tests {
 
     #[test]
     fn list_groups_by_attention_needs_you_first() {
-        use crate::work::WorkState;
+        use crate::work::Work;
         let mut app = app_with(&["default", "busy", "blocked", "dirtyws"]);
         // Give each workspace a distinct axis so they land in distinct groups.
         // canon() no-ops on the nonexistent /wt/* paths, so agent keys match.
@@ -798,9 +892,12 @@ mod tests {
         let mut snap = HashMap::new();
         snap.insert(
             "dirtyws".to_string(),
-            WorkState::Dirty {
-                added: 1,
-                removed: 0,
+            Work {
+                state: WorkState::Dirty {
+                    added: 1,
+                    removed: 0,
+                },
+                behind: 0,
             },
         );
         app.handle(Msg::WorkSnapshot(snap));

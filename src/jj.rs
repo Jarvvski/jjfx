@@ -48,6 +48,70 @@ pub fn forget_workspace(repo_root: &Path, name: &str) -> anyhow::Result<()> {
     run_mut(repo_root, &["workspace", "forget", name])
 }
 
+/// Source revset for `tidyws`: idle, empty, undescribed workspace working-copies
+/// (excluding any that carry a bookmark or tag). Ported from the `tidyws` alias.
+const TIDYWS_SRC: &str =
+    "working_copies() & empty() & description(exact:'') ~ bookmarks() ~ tags()";
+
+/// Revset for `tidy`: junk mutable empties - undescribed, unbookmarked, untagged,
+/// and never the current `@`. Ported from the `tidy` alias.
+const TIDY_REVSET: &str = "mutable() & empty() & description(exact:'') ~ @ ~ bookmarks() ~ tags()";
+
+/// Reset idle, empty, undescribed workspace working-copies onto latest `trunk()`
+/// (`jj rebase -s <ws-empties> -d trunk()`), returning how many matched. A no-op
+/// (returning 0) when nothing is eligible, so it never errors on an empty repo.
+/// `--ignore-immutable` mirrors the alias; workspaces with real work are excluded
+/// by the `empty()`/`description(exact:'')` filters, so they are never touched.
+pub fn tidyws(repo_root: &Path) -> anyhow::Result<usize> {
+    let n = count(repo_root, TIDYWS_SRC);
+    if n == 0 {
+        return Ok(0);
+    }
+    run_mut(
+        repo_root,
+        &[
+            "rebase",
+            "--ignore-immutable",
+            "-s",
+            TIDYWS_SRC,
+            "-d",
+            "trunk()",
+        ],
+    )?;
+    Ok(n)
+}
+
+/// Abandon junk empties (`jj abandon <tidy-revset>`), returning how many matched.
+/// A no-op (returning 0) when nothing is eligible. Destructive - callers confirm
+/// first.
+pub fn tidy(repo_root: &Path) -> anyhow::Result<usize> {
+    let n = count(repo_root, TIDY_REVSET);
+    if n == 0 {
+        return Ok(0);
+    }
+    run_mut(repo_root, &["abandon", TIDY_REVSET])?;
+    Ok(n)
+}
+
+/// Count the revisions matching `revset` via a pure read (`--ignore-working-copy`,
+/// no snapshot). Zero on any failure - the caller then treats it as "nothing to
+/// do" rather than erroring.
+fn count(repo_root: &Path, revset: &str) -> usize {
+    let out = Command::new("jj")
+        .arg("--repository")
+        .arg(repo_root)
+        .arg("--ignore-working-copy")
+        .args(["log", "-r", revset, "--no-graph", "-T", "\"x\\n\""])
+        .output();
+    match out {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .filter(|l| !l.is_empty())
+            .count(),
+        _ => 0,
+    }
+}
+
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.
 fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
     let output = Command::new("jj")

@@ -69,6 +69,17 @@ pub enum WorkState {
     Merged,
 }
 
+/// A workspace's work-lifecycle snapshot: its [`WorkState`] plus how far
+/// `trunk()` has advanced past its base (`behind`). `behind` is orthogonal to the
+/// state - a Dirty or Pushed workspace can still be behind trunk - and `tidyws`
+/// is its remedy (ticket 09).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Work {
+    pub state: WorkState,
+    /// Commits on `trunk()` the workspace's base has not yet caught up to.
+    pub behind: u32,
+}
+
 impl WorkState {
     /// Short label for a list row.
     pub fn label(self) -> String {
@@ -101,17 +112,43 @@ struct Pr {
     review: Option<String>,
 }
 
-/// Compute the work state for each named workspace. One `gh` call serves all
-/// workspaces; jj is queried per workspace. Runs blocking subprocesses, so call
-/// it from `spawn_blocking`.
-pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, WorkState> {
+/// Compute the [`Work`] snapshot for each named workspace. One `gh` call serves
+/// all workspaces; jj is queried per workspace. Runs blocking subprocesses, so
+/// call it from `spawn_blocking`.
+pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work> {
     let prs = derive_repo_slug(repo_root)
         .map(|slug| list_prs(&slug))
         .unwrap_or_default();
     workspaces
         .iter()
-        .map(|name| (name.clone(), classify(repo_root, name, &prs)))
+        .map(|name| {
+            let work = Work {
+                state: classify(repo_root, name, &prs),
+                behind: behind(repo_root, name),
+            };
+            (name.clone(), work)
+        })
         .collect()
+}
+
+/// How far `trunk()` has advanced past a workspace's base: the count of commits
+/// that are ancestors of `trunk()` but not of the workspace head
+/// (`::trunk() ~ ::<ws>@`). Zero when the workspace already sits on the tip of
+/// trunk, and zero on any jj read failure (degrade, don't crash).
+fn behind(repo_root: &Path, ws: &str) -> u32 {
+    jj(
+        repo_root,
+        &[
+            "log",
+            "-r",
+            &format!("::trunk() ~ ::{ws}@"),
+            "--no-graph",
+            "-T",
+            "\"x\\n\"",
+        ],
+    )
+    .map(|out| out.lines().filter(|l| !l.is_empty()).count() as u32)
+    .unwrap_or(0)
 }
 
 /// Classify one workspace: read its jj change chain relative to `trunk()`, then
