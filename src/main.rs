@@ -7,6 +7,7 @@ mod agent;
 mod app;
 mod attention;
 mod cache;
+mod cmd;
 mod events;
 mod forge;
 mod hooks;

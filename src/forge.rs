@@ -15,6 +15,7 @@ use std::process::{Command, Stdio};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::Msg;
+use crate::cmd::{Run, cmd};
 
 /// Weld source: the root of this workspace's own mutable chain, rebased onto
 /// `trunk()`. Scoped to `::@` so only this workspace's stack moves.
@@ -223,15 +224,14 @@ async fn config_get(repo_root: &Path, key: &str) -> Option<String> {
     let root = repo_root.to_path_buf();
     let key = key.to_string();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new("jj")
+        cmd("jj")
             .arg("--repository")
             .arg(&root)
             .args(["config", "get", &key])
-            .output()
-            .ok()?;
-        out.status
-            .success()
-            .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+            .run()
+            .ok()
+            .and_then(Run::stdout_ok)
+            .map(|s| s.trim().to_string())
     })
     .await
     .ok()
@@ -279,7 +279,7 @@ async fn gpg_unlocked(key: String) -> bool {
 async fn has_conflict(dir: &Path) -> bool {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        let out = Command::new("jj")
+        cmd("jj")
             .current_dir(&dir)
             .args([
                 "--ignore-working-copy",
@@ -290,8 +290,9 @@ async fn has_conflict(dir: &Path) -> bool {
                 "-T",
                 "\"x\"",
             ])
-            .output();
-        matches!(out, Ok(o) if o.status.success() && !o.stdout.is_empty())
+            .run()
+            .map(|r| r.ok() && !r.stdout().is_empty())
+            .unwrap_or(false)
     })
     .await
     .unwrap_or(false)
@@ -302,14 +303,12 @@ async fn jj_at(repo_root: &Path, args: &[&str]) -> bool {
     let root = repo_root.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        Command::new("jj")
+        cmd("jj")
             .arg("--repository")
             .arg(&root)
             .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
+            .run()
+            .map(|r| r.ok())
             .unwrap_or(false)
     })
     .await
@@ -322,13 +321,11 @@ async fn jj_in(dir: &Path, args: &[&str]) -> bool {
     let dir = dir.to_path_buf();
     let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
     tokio::task::spawn_blocking(move || {
-        Command::new("jj")
+        cmd("jj")
             .current_dir(&dir)
             .args(&args)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
+            .run()
+            .map(|r| r.ok())
             .unwrap_or(false)
     })
     .await
@@ -339,14 +336,12 @@ async fn jj_in(dir: &Path, args: &[&str]) -> bool {
 async fn spr_sync(dir: &Path) -> bool {
     let dir = dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
-        Command::new("jj-spr")
+        cmd("jj-spr")
             .current_dir(&dir)
             .env("JJ_SPR_REVSET", SPR_REVSET)
             .arg("sync")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
+            .run()
+            .map(|r| r.ok())
             .unwrap_or(false)
     })
     .await

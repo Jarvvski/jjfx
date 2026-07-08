@@ -10,9 +10,10 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::process::Command;
 
 use serde::Deserialize;
+
+use crate::cmd::{Run, cmd};
 
 /// A PR's review verdict, as reported by `gh`'s `reviewDecision`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -306,24 +307,20 @@ fn parse_diff_stat(stat: &str) -> Option<(u32, u32)> {
 /// failure. `--ignore-working-copy` keeps it a pure read - jjfx must never
 /// snapshot the working copy (that would churn commits and ping its own watcher).
 fn jj(repo_root: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("jj")
+    cmd("jj")
         .arg("--repository")
         .arg(repo_root)
         .arg("--ignore-working-copy")
         .args(args)
-        .output()
-        .ok()?;
-    if output.status.success() {
-        Some(String::from_utf8_lossy(&output.stdout).into_owned())
-    } else {
-        None
-    }
+        .run()
+        .ok()?
+        .stdout_ok()
 }
 
 /// List PRs via `gh --json`. Returns an empty list on any failure, so a missing
 /// `gh`, no auth, or no network degrades to "no PR info" rather than crashing.
 fn list_prs(slug: &str) -> Vec<Pr> {
-    let output = Command::new("gh")
+    cmd("gh")
         .args([
             "pr",
             "list",
@@ -336,11 +333,11 @@ fn list_prs(slug: &str) -> Vec<Pr> {
             "--json",
             "number,headRefName,state,reviewDecision",
         ])
-        .output();
-    match output {
-        Ok(out) if out.status.success() => serde_json::from_slice(&out.stdout).unwrap_or_default(),
-        _ => Vec::new(),
-    }
+        .run()
+        .ok()
+        .and_then(Run::stdout_ok)
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default()
 }
 
 /// Derive the `owner/repo` slug from jj's `origin` remote URL. `gh` auto-detection

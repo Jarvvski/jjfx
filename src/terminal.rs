@@ -6,10 +6,11 @@
 //! distinct from the user's other tabs and from the coexisting bash tools.
 
 use std::path::Path;
-use std::process::Command;
 
-use anyhow::{Context, anyhow};
+use anyhow::Context;
 use serde_json::Value;
+
+use crate::cmd::cmd;
 
 /// Tab-title prefix that marks (and locates) a workspace's tab.
 const TAB_PREFIX: &str = "jjfx:";
@@ -41,20 +42,12 @@ impl KittyTerminal {
     /// Run `kitten @ <args>`, returning stdout on success. Errors carry stderr so
     /// the app can surface a useful message rather than failing silently.
     fn run(&self, args: &[&str]) -> anyhow::Result<String> {
-        let out = Command::new("kitten")
+        cmd("kitten")
             .arg("@")
             .args(args)
-            .output()
-            .context("running `kitten @` - is kitty's remote control enabled?")?;
-        if out.status.success() {
-            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
-        } else {
-            Err(anyhow!(
-                "kitten @ {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&out.stderr).trim()
-            ))
-        }
+            .run()
+            .context("running `kitten @` - is kitty's remote control enabled?")?
+            .checked()
     }
 
     /// Parse `kitten @ ls` into its JSON tree.

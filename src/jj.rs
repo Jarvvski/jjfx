@@ -4,9 +4,8 @@
 //! later epics (ADR 0007).
 
 use std::path::Path;
-use std::process::Command;
 
-use anyhow::{Context, anyhow};
+use crate::cmd::{Run, cmd};
 
 /// Workspace names jj knows in this repo, via
 /// `jj workspace list -T 'name ++ "\n"'`. `--ignore-working-copy` keeps it a
@@ -14,22 +13,24 @@ use anyhow::{Context, anyhow};
 /// failure - the skeleton degrades to the ws-cache + derived default rather than
 /// erroring, and the caller cannot surface errors from inside the alt-screen.
 pub fn workspace_names(repo_root: &Path) -> Vec<String> {
-    let output = Command::new("jj")
+    let out = cmd("jj")
         .arg("--repository")
         .arg(repo_root)
         .arg("--ignore-working-copy")
         .args(["workspace", "list", "-T", "name ++ \"\\n\""])
-        .output();
+        .run()
+        .ok()
+        .and_then(Run::stdout_ok);
 
-    match output {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .map(String::from)
-            .collect(),
-        _ => Vec::new(),
-    }
+    out.into_iter()
+        .flat_map(|s| {
+            s.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Create a new named workspace rooted at `dest` (`jj workspace add`). Unlike the
@@ -97,36 +98,25 @@ pub fn tidy(repo_root: &Path) -> anyhow::Result<usize> {
 /// no snapshot). Zero on any failure - the caller then treats it as "nothing to
 /// do" rather than erroring.
 fn count(repo_root: &Path, revset: &str) -> usize {
-    let out = Command::new("jj")
+    cmd("jj")
         .arg("--repository")
         .arg(repo_root)
         .arg("--ignore-working-copy")
         .args(["log", "-r", revset, "--no-graph", "-T", "\"x\\n\""])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .filter(|l| !l.is_empty())
-            .count(),
-        _ => 0,
-    }
+        .run()
+        .ok()
+        .and_then(Run::stdout_ok)
+        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+        .unwrap_or(0)
 }
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.
 fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let output = Command::new("jj")
+    cmd("jj")
         .arg("--repository")
         .arg(repo_root)
         .args(args)
-        .output()
-        .with_context(|| format!("running jj {}", args.join(" ")))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "jj {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+        .run()?
+        .checked()?;
+    Ok(())
 }
