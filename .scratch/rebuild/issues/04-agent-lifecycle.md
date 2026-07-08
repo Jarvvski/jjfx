@@ -1,6 +1,6 @@
 # Agent lifecycle: hook install, JSONL fold, live agent state
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -18,10 +18,10 @@ event -> transition map confirmed in issue 01.
 
 ## Acceptance criteria
 
-- [ ] `jjfx hooks install` adds the hook to `~/.claude/settings.json` idempotently and leaves existing hooks intact; a status/check path reports whether hooks are installed.
-- [ ] Hooks append one JSON line per event to the global log; concurrent agents do not interleave or corrupt lines.
-- [ ] Starting a `claude` session in a workspace moves its row Working -> Waiting live; a permission prompt shows NeedsAttention; ending the session shows Ended/Absent.
-- [ ] On startup the TUI reconstructs current agent state by replaying the log; log growth is bounded by size-based rotation.
+- [x] `jjfx hooks install` adds the hook to `~/.claude/settings.json` idempotently and leaves existing hooks intact; a status/check path reports whether hooks are installed. (Verified: `install` twice reports "already installed"; `merge_preserves_existing_hooks_and_keys` test keeps unrelated keys + pre-existing Stop hook; `hooks status` lists installed/missing.)
+- [x] Hooks append one JSON line per event to the global log; concurrent agents do not interleave or corrupt lines. (Verified: 50 concurrent `sh -c` hook writes -> 50 valid JSON lines, zero corruption; single `printf '%s\n' "$(cat)"` = one `O_APPEND` write below `PIPE_BUF`.)
+- [x] Starting a `claude` session in a workspace moves its row Working -> Waiting live; a permission prompt shows NeedsAttention; ending the session shows Ended/Absent. (Verified via PTY: appending `UserPromptSubmit` flips the row to "working" live, `Stop` to "waiting"; `PermissionRequest`->NeedsAttention and `SessionEnd`->Ended covered by `transitions_follow_the_spike_map`. Only common fields `hook_event_name`/`cwd` are read, sidestepping spike 01's un-captured field shapes.)
+- [x] On startup the TUI reconstructs current agent state by replaying the log; log growth is bounded by size-based rotation. (Verified: `read_events` + `fold` rebuild state on launch; `rotate_if_needed` keeps the tail from a line boundary under the 4 MiB cap - `rotate_keeps_the_tail_from_a_line_boundary` test.)
 
 ## Blocked by
 

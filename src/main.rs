@@ -1,10 +1,13 @@
 //! jjfx - keyboard-driven mission-control for parallel Claude Code agents, each
-//! in its own Jujutsu workspace. This is the walking skeleton (issue 03): it
-//! loads the authoritative workspace store, mirrors `.jj/ws-cache`, watches for
-//! live changes, and renders the workspace list. No lifecycle state yet.
+//! in its own Jujutsu workspace. It loads the authoritative workspace store,
+//! mirrors `.jj/ws-cache`, event-sources each workspace's agent lifecycle from
+//! Claude Code hooks, and renders an Attention-first list.
 
+mod agent;
 mod app;
 mod cache;
+mod events;
+mod hooks;
 mod jj;
 mod repo;
 mod store;
@@ -22,12 +25,20 @@ use crate::store::Store;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // `jjfx hooks [install|status]` is global - it manages ~/.claude/settings.json
+    // and needs no jj repo, so it runs before repo discovery.
+    if args.first().map(String::as_str) == Some("hooks") {
+        return hooks::run_cli(args.get(1).map(String::as_str));
+    }
+
     let cwd = std::env::current_dir().context("reading current directory")?;
     let repo_root = repo::discover(&cwd)?;
 
     // Headless mode: dump the reconciled store and exit. Useful for scripting and
     // for confirming the store/cache round-trip without a terminal.
-    if std::env::args().any(|a| a == "--list") {
+    if args.iter().any(|a| a == "--list") {
         let store = Store::load(&repo_root);
         let mut out = std::io::stdout().lock();
         for w in &store.workspaces {
@@ -47,14 +58,22 @@ async fn main() -> anyhow::Result<()> {
 async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
+    // Bound the event log, then reconstruct current agent state by replaying it
+    // (ADR 0004). Rotate before replay so the read is already within the cap.
+    let log = events::log_path();
+    events::rotate_if_needed(&log, events::MAX_LOG_BYTES).ok();
+    let initial_agents = agent::fold(events::read_events(&log));
+
     // Filesystem watcher -> Msg::Reload. Held for the duration of the loop.
     let _watcher = watch::watch_repo(&repo_root, tx.clone())?;
+    // Event-log tailer -> Msg::AgentEvent for each new line. Also held alive.
+    let _log_watcher = events::watch_log(&log, tx.clone())?;
 
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx);
 
     let mut terminal = tui::init()?;
-    let result = event_loop(&mut terminal, &mut rx, &repo_root).await;
+    let result = event_loop(&mut terminal, &mut rx, &repo_root, initial_agents).await;
 
     // Always restore, then surface any loop error.
     tui::restore()?;
@@ -66,8 +85,9 @@ async fn event_loop(
     terminal: &mut tui::Tui,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     repo_root: &std::path::Path,
+    initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(Store::load(repo_root));
+    let mut app = App::new(Store::load(repo_root), initial_agents);
     terminal.draw(|f| app.render(f))?;
 
     while let Some(first) = rx.recv().await {

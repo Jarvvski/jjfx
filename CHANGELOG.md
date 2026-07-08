@@ -6,6 +6,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Agent lifecycle (v0.2.0): each workspace row now shows its live
+  agent state - working / waiting / needs-attn / ended - event-sourced from
+  Claude Code hooks. `jjfx hooks install` adds a dumb append-only hook to
+  `~/.claude/settings.json` (idempotent, non-destructive) that appends each
+  event to a global JSONL log; `jjfx hooks status` reports whether it is
+  installed. The TUI replays the log on startup to reconstruct state, tails it
+  for live transitions keyed by `cwd`, and bounds log growth with size-based
+  rotation.
+
 - 2026-07-08 - Walking skeleton: `jjfx` launches in a jj repo and renders a
   keyboard-driven workspace list (default + named). It reconciles the
   authoritative in-memory store from jj plus `.jj/ws-cache`, writes the cache

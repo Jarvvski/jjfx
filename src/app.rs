@@ -2,14 +2,18 @@
 //! over a channel to the single owned `App`, which the main loop mutates and
 //! redraws (the engine shape from the PRD).
 
+use std::collections::HashMap;
+use std::path::PathBuf;
+
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use crate::store::Store;
+use crate::agent::{self, AgentState};
+use crate::store::{Store, Workspace};
 
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
@@ -18,23 +22,29 @@ pub enum Msg {
     Input(Event),
     /// The repo changed on disk; re-reconcile the store.
     Reload,
+    /// A Claude Code hook event, appended to the global log (ADR 0004).
+    AgentEvent(agent::Event),
 }
 
 /// The whole application state - one owned value on the main task.
 pub struct App {
     store: Store,
+    /// Current agent lifecycle state per workspace, keyed by canonicalized path
+    /// (the `cwd` join from the hook log). Absent workspaces are simply missing.
+    agents: HashMap<PathBuf, AgentState>,
     list_state: ListState,
     pub should_quit: bool,
 }
 
 impl App {
-    pub fn new(store: Store) -> Self {
+    pub fn new(store: Store, agents: HashMap<PathBuf, AgentState>) -> Self {
         let mut list_state = ListState::default();
         if !store.workspaces.is_empty() {
             list_state.select(Some(0));
         }
         App {
             store,
+            agents,
             list_state,
             should_quit: false,
         }
@@ -46,7 +56,24 @@ impl App {
             Msg::Input(Event::Key(key)) => self.on_key(key),
             Msg::Input(_) => {}
             Msg::Reload => self.reload(),
+            Msg::AgentEvent(ev) => self.on_agent_event(ev),
         }
+    }
+
+    /// Fold one hook event into the per-workspace agent state.
+    fn on_agent_event(&mut self, ev: agent::Event) {
+        let key = agent::canon(std::path::Path::new(&ev.cwd));
+        let entry = self.agents.entry(key).or_insert(AgentState::Absent);
+        *entry = agent::transition(*entry, &ev.name);
+    }
+
+    /// The agent state for a workspace, `Absent` if the log has none for it.
+    fn agent_state(&self, w: &Workspace) -> AgentState {
+        w.path
+            .as_deref()
+            .map(agent::canon)
+            .and_then(|p| self.agents.get(&p).copied())
+            .unwrap_or_default()
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -108,12 +135,19 @@ impl App {
             .workspaces
             .iter()
             .map(|w| {
+                let state = self.agent_state(w);
                 let path = w
                     .path
                     .as_deref()
                     .map(display_path)
                     .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
-                ListItem::new(Line::from(format!("{:<20} {}", w.name, path)))
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("{:<11}", state.label()),
+                        Style::default().fg(agent_color(state)),
+                    ),
+                    Span::raw(format!("{:<20} {}", w.name, path)),
+                ]))
             })
             .collect();
 
@@ -137,6 +171,17 @@ fn display_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
+/// Colour cue for an agent state - drawing the eye to what is live or blocked.
+fn agent_color(state: AgentState) -> Color {
+    match state {
+        AgentState::Absent => Color::DarkGray,
+        AgentState::Working => Color::Green,
+        AgentState::Waiting => Color::Yellow,
+        AgentState::NeedsAttention => Color::Red,
+        AgentState::Ended => Color::DarkGray,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -152,10 +197,13 @@ mod tests {
                 path: Some(PathBuf::from(format!("/wt/{n}"))),
             })
             .collect();
-        App::new(Store {
-            repo_root: Path::new("/repo").to_path_buf(),
-            workspaces,
-        })
+        App::new(
+            Store {
+                repo_root: Path::new("/repo").to_path_buf(),
+                workspaces,
+            },
+            HashMap::new(),
+        )
     }
 
     fn press(code: KeyCode) -> Msg {
@@ -176,6 +224,31 @@ mod tests {
         let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Esc));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn agent_event_updates_the_matching_workspace_row() {
+        let mut app = app_with(&["default", "feat"]);
+        // canon() no-ops on nonexistent paths, so /wt/feat matches the row path.
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "UserPromptSubmit".into(),
+            cwd: "/wt/feat".into(),
+        }));
+        let feat = app
+            .store
+            .workspaces
+            .iter()
+            .find(|w| w.name == "feat")
+            .unwrap();
+        assert_eq!(app.agent_state(feat), AgentState::Working);
+        // A workspace with no events stays Absent.
+        let def = app
+            .store
+            .workspaces
+            .iter()
+            .find(|w| w.name == "default")
+            .unwrap();
+        assert_eq!(app.agent_state(def), AgentState::Absent);
     }
 
     #[test]
