@@ -1,7 +1,7 @@
 # Epic B - Triage and actions
 
 Type: epic
-Status: tracking
+Status: done
 Milestone: v0.1
 
 ## Goal
