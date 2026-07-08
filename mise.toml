@@ -1,0 +1,26 @@
+[tools]
+rust = "1.96.1"
+
+[tasks.run]
+description = "Run the app"
+run = "cargo run"
+
+[tasks.build]
+description = "Build the workspace"
+run = "cargo build"
+
+[tasks.test]
+description = "Run tests"
+run = "cargo test"
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks.lint]
+description = "Clippy across all targets, warnings as errors"
+run = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.check]
+description = "fmt + lint + build + test (the pre-land gate)"
+depends = ["fmt", "lint", "build", "test"]
