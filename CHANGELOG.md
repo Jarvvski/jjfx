@@ -6,6 +6,14 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-08 - Stop the forge pipeline from spewing over the TUI (v0.8.2): the
+  `fetch`, `weld`, `push`, and `spr` steps ran their subprocesses with bare
+  `.status()`, which inherits the parent's stdout/stderr - so jj/jj-spr output
+  (`Working copy (@) now at:`, `Nothing changed.`, `Added 0 files, modified 5
+  files`) printed straight onto the alt-screen and corrupted the workspace list.
+  Those steps now redirect both streams to `Stdio::null()`, matching the forge's
+  design of modelling step state natively rather than scraping stdout.
+
 - 2026-07-08 - Correct the diff base in never-pushed repos (v0.8.1): `trunk()`
   resolves to the root commit when no remote mainline bookmark exists yet, which
   made every workspace diff the entire history - so an empty workspace read as
