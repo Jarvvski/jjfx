@@ -6,6 +6,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Attention triage (v0.5.0): the list is now organized around the
+  derived Attention badge (ADR 0008). Each workspace shows one signal - needs
+  you / working / ready to forge / idle - derived from its (agent, work) pair,
+  and the list is grouped in that order with the idle group foldable (`c`).
+  needs-you distinguishes a Waiting agent over a changes-requested PR from an
+  idle Clean workspace. A live state change (agent Stop, PR review) re-sorts the
+  workspace into the right group with no manual refresh; selection follows a
+  workspace by name as it moves.
+
 - 2026-07-08 - Workspace actions (v0.4.0): drive workspaces from the list -
   `n` creates one (a new `jj` workspace in a `<repo>-<name>` sibling dir,
   persisted to the ws-cache) and opens a kitty tab running claude beside a

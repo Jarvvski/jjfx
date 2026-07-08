@@ -13,6 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use crate::agent::{self, AgentState};
+use crate::attention::{self, Attention};
 use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
 use crate::work::WorkState;
@@ -24,6 +25,12 @@ enum Mode {
     Normal,
     NewWorkspace(String),
     ConfirmDelete(String),
+}
+
+/// One rendered list line: a group header (non-selectable) or a workspace row.
+enum Row<'a> {
+    Header(Attention, usize),
+    Ws(&'a Workspace, Attention),
 }
 
 /// Messages folded into the app from the terminal and background watchers.
@@ -54,6 +61,13 @@ pub struct App {
     mode: Mode,
     /// A transient one-line message shown in the footer (last action's result).
     status: Option<String>,
+    /// Selection tracked by workspace name, not row index, so it follows a
+    /// workspace as live state re-sorts it between Attention groups.
+    selected: Option<String>,
+    /// Whether the idle group is folded away.
+    idle_collapsed: bool,
+    /// Render-only: the highlighted row index, recomputed from `selected` each
+    /// draw (the list interleaves non-selectable group headers).
     list_state: ListState,
     pub should_quit: bool,
 }
@@ -64,20 +78,20 @@ impl App {
         agents: HashMap<PathBuf, AgentState>,
         terminal: Box<dyn Terminal>,
     ) -> Self {
-        let mut list_state = ListState::default();
-        if !store.workspaces.is_empty() {
-            list_state.select(Some(0));
-        }
-        App {
+        let mut app = App {
             store,
             agents,
             work: HashMap::new(),
             terminal,
             mode: Mode::Normal,
             status: None,
-            list_state,
+            selected: None,
+            idle_collapsed: false,
+            list_state: ListState::default(),
             should_quit: false,
-        }
+        };
+        app.ensure_selection();
+        app
     }
 
     /// Fold one message into the state.
@@ -136,6 +150,10 @@ impl App {
             KeyCode::Enter => self.open_selected(true),
             KeyCode::Char('o') => self.open_selected(false),
             KeyCode::Char('d') => self.begin_delete_selected(),
+            KeyCode::Char('c') => {
+                self.idle_collapsed = !self.idle_collapsed;
+                self.ensure_selection();
+            }
             _ => {}
         }
     }
@@ -177,9 +195,9 @@ impl App {
 
     /// The workspace under the cursor, if any.
     fn selected_workspace(&self) -> Option<&Workspace> {
-        self.list_state
-            .selected()
-            .and_then(|i| self.store.workspaces.get(i))
+        self.selected
+            .as_ref()
+            .and_then(|s| self.store.workspaces.iter().find(|w| &w.name == s))
     }
 
     /// `enter`/`o`: focus the selected workspace's tab if it exists, else open a
@@ -304,30 +322,94 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.store.workspaces.len();
-        if len == 0 {
+        let names: Vec<String> = self.selectable().iter().map(|w| w.name.clone()).collect();
+        if names.is_empty() {
+            self.selected = None;
             return;
         }
-        let current = self.list_state.selected().unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, len as isize - 1);
-        self.list_state.select(Some(next as usize));
+        let current = self
+            .selected
+            .as_ref()
+            .and_then(|s| names.iter().position(|n| n == s))
+            .unwrap_or(0) as isize;
+        let next = (current + delta).clamp(0, names.len() as isize - 1);
+        self.selected = Some(names[next as usize].clone());
     }
 
-    /// Re-reconcile from disk, preserving the selection where possible.
+    /// Re-reconcile from disk; the selection follows its workspace by name.
     fn reload(&mut self) {
         self.store = Store::load(&self.store.repo_root);
-        let len = self.store.workspaces.len();
-        match len {
-            0 => self.list_state.select(None),
-            _ => {
-                let clamped = self.list_state.selected().unwrap_or(0).min(len - 1);
-                self.list_state.select(Some(clamped));
-            }
+        self.ensure_selection();
+    }
+
+    /// Point the selection at a real, currently-selectable workspace, falling
+    /// back to the first one when the current target is gone or hidden.
+    fn ensure_selection(&mut self) {
+        let names: Vec<String> = self.selectable().iter().map(|w| w.name.clone()).collect();
+        let valid = self.selected.as_ref().is_some_and(|s| names.contains(s));
+        if !valid {
+            self.selected = names.into_iter().next();
         }
     }
 
-    /// Render the workspace list plus a header and a key-hint footer.
+    /// Workspaces paired with their derived Attention, grouped needs-you ->
+    /// working -> ready-to-forge -> idle, sorted by name within each group.
+    fn classified(&self) -> Vec<(Attention, &Workspace)> {
+        let mut v: Vec<(Attention, &Workspace)> = self
+            .store
+            .workspaces
+            .iter()
+            .map(|w| {
+                (
+                    attention::derive(self.agent_state(w), self.work_state(w)),
+                    w,
+                )
+            })
+            .collect();
+        v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
+        v
+    }
+
+    /// The display rows: a header per non-empty group, then its workspace rows
+    /// (unless the idle group is collapsed).
+    fn rows(&self) -> Vec<Row<'_>> {
+        let classified = self.classified();
+        let mut rows = Vec::new();
+        let mut idx = 0;
+        while idx < classified.len() {
+            let att = classified[idx].0;
+            let end = idx
+                + classified[idx..]
+                    .iter()
+                    .take_while(|(a, _)| *a == att)
+                    .count();
+            rows.push(Row::Header(att, end - idx));
+            if !(att == Attention::Idle && self.idle_collapsed) {
+                for (a, w) in &classified[idx..end] {
+                    rows.push(Row::Ws(w, *a));
+                }
+            }
+            idx = end;
+        }
+        rows
+    }
+
+    /// The currently-selectable workspaces, in display order (excludes ones
+    /// hidden in a collapsed idle group).
+    fn selectable(&self) -> Vec<&Workspace> {
+        self.rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                Row::Ws(w, _) => Some(w),
+                Row::Header(..) => None,
+            })
+            .collect()
+    }
+
+    /// Render the Attention-grouped workspace list plus a header and footer.
     pub fn render(&mut self, frame: &mut Frame) {
+        self.ensure_selection();
+
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
@@ -344,32 +426,26 @@ impl App {
             header,
         );
 
+        // Build list items from the grouped rows, tracking which item index the
+        // selected workspace lands on so the highlight follows it.
+        let selected = self.selected.clone();
+        let mut selected_idx = None;
         let items: Vec<ListItem> = self
-            .store
-            .workspaces
-            .iter()
-            .map(|w| {
-                let agent = self.agent_state(w);
-                let work = self.work_state(w);
-                let path = w
-                    .path
-                    .as_deref()
-                    .map(display_path)
-                    .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
-                ListItem::new(Line::from(vec![
-                    Span::styled(
-                        format!("{:<11}", agent.label()),
-                        Style::default().fg(agent_color(agent)),
-                    ),
-                    Span::styled(
-                        format!("{:<16}", work.label()),
-                        Style::default().fg(work_color(work)),
-                    ),
-                    Span::raw(format!("{:<20} {}", w.name, path)),
-                ]))
+            .rows()
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| match row {
+                Row::Header(att, count) => self.header_item(att, count),
+                Row::Ws(w, att) => {
+                    if selected.as_deref() == Some(w.name.as_str()) {
+                        selected_idx = Some(i);
+                    }
+                    self.workspace_item(w, att)
+                }
             })
             .collect();
 
+        self.list_state.select(selected_idx);
         let list = List::new(items)
             .block(Block::bordered())
             .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
@@ -377,6 +453,52 @@ impl App {
         frame.render_stateful_widget(list, body, &mut self.list_state);
 
         frame.render_widget(self.footer(), footer);
+    }
+
+    /// A group-header row: the Attention heading, count, and a fold hint for idle.
+    fn header_item(&self, att: Attention, count: usize) -> ListItem<'static> {
+        let mut text = format!("{} ({count})", att.heading());
+        if att == Attention::Idle {
+            text.push_str(if self.idle_collapsed {
+                "  [c: expand]"
+            } else {
+                "  [c: fold]"
+            });
+        }
+        ListItem::new(Line::from(Span::styled(
+            text,
+            Style::default()
+                .fg(attention_color(att))
+                .add_modifier(Modifier::BOLD),
+        )))
+    }
+
+    /// A workspace row: Attention badge, then the two lifecycle axes, then name
+    /// and path.
+    fn workspace_item(&self, w: &Workspace, att: Attention) -> ListItem<'static> {
+        let agent = self.agent_state(w);
+        let work = self.work_state(w);
+        let path = w
+            .path
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
+        ListItem::new(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(
+                format!("{:<10}", att.heading()),
+                Style::default().fg(attention_color(att)),
+            ),
+            Span::styled(
+                format!("{:<11}", agent.label()),
+                Style::default().fg(agent_color(agent)),
+            ),
+            Span::styled(
+                format!("{:<16}", work.label()),
+                Style::default().fg(work_color(work)),
+            ),
+            Span::raw(format!("{:<18} {}", w.name, path)),
+        ]))
     }
 
     /// The footer: a live prompt while entering a name or confirming a delete, a
@@ -397,7 +519,7 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )),
                 None => Paragraph::new(Span::styled(
-                    " j/k move  n new  enter open  o open-bg  d delete  q quit ",
+                    " j/k move  n new  enter open  o open-bg  d delete  c fold-idle  q quit ",
                     Style::default().add_modifier(Modifier::DIM),
                 )),
             },
@@ -407,6 +529,16 @@ impl App {
 
 fn display_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// Colour cue for the Attention badge - the primary triage signal.
+fn attention_color(att: Attention) -> Color {
+    match att {
+        Attention::NeedsYou => Color::Red,
+        Attention::Working => Color::Green,
+        Attention::ReadyToForge => Color::Cyan,
+        Attention::Idle => Color::DarkGray,
+    }
 }
 
 /// Colour cue for an agent state - drawing the eye to what is live or blocked.
@@ -637,13 +769,63 @@ mod tests {
 
     #[test]
     fn selection_moves_and_clamps() {
+        // All idle -> one group, sorted by name: a, b, default.
         let mut app = app_with(&["default", "a", "b"]);
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected.as_deref(), Some("a"));
         app.handle(press(KeyCode::Up)); // clamp at top
-        assert_eq!(app.list_state.selected(), Some(0));
+        assert_eq!(app.selected.as_deref(), Some("a"));
         app.handle(press(KeyCode::Down));
+        assert_eq!(app.selected.as_deref(), Some("b"));
         app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Down)); // clamp at bottom (len 3)
-        assert_eq!(app.list_state.selected(), Some(2));
+        app.handle(press(KeyCode::Down)); // clamp at bottom
+        assert_eq!(app.selected.as_deref(), Some("default"));
+    }
+
+    #[test]
+    fn list_groups_by_attention_needs_you_first() {
+        use crate::work::WorkState;
+        let mut app = app_with(&["default", "busy", "blocked", "dirtyws"]);
+        // Give each workspace a distinct axis so they land in distinct groups.
+        // canon() no-ops on the nonexistent /wt/* paths, so agent keys match.
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "PermissionRequest".into(),
+            cwd: "/wt/blocked".into(),
+        }));
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "UserPromptSubmit".into(),
+            cwd: "/wt/busy".into(),
+        }));
+        let mut snap = HashMap::new();
+        snap.insert(
+            "dirtyws".to_string(),
+            WorkState::Dirty {
+                added: 1,
+                removed: 0,
+            },
+        );
+        app.handle(Msg::WorkSnapshot(snap));
+
+        // Group order via classified(): needs-you, working, ready-to-forge, idle.
+        let groups: Vec<Attention> = app.classified().iter().map(|(a, _)| *a).collect();
+        assert_eq!(groups[0], Attention::NeedsYou); // blocked
+        assert_eq!(groups[1], Attention::Working); // busy
+        assert_eq!(groups[2], Attention::ReadyToForge); // dirtyws
+        assert_eq!(groups[3], Attention::Idle); // default
+    }
+
+    #[test]
+    fn idle_group_folds_and_selection_stays_valid() {
+        let mut app = app_with(&["default", "a"]); // both idle
+        assert_eq!(app.selectable().len(), 2);
+        // Fold idle -> no selectable rows remain, selection clears gracefully.
+        app.handle(press(KeyCode::Char('c')));
+        assert!(app.idle_collapsed);
+        assert_eq!(app.selectable().len(), 0);
+        assert_eq!(app.selected, None);
+        // Unfold restores selectability and a valid selection.
+        app.handle(press(KeyCode::Char('c')));
+        assert!(!app.idle_collapsed);
+        assert_eq!(app.selectable().len(), 2);
+        assert!(app.selected.is_some());
     }
 }

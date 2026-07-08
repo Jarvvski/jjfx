@@ -43,6 +43,12 @@ impl ReviewVerdict {
             ReviewVerdict::None => "",
         }
     }
+
+    /// Whether this verdict is a change request - the signal that turns a Waiting
+    /// agent into a needs-you (the Attention derivation, ticket 06).
+    pub fn is_changes_requested(self) -> bool {
+        matches!(self, ReviewVerdict::ChangesRequested)
+    }
 }
 
 /// Where a workspace's change sits on the road to merge.

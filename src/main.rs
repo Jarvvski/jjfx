@@ -5,6 +5,7 @@
 
 mod agent;
 mod app;
+mod attention;
 mod cache;
 mod events;
 mod hooks;

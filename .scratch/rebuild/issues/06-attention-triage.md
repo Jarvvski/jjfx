@@ -1,6 +1,6 @@
 # Attention triage: derive the badge, group and sort the list
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -16,10 +16,10 @@ itself by push as state changes - no polling flicker.
 
 ## Acceptance criteria
 
-- [ ] Each workspace shows one Attention badge derived from its (agent, work) state per the PRD rules.
-- [ ] The list is grouped needs-you -> working -> ready-to-forge -> idle, with the idle group collapsible.
-- [ ] A live state change (agent Stop, PR review) re-sorts the affected workspace into the right group without a manual refresh.
-- [ ] The needs-you case distinguishes a Waiting-over-changes-requested-PR workspace from an idle Clean one.
+- [x] Each workspace shows one Attention badge derived from its (agent, work) state per the PRD rules. (Verified: `attention::derive` implements the PRD rules with a full unit-test matrix; each row renders a coloured badge column alongside its group.)
+- [x] The list is grouped needs-you -> working -> ready-to-forge -> idle, with the idle group collapsible. (Verified: `classified()` sorts by `Attention` then name - `list_groups_by_attention_needs_you_first`; `c` folds the idle group - `idle_group_folds_and_selection_stays_valid`; live PTY run showed the four headings.)
+- [x] A live state change (agent Stop, PR review) re-sorts the affected workspace into the right group without a manual refresh. (Verified via PTY: the default workspace moved ready-to-forge -> working -> needs-you -> ready-to-forge as `UserPromptSubmit`/`PermissionRequest`/`Stop` events arrived, each re-grouping with no keypress.)
+- [x] The needs-you case distinguishes a Waiting-over-changes-requested-PR workspace from an idle Clean one. (Verified: `waiting_over_changes_requested_pr_is_needs_you_not_idle` - Waiting+ChangesRequested -> NeedsYou, Waiting+Clean -> Idle, Waiting+Approved -> not NeedsYou.)
 
 ## Blocked by
 
