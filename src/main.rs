@@ -13,6 +13,7 @@ mod repo;
 mod store;
 mod tui;
 mod watch;
+mod work;
 
 use std::io::Write;
 
@@ -69,11 +70,16 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     // Event-log tailer -> Msg::AgentEvent for each new line. Also held alive.
     let _log_watcher = events::watch_log(&log, tx.clone())?;
 
+    // Work-lifecycle poller: recompute the jj/gh work state periodically and on
+    // demand, sending Msg::WorkSnapshot. `work_tx` nudges it when the repo changes.
+    let (work_tx, work_rx) = mpsc::unbounded_channel::<()>();
+    spawn_work_poller(repo_root.clone(), tx.clone(), work_rx);
+
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx);
 
     let mut terminal = tui::init()?;
-    let result = event_loop(&mut terminal, &mut rx, &repo_root, initial_agents).await;
+    let result = event_loop(&mut terminal, &mut rx, &repo_root, initial_agents, work_tx).await;
 
     // Always restore, then surface any loop error.
     tui::restore()?;
@@ -86,6 +92,7 @@ async fn event_loop(
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     repo_root: &std::path::Path,
     initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
+    work_tx: UnboundedSender<()>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(Store::load(repo_root), initial_agents);
     terminal.draw(|f| app.render(f))?;
@@ -107,6 +114,9 @@ async fn event_loop(
         }
         if needs_reload {
             app.handle(Msg::Reload);
+            // A repo change may have altered the work state; nudge the poller so
+            // the row refreshes without waiting for the next interval tick.
+            let _ = work_tx.send(());
         }
 
         if app.should_quit {
@@ -115,6 +125,44 @@ async fn event_loop(
         terminal.draw(|f| app.render(f))?;
     }
     Ok(())
+}
+
+/// Recompute the work-lifecycle snapshot on an interval and whenever nudged via
+/// `refresh_rx`, sending each result as [`Msg::WorkSnapshot`]. The jj/gh reads
+/// are blocking, so they run on `spawn_blocking`.
+fn spawn_work_poller(
+    repo_root: std::path::PathBuf,
+    tx: UnboundedSender<Msg>,
+    mut refresh_rx: mpsc::UnboundedReceiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            let root = repo_root.clone();
+            let snapshot = tokio::task::spawn_blocking(move || {
+                let mut names = jj::workspace_names(&root);
+                if !names.iter().any(|n| n == store::DEFAULT_WORKSPACE) {
+                    names.push(store::DEFAULT_WORKSPACE.to_string());
+                }
+                work::snapshot(&root, &names)
+            })
+            .await;
+            if let Ok(snapshot) = snapshot
+                && tx.send(Msg::WorkSnapshot(snapshot)).is_err()
+            {
+                break; // app gone
+            }
+            // Wait for the next tick or an on-demand refresh, whichever comes first.
+            tokio::select! {
+                _ = interval.tick() => {}
+                got = refresh_rx.recv() => {
+                    if got.is_none() {
+                        break; // sender dropped at shutdown
+                    }
+                }
+            }
+        }
+    });
 }
 
 /// Read terminal events on a dedicated OS thread (crossterm reads block) and

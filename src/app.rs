@@ -14,6 +14,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use crate::agent::{self, AgentState};
 use crate::store::{Store, Workspace};
+use crate::work::WorkState;
 
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
@@ -24,6 +25,8 @@ pub enum Msg {
     Reload,
     /// A Claude Code hook event, appended to the global log (ADR 0004).
     AgentEvent(agent::Event),
+    /// A freshly computed work-lifecycle snapshot, keyed by workspace name.
+    WorkSnapshot(HashMap<String, WorkState>),
 }
 
 /// The whole application state - one owned value on the main task.
@@ -32,6 +35,9 @@ pub struct App {
     /// Current agent lifecycle state per workspace, keyed by canonicalized path
     /// (the `cwd` join from the hook log). Absent workspaces are simply missing.
     agents: HashMap<PathBuf, AgentState>,
+    /// Latest work-lifecycle state per workspace, keyed by workspace name.
+    /// Missing entries render as unknown until the first snapshot arrives.
+    work: HashMap<String, WorkState>,
     list_state: ListState,
     pub should_quit: bool,
 }
@@ -45,6 +51,7 @@ impl App {
         App {
             store,
             agents,
+            work: HashMap::new(),
             list_state,
             should_quit: false,
         }
@@ -57,6 +64,7 @@ impl App {
             Msg::Input(_) => {}
             Msg::Reload => self.reload(),
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
+            Msg::WorkSnapshot(work) => self.work = work,
         }
     }
 
@@ -74,6 +82,11 @@ impl App {
             .map(agent::canon)
             .and_then(|p| self.agents.get(&p).copied())
             .unwrap_or_default()
+    }
+
+    /// The work state for a workspace, `Unknown` until the first snapshot lands.
+    fn work_state(&self, w: &Workspace) -> WorkState {
+        self.work.get(&w.name).copied().unwrap_or_default()
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -135,7 +148,8 @@ impl App {
             .workspaces
             .iter()
             .map(|w| {
-                let state = self.agent_state(w);
+                let agent = self.agent_state(w);
+                let work = self.work_state(w);
                 let path = w
                     .path
                     .as_deref()
@@ -143,8 +157,12 @@ impl App {
                     .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
                 ListItem::new(Line::from(vec![
                     Span::styled(
-                        format!("{:<11}", state.label()),
-                        Style::default().fg(agent_color(state)),
+                        format!("{:<11}", agent.label()),
+                        Style::default().fg(agent_color(agent)),
+                    ),
+                    Span::styled(
+                        format!("{:<16}", work.label()),
+                        Style::default().fg(work_color(work)),
                     ),
                     Span::raw(format!("{:<20} {}", w.name, path)),
                 ]))
@@ -179,6 +197,27 @@ fn agent_color(state: AgentState) -> Color {
         AgentState::Waiting => Color::Yellow,
         AgentState::NeedsAttention => Color::Red,
         AgentState::Ended => Color::DarkGray,
+    }
+}
+
+/// Colour cue for a work state - progress toward merge, plus review verdict.
+fn work_color(state: WorkState) -> Color {
+    use crate::work::ReviewVerdict;
+    match state {
+        WorkState::Unknown => Color::DarkGray,
+        WorkState::Clean => Color::DarkGray,
+        WorkState::Dirty { .. } => Color::Yellow,
+        WorkState::Pushed => Color::Cyan,
+        WorkState::PrOpen {
+            verdict: ReviewVerdict::ChangesRequested,
+            ..
+        } => Color::Red,
+        WorkState::PrOpen {
+            verdict: ReviewVerdict::Approved,
+            ..
+        } => Color::Green,
+        WorkState::PrOpen { .. } => Color::Cyan,
+        WorkState::Merged => Color::Magenta,
     }
 }
 
@@ -249,6 +288,42 @@ mod tests {
             .find(|w| w.name == "default")
             .unwrap();
         assert_eq!(app.agent_state(def), AgentState::Absent);
+    }
+
+    #[test]
+    fn work_snapshot_updates_the_matching_row_by_name() {
+        use crate::work::WorkState;
+        let mut app = app_with(&["default", "feat"]);
+        let mut snap = HashMap::new();
+        snap.insert(
+            "feat".to_string(),
+            WorkState::Dirty {
+                added: 9,
+                removed: 2,
+            },
+        );
+        app.handle(Msg::WorkSnapshot(snap));
+        let feat = app
+            .store
+            .workspaces
+            .iter()
+            .find(|w| w.name == "feat")
+            .unwrap();
+        assert_eq!(
+            app.work_state(feat),
+            WorkState::Dirty {
+                added: 9,
+                removed: 2
+            }
+        );
+        // A workspace absent from the snapshot stays Unknown.
+        let def = app
+            .store
+            .workspaces
+            .iter()
+            .find(|w| w.name == "default")
+            .unwrap();
+        assert_eq!(app.work_state(def), WorkState::Unknown);
     }
 
     #[test]
