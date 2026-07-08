@@ -6,6 +6,20 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Forge pipeline (v0.7.0): drive a workspace toward merge from the
+  list. `f` forges the selected workspace, `F` forges every eligible one, and `g`
+  forges the default - each running fetch -> weld -> push -> spr natively (ADR
+  0005) with the workspace-safe revsets ported from `jj-forge` (weld scoped to
+  `::@`, push excluding `trunk()`/`conflicts()`, `jj-spr` handed a scoped
+  `JJ_SPR_REVSET`). Every mutating step runs in the workspace's own directory, so
+  forging one workspace never rebases another's chain. The pipeline runs on a
+  background task and streams real step state (`⚒ f✓ w✓ p… s·`) onto the row - not
+  scraped stdout; a clean run clears the overlay and the work axis advances. A
+  conflicted working copy is skipped with a visible reason, and a locked GPG
+  signing key is detected up front and aborts cleanly (no pinentry inside the
+  alt-screen) rather than corrupting the terminal. The `jj-forge` bash tool is
+  untouched and still usable standalone.
+
 - 2026-07-08 - Maintenance: tidy, tidyws, and the behind indicator (v0.6.0):
   native versions of the two maintenance aliases (ADR 0005). `t` runs `tidyws` -
   rebasing every idle, empty, undescribed workspace working-copy onto latest

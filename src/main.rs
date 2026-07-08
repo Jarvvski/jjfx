@@ -8,6 +8,7 @@ mod app;
 mod attention;
 mod cache;
 mod events;
+mod forge;
 mod hooks;
 mod jj;
 mod repo;
@@ -78,10 +79,18 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     spawn_work_poller(repo_root.clone(), tx.clone(), work_rx);
 
     // Blocking terminal-input reader on its own thread -> Msg::Input.
-    spawn_input_reader(tx);
+    spawn_input_reader(tx.clone());
 
     let mut terminal = tui::init()?;
-    let result = event_loop(&mut terminal, &mut rx, &repo_root, initial_agents, work_tx).await;
+    let result = event_loop(
+        &mut terminal,
+        &mut rx,
+        &repo_root,
+        initial_agents,
+        work_tx,
+        tx,
+    )
+    .await;
 
     // Always restore, then surface any loop error.
     tui::restore()?;
@@ -95,11 +104,13 @@ async fn event_loop(
     repo_root: &std::path::Path,
     initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
     work_tx: UnboundedSender<()>,
+    tx: UnboundedSender<Msg>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(
         Store::load(repo_root),
         initial_agents,
         Box::new(terminal::KittyTerminal),
+        tx,
     );
     terminal.draw(|f| app.render(f))?;
 

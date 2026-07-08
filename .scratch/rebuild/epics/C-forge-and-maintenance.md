@@ -1,7 +1,7 @@
 # Epic C - Forge and maintenance
 
 Type: epic
-Status: tracking
+Status: done
 Milestone: v0.2
 
 ## Goal

@@ -1,6 +1,6 @@
 # Forge a workspace (fetch -> weld -> push -> spr)
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
