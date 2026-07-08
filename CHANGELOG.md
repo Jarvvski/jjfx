@@ -6,6 +6,18 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Diff detail view (v0.10.0): press `→`/`l` on a workspace to open a
+  full-screen, two-pane detail - a changed-file list with per-file `+`/`-`
+  magnitude bars on the left, the selected file's diff from `trunk()` on the
+  right. The diff is highlighted in-process with `syntect` (no `bat` process),
+  with the `+`/`-` gutters preserved and unknown languages degrading to plain
+  text. Type to fuzzy-filter the file list; `↑`/`↓` pick a file; `→`/`tab` focus
+  the diff and `j/k` + `PgUp`/`PgDn` scroll it; `esc` returns to the list. The
+  diff is read on a background thread, and highlighting is incremental - each
+  file is syntect-highlighted only as far down as the viewport has scrolled, so
+  switching between files (or opening a large diff) never highlights the whole
+  patch up front and navigation stays responsive.
+
 - 2026-07-08 - Help overlay (v0.9.0): press `?` for a centered, bordered
   keybindings menu (action left, key right) drawn over the dimmed list; `?` or
   `esc` closes it. The footer no longer carries the full key list - in normal

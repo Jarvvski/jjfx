@@ -204,7 +204,7 @@ struct Chain {
 /// back to the local `main`/`master`/`trunk` bookmark (whichever exists), taking
 /// the most recent. `present(...)` stops a missing bookmark from erroring the
 /// revset. Once main is pushed, `trunk()` wins and behaviour is unchanged.
-const TRUNK_BASE: &str =
+pub(crate) const TRUNK_BASE: &str =
     "latest((trunk() ~ root()) | present(main) | present(master) | present(trunk))";
 
 /// Read `<base>..<ws>@` for content flags + local bookmark names in one call,

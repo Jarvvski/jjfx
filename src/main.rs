@@ -8,6 +8,7 @@ mod app;
 mod attention;
 mod cache;
 mod cmd;
+mod diff;
 mod events;
 mod forge;
 mod hooks;
