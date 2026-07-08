@@ -132,17 +132,22 @@ pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work
         .collect()
 }
 
-/// How far `trunk()` has advanced past a workspace's base: the count of commits
-/// that are ancestors of `trunk()` but not of the workspace head
-/// (`::trunk() ~ ::<ws>@`). Zero when the workspace already sits on the tip of
-/// trunk, and zero on any jj read failure (degrade, don't crash).
+/// How far trunk has advanced past a workspace's base: the count of commits that
+/// are ancestors of the trunk base but not of the workspace head
+/// (`::TRUNK_BASE ~ ::<ws>@`). Uses the same [`TRUNK_BASE`] as [`classify`] - the
+/// latest of the remote mainline and the local `main`/`master`/`trunk` bookmarks -
+/// rather than jj's raw `trunk()`. Otherwise `behind` measures against a possibly
+/// stale `origin/main` while `classify` measures against local `main`, so a
+/// workspace can read `clean` yet be several commits behind by the same base the
+/// dirty/clean check uses. Zero when the workspace sits on the trunk tip, and zero
+/// on any jj read failure (degrade, don't crash).
 fn behind(repo_root: &Path, ws: &str) -> u32 {
     jj(
         repo_root,
         &[
             "log",
             "-r",
-            &format!("::trunk() ~ ::{ws}@"),
+            &format!("::({TRUNK_BASE}) ~ ::{ws}@"),
             "--no-graph",
             "-T",
             "\"x\\n\"",

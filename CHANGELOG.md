@@ -4,6 +4,16 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-07-08 - Behind indicator (v0.11.1): the `↓N` "behind trunk" count now
+  measures against the same base as the dirty/clean classification -
+  `TRUNK_BASE` (the latest of the remote mainline and the local
+  `main`/`master`/`trunk` bookmarks) - instead of jj's raw `trunk()`
+  (`origin/main`). Previously, when local `main` was ahead of `origin/main`, a
+  workspace could read `clean` yet show no `↓` despite being several commits
+  behind the base its cleanliness was judged against.
+
 ### Added
 
 - 2026-07-08 - Commit graph (v0.11.0): press `w` for a full-screen "world" graph -
