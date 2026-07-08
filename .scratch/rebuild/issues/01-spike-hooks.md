@@ -1,6 +1,6 @@
 # Spike: confirm Claude Code hook lifecycle events
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 
@@ -19,10 +19,10 @@ transition map for issue 04 to implement against.
 
 ## Acceptance criteria
 
-- [ ] Each candidate hook (SessionStart, UserPromptSubmit, Stop, PermissionRequest, Notification, SessionEnd, and any others present) is triggered and its stdin payload captured verbatim.
-- [ ] Confirmed which event(s) map to Working, Waiting, NeedsAttention, Ended; the Notification vs PermissionRequest ambiguity is resolved.
-- [ ] Verified `session_id` and `cwd` are present on the events we rely on.
-- [ ] Findings recorded as a note under `.scratch/rebuild/`; ADR 0002 amended if reality differs from its assumptions.
+- [x] Each candidate hook (SessionStart, UserPromptSubmit, Stop, PermissionRequest, Notification, SessionEnd, and any others present) is triggered and its stdin payload captured verbatim. (Six headless-triggerable events captured verbatim; PermissionRequest/Notification documented from the reference - they need an interactive dialog `-p` cannot surface. See findings "Limitation".)
+- [x] Confirmed which event(s) map to Working, Waiting, NeedsAttention, Ended; the Notification vs PermissionRequest ambiguity is resolved.
+- [x] Verified `session_id` and `cwd` are present on the events we rely on.
+- [x] Findings recorded as a note under `.scratch/rebuild/`; ADR 0002 amended if reality differs from its assumptions.
 
 ## Blocked by
 
