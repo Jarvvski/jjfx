@@ -34,6 +34,18 @@ pub struct Store {
 
 pub const DEFAULT_WORKSPACE: &str = "default";
 
+/// Derive the on-disk path for a new named workspace: a sibling of the repo root
+/// named `<repo>-<name>`. jj does not record workspace paths (spike 02), so jjfx
+/// chooses this and persists it in the ws-cache (ADR 0006).
+pub fn new_workspace_path(repo_root: &Path, name: &str) -> PathBuf {
+    let base = repo_root
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("repo");
+    let parent = repo_root.parent().unwrap_or(repo_root);
+    parent.join(format!("{base}-{name}"))
+}
+
 impl Store {
     /// Load and reconcile from all live sources (jj names + ws-cache + derived
     /// default), then write the result through to the ws-cache so the bash tools

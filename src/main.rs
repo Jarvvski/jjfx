@@ -11,6 +11,7 @@ mod hooks;
 mod jj;
 mod repo;
 mod store;
+mod terminal;
 mod tui;
 mod watch;
 mod work;
@@ -94,7 +95,11 @@ async fn event_loop(
     initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
     work_tx: UnboundedSender<()>,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(Store::load(repo_root), initial_agents);
+    let mut app = App::new(
+        Store::load(repo_root),
+        initial_agents,
+        Box::new(terminal::KittyTerminal),
+    );
     terminal.draw(|f| app.render(f))?;
 
     while let Some(first) = rx.recv().await {

@@ -6,6 +6,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-08 - Workspace actions (v0.4.0): drive workspaces from the list -
+  `n` creates one (a new `jj` workspace in a `<repo>-<name>` sibling dir,
+  persisted to the ws-cache) and opens a kitty tab running claude beside a
+  shell; `enter` focuses its tab (or opens one), `o` opens in the background
+  without stealing focus, and re-opening focuses rather than duplicating; `d`
+  deletes after a confirmation (closing the tab and forgetting the workspace),
+  and the default workspace is undeletable. All terminal control goes through a
+  `Terminal` trait (kitty-only for now), so the multiplexer is swappable.
+
 - 2026-07-08 - Work lifecycle (v0.3.0): each workspace row now also shows its
   work state - clean / dirty (with +/- LOC from trunk) / pushed / pr#N (with
   review verdict) / merged. jj state is read via CLI `-T` revsets relative to

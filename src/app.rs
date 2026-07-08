@@ -3,7 +3,7 @@
 //! redraws (the engine shape from the PRD).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
@@ -13,8 +13,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use crate::agent::{self, AgentState};
-use crate::store::{Store, Workspace};
+use crate::store::{self, Store, Workspace};
+use crate::terminal::Terminal;
 use crate::work::WorkState;
+use crate::{cache, jj};
+
+/// What the key handler is currently collecting: normal navigation, a new
+/// workspace name, or a delete confirmation.
+enum Mode {
+    Normal,
+    NewWorkspace(String),
+    ConfirmDelete(String),
+}
 
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
@@ -38,12 +48,22 @@ pub struct App {
     /// Latest work-lifecycle state per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, WorkState>,
+    /// The multiplexer jjfx drives for workspace tabs (behind a trait so kitty is
+    /// swappable - ticket 07).
+    terminal: Box<dyn Terminal>,
+    mode: Mode,
+    /// A transient one-line message shown in the footer (last action's result).
+    status: Option<String>,
     list_state: ListState,
     pub should_quit: bool,
 }
 
 impl App {
-    pub fn new(store: Store, agents: HashMap<PathBuf, AgentState>) -> Self {
+    pub fn new(
+        store: Store,
+        agents: HashMap<PathBuf, AgentState>,
+        terminal: Box<dyn Terminal>,
+    ) -> Self {
         let mut list_state = ListState::default();
         if !store.workspaces.is_empty() {
             list_state.select(Some(0));
@@ -52,6 +72,9 @@ impl App {
             store,
             agents,
             work: HashMap::new(),
+            terminal,
+            mode: Mode::Normal,
+            status: None,
             list_state,
             should_quit: false,
         }
@@ -94,12 +117,190 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        match &self.mode {
+            Mode::Normal => self.on_key_normal(key),
+            Mode::NewWorkspace(_) => self.on_key_new_workspace(key),
+            Mode::ConfirmDelete(_) => self.on_key_confirm_delete(key),
+        }
+    }
+
+    fn on_key_normal(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::Char('n') => {
+                self.status = None;
+                self.mode = Mode::NewWorkspace(String::new());
+            }
+            KeyCode::Enter => self.open_selected(true),
+            KeyCode::Char('o') => self.open_selected(false),
+            KeyCode::Char('d') => self.begin_delete_selected(),
             _ => {}
         }
+    }
+
+    fn on_key_new_workspace(&mut self, key: KeyEvent) {
+        let Mode::NewWorkspace(buf) = &mut self.mode else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.mode = Mode::Normal,
+            KeyCode::Enter => {
+                let name = buf.clone();
+                self.mode = Mode::Normal;
+                self.create_workspace(&name);
+            }
+            KeyCode::Backspace => {
+                buf.pop();
+            }
+            // Keep names to a safe, filesystem- and jj-friendly character set.
+            KeyCode::Char(c) if c.is_alphanumeric() || c == '-' || c == '_' => buf.push(c),
+            _ => {}
+        }
+    }
+
+    fn on_key_confirm_delete(&mut self, key: KeyEvent) {
+        let Mode::ConfirmDelete(name) = &self.mode else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let name = name.clone();
+                self.mode = Mode::Normal;
+                self.delete_workspace(&name);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => self.mode = Mode::Normal,
+            _ => {}
+        }
+    }
+
+    /// The workspace under the cursor, if any.
+    fn selected_workspace(&self) -> Option<&Workspace> {
+        self.list_state
+            .selected()
+            .and_then(|i| self.store.workspaces.get(i))
+    }
+
+    /// `enter`/`o`: focus the selected workspace's tab if it exists, else open a
+    /// new one. `focus` steals focus (`enter`); otherwise it opens in the
+    /// background (`o`) - and when a background target already exists, we leave
+    /// it untouched rather than raising it.
+    fn open_selected(&mut self, focus: bool) {
+        self.status = None;
+        let Some(w) = self.selected_workspace().cloned() else {
+            return;
+        };
+        let Some(path) = w.path.clone() else {
+            self.status = Some(format!("no path known for '{}'", w.name));
+            return;
+        };
+        let result = if self.terminal.is_open(&w.name) {
+            if focus {
+                self.terminal.focus(&w.name)
+            } else {
+                Ok(())
+            }
+        } else {
+            self.terminal.open(&w.name, &path, focus)
+        };
+        if let Err(e) = result {
+            self.status = Some(format!("open failed: {e}"));
+        }
+    }
+
+    /// `d`: confirm before deleting; the default workspace is undeletable.
+    fn begin_delete_selected(&mut self) {
+        self.status = None;
+        let Some(w) = self.selected_workspace() else {
+            return;
+        };
+        if w.name == store::DEFAULT_WORKSPACE {
+            self.status = Some("the default workspace cannot be deleted".to_string());
+            return;
+        }
+        self.mode = Mode::ConfirmDelete(w.name.clone());
+    }
+
+    /// Create a workspace: `jj workspace add`, persist its chosen path to the
+    /// ws-cache (jj records no path), reload, then open its tab.
+    fn create_workspace(&mut self, name: &str) {
+        let name = name.trim();
+        if name.is_empty() {
+            self.status = Some("workspace name required".to_string());
+            return;
+        }
+        if self.store.workspaces.iter().any(|w| w.name == name) {
+            self.status = Some(format!("workspace '{name}' already exists"));
+            return;
+        }
+        let path = store::new_workspace_path(&self.store.repo_root, name);
+        if let Err(e) = jj::add_workspace(&self.store.repo_root, name, &path) {
+            self.status = Some(format!("create failed: {e}"));
+            return;
+        }
+        if let Err(e) = self.persist_cache_add(name, &path) {
+            self.status = Some(format!("cache write failed: {e}"));
+        }
+        self.reload();
+        match self.terminal.open(name, &path, true) {
+            Ok(()) => self.status = Some(format!("created '{name}'")),
+            Err(e) => self.status = Some(format!("created '{name}', tab failed: {e}")),
+        }
+    }
+
+    /// Delete a workspace: close its tab, `jj workspace forget`, remove its
+    /// directory (guarded - never the repo root), drop it from the cache, reload.
+    fn delete_workspace(&mut self, name: &str) {
+        if name == store::DEFAULT_WORKSPACE {
+            self.status = Some("the default workspace cannot be deleted".to_string());
+            return;
+        }
+        let path = self
+            .store
+            .workspaces
+            .iter()
+            .find(|w| w.name == name)
+            .and_then(|w| w.path.clone());
+
+        let _ = self.terminal.close(name); // best-effort; jj is the source of truth
+        if let Err(e) = jj::forget_workspace(&self.store.repo_root, name) {
+            self.status = Some(format!("delete failed: {e}"));
+            return;
+        }
+        if let Some(p) = path
+            && p != self.store.repo_root
+            && p.is_dir()
+        {
+            let _ = std::fs::remove_dir_all(&p);
+        }
+        let _ = self.persist_cache_remove(name);
+        self.reload();
+        self.status = Some(format!("deleted '{name}'"));
+    }
+
+    /// Upsert a `(name, path)` into the ws-cache so the path jj does not record
+    /// survives a reload.
+    fn persist_cache_add(&self, name: &str, path: &Path) -> std::io::Result<()> {
+        let cache_path = cache::path(&self.store.repo_root);
+        let mut entries = cache::read(&cache_path).unwrap_or_default();
+        if !entries.iter().any(|(n, _)| n == name) {
+            entries.push((name.to_string(), path.to_path_buf()));
+        }
+        cache::write_through(&cache_path, &entries)?;
+        Ok(())
+    }
+
+    /// Drop a workspace from the ws-cache.
+    fn persist_cache_remove(&self, name: &str) -> std::io::Result<()> {
+        let cache_path = cache::path(&self.store.repo_root);
+        let entries: Vec<_> = cache::read(&cache_path)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|(n, _)| n != name)
+            .collect();
+        cache::write_through(&cache_path, &entries)?;
+        Ok(())
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -175,13 +376,32 @@ impl App {
             .highlight_symbol("> ");
         frame.render_stateful_widget(list, body, &mut self.list_state);
 
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " j/k or ↑/↓ move   q/esc quit ",
-                Style::default().add_modifier(Modifier::DIM),
+        frame.render_widget(self.footer(), footer);
+    }
+
+    /// The footer: a live prompt while entering a name or confirming a delete, a
+    /// transient status message after an action, else the key hints.
+    fn footer(&self) -> Paragraph<'_> {
+        match &self.mode {
+            Mode::NewWorkspace(buf) => Paragraph::new(Span::styled(
+                format!(" new workspace: {buf}_   (enter create, esc cancel) "),
+                Style::default().fg(Color::Cyan),
             )),
-            footer,
-        );
+            Mode::ConfirmDelete(name) => Paragraph::new(Span::styled(
+                format!(" delete workspace '{name}'? (y/n) "),
+                Style::default().fg(Color::Red),
+            )),
+            Mode::Normal => match &self.status {
+                Some(msg) => Paragraph::new(Span::styled(
+                    format!(" {msg} "),
+                    Style::default().fg(Color::Yellow),
+                )),
+                None => Paragraph::new(Span::styled(
+                    " j/k move  n new  enter open  o open-bg  d delete  q quit ",
+                    Style::default().add_modifier(Modifier::DIM),
+                )),
+            },
+        }
     }
 }
 
@@ -227,8 +447,40 @@ mod tests {
     use crate::store::Workspace;
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
     use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex};
+
+    /// A `Terminal` that records calls instead of driving kitty, so key handling
+    /// is testable without a real multiplexer. Cloning shares the recorders, so a
+    /// test can keep a handle to inspect what the app asked the terminal to do.
+    #[derive(Clone, Default)]
+    struct FakeTerminal {
+        opened: Arc<Mutex<Vec<(String, bool)>>>,
+        closed: Arc<Mutex<Vec<String>>>,
+        existing: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Terminal for FakeTerminal {
+        fn is_open(&self, name: &str) -> bool {
+            self.existing.lock().unwrap().iter().any(|n| n == name)
+        }
+        fn open(&self, name: &str, _path: &Path, focus: bool) -> anyhow::Result<()> {
+            self.opened.lock().unwrap().push((name.to_string(), focus));
+            Ok(())
+        }
+        fn focus(&self, _name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+        fn close(&self, name: &str) -> anyhow::Result<()> {
+            self.closed.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+    }
 
     fn app_with(names: &[&str]) -> App {
+        app_with_terminal(names, Box::new(FakeTerminal::default()))
+    }
+
+    fn app_with_terminal(names: &[&str], terminal: Box<dyn Terminal>) -> App {
         let workspaces = names
             .iter()
             .map(|n| Workspace {
@@ -242,6 +494,7 @@ mod tests {
                 workspaces,
             },
             HashMap::new(),
+            terminal,
         )
     }
 
@@ -263,6 +516,62 @@ mod tests {
         let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Esc));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn n_enters_name_mode_and_filters_to_safe_chars() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('n')));
+        // Only alphanumerics, '-', '_' are accepted into the buffer.
+        for c in ['f', 'e', 'a', 't', '/', ' ', '-', '1'] {
+            app.handle(press(KeyCode::Char(c)));
+        }
+        match &app.mode {
+            Mode::NewWorkspace(buf) => assert_eq!(buf, "feat-1"),
+            _ => panic!("expected NewWorkspace mode"),
+        }
+        // Esc cancels back to Normal without creating anything.
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn d_on_default_is_refused_without_confirmation() {
+        let mut app = app_with(&["default", "feat"]);
+        // Selection starts on default (index 0).
+        app.handle(press(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("the default workspace cannot be deleted")
+        );
+        // On a non-default workspace, d asks for confirmation.
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Char('d')));
+        assert!(matches!(app.mode, Mode::ConfirmDelete(ref n) if n == "feat"));
+        // n cancels.
+        app.handle(press(KeyCode::Char('n')));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn enter_focuses_existing_tab_and_o_opens_background() {
+        let fake = FakeTerminal::default();
+        // Pretend "default"'s tab already exists.
+        fake.existing.lock().unwrap().push("default".to_string());
+        let mut app = app_with_terminal(&["default", "feat"], Box::new(fake.clone()));
+
+        // enter on an existing tab -> focus, no new open.
+        app.handle(press(KeyCode::Enter));
+        assert!(fake.opened.lock().unwrap().is_empty());
+
+        // o on a not-yet-open workspace -> background open (focus=false).
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Char('o')));
+        assert_eq!(
+            fake.opened.lock().unwrap().as_slice(),
+            &[("feat".to_string(), false)]
+        );
     }
 
     #[test]
