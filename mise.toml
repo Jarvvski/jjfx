@@ -1,5 +1,9 @@
 [tools]
 rust = "1.96.1"
+# jj-lib reads the on-disk .jj store directly, so jjfx is version-coupled to the
+# jj binary's store format (ADR 0007). Pin jj to the version jj-lib targets and
+# upgrade them in lockstep. Spike 02 confirmed jj 0.43.0 <-> jj-lib 0.43.0.
+jj = "0.43.0"
 
 [tasks.run]
 description = "Run the app"
