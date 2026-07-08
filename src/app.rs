@@ -10,7 +10,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{List, ListItem, ListState, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
@@ -611,13 +611,14 @@ impl App {
         self.ensure_selection();
 
         let [header, body, footer] = Layout::vertical([
-            Constraint::Length(1),
+            Constraint::Length(2),
             Constraint::Min(0),
             Constraint::Length(1),
         ])
+        .horizontal_margin(2)
         .areas(frame.area());
 
-        let title = format!(" jjfx - {} workspace(s) ", self.store.workspaces.len());
+        let title = format!("jjfx - {} workspace(s)", self.store.workspaces.len());
         frame.render_widget(
             Paragraph::new(Span::styled(
                 title,
@@ -637,19 +638,17 @@ impl App {
             .map(|(i, row)| match row {
                 Row::Header(att, count) => self.header_item(att, count),
                 Row::Ws(w, att) => {
-                    if selected.as_deref() == Some(w.name.as_str()) {
+                    let is_selected = selected.as_deref() == Some(w.name.as_str());
+                    if is_selected {
                         selected_idx = Some(i);
                     }
-                    self.workspace_item(w, att)
+                    self.workspace_item(w, att, is_selected)
                 }
             })
             .collect();
 
         self.list_state.select(selected_idx);
-        let list = List::new(items)
-            .block(Block::bordered())
-            .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-            .highlight_symbol("> ");
+        let list = List::new(items);
         frame.render_stateful_widget(list, body, &mut self.list_state);
 
         frame.render_widget(self.footer(), footer);
@@ -675,7 +674,7 @@ impl App {
 
     /// A workspace row: Attention badge, then the two lifecycle axes, then name
     /// and path.
-    fn workspace_item(&self, w: &Workspace, att: Attention) -> ListItem<'static> {
+    fn workspace_item(&self, w: &Workspace, att: Attention, selected: bool) -> ListItem<'static> {
         let agent = self.agent_state(w);
         let work = self.work_state(w);
         let behind = self.behind(w);
@@ -690,10 +689,19 @@ impl App {
             .as_deref()
             .map(display_path)
             .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
+        // A dim bullet marks every row; the selected row's bullet brightens as the
+        // only structural cue, keeping the line otherwise calm.
+        let bullet = if selected {
+            Span::styled("▸ ", Style::default().fg(Color::White))
+        } else {
+            Span::styled("· ", Style::default().fg(Color::DarkGray))
+        };
         let mut spans = vec![
-            Span::raw("  "),
+            bullet,
             Span::styled(
-                format!("{:<10}", att.heading()),
+                // Widest heading ("ready to forge") is 14 chars; pad past it so
+                // the following columns align across every row.
+                format!("{:<15}", att.heading()),
                 Style::default().fg(attention_color(att)),
             ),
             Span::styled(
@@ -714,7 +722,19 @@ impl App {
             format!("{behind_label:<5}"),
             Style::default().fg(behind_color(behind)),
         ));
-        spans.push(Span::raw(format!("{:<18} {}", w.name, path)));
+        // The name is boxed (reversed) when selected - a tight highlight instead
+        // of a full-width bar; the path trails in dim.
+        let name_style = if selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default().add_modifier(Modifier::BOLD)
+        };
+        let pad = 18usize.saturating_sub(w.name.chars().count()).max(1);
+        spans.push(Span::styled(w.name.clone(), name_style));
+        spans.push(Span::styled(
+            format!("{:pad$}{path}", ""),
+            Style::default().fg(Color::DarkGray),
+        ));
         ListItem::new(Line::from(spans))
     }
 

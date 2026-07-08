@@ -4,6 +4,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-07-08 - Minimal restyle of the workspace list (v0.8.0): dropped the box
+  border and the full-width reversed selection bar - the latter inverted every
+  padded, coloured column into a solid block. Rows now carry a dim `·` bullet
+  (the selected row a bright `▸`), only the selected name is boxed, and the
+  attention column is padded past its widest heading so the columns line up
+  across every row. Calmer and closer to a plain, minimal list.
+
 ### Added
 
 - 2026-07-08 - Forge pipeline (v0.7.0): drive a workspace toward merge from the
