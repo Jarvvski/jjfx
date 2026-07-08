@@ -1,6 +1,6 @@
 # Help overlay: move the keybindings off the footer into a `?` menu
 
-Status: ready-for-agent
+Status: done
 
 ## Parent
 

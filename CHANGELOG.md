@@ -4,6 +4,13 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Added
+
+- 2026-07-08 - Help overlay (v0.9.0): press `?` for a centered, bordered
+  keybindings menu (action left, key right) drawn over the dimmed list; `?` or
+  `esc` closes it. The footer no longer carries the full key list - in normal
+  mode it now shows only `j/k move  ? help  q quit`.
+
 ### Fixed
 
 - 2026-07-08 - Stop the forge pipeline from spewing over the TUI (v0.8.2): the

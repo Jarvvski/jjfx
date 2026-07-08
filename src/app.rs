@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
@@ -29,7 +29,29 @@ enum Mode {
     ConfirmDelete(String),
     /// Confirming the destructive `tidy` sweep (abandon junk empties).
     ConfirmTidy,
+    /// The `?` help overlay is open (a pure UI mode - no state is mutated).
+    Help,
 }
+
+/// Every keybinding, shown in the `?` help overlay. Kept adjacent to
+/// `on_key_normal` (the real dispatch) so the list cannot silently drift from
+/// the keys the app actually handles.
+const BINDINGS: &[(&str, &str)] = &[
+    ("Move down", "j / ↓"),
+    ("Move up", "k / ↑"),
+    ("Open workspace", "enter"),
+    ("Open in background", "o"),
+    ("New workspace", "n"),
+    ("Delete workspace", "d"),
+    ("Forge selected", "f"),
+    ("Forge all", "F"),
+    ("Forge default", "g"),
+    ("Tidy this workspace", "t"),
+    ("Tidy (abandon junk empties)", "T"),
+    ("Fold / expand idle group", "c"),
+    ("Toggle this help", "?"),
+    ("Quit", "q / esc"),
+];
 
 /// One rendered list line: a group header (non-selectable) or a workspace row.
 enum Row<'a> {
@@ -233,6 +255,7 @@ impl App {
             Mode::NewWorkspace(_) => self.on_key_new_workspace(key),
             Mode::ConfirmDelete(_) => self.on_key_confirm_delete(key),
             Mode::ConfirmTidy => self.on_key_confirm_tidy(key),
+            Mode::Help => self.on_key_help(key),
         }
     }
 
@@ -257,7 +280,16 @@ impl App {
                 self.idle_collapsed = !self.idle_collapsed;
                 self.ensure_selection();
             }
+            KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
+        }
+    }
+
+    /// Help is a read-only overlay: `?` or `esc` dismisses it, everything else
+    /// is swallowed so no navigation leaks through.
+    fn on_key_help(&mut self, key: KeyEvent) {
+        if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
+            self.mode = Mode::Normal;
         }
     }
 
@@ -652,6 +684,66 @@ impl App {
         frame.render_stateful_widget(list, body, &mut self.list_state);
 
         frame.render_widget(self.footer(), footer);
+
+        if matches!(self.mode, Mode::Help) {
+            self.render_help(frame);
+        }
+    }
+
+    /// The `?` overlay: a centered, bordered box listing every binding
+    /// (label-left, key-right) drawn over a dimmed copy of the list behind it.
+    fn render_help(&self, frame: &mut Frame) {
+        let label_w = BINDINGS
+            .iter()
+            .map(|(label, _)| label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let key_w = BINDINGS
+            .iter()
+            .map(|(_, key)| key.chars().count())
+            .max()
+            .unwrap_or(0);
+
+        let lines: Vec<Line> = BINDINGS
+            .iter()
+            .map(|(label, key)| {
+                Line::from(vec![
+                    Span::raw(format!(" {label:<label_w$}")),
+                    Span::raw("   "),
+                    Span::styled(
+                        format!("{key:>key_w$} "),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ])
+            })
+            .collect();
+
+        // Inner content is " label   key " plus the two borders.
+        let width = (label_w + key_w + 5) as u16 + 2;
+        let height = BINDINGS.len() as u16 + 2;
+        let area = centered_rect(frame.area(), width, height);
+
+        // Dim everything already drawn so the popup reads as the foreground,
+        // then punch the popup area clear before drawing it.
+        let full = frame.area();
+        let buf = frame.buffer_mut();
+        for y in full.top()..full.bottom() {
+            for x in full.left()..full.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_style(Style::default().add_modifier(Modifier::DIM));
+                }
+            }
+        }
+
+        frame.render_widget(Clear, area);
+        frame.render_widget(
+            Paragraph::new(lines).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Keybindings "),
+            ),
+            area,
+        );
     }
 
     /// A group-header row: the Attention heading, count, and a fold hint for idle.
@@ -760,16 +852,34 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )),
                 None => Paragraph::new(Span::styled(
-                    " j/k move  n new  enter open  o open-bg  d delete  f forge  F all  g default  t tidyws  T tidy  c fold-idle  q quit ",
+                    " j/k move  ? help  q quit ",
                     Style::default().add_modifier(Modifier::DIM),
                 )),
             },
+            // Help draws its own overlay; the footer stays on the slim hint.
+            Mode::Help => Paragraph::new(Span::styled(
+                " j/k move  ? help  q quit ",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
         }
     }
 }
 
 fn display_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+/// A `width` x `height` rect centered in `area`, clamped so it never exceeds the
+/// frame - the popup shrinks to fit a short/narrow terminal instead of panicking.
+fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect {
+        x: area.x + area.width.saturating_sub(w) / 2,
+        y: area.y + area.height.saturating_sub(h) / 2,
+        width: w,
+        height: h,
+    }
 }
 
 /// Colour cue for the Attention badge - the primary triage signal.
@@ -938,6 +1048,77 @@ mod tests {
         let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Esc));
         assert!(app.should_quit);
+    }
+
+    #[test]
+    fn help_toggles_without_touching_state() {
+        let mut app = app_with(&["default", "feat"]);
+        // Move selection off the top so we can prove Help leaves it untouched.
+        app.handle(press(KeyCode::Down));
+        let before = app.selected.clone();
+
+        app.handle(press(KeyCode::Char('?')));
+        assert!(matches!(app.mode, Mode::Help));
+        // Navigation is swallowed while the overlay is open, and no status leaks.
+        app.handle(press(KeyCode::Down));
+        assert!(matches!(app.mode, Mode::Help));
+        assert_eq!(app.selected, before);
+        assert!(app.status.is_none());
+
+        // Esc closes it; reopening and pressing ? again also closes.
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Normal));
+        app.handle(press(KeyCode::Char('?')));
+        app.handle(press(KeyCode::Char('?')));
+        assert!(matches!(app.mode, Mode::Normal));
+        assert!(!app.should_quit);
+    }
+
+    #[test]
+    fn help_overlay_renders_a_bordered_box() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        app.mode = Mode::Help;
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+
+        // The title and a binding row must be present in the drawn buffer.
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("Keybindings"));
+        assert!(text.contains("Open workspace"));
+    }
+
+    #[test]
+    fn help_overlay_clamps_to_a_tiny_terminal() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // A terminal smaller than the popup must clamp, not panic.
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Help;
+        let mut term = Terminal::new(TestBackend::new(6, 3)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+
+    #[test]
+    fn bindings_cover_the_essential_keys() {
+        let keys: Vec<&str> = BINDINGS.iter().map(|(_, k)| *k).collect();
+        assert!(keys.contains(&"j / ↓"));
+        assert!(keys.contains(&"?"));
+        assert!(keys.contains(&"q / esc"));
+        assert!(
+            BINDINGS
+                .iter()
+                .all(|(label, key)| !label.is_empty() && !key.is_empty())
+        );
     }
 
     #[test]
