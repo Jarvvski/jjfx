@@ -12,9 +12,8 @@
 
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
-
 use crate::cmd::cmd;
+use crate::prs::{self, Pr};
 use crate::trunk;
 
 /// The repo-wide facts a submission pass needs, resolved once per forge run.
@@ -40,35 +39,18 @@ pub enum Outcome {
     Failed(String),
 }
 
-/// One PR as reported by `gh pr list --json`.
-#[derive(Debug, Clone, Deserialize)]
-struct GhPr {
-    number: u64,
-    /// GraphQL state: `OPEN` | `CLOSED` | `MERGED`.
-    state: String,
-    body: Option<String>,
-    #[serde(rename = "mergedAt")]
-    merged_at: Option<String>,
-}
-
-impl GhPr {
-    fn is_merged(&self) -> bool {
-        self.state == "MERGED" || self.merged_at.is_some()
-    }
-}
-
 /// One bookmark on a workspace's chain, with its commit-derived title/body and
 /// its resolved PR (looked up, then filled in on creation).
 struct Entry {
     bookmark: String,
     title: String,
     body: String,
-    pr: Option<GhPr>,
+    pr: Option<Pr>,
 }
 
 impl Entry {
     fn is_merged(&self) -> bool {
-        self.pr.as_ref().is_some_and(GhPr::is_merged)
+        self.pr.as_ref().is_some_and(Pr::is_merged)
     }
 }
 
@@ -111,7 +93,7 @@ fn submit_blocking(ctx: &Context, dir: &Path) -> Outcome {
     // and its commit-derived title/body.
     let mut entries: Vec<Entry> = Vec::with_capacity(bookmarks.len());
     for bookmark in bookmarks {
-        let pr = match find_pr(&ctx.slug, &bookmark) {
+        let pr = match prs::find(&ctx.slug, &bookmark) {
             Ok(pr) => pr,
             Err(e) => return Outcome::Failed(e),
         };
@@ -305,34 +287,6 @@ fn chain_bookmarks(dir: &Path) -> Result<Vec<String>, String> {
     Ok(names)
 }
 
-/// Find the PR for a branch: an open one wins, else a merged one; closed-unmerged
-/// and absent both yield `None`.
-fn find_pr(slug: &str, branch: &str) -> Result<Option<GhPr>, String> {
-    let out = cmd("gh")
-        .args([
-            "pr",
-            "list",
-            "-R",
-            slug,
-            "--head",
-            branch,
-            "--state",
-            "all",
-            "--json",
-            "number,state,body,mergedAt",
-            "--limit",
-            "20",
-        ])
-        .run()
-        .map_err(|e| e.to_string())?;
-    if !out.ok() {
-        return Err(format!("gh pr list ({branch}): {}", out.stderr().trim()));
-    }
-    let prs: Vec<GhPr> = serde_json::from_str(out.stdout()).map_err(|e| e.to_string())?;
-    let open = prs.iter().find(|p| p.state == "OPEN").cloned();
-    Ok(open.or_else(|| prs.into_iter().find(GhPr::is_merged)))
-}
-
 /// Open a draft (or ready) PR for `head` based on `base`, returning the created
 /// PR. `gh pr create` prints the new PR's URL, from which the number is parsed.
 fn create_pr(
@@ -342,7 +296,7 @@ fn create_pr(
     title: &str,
     body: &str,
     draft: bool,
-) -> Result<GhPr, String> {
+) -> Result<Pr, String> {
     let mut args = vec![
         "pr", "create", "-R", slug, "--head", head, "--base", base, "--title", title, "--body",
         body,
@@ -356,9 +310,11 @@ fn create_pr(
     }
     let number = pr_number_from_url(out.stdout())
         .ok_or_else(|| format!("gh pr create ({head}): no PR url in output"))?;
-    Ok(GhPr {
+    Ok(Pr {
         number,
+        head: head.to_string(),
         state: "OPEN".into(),
+        review: None,
         body: Some(body.to_string()),
         merged_at: None,
     })
@@ -429,9 +385,11 @@ mod tests {
             bookmark: bookmark.to_string(),
             title: String::new(),
             body: String::new(),
-            pr: Some(GhPr {
+            pr: Some(Pr {
                 number,
+                head: bookmark.to_string(),
                 state: state.to_string(),
+                review: None,
                 body: None,
                 merged_at: merged.then(|| "2026-01-01T00:00:00Z".to_string()),
             }),

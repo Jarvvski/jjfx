@@ -10,7 +10,7 @@ use crate::cmd::cmd;
 
 /// The `--json` fields every `gh pr list` read requests, spelled once. Their
 /// camelCase spellings map onto [`Pr`]'s fields (two via `serde(rename)`).
-const FIELDS: &str = "number,headRefName,state,reviewDecision,mergedAt";
+const FIELDS: &str = "number,headRefName,state,reviewDecision,body,mergedAt";
 
 /// One PR as reported by `gh pr list --json`. Carries the union of the fields the
 /// two consumers need; each reads only the subset it cares about.
@@ -26,6 +26,8 @@ pub struct Pr {
     /// The review verdict (`reviewDecision`); `None` when no decision yet.
     #[serde(rename = "reviewDecision")]
     pub review: Option<String>,
+    /// The PR description; rewritten with a `## Stack` section on submission.
+    pub body: Option<String>,
     #[serde(rename = "mergedAt")]
     pub merged_at: Option<String>,
 }
@@ -60,16 +62,32 @@ pub fn list(slug: &str) -> Vec<Pr> {
     query(slug, &["--limit", "100"]).unwrap_or_default()
 }
 
+/// The PR for one branch: an open one wins, else a merged one; closed-unmerged
+/// and absent both yield `None`. Surfaces `gh` failures as an error string (the
+/// forge submission path shows them), unlike [`list`], which degrades silently.
+pub fn find(slug: &str, branch: &str) -> Result<Option<Pr>, String> {
+    let prs = query(slug, &["--head", branch, "--limit", "20"])?;
+    Ok(pick(prs))
+}
+
+/// Choose the one relevant PR for a branch from a `gh` result: an open PR wins,
+/// else the first merged one; closed-unmerged and empty both yield `None`.
+fn pick(prs: Vec<Pr>) -> Option<Pr> {
+    let open = prs.iter().find(|p| p.state == "OPEN").cloned();
+    open.or_else(|| prs.into_iter().find(Pr::is_merged))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn pr(state: &str, merged_at: Option<&str>) -> Pr {
+    fn pr(number: u64, state: &str, merged_at: Option<&str>) -> Pr {
         Pr {
-            number: 1,
+            number,
             head: "branch".to_string(),
             state: state.to_string(),
             review: None,
+            body: None,
             merged_at: merged_at.map(String::from),
         }
     }
@@ -83,6 +101,7 @@ mod tests {
             "headRefName": "adam/feature",
             "state": "OPEN",
             "reviewDecision": "APPROVED",
+            "body": "the description",
             "mergedAt": null
         }]"#;
         let prs: Vec<Pr> = serde_json::from_str(json).expect("gh json parses");
@@ -91,6 +110,7 @@ mod tests {
         assert_eq!(pr.head, "adam/feature");
         assert_eq!(pr.state, "OPEN");
         assert_eq!(pr.review.as_deref(), Some("APPROVED"));
+        assert_eq!(pr.body.as_deref(), Some("the description"));
         assert_eq!(pr.merged_at, None);
     }
 
@@ -98,9 +118,26 @@ mod tests {
     fn is_merged_accepts_either_gh_signal() {
         // gh's two mergedness signals, and the negative case, as independent
         // known-good inputs: state alone, mergedAt alone, and neither.
-        assert!(pr("MERGED", None).is_merged());
-        assert!(pr("CLOSED", Some("2026-01-01T00:00:00Z")).is_merged());
-        assert!(!pr("OPEN", None).is_merged());
-        assert!(!pr("CLOSED", None).is_merged());
+        assert!(pr(1, "MERGED", None).is_merged());
+        assert!(pr(1, "CLOSED", Some("2026-01-01T00:00:00Z")).is_merged());
+        assert!(!pr(1, "OPEN", None).is_merged());
+        assert!(!pr(1, "CLOSED", None).is_merged());
+    }
+
+    #[test]
+    fn pick_prefers_open_then_merged_else_none() {
+        // An open PR wins even when a merged one is also present.
+        let both = vec![
+            pr(1, "MERGED", Some("2026-01-01T00:00:00Z")),
+            pr(2, "OPEN", None),
+        ];
+        assert_eq!(pick(both).map(|p| p.number), Some(2));
+        // No open one: the merged one is chosen.
+        let merged = vec![pr(3, "CLOSED", None), pr(4, "MERGED", None)];
+        assert_eq!(pick(merged).map(|p| p.number), Some(4));
+        // Only closed-unmerged: nothing to report.
+        assert_eq!(pick(vec![pr(5, "CLOSED", None)]).map(|p| p.number), None);
+        // Empty.
+        assert_eq!(pick(Vec::new()).map(|p| p.number), None);
     }
 }

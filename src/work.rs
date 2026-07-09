@@ -619,6 +619,7 @@ mod tests {
             head: head.to_string(),
             state: state.to_string(),
             review: None,
+            body: None,
             merged_at: merged_at.map(String::from),
         }
     }
