@@ -6,6 +6,18 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-09 - Target terminal (v0.14.0): a new config file,
+  `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, lets you host workspace
+  sessions in a *different* kitty instance than the one jjfx runs in. Set
+  `[terminal] listen_on` to that instance's `listen_on` base (e.g.
+  `unix:/tmp/kitty-visor`) and jjfx routes every `kitten @` call there via
+  `--to`, resolving kitty's live pid-suffixed socket (`/tmp/kitty-visor-<pid>`)
+  from the base at call time so it survives restarts. Set `launch_command`
+  (program + args) and jjfx runs it to start the target when its socket isn't
+  found, then waits for it to answer. With no config jjfx behaves exactly as
+  before, driving the surrounding kitty. A malformed config is reported at
+  startup before the TUI loads; a missing one is fine.
+
 - 2026-07-09 - Version flag (v0.13.0): `jjfx --version` (or `-V`) prints
   `jjfx <version>` and exits without discovering a jj repo or opening a terminal,
   so it is safe to run anywhere and lets `release`/CI smoke-test the built binary.
@@ -19,6 +31,15 @@ All notable changes to this project are documented here (newest first). The vers
   also clears the indicator; forge is unchanged (it still welds onto the remote
   mainline for clean PRs). Unlike `tidyws`, which only touches idle *empty*
   workspaces, `r`/`R` lift a workspace regardless of its contents.
+
+### Changed
+
+- 2026-07-09 - Workspace tab layout (v0.14.0): opening a workspace now builds
+  three panes - claude on the left, and a right column split into two stacked
+  shells - matching the `jj-wsx` layout. The splits are anchored to their window
+  ids so they land correctly even when the tab is opened in the background, which
+  now uses `--dont-take-focus` (so a background open never raises the target) and
+  then focuses the claude pane.
 
 ### Fixed
 

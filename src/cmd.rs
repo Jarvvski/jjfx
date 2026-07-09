@@ -11,7 +11,7 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, anyhow};
 
@@ -65,6 +65,21 @@ impl Cmd {
     pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(mut self, key: K, val: V) -> Self {
         self.inner.env(key, val);
         self
+    }
+
+    /// Spawn the command and return immediately, without waiting for it to
+    /// finish, with all three standard streams nulled so nothing leaks onto the
+    /// alt-screen TUI. For launching a detaching background process (e.g. a
+    /// dropdown terminal) that jjfx then polls for over another channel - using
+    /// [`run`](Cmd::run) would block until the child's stdout pipe closed.
+    pub fn spawn_detached(mut self) -> Result<()> {
+        self.inner
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawning {}", self.label))?;
+        Ok(())
     }
 
     /// Run to completion, capturing both streams. Errors only when the process

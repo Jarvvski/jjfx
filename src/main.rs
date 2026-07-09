@@ -8,6 +8,7 @@ mod app;
 mod attention;
 mod cache;
 mod cmd;
+mod config;
 mod diff;
 mod events;
 mod forge;
@@ -71,6 +72,10 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
+    // Load jjfx's own config first: a parse error must surface here, before
+    // tui::init() takes over the screen, or the message would be lost.
+    let config = config::load()?;
+
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
     // Bound the event log, then reconstruct current agent state by replaying it
@@ -98,6 +103,7 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
         &mut rx,
         &repo_root,
         initial_agents,
+        Box::new(terminal::KittyTerminal::new(&config.terminal)),
         work_tx,
         tx,
     )
@@ -114,13 +120,14 @@ async fn event_loop(
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     repo_root: &std::path::Path,
     initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
+    workspace_terminal: Box<dyn terminal::Terminal>,
     work_tx: UnboundedSender<()>,
     tx: UnboundedSender<Msg>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(
         Store::load(repo_root),
         initial_agents,
-        Box::new(terminal::KittyTerminal),
+        workspace_terminal,
         tx,
     );
     terminal.draw(|f| app.render(f))?;
