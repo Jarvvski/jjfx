@@ -65,15 +65,14 @@ struct Detail {
     selected: usize,
     /// Fuzzy filter typed against the file paths.
     filter: String,
-    /// Top line of the diff pane.
-    scroll: u16,
+    /// Vertical scroll of the diff pane. `total` tracks the selected file's line
+    /// count; `height` is refreshed at render.
+    viewport: Viewport,
     /// Lazy highlighter for the selected file, rebuilt when the selection or
     /// filter changes. It highlights only as far down as the viewport has needed,
     /// so navigating between files never highlights a whole large diff up front.
     /// Boxed - its syntect state is large and would bloat the `Mode` enum inline.
     hl: Option<Box<diff::FileHighlighter>>,
-    /// Inner height of the diff pane at the last render, for page/clamp math.
-    diff_height: u16,
 }
 
 impl Detail {
@@ -85,9 +84,8 @@ impl Detail {
             focus: DetailFocus::Files,
             selected: 0,
             filter: String::new(),
-            scroll: 0,
+            viewport: Viewport::default(),
             hl: None,
-            diff_height: 0,
         }
     }
 
@@ -115,19 +113,16 @@ impl Detail {
         if self.selected >= len {
             self.selected = len.saturating_sub(1);
         }
-        self.scroll = 0;
+        // Reset to the top and retarget the viewport at the newly-selected file's
+        // line count, so scrolling clamps correctly even before the next render.
+        let total = self.current().map(|f| f.lines.len()).unwrap_or(0) as u16;
+        self.viewport.jump_top();
+        self.viewport.set_total(total);
         // A fresh lazy highlighter for the new file; it highlights nothing until
         // the diff pane renders and asks for the visible window.
         self.hl = self
             .current()
             .map(|f| Box::new(diff::FileHighlighter::new(f)));
-    }
-
-    /// The furthest the diff can scroll so its last line still shows. Uses the
-    /// file's diff-line count (known immediately, without highlighting).
-    fn max_scroll(&self) -> u16 {
-        let total = self.current().map(|f| f.lines.len()).unwrap_or(0) as u16;
-        total.saturating_sub(self.diff_height)
     }
 }
 
@@ -475,26 +470,14 @@ impl App {
                     KeyCode::Left | KeyCode::Char('h') | KeyCode::Tab | KeyCode::BackTab => {
                         d.focus = DetailFocus::Files;
                     }
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        d.scroll = (d.scroll + 1).min(d.max_scroll());
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        d.scroll = d.scroll.saturating_sub(1);
-                    }
-                    KeyCode::Char('d') if ctrl => {
-                        d.scroll = (d.scroll + d.diff_height / 2).min(d.max_scroll());
-                    }
-                    KeyCode::Char('u') if ctrl => {
-                        d.scroll = d.scroll.saturating_sub(d.diff_height / 2);
-                    }
-                    KeyCode::PageDown => {
-                        d.scroll = (d.scroll + d.diff_height).min(d.max_scroll());
-                    }
-                    KeyCode::PageUp => {
-                        d.scroll = d.scroll.saturating_sub(d.diff_height);
-                    }
-                    KeyCode::Char('g') => d.scroll = 0,
-                    KeyCode::Char('G') => d.scroll = d.max_scroll(),
+                    KeyCode::Char('j') | KeyCode::Down => d.viewport.line_down(),
+                    KeyCode::Char('k') | KeyCode::Up => d.viewport.line_up(),
+                    KeyCode::Char('d') if ctrl => d.viewport.half_page_down(),
+                    KeyCode::Char('u') if ctrl => d.viewport.half_page_up(),
+                    KeyCode::PageDown => d.viewport.page_down(),
+                    KeyCode::PageUp => d.viewport.page_up(),
+                    KeyCode::Char('g') => d.viewport.jump_top(),
+                    KeyCode::Char('G') => d.viewport.jump_bottom(),
                     _ => {}
                 },
             }
@@ -1435,9 +1418,10 @@ fn render_diff_pane(frame: &mut Frame, d: &mut Detail, area: Rect) {
 
     // The visible height feeds page/scroll math and clamping on the next key.
     let inner_h = area.height.saturating_sub(2) as usize;
-    d.diff_height = inner_h as u16;
 
     let Some(fi) = fi else {
+        // Nothing to show: keep the viewport height current (nothing to scroll).
+        d.viewport.resize(inner_h as u16, 0);
         let msg = if d.loading { " loading…" } else { "" };
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -1450,13 +1434,11 @@ fn render_diff_pane(frame: &mut Frame, d: &mut Detail, area: Rect) {
         return;
     };
 
-    // Clamp scroll to the file's line count (known without highlighting).
+    // Record the geometry and clamp scroll to the file's line count (known
+    // without highlighting).
     let total = d.files[fi].lines.len();
-    let max_scroll = (total as u16).saturating_sub(d.diff_height);
-    if d.scroll > max_scroll {
-        d.scroll = max_scroll;
-    }
-    let start = (d.scroll as usize).min(total);
+    d.viewport.resize(inner_h as u16, total as u16);
+    let start = (d.viewport.scroll() as usize).min(total);
     let end = (start + inner_h).min(total);
 
     let Some(hl) = d.hl.as_mut() else {
@@ -2666,9 +2648,10 @@ mod tests {
     #[test]
     fn focus_toggles_between_panes_and_diff_scrolls() {
         let mut app = app_in_detail("feat");
-        // Give the diff pane a viewport so scroll clamps like a real render.
+        // Give the diff pane a viewport (height 1 over the 3-line file) so scroll
+        // clamps like a real render.
         if let Mode::Detail(d) = &mut app.mode {
-            d.diff_height = 1;
+            d.viewport.resize(1, 3);
         }
         // → moves focus into the diff pane.
         app.handle(press(KeyCode::Right));
@@ -2677,7 +2660,7 @@ mod tests {
         match &app.mode {
             Mode::Detail(d) => {
                 assert_eq!(d.focus, DetailFocus::Diff);
-                assert_eq!(d.scroll, 1);
+                assert_eq!(d.viewport.scroll(), 1);
             }
             _ => panic!("expected Detail mode"),
         }
@@ -2688,7 +2671,7 @@ mod tests {
         match &app.mode {
             Mode::Detail(d) => {
                 assert_eq!(d.focus, DetailFocus::Files);
-                assert_eq!(d.scroll, 0);
+                assert_eq!(d.viewport.scroll(), 0);
             }
             _ => panic!("expected still in Detail mode"),
         }

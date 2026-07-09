@@ -33,6 +33,14 @@ impl Viewport {
         self.scroll = self.scroll.min(self.max_scroll());
     }
 
+    /// Update just the content length - the viewport height is unchanged - and
+    /// re-clamp. Used when the content behind the viewport swaps for something of
+    /// a different length between renders (the diff pane changing files).
+    pub fn set_total(&mut self, total: u16) {
+        self.total = total;
+        self.scroll = self.scroll.min(self.max_scroll());
+    }
+
     /// The furthest `scroll` may travel so the last line still shows.
     fn max_scroll(&self) -> u16 {
         self.total.saturating_sub(self.height)
@@ -56,6 +64,16 @@ impl Viewport {
     /// Scroll a full viewport toward the start.
     pub fn page_up(&mut self) {
         self.scroll = self.scroll.saturating_sub(self.height);
+    }
+
+    /// Scroll half a viewport toward the end (a `Ctrl-d`-style nudge).
+    pub fn half_page_down(&mut self) {
+        self.scroll = (self.scroll + self.height / 2).min(self.max_scroll());
+    }
+
+    /// Scroll half a viewport toward the start (a `Ctrl-u`-style nudge).
+    pub fn half_page_up(&mut self) {
+        self.scroll = self.scroll.saturating_sub(self.height / 2);
     }
 
     /// Jump to the first line.
@@ -101,6 +119,35 @@ mod tests {
         assert_eq!(v.scroll(), 2, "page_up steps back a whole height");
         v.page_up();
         assert_eq!(v.scroll(), 0, "page_up saturates at the top");
+    }
+
+    #[test]
+    fn half_paging_moves_by_half_a_viewport_height() {
+        let mut v = Viewport::default();
+        v.resize(4, 10);
+        v.half_page_down();
+        assert_eq!(v.scroll(), 2, "half a 4-row viewport is 2 lines");
+        v.half_page_down();
+        assert_eq!(v.scroll(), 4);
+        v.half_page_down();
+        assert_eq!(v.scroll(), 6, "clamps to the last screen");
+        v.half_page_up();
+        assert_eq!(v.scroll(), 4);
+        v.half_page_up();
+        v.half_page_up();
+        assert_eq!(v.scroll(), 0, "half_page_up saturates at the top");
+    }
+
+    #[test]
+    fn set_total_reclamps_when_the_content_shrinks() {
+        let mut v = Viewport::default();
+        v.resize(4, 100);
+        v.jump_bottom();
+        assert_eq!(v.scroll(), 96);
+        // The viewport now shows a shorter document without a resize; the offset
+        // must be reeled back in against the new length.
+        v.set_total(10);
+        assert_eq!(v.scroll(), 6);
     }
 
     #[test]
