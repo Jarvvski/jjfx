@@ -11,7 +11,7 @@ use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, ListItem, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
@@ -25,6 +25,7 @@ use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
+use crate::workspace_list::{Row, WorkspaceList};
 use crate::{cache, jj};
 
 /// What the key handler is currently collecting: normal navigation, a new
@@ -68,12 +69,6 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Toggle this help", "?"),
     ("Quit", "q / esc"),
 ];
-
-/// One rendered list line: a group header (non-selectable) or a workspace row.
-enum Row<'a> {
-    Header(Attention, usize),
-    Ws(&'a Workspace, Attention),
-}
 
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
@@ -144,14 +139,10 @@ pub struct App {
     graph: Option<graph::Graph>,
     /// A transient one-line message shown in the footer (last action's result).
     status: Option<String>,
-    /// Selection tracked by workspace name, not row index, so it follows a
-    /// workspace as live state re-sorts it between Attention groups.
-    selected: Option<String>,
-    /// Whether the idle group is folded away.
-    idle_collapsed: bool,
-    /// Render-only: the highlighted row index, recomputed from `selected` each
-    /// draw (the list interleaves non-selectable group headers).
-    list_state: ListState,
+    /// The attention-grouped, idle-collapsible workspace list: owns grouping,
+    /// the idle fold, and the name-tracked selection + render cursor. `App`
+    /// supplies the [`Attention`] per workspace via [`App::classified`].
+    list: WorkspaceList,
     pub should_quit: bool,
 }
 
@@ -176,9 +167,7 @@ impl App {
             mode: Mode::Normal,
             graph: None,
             status: None,
-            selected: None,
-            idle_collapsed: false,
-            list_state: ListState::default(),
+            list: WorkspaceList::default(),
             should_quit: false,
         };
         app.ensure_selection();
@@ -329,7 +318,7 @@ impl App {
             KeyCode::Char('F') => self.forge_all(),
             KeyCode::Char('g') => self.forge_default(),
             KeyCode::Char('c') => {
-                self.idle_collapsed = !self.idle_collapsed;
+                self.list.toggle_idle();
                 self.ensure_selection();
             }
             KeyCode::Char('?') => self.mode = Mode::Help,
@@ -476,9 +465,9 @@ impl App {
 
     /// The workspace under the cursor, if any.
     fn selected_workspace(&self) -> Option<&Workspace> {
-        self.selected
-            .as_ref()
-            .and_then(|s| self.store.workspaces.iter().find(|w| &w.name == s))
+        self.list
+            .selected()
+            .and_then(|s| self.store.workspaces.iter().find(|w| w.name == s))
     }
 
     /// `enter`/`o`: focus the selected workspace's tab if it exists, else open a
@@ -713,19 +702,14 @@ impl App {
         Ok(())
     }
 
+    /// The ordered selectable workspace names for the current classification.
+    fn selectable_names(&self) -> Vec<String> {
+        self.list.selectable(&self.classified())
+    }
+
     fn move_selection(&mut self, delta: isize) {
-        let names: Vec<String> = self.selectable().iter().map(|w| w.name.clone()).collect();
-        if names.is_empty() {
-            self.selected = None;
-            return;
-        }
-        let current = self
-            .selected
-            .as_ref()
-            .and_then(|s| names.iter().position(|n| n == s))
-            .unwrap_or(0) as isize;
-        let next = (current + delta).clamp(0, names.len() as isize - 1);
-        self.selected = Some(names[next as usize].clone());
+        let names = self.selectable_names();
+        self.list.move_selection(&names, delta);
     }
 
     /// Re-reconcile from disk; the selection follows its workspace by name.
@@ -740,11 +724,8 @@ impl App {
     /// Point the selection at a real, currently-selectable workspace, falling
     /// back to the first one when the current target is gone or hidden.
     fn ensure_selection(&mut self) {
-        let names: Vec<String> = self.selectable().iter().map(|w| w.name.clone()).collect();
-        let valid = self.selected.as_ref().is_some_and(|s| names.contains(s));
-        if !valid {
-            self.selected = names.into_iter().next();
-        }
+        let names = self.selectable_names();
+        self.list.ensure_selection(&names);
     }
 
     /// Workspaces paired with their derived Attention, grouped needs-you ->
@@ -763,42 +744,6 @@ impl App {
             .collect();
         v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
         v
-    }
-
-    /// The display rows: a header per non-empty group, then its workspace rows
-    /// (unless the idle group is collapsed).
-    fn rows(&self) -> Vec<Row<'_>> {
-        let classified = self.classified();
-        let mut rows = Vec::new();
-        let mut idx = 0;
-        while idx < classified.len() {
-            let att = classified[idx].0;
-            let end = idx
-                + classified[idx..]
-                    .iter()
-                    .take_while(|(a, _)| *a == att)
-                    .count();
-            rows.push(Row::Header(att, end - idx));
-            if !(att == Attention::Idle && self.idle_collapsed) {
-                for (a, w) in &classified[idx..end] {
-                    rows.push(Row::Ws(w, *a));
-                }
-            }
-            idx = end;
-        }
-        rows
-    }
-
-    /// The currently-selectable workspaces, in display order (excludes ones
-    /// hidden in a collapsed idle group).
-    fn selectable(&self) -> Vec<&Workspace> {
-        self.rows()
-            .into_iter()
-            .filter_map(|r| match r {
-                Row::Ws(w, _) => Some(w),
-                Row::Header(..) => None,
-            })
-            .collect()
     }
 
     /// Render the Attention-grouped workspace list plus a header and footer.
@@ -833,27 +778,27 @@ impl App {
 
         // Build list items from the grouped rows, tracking which item index the
         // selected workspace lands on so the highlight follows it.
-        let selected = self.selected.clone();
-        let mut selected_idx = None;
-        let items: Vec<ListItem> = self
-            .rows()
-            .into_iter()
+        let classified = self.classified();
+        let rows = self.list.rows(&classified);
+        let mut cursor = None;
+        let items: Vec<ListItem> = rows
+            .iter()
             .enumerate()
             .map(|(i, row)| match row {
-                Row::Header(att, count) => self.header_item(att, count),
+                Row::Header(att, count) => self.header_item(*att, *count),
                 Row::Ws(w, att) => {
-                    let is_selected = selected.as_deref() == Some(w.name.as_str());
+                    let is_selected = self.list.selected() == Some(w.name.as_str());
                     if is_selected {
-                        selected_idx = Some(i);
+                        cursor = Some(i);
                     }
-                    self.workspace_item(w, att, is_selected)
+                    self.workspace_item(w, *att, is_selected)
                 }
             })
             .collect();
+        drop(rows);
+        drop(classified);
 
-        self.list_state.select(selected_idx);
-        let list = List::new(items);
-        frame.render_stateful_widget(list, body, &mut self.list_state);
+        self.list.render_body(frame, body, items, cursor);
 
         frame.render_widget(self.footer(), footer);
 
@@ -979,10 +924,7 @@ impl App {
     fn render_graph_world(&mut self, frame: &mut Frame) {
         // Disjoint borrows: scroll state is `&mut`, the graph and selection `&`.
         let Self {
-            mode,
-            graph,
-            selected,
-            ..
+            mode, graph, list, ..
         } = self;
         let Mode::Graph(g) = mode else {
             return;
@@ -1010,7 +952,7 @@ impl App {
 
         let lines: Vec<Line> = match graph.as_ref() {
             Some(gr) if !gr.chains.is_empty() => {
-                world_graph_lines(gr, selected.as_deref(), now_millis(), body.width)
+                world_graph_lines(gr, list.selected(), now_millis(), body.width)
             }
             Some(_) => vec![dim_line(" (no workspaces)")],
             None => vec![dim_line(" loading…")],
@@ -1042,7 +984,7 @@ impl App {
     fn header_item(&self, att: Attention, count: usize) -> ListItem<'static> {
         let mut text = format!("{} ({count})", att.heading());
         if att == Attention::Idle {
-            text.push_str(if self.idle_collapsed {
+            text.push_str(if self.list.idle_collapsed() {
                 "  [c: expand]"
             } else {
                 "  [c: fold]"
@@ -1727,14 +1669,14 @@ mod tests {
         let mut app = app_with(&["default", "feat"]);
         // Move selection off the top so we can prove Help leaves it untouched.
         app.handle(press(KeyCode::Down));
-        let before = app.selected.clone();
+        let before = app.list.selected().map(str::to_string);
 
         app.handle(press(KeyCode::Char('?')));
         assert!(matches!(app.mode, Mode::Help));
         // Navigation is swallowed while the overlay is open, and no status leaks.
         app.handle(press(KeyCode::Down));
         assert!(matches!(app.mode, Mode::Help));
-        assert_eq!(app.selected, before);
+        assert_eq!(app.list.selected().map(str::to_string), before);
         assert!(app.status.is_none());
 
         // Esc closes it; reopening and pressing ? again also closes.
@@ -2157,14 +2099,14 @@ mod tests {
     fn selection_moves_and_clamps() {
         // All idle -> one group, sorted by name: a, b, default.
         let mut app = app_with(&["default", "a", "b"]);
-        assert_eq!(app.selected.as_deref(), Some("a"));
+        assert_eq!(app.list.selected(), Some("a"));
         app.handle(press(KeyCode::Up)); // clamp at top
-        assert_eq!(app.selected.as_deref(), Some("a"));
+        assert_eq!(app.list.selected(), Some("a"));
         app.handle(press(KeyCode::Down));
-        assert_eq!(app.selected.as_deref(), Some("b"));
+        assert_eq!(app.list.selected(), Some("b"));
         app.handle(press(KeyCode::Down));
         app.handle(press(KeyCode::Down)); // clamp at bottom
-        assert_eq!(app.selected.as_deref(), Some("default"));
+        assert_eq!(app.list.selected(), Some("default"));
     }
 
     #[test]
@@ -2205,17 +2147,17 @@ mod tests {
     #[test]
     fn idle_group_folds_and_selection_stays_valid() {
         let mut app = app_with(&["default", "a"]); // both idle
-        assert_eq!(app.selectable().len(), 2);
+        assert_eq!(app.selectable_names().len(), 2);
         // Fold idle -> no selectable rows remain, selection clears gracefully.
         app.handle(press(KeyCode::Char('c')));
-        assert!(app.idle_collapsed);
-        assert_eq!(app.selectable().len(), 0);
-        assert_eq!(app.selected, None);
+        assert!(app.list.idle_collapsed());
+        assert_eq!(app.selectable_names().len(), 0);
+        assert_eq!(app.list.selected(), None);
         // Unfold restores selectability and a valid selection.
         app.handle(press(KeyCode::Char('c')));
-        assert!(!app.idle_collapsed);
-        assert_eq!(app.selectable().len(), 2);
-        assert!(app.selected.is_some());
+        assert!(!app.list.idle_collapsed());
+        assert_eq!(app.selectable_names().len(), 2);
+        assert!(app.list.selected().is_some());
     }
 
     /// Two changed files with distinct magnitudes, folded in via `Msg::DiffLoaded`.
@@ -2257,7 +2199,7 @@ mod tests {
     /// populate it, mirroring what the loaded diff snapshot does.
     fn app_in_detail(ws: &str) -> App {
         let mut app = app_with(&["default", ws]);
-        app.selected = Some(ws.to_string());
+        app.list.select(ws);
         app.mode = Mode::Detail(Detail::loading(ws.to_string()));
         app.handle(Msg::DiffLoaded {
             ws: ws.to_string(),
@@ -2269,7 +2211,7 @@ mod tests {
     #[tokio::test]
     async fn right_opens_detail_for_the_selected_workspace() {
         let mut app = app_with(&["default", "feat"]);
-        app.selected = Some("feat".to_string());
+        app.list.select("feat");
         // `l` (and `→`) drills into the diff viewer for the selected workspace;
         // the diff itself loads on a background task. (The loading/populate
         // behaviour is tested directly against `Detail` in `diff_view`.)
@@ -2350,7 +2292,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut app = app_with(&["default", "feat"]);
-        app.selected = Some("feat".to_string());
+        app.list.select("feat");
         app.mode = Mode::Graph(Viewport::default());
         app.graph = Some(sample_graph());
 

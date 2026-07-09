@@ -26,6 +26,7 @@ mod tui;
 mod viewport;
 mod watch;
 mod work;
+mod workspace_list;
 
 use std::io::Write;
 
