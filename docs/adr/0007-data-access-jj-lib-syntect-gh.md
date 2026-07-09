@@ -33,4 +33,18 @@ not the five CLI reads that ticket covers. Those stay on the CLI `-T` path for n
 the ticket is re-triaged to `needs-triage` to reassess the gate against the churn
 we actually observe on the next `jj` bump.
 
+## Note (2026-07-09)
+
+The trunk mirror this ADR accepts now lives in one place. The revset (CLI reads)
+and the jj-lib walk (graph) were two hand-maintained encodings of the same
+selection rule with nothing forcing them to agree - the missing agreement test.
+Both now sit in a `trunk` module that states the rule once as an ordered `SOURCES`
+list: `as_revset()` builds the revset string from it and `resolve()` gathers the
+jj-lib candidates from the same list, so the two adapters cannot drift by
+construction. The seam is genuine (two engines, one rule); a unit test pins the
+SOURCES-derived candidate order against the revset's priority, and another pins the
+revset string. `forge`'s weld/push target keeps jj's *bare* `trunk()` - the real
+remote mainline you push against - as a named, documented exception, not a fourth
+accident.
+
 Status: accepted

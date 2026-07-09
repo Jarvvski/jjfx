@@ -21,6 +21,14 @@ use crate::cmd::{Run, cmd};
 use crate::config::ForgeConfig;
 use crate::pr;
 
+// Both revsets below use jj's *bare* `trunk()` deliberately, NOT
+// [`crate::trunk::as_revset`]. That module resolves the base the reads measure
+// against - the latest of the remote mainline and local `main`/`master`/`trunk`,
+// so an unpushed local `main` still counts as trunk. Weld and push instead target
+// the *real remote* mainline: you rebase onto and push against what `origin`
+// actually has, and a local `main` ahead of `origin` is not a push target. This is
+// a named exception to the "one trunk" rule, not an accident (ADR-0007).
+
 /// Weld source: the root of this workspace's own mutable chain, rebased onto
 /// `trunk()`. Scoped to `::@` so only this workspace's stack moves.
 const WELD_SRC: &str = "roots(mutable() & mine() & ::@)";
