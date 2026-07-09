@@ -22,6 +22,7 @@ use crate::forge::{self, Target};
 use crate::graph;
 use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
+use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::{cache, jj};
 
@@ -38,27 +39,9 @@ enum Mode {
     /// The full-screen diff-detail view for one workspace (ADR 0008).
     Detail(Detail),
     /// The full-screen "world" commit graph: trunk plus every workspace's chain
-    /// (ticket 11).
-    Graph(GraphView),
-}
-
-/// Scroll state for the full-screen world graph. The rendered lines are rebuilt
-/// each draw from `App::graph`, so only the viewport offset is held here.
-#[derive(Debug, Default)]
-pub struct GraphView {
-    /// Top line of the graph viewport.
-    scroll: u16,
-    /// Inner height at the last render, for page/clamp math.
-    height: u16,
-    /// Total rendered line count at the last render, for scroll clamping.
-    total: u16,
-}
-
-impl GraphView {
-    /// The furthest the graph can scroll so its last line still shows.
-    fn max_scroll(&self) -> u16 {
-        self.total.saturating_sub(self.height)
-    }
+    /// (ticket 11). The rendered lines are rebuilt each draw from `App::graph`,
+    /// so only the [`Viewport`] offset is held here.
+    Graph(Viewport),
 }
 
 /// Which pane of the diff-detail view owns the keyboard: the changed-file list or
@@ -549,7 +532,7 @@ impl App {
     /// The last-loaded graph shows immediately (if any) while the fresh one loads.
     fn open_graph(&mut self) {
         self.status = None;
-        self.mode = Mode::Graph(GraphView::default());
+        self.mode = Mode::Graph(Viewport::default());
         self.spawn_graph_load();
     }
 
@@ -561,12 +544,12 @@ impl App {
         };
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => self.mode = Mode::Normal,
-            KeyCode::Char('j') | KeyCode::Down => g.scroll = (g.scroll + 1).min(g.max_scroll()),
-            KeyCode::Char('k') | KeyCode::Up => g.scroll = g.scroll.saturating_sub(1),
-            KeyCode::PageDown => g.scroll = (g.scroll + g.height).min(g.max_scroll()),
-            KeyCode::PageUp => g.scroll = g.scroll.saturating_sub(g.height),
-            KeyCode::Char('g') => g.scroll = 0,
-            KeyCode::Char('G') => g.scroll = g.max_scroll(),
+            KeyCode::Char('j') | KeyCode::Down => g.line_down(),
+            KeyCode::Char('k') | KeyCode::Up => g.line_up(),
+            KeyCode::PageDown => g.page_down(),
+            KeyCode::PageUp => g.page_up(),
+            KeyCode::Char('g') => g.jump_top(),
+            KeyCode::Char('G') => g.jump_bottom(),
             _ => {}
         }
     }
@@ -1171,7 +1154,6 @@ impl App {
             title,
         );
 
-        g.height = body.height.saturating_sub(2);
         let lines: Vec<Line> = match graph.as_ref() {
             Some(gr) if !gr.chains.is_empty() => {
                 world_graph_lines(gr, selected.as_deref(), now_millis(), body.width)
@@ -1179,10 +1161,7 @@ impl App {
             Some(_) => vec![dim_line(" (no workspaces)")],
             None => vec![dim_line(" loading…")],
         };
-        g.total = lines.len() as u16;
-        if g.scroll > g.max_scroll() {
-            g.scroll = g.max_scroll();
-        }
+        g.resize(body.height.saturating_sub(2), lines.len() as u16);
 
         frame.render_widget(
             Paragraph::new(lines)
@@ -1192,7 +1171,7 @@ impl App {
                         .border_style(pane_border(true))
                         .title(" commit graph "),
                 )
-                .scroll((g.scroll, 0)),
+                .scroll((g.scroll(), 0)),
             body,
         );
 
@@ -2786,7 +2765,7 @@ mod tests {
 
         let mut app = app_with(&["default", "feat"]);
         app.selected = Some("feat".to_string());
-        app.mode = Mode::Graph(GraphView::default());
+        app.mode = Mode::Graph(Viewport::default());
         app.graph = Some(sample_graph());
 
         // A tiny terminal must clamp its layout, not corrupt or panic (AC 4).
@@ -2803,7 +2782,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut app = app_with(&["default"]);
-        app.mode = Mode::Graph(GraphView::default());
+        app.mode = Mode::Graph(Viewport::default());
         // graph is still None: must render a loading state, not panic.
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| app.render(f)).unwrap();

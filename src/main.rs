@@ -22,6 +22,7 @@ mod store;
 mod terminal;
 mod trunk;
 mod tui;
+mod viewport;
 mod watch;
 mod work;
 
