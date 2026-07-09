@@ -129,6 +129,7 @@ async fn event_loop(
         Store::load(repo_root),
         initial_agents,
         Box::new(terminal::KittyTerminal::new(&config.terminal)),
+        Box::new(jj::RealJj::new(repo_root.to_path_buf())),
         config.forge,
         tx,
     );

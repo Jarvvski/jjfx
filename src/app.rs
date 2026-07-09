@@ -237,6 +237,9 @@ pub struct App {
     /// The multiplexer jjfx drives for workspace tabs (behind a trait so kitty is
     /// swappable - ticket 07).
     terminal: Box<dyn Terminal>,
+    /// The jj mutations the destructive verbs perform, behind a trait so they are
+    /// testable against a fake (like `terminal`), rather than shelling out inline.
+    jj: Box<dyn jj::Jj>,
     mode: Mode,
     /// The last-loaded commit graph (ticket 11), shared by the world view and the
     /// per-workspace strip in the detail view. `None` until first loaded.
@@ -259,6 +262,7 @@ impl App {
         store: Store,
         agents: HashMap<PathBuf, AgentState>,
         terminal: Box<dyn Terminal>,
+        jj: Box<dyn jj::Jj>,
         forge_config: ForgeConfig,
         tx: UnboundedSender<Msg>,
     ) -> Self {
@@ -270,6 +274,7 @@ impl App {
             forge_config,
             tx,
             terminal,
+            jj,
             mode: Mode::Normal,
             graph: None,
             status: None,
@@ -697,7 +702,7 @@ impl App {
             return;
         }
         let path = store::new_workspace_path(&self.store.repo_root, name);
-        if let Err(e) = jj::add_workspace(&self.store.repo_root, name, &path) {
+        if let Err(e) = self.jj.add_workspace(name, &path) {
             self.status = Some(format!("create failed: {e}"));
             return;
         }
@@ -726,7 +731,7 @@ impl App {
             .and_then(|w| w.path.clone());
 
         let _ = self.terminal.close(name); // best-effort; jj is the source of truth
-        if let Err(e) = jj::forget_workspace(&self.store.repo_root, name) {
+        if let Err(e) = self.jj.forget_workspace(name) {
             self.status = Some(format!("delete failed: {e}"));
             return;
         }
@@ -745,7 +750,7 @@ impl App {
     /// `trunk()`. Non-destructive (workspaces with real work are untouched), so it
     /// runs without confirmation; the poller refreshes each row's `behind` count.
     fn tidyws(&mut self) {
-        self.status = Some(match jj::tidyws(&self.store.repo_root) {
+        self.status = Some(match self.jj.tidyws() {
             Ok(0) => "tidyws: nothing to reset".to_string(),
             Ok(n) => format!("tidyws: reset {n} workspace(s) onto trunk"),
             Err(e) => format!("tidyws failed: {e}"),
@@ -762,7 +767,7 @@ impl App {
     /// Abandon junk empties across the repo (mutable, empty, undescribed,
     /// unbookmarked, untagged, never `@`), after confirmation.
     fn tidy(&mut self) {
-        self.status = Some(match jj::tidy(&self.store.repo_root) {
+        self.status = Some(match self.jj.tidy() {
             Ok(0) => "tidy: nothing to abandon".to_string(),
             Ok(n) => format!("tidy: abandoned {n} junk empty change(s)"),
             Err(e) => format!("tidy failed: {e}"),
@@ -776,7 +781,7 @@ impl App {
         let Some(w) = self.selected_workspace().cloned() else {
             return;
         };
-        self.status = Some(match jj::lift(&self.store.repo_root, &w.name) {
+        self.status = Some(match self.jj.lift(&w.name) {
             Ok(true) => format!("lifted {} onto trunk", w.name),
             Ok(false) => format!("{}: nothing to lift", w.name),
             Err(e) => format!("lift failed: {e}"),
@@ -786,7 +791,7 @@ impl App {
 
     /// `R`: lift every workspace's stack onto trunk in one rebase.
     fn lift_all(&mut self) {
-        self.status = Some(match jj::lift_all(&self.store.repo_root) {
+        self.status = Some(match self.jj.lift_all() {
             Ok(true) => "lifted all workspaces onto trunk".to_string(),
             Ok(false) => "nothing to lift".to_string(),
             Err(e) => format!("lift failed: {e}"),
@@ -1955,11 +1960,85 @@ mod tests {
         }
     }
 
+    /// Programmed outcomes for [`FakeJj`]. Default is success-with-nothing-to-do
+    /// (counts 0, bools false, no failure), matching an empty repo.
+    #[derive(Clone, Default)]
+    struct FakeOutcome {
+        /// When set, every fallible mutation returns an error carrying this text.
+        fail: Option<String>,
+        tidyws_n: usize,
+        tidy_n: usize,
+        lift_ok: bool,
+        lift_all_ok: bool,
+    }
+
+    /// A `Jj` that records calls instead of shelling out and returns programmed
+    /// outcomes, so the destructive verbs are testable without a real repo.
+    /// Cloning shares the recorders (like `FakeTerminal`); the outcome is copied.
+    #[derive(Clone, Default)]
+    struct FakeJj {
+        added: Arc<Mutex<Vec<(String, PathBuf)>>>,
+        forgotten: Arc<Mutex<Vec<String>>>,
+        lifted: Arc<Mutex<Vec<String>>>,
+        lift_all_calls: Arc<Mutex<usize>>,
+        tidyws_calls: Arc<Mutex<usize>>,
+        tidy_calls: Arc<Mutex<usize>>,
+        outcome: FakeOutcome,
+    }
+
+    impl FakeJj {
+        /// `Ok(val)`, or the programmed failure when one is set.
+        fn result<T>(&self, val: T) -> anyhow::Result<T> {
+            match &self.outcome.fail {
+                Some(e) => Err(anyhow::anyhow!("{e}")),
+                None => Ok(val),
+            }
+        }
+    }
+
+    impl jj::Jj for FakeJj {
+        fn add_workspace(&self, name: &str, dest: &Path) -> anyhow::Result<()> {
+            self.added
+                .lock()
+                .unwrap()
+                .push((name.to_string(), dest.to_path_buf()));
+            self.result(())
+        }
+        fn forget_workspace(&self, name: &str) -> anyhow::Result<()> {
+            self.forgotten.lock().unwrap().push(name.to_string());
+            self.result(())
+        }
+        fn tidyws(&self) -> anyhow::Result<usize> {
+            *self.tidyws_calls.lock().unwrap() += 1;
+            self.result(self.outcome.tidyws_n)
+        }
+        fn tidy(&self) -> anyhow::Result<usize> {
+            *self.tidy_calls.lock().unwrap() += 1;
+            self.result(self.outcome.tidy_n)
+        }
+        fn lift(&self, ws: &str) -> anyhow::Result<bool> {
+            self.lifted.lock().unwrap().push(ws.to_string());
+            self.result(self.outcome.lift_ok)
+        }
+        fn lift_all(&self) -> anyhow::Result<bool> {
+            *self.lift_all_calls.lock().unwrap() += 1;
+            self.result(self.outcome.lift_all_ok)
+        }
+    }
+
     fn app_with(names: &[&str]) -> App {
         app_with_terminal(names, Box::new(FakeTerminal::default()))
     }
 
     fn app_with_terminal(names: &[&str], terminal: Box<dyn Terminal>) -> App {
+        app_full(names, terminal, Box::new(FakeJj::default()))
+    }
+
+    fn app_with_jj(names: &[&str], jj: Box<dyn jj::Jj>) -> App {
+        app_full(names, Box::new(FakeTerminal::default()), jj)
+    }
+
+    fn app_full(names: &[&str], terminal: Box<dyn Terminal>, jj: Box<dyn jj::Jj>) -> App {
         let workspaces = names
             .iter()
             .map(|n| Workspace {
@@ -1977,6 +2056,7 @@ mod tests {
             },
             HashMap::new(),
             terminal,
+            jj,
             ForgeConfig::default(),
             tx,
         )
@@ -2273,6 +2353,164 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         // The status is untouched by a cancelled tidy (no mutation ran).
         assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn tidyws_resets_idle_empties_and_reports_the_count() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                tidyws_n: 3,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('t')));
+        assert_eq!(*fake.tidyws_calls.lock().unwrap(), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("tidyws: reset 3 workspace(s) onto trunk")
+        );
+    }
+
+    #[test]
+    fn tidyws_reports_nothing_to_reset_when_no_match() {
+        let fake = FakeJj::default(); // tidyws_n defaults to 0
+        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('t')));
+        assert_eq!(*fake.tidyws_calls.lock().unwrap(), 1);
+        assert_eq!(app.status.as_deref(), Some("tidyws: nothing to reset"));
+    }
+
+    #[test]
+    fn tidy_runs_only_after_confirmation_and_reports_the_count() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                tidy_n: 2,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('T')));
+        // The prompt is up but nothing has been abandoned yet.
+        assert_eq!(*fake.tidy_calls.lock().unwrap(), 0);
+        app.handle(press(KeyCode::Char('y')));
+        assert_eq!(*fake.tidy_calls.lock().unwrap(), 1);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("tidy: abandoned 2 junk empty change(s)")
+        );
+    }
+
+    #[test]
+    fn lift_selected_rebases_the_selected_workspace_and_reports() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                lift_ok: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        // "default" is the sole workspace, so it is the selection.
+        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('r')));
+        assert_eq!(*fake.lifted.lock().unwrap(), vec!["default".to_string()]);
+        assert_eq!(app.status.as_deref(), Some("lifted default onto trunk"));
+    }
+
+    #[test]
+    fn lift_selected_reports_nothing_to_lift_when_already_on_trunk() {
+        let fake = FakeJj::default(); // lift_ok defaults to false
+        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('r')));
+        assert_eq!(app.status.as_deref(), Some("default: nothing to lift"));
+    }
+
+    #[test]
+    fn lift_selected_surfaces_the_jj_error() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                fail: Some("immutable commit".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('r')));
+        assert_eq!(app.status.as_deref(), Some("lift failed: immutable commit"));
+    }
+
+    #[test]
+    fn lift_all_rebases_every_workspace_and_reports() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                lift_all_ok: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_with_jj(&["default", "feat"], Box::new(fake.clone()));
+        app.handle(press(KeyCode::Char('R')));
+        assert_eq!(*fake.lift_all_calls.lock().unwrap(), 1);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("lifted all workspaces onto trunk")
+        );
+    }
+
+    #[test]
+    fn create_workspace_adds_via_jj_and_opens_the_tab() {
+        let term = FakeTerminal::default();
+        let fake = FakeJj::default();
+        let mut app = app_full(&["default"], Box::new(term.clone()), Box::new(fake.clone()));
+        app.create_workspace("feat");
+        // jj adds the workspace at the derived sibling path, with the chosen name.
+        assert_eq!(
+            *fake.added.lock().unwrap(),
+            vec![("feat".to_string(), PathBuf::from("/repo-feat"))]
+        );
+        // The tab opens with focus, and the footer confirms.
+        assert_eq!(
+            term.opened.lock().unwrap().as_slice(),
+            &[("feat".to_string(), true)]
+        );
+        assert_eq!(app.status.as_deref(), Some("created 'feat'"));
+    }
+
+    #[test]
+    fn create_workspace_surfaces_the_jj_error_and_opens_no_tab() {
+        let term = FakeTerminal::default();
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                fail: Some("path exists".to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_full(&["default"], Box::new(term.clone()), Box::new(fake.clone()));
+        app.create_workspace("feat");
+        assert_eq!(app.status.as_deref(), Some("create failed: path exists"));
+        assert!(term.opened.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_workspace_forgets_via_jj_closes_the_tab_and_reports() {
+        let term = FakeTerminal::default();
+        let fake = FakeJj::default();
+        let mut app = app_full(
+            &["default", "feat"],
+            Box::new(term.clone()),
+            Box::new(fake.clone()),
+        );
+        app.delete_workspace("feat");
+        assert_eq!(*fake.forgotten.lock().unwrap(), vec!["feat".to_string()]);
+        assert_eq!(
+            term.closed.lock().unwrap().as_slice(),
+            &["feat".to_string()]
+        );
+        assert_eq!(app.status.as_deref(), Some("deleted 'feat'"));
     }
 
     #[test]
