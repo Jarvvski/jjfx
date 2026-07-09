@@ -162,6 +162,8 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Forge selected", "f"),
     ("Forge all", "F"),
     ("Forge default", "g"),
+    ("Lift onto trunk", "r"),
+    ("Lift all onto trunk", "R"),
     ("Tidy this workspace", "t"),
     ("Tidy (abandon junk empties)", "T"),
     ("Fold / expand idle group", "c"),
@@ -415,6 +417,8 @@ impl App {
             KeyCode::Right | KeyCode::Char('l') => self.open_detail(),
             KeyCode::Char('w') => self.open_graph(),
             KeyCode::Char('d') => self.begin_delete_selected(),
+            KeyCode::Char('r') => self.lift_selected(),
+            KeyCode::Char('R') => self.lift_all(),
             KeyCode::Char('t') => self.tidyws(),
             KeyCode::Char('T') => self.begin_tidy(),
             KeyCode::Char('f') => self.forge_selected(),
@@ -756,6 +760,30 @@ impl App {
             Ok(0) => "tidy: nothing to abandon".to_string(),
             Ok(n) => format!("tidy: abandoned {n} junk empty change(s)"),
             Err(e) => format!("tidy failed: {e}"),
+        });
+        self.reload();
+    }
+
+    /// `r`: lift the selected workspace's stack onto trunk (local rebase, no
+    /// push) - the remedy for a `behind` workspace, empty or not.
+    fn lift_selected(&mut self) {
+        let Some(w) = self.selected_workspace().cloned() else {
+            return;
+        };
+        self.status = Some(match jj::lift(&self.store.repo_root, &w.name) {
+            Ok(true) => format!("lifted {} onto trunk", w.name),
+            Ok(false) => format!("{}: nothing to lift", w.name),
+            Err(e) => format!("lift failed: {e}"),
+        });
+        self.reload();
+    }
+
+    /// `R`: lift every workspace's stack onto trunk in one rebase.
+    fn lift_all(&mut self) {
+        self.status = Some(match jj::lift_all(&self.store.repo_root) {
+            Ok(true) => "lifted all workspaces onto trunk".to_string(),
+            Ok(false) => "nothing to lift".to_string(),
+            Err(e) => format!("lift failed: {e}"),
         });
         self.reload();
     }

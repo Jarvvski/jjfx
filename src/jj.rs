@@ -58,11 +58,14 @@ const TIDYWS_SRC: &str =
 /// and never the current `@`. Ported from the `tidy` alias.
 const TIDY_REVSET: &str = "mutable() & empty() & description(exact:'') ~ @ ~ bookmarks() ~ tags()";
 
-/// Reset idle, empty, undescribed workspace working-copies onto latest `trunk()`
-/// (`jj rebase -s <ws-empties> -d trunk()`), returning how many matched. A no-op
-/// (returning 0) when nothing is eligible, so it never errors on an empty repo.
-/// `--ignore-immutable` mirrors the alias; workspaces with real work are excluded
-/// by the `empty()`/`description(exact:'')` filters, so they are never touched.
+/// Reset idle, empty, undescribed workspace working-copies onto the trunk base
+/// (`jj rebase -s <ws-empties> -d TRUNK_BASE`), returning how many matched. A
+/// no-op (returning 0) when nothing is eligible, so it never errors on an empty
+/// repo. Rebases onto [`crate::work::TRUNK_BASE`] - the same base the `behind`
+/// indicator measures against - rather than jj's raw `trunk()`, so tidying an idle
+/// empty workspace actually zeroes its `behind` count even when local `main` is
+/// ahead of `origin/main`. `--ignore-immutable` mirrors the alias; workspaces with
+/// real work are excluded by the `empty()`/`description(exact:'')` filters.
 pub fn tidyws(repo_root: &Path) -> anyhow::Result<usize> {
     let n = count(repo_root, TIDYWS_SRC);
     if n == 0 {
@@ -76,10 +79,66 @@ pub fn tidyws(repo_root: &Path) -> anyhow::Result<usize> {
             "-s",
             TIDYWS_SRC,
             "-d",
-            "trunk()",
+            crate::work::TRUNK_BASE,
         ],
     )?;
     Ok(n)
+}
+
+/// Source revset for lifting one workspace's own stack: the root(s) of its mutable
+/// chain reachable from `<ws>@`. `-s` on this moves the whole stack, so it adapts
+/// to shape on its own - a lone empty `@`, or a multi-commit stack - without
+/// choosing between `-r`/`-s`.
+fn lift_src(ws: &str) -> String {
+    format!("roots(mutable() & mine() & ::{ws}@)")
+}
+
+/// Rebase one workspace's own mutable stack onto the trunk base
+/// ([`crate::work::TRUNK_BASE`]), lifting it up to date **without pushing** - the
+/// local remedy for a `behind` workspace, for empty and non-empty alike. `-s`
+/// moves the whole stack; `--skip-emptied` drops commits the rebase makes empty
+/// (e.g. an idle empty `@`, recreated on trunk). Returns `false` when the
+/// workspace has nothing of ours to lift. Idempotent: a no-op when already on the
+/// trunk tip.
+pub fn lift(repo_root: &Path, ws: &str) -> anyhow::Result<bool> {
+    let src = lift_src(ws);
+    if count(repo_root, &src) == 0 {
+        return Ok(false);
+    }
+    run_mut(
+        repo_root,
+        &[
+            "rebase",
+            "--skip-emptied",
+            "-s",
+            &src,
+            "-d",
+            crate::work::TRUNK_BASE,
+        ],
+    )?;
+    Ok(true)
+}
+
+/// Lift every workspace's stack onto the trunk base in one rebase (the bulk form
+/// of [`lift`], keyed off every workspace's `@` via `working_copies()`). Returns
+/// `false` when there is nothing to lift.
+pub fn lift_all(repo_root: &Path) -> anyhow::Result<bool> {
+    let src = "roots(mutable() & mine() & ::working_copies())";
+    if count(repo_root, src) == 0 {
+        return Ok(false);
+    }
+    run_mut(
+        repo_root,
+        &[
+            "rebase",
+            "--skip-emptied",
+            "-s",
+            src,
+            "-d",
+            crate::work::TRUNK_BASE,
+        ],
+    )?;
+    Ok(true)
 }
 
 /// Abandon junk empties (`jj abandon <tidy-revset>`), returning how many matched.

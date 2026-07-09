@@ -4,6 +4,18 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Added
+
+- 2026-07-08 - Lift onto trunk (v0.12.0): press `r` to rebase the selected
+  workspace's own stack onto the current trunk, or `R` to lift every workspace at
+  once - a local rebase, no push, that works whether the workspace is empty or
+  carries work. This is the remedy for a `↓N` "behind" workspace: it rebases onto
+  `TRUNK_BASE` (the same base `behind` and the dirty/clean check use), so lifting
+  zeroes the `↓`. `tidyws` (`t`) now rebases onto that same `TRUNK_BASE` too, so it
+  also clears the indicator; forge is unchanged (it still welds onto the remote
+  mainline for clean PRs). Unlike `tidyws`, which only touches idle *empty*
+  workspaces, `r`/`R` lift a workspace regardless of its contents.
+
 ### Fixed
 
 - 2026-07-08 - Behind indicator (v0.11.1): the `↓N` "behind trunk" count now
