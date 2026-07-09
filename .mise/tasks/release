@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+#MISE description="Build stripped release tarball(s) + sha256 into dist/ for one or more targets (default: host)"
+#
+# Examples:
+#   mise run release                                   # host only
+#   mise run release aarch64-apple-darwin x86_64-apple-darwin
+#   mise run release x86_64-unknown-linux-musl         # cross via cargo-zigbuild
+#
+# The host target builds with plain `cargo build` (no zig needed). Any other
+# target is cross-compiled with cargo-zigbuild, which is pinned in mise.toml.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+
+bin=jjfx
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+host=$(rustc -vV | sed -n 's/^host: //p')
+
+targets=("$@")
+if [ "${#targets[@]}" -eq 0 ]; then
+  targets=("$host")
+fi
+
+# cargo-zigbuild is only required if at least one target isn't the host.
+needs_cross=false
+for t in "${targets[@]}"; do
+  [ "$t" != "$host" ] && needs_cross=true
+done
+if [ "$needs_cross" = true ] && ! command -v cargo-zigbuild >/dev/null 2>&1; then
+  echo "error: cross target requested but cargo-zigbuild is unavailable." >&2
+  echo "       run 'mise install' (zig + cargo-zigbuild are pinned in mise.toml)." >&2
+  exit 1
+fi
+
+if command -v shasum >/dev/null 2>&1; then
+  sha() { shasum -a 256 "$1"; }
+else
+  sha() { sha256sum "$1"; }
+fi
+
+dist="$root/dist"
+mkdir -p "$dist"
+
+for target in "${targets[@]}"; do
+  echo "==> building $bin $version for $target"
+  rustup target add "$target" >/dev/null 2>&1 || true
+
+  if [ "$target" = "$host" ]; then
+    cargo build --release --target "$target" --config profile.release.strip=true
+  else
+    cargo zigbuild --release --target "$target" --config profile.release.strip=true
+  fi
+
+  ext=""
+  case "$target" in *windows*) ext=".exe" ;; esac
+  binpath="target/$target/release/$bin$ext"
+
+  # Host binaries run here, so smoke-test that the artifact actually starts.
+  # Cross binaries target another OS/arch and can't be executed on this host.
+  if [ "$target" = "$host" ]; then
+    echo "    smoke-test: $("$binpath" --version)"
+  fi
+
+  name="$bin-$version-$target"
+  tar -C "target/$target/release" -czf "$dist/$name.tar.gz" "$bin$ext"
+  ( cd "$dist" && sha "$name.tar.gz" >"$name.tar.gz.sha256" )
+  echo "    dist/$name.tar.gz (+ .sha256)"
+done

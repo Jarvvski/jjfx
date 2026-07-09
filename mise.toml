@@ -4,6 +4,11 @@ rust = "1.96.1"
 # jj binary's store format (ADR 0007). Pin jj to the version jj-lib targets and
 # upgrade them in lockstep. Spike 02 confirmed jj 0.43.0 <-> jj-lib 0.43.0.
 jj = "0.43.0"
+# Cross-compilation toolchain for `mise run release`. zig is the C cross-linker
+# cargo-zigbuild drives; together they build Linux (musl/gnu) and both macOS
+# arches from this host without Docker (cross/Docker cannot target apple-darwin).
+zig = "0.16.0"
+"cargo:cargo-zigbuild" = "0.23.0"
 
 [tasks.run]
 description = "Run the app"

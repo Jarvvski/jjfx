@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+#MISE description="Build a host release binary and install it to ~/.cargo/bin (local dev)"
+#
+# For iterating locally: builds an optimized, stripped host binary and drops it
+# on your PATH via Cargo's bin dir. Not a cross/packaging step - that's `release`.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+
+bin=jjfx
+dest="${CARGO_HOME:-$HOME/.cargo}/bin"
+
+echo "==> building $bin (release, host)"
+cargo build --release --config profile.release.strip=true
+
+mkdir -p "$dest"
+install -m 0755 "target/release/$bin" "$dest/$bin"
+echo "==> installed $bin -> $dest/$bin"
+
+if ! command -v "$bin" >/dev/null 2>&1; then
+  echo "note: $dest is not on your PATH - add it to use '$bin' directly." >&2
+fi
