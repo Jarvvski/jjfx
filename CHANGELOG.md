@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-09 - Version flag (v0.13.0): `jjfx --version` (or `-V`) prints
+  `jjfx <version>` and exits without discovering a jj repo or opening a terminal,
+  so it is safe to run anywhere and lets `release`/CI smoke-test the built binary.
+
 - 2026-07-08 - Lift onto trunk (v0.12.0): press `r` to rebase the selected
   workspace's own stack onto the current trunk, or `R` to lift every workspace at
   once - a local rebase, no push, that works whether the workspace is empty or

@@ -34,6 +34,14 @@ use crate::store::Store;
 async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // `--version`/`-V` prints "jjfx <version>" and exits before any repo or
+    // terminal work, so it is safe to run outside a jj repo and without a TTY
+    // (release/CI can smoke-test the built binary with it).
+    if args.iter().any(|a| a == "--version" || a == "-V") {
+        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
+
     // `jjfx hooks [install|status]` is global - it manages ~/.claude/settings.json
     // and needs no jj repo, so it runs before repo discovery.
     if args.first().map(String::as_str) == Some("hooks") {
