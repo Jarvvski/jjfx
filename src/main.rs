@@ -19,6 +19,7 @@ mod pr;
 mod repo;
 mod store;
 mod terminal;
+mod trunk;
 mod tui;
 mod watch;
 mod work;

@@ -205,20 +205,22 @@ impl<'a> Ownership<'a> {
 
 /// How far trunk has advanced past a workspace's base: the count of commits that
 /// are ancestors of the trunk base but not of the workspace head
-/// (`::TRUNK_BASE ~ ::<ws>@`). Uses the same [`TRUNK_BASE`] as [`classify`] - the
-/// latest of the remote mainline and the local `main`/`master`/`trunk` bookmarks -
-/// rather than jj's raw `trunk()`. Otherwise `behind` measures against a possibly
-/// stale `origin/main` while `classify` measures against local `main`, so a
-/// workspace can read `clean` yet be several commits behind by the same base the
-/// dirty/clean check uses. Zero when the workspace sits on the trunk tip, and zero
-/// on any jj read failure (degrade, don't crash).
+/// (`::trunk ~ ::<ws>@`). Uses the same [`crate::trunk::as_revset`] as
+/// [`classify`] - the latest of the remote mainline and the local
+/// `main`/`master`/`trunk` bookmarks - rather than jj's raw `trunk()`. Otherwise
+/// `behind` measures against a possibly stale `origin/main` while `classify`
+/// measures against local `main`, so a workspace can read `clean` yet be several
+/// commits behind by the same base the dirty/clean check uses. Zero when the
+/// workspace sits on the trunk tip, and zero on any jj read failure (degrade,
+/// don't crash).
 fn behind(repo_root: &Path, ws: &str) -> u32 {
+    let trunk = crate::trunk::as_revset();
     jj(
         repo_root,
         &[
             "log",
             "-r",
-            &format!("::({TRUNK_BASE}) ~ ::{ws}@"),
+            &format!("::({trunk}) ~ ::{ws}@"),
             "--no-graph",
             "-T",
             "\"x\\n\"",
@@ -239,7 +241,7 @@ fn classify(repo_root: &Path, ws: &str, owned: &[&ChainCommit], prs: &[Pr]) -> W
             let from = owned
                 .last()
                 .map(|c| format!("{}-", c.change_id))
-                .unwrap_or_else(|| TRUNK_BASE.to_string());
+                .unwrap_or_else(crate::trunk::as_revset);
             let (added, removed) = diff_loc(repo_root, &from, ws).unwrap_or((0, 0));
             WorkState::Dirty { added, removed }
         }
@@ -280,7 +282,7 @@ fn overlay(owned: &[&ChainCommit], prs: &[Pr]) -> WorkState {
     WorkState::Clean
 }
 
-/// One commit on a workspace's own change chain (`TRUNK_BASE..<ws>@`).
+/// One commit on a workspace's own change chain (`trunk..<ws>@`).
 struct ChainCommit {
     /// The commit's change id (full, for cross-workspace ownership comparison).
     change_id: String,
@@ -297,28 +299,17 @@ struct ChainCommit {
     head_line: bool,
 }
 
-/// A workspace's own change chain (`TRUNK_BASE..<ws>@`), tip first.
+/// A workspace's own change chain (`trunk..<ws>@`), tip first.
 struct Chain {
     commits: Vec<ChainCommit>,
 }
 
-/// The mainline base a workspace's own work is measured against.
-///
-/// jj's `trunk()` resolves to the *remote* mainline, but a repo that has never
-/// been pushed has no remote bookmark, so `trunk()` falls back to the root
-/// commit - which would make every workspace diff the whole history and an empty
-/// workspace read as dirty. Prefer `trunk()` when it is a real commit, else fall
-/// back to the local `main`/`master`/`trunk` bookmark (whichever exists), taking
-/// the most recent. `present(...)` stops a missing bookmark from erroring the
-/// revset. Once main is pushed, `trunk()` wins and behaviour is unchanged.
-pub(crate) const TRUNK_BASE: &str =
-    "latest((trunk() ~ root()) | present(main) | present(master) | present(trunk))";
-
-/// Read `TRUNK_BASE..<ws>@` per-commit (empty flag, change id, local bookmarks)
-/// in one call, plus a second call for which commits carry a real-remote
-/// bookmark. `None` on any jj failure.
+/// Read `trunk::as_revset()..<ws>@` per-commit (empty flag, change id, local
+/// bookmarks) in one call, plus a second call for which commits carry a
+/// real-remote bookmark. `None` on any jj failure.
 fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
-    let chain = format!("({TRUNK_BASE})..{ws}@");
+    let trunk = crate::trunk::as_revset();
+    let chain = format!("({trunk})..{ws}@");
 
     // Per-commit, newest first: "E"/"N", change id, comma-joined local bookmarks.
     let out = jj(

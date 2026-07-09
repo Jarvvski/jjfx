@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::cmd::cmd;
-use crate::work::TRUNK_BASE;
+use crate::trunk;
 
 /// The repo-wide facts a submission pass needs, resolved once per forge run.
 #[derive(Debug, Clone)]
@@ -273,11 +273,12 @@ fn pr_number_from_url(url: &str) -> Option<u64> {
     url.trim().rsplit('/').next()?.parse().ok()
 }
 
-/// The bookmarks on a workspace's own chain (`TRUNK_BASE..@`), bottom (nearest
-/// trunk) first, deduped. Read-only (`--ignore-working-copy`), run in the
-/// workspace dir so `@` is that workspace's head.
+/// The bookmarks on a workspace's own chain (`trunk..@`), bottom (nearest trunk)
+/// first, deduped. Read-only (`--ignore-working-copy`), run in the workspace dir
+/// so `@` is that workspace's head.
 fn chain_bookmarks(dir: &Path) -> Result<Vec<String>, String> {
-    let revset = format!("({TRUNK_BASE})..@");
+    let trunk = trunk::as_revset();
+    let revset = format!("({trunk})..@");
     let out = jj_read(
         dir,
         &[

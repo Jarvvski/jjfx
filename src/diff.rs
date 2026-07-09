@@ -13,7 +13,7 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-use crate::work::TRUNK_BASE;
+use crate::trunk;
 
 /// Above this many lines a single file's diff is rendered plain rather than
 /// syntect-highlighted, so a pathologically large patch never hitches the render
@@ -60,16 +60,10 @@ pub struct FileDiff {
 /// vec on any jj failure or when the workspace matches trunk. Blocking - call it
 /// from `spawn_blocking`, never the render task.
 pub fn load(repo_root: &Path, ws: &str) -> Vec<FileDiff> {
+    let trunk = trunk::as_revset();
     match jj_read(
         repo_root,
-        &[
-            "diff",
-            "--from",
-            TRUNK_BASE,
-            "--to",
-            &format!("{ws}@"),
-            "--git",
-        ],
+        &["diff", "--from", &trunk, "--to", &format!("{ws}@"), "--git"],
     ) {
         Some(out) => parse(&out),
         None => Vec::new(),

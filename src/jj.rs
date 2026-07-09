@@ -85,9 +85,9 @@ pub trait Jj: Send {
     fn forget_workspace(&self, name: &str) -> anyhow::Result<()>;
 
     /// Reset idle, empty, undescribed workspace working-copies onto the trunk base
-    /// (`jj rebase -s <ws-empties> -d TRUNK_BASE`), returning how many matched. A
+    /// (`jj rebase -s <ws-empties> -d <trunk>`), returning how many matched. A
     /// no-op (returning 0) when nothing is eligible, so it never errors on an empty
-    /// repo. Rebases onto [`crate::work::TRUNK_BASE`] - the same base the `behind`
+    /// repo. Rebases onto [`crate::trunk::as_revset`] - the same base the `behind`
     /// indicator measures against - rather than jj's raw `trunk()`, so tidying an
     /// idle empty workspace actually zeroes its `behind` count even when local
     /// `main` is ahead of `origin/main`. `--ignore-immutable` mirrors the alias;
@@ -101,7 +101,7 @@ pub trait Jj: Send {
     fn tidy(&self) -> anyhow::Result<usize>;
 
     /// Rebase one workspace's own mutable stack onto the trunk base
-    /// ([`crate::work::TRUNK_BASE`]), lifting it up to date **without pushing** -
+    /// ([`crate::trunk::as_revset`]), lifting it up to date **without pushing** -
     /// the local remedy for a `behind` workspace, for empty and non-empty alike.
     /// `-s` moves the whole stack; `--skip-emptied` drops commits the rebase makes
     /// empty (e.g. an idle empty `@`, recreated on trunk). Returns `false` when the
@@ -145,6 +145,7 @@ impl Jj for RealJj {
         if n == 0 {
             return Ok(0);
         }
+        let trunk = crate::trunk::as_revset();
         run_mut(
             &self.repo_root,
             &[
@@ -153,7 +154,7 @@ impl Jj for RealJj {
                 "-s",
                 TIDYWS_SRC,
                 "-d",
-                crate::work::TRUNK_BASE,
+                &trunk,
             ],
         )?;
         Ok(n)
@@ -173,16 +174,10 @@ impl Jj for RealJj {
         if count(&self.repo_root, &src) == 0 {
             return Ok(false);
         }
+        let trunk = crate::trunk::as_revset();
         run_mut(
             &self.repo_root,
-            &[
-                "rebase",
-                "--skip-emptied",
-                "-s",
-                &src,
-                "-d",
-                crate::work::TRUNK_BASE,
-            ],
+            &["rebase", "--skip-emptied", "-s", &src, "-d", &trunk],
         )?;
         Ok(true)
     }
@@ -192,16 +187,10 @@ impl Jj for RealJj {
         if count(&self.repo_root, src) == 0 {
             return Ok(false);
         }
+        let trunk = crate::trunk::as_revset();
         run_mut(
             &self.repo_root,
-            &[
-                "rebase",
-                "--skip-emptied",
-                "-s",
-                src,
-                "-d",
-                crate::work::TRUNK_BASE,
-            ],
+            &["rebase", "--skip-emptied", "-s", src, "-d", &trunk],
         )?;
         Ok(true)
     }
