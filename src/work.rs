@@ -8,7 +8,7 @@
 //! association is derived by matching a PR's head branch to a bookmark on the
 //! workspace's own change chain, never hard-coded.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -116,20 +116,91 @@ struct Pr {
 /// Compute the [`Work`] snapshot for each named workspace. One `gh` call serves
 /// all workspaces; jj is queried per workspace. Runs blocking subprocesses, so
 /// call it from `spawn_blocking`.
+///
+/// Every workspace's chain is read up front so each commit can be attributed to
+/// at most one workspace before classifying: a commit several workspaces share
+/// (a common base they are all stacked on) must not make each of them look
+/// dirty/pushed or claim the same PR - only the workspace that uniquely *heads*
+/// that commit owns it, and a base nobody uniquely heads is owned by none.
 pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work> {
     let prs = derive_repo_slug(repo_root)
         .map(|slug| list_prs(&slug))
         .unwrap_or_default();
-    workspaces
+
+    let chains: Vec<(String, Option<Chain>)> = workspaces
         .iter()
-        .map(|name| {
+        .map(|name| (name.clone(), read_chain(repo_root, name)))
+        .collect();
+    let ownership = Ownership::compute(&chains);
+
+    chains
+        .iter()
+        .map(|(name, chain)| {
+            let state = match chain {
+                None => WorkState::Unknown,
+                Some(chain) => {
+                    let owned: Vec<&ChainCommit> = chain
+                        .commits
+                        .iter()
+                        .filter(|c| ownership.owns(name, c))
+                        .collect();
+                    classify(repo_root, name, &owned, &prs)
+                }
+            };
             let work = Work {
-                state: classify(repo_root, name, &prs),
+                state,
                 behind: behind(repo_root, name),
             };
             (name.clone(), work)
         })
         .collect()
+}
+
+/// Which workspace, if any, owns each commit across the whole workspace set.
+struct Ownership<'a> {
+    /// change id -> how many workspaces' chains contain it.
+    in_chains: HashMap<&'a str, u32>,
+    /// change id -> the workspaces that head it (it is on their head-line).
+    heads: HashMap<&'a str, Vec<&'a str>>,
+}
+
+impl<'a> Ownership<'a> {
+    fn compute(chains: &'a [(String, Option<Chain>)]) -> Self {
+        let mut in_chains: HashMap<&str, u32> = HashMap::new();
+        let mut heads: HashMap<&str, Vec<&str>> = HashMap::new();
+        for (name, chain) in chains {
+            let Some(chain) = chain else { continue };
+            for c in &chain.commits {
+                *in_chains.entry(c.change_id.as_str()).or_default() += 1;
+                if c.head_line {
+                    heads
+                        .entry(c.change_id.as_str())
+                        .or_default()
+                        .push(name.as_str());
+                }
+            }
+        }
+        Ownership { in_chains, heads }
+    }
+
+    /// A commit on only one chain is owned by that workspace. A commit on several
+    /// is owned only by the single workspace that heads it - so a base multiple
+    /// workspaces are parked on (headed by more than one) belongs to none.
+    fn owns(&self, ws: &str, c: &ChainCommit) -> bool {
+        let shared = self
+            .in_chains
+            .get(c.change_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            >= 2;
+        if !shared {
+            return true;
+        }
+        matches!(
+            self.heads.get(c.change_id.as_str()),
+            Some(headers) if headers.len() == 1 && headers[0] == ws
+        )
+    }
 }
 
 /// How far trunk has advanced past a workspace's base: the count of commits that
@@ -157,16 +228,34 @@ fn behind(repo_root: &Path, ws: &str) -> u32 {
     .unwrap_or(0)
 }
 
-/// Classify one workspace: read its jj change chain relative to `trunk()`, then
-/// overlay any matching PR. A jj read failure yields `Unknown`.
-fn classify(repo_root: &Path, ws: &str, prs: &[Pr]) -> WorkState {
-    let Some(chain) = read_chain(repo_root, ws) else {
-        return WorkState::Unknown;
-    };
+/// Classify one workspace from the commits it owns: overlay a matching PR, else
+/// derive the state from jj facts. `owned` is the workspace's own commits (a
+/// shared base is already filtered out by [`Ownership`]).
+fn classify(repo_root: &Path, ws: &str, owned: &[&ChainCommit], prs: &[Pr]) -> WorkState {
+    match overlay(owned, prs) {
+        // Fill in the line delta, measured from the base of the owned line (its
+        // deepest owned commit's parent) so a shared ancestor's diff is excluded.
+        WorkState::Dirty { .. } => {
+            let from = owned
+                .last()
+                .map(|c| format!("{}-", c.change_id))
+                .unwrap_or_else(|| TRUNK_BASE.to_string());
+            let (added, removed) = diff_loc(repo_root, &from, ws).unwrap_or((0, 0));
+            WorkState::Dirty { added, removed }
+        }
+        other => other,
+    }
+}
 
-    // A PR whose head branch is a bookmark on this workspace's chain wins - it is
-    // the furthest point on the road to merge.
-    if let Some(pr) = prs.iter().find(|pr| chain.bookmarks.contains(&pr.head)) {
+/// The pure overlay decision over a workspace's owned commits: PR (the furthest
+/// point on the road to merge) wins, then pushed, then own content, else clean.
+/// A `Dirty` result carries no line counts yet - [`classify`] fills them.
+fn overlay(owned: &[&ChainCommit], prs: &[Pr]) -> WorkState {
+    if let Some(pr) = prs.iter().find(|pr| {
+        owned
+            .iter()
+            .any(|c| c.local_bookmarks.iter().any(|b| b == &pr.head))
+    }) {
         match pr.state.as_str() {
             "MERGED" => return WorkState::Merged,
             "OPEN" => {
@@ -179,25 +268,38 @@ fn classify(repo_root: &Path, ws: &str, prs: &[Pr]) -> WorkState {
         }
     }
 
-    if chain.pushed {
+    if owned.iter().any(|c| c.pushed) {
         return WorkState::Pushed;
     }
-    if chain.has_content {
-        let (added, removed) = diff_loc(repo_root, ws).unwrap_or((0, 0));
-        return WorkState::Dirty { added, removed };
+    if owned.iter().any(|c| !c.empty) {
+        return WorkState::Dirty {
+            added: 0,
+            removed: 0,
+        };
     }
     WorkState::Clean
 }
 
-/// The jj-derived facts about a workspace's own change chain (`trunk()..<ws>@`).
-struct Chain {
-    /// Any non-empty commit on the chain (real content beyond trunk).
-    has_content: bool,
-    /// A bookmark on the chain is on a real remote (excludes the colocated `git`
+/// One commit on a workspace's own change chain (`TRUNK_BASE..<ws>@`).
+struct ChainCommit {
+    /// The commit's change id (full, for cross-workspace ownership comparison).
+    change_id: String,
+    /// The commit is empty (no content of its own beyond its parent).
+    empty: bool,
+    /// Local bookmark names on this commit, for deriving PR association.
+    local_bookmarks: Vec<String>,
+    /// This commit carries a real-remote bookmark (excludes the colocated `git`
     /// pseudo-remote, via the `remote_bookmarks()` revset).
     pushed: bool,
-    /// Local bookmark names on the chain, for deriving PR association.
-    bookmarks: Vec<String>,
+    /// No non-empty commit sits strictly above this one in the workspace's chain,
+    /// so this commit is on the workspace's head-line. Used to pick the single
+    /// owner of a commit shared by several workspaces.
+    head_line: bool,
+}
+
+/// A workspace's own change chain (`TRUNK_BASE..<ws>@`), tip first.
+struct Chain {
+    commits: Vec<ChainCommit>,
 }
 
 /// The mainline base a workspace's own work is measured against.
@@ -212,12 +314,13 @@ struct Chain {
 pub(crate) const TRUNK_BASE: &str =
     "latest((trunk() ~ root()) | present(main) | present(master) | present(trunk))";
 
-/// Read `<base>..<ws>@` for content flags + local bookmark names in one call,
-/// plus a second call for real-remote presence. `None` on any jj failure.
+/// Read `TRUNK_BASE..<ws>@` per-commit (empty flag, change id, local bookmarks)
+/// in one call, plus a second call for which commits carry a real-remote
+/// bookmark. `None` on any jj failure.
 fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
     let chain = format!("({TRUNK_BASE})..{ws}@");
 
-    // Per-commit: "E"/"N" for empty/non-empty, then comma-joined local bookmarks.
+    // Per-commit, newest first: "E"/"N", change id, comma-joined local bookmarks.
     let out = jj(
         repo_root,
         &[
@@ -226,26 +329,12 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
             &chain,
             "--no-graph",
             "-T",
-            "if(empty,\"E\",\"N\") ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\",\") ++ \"\\n\"",
+            "if(empty,\"E\",\"N\") ++ \"\\t\" ++ change_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\",\") ++ \"\\n\"",
         ],
     )?;
 
-    let mut has_content = false;
-    let mut bookmarks = Vec::new();
-    for line in out.lines() {
-        let (flag, names) = line.split_once('\t').unwrap_or((line, ""));
-        if flag == "N" {
-            has_content = true;
-        }
-        for name in names.split(',').filter(|n| !n.is_empty()) {
-            if !bookmarks.iter().any(|b| b == name) {
-                bookmarks.push(name.to_string());
-            }
-        }
-    }
-
-    // Pushed iff any commit on the chain carries a real-remote bookmark. The
-    // revset `remote_bookmarks()` excludes the colocated `git` remote, so this is
+    // Change ids on the chain that carry a real-remote bookmark. The revset
+    // `remote_bookmarks()` excludes the colocated `git` remote, so this is
     // "actually pushed", not merely git-tracked.
     let pushed_out = jj(
         repo_root,
@@ -255,31 +344,53 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
             &format!("({chain}) & remote_bookmarks()"),
             "--no-graph",
             "-T",
-            "\"x\"",
+            "change_id ++ \"\\n\"",
         ],
     )?;
-    let pushed = !pushed_out.trim().is_empty();
+    let pushed_ids: HashSet<&str> = pushed_out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
 
-    Some(Chain {
-        has_content,
-        pushed,
-        bookmarks,
-    })
+    // Walk newest -> oldest: a commit is on the head-line until a non-empty
+    // commit has been seen above it.
+    let mut commits = Vec::new();
+    let mut seen_nonempty = false;
+    for line in out.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let flag = parts.next().unwrap_or("");
+        let change_id = parts.next().unwrap_or("").trim().to_string();
+        let names = parts.next().unwrap_or("");
+        if change_id.is_empty() {
+            continue;
+        }
+        let empty = flag != "N";
+        let head_line = !seen_nonempty;
+        if !empty {
+            seen_nonempty = true;
+        }
+        commits.push(ChainCommit {
+            pushed: pushed_ids.contains(change_id.as_str()),
+            local_bookmarks: names
+                .split(',')
+                .filter(|n| !n.is_empty())
+                .map(String::from)
+                .collect(),
+            change_id,
+            empty,
+            head_line,
+        });
+    }
+
+    Some(Chain { commits })
 }
 
-/// Insertions/deletions from the mainline base to `<ws>@`, parsed from
-/// `jj diff --stat`.
-fn diff_loc(repo_root: &Path, ws: &str) -> Option<(u32, u32)> {
+/// Insertions/deletions from `from` to `<ws>@`, parsed from `jj diff --stat`.
+fn diff_loc(repo_root: &Path, from: &str, ws: &str) -> Option<(u32, u32)> {
     let out = jj(
         repo_root,
-        &[
-            "diff",
-            "--from",
-            TRUNK_BASE,
-            "--to",
-            &format!("{ws}@"),
-            "--stat",
-        ],
+        &["diff", "--from", from, "--to", &format!("{ws}@"), "--stat"],
     )?;
     parse_diff_stat(&out)
 }
@@ -459,33 +570,121 @@ mod tests {
         assert_eq!(WorkState::Unknown.label(), "?");
     }
 
+    /// Build a `ChainCommit` for tests.
+    fn cc(
+        change_id: &str,
+        empty: bool,
+        bms: &[&str],
+        pushed: bool,
+        head_line: bool,
+    ) -> ChainCommit {
+        ChainCommit {
+            change_id: change_id.to_string(),
+            empty,
+            local_bookmarks: bms.iter().map(|s| s.to_string()).collect(),
+            pushed,
+            head_line,
+        }
+    }
+
     #[test]
-    fn pr_association_matches_by_head_branch() {
-        // A PR is matched only when its head branch is a bookmark on the chain.
+    fn shared_base_headed_by_several_is_owned_by_nobody() {
+        // The real bug: `uyr` (PR branch) is a shared ancestor - the head-line of
+        // two empty workspaces and a buried ancestor of a third. None owns it.
+        let chains = vec![
+            (
+                "default".to_string(),
+                Some(Chain {
+                    commits: vec![
+                        cc("syq", false, &[], false, true),
+                        cc("uyr", false, &["adam/x"], true, false),
+                    ],
+                }),
+            ),
+            (
+                "new-tui".to_string(),
+                Some(Chain {
+                    commits: vec![
+                        cc("qpo", true, &[], false, true),
+                        cc("uyr", false, &["adam/x"], true, true),
+                    ],
+                }),
+            ),
+            (
+                "tseter".to_string(),
+                Some(Chain {
+                    commits: vec![
+                        cc("szw", true, &[], false, true),
+                        cc("uyr", false, &["adam/x"], true, true),
+                    ],
+                }),
+            ),
+        ];
+        let own = Ownership::compute(&chains);
+        let uyr = cc("uyr", false, &["adam/x"], true, true);
+        assert!(!own.owns("default", &uyr));
+        assert!(!own.owns("new-tui", &uyr));
+        assert!(!own.owns("tseter", &uyr));
+        // Each workspace still owns its own tip commit.
+        assert!(own.owns("default", &cc("syq", false, &[], false, true)));
+        assert!(own.owns("new-tui", &cc("qpo", true, &[], false, true)));
+    }
+
+    #[test]
+    fn shared_base_headed_by_one_is_still_owned_stacked_prs() {
+        // A base branch `B` shared with a workspace stacked above it (`feature`)
+        // is the head-line of `base` alone, so `base` keeps owning it.
+        let chains = vec![
+            (
+                "base".to_string(),
+                Some(Chain {
+                    commits: vec![
+                        cc("wc", true, &[], false, true),
+                        cc("B", false, &["base-br"], true, true),
+                    ],
+                }),
+            ),
+            (
+                "feature".to_string(),
+                Some(Chain {
+                    commits: vec![
+                        cc("F", false, &["feat-br"], true, true),
+                        cc("B", false, &["base-br"], true, false),
+                    ],
+                }),
+            ),
+        ];
+        let own = Ownership::compute(&chains);
+        let b = cc("B", false, &["base-br"], true, true);
+        assert!(own.owns("base", &b));
+        assert!(!own.owns("feature", &b));
+        assert!(own.owns("feature", &cc("F", false, &["feat-br"], true, true)));
+    }
+
+    #[test]
+    fn overlay_prefers_pr_then_pushed_then_dirty_then_clean() {
         let prs = [Pr {
             number: 5,
-            head: "feature-x".to_string(),
+            head: "adam/x".to_string(),
             state: "OPEN".to_string(),
-            review: Some("CHANGES_REQUESTED".to_string()),
+            review: None,
         }];
-        // Simulate the overlay decision directly (classify's jj part needs a repo).
-        let chain = Chain {
-            has_content: true,
-            pushed: true,
-            bookmarks: vec!["feature-x".to_string()],
-        };
-        let matched = prs.iter().find(|pr| chain.bookmarks.contains(&pr.head));
-        assert!(matched.is_some());
-        // A chain without that bookmark does not match.
-        let other = Chain {
-            has_content: true,
-            pushed: false,
-            bookmarks: vec!["something-else".to_string()],
-        };
-        assert!(
-            prs.iter()
-                .find(|pr| other.bookmarks.contains(&pr.head))
-                .is_none()
-        );
+        // PR whose head branch is on an owned commit wins.
+        let with_pr = cc("uyr", false, &["adam/x"], true, true);
+        assert!(matches!(
+            overlay(&[&with_pr], &prs),
+            WorkState::PrOpen { number: 5, .. }
+        ));
+        // Pushed, but no matching PR.
+        let pushed = cc("p", false, &["other"], true, true);
+        assert_eq!(overlay(&[&pushed], &prs), WorkState::Pushed);
+        // Own non-empty content, unbookmarked.
+        let dirty = cc("d", false, &[], false, true);
+        assert!(matches!(overlay(&[&dirty], &prs), WorkState::Dirty { .. }));
+        // Only empty owned commits -> clean (the fix for a parked empty workspace).
+        let empty = cc("e", true, &[], false, true);
+        assert_eq!(overlay(&[&empty], &prs), WorkState::Clean);
+        // Nothing owned at all -> clean.
+        assert_eq!(overlay(&[], &prs), WorkState::Clean);
     }
 }

@@ -43,6 +43,17 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-09 - Shared-base work state (v0.14.0): a workspace's state
+  (PR / pushed / dirty) is now computed only from the commits it *owns*, not from
+  a base it shares with other workspaces. Previously a branch sitting on a common
+  ancestor - e.g. several workspaces parked on or stacked above one feature branch -
+  made every one of them claim that branch's PR (and look pushed). Each commit is
+  now attributed to at most one workspace: a commit on a single chain belongs to
+  it, and a commit several workspaces share belongs only to the one that uniquely
+  *heads* it (a base nobody uniquely heads is owned by none). So an empty workspace
+  parked on a pushed branch reads `clean`, a workspace with its own commit on top
+  reads `dirty` (measured from its own base), and normal stacked PRs still show.
+
 - 2026-07-08 - Behind indicator (v0.11.1): the `↓N` "behind trunk" count now
   measures against the same base as the dirty/clean classification -
   `TRUNK_BASE` (the latest of the remote mainline and the local
