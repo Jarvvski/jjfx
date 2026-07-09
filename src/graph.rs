@@ -11,7 +11,8 @@
 //! and bookmarks, walk parents - to keep the migration cost of a `jj` bump small.
 //!
 //! The build splits into a thin jj-lib I/O shell ([`load`]) and a pure core
-//! ([`pick_trunk`], [`build`]) that is unit-tested without a real store.
+//! ([`build`]) that is unit-tested without a real store. Trunk selection lives in
+//! [`crate::trunk`], shared with the CLI reads.
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::Path;
@@ -20,7 +21,6 @@ use anyhow::{Context, anyhow};
 use jj_lib::backend::CommitId;
 use jj_lib::config::StackedConfig;
 use jj_lib::object_id::ObjectId;
-use jj_lib::ref_name::{RefName, RemoteName};
 use jj_lib::repo::{Repo, StoreFactories};
 use jj_lib::settings::UserSettings;
 use jj_lib::workspace::{Workspace, default_working_copy_factories};
@@ -123,7 +123,7 @@ pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
         }
     }
 
-    let trunk_id = resolve_trunk(view, store, root.clone());
+    let trunk_id = crate::trunk::resolve(view, store, root.clone());
 
     // Phase A: trunk ancestors (bounded), so we can tell where a branch rejoins
     // the mainline without walking all of history. Also captures trunk context.
@@ -199,65 +199,6 @@ const TRUNK_CONTEXT: usize = 6;
 const NEIGHBOURHOOD_CAP: usize = 3000;
 /// Longest single workspace chain we will render before giving up (graceful).
 const CHAIN_CAP: usize = 500;
-
-/// Resolve the trunk commit the way `work::TRUNK_BASE` does, so the graph agrees
-/// with the workspace list's clean/dirty/behind. That revset,
-/// `latest((trunk() ~ root()) | present(main) | present(master) | present(trunk))`,
-/// takes the *most recent* of the real-remote mainline and the local `main`/
-/// `master`/`trunk` bookmarks, else the root. Most-recent (not remote-first) is the
-/// point: a local `main` ahead of `origin/main` must win, or every unpushed
-/// mainline commit would show as workspace divergence below trunk. The root
-/// fallback keeps a never-pushed repo (no bookmark) from treating all history as
-/// one branch (v0.8.1).
-fn resolve_trunk(
-    view: &jj_lib::view::View,
-    store: &std::sync::Arc<jj_lib::store::Store>,
-    root: CommitId,
-) -> CommitId {
-    // Only the `origin` remote counts as "really pushed"; jj's colocated `git`
-    // remote is not queried, so a git-tracked-but-unpushed bookmark cannot
-    // masquerade as trunk.
-    let remote = |name: &str| -> Option<CommitId> {
-        view.remote_bookmarks(RemoteName::new("origin"))
-            .find(|(n, _)| n.as_str() == name)
-            .and_then(|(_, r)| r.target.as_normal().cloned())
-    };
-    let local = |name: &str| -> Option<CommitId> {
-        view.get_local_bookmark(RefName::new(name))
-            .as_normal()
-            .cloned()
-    };
-    // Each candidate paired with its committer timestamp, so the latest wins
-    // (mirroring the revset's `latest(...)`).
-    let candidates: Vec<(CommitId, i64)> = [
-        remote("main"),
-        remote("master"),
-        local("main"),
-        local("master"),
-        local("trunk"),
-    ]
-    .into_iter()
-    .flatten()
-    .filter_map(|id| {
-        store
-            .get_commit(&id)
-            .ok()
-            .map(|c| (id, c.committer().timestamp.timestamp.0))
-    })
-    .collect();
-    pick_trunk(&candidates, root)
-}
-
-/// Pure trunk pick: the candidate with the most recent timestamp, else the
-/// fallback. Ties resolve to the last max, which is fine - tied candidates point
-/// at the same commit (e.g. `origin/main` == local `main` just after a push).
-fn pick_trunk<T: Clone>(candidates: &[(T, i64)], fallback: T) -> T {
-    candidates
-        .iter()
-        .max_by_key(|(_, ts)| *ts)
-        .map(|(id, _)| id.clone())
-        .unwrap_or(fallback)
-}
 
 /// Assemble the graph from loaded commits. Projects the jj-lib `Commit` map into
 /// plain string maps up front, then delegates the chain/trunk-boundary logic to
@@ -414,22 +355,6 @@ mod tests {
         assert_eq!(summary(""), "(no description)");
         assert_eq!(summary("   \n"), "(no description)");
         assert_eq!(summary("first line\nsecond"), "first line");
-    }
-
-    #[test]
-    fn pick_trunk_picks_the_most_recent_candidate() {
-        // A local `main` ahead of `origin/main` must win (matches `latest(...)`),
-        // else unpushed mainline commits would show as workspace divergence.
-        let candidates = [("origin-main", 100_i64), ("local-main", 200_i64)];
-        assert_eq!(pick_trunk(&candidates, "root"), "local-main");
-    }
-
-    #[test]
-    fn pick_trunk_falls_back_to_root_when_no_candidates() {
-        // The never-pushed / no-bookmark case (v0.8.1): nothing resolves, so the
-        // caller must land on the root commit, not error.
-        let none: [(&str, i64); 0] = [];
-        assert_eq!(pick_trunk(&none, "root"), "root");
     }
 
     /// Build a minimal node map from `(id, parent, summary)` triples. `parent`
