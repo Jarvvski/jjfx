@@ -5,7 +5,35 @@
 
 use std::path::Path;
 
-use crate::cmd::{Run, cmd};
+use crate::cmd::cmd;
+
+/// Run a read-only jj command against the repo, returning stdout on success. The
+/// single home for the read incantation: `--repository <repo_root>
+/// --ignore-working-copy` keeps it a pure read - jjfx must never snapshot the
+/// working copy (that would churn commits and ping its own watcher, ADR 0006).
+/// Callers project the `Result` to whatever they need (`.ok()` to degrade
+/// silently, `map_err` for a string error).
+pub fn read_at_repo(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
+    cmd("jj")
+        .arg("--repository")
+        .arg(repo_root)
+        .arg("--ignore-working-copy")
+        .args(args)
+        .run()?
+        .checked()
+}
+
+/// Run a read-only jj command in `dir`, so `@` resolves to that workspace's own
+/// working copy. Like [`read_at_repo`], `--ignore-working-copy` keeps it a pure
+/// read.
+pub fn read_in_dir(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
+    cmd("jj")
+        .current_dir(dir)
+        .arg("--ignore-working-copy")
+        .args(args)
+        .run()?
+        .checked()
+}
 
 /// Workspace names jj knows in this repo, via
 /// `jj workspace list -T 'name ++ "\n"'`. `--ignore-working-copy` keeps it a
@@ -13,14 +41,7 @@ use crate::cmd::{Run, cmd};
 /// failure - the skeleton degrades to the ws-cache + derived default rather than
 /// erroring, and the caller cannot surface errors from inside the alt-screen.
 pub fn workspace_names(repo_root: &Path) -> Vec<String> {
-    let out = cmd("jj")
-        .arg("--repository")
-        .arg(repo_root)
-        .arg("--ignore-working-copy")
-        .args(["workspace", "list", "-T", "name ++ \"\\n\""])
-        .run()
-        .ok()
-        .and_then(Run::stdout_ok);
+    let out = read_at_repo(repo_root, &["workspace", "list", "-T", "name ++ \"\\n\""]).ok();
 
     out.into_iter()
         .flat_map(|s| {
@@ -157,16 +178,13 @@ pub fn tidy(repo_root: &Path) -> anyhow::Result<usize> {
 /// no snapshot). Zero on any failure - the caller then treats it as "nothing to
 /// do" rather than erroring.
 fn count(repo_root: &Path, revset: &str) -> usize {
-    cmd("jj")
-        .arg("--repository")
-        .arg(repo_root)
-        .arg("--ignore-working-copy")
-        .args(["log", "-r", revset, "--no-graph", "-T", "\"x\\n\""])
-        .run()
-        .ok()
-        .and_then(Run::stdout_ok)
-        .map(|s| s.lines().filter(|l| !l.is_empty()).count())
-        .unwrap_or(0)
+    read_at_repo(
+        repo_root,
+        &["log", "-r", revset, "--no-graph", "-T", "\"x\\n\""],
+    )
+    .ok()
+    .map(|s| s.lines().filter(|l| !l.is_empty()).count())
+    .unwrap_or(0)
 }
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.

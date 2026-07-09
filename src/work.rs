@@ -423,14 +423,7 @@ fn parse_diff_stat(stat: &str) -> Option<(u32, u32)> {
 /// failure. `--ignore-working-copy` keeps it a pure read - jjfx must never
 /// snapshot the working copy (that would churn commits and ping its own watcher).
 fn jj(repo_root: &Path, args: &[&str]) -> Option<String> {
-    cmd("jj")
-        .arg("--repository")
-        .arg(repo_root)
-        .arg("--ignore-working-copy")
-        .args(args)
-        .run()
-        .ok()?
-        .stdout_ok()
+    crate::jj::read_at_repo(repo_root, args).ok()
 }
 
 /// List PRs via `gh --json`. Returns an empty list on any failure, so a missing

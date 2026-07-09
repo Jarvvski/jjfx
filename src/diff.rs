@@ -13,7 +13,6 @@ use syntect::easy::HighlightLines;
 use syntect::highlighting::{Theme, ThemeSet};
 use syntect::parsing::SyntaxSet;
 
-use crate::cmd::cmd;
 use crate::work::TRUNK_BASE;
 
 /// Above this many lines a single file's diff is rendered plain rather than
@@ -300,14 +299,7 @@ pub fn fuzzy_match(query: &str, text: &str) -> bool {
 /// Run a read-only jj command, stdout on success or `None`. `--ignore-working-copy`
 /// keeps it a pure read (never snapshot - that would churn commits, ADR 0006).
 fn jj_read(repo_root: &Path, args: &[&str]) -> Option<String> {
-    cmd("jj")
-        .arg("--repository")
-        .arg(repo_root)
-        .arg("--ignore-working-copy")
-        .args(args)
-        .run()
-        .ok()?
-        .stdout_ok()
+    crate::jj::read_at_repo(repo_root, args).ok()
 }
 
 #[cfg(test)]

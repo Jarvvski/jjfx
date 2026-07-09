@@ -416,17 +416,7 @@ fn default_branch(slug: &str) -> Result<String, String> {
 /// never snapshots and churns the working copy). Stdout on success, else an error
 /// carrying the trimmed stderr.
 fn jj_read(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let out = cmd("jj")
-        .current_dir(dir)
-        .arg("--ignore-working-copy")
-        .args(args)
-        .run()
-        .map_err(|e| e.to_string())?;
-    if out.ok() {
-        Ok(out.stdout().to_string())
-    } else {
-        Err(format!("jj {}: {}", args.join(" "), out.stderr().trim()))
-    }
+    crate::jj::read_in_dir(dir, args).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]
