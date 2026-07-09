@@ -6,6 +6,13 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-09 - Merged PRs read as merged in the work list (v0.16.1): a workspace
+  whose PR `gh` reports with a `mergedAt` timestamp but a non-`MERGED` state (e.g.
+  a squash-merge recorded as closed) now shows "merged" instead of falling back to
+  "pushed". The work-list overlay and the forge's stacked-PR submission now share
+  one PR model with a single mergedness rule (`state == "MERGED"` or a set
+  `mergedAt`), so the two can no longer disagree about whether a PR has merged.
+
 - 2026-07-09 - Honest forge (v0.16.0): a forge that pushed nothing no longer
   claims "forged". `jj git push` exits 0 even when it moves nothing (printing
   "Nothing changed."), so an undescribed or unbookmarked working copy used to

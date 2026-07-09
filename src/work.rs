@@ -11,10 +11,6 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use serde::Deserialize;
-
-use crate::cmd::{Run, cmd};
-
 /// A PR's review verdict, as reported by `gh`'s `reviewDecision`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReviewVerdict {
@@ -102,17 +98,6 @@ impl WorkState {
     }
 }
 
-/// One PR as reported by `gh pr list --json`.
-#[derive(Debug, Clone, Deserialize)]
-struct Pr {
-    number: u64,
-    #[serde(rename = "headRefName")]
-    head: String,
-    state: String,
-    #[serde(rename = "reviewDecision")]
-    review: Option<String>,
-}
-
 /// Compute the [`Work`] snapshot for each named workspace. One `gh` call serves
 /// all workspaces; jj is queried per workspace. Runs blocking subprocesses, so
 /// call it from `spawn_blocking`.
@@ -124,7 +109,7 @@ struct Pr {
 /// that commit owns it, and a base nobody uniquely heads is owned by none.
 pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work> {
     let prs = derive_repo_slug(repo_root)
-        .map(|slug| list_prs(&slug))
+        .map(|slug| crate::prs::list(&slug))
         .unwrap_or_default();
 
     let chains: Vec<(String, Option<Chain>)> = workspaces
@@ -233,7 +218,12 @@ fn behind(repo_root: &Path, ws: &str) -> u32 {
 /// Classify one workspace from the commits it owns: overlay a matching PR, else
 /// derive the state from jj facts. `owned` is the workspace's own commits (a
 /// shared base is already filtered out by [`Ownership`]).
-fn classify(repo_root: &Path, ws: &str, owned: &[&ChainCommit], prs: &[Pr]) -> WorkState {
+fn classify(
+    repo_root: &Path,
+    ws: &str,
+    owned: &[&ChainCommit],
+    prs: &[crate::prs::Pr],
+) -> WorkState {
     match overlay(owned, prs) {
         // Fill in the line delta, measured from the base of the owned line (its
         // deepest owned commit's parent) so a shared ancestor's diff is excluded.
@@ -252,22 +242,22 @@ fn classify(repo_root: &Path, ws: &str, owned: &[&ChainCommit], prs: &[Pr]) -> W
 /// The pure overlay decision over a workspace's owned commits: PR (the furthest
 /// point on the road to merge) wins, then pushed, then own content, else clean.
 /// A `Dirty` result carries no line counts yet - [`classify`] fills them.
-fn overlay(owned: &[&ChainCommit], prs: &[Pr]) -> WorkState {
+fn overlay(owned: &[&ChainCommit], prs: &[crate::prs::Pr]) -> WorkState {
     if let Some(pr) = prs.iter().find(|pr| {
         owned
             .iter()
             .any(|c| c.local_bookmarks.iter().any(|b| b == &pr.head))
     }) {
-        match pr.state.as_str() {
-            "MERGED" => return WorkState::Merged,
-            "OPEN" => {
-                return WorkState::PrOpen {
-                    number: pr.number,
-                    verdict: ReviewVerdict::parse(pr.review.as_deref()),
-                };
-            }
-            _ => {} // CLOSED-not-merged: fall back to the jj-derived state
+        if pr.is_merged() {
+            return WorkState::Merged;
         }
+        if pr.state == "OPEN" {
+            return WorkState::PrOpen {
+                number: pr.number,
+                verdict: ReviewVerdict::parse(pr.review.as_deref()),
+            };
+        }
+        // CLOSED-not-merged: fall back to the jj-derived state.
     }
 
     if owned.iter().any(|c| c.pushed) {
@@ -415,29 +405,6 @@ fn parse_diff_stat(stat: &str) -> Option<(u32, u32)> {
 /// snapshot the working copy (that would churn commits and ping its own watcher).
 fn jj(repo_root: &Path, args: &[&str]) -> Option<String> {
     crate::jj::read_at_repo(repo_root, args).ok()
-}
-
-/// List PRs via `gh --json`. Returns an empty list on any failure, so a missing
-/// `gh`, no auth, or no network degrades to "no PR info" rather than crashing.
-fn list_prs(slug: &str) -> Vec<Pr> {
-    cmd("gh")
-        .args([
-            "pr",
-            "list",
-            "-R",
-            slug,
-            "--state",
-            "all",
-            "--limit",
-            "100",
-            "--json",
-            "number,headRefName,state,reviewDecision",
-        ])
-        .run()
-        .ok()
-        .and_then(Run::stdout_ok)
-        .and_then(|json| serde_json::from_str(&json).ok())
-        .unwrap_or_default()
 }
 
 /// Derive the `owner/repo` slug from jj's `origin` remote URL. `gh` auto-detection
@@ -645,14 +612,31 @@ mod tests {
         assert!(own.owns("feature", &cc("F", false, &["feat-br"], true, true)));
     }
 
+    /// Build a `prs::Pr` for overlay tests.
+    fn pr(number: u64, head: &str, state: &str, merged_at: Option<&str>) -> crate::prs::Pr {
+        crate::prs::Pr {
+            number,
+            head: head.to_string(),
+            state: state.to_string(),
+            review: None,
+            merged_at: merged_at.map(String::from),
+        }
+    }
+
+    #[test]
+    fn overlay_reads_a_merged_at_pr_as_merged() {
+        // gh sometimes reports a merged PR with a non-MERGED state but a set
+        // mergedAt (e.g. a squash-merge it records as CLOSED). The unified
+        // `Pr::is_merged` must still classify it Merged, not fall through to the
+        // jj-derived state - the divergence this consolidation removes.
+        let prs = [pr(9, "adam/x", "CLOSED", Some("2026-01-01T00:00:00Z"))];
+        let owned = cc("uyr", false, &["adam/x"], true, true);
+        assert_eq!(overlay(&[&owned], &prs), WorkState::Merged);
+    }
+
     #[test]
     fn overlay_prefers_pr_then_pushed_then_dirty_then_clean() {
-        let prs = [Pr {
-            number: 5,
-            head: "adam/x".to_string(),
-            state: "OPEN".to_string(),
-            review: None,
-        }];
+        let prs = [pr(5, "adam/x", "OPEN", None)];
         // PR whose head branch is on an owned commit wins.
         let with_pr = cc("uyr", false, &["adam/x"], true, true);
         assert!(matches!(
