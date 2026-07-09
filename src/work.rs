@@ -458,7 +458,7 @@ fn list_prs(slug: &str) -> Vec<Pr> {
 
 /// Derive the `owner/repo` slug from jj's `origin` remote URL. `gh` auto-detection
 /// fails in jj workspaces, so every `gh` call must pass `-R <slug>` (CLAUDE.md).
-fn derive_repo_slug(repo_root: &Path) -> Option<String> {
+pub(crate) fn derive_repo_slug(repo_root: &Path) -> Option<String> {
     let out = jj(repo_root, &["git", "remote", "list"])?;
     let url = out
         .lines()

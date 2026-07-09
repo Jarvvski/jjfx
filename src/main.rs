@@ -15,6 +15,7 @@ mod forge;
 mod graph;
 mod hooks;
 mod jj;
+mod pr;
 mod repo;
 mod store;
 mod terminal;
@@ -103,7 +104,7 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
         &mut rx,
         &repo_root,
         initial_agents,
-        Box::new(terminal::KittyTerminal::new(&config.terminal)),
+        config,
         work_tx,
         tx,
     )
@@ -120,14 +121,15 @@ async fn event_loop(
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     repo_root: &std::path::Path,
     initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
-    workspace_terminal: Box<dyn terminal::Terminal>,
+    config: config::Config,
     work_tx: UnboundedSender<()>,
     tx: UnboundedSender<Msg>,
 ) -> anyhow::Result<()> {
     let mut app = App::new(
         Store::load(repo_root),
         initial_agents,
-        workspace_terminal,
+        Box::new(terminal::KittyTerminal::new(&config.terminal)),
+        config.forge,
         tx,
     );
     terminal.draw(|f| app.render(f))?;

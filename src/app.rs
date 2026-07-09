@@ -16,6 +16,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
 use crate::attention::{self, Attention};
+use crate::config::ForgeConfig;
 use crate::diff::{self, FileDiff};
 use crate::forge::{self, Target};
 use crate::graph;
@@ -227,6 +228,9 @@ pub struct App {
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs or after one that ended with a skip/failure.
     forge: HashMap<String, ForgeProgress>,
+    /// How the forge manages pull requests (toggle + draft), handed to each
+    /// [`forge::run`].
+    forge_config: ForgeConfig,
     /// Channel to the app's own message loop, so forge tasks can stream updates
     /// back as [`Msg::Forge`].
     tx: UnboundedSender<Msg>,
@@ -255,6 +259,7 @@ impl App {
         store: Store,
         agents: HashMap<PathBuf, AgentState>,
         terminal: Box<dyn Terminal>,
+        forge_config: ForgeConfig,
         tx: UnboundedSender<Msg>,
     ) -> Self {
         let mut app = App {
@@ -262,6 +267,7 @@ impl App {
             agents,
             work: HashMap::new(),
             forge: HashMap::new(),
+            forge_config,
             tx,
             terminal,
             mode: Mode::Normal,
@@ -842,7 +848,8 @@ impl App {
         }
         let tx = self.tx.clone();
         let repo_root = self.store.repo_root.clone();
-        tokio::spawn(async move { forge::run(tx, repo_root, targets).await });
+        let cfg = self.forge_config;
+        tokio::spawn(async move { forge::run(tx, repo_root, targets, cfg).await });
     }
 
     /// Upsert a `(name, path)` into the ws-cache so the path jj does not record
@@ -1848,11 +1855,11 @@ fn agent_color(state: AgentState) -> Color {
 }
 
 /// The compact forge pipeline for a row: a `⚒` sigil then one `letter+glyph` per
-/// step (`f w p s`), each coloured by its live status.
+/// step (`f w p r`), each coloured by its live status.
 fn forge_spans(progress: &ForgeProgress) -> Vec<Span<'static>> {
     use crate::forge::Step;
     let mut spans = vec![Span::styled("⚒ ", Style::default().fg(Color::Magenta))];
-    for step in [Step::Fetch, Step::Weld, Step::Push, Step::Spr] {
+    for step in [Step::Fetch, Step::Weld, Step::Push, Step::Pr] {
         let status = progress.steps[step.index()];
         spans.push(Span::styled(
             format!("{}{} ", step.letter(), forge_glyph(status)),
@@ -1970,6 +1977,7 @@ mod tests {
             },
             HashMap::new(),
             terminal,
+            ForgeConfig::default(),
             tx,
         )
     }
@@ -2230,7 +2238,7 @@ mod tests {
         use crate::forge::{Status, Step, Update};
         let mut app = app_with(&["feat"]);
         app.handle(Msg::Forge(Update::Start(vec!["feat".to_string()])));
-        for step in [Step::Fetch, Step::Weld, Step::Push, Step::Spr] {
+        for step in [Step::Fetch, Step::Weld, Step::Push, Step::Pr] {
             app.handle(Msg::Forge(Update::Step {
                 ws: "feat".to_string(),
                 step,

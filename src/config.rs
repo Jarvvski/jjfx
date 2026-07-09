@@ -15,6 +15,31 @@ use serde::Deserialize;
 pub struct Config {
     /// Which terminal instance hosts workspace sessions, and how to reach it.
     pub terminal: TerminalConfig,
+    /// How the forge pipeline opens and maintains pull requests.
+    pub forge: ForgeConfig,
+}
+
+/// How the forge's final step manages pull requests. jjfx submits PRs natively
+/// over `gh` (ADR 0007) - no third-party CLI - and these settings gate it.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ForgeConfig {
+    /// Whether the forge creates/updates PRs at all. On by default; set false to
+    /// stop the pipeline after push and open PRs yourself.
+    pub pull_requests: bool,
+    /// Open newly-created PRs as drafts. On by default; set false to open them
+    /// ready for review.
+    pub draft: bool,
+}
+
+impl Default for ForgeConfig {
+    fn default() -> Self {
+        // Both default on: forging a workspace opens a draft PR out of the box.
+        ForgeConfig {
+            pull_requests: true,
+            draft: true,
+        }
+    }
 }
 
 /// Where jjfx opens workspace session tabs. Empty (the default) drives the kitty
@@ -37,6 +62,15 @@ pub struct TerminalConfig {
     /// reports the target as not running.
     #[serde(default)]
     pub launch_command: Vec<String>,
+    /// The command (program + args) run in a workspace's left pane. Empty (the
+    /// default) wraps claude in your login shell - `$SHELL -l -i -c claude` - so
+    /// it inherits the PATH your zsh/bash startup files set, matching the two
+    /// shell panes beside it. (kitty execs an explicit `launch` command directly
+    /// rather than through a shell, so a GUI-launched kitty would otherwise hand
+    /// claude launchd's bare environment.) Override it to run a different agent
+    /// or skip the shell wrap, e.g. `["zsh", "-l", "-i", "-c", "claude"]`.
+    #[serde(default)]
+    pub claude_command: Vec<String>,
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml` - the same XDG convention as
@@ -79,6 +113,31 @@ mod tests {
         let cfg: Config = toml::from_str("").expect("empty toml parses");
         assert!(cfg.terminal.listen_on.is_none());
         assert!(cfg.terminal.launch_command.is_empty());
+        assert!(cfg.terminal.claude_command.is_empty());
+        // Forge PR management is on-by-default, drafts on-by-default.
+        assert!(cfg.forge.pull_requests);
+        assert!(cfg.forge.draft);
+    }
+
+    #[test]
+    fn forge_section_overrides_only_the_keys_given() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [forge]
+            draft = false
+            "#,
+        )
+        .expect("toml parses");
+        // Unspecified key keeps its default; the given one is overridden.
+        assert!(cfg.forge.pull_requests);
+        assert!(!cfg.forge.draft);
+    }
+
+    #[test]
+    fn forge_can_disable_pull_requests() {
+        let cfg: Config = toml::from_str("[forge]\npull_requests = false\n").expect("toml parses");
+        assert!(!cfg.forge.pull_requests);
+        assert!(cfg.forge.draft);
     }
 
     #[test]
@@ -88,6 +147,7 @@ mod tests {
             [terminal]
             listen_on = "unix:/tmp/kitty-visor"
             launch_command = ["kitty", "--detach", "-o", "listen_on=unix:/tmp/kitty-visor"]
+            claude_command = ["zsh", "-l", "-i", "-c", "claude"]
             "#,
         )
         .expect("toml parses");
@@ -98,6 +158,10 @@ mod tests {
         assert_eq!(
             cfg.terminal.launch_command,
             ["kitty", "--detach", "-o", "listen_on=unix:/tmp/kitty-visor"]
+        );
+        assert_eq!(
+            cfg.terminal.claude_command,
+            ["zsh", "-l", "-i", "-c", "claude"]
         );
     }
 

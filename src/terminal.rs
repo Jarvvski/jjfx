@@ -53,6 +53,12 @@ pub struct KittyTerminal {
     /// Command (program + args) run to launch the target when its socket isn't
     /// found. Empty never auto-launches.
     launch_command: Vec<String>,
+    /// Command (program + args) run in a tab's left pane. Defaults to claude
+    /// wrapped in the login shell (see [`default_claude_command`]) so it inherits
+    /// the PATH your shell startup files set; kitty execs a `launch` command
+    /// directly, not through a shell, so an unwrapped `claude` would otherwise
+    /// see only the environment kitty itself was started with.
+    claude_command: Vec<String>,
 }
 
 /// How long to wait for a freshly-launched target to expose its socket, and how
@@ -65,9 +71,15 @@ impl KittyTerminal {
     /// Build from config. Empty config reproduces the pre-config behaviour of
     /// driving the surrounding kitty.
     pub fn new(cfg: &TerminalConfig) -> Self {
+        let claude_command = if cfg.claude_command.is_empty() {
+            default_claude_command()
+        } else {
+            cfg.claude_command.clone()
+        };
         Self {
             listen_on: cfg.listen_on.clone(),
             launch_command: cfg.launch_command.clone(),
+            claude_command,
         }
     }
 
@@ -178,7 +190,7 @@ impl Terminal for KittyTerminal {
         // tab is not the active one.
         let mut claude = vec!["launch", "--type=tab", "--tab-title", &title, &cwd_arg];
         claude.extend_from_slice(no_focus);
-        claude.push("claude");
+        claude.extend(self.claude_command.iter().map(String::as_str));
         let win_id = self.launch(&claude)?;
         if win_id.is_empty() {
             return Ok(()); // tab exists but there is no id to anchor splits to
@@ -228,6 +240,22 @@ impl Terminal for KittyTerminal {
         self.run(&["close-tab", "--match", &title_match(name)])?;
         Ok(())
     }
+}
+
+/// The default left-pane command: claude wrapped in the user's login shell as
+/// `$SHELL -l -i -c claude`. `-l` sources the login files (`.zprofile`/`.profile`)
+/// and `-i` the interactive ones (`.zshrc`/`.bashrc`), so claude gets the PATH
+/// its neighbouring shells do regardless of where the user exports it. Falls back
+/// to `/bin/sh` when `$SHELL` is unset (a bare cron-like environment).
+fn default_claude_command() -> Vec<String> {
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    vec![
+        shell,
+        "-l".to_string(),
+        "-i".to_string(),
+        "-c".to_string(),
+        "claude".to_string(),
+    ]
 }
 
 /// Build the argv after the `kitten` program name: always the `@` verb, an
@@ -322,6 +350,15 @@ mod tests {
     #[test]
     fn tab_title_is_prefixed() {
         assert_eq!(tab_title("feat"), "jjfx:feat");
+    }
+
+    #[test]
+    fn default_claude_command_wraps_claude_in_a_login_shell() {
+        let cmd = default_claude_command();
+        // Whatever $SHELL resolves to, claude runs through it as a login+
+        // interactive shell so it inherits the user's PATH.
+        assert_eq!(&cmd[1..], ["-l", "-i", "-c", "claude"]);
+        assert!(!cmd[0].is_empty(), "a shell program is always chosen");
     }
 
     #[test]

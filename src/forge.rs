@@ -1,12 +1,14 @@
-//! The forge pipeline (ADR 0005, ticket 08): fetch -> weld -> push -> spr, run
+//! The forge pipeline (ADR 0005, ticket 08): fetch -> weld -> push -> pr, run
 //! natively with the workspace-safe revsets ported from `jj-forge`, modeled as
-//! real step state that streams to the TUI rather than scraped stdout.
+//! real step state that streams to the TUI rather than scraped stdout. The final
+//! step opens/updates pull requests over `gh` (see [`crate::pr`]); the whole
+//! pipeline depends only on `jj` and `gh`, never a third-party CLI.
 //!
 //! Each mutating step runs with its current directory set to the workspace's own
 //! path, so `@` resolves to *that* workspace's working copy - forging one
 //! workspace never rebases another's chain. Steps shell out via `spawn_blocking`
-//! (jj/gh/jj-spr calls block), and each transition is sent to the single owned
-//! `App` as a [`Msg::Forge`].
+//! (jj/gh calls block), and each transition is sent to the single owned `App` as
+//! a [`Msg::Forge`].
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -16,14 +18,17 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::Msg;
 use crate::cmd::{Run, cmd};
+use crate::config::ForgeConfig;
+use crate::pr;
 
 /// Weld source: the root of this workspace's own mutable chain, rebased onto
 /// `trunk()`. Scoped to `::@` so only this workspace's stack moves.
 const WELD_SRC: &str = "roots(mutable() & mine() & ::@)";
 /// Push revisions: this workspace's chain, minus trunk and any conflicts.
 const PUSH_REVS: &str = "::@ ~ trunk() ~ conflicts()";
-/// The `JJ_SPR_REVSET` handed to `jj-spr`: this workspace's own non-trunk chain.
-const SPR_REVSET: &str = "(::@ ~ trunk()) & mine()";
+/// jj prints this (exit 0) when a push had nothing to do - the signal that a
+/// push moved no revisions despite succeeding.
+const NOTHING_CHANGED: &str = "Nothing changed.";
 
 /// The four forge steps, in pipeline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +36,7 @@ pub enum Step {
     Fetch,
     Weld,
     Push,
-    Spr,
+    Pr,
 }
 
 impl Step {
@@ -41,7 +46,7 @@ impl Step {
             Step::Fetch => 0,
             Step::Weld => 1,
             Step::Push => 2,
-            Step::Spr => 3,
+            Step::Pr => 3,
         }
     }
 
@@ -51,7 +56,7 @@ impl Step {
             Step::Fetch => 'f',
             Step::Weld => 'w',
             Step::Push => 'p',
-            Step::Spr => 's',
+            Step::Pr => 'r',
         }
     }
 
@@ -60,7 +65,7 @@ impl Step {
             Step::Fetch => "fetch",
             Step::Weld => "weld",
             Step::Push => "push",
-            Step::Spr => "spr",
+            Step::Pr => "pr",
         }
     }
 }
@@ -105,7 +110,12 @@ pub struct Target {
 /// Run the forge pipeline for `targets`: a shared `fetch`, then `weld -> push ->
 /// spr` per workspace. Sends each transition as a [`Msg::Forge`]; a send failure
 /// (the app has quit) simply ends the run.
-pub async fn run(tx: UnboundedSender<Msg>, repo_root: PathBuf, targets: Vec<Target>) {
+pub async fn run(
+    tx: UnboundedSender<Msg>,
+    repo_root: PathBuf,
+    targets: Vec<Target>,
+    cfg: ForgeConfig,
+) {
     let names: Vec<String> = targets.iter().map(|t| t.name.clone()).collect();
     send(&tx, Update::Start(names.clone()));
 
@@ -137,15 +147,28 @@ pub async fn run(tx: UnboundedSender<Msg>, repo_root: PathBuf, targets: Vec<Targ
         return;
     }
 
+    // Resolve the repo-wide PR facts (slug + default branch) once, shared by every
+    // target. `None` when PR management is off or there is no origin remote.
+    let pr_ctx = if cfg.pull_requests {
+        pr::context(repo_root.clone(), cfg.draft).await
+    } else {
+        None
+    };
+
     for t in &targets {
-        forge_one(&tx, t).await;
+        forge_one(&tx, t, cfg, pr_ctx.as_ref()).await;
     }
 }
 
 /// Weld -> push -> spr for one workspace, skipping the whole pipeline if its
 /// working copy is conflicted. Each step is best-effort: a failure is reported as
 /// `Skipped` (mirroring `jj-forge`) and the pipeline continues.
-async fn forge_one(tx: &UnboundedSender<Msg>, t: &Target) {
+async fn forge_one(
+    tx: &UnboundedSender<Msg>,
+    t: &Target,
+    cfg: ForgeConfig,
+    pr_ctx: Option<&pr::Context>,
+) {
     if has_conflict(&t.dir).await {
         send(
             tx,
@@ -169,17 +192,46 @@ async fn forge_one(tx: &UnboundedSender<Msg>, t: &Target) {
     );
 
     send(tx, step_running(&t.name, Step::Push));
-    let pushed = jj_in(&t.dir, &["git", "push", "--revisions", PUSH_REVS]).await;
+    let pushed = did_push(&t.dir).await;
     send(
         tx,
         step_result(&t.name, Step::Push, pushed, "nothing to push"),
     );
 
-    send(tx, step_running(&t.name, Step::Spr));
-    let spr = spr_sync(&t.dir).await;
-    send(tx, step_result(&t.name, Step::Spr, spr, "spr sync skipped"));
+    send(tx, step_running(&t.name, Step::Pr));
+    let (ok, reason) = pr_step(cfg, pr_ctx, &t.dir).await;
+    send(
+        tx,
+        Update::Step {
+            ws: t.name.clone(),
+            step: Step::Pr,
+            status: if ok { Status::Ok } else { Status::Skipped },
+            reason,
+        },
+    );
 
     send(tx, Update::Done { ws: t.name.clone() });
+}
+
+/// Run the native PR step, returning `(did_real_work, footer_reason)`. PR
+/// management disabled by config is a no-op success (nothing to report); a
+/// missing context (no origin remote) or a `gh`/`jj` failure is a `Skipped` with
+/// a reason so the row stays honest instead of claiming "forged".
+async fn pr_step(
+    cfg: ForgeConfig,
+    pr_ctx: Option<&pr::Context>,
+    dir: &Path,
+) -> (bool, Option<String>) {
+    if !cfg.pull_requests {
+        return (true, None);
+    }
+    let Some(ctx) = pr_ctx else {
+        return (false, Some("pr: no origin remote".into()));
+    };
+    match pr::submit(ctx.clone(), dir.to_path_buf()).await {
+        pr::Outcome::Did => (true, None),
+        pr::Outcome::Noop(r) | pr::Outcome::Failed(r) => (false, Some(format!("pr: {r}"))),
+    }
 }
 
 fn send(tx: &UnboundedSender<Msg>, update: Update) {
@@ -318,34 +370,37 @@ async fn jj_at(repo_root: &Path, args: &[&str]) -> bool {
 /// Run a jj command in the workspace's directory (so `@` is that workspace's
 /// working copy, and jj snapshots it first - matching `jj-forge`). Success only.
 async fn jj_in(dir: &Path, args: &[&str]) -> bool {
-    let dir = dir.to_path_buf();
-    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
-    tokio::task::spawn_blocking(move || {
-        cmd("jj")
-            .current_dir(&dir)
-            .args(&args)
-            .run()
-            .map(|r| r.ok())
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false)
+    jj_in_run(dir, args).await.map(|r| r.ok()).unwrap_or(false)
 }
 
-/// Run `jj-spr sync` in the workspace dir with the scoped `JJ_SPR_REVSET`.
-async fn spr_sync(dir: &Path) -> bool {
+/// Like [`jj_in`], but hands back the captured [`Run`] so a caller can tell a
+/// no-op from real work (jj exits 0 either way). `None` if it could not spawn.
+async fn jj_in_run(dir: &Path, args: &[&str]) -> Option<Run> {
     let dir = dir.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        cmd("jj-spr")
-            .current_dir(&dir)
-            .env("JJ_SPR_REVSET", SPR_REVSET)
-            .arg("sync")
-            .run()
-            .map(|r| r.ok())
-            .unwrap_or(false)
-    })
-    .await
-    .unwrap_or(false)
+    let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+    tokio::task::spawn_blocking(move || cmd("jj").current_dir(&dir).args(&args).run().ok())
+        .await
+        .ok()
+        .flatten()
+}
+
+/// Push this workspace's chain, reporting whether it *actually pushed anything*.
+/// `jj git push` exits 0 even when there is nothing to push (an unbookmarked or
+/// undescribed working copy, or an already-pushed chain), printing "Nothing
+/// changed." - so keying off the exit code alone marks an empty push a success
+/// and makes the whole forge report "forged" when it moved nothing. Reading the
+/// output turns that no-op into a `Skipped` "nothing to push" instead.
+async fn did_push(dir: &Path) -> bool {
+    match jj_in_run(dir, &["git", "push", "--revisions", PUSH_REVS]).await {
+        Some(run) => pushed_something(run.ok(), run.stdout(), run.stderr()),
+        None => false,
+    }
+}
+
+/// The pure decision behind [`did_push`]: a push did real work only if it exited
+/// zero *and* did not report "Nothing changed." on either stream.
+fn pushed_something(ok: bool, stdout: &str, stderr: &str) -> bool {
+    ok && !stdout.contains(NOTHING_CHANGED) && !stderr.contains(NOTHING_CHANGED)
 }
 
 #[cfg(test)]
@@ -357,7 +412,23 @@ mod tests {
         assert_eq!(Step::Fetch.index(), 0);
         assert_eq!(Step::Weld.index(), 1);
         assert_eq!(Step::Push.index(), 2);
-        assert_eq!(Step::Spr.index(), 3);
+        assert_eq!(Step::Pr.index(), 3);
+    }
+
+    #[test]
+    fn push_noop_is_not_real_work_despite_exit_zero() {
+        // The bug: jj exits 0 with "Nothing changed." on stderr when a push
+        // moved nothing - that must read as a no-op, not a success.
+        assert!(!pushed_something(true, "", "Nothing changed.\n"));
+        assert!(!pushed_something(true, "Nothing changed.\n", ""));
+        // A real push (bookmark moved) has no such line.
+        assert!(pushed_something(
+            true,
+            "",
+            "Changes to push to origin:\n  Add bookmark adam/x to abc123\n"
+        ));
+        // A failed push is never real work.
+        assert!(!pushed_something(false, "", ""));
     }
 
     #[test]

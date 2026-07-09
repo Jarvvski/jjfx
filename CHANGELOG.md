@@ -4,7 +4,36 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-07-09 - Honest forge (v0.16.0): a forge that pushed nothing no longer
+  claims "forged". `jj git push` exits 0 even when it moves nothing (printing
+  "Nothing changed."), so an undescribed or unbookmarked working copy used to
+  sail through the push step and drop the progress overlay as if it had merged
+  work. Push now reads its output and reports "nothing to push" when the push was
+  a no-op, leaving the row honestly "ready to forge".
+
+- 2026-07-09 - Claude pane inherits your shell PATH (v0.15.0): the left pane now
+  launches claude through your login shell (`$SHELL -l -i -c claude`) instead of
+  execing `claude` directly, so it sources your `.zprofile`/`.zshrc` and sees the
+  same PATH as the two shell panes beside it. Previously a GUI-launched kitty
+  handed claude launchd's bare environment, leaving it (and every command it ran)
+  with an empty PATH. A new `[terminal] claude_command` config field overrides
+  the left-pane command (program + args) if you want a different agent or to skip
+  the shell wrap.
+
 ### Added
+
+- 2026-07-09 - Native pull requests (v0.16.0): the forge's final step now opens
+  and maintains PRs itself over `gh`, replacing the external `jj-spr` shell-out -
+  jjfx now depends only on `jj` and `gh`, nothing else on your `PATH`. For each
+  bookmark on a workspace's chain it creates a draft PR (base = the nearest open
+  bookmark below it in the stack, or the repo default branch), titled from the
+  commit description, then rewrites each PR body's `## Stack` navigation section
+  (current PR flagged, merged ones struck through). A new `[forge]` config section
+  tunes it: `pull_requests = false` stops the pipeline after push so you open PRs
+  yourself, and `draft = false` opens new PRs ready for review instead of as
+  drafts. Both default on.
 
 - 2026-07-09 - Target terminal (v0.14.0): a new config file,
   `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, lets you host workspace

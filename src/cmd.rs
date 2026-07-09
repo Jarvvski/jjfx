@@ -61,12 +61,6 @@ impl Cmd {
         self
     }
 
-    /// Set an environment variable for the child.
-    pub fn env<K: AsRef<OsStr>, V: AsRef<OsStr>>(mut self, key: K, val: V) -> Self {
-        self.inner.env(key, val);
-        self
-    }
-
     /// Spawn the command and return immediately, without waiting for it to
     /// finish, with all three standard streams nulled so nothing leaks onto the
     /// alt-screen TUI. For launching a detaching background process (e.g. a
@@ -117,6 +111,13 @@ impl Run {
     /// Captured stdout, whether or not the run succeeded.
     pub fn stdout(&self) -> &str {
         &self.stdout
+    }
+
+    /// Captured stderr, whether or not the run succeeded. jj writes its status
+    /// lines (e.g. "Nothing changed.") here, so callers that must tell a no-op
+    /// from real work read this even on a zero exit.
+    pub fn stderr(&self) -> &str {
+        &self.stderr
     }
 
     /// Owned stdout when the run succeeded, else `None` - the read-only idiom for
