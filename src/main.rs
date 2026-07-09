@@ -83,7 +83,7 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     // (ADR 0004). Rotate before replay so the read is already within the cap.
     let log = events::log_path();
     events::rotate_if_needed(&log, events::MAX_LOG_BYTES).ok();
-    let initial_agents = agent::fold(events::read_events(&log));
+    let initial_agents = agent::AgentStates::replay(events::read_events(&log));
 
     // Filesystem watcher -> Msg::Reload. Held for the duration of the loop.
     let _watcher = watch::watch_repo(&repo_root, tx.clone())?;
@@ -120,7 +120,7 @@ async fn event_loop(
     terminal: &mut tui::Tui,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     repo_root: &std::path::Path,
-    initial_agents: std::collections::HashMap<std::path::PathBuf, agent::AgentState>,
+    initial_agents: agent::AgentStates,
     config: config::Config,
     work_tx: UnboundedSender<()>,
     tx: UnboundedSender<Msg>,

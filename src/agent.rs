@@ -65,7 +65,7 @@ pub fn parse_line(line: &str) -> Option<Event> {
 
 /// The event -> agent-state transition map confirmed in spike 01. Unknown events
 /// (the wider 2.x set jjfx does not model) leave the state unchanged.
-pub fn transition(current: AgentState, event: &str) -> AgentState {
+fn transition(current: AgentState, event: &str) -> AgentState {
     match event {
         "SessionStart" => AgentState::Waiting,
         "UserPromptSubmit" => AgentState::Working,
@@ -79,21 +79,44 @@ pub fn transition(current: AgentState, event: &str) -> AgentState {
 /// Canonicalize a path for use as a join key, falling back to the path as-is
 /// when it cannot be resolved (e.g. a workspace dir that no longer exists). Both
 /// event `cwd`s and workspace paths pass through this so they compare equal.
-pub fn canon(path: &Path) -> PathBuf {
+fn canon(path: &Path) -> PathBuf {
     std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
 }
 
-/// Replay a sequence of events into the current per-workspace agent state, keyed
-/// by canonicalized `cwd`. At most one agent runs per workspace (CONTEXT), so
-/// last-write-wins by log order is the whole rule.
-pub fn fold(events: impl IntoIterator<Item = Event>) -> HashMap<PathBuf, AgentState> {
-    let mut map = HashMap::new();
-    for ev in events {
+/// The per-workspace agent state, folded from the hook-event log and keyed by
+/// canonicalized `cwd`. Owns the map, the per-event fold step, and the canon
+/// join, so startup replay ([`replay`](Self::replay)) and live updates
+/// ([`apply`](Self::apply)) reduce through the same rule and canonicalization
+/// happens in exactly one place. At most one agent runs per workspace (CONTEXT),
+/// so last-write-wins by log order is the whole rule.
+#[derive(Debug, Default)]
+pub struct AgentStates {
+    states: HashMap<PathBuf, AgentState>,
+}
+
+impl AgentStates {
+    /// Startup: replay a sequence of events into a fresh map.
+    pub fn replay(events: impl IntoIterator<Item = Event>) -> Self {
+        let mut this = Self::default();
+        for ev in events {
+            this.apply(&ev);
+        }
+        this
+    }
+
+    /// Live: fold one event into the state, keyed by its canonicalized `cwd`.
+    pub fn apply(&mut self, ev: &Event) {
         let key = canon(Path::new(&ev.cwd));
-        let entry = map.entry(key).or_insert(AgentState::Absent);
+        let entry = self.states.entry(key).or_insert(AgentState::Absent);
         *entry = transition(*entry, &ev.name);
     }
-    map
+
+    /// The agent state for a workspace `path`, canonicalized to match the `cwd`
+    /// keys so the two sides of the join compare equal. `Absent` if the log has
+    /// no events for it.
+    pub fn state_for(&self, path: &Path) -> AgentState {
+        self.states.get(&canon(path)).copied().unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -130,7 +153,7 @@ mod tests {
     }
 
     #[test]
-    fn fold_replays_a_full_turn_per_cwd() {
+    fn replay_folds_a_full_turn_per_cwd() {
         let lines = [
             r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
             r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
@@ -138,9 +161,27 @@ mod tests {
             r#"{"cwd":"/w/a","hook_event_name":"Stop"}"#,
         ];
         let events = lines.iter().filter_map(|l| parse_line(l));
-        let state = fold(events);
+        let states = AgentStates::replay(events);
         // /w/a: Start -> Working -> Waiting; canon() no-ops on nonexistent paths.
-        assert_eq!(state.get(Path::new("/w/a")), Some(&AgentState::Waiting));
-        assert_eq!(state.get(Path::new("/w/b")), Some(&AgentState::Waiting));
+        assert_eq!(states.state_for(Path::new("/w/a")), AgentState::Waiting);
+        assert_eq!(states.state_for(Path::new("/w/b")), AgentState::Waiting);
+    }
+
+    #[test]
+    fn state_for_an_unseen_path_is_absent() {
+        let states = AgentStates::default();
+        assert_eq!(states.state_for(Path::new("/w/never")), AgentState::Absent);
+    }
+
+    #[test]
+    fn apply_advances_a_live_event_through_the_same_fold() {
+        let mut states = AgentStates::default();
+        for name in ["SessionStart", "UserPromptSubmit"] {
+            states.apply(&Event {
+                name: name.to_string(),
+                cwd: "/w/a".to_string(),
+            });
+        }
+        assert_eq!(states.state_for(Path::new("/w/a")), AgentState::Working);
     }
 }

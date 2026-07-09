@@ -3,7 +3,7 @@
 //! redraws (the engine shape from the PRD).
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -219,9 +219,10 @@ impl ForgeProgress {
 /// The whole application state - one owned value on the main task.
 pub struct App {
     store: Store,
-    /// Current agent lifecycle state per workspace, keyed by canonicalized path
-    /// (the `cwd` join from the hook log). Absent workspaces are simply missing.
-    agents: HashMap<PathBuf, AgentState>,
+    /// Current agent lifecycle state per workspace. Owns the fold and the canon
+    /// join (the `cwd` <-> workspace-path key), so startup and live updates
+    /// cannot drift. Absent workspaces are simply missing.
+    agents: agent::AgentStates,
     /// Latest work-lifecycle snapshot per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, Work>,
@@ -260,7 +261,7 @@ pub struct App {
 impl App {
     pub fn new(
         store: Store,
-        agents: HashMap<PathBuf, AgentState>,
+        agents: agent::AgentStates,
         terminal: Box<dyn Terminal>,
         jj: Box<dyn jj::Jj>,
         forge_config: ForgeConfig,
@@ -371,17 +372,14 @@ impl App {
 
     /// Fold one hook event into the per-workspace agent state.
     fn on_agent_event(&mut self, ev: agent::Event) {
-        let key = agent::canon(std::path::Path::new(&ev.cwd));
-        let entry = self.agents.entry(key).or_insert(AgentState::Absent);
-        *entry = agent::transition(*entry, &ev.name);
+        self.agents.apply(&ev);
     }
 
     /// The agent state for a workspace, `Absent` if the log has none for it.
     fn agent_state(&self, w: &Workspace) -> AgentState {
         w.path
             .as_deref()
-            .map(agent::canon)
-            .and_then(|p| self.agents.get(&p).copied())
+            .map(|p| self.agents.state_for(p))
             .unwrap_or_default()
     }
 
@@ -2054,7 +2052,7 @@ mod tests {
                 repo_root: Path::new("/repo").to_path_buf(),
                 workspaces,
             },
-            HashMap::new(),
+            agent::AgentStates::default(),
             terminal,
             jj,
             ForgeConfig::default(),
