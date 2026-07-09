@@ -7,7 +7,7 @@ use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -18,6 +18,7 @@ use crate::agent::{self, AgentState};
 use crate::attention::{self, Attention};
 use crate::config::ForgeConfig;
 use crate::diff::{self, FileDiff};
+use crate::diff_view::Detail;
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::store::{self, Store, Workspace};
@@ -42,88 +43,6 @@ enum Mode {
     /// (ticket 11). The rendered lines are rebuilt each draw from `App::graph`,
     /// so only the [`Viewport`] offset is held here.
     Graph(Viewport),
-}
-
-/// Which pane of the diff-detail view owns the keyboard: the changed-file list or
-/// the scrolling diff.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum DetailFocus {
-    Files,
-    Diff,
-}
-
-/// The progressive-disclosure diff view for one workspace: a changed-file list
-/// with +/- magnitude bars on the left, the selected file's syntect-highlighted
-/// diff on the right. The diff is read asynchronously, so it opens `loading`
-/// until the [`Msg::DiffLoaded`] snapshot lands.
-struct Detail {
-    ws: String,
-    loading: bool,
-    files: Vec<FileDiff>,
-    focus: DetailFocus,
-    /// Cursor into the *filtered* file list.
-    selected: usize,
-    /// Fuzzy filter typed against the file paths.
-    filter: String,
-    /// Vertical scroll of the diff pane. `total` tracks the selected file's line
-    /// count; `height` is refreshed at render.
-    viewport: Viewport,
-    /// Lazy highlighter for the selected file, rebuilt when the selection or
-    /// filter changes. It highlights only as far down as the viewport has needed,
-    /// so navigating between files never highlights a whole large diff up front.
-    /// Boxed - its syntect state is large and would bloat the `Mode` enum inline.
-    hl: Option<Box<diff::FileHighlighter>>,
-}
-
-impl Detail {
-    fn loading(ws: String) -> Self {
-        Detail {
-            ws,
-            loading: true,
-            files: Vec::new(),
-            focus: DetailFocus::Files,
-            selected: 0,
-            filter: String::new(),
-            viewport: Viewport::default(),
-            hl: None,
-        }
-    }
-
-    /// Indices into `files` whose path matches the current fuzzy filter, in diff
-    /// order.
-    fn filtered(&self) -> Vec<usize> {
-        self.files
-            .iter()
-            .enumerate()
-            .filter(|(_, f)| diff::fuzzy_match(&self.filter, &f.path))
-            .map(|(i, _)| i)
-            .collect()
-    }
-
-    /// The file under the cursor in the filtered list, if any.
-    fn current(&self) -> Option<&FileDiff> {
-        self.filtered().get(self.selected).map(|&i| &self.files[i])
-    }
-
-    /// Clamp the cursor into the (possibly narrowed) filtered range, reset the
-    /// scroll, and rehighlight the newly-selected file. Called after any change to
-    /// the selection or filter, never on a plain scroll.
-    fn resync(&mut self) {
-        let len = self.filtered().len();
-        if self.selected >= len {
-            self.selected = len.saturating_sub(1);
-        }
-        // Reset to the top and retarget the viewport at the newly-selected file's
-        // line count, so scrolling clamps correctly even before the next render.
-        let total = self.current().map(|f| f.lines.len()).unwrap_or(0) as u16;
-        self.viewport.jump_top();
-        self.viewport.set_total(total);
-        // A fresh lazy highlighter for the new file; it highlights nothing until
-        // the diff pane renders and asks for the visible window.
-        self.hl = self
-            .current()
-            .map(|f| Box::new(diff::FileHighlighter::new(f)));
-    }
 }
 
 /// Every keybinding, shown in the `?` help overlay. Kept adjacent to
@@ -284,11 +203,9 @@ impl App {
     /// the same workspace (the user may have backed out or switched meanwhile).
     fn on_diff_loaded(&mut self, ws: String, files: Vec<FileDiff>) {
         if let Mode::Detail(d) = &mut self.mode
-            && d.ws == ws
+            && d.workspace() == ws
         {
-            d.files = files;
-            d.loading = false;
-            d.resync();
+            d.loaded(files);
         }
     }
 
@@ -428,61 +345,12 @@ impl App {
         }
     }
 
-    /// Diff-detail keys. Depth is `list → files → diff`: `→` goes deeper, `←`
-    /// shallower, `esc` jumps straight back to the list. In the files pane typing
-    /// fuzzy-filters and the arrows move the cursor; in the diff pane `j/k` and
-    /// `PgUp/PgDn` scroll. `tab` toggles the two panes.
+    /// Forward a key to the open diff viewer; close it when the viewer signals
+    /// exit. The viewer owns all diff-detail key behaviour ([`Detail::on_key`]).
     fn on_key_detail(&mut self, key: KeyEvent) {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let mut exit = false;
-        if let Mode::Detail(d) = &mut self.mode {
-            match d.focus {
-                DetailFocus::Files => match key.code {
-                    KeyCode::Esc | KeyCode::Left => exit = true,
-                    KeyCode::Up => {
-                        d.selected = d.selected.saturating_sub(1);
-                        d.resync();
-                    }
-                    KeyCode::Down => {
-                        d.selected += 1;
-                        d.resync();
-                    }
-                    KeyCode::Right | KeyCode::Tab => {
-                        if !d.filtered().is_empty() {
-                            d.focus = DetailFocus::Diff;
-                        }
-                    }
-                    KeyCode::Backspace => {
-                        d.filter.pop();
-                        d.selected = 0;
-                        d.resync();
-                    }
-                    // Any printable char (not a Ctrl chord) extends the filter.
-                    KeyCode::Char(c) if !ctrl => {
-                        d.filter.push(c);
-                        d.selected = 0;
-                        d.resync();
-                    }
-                    _ => {}
-                },
-                DetailFocus::Diff => match key.code {
-                    KeyCode::Esc => exit = true,
-                    KeyCode::Left | KeyCode::Char('h') | KeyCode::Tab | KeyCode::BackTab => {
-                        d.focus = DetailFocus::Files;
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => d.viewport.line_down(),
-                    KeyCode::Char('k') | KeyCode::Up => d.viewport.line_up(),
-                    KeyCode::Char('d') if ctrl => d.viewport.half_page_down(),
-                    KeyCode::Char('u') if ctrl => d.viewport.half_page_up(),
-                    KeyCode::PageDown => d.viewport.page_down(),
-                    KeyCode::PageUp => d.viewport.page_up(),
-                    KeyCode::Char('g') => d.viewport.jump_top(),
-                    KeyCode::Char('G') => d.viewport.jump_bottom(),
-                    _ => {}
-                },
-            }
-        }
-        if exit {
+        if let Mode::Detail(d) = &mut self.mode
+            && d.on_key(key)
+        {
             self.mode = Mode::Normal;
         }
     }
@@ -1072,7 +940,10 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("diff  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(d.ws.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    d.workspace().to_string(),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
                 Span::styled("  from trunk", Style::default().add_modifier(Modifier::DIM)),
             ])),
             title,
@@ -1089,18 +960,18 @@ impl App {
                 Constraint::Length(GRAPH_PANE_WIDTH),
             ])
             .areas(body);
-            render_files_pane(frame, d, files_area);
-            render_diff_pane(frame, d, diff_area);
-            render_graph_pane(frame, graph.as_ref(), &d.ws, graph_area);
+            d.render_files(frame, files_area);
+            d.render_diff(frame, diff_area);
+            render_graph_pane(frame, graph.as_ref(), d.workspace(), graph_area);
         } else {
             let [files_area, diff_area] =
                 Layout::horizontal([Constraint::Length(FILES_PANE_WIDTH), Constraint::Min(0)])
                     .areas(body);
-            render_files_pane(frame, d, files_area);
-            render_diff_pane(frame, d, diff_area);
+            d.render_files(frame, files_area);
+            d.render_diff(frame, diff_area);
         }
 
-        frame.render_widget(detail_footer(d.focus), footer);
+        frame.render_widget(d.footer(), footer);
     }
 
     /// The full-screen world graph: a title, the bordered graph (trunk plus every
@@ -1299,170 +1170,15 @@ const GRAPH_PANE_WIDTH: u16 = 34;
 /// Minimum diff width to keep the strip; below this the strip is dropped so a
 /// narrow terminal keeps a readable diff.
 const MIN_DIFF_WIDTH: u16 = 40;
-/// Width of a file's +/- magnitude bar, in cells.
-const BAR_W: usize = 8;
 
-/// Bright border when a detail pane has focus, dim otherwise.
-fn pane_border(focused: bool) -> Style {
+/// Bright border when a pane has focus, dim otherwise. Shared by the diff
+/// viewer's panes and the graph views.
+pub(crate) fn pane_border(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::White)
     } else {
         Style::default().fg(Color::DarkGray)
     }
-}
-
-/// The changed-file list: a cursor bullet, a +/- magnitude bar, and the elided
-/// path. Shows loading / empty states in place of the list.
-fn render_files_pane(frame: &mut Frame, d: &Detail, area: Rect) {
-    let focused = d.focus == DetailFocus::Files;
-    let title = if d.filter.is_empty() {
-        " files ".to_string()
-    } else {
-        format!(" files  /{} ", d.filter)
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(pane_border(focused))
-        .title(title);
-
-    if d.loading {
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                " loading…",
-                Style::default().add_modifier(Modifier::DIM),
-            ))
-            .block(block),
-            area,
-        );
-        return;
-    }
-
-    let filtered = d.filtered();
-    if filtered.is_empty() {
-        let msg = if d.files.is_empty() {
-            " no changes from trunk"
-        } else {
-            " no files match"
-        };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                msg,
-                Style::default().add_modifier(Modifier::DIM),
-            ))
-            .block(block),
-            area,
-        );
-        return;
-    }
-
-    let max_total = d
-        .files
-        .iter()
-        .map(|f| f.added + f.removed)
-        .max()
-        .unwrap_or(0)
-        .max(1);
-    // Inner width less the border (2), the bullet (2), the bar and its gap.
-    let name_w = (area.width as usize)
-        .saturating_sub(2 + 2 + BAR_W + 1)
-        .max(4);
-
-    let items: Vec<ListItem> = filtered
-        .iter()
-        .enumerate()
-        .map(|(row, &fi)| {
-            let f = &d.files[fi];
-            let is_sel = row == d.selected;
-            let bullet = if is_sel {
-                Span::styled("▸ ", Style::default().fg(Color::White))
-            } else {
-                Span::raw("  ")
-            };
-            let mut spans = vec![bullet];
-            spans.extend(ratio_bar(f.added, f.removed, max_total));
-            spans.push(Span::raw(" "));
-            let name_style = if is_sel && focused {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else if is_sel {
-                Style::default().add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
-            };
-            spans.push(Span::styled(elide_left(&f.path, name_w), name_style));
-            ListItem::new(Line::from(spans))
-        })
-        .collect();
-
-    let mut state = ListState::default();
-    state.select(Some(d.selected));
-    frame.render_stateful_widget(List::new(items).block(block), area, &mut state);
-}
-
-/// The selected file's diff. Highlighting is advanced lazily to the bottom of the
-/// viewport and only the visible slice is cloned, so both switching files and
-/// scrolling a large diff stay bounded by the viewport, not the diff size (AC:
-/// large diffs must not block the render loop).
-fn render_diff_pane(frame: &mut Frame, d: &mut Detail, area: Rect) {
-    let focused = d.focus == DetailFocus::Diff;
-    // The file index up front, so files and the highlighter can be borrowed
-    // disjointly below.
-    let fi = d.filtered().get(d.selected).copied();
-    let title = match fi {
-        Some(i) => format!(" {} ", d.files[i].path),
-        None => " diff ".to_string(),
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(pane_border(focused))
-        .title(title);
-
-    // The visible height feeds page/scroll math and clamping on the next key.
-    let inner_h = area.height.saturating_sub(2) as usize;
-
-    let Some(fi) = fi else {
-        // Nothing to show: keep the viewport height current (nothing to scroll).
-        d.viewport.resize(inner_h as u16, 0);
-        let msg = if d.loading { " loading…" } else { "" };
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                msg,
-                Style::default().add_modifier(Modifier::DIM),
-            ))
-            .block(block),
-            area,
-        );
-        return;
-    };
-
-    // Record the geometry and clamp scroll to the file's line count (known
-    // without highlighting).
-    let total = d.files[fi].lines.len();
-    d.viewport.resize(inner_h as u16, total as u16);
-    let start = (d.viewport.scroll() as usize).min(total);
-    let end = (start + inner_h).min(total);
-
-    let Some(hl) = d.hl.as_mut() else {
-        frame.render_widget(Paragraph::new("").block(block), area);
-        return;
-    };
-    // Highlight only as far as the viewport bottom, extending a chunk at a time.
-    hl.ensure(&d.files[fi], end);
-    let ready = hl.ready();
-    let hi_end = end.min(ready.len());
-    let visible: Vec<Line> = ready[start.min(hi_end)..hi_end].to_vec();
-    frame.render_widget(Paragraph::new(visible).block(block), area);
-}
-
-/// The detail footer hint, per focused pane.
-fn detail_footer(focus: DetailFocus) -> Paragraph<'static> {
-    let hint = match focus {
-        DetailFocus::Files => " type filter · ↑/↓ file · →/tab diff · esc back ",
-        DetailFocus::Diff => " j/k scroll · PgUp/PgDn page · ←/tab files · esc back ",
-    };
-    Paragraph::new(Span::styled(
-        hint,
-        Style::default().add_modifier(Modifier::DIM),
-    ))
 }
 
 /// Milliseconds since the epoch, for freshness shading. Zero if the clock is
@@ -1747,41 +1463,6 @@ fn render_graph_pane(frame: &mut Frame, graph: Option<&graph::Graph>, ws: &str, 
         None => vec![dim_line(" loading…")],
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
-}
-
-/// A fixed-width +/- magnitude bar: green cells for insertions, red for
-/// deletions (scaled so the busiest file fills the bar), dim dots for the rest.
-fn ratio_bar(added: u32, removed: u32, max_total: u32) -> Vec<Span<'static>> {
-    let total = added + removed;
-    let filled = if total == 0 {
-        0
-    } else {
-        (((total as f64 / max_total as f64) * BAR_W as f64).round() as usize).clamp(1, BAR_W)
-    };
-    let greens = if total == 0 {
-        0
-    } else {
-        (((added as f64 / total as f64) * filled as f64).round() as usize).min(filled)
-    };
-    let reds = filled - greens;
-    let empty = BAR_W - filled;
-    vec![
-        Span::styled("█".repeat(greens), Style::default().fg(Color::Green)),
-        Span::styled("█".repeat(reds), Style::default().fg(Color::Red)),
-        Span::styled("·".repeat(empty), Style::default().fg(Color::DarkGray)),
-    ]
-}
-
-/// Truncate a path to `max` columns, keeping the tail (filename) with a leading
-/// ellipsis when it overflows.
-fn elide_left(s: &str, max: usize) -> String {
-    let len = s.chars().count();
-    if len <= max {
-        return s.to_string();
-    }
-    let keep = max.saturating_sub(1);
-    let tail: String = s.chars().skip(len - keep).collect();
-    format!("…{tail}")
 }
 
 /// A `width` x `height` rect centered in `area`, clamped so it never exceeds the
@@ -2586,94 +2267,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn right_opens_detail_in_a_loading_state() {
+    async fn right_opens_detail_for_the_selected_workspace() {
         let mut app = app_with(&["default", "feat"]);
         app.selected = Some("feat".to_string());
-        // `l` (and `→`) drills in; the diff loads on a background task.
+        // `l` (and `→`) drills into the diff viewer for the selected workspace;
+        // the diff itself loads on a background task. (The loading/populate
+        // behaviour is tested directly against `Detail` in `diff_view`.)
         app.handle(press(KeyCode::Char('l')));
         match &app.mode {
-            Mode::Detail(d) => {
-                assert_eq!(d.ws, "feat");
-                assert!(d.loading);
-            }
+            Mode::Detail(d) => assert_eq!(d.workspace(), "feat"),
             _ => panic!("expected Detail mode"),
-        }
-    }
-
-    #[test]
-    fn diff_loaded_populates_and_selects_first_file() {
-        let app = app_in_detail("feat");
-        match &app.mode {
-            Mode::Detail(d) => {
-                assert!(!d.loading);
-                assert_eq!(d.files.len(), 2);
-                assert_eq!(d.selected, 0);
-                assert_eq!(d.current().unwrap().path, "src/app.rs");
-                // A highlighter is armed for the selection (lazy - it highlights
-                // on the first render, not here).
-                assert!(d.hl.is_some());
-            }
-            _ => panic!("expected Detail mode"),
-        }
-    }
-
-    #[test]
-    fn typing_fuzzy_filters_the_file_list_and_clamps_selection() {
-        let mut app = app_in_detail("feat");
-        // Move to the second file, then filter to only the first.
-        app.handle(press(KeyCode::Down));
-        for c in ['a', 'p', 'p'] {
-            app.handle(press(KeyCode::Char(c)));
-        }
-        match &app.mode {
-            Mode::Detail(d) => {
-                assert_eq!(d.filter, "app");
-                assert_eq!(d.filtered().len(), 1);
-                // Selection clamped back into the narrowed range.
-                assert_eq!(d.selected, 0);
-                assert_eq!(d.current().unwrap().path, "src/app.rs");
-            }
-            _ => panic!("expected Detail mode"),
-        }
-        // Backspacing the filter widens it again.
-        app.handle(press(KeyCode::Backspace));
-        app.handle(press(KeyCode::Backspace));
-        app.handle(press(KeyCode::Backspace));
-        match &app.mode {
-            Mode::Detail(d) => assert_eq!(d.filtered().len(), 2),
-            _ => panic!("expected Detail mode"),
-        }
-    }
-
-    #[test]
-    fn focus_toggles_between_panes_and_diff_scrolls() {
-        let mut app = app_in_detail("feat");
-        // Give the diff pane a viewport (height 1 over the 3-line file) so scroll
-        // clamps like a real render.
-        if let Mode::Detail(d) = &mut app.mode {
-            d.viewport.resize(1, 3);
-        }
-        // → moves focus into the diff pane.
-        app.handle(press(KeyCode::Right));
-        // j scrolls down; k scrolls back to the top (saturating at 0).
-        app.handle(press(KeyCode::Char('j')));
-        match &app.mode {
-            Mode::Detail(d) => {
-                assert_eq!(d.focus, DetailFocus::Diff);
-                assert_eq!(d.viewport.scroll(), 1);
-            }
-            _ => panic!("expected Detail mode"),
-        }
-        app.handle(press(KeyCode::Char('k')));
-        app.handle(press(KeyCode::Char('k')));
-        // ← returns focus to the file list (does not exit the view).
-        app.handle(press(KeyCode::Left));
-        match &app.mode {
-            Mode::Detail(d) => {
-                assert_eq!(d.focus, DetailFocus::Files);
-                assert_eq!(d.viewport.scroll(), 0);
-            }
-            _ => panic!("expected still in Detail mode"),
         }
     }
 

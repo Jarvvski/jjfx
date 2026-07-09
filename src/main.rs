@@ -10,6 +10,7 @@ mod cache;
 mod cmd;
 mod config;
 mod diff;
+mod diff_view;
 mod events;
 mod forge;
 mod graph;
