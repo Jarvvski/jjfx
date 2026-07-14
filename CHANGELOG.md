@@ -4,6 +4,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Added
+
+- 2026-07-14 - Fetch keybinding (v0.18.0): `u` runs `jj git fetch` on a
+  background task and reports the outcome in the footer. Remote-only changes -
+  a PR merged on GitHub, its head branch deleted - now reach the work rows
+  without running a full forge: fetching advances `trunk()` and propagates
+  remote branch deletions, which is what lets a stale "merged" row resolve
+  back to clean.
+
 ### Fixed
 
 - 2026-07-14 - Quitting no longer hangs on an in-flight poll (v0.17.1): pressing

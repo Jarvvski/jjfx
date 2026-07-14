@@ -63,6 +63,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Forge selected", "f"),
     ("Forge all", "F"),
     ("Forge default", "g"),
+    ("Fetch from remote", "u"),
     ("Lift onto trunk", "r"),
     ("Lift all onto trunk", "R"),
     ("Tidy this workspace", "t"),
@@ -85,6 +86,8 @@ pub enum Msg {
     WorkSnapshot(HashMap<String, Work>),
     /// A forge pipeline transition (ticket 08).
     Forge(forge::Update),
+    /// The background `jj git fetch` finished; `Err` carries jj's error text.
+    Fetched(Result<(), String>),
     /// The diff for a workspace finished loading (ticket 10).
     DiffLoaded { ws: String, files: Vec<FileDiff> },
     /// The commit graph finished loading from jj-lib (ticket 11).
@@ -123,6 +126,9 @@ pub struct App {
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs or after one that ended with a skip/failure.
     forge: HashMap<String, ForgeProgress>,
+    /// A background `jj git fetch` is in flight; a second `u` is ignored until
+    /// it resolves (two would just contend on the repo lock).
+    fetching: bool,
     /// How the forge manages pull requests (toggle + draft), handed to each
     /// [`forge::run`].
     forge_config: ForgeConfig,
@@ -167,6 +173,7 @@ impl App {
             agents,
             work: HashMap::new(),
             forge: HashMap::new(),
+            fetching: false,
             forge_config,
             tx,
             terminal,
@@ -191,6 +198,7 @@ impl App {
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
             Msg::WorkSnapshot(work) => self.work = work,
             Msg::Forge(update) => self.on_forge(update),
+            Msg::Fetched(result) => self.on_fetched(result),
             Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
             Msg::GraphLoaded(graph) => self.graph = Some(graph),
         }
@@ -333,6 +341,7 @@ impl App {
             KeyCode::Char('R') => self.lift_all(),
             KeyCode::Char('t') => self.tidyws(),
             KeyCode::Char('T') => self.begin_tidy(),
+            KeyCode::Char('u') => self.fetch(),
             KeyCode::Char('f') => self.forge_selected(),
             KeyCode::Char('F') => self.forge_all(),
             KeyCode::Char('g') => self.forge_default(),
@@ -655,6 +664,40 @@ impl App {
             Ok(true) => "lifted all workspaces onto trunk".to_string(),
             Ok(false) => "nothing to lift".to_string(),
             Err(e) => format!("lift failed: {e}"),
+        });
+        self.reload();
+    }
+
+    /// `u`: fetch from the git remote on a background task (network-bound - it
+    /// must never block the render loop, so unlike the local verbs it cannot go
+    /// through the synchronous `Jj` trait). This is how remote-only changes - a
+    /// PR merged on GitHub, its head branch deleted - reach the work rows
+    /// without running a full forge. The outcome lands as [`Msg::Fetched`].
+    fn fetch(&mut self) {
+        if self.fetching {
+            return;
+        }
+        self.fetching = true;
+        self.status = Some("fetching…".to_string());
+        let tx = self.tx.clone();
+        let repo_root = self.store.repo_root.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || jj::fetch(&repo_root))
+                .await
+                .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+            let _ = tx.send(Msg::Fetched(result.map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    /// Fold the background fetch's outcome into the footer, then reload. The
+    /// explicit reload matters for the no-op case: a fetch that brought nothing
+    /// changes no files, so the watcher stays silent and this is the only
+    /// refresh the row gets.
+    fn on_fetched(&mut self, result: Result<(), String>) {
+        self.fetching = false;
+        self.status = Some(match result {
+            Ok(()) => "fetched".to_string(),
+            Err(e) => format!("fetch failed: {e}"),
         });
         self.reload();
     }
@@ -2123,6 +2166,32 @@ mod tests {
         assert_eq!(
             app.status.as_deref(),
             Some("lifted all workspaces onto trunk")
+        );
+    }
+
+    #[tokio::test]
+    async fn u_starts_one_background_fetch_and_folds_its_outcome() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('u')));
+        assert_eq!(app.status.as_deref(), Some("fetching…"));
+        // A second press while one is in flight is ignored (repo-lock contention).
+        app.handle(press(KeyCode::Char('u')));
+        assert_eq!(app.status.as_deref(), Some("fetching…"));
+
+        app.handle(Msg::Fetched(Ok(())));
+        assert_eq!(app.status.as_deref(), Some("fetched"));
+        // Resolved: the next press may fetch again.
+        app.handle(press(KeyCode::Char('u')));
+        assert_eq!(app.status.as_deref(), Some("fetching…"));
+    }
+
+    #[test]
+    fn fetch_failure_surfaces_the_jj_error_in_the_footer() {
+        let mut app = app_with(&["default"]);
+        app.handle(Msg::Fetched(Err("remote unreachable".into())));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("fetch failed: remote unreachable")
         );
     }
 

@@ -196,6 +196,16 @@ impl Jj for RealJj {
     }
 }
 
+/// Fetch from the git remote (`jj git fetch`), surfacing jj's error text on
+/// failure. This is what advances `trunk()` and propagates remote branch
+/// deletions (clearing a stale "merged" row) without running a full forge.
+/// Blocking and network-bound - callers must run it off the render loop
+/// (`spawn_blocking`), which is why it is a free function rather than a
+/// [`Jj`] method (the boxed trait object cannot move to a worker thread).
+pub fn fetch(repo_root: &Path) -> anyhow::Result<()> {
+    run_mut(repo_root, &["git", "fetch"])
+}
+
 /// Count the revisions matching `revset` via a pure read (`--ignore-working-copy`,
 /// no snapshot). Zero on any failure - the caller then treats it as "nothing to
 /// do" rather than erroring.
