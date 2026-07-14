@@ -23,6 +23,7 @@ mod store;
 mod terminal;
 mod trunk;
 mod tui;
+mod ui_state;
 mod viewport;
 mod watch;
 mod work;
@@ -81,6 +82,8 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     // Load jjfx's own config first: a parse error must surface here, before
     // tui::init() takes over the screen, or the message would be lost.
     let config = config::load()?;
+    // Persisted UI toggles (e.g. the world-graph pane); missing/garbled is fine.
+    let ui = ui_state::load();
 
     let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
 
@@ -103,41 +106,41 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx.clone());
 
-    let mut terminal = tui::init()?;
-    let result = event_loop(
-        &mut terminal,
-        &mut rx,
-        &repo_root,
+    let mut app = App::new(
+        Store::load(&repo_root),
         initial_agents,
-        config,
-        work_tx,
+        Box::new(terminal::KittyTerminal::new(&config.terminal)),
+        Box::new(jj::RealJj::new(repo_root.clone())),
+        config.forge,
+        ui.world_pane,
         tx,
-    )
-    .await;
+    );
+    // A persisted-on world pane needs its first graph load kicked off here (the
+    // load is otherwise only triggered by the toggle keys).
+    app.refresh_graph_if_visible();
+
+    let mut terminal = tui::init()?;
+    let result = event_loop(&mut terminal, &mut rx, &mut app, work_tx).await;
 
     // Always restore, then surface any loop error.
     tui::restore()?;
     terminal.show_cursor().ok();
+
+    // Persist the UI toggles. Best-effort: a failed write of a nicety must not
+    // turn a clean quit into an error.
+    ui_state::save(&ui_state::UiState {
+        world_pane: app.world_pane(),
+    })
+    .ok();
     result
 }
 
 async fn event_loop(
     terminal: &mut tui::Tui,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
-    repo_root: &std::path::Path,
-    initial_agents: agent::AgentStates,
-    config: config::Config,
+    app: &mut App,
     work_tx: UnboundedSender<()>,
-    tx: UnboundedSender<Msg>,
 ) -> anyhow::Result<()> {
-    let mut app = App::new(
-        Store::load(repo_root),
-        initial_agents,
-        Box::new(terminal::KittyTerminal::new(&config.terminal)),
-        Box::new(jj::RealJj::new(repo_root.to_path_buf())),
-        config.forge,
-        tx,
-    );
     terminal.draw(|f| app.render(f))?;
 
     while let Some(first) = rx.recv().await {

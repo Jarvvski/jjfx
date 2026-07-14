@@ -31,6 +31,16 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-14 - Inline world graph (v0.17.0): `w` on the home view now toggles a
+  world-graph pane underneath the workspace list, so you can watch trunk and
+  every workspace's chain without leaving the list. The pane sizes itself to the
+  graph (capped at half the body, dropped on very short terminals), highlights
+  the selected workspace's chain as you move with `j`/`k`, and scrolls with
+  `J`/`K`. The full-screen world graph moved from `w` to `W`. The toggle
+  persists across launches in a new jjfx-owned state file,
+  `${XDG_STATE_HOME:-~/.local/state}/jjfx/ui.toml` (your `config.toml` is never
+  written).
+
 - 2026-07-09 - Native pull requests (v0.16.0): the forge's final step now opens
   and maintains PRs itself over `gh`, replacing the external `jj-spr` shell-out -
   jjfx now depends only on `jj` and `gh`, nothing else on your `PATH`. For each

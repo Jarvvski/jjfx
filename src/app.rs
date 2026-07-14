@@ -55,7 +55,9 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Open workspace", "enter"),
     ("Open in background", "o"),
     ("Diff detail", "→ / l"),
-    ("Commit graph (world)", "w"),
+    ("Toggle world graph pane", "w"),
+    ("Scroll world pane", "J / K"),
+    ("World graph (full screen)", "W"),
     ("New workspace", "n"),
     ("Delete workspace", "d"),
     ("Forge selected", "f"),
@@ -137,6 +139,10 @@ pub struct App {
     /// The last-loaded commit graph (ticket 11), shared by the world view and the
     /// per-workspace strip in the detail view. `None` until first loaded.
     graph: Option<graph::Graph>,
+    /// The inline world-graph pane under the home list: `Some` (holding its
+    /// scroll viewport) when toggled on. The toggle persists across launches as
+    /// [`crate::ui_state::UiState::world_pane`].
+    world: Option<Viewport>,
     /// A transient one-line message shown in the footer (last action's result).
     status: Option<String>,
     /// The attention-grouped, idle-collapsible workspace list: owns grouping,
@@ -153,6 +159,7 @@ impl App {
         terminal: Box<dyn Terminal>,
         jj: Box<dyn jj::Jj>,
         forge_config: ForgeConfig,
+        world_pane: bool,
         tx: UnboundedSender<Msg>,
     ) -> Self {
         let mut app = App {
@@ -166,6 +173,7 @@ impl App {
             jj,
             mode: Mode::Normal,
             graph: None,
+            world: world_pane.then(Viewport::default),
             status: None,
             list: WorkspaceList::default(),
             should_quit: false,
@@ -308,7 +316,18 @@ impl App {
             KeyCode::Enter => self.open_selected(true),
             KeyCode::Char('o') => self.open_selected(false),
             KeyCode::Right | KeyCode::Char('l') => self.open_detail(),
-            KeyCode::Char('w') => self.open_graph(),
+            KeyCode::Char('w') => self.toggle_world(),
+            KeyCode::Char('W') => self.open_graph(),
+            KeyCode::Char('J') => {
+                if let Some(v) = &mut self.world {
+                    v.line_down();
+                }
+            }
+            KeyCode::Char('K') => {
+                if let Some(v) = &mut self.world {
+                    v.line_up();
+                }
+            }
             KeyCode::Char('d') => self.begin_delete_selected(),
             KeyCode::Char('r') => self.lift_selected(),
             KeyCode::Char('R') => self.lift_all(),
@@ -368,7 +387,25 @@ impl App {
         self.spawn_graph_load();
     }
 
-    /// `w`: open the full-screen world graph and kick off an async jj-lib read.
+    /// `w`: toggle the inline world-graph pane under the home list. Turning it
+    /// on kicks off an async jj-lib read; the last-loaded graph (if any) shows
+    /// immediately while the fresh one loads.
+    fn toggle_world(&mut self) {
+        match self.world {
+            Some(_) => self.world = None,
+            None => {
+                self.world = Some(Viewport::default());
+                self.spawn_graph_load();
+            }
+        }
+    }
+
+    /// Whether the inline world-graph pane is on - persisted as UI state at exit.
+    pub fn world_pane(&self) -> bool {
+        self.world.is_some()
+    }
+
+    /// `W`: open the full-screen world graph and kick off an async jj-lib read.
     /// The last-loaded graph shows immediately (if any) while the fresh one loads.
     fn open_graph(&mut self) {
         self.status = None;
@@ -376,14 +413,14 @@ impl App {
         self.spawn_graph_load();
     }
 
-    /// World-graph keys: `j`/`k` (and arrows/page) scroll; `esc`/`w`/`q` return to
+    /// World-graph keys: `j`/`k` (and arrows/page) scroll; `esc`/`W`/`q` return to
     /// the list. The highlighted chain is whatever workspace was selected.
     fn on_key_graph(&mut self, key: KeyEvent) {
         let Mode::Graph(g) = &mut self.mode else {
             return;
         };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('w') => self.mode = Mode::Normal,
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('W') => self.mode = Mode::Normal,
             KeyCode::Char('j') | KeyCode::Down => g.line_down(),
             KeyCode::Char('k') | KeyCode::Up => g.line_up(),
             KeyCode::PageDown => g.page_down(),
@@ -409,10 +446,12 @@ impl App {
         });
     }
 
-    /// Reload the graph if a graph-bearing view is on screen, so it tracks the
-    /// underlying revisions changing (new commits, fetch, forge).
-    fn refresh_graph_if_visible(&self) {
-        if matches!(self.mode, Mode::Graph(_) | Mode::Detail(_)) {
+    /// Reload the graph if a graph-bearing view is on screen (the full-screen
+    /// views or the inline world pane), so it tracks the underlying revisions
+    /// changing (new commits, fetch, forge). Also called once at startup so a
+    /// persisted-on world pane fills in. `pub(crate)` for that startup call.
+    pub(crate) fn refresh_graph_if_visible(&self) {
+        if matches!(self.mode, Mode::Graph(_) | Mode::Detail(_)) || self.world.is_some() {
             self.spawn_graph_load();
         }
     }
@@ -776,6 +815,22 @@ impl App {
             header,
         );
 
+        // The optional world-graph pane under the list: content-sized, capped at
+        // half the body, and dropped entirely when the body is too short to
+        // split usefully (the list stays readable - graceful degradation).
+        let world = self
+            .world
+            .is_some()
+            .then(|| self.world_lines(body.width))
+            .filter(|_| body.height / 2 >= MIN_WORLD_PANE_HEIGHT)
+            .map(|lines| {
+                let h = (lines.len() as u16).saturating_add(2).min(body.height / 2);
+                let [list_area, world_area] =
+                    Layout::vertical([Constraint::Min(0), Constraint::Length(h)]).areas(body);
+                (lines, list_area, world_area)
+            });
+        let list_area = world.as_ref().map_or(body, |(_, list_area, _)| *list_area);
+
         // Build list items from the grouped rows, tracking which item index the
         // selected workspace lands on so the highlight follows it.
         let classified = self.classified();
@@ -798,7 +853,24 @@ impl App {
         drop(rows);
         drop(classified);
 
-        self.list.render_body(frame, body, items, cursor);
+        self.list.render_body(frame, list_area, items, cursor);
+
+        if let Some((lines, _, world_area)) = world
+            && let Some(vp) = &mut self.world
+        {
+            vp.resize(world_area.height.saturating_sub(2), lines.len() as u16);
+            frame.render_widget(
+                Paragraph::new(lines)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(pane_border(false))
+                            .title(" world "),
+                    )
+                    .scroll((vp.scroll(), 0)),
+                world_area,
+            );
+        }
 
         frame.render_widget(self.footer(), footer);
 
@@ -922,14 +994,6 @@ impl App {
     /// The full-screen world graph: a title, the bordered graph (trunk plus every
     /// workspace's chain, the selected chain highlighted), and a scroll footer.
     fn render_graph_world(&mut self, frame: &mut Frame) {
-        // Disjoint borrows: scroll state is `&mut`, the graph and selection `&`.
-        let Self {
-            mode, graph, list, ..
-        } = self;
-        let Mode::Graph(g) = mode else {
-            return;
-        };
-
         let [title, body, footer] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
@@ -937,6 +1001,12 @@ impl App {
         ])
         .horizontal_margin(2)
         .areas(frame.area());
+
+        // Build the lines before mutably borrowing the mode's scroll state.
+        let lines = self.world_lines(body.width);
+        let Mode::Graph(g) = &mut self.mode else {
+            return;
+        };
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
@@ -950,13 +1020,6 @@ impl App {
             title,
         );
 
-        let lines: Vec<Line> = match graph.as_ref() {
-            Some(gr) if !gr.chains.is_empty() => {
-                world_graph_lines(gr, list.selected(), now_millis(), body.width)
-            }
-            Some(_) => vec![dim_line(" (no workspaces)")],
-            None => vec![dim_line(" loading…")],
-        };
         g.resize(body.height.saturating_sub(2), lines.len() as u16);
 
         frame.render_widget(
@@ -978,6 +1041,19 @@ impl App {
             )),
             footer,
         );
+    }
+
+    /// The world graph's rendered lines - trunk plus every workspace's chain,
+    /// the selected chain highlighted - with loading/empty placeholders. Shared
+    /// by the full-screen view and the inline home pane.
+    fn world_lines(&self, width: u16) -> Vec<Line<'static>> {
+        match self.graph.as_ref() {
+            Some(g) if !g.chains.is_empty() => {
+                world_graph_lines(g, self.list.selected(), now_millis(), width)
+            }
+            Some(_) => vec![dim_line(" (no workspaces)")],
+            None => vec![dim_line(" loading…")],
+        }
     }
 
     /// A group-header row: the Attention heading, count, and a fold hint for idle.
@@ -1086,7 +1162,11 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )),
                 None => Paragraph::new(Span::styled(
-                    " j/k move  ? help  q quit ",
+                    if self.world.is_some() {
+                        " j/k move  J/K scroll world  ? help  q quit "
+                    } else {
+                        " j/k move  ? help  q quit "
+                    },
                     Style::default().add_modifier(Modifier::DIM),
                 )),
             },
@@ -1112,6 +1192,9 @@ const GRAPH_PANE_WIDTH: u16 = 34;
 /// Minimum diff width to keep the strip; below this the strip is dropped so a
 /// narrow terminal keeps a readable diff.
 const MIN_DIFF_WIDTH: u16 = 40;
+/// Minimum rows (borders included) the inline world pane needs; when half the
+/// home body is shorter than this the pane is dropped so the list stays usable.
+const MIN_WORLD_PANE_HEIGHT: u16 = 5;
 
 /// Bright border when a pane has focus, dim otherwise. Shared by the diff
 /// viewer's panes and the graph views.
@@ -1640,6 +1723,7 @@ mod tests {
             terminal,
             jj,
             ForgeConfig::default(),
+            false,
             tx,
         )
     }
@@ -2284,6 +2368,120 @@ mod tests {
                 },
             ],
         }
+    }
+
+    #[tokio::test]
+    async fn w_toggles_the_inline_world_pane() {
+        let mut app = app_with(&["default"]);
+        assert!(!app.world_pane());
+        app.handle(press(KeyCode::Char('w')));
+        assert!(app.world_pane(), "w turns the pane on");
+        assert!(matches!(app.mode, Mode::Normal), "no mode change");
+        app.handle(press(KeyCode::Char('w')));
+        assert!(!app.world_pane(), "w again turns it off");
+    }
+
+    #[tokio::test]
+    async fn shift_w_opens_and_closes_the_full_screen_graph() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('W')));
+        assert!(matches!(app.mode, Mode::Graph(_)));
+        app.handle(press(KeyCode::Char('W')));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn app_starts_with_a_persisted_on_world_pane() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
+            Store {
+                repo_root: Path::new("/repo").to_path_buf(),
+                workspaces: vec![],
+            },
+            agent::AgentStates::default(),
+            Box::new(FakeTerminal::default()),
+            Box::new(FakeJj::default()),
+            ForgeConfig::default(),
+            true,
+            tx,
+        );
+        assert!(app.world_pane());
+    }
+
+    #[test]
+    fn home_view_renders_the_world_pane_when_toggled_on() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        app.world = Some(Viewport::default());
+        app.graph = Some(sample_graph());
+
+        let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("world"), "the pane's title is drawn");
+        assert!(
+            text.contains("summary for t1"),
+            "the graph's content is drawn"
+        );
+
+        // A tiny terminal drops the pane rather than corrupting the layout.
+        let mut term = Terminal::new(TestBackend::new(20, 6)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+    }
+
+    #[test]
+    fn home_view_world_pane_shows_loading_before_the_graph_arrives() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default"]);
+        app.world = Some(Viewport::default());
+        // graph is still None: must render a loading state, not panic.
+        let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let text: String = term
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains("loading"));
+    }
+
+    #[test]
+    fn shift_j_and_k_scroll_the_world_pane_only_when_it_is_on() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        // Pane off: J/K are inert (and must not panic).
+        app.handle(press(KeyCode::Char('J')));
+        app.handle(press(KeyCode::Char('K')));
+        assert!(app.world.is_none());
+
+        app.world = Some(Viewport::default());
+        app.graph = Some(sample_graph());
+        // A short terminal gives the pane fewer rows than the graph has lines
+        // (9 for the sample), so there is room to scroll once the render has
+        // recorded the geometry.
+        let mut term = Terminal::new(TestBackend::new(100, 16)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+
+        app.handle(press(KeyCode::Char('J')));
+        assert_eq!(app.world.unwrap().scroll(), 1, "J scrolls the pane down");
+        app.handle(press(KeyCode::Char('K')));
+        assert_eq!(app.world.unwrap().scroll(), 0, "K scrolls it back up");
+        // The list selection never moved: J/K drive the pane, j/k the list.
+        assert_eq!(app.list.selected(), Some("default"));
     }
 
     #[test]
