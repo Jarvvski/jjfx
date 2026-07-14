@@ -1,6 +1,6 @@
 [package]
 name = "jjfx"
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -13,6 +13,9 @@ notify = "8"
 # pollster block_on's jj-lib's async RepoLoader inside spawn_blocking (spike 02).
 jj-lib = "0.43.0"
 pollster = "0.4"
+# The DAG column/edge renderer jj's own CLI uses for `jj log`, so the world
+# graph lays out exactly like jj's. Version matches the jj 0.43.0 workspace pin.
+sapling-renderdag = "0.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # default-fancy swaps onig (a C dependency) for the pure-Rust fancy-regex engine,

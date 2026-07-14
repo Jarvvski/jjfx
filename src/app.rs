@@ -2,7 +2,7 @@
 //! over a channel to the single owned `App`, which the main loop mutates and
 //! redraws (the engine shape from the PRD).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -12,6 +12,8 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, ListItem, Paragraph};
+// sapling-renderdag exports its library as plain `renderdag`.
+use renderdag::{Ancestor, GraphRowRenderer, Renderer};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
@@ -40,9 +42,9 @@ enum Mode {
     Help,
     /// The full-screen diff-detail view for one workspace (ADR 0008).
     Detail(Detail),
-    /// The full-screen "world" commit graph: trunk plus every workspace's chain
-    /// (ticket 11). The rendered lines are rebuilt each draw from `App::graph`,
-    /// so only the [`Viewport`] offset is held here.
+    /// The full-screen "world" commit graph: the repo DAG laid out like
+    /// `jj log` (ticket 11). The rendered lines are rebuilt each draw from
+    /// `App::graph`, so only the [`Viewport`] offset is held here.
     Graph(Viewport),
 }
 
@@ -1100,7 +1102,7 @@ impl App {
                 Span::styled("graph  ", Style::default().add_modifier(Modifier::DIM)),
                 Span::styled("world", Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    "  trunk + every workspace",
+                    "  every workspace, jj log shaped",
                     Style::default().add_modifier(Modifier::DIM),
                 ),
             ])),
@@ -1130,7 +1132,7 @@ impl App {
         );
     }
 
-    /// The world graph's rendered lines - trunk plus every workspace's chain,
+    /// The world graph's rendered lines - the repo DAG laid out like `jj log`,
     /// the selected chain highlighted - with loading/empty placeholders. Shared
     /// by the full-screen view and the inline home pane.
     fn world_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -1399,102 +1401,139 @@ fn commit_line(
     Line::from(spans)
 }
 
-/// The world view: trunk (plus a little context) then each workspace's chain,
-/// the selected chain highlighted. Chains hang off trunk with `├─`/`╰─`
-/// connectors; commits stack directly under their branch header for compactness.
+/// The world view: the commit DAG laid out like `jj log` - every mutable
+/// commit, each fragment's trunk branch point, and the trunk tip, history
+/// below elided as `~`. Columns and edges come from sapling-renderdag (the
+/// renderer jj's own CLI uses), so the shape matches `jj log`'s; the selected
+/// workspace's chain is highlighted.
 fn world_graph_lines(
     g: &graph::Graph,
     selected: Option<&str>,
     now_ms: i64,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let w = width.saturating_sub(2);
+    // The message slot carries a sentinel so the graph prefix can be split
+    // back out of the rendered row and restyled; the text spans are ours.
+    const MARK: char = '\u{1}';
+    let selected_ids: HashSet<&str> = selected
+        .and_then(|w| g.chain(w))
+        .map(|c| {
+            c.commits
+                .iter()
+                .map(String::as_str)
+                .chain([c.head.as_str()])
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut renderer = GraphRowRenderer::new()
+        .output()
+        .with_min_row_height(1)
+        .build_box_drawing();
     let mut lines = Vec::new();
-
-    if let Some(tid) = &g.trunk_id {
-        if let Some(node) = g.nodes.get(tid) {
-            lines.push(commit_line(
-                "",
-                "● ",
-                Color::Cyan,
-                node,
-                false,
-                false,
-                now_ms,
-                w,
-            ));
-        }
-        for id in g.trunk_context.iter().skip(1).take(3) {
-            if let Some(node) = g.nodes.get(id) {
-                lines.push(commit_line(
-                    "│ ",
-                    "○ ",
-                    Color::DarkGray,
-                    node,
-                    false,
-                    false,
-                    now_ms,
-                    w,
-                ));
-            }
-        }
-    }
-    if !g.chains.is_empty() {
-        lines.push(dim_line("│"));
-    }
-
-    let last = g.chains.len().saturating_sub(1);
-    for (i, chain) in g.chains.iter().enumerate() {
-        let is_sel = selected == Some(chain.workspace.as_str());
-        let (conn, prefix) = if i == last {
-            ("╰─ ", "   ")
-        } else {
-            ("├─ ", "│  ")
+    for row in graph::log_rows(g) {
+        let Some(node) = g.nodes.get(&row.id) else {
+            continue;
         };
-        let name_style = if is_sel {
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD)
+        let is_sel = selected_ids.contains(row.id.as_str());
+        let glyph = if !node.wc_of.is_empty() {
+            "@"
+        } else if node.on_trunk {
+            "◆"
         } else {
-            Style::default().add_modifier(Modifier::BOLD)
+            "○"
         };
-        let mut header = vec![
-            Span::raw(conn.to_string()),
-            Span::styled(chain.workspace.clone(), name_style),
-        ];
-        if chain.commits.is_empty() && chain.child.is_none() {
-            header.push(Span::styled(
-                "  on trunk",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-        }
-        lines.push(Line::from(header));
-
-        if let Some(cid) = &chain.child
-            && let Some(node) = g.nodes.get(cid)
-        {
-            let mut l = commit_line(prefix, "◆ ", Color::Yellow, node, false, is_sel, now_ms, w);
-            l.spans.push(Span::styled(
-                "  +1",
-                Style::default().add_modifier(Modifier::DIM),
-            ));
-            lines.push(l);
-        }
-        for id in &chain.commits {
-            if let Some(node) = g.nodes.get(id) {
-                let is_head = id == &chain.head;
-                let glyph = if is_head { "● " } else { "○ " };
-                let color = if is_sel { Color::Cyan } else { Color::Gray };
-                lines.push(commit_line(
-                    prefix, glyph, color, node, is_head, is_sel, now_ms, w,
-                ));
+        let parents = row
+            .edges
+            .iter()
+            .map(|e| match e {
+                graph::LogEdge::Direct(p) => Ancestor::Parent(p.clone()),
+                graph::LogEdge::Elided(p) => Ancestor::Ancestor(p.clone()),
+                graph::LogEdge::Missing => Ancestor::Anonymous,
+            })
+            .collect();
+        let rendered =
+            renderer.next_row(row.id.clone(), parents, glyph.to_string(), MARK.to_string());
+        for text in rendered.lines() {
+            match text.split_once(MARK) {
+                Some((prefix, _)) => {
+                    lines.push(world_row(prefix, glyph, node, is_sel, now_ms, width));
+                }
+                // A pure link/termination row (fork, merge, `~`): no commit text.
+                None => lines.push(dim_line(text)),
             }
-        }
-        if i != last {
-            lines.push(dim_line("│"));
         }
     }
     lines
+}
+
+/// One commit row of the world graph: the graph prefix (edges dim, the node
+/// glyph coloured), then change id, `name@` working-copy badges, summary, and
+/// bookmarks - sized to the pane width.
+fn world_row(
+    prefix: &str,
+    glyph: &str,
+    node: &graph::Node,
+    selected: bool,
+    now_ms: i64,
+    width: u16,
+) -> Line<'static> {
+    let glyph_color = if selected {
+        Color::Cyan
+    } else if !node.wc_of.is_empty() {
+        Color::White
+    } else if node.on_trunk {
+        Color::DarkGray
+    } else {
+        Color::Gray
+    };
+    let edge_style = Style::default().add_modifier(Modifier::DIM);
+    // The glyph is the one non-edge character in the prefix; split on it so
+    // the edges around it stay dim while the node itself is coloured.
+    let (before, after) = prefix.split_once(glyph).unwrap_or((prefix, ""));
+    let mut spans = vec![
+        Span::styled(before.to_string(), edge_style),
+        Span::styled(glyph.to_string(), Style::default().fg(glyph_color)),
+        Span::styled(after.to_string(), edge_style),
+    ];
+
+    let mut id_style = freshness_style(node.timestamp_ms, now_ms);
+    if selected {
+        id_style = id_style.add_modifier(Modifier::BOLD);
+    }
+    spans.push(Span::styled(node.change_id.clone(), id_style));
+    for ws in &node.wc_of {
+        spans.push(Span::styled(
+            format!(" {ws}@"),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
+    let wc_w: usize = node.wc_of.iter().map(|w| w.chars().count() + 2).sum();
+    let bookmarks_w: usize = node.bookmarks.iter().map(|b| b.chars().count() + 1).sum();
+    let used = prefix.chars().count() + node.change_id.chars().count() + wc_w + 1;
+    let budget = (width as usize)
+        .saturating_sub(used + bookmarks_w + 1)
+        .max(6);
+    let summary_style = if selected {
+        Style::default()
+    } else {
+        Style::default().add_modifier(Modifier::DIM)
+    };
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        elide_right(&node.summary, budget),
+        summary_style,
+    ));
+    for bm in &node.bookmarks {
+        spans.push(Span::styled(
+            format!(" {bm}"),
+            Style::default().fg(Color::Magenta),
+        ));
+    }
+    Line::from(spans)
 }
 
 /// The per-workspace strip in the detail view: the one child past `@` (if any),
@@ -2482,23 +2521,30 @@ mod tests {
     /// A small graph: trunk `t1`, a `default` chain `t1 -> c1 -> c2(@)`, and a
     /// `feat` chain with a child past `@`.
     fn sample_graph() -> graph::Graph {
-        let node = |id: &str| graph::Node {
-            id: id.to_string(),
-            change_id: format!("ch{id}"),
-            summary: format!("summary for {id}"),
-            parents: vec![],
-            bookmarks: vec![],
-            timestamp_ms: 0,
-            wc_of: vec![],
-        };
-        let nodes = ["t1", "c1", "c2", "f1", "f2"]
-            .iter()
-            .map(|id| (id.to_string(), node(id)))
-            .collect();
+        let node =
+            |id: &str, parents: &[&str], wc_of: &[&str], on_trunk: bool, ts: i64| graph::Node {
+                id: id.to_string(),
+                change_id: format!("ch{id}"),
+                summary: format!("summary for {id}"),
+                parents: parents.iter().map(|p| p.to_string()).collect(),
+                bookmarks: vec![],
+                timestamp_ms: ts,
+                wc_of: wc_of.iter().map(|w| w.to_string()).collect(),
+                on_trunk,
+            };
+        let nodes = [
+            node("t1", &[], &[], true, 1),
+            node("c1", &["t1"], &[], false, 2),
+            node("c2", &["c1"], &["default"], false, 3),
+            node("f1", &["t1"], &["feat"], false, 4),
+            node("f2", &["f1"], &[], false, 5),
+        ]
+        .into_iter()
+        .map(|n| (n.id.clone(), n))
+        .collect();
         graph::Graph {
             nodes,
             trunk_id: Some("t1".to_string()),
-            trunk_context: vec!["t1".to_string()],
             chains: vec![
                 graph::Chain {
                     workspace: "default".to_string(),

@@ -117,6 +117,9 @@ name = "bitflags"
 version = "2.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b4388bee8683e3d04af747c73422af53102d2bd24d9eadb6cbc100baef4b43f8"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "blake2"
@@ -1694,13 +1697,14 @@ dependencies = [
 
 [[package]]
 name = "jjfx"
-version = "0.21.0"
+version = "0.22.0"
 dependencies = [
  "anyhow",
  "jj-lib",
  "notify",
  "pollster",
  "ratatui",
+ "sapling-renderdag",
  "serde",
  "serde_json",
  "syntect",
@@ -2321,6 +2325,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
+]
+
+[[package]]
+name = "sapling-renderdag"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "edffb89cab87bd0901c5749d576f5d37a1f34e05160e936f463f4e94cc447b61"
+dependencies = [
+ "bitflags 2.13.0",
 ]
 
 [[package]]

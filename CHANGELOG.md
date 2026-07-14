@@ -15,6 +15,14 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Changed
 
+- 2026-07-14 - World graph is now the real jj log DAG (v0.22.0): the world
+  view (full-screen `W` and the inline `w` pane) lays commits out like
+  `jj log` - one topologically ordered graph with fork/merge connectors and
+  elided history (`~`), drawn by sapling-renderdag (the renderer jj's own
+  CLI uses) - instead of stacking each workspace's chain under a name header
+  with the trunk floating disjointedly above. Every workspace's `@` is
+  badged `name@`; the selected workspace's chain stays highlighted.
+
 - 2026-07-14 - Selectable coding agent (v0.20.0): a new `[terminal] agent`
   config key picks which agent a workspace tab's left pane runs - `"claude"`
   (the default) or `"codex"`. Each agent has its own top-level section
