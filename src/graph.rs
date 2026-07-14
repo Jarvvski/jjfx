@@ -343,9 +343,9 @@ pub struct LogRow {
     pub edges: Vec<LogEdge>,
 }
 
-/// Derive the world view's rows, mirroring `jj log`'s default revset: every
-/// mutable commit, every workspace's `@`, each fragment's immutable parent as
-/// context, and the trunk tip - with history below elided.
+/// Derive the world view's rows: every mutable commit, every workspace's `@`,
+/// the full connected trunk history (`::trunk()`), and each fragment's
+/// immutable branch point - with only off-trunk history elided.
 pub fn log_rows(g: &Graph) -> Vec<LogRow> {
     let mut shown: HashSet<&str> = g
         .nodes
@@ -353,7 +353,24 @@ pub fn log_rows(g: &Graph) -> Vec<LogRow> {
         .filter(|n| !n.immutable || !n.wc_of.is_empty())
         .map(|n| n.id.as_str())
         .collect();
-    // Branch points: the immutable parent each mutable fragment sits on.
+    // The trunk spine: every loaded ancestor of the trunk tip, shown connected
+    // (the `::trunk()` mainline history a jj log is read against).
+    if let Some(tid) = &g.trunk_id {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut queue: VecDeque<&str> = VecDeque::from([tid.as_str()]);
+        while let Some(id) = queue.pop_front() {
+            let Some(node) = g.nodes.get(id) else {
+                continue;
+            };
+            if !seen.insert(&node.id) {
+                continue;
+            }
+            shown.insert(&node.id);
+            queue.extend(node.parents.iter().map(String::as_str));
+        }
+    }
+    // Branch points: the immutable parent each mutable fragment sits on
+    // (already covered when it is on the trunk spine).
     let context: Vec<&str> = g
         .nodes
         .values()
@@ -364,9 +381,6 @@ pub fn log_rows(g: &Graph) -> Vec<LogRow> {
         .map(|p| p.id.as_str())
         .collect();
     shown.extend(context);
-    if let Some(tid) = &g.trunk_id {
-        shown.insert(tid);
-    }
 
     // Classify each shown commit's parent edges; elided gaps (undisplayed
     // ancestors between two shown commits, e.g. along the trunk) walk down
@@ -429,9 +443,18 @@ fn walk_to_shown(g: &Graph, shown: &HashSet<&str>, from: &str) -> Vec<LogEdge> {
     out
 }
 
-/// Topologically order the shown commits, children before parents, preferring
-/// to continue the current chain (so a workspace's commits stay contiguous)
-/// and otherwise picking the newest ready commit - the shape `jj log` has.
+/// The displayed ancestor a [`LogEdge`] points at, if any.
+fn edge_target(e: &LogEdge) -> Option<&str> {
+    match e {
+        LogEdge::Direct(p) | LogEdge::Elided(p) => Some(p),
+        LogEdge::Missing => None,
+    }
+}
+
+/// Topologically order the shown commits, children before parents, the way a
+/// jj log reads: the working-copy chains lead (`default` first, mirroring
+/// jj's `log-graph-prioritize`), each fragment stays contiguous and sits
+/// beside its branch point, and the trunk spine flows on down between them.
 fn order_rows(
     g: &Graph,
     shown: &HashSet<&str>,
@@ -439,14 +462,29 @@ fn order_rows(
 ) -> Vec<LogRow> {
     let mut indeg: HashMap<&str, usize> = shown.iter().map(|&id| (id, 0)).collect();
     for out in edges.values() {
-        for e in out {
-            if let LogEdge::Direct(p) | LogEdge::Elided(p) = e
-                && let Some(d) = indeg.get_mut(p.as_str())
-            {
+        for e in out.iter().filter_map(edge_target) {
+            if let Some(d) = indeg.get_mut(e) {
                 *d += 1;
             }
         }
     }
+
+    // A commit's pick priority: its workspace chain's position (`default`
+    // first, then alphabetical - the chains' order), then recency.
+    let mut chain_rank: HashMap<&str, usize> = HashMap::new();
+    for (i, chain) in g.chains.iter().enumerate() {
+        chain_rank.entry(chain.head.as_str()).or_insert(i);
+        for c in &chain.commits {
+            chain_rank.entry(c.as_str()).or_insert(i);
+        }
+    }
+    let key = |id: &str| {
+        (
+            chain_rank.get(id).copied().unwrap_or(usize::MAX),
+            std::cmp::Reverse(g.nodes[id].timestamp_ms),
+            id.to_string(),
+        )
+    };
 
     let mut ready: Vec<&str> = indeg
         .iter()
@@ -454,37 +492,53 @@ fn order_rows(
         .map(|(id, _)| *id)
         .collect();
     let mut rows = Vec::with_capacity(shown.len());
-    let mut prefer: Option<String> = None;
+    // The parent we are working towards - it keeps a chain contiguous, and
+    // while it is blocked by other children (sibling fragments), those emit
+    // first so every fragment lands beside its branch point.
+    let mut goal: Option<String> = None;
     while !ready.is_empty() {
-        // Continue the chain we are on when its parent is ready; else newest.
-        let pos = prefer
-            .take()
-            .and_then(|p| ready.iter().position(|id| *id == p))
+        let pos = goal
+            .as_ref()
+            .and_then(|goa| {
+                ready.iter().position(|id| id == goa).or_else(|| {
+                    // The goal still waits on other children; emit one of them.
+                    ready
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, id)| {
+                            edges[**id].iter().filter_map(edge_target).any(|t| t == goa)
+                        })
+                        .min_by_key(|(_, id)| key(id))
+                        .map(|(i, _)| i)
+                })
+            })
             .unwrap_or_else(|| {
-                let key = |id: &str| (g.nodes[id].timestamp_ms, id.to_string());
                 ready
                     .iter()
                     .enumerate()
-                    .max_by_key(|(_, id)| key(id))
+                    .min_by_key(|(_, id)| key(id))
                     .map(|(i, _)| i)
                     .unwrap_or(0)
             });
         let id = ready.swap_remove(pos);
         let out = edges.get(id).cloned().unwrap_or_default();
-        for e in &out {
-            if let LogEdge::Direct(p) | LogEdge::Elided(p) = e
-                && let Some(d) = indeg.get_mut(p.as_str())
-            {
+        for e in out.iter().filter_map(edge_target) {
+            if let Some(d) = indeg.get_mut(e) {
                 *d -= 1;
                 if *d == 0 {
-                    ready.push(&g.nodes[p.as_str()].id);
+                    ready.push(&g.nodes[e].id);
                 }
             }
         }
-        prefer = out.iter().find_map(|e| match e {
-            LogEdge::Direct(p) | LogEdge::Elided(p) => Some(p.clone()),
-            LogEdge::Missing => None,
-        });
+        // Advance the goal: reaching it (or starting fresh) chases this
+        // commit's first parent next; a sibling emitted while the goal still
+        // waits keeps the goal in place.
+        let sibling_of_goal = goal
+            .as_ref()
+            .is_some_and(|goa| out.iter().filter_map(edge_target).any(|t| t == goa));
+        if goal.as_deref() == Some(id) || !sibling_of_goal {
+            goal = out.iter().find_map(edge_target).map(str::to_string);
+        }
         rows.push(LogRow {
             id: id.to_string(),
             edges: out,
@@ -593,7 +647,8 @@ mod tests {
     #[test]
     fn log_rows_orders_children_before_parents_and_keeps_chains_contiguous() {
         // Two workspaces branch off the trunk tip; a chain's commits must stay
-        // together, newest chain first, trunk tip after everything above it.
+        // together, newest chain first, and the trunk spine flows connected
+        // below everything that branches from it.
         let g = graph_of(
             &[
                 ("b2", &["b1"], false, &["feat"]),
@@ -605,16 +660,16 @@ mod tests {
             "t1",
         );
         let rows = log_rows(&g);
-        assert_eq!(row_ids(&rows), ["b2", "b1", "a1", "t1"]);
-        // The trunk tip's parent is loaded but not shown: history is elided
-        // below it, so its one edge is Missing (t0 reaches nothing shown).
-        assert_eq!(rows[3].edges, vec![LogEdge::Missing]);
+        assert_eq!(row_ids(&rows), ["b2", "b1", "a1", "t1", "t0"]);
+        // The whole trunk history is shown (`::trunk()`), so the tip connects
+        // straight down the spine rather than eliding it away.
+        assert_eq!(rows[3].edges, vec![LogEdge::Direct("t0".to_string())]);
     }
 
     #[test]
-    fn log_rows_elides_the_trunk_gap_between_fragments() {
-        // A workspace sits on an older trunk commit t0; the gap commit t_mid is
-        // not shown, so t1 connects to t0 through an Elided edge.
+    fn log_rows_shows_the_whole_trunk_spine_connected() {
+        // A workspace on an older trunk commit: every trunk commit between the
+        // tip and its branch point renders, connected by direct edges.
         let g = graph_of(
             &[
                 ("a1", &["t0"], false, &["old"]),
@@ -625,15 +680,35 @@ mod tests {
             "t1",
         );
         let rows = log_rows(&g);
-        assert_eq!(row_ids(&rows), ["a1", "t1", "t0"]);
+        assert_eq!(row_ids(&rows), ["a1", "t1", "t_mid", "t0"]);
         let t1 = rows.iter().find(|r| r.id == "t1").unwrap();
-        assert_eq!(t1.edges, vec![LogEdge::Elided("t0".to_string())]);
+        assert_eq!(t1.edges, vec![LogEdge::Direct("t_mid".to_string())]);
+    }
+
+    #[test]
+    fn log_rows_elides_offtrunk_immutable_history_to_the_spine() {
+        // A fragment based on someone else's (immutable, off-trunk) branch:
+        // its branch point shows as an anchor whose hidden history walks down
+        // until it rejoins the trunk spine through an Elided edge.
+        let g = graph_of(
+            &[
+                ("m", &["anchor"], false, &[]),
+                ("anchor", &["gap"], true, &[]),
+                ("gap", &["t0"], true, &[]),
+                ("t1", &["t0"], true, &[]),
+                ("t0", &[], true, &[]),
+            ],
+            "t1",
+        );
+        let rows = log_rows(&g);
+        assert!(!row_ids(&rows).contains(&"gap"), "gap commits stay hidden");
+        let anchor = rows.iter().find(|r| r.id == "anchor").unwrap();
+        assert_eq!(anchor.edges, vec![LogEdge::Elided("t0".to_string())]);
     }
 
     #[test]
     fn log_rows_shows_a_clean_workspace_sitting_on_the_trunk() {
-        // `@` on a trunk commit that is neither tip nor branch point must still
-        // be displayed (the workspace would otherwise vanish from the view).
+        // `@` on a trunk commit keeps its workspace badge on the spine row.
         let g = graph_of(
             &[
                 ("t1", &["t_mid"], true, &[]),
@@ -643,7 +718,39 @@ mod tests {
             "t1",
         );
         let rows = log_rows(&g);
-        assert_eq!(row_ids(&rows), ["t1", "t_mid"]);
+        assert_eq!(row_ids(&rows), ["t1", "t_mid", "t0"]);
+    }
+
+    #[test]
+    fn log_rows_puts_the_default_workspace_chain_first() {
+        // feat's head is newer, but the default workspace's chain leads
+        // (mirroring jj's `log-graph-prioritize` on `@`).
+        let mut g = graph_of(
+            &[
+                ("f1", &["t1"], false, &["feat"]),
+                ("d1", &["t1"], false, &["default"]),
+                ("t1", &[], true, &[]),
+            ],
+            "t1",
+        );
+        g.chains = vec![
+            Chain {
+                workspace: "default".to_string(),
+                head: "d1".to_string(),
+                commits: vec!["d1".to_string()],
+                base: Some("t1".to_string()),
+                child: None,
+            },
+            Chain {
+                workspace: "feat".to_string(),
+                head: "f1".to_string(),
+                commits: vec!["f1".to_string()],
+                base: Some("t1".to_string()),
+                child: None,
+            },
+        ];
+        let rows = log_rows(&g);
+        assert_eq!(row_ids(&rows), ["d1", "f1", "t1"]);
     }
 
     #[test]

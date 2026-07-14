@@ -15,6 +15,14 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Changed
 
+- 2026-07-14 - World graph shows the connected trunk spine (v0.22.2): instead
+  of eliding trunk history down to branch points, the world view now renders
+  every trunk ancestor as a connected `◆` mainline (the `::trunk()` the
+  owner's `jj log` shows), with each mutable fragment attached beside its
+  branch point. Ordering now mirrors jj's `log-graph-prioritize`: the default
+  workspace's chain leads, then the other workspaces, then fragments grouped
+  where they branch - no more free-floating hooks between fragments.
+
 - 2026-07-14 - World graph hides immutable history like jj does (v0.22.1):
   the world view's mutable set now matches jj's `immutable_heads()..` exactly -
   ancestors of trunk, tags, and untracked remote bookmarks (other people's
