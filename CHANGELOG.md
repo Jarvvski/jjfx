@@ -4,6 +4,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Added
+
+- 2026-07-14 - Codex lifecycle tracking (v0.21.0): `jjfx hooks install` now
+  also installs the append hook into codex's `~/.codex/hooks.json` (same
+  events log, same payload shape), so codex sessions drive the agent status
+  column exactly like claude ones. `jjfx hooks status` reports both agents.
+  Codex has no `SessionEnd` hook, so a closed codex session shows `waiting`
+  rather than `ended`.
+
 ### Changed
 
 - 2026-07-14 - Selectable coding agent (v0.20.0): a new `[terminal] agent`

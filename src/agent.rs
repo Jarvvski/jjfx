@@ -1,7 +1,9 @@
-//! The agent lifecycle axis (ADR 0002/0003), event-sourced from Claude Code
-//! hooks. Hooks append raw events to a global JSONL log (ADR 0004); this module
-//! parses each line and folds it into a per-workspace [`AgentState`], keyed by
-//! the event's `cwd` - the clean join to a workspace confirmed by spike 01.
+//! The agent lifecycle axis (ADR 0002/0003), event-sourced from agent hooks.
+//! Claude Code and Codex emit the same event names and payload fields, so one
+//! fold serves both (Codex just lacks `SessionEnd`, see `hooks.rs`). Hooks
+//! append raw events to a global JSONL log (ADR 0004); this module parses each
+//! line and folds it into a per-workspace [`AgentState`], keyed by the event's
+//! `cwd` - the clean join to a workspace confirmed by spike 01.
 //!
 //! Only the three common fields (`hook_event_name`, `cwd`, `session_id`) are
 //! read; no event-specific field is touched, so the un-captured field shapes of
