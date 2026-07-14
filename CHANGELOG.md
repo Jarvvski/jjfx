@@ -6,6 +6,12 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-14 - Quitting no longer hangs on an in-flight poll (v0.17.1): pressing
+  `q` used to leave the process lingering until any mid-flight `gh`/`jj` work
+  snapshot finished, because dropping the tokio runtime joins every blocking
+  task. The runtime now shuts down in the background on exit, so quit returns
+  the prompt immediately.
+
 - 2026-07-09 - Merged PRs read as merged in the work list (v0.16.1): a workspace
   whose PR `gh` reports with a `mergedAt` timestamp but a non-`MERGED` state (e.g.
   a squash-merge recorded as closed) now shows "merged" instead of falling back to

@@ -38,8 +38,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::app::{App, Msg};
 use crate::store::Store;
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // `--version`/`-V` prints "jjfx <version>" and exits before any repo or
@@ -75,7 +74,16 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    run_tui(repo_root).await
+    // Build the runtime explicitly so shutdown can abandon in-flight blocking
+    // tasks. `#[tokio::main]` drops the runtime on return, and that drop joins
+    // every `spawn_blocking` thread - if the work poller had a `gh`/`jj`
+    // snapshot mid-flight when the user quit, the process lingered until the
+    // subprocess finished. `shutdown_background` releases those threads
+    // without waiting.
+    let runtime = tokio::runtime::Runtime::new().context("building tokio runtime")?;
+    let result = runtime.block_on(run_tui(repo_root));
+    runtime.shutdown_background();
+    result
 }
 
 async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
