@@ -15,6 +15,14 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Changed
 
+- 2026-07-14 - World graph hides immutable history like jj does (v0.22.1):
+  the world view's mutable set now matches jj's `immutable_heads()..` exactly -
+  ancestors of trunk, tags, and untracked remote bookmarks (other people's
+  branches) no longer render as orphaned mutable fragments. Previously the
+  boundary was trunk-only and capped at 1,000 commits, so on a large repo
+  thousands of already-landed commits leaked into the view as disconnected `○`
+  chains; the immutable walk is now sized for whole-repo history (50k cap).
+
 - 2026-07-14 - World graph is now the real jj log DAG (v0.22.0): the world
   view (full-screen `W` and the inline `w` pane) lays commits out like
   `jj log` - one topologically ordered graph with fork/merge connectors and

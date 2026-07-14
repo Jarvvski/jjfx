@@ -1438,7 +1438,7 @@ fn world_graph_lines(
         let is_sel = selected_ids.contains(row.id.as_str());
         let glyph = if !node.wc_of.is_empty() {
             "@"
-        } else if node.on_trunk {
+        } else if node.immutable {
             "◆"
         } else {
             "○"
@@ -1482,7 +1482,7 @@ fn world_row(
         Color::Cyan
     } else if !node.wc_of.is_empty() {
         Color::White
-    } else if node.on_trunk {
+    } else if node.immutable {
         Color::DarkGray
     } else {
         Color::Gray
@@ -2522,7 +2522,7 @@ mod tests {
     /// `feat` chain with a child past `@`.
     fn sample_graph() -> graph::Graph {
         let node =
-            |id: &str, parents: &[&str], wc_of: &[&str], on_trunk: bool, ts: i64| graph::Node {
+            |id: &str, parents: &[&str], wc_of: &[&str], immutable: bool, ts: i64| graph::Node {
                 id: id.to_string(),
                 change_id: format!("ch{id}"),
                 summary: format!("summary for {id}"),
@@ -2530,7 +2530,7 @@ mod tests {
                 bookmarks: vec![],
                 timestamp_ms: ts,
                 wc_of: wc_of.iter().map(|w| w.to_string()).collect(),
-                on_trunk,
+                immutable,
             };
         let nodes = [
             node("t1", &[], &[], true, 1),

@@ -43,22 +43,24 @@ pub struct Node {
     pub timestamp_ms: i64,
     /// Workspace names whose working-copy `@` is this commit (usually 0 or 1).
     pub wc_of: Vec<String>,
-    /// Whether this commit is on the trunk line (an ancestor of `trunk()`).
-    pub on_trunk: bool,
+    /// Whether this commit is immutable in jj's default sense - an ancestor of
+    /// `trunk()`, a tag, or an untracked remote bookmark (other people's work).
+    pub immutable: bool,
 }
 
-/// One workspace's chain: its own commits above `trunk()`, the trunk commit it
-/// attaches to, and the one child past `@` (the "n+1").
+/// One workspace's chain: its own commits above the immutable boundary, the
+/// boundary commit it attaches to, and the one child past `@` (the "n+1").
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chain {
     pub workspace: String,
     /// The working-copy `@` commit id (may equal `base` for a clean workspace
     /// sitting on the trunk tip, in which case `commits` is empty).
     pub head: String,
-    /// Trunk-exclusive commits, ordered `@` (or nearest) down to the branch
-    /// point. Empty when the workspace sits directly on trunk.
+    /// The workspace's own mutable commits, ordered `@` (or nearest) down to
+    /// the branch point. Empty when the workspace sits directly on trunk.
     pub commits: Vec<String>,
-    /// The trunk commit this chain branches from, if it was reached.
+    /// The immutable commit (usually on trunk) this chain branches from, if it
+    /// was reached.
     pub base: Option<String>,
     /// One child of `@`, if `@` is not itself a leaf (the "n+1" context commit).
     pub child: Option<String>,
@@ -124,36 +126,54 @@ pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
 
     let trunk_id = crate::trunk::resolve(view, store, root.clone());
 
-    // Phase A: trunk ancestors (bounded), so we can tell where a branch rejoins
-    // the mainline without walking all of history.
+    // The immutable boundary heads, mirroring jj's `builtin_immutable_heads()`:
+    // trunk, tags, and untracked remote bookmarks (other people's work). The
+    // colocated `git` pseudo-remote is not a real remote and does not count
+    // (same rule as `crate::trunk`).
+    let mut immutable_heads: Vec<CommitId> = vec![trunk_id.clone()];
+    for (symbol, remote_ref) in view.all_remote_bookmarks() {
+        if symbol.remote != jj_lib::git::REMOTE_NAME_FOR_LOCAL_GIT_REPO
+            && !remote_ref.is_tracked()
+            && let Some(id) = remote_ref.target.as_normal()
+        {
+            immutable_heads.push(id.clone());
+        }
+    }
+    for (_, target) in view.tags() {
+        if let Some(id) = target.local_target.as_normal() {
+            immutable_heads.push(id.clone());
+        }
+    }
+
+    // Phase A: immutable ancestors (bounded), so we can tell where a branch
+    // rejoins already-landed history without walking past it.
     let mut loaded: HashMap<CommitId, jj_lib::commit::Commit> = HashMap::new();
-    let mut trunk_ancestors: HashSet<CommitId> = HashSet::new();
-    let mut queue: VecDeque<CommitId> = VecDeque::new();
-    queue.push_back(trunk_id.clone());
+    let mut immutable: HashSet<CommitId> = HashSet::new();
+    let mut queue: VecDeque<CommitId> = immutable_heads.into_iter().collect();
     while let Some(id) = queue.pop_front() {
-        if trunk_ancestors.contains(&id) || trunk_ancestors.len() >= TRUNK_ANCESTOR_CAP {
+        if immutable.contains(&id) || immutable.len() >= IMMUTABLE_ANCESTOR_CAP {
             continue;
         }
         let commit = match store.get_commit(&id) {
             Ok(c) => c,
             Err(_) => continue,
         };
-        trunk_ancestors.insert(id.clone());
+        immutable.insert(id.clone());
         for p in commit.parent_ids() {
             queue.push_back(p.clone());
         }
         loaded.insert(id, commit);
     }
 
-    // Phase B: the workspace neighbourhood. Seed with every head and every `@`
-    // (heads capture children of `@`); walk parents but stop at the trunk
-    // boundary so we never pull in deep mainline history.
+    // Phase B: the mutable neighbourhood. Seed with every head and every `@`
+    // (heads capture children of `@`); walk parents but stop at the immutable
+    // boundary so we never pull in deep landed history.
     let mut seeds: Vec<CommitId> = view.heads().iter().cloned().collect();
     seeds.extend(wc.values().cloned());
     let mut expanded: HashSet<CommitId> = HashSet::new();
     let mut queue: VecDeque<CommitId> = seeds.into_iter().collect();
     while let Some(id) = queue.pop_front() {
-        if !expanded.insert(id.clone()) || loaded.len() >= NEIGHBOURHOOD_CAP {
+        if !expanded.insert(id.clone()) || expanded.len() > NEIGHBOURHOOD_CAP {
             continue;
         }
         let parents = match loaded.get(&id) {
@@ -167,9 +187,9 @@ pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
                 Err(_) => continue,
             },
         };
-        // Boundary: a commit on the trunk line is an anchor, not something to
-        // expand through.
-        if trunk_ancestors.contains(&id) {
+        // Boundary: an immutable commit is an anchor, not something to expand
+        // through.
+        if immutable.contains(&id) {
             continue;
         }
         for p in parents {
@@ -177,24 +197,26 @@ pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
         }
     }
 
-    Ok(build(&loaded, &bookmarks, &wc, &trunk_ancestors, &trunk_id))
+    Ok(build(&loaded, &bookmarks, &wc, &immutable, &trunk_id))
 }
 
-/// Depth caps: bounded so a huge repo never stalls the read. A workspace's branch
-/// point is normally a handful of commits back; these are generous safety nets.
-const TRUNK_ANCESTOR_CAP: usize = 1000;
+/// Depth caps: bounded so a pathological repo never stalls the read. The
+/// immutable walk must cover the whole landed history (a branch point below the
+/// cap would misclassify everything under it as mutable), so its cap is sized
+/// for very large repos, not typical ones.
+const IMMUTABLE_ANCESTOR_CAP: usize = 50_000;
 const NEIGHBOURHOOD_CAP: usize = 3000;
 /// Longest single workspace chain we will render before giving up (graceful).
 const CHAIN_CAP: usize = 500;
 
 /// Assemble the graph from loaded commits. Projects the jj-lib `Commit` map into
-/// plain string maps up front, then delegates the chain/trunk-boundary logic to
-/// the pure [`build_chains`] so that logic is unit-testable without a real store.
+/// plain string maps up front, then delegates the chain/boundary logic to the
+/// pure [`build_chains`] so that logic is unit-testable without a real store.
 fn build(
     loaded: &HashMap<CommitId, jj_lib::commit::Commit>,
     bookmarks: &HashMap<CommitId, Vec<String>>,
     wc: &BTreeMap<String, CommitId>,
-    trunk_ancestors: &HashSet<CommitId>,
+    immutable: &HashSet<CommitId>,
     trunk_id: &CommitId,
 ) -> Graph {
     let wc_of: HashMap<String, Vec<String>> = {
@@ -221,16 +243,16 @@ fn build(
                 bookmarks: bookmarks.get(id).cloned().unwrap_or_default(),
                 timestamp_ms: commit.author().timestamp.timestamp.0,
                 wc_of: wc_of.get(&hex).cloned().unwrap_or_default(),
-                on_trunk: trunk_ancestors.contains(id),
+                immutable: immutable.contains(id),
                 id: hex.clone(),
             };
             (hex, node)
         })
         .collect();
 
-    let trunk_ancestors: HashSet<String> = trunk_ancestors.iter().map(ObjectId::hex).collect();
+    let immutable: HashSet<String> = immutable.iter().map(ObjectId::hex).collect();
     let wc_hex: BTreeMap<String, String> = wc.iter().map(|(n, id)| (n.clone(), id.hex())).collect();
-    let chains = build_chains(&nodes, &wc_hex, &trunk_ancestors);
+    let chains = build_chains(&nodes, &wc_hex, &immutable);
 
     Graph {
         trunk_id: loaded.contains_key(trunk_id).then(|| trunk_id.hex()),
@@ -240,13 +262,13 @@ fn build(
 }
 
 /// Pure per-workspace chain derivation over the string node map. Each chain is a
-/// first-parent walk from `@` down to the trunk boundary, plus the one child past
-/// `@`. First-parent keeps the chain linear; merges (rare in these workspaces)
-/// show only their mainline side, which is acceptable for v1.
+/// first-parent walk from `@` down to the immutable boundary, plus the one child
+/// past `@`. First-parent keeps the chain linear; merges (rare in these
+/// workspaces) show only their mainline side, which is acceptable for v1.
 fn build_chains(
     nodes: &BTreeMap<String, Node>,
     wc: &BTreeMap<String, String>,
-    trunk_ancestors: &HashSet<String>,
+    immutable: &HashSet<String>,
 ) -> Vec<Chain> {
     // Reverse adjacency, to find the child past `@`.
     let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -262,7 +284,7 @@ fn build_chains(
             let mut commits = Vec::new();
             let mut cur = at.clone();
             let mut depth = 0;
-            while !trunk_ancestors.contains(&cur) && depth < CHAIN_CAP {
+            while !immutable.contains(&cur) && depth < CHAIN_CAP {
                 commits.push(cur.clone());
                 let Some(parent) = nodes.get(&cur).and_then(|n| n.parents.first()).cloned() else {
                     break;
@@ -270,7 +292,7 @@ fn build_chains(
                 cur = parent;
                 depth += 1;
             }
-            let base = trunk_ancestors.contains(&cur).then(|| cur.clone());
+            let base = immutable.contains(&cur).then(|| cur.clone());
 
             // The "n+1": the child of `@` (deterministic by id), only meaningful
             // when `@` is not a leaf - e.g. after `jj edit`ing into history.
@@ -322,23 +344,23 @@ pub struct LogRow {
 }
 
 /// Derive the world view's rows, mirroring `jj log`'s default revset: every
-/// mutable (off-trunk) commit, every workspace's `@`, each of their trunk
-/// parents as context, and the trunk tip - with history below elided.
+/// mutable commit, every workspace's `@`, each fragment's immutable parent as
+/// context, and the trunk tip - with history below elided.
 pub fn log_rows(g: &Graph) -> Vec<LogRow> {
     let mut shown: HashSet<&str> = g
         .nodes
         .values()
-        .filter(|n| !n.on_trunk || !n.wc_of.is_empty())
+        .filter(|n| !n.immutable || !n.wc_of.is_empty())
         .map(|n| n.id.as_str())
         .collect();
-    // Branch points: the trunk parent each mutable fragment sits on.
+    // Branch points: the immutable parent each mutable fragment sits on.
     let context: Vec<&str> = g
         .nodes
         .values()
-        .filter(|n| !n.on_trunk && shown.contains(n.id.as_str()))
+        .filter(|n| !n.immutable && shown.contains(n.id.as_str()))
         .flat_map(|n| &n.parents)
         .filter_map(|p| g.nodes.get(p))
-        .filter(|p| p.on_trunk)
+        .filter(|p| p.immutable)
         .map(|p| p.id.as_str())
         .collect();
     shown.extend(context);
@@ -529,21 +551,21 @@ mod tests {
                     bookmarks: vec![],
                     timestamp_ms: 0,
                     wc_of: vec![],
-                    on_trunk: false,
+                    immutable: false,
                 };
                 (node.id.clone(), node)
             })
             .collect()
     }
 
-    /// A Graph for `log_rows` tests: `(id, parents, on_trunk, wc_of)` rows,
+    /// A Graph for `log_rows` tests: `(id, parents, immutable, wc_of)` rows,
     /// timestamps descending in declaration order (first row newest).
     fn graph_of(rows: &[(&str, &[&str], bool, &[&str])], trunk_id: &str) -> Graph {
         let count = rows.len() as i64;
         let nodes: BTreeMap<String, Node> = rows
             .iter()
             .enumerate()
-            .map(|(i, (id, parents, on_trunk, wc_of))| {
+            .map(|(i, (id, parents, immutable, wc_of))| {
                 let node = Node {
                     id: id.to_string(),
                     change_id: id.to_string(),
@@ -552,7 +574,7 @@ mod tests {
                     bookmarks: vec![],
                     timestamp_ms: count - i as i64,
                     wc_of: wc_of.iter().map(|w| w.to_string()).collect(),
-                    on_trunk: *on_trunk,
+                    immutable: *immutable,
                 };
                 (node.id.clone(), node)
             })
