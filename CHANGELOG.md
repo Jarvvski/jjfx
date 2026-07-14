@@ -4,6 +4,14 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-07-14 - Footer status messages expire (v0.19.0): the transient result
+  line after an action ("lifted feat onto trunk", "fetched", ...) now clears
+  itself after 5 seconds instead of sitting in the footer until the next
+  action. In-flight progress ("fetching…") still stays until its outcome
+  arrives.
+
 ### Added
 
 - 2026-07-14 - Fetch keybinding (v0.18.0): `u` runs `jj git fetch` on a

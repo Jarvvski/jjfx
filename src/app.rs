@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
@@ -92,7 +92,14 @@ pub enum Msg {
     DiffLoaded { ws: String, files: Vec<FileDiff> },
     /// The commit graph finished loading from jj-lib (ticket 11).
     GraphLoaded(graph::Graph),
+    /// A footer status message's expiry timer fired. Carries the generation it
+    /// was armed for; a stale one (an action replaced the message since) is a
+    /// no-op.
+    StatusExpired(u64),
 }
+
+/// How long a transient footer status message stays before expiring.
+const STATUS_TTL: Duration = Duration::from_secs(5);
 
 /// The live forge progress for one workspace: the four steps' statuses, whether a
 /// pipeline is still running, and the last skip/abort reason (for the footer).
@@ -151,6 +158,9 @@ pub struct App {
     world: Option<Viewport>,
     /// A transient one-line message shown in the footer (last action's result).
     status: Option<String>,
+    /// Bumped whenever the status is replaced, so an expiry timer armed for an
+    /// older message cannot clear a newer one.
+    status_gen: u64,
     /// The attention-grouped, idle-collapsible workspace list: owns grouping,
     /// the idle fold, and the name-tracked selection + render cursor. `App`
     /// supplies the [`Attention`] per workspace via [`App::classified`].
@@ -182,6 +192,7 @@ impl App {
             graph: None,
             world: world_pane.then(Viewport::default),
             status: None,
+            status_gen: 0,
             list: WorkspaceList::default(),
             should_quit: false,
         };
@@ -201,6 +212,11 @@ impl App {
             Msg::Fetched(result) => self.on_fetched(result),
             Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
             Msg::GraphLoaded(graph) => self.graph = Some(graph),
+            Msg::StatusExpired(generation) => {
+                if generation == self.status_gen {
+                    self.status = None;
+                }
+            }
         }
     }
 
@@ -212,6 +228,30 @@ impl App {
         {
             d.loaded(files);
         }
+    }
+
+    /// Show a transient footer message and arm a timer to clear it after
+    /// [`STATUS_TTL`]. The generation stamp disarms any earlier timer, so an old
+    /// expiry can never wipe a newer message.
+    fn set_status(&mut self, msg: String) {
+        self.pin_status(msg);
+        let generation = self.status_gen;
+        let tx = self.tx.clone();
+        // Unit tests drive `handle` without a tokio runtime; there the message
+        // simply never expires, which keeps assertions on `status` simple.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                tokio::time::sleep(STATUS_TTL).await;
+                let _ = tx.send(Msg::StatusExpired(generation));
+            });
+        }
+    }
+
+    /// Show a footer message that stays until replaced - for in-flight progress
+    /// ("fetching…") whose end is signalled by a later message, not a timer.
+    fn pin_status(&mut self, msg: String) {
+        self.status_gen += 1;
+        self.status = Some(msg);
     }
 
     /// Fold one forge transition into per-workspace progress and the footer.
@@ -240,14 +280,14 @@ impl App {
                 entry.steps[step.index()] = Some(status);
                 if let Some(r) = reason {
                     entry.reason = Some(r.clone());
-                    self.status = Some(format!("{ws}: {r}"));
+                    self.set_status(format!("{ws}: {r}"));
                 }
             }
             forge::Update::Skip { ws, reason } => {
                 let entry = self.forge.entry(ws.clone()).or_default();
                 entry.active = false;
                 entry.reason = Some(reason.clone());
-                self.status = Some(format!("{ws}: {reason}"));
+                self.set_status(format!("{ws}: {reason}"));
             }
             forge::Update::Done { ws } => {
                 if let Some(entry) = self.forge.get_mut(&ws) {
@@ -256,7 +296,7 @@ impl App {
                     // (picked up by the poller) speaks for itself.
                     if entry.clean_success() {
                         self.forge.remove(&ws);
-                        self.status = Some(format!("{ws}: forged"));
+                        self.set_status(format!("{ws}: forged"));
                     }
                 }
                 // A forge moves revisions (weld/push); refresh the graph if shown.
@@ -265,7 +305,7 @@ impl App {
             forge::Update::Aborted(reason) => {
                 // Drop every still-running overlay; the run did no per-ws work.
                 self.forge.retain(|_, p| !p.active);
-                self.status = Some(format!("forge aborted: {reason}"));
+                self.set_status(format!("forge aborted: {reason}"));
             }
         }
     }
@@ -528,7 +568,7 @@ impl App {
             return;
         };
         let Some(path) = w.path.clone() else {
-            self.status = Some(format!("no path known for '{}'", w.name));
+            self.set_status(format!("no path known for '{}'", w.name));
             return;
         };
         let result = if self.terminal.is_open(&w.name) {
@@ -541,7 +581,7 @@ impl App {
             self.terminal.open(&w.name, &path, focus)
         };
         if let Err(e) = result {
-            self.status = Some(format!("open failed: {e}"));
+            self.set_status(format!("open failed: {e}"));
         }
     }
 
@@ -552,7 +592,7 @@ impl App {
             return;
         };
         if w.name == store::DEFAULT_WORKSPACE {
-            self.status = Some("the default workspace cannot be deleted".to_string());
+            self.set_status("the default workspace cannot be deleted".to_string());
             return;
         }
         self.mode = Mode::ConfirmDelete(w.name.clone());
@@ -563,25 +603,25 @@ impl App {
     fn create_workspace(&mut self, name: &str) {
         let name = name.trim();
         if name.is_empty() {
-            self.status = Some("workspace name required".to_string());
+            self.set_status("workspace name required".to_string());
             return;
         }
         if self.store.workspaces.iter().any(|w| w.name == name) {
-            self.status = Some(format!("workspace '{name}' already exists"));
+            self.set_status(format!("workspace '{name}' already exists"));
             return;
         }
         let path = store::new_workspace_path(&self.store.repo_root, name);
         if let Err(e) = self.jj.add_workspace(name, &path) {
-            self.status = Some(format!("create failed: {e}"));
+            self.set_status(format!("create failed: {e}"));
             return;
         }
         if let Err(e) = self.persist_cache_add(name, &path) {
-            self.status = Some(format!("cache write failed: {e}"));
+            self.set_status(format!("cache write failed: {e}"));
         }
         self.reload();
         match self.terminal.open(name, &path, true) {
-            Ok(()) => self.status = Some(format!("created '{name}'")),
-            Err(e) => self.status = Some(format!("created '{name}', tab failed: {e}")),
+            Ok(()) => self.set_status(format!("created '{name}'")),
+            Err(e) => self.set_status(format!("created '{name}', tab failed: {e}")),
         }
     }
 
@@ -589,7 +629,7 @@ impl App {
     /// directory (guarded - never the repo root), drop it from the cache, reload.
     fn delete_workspace(&mut self, name: &str) {
         if name == store::DEFAULT_WORKSPACE {
-            self.status = Some("the default workspace cannot be deleted".to_string());
+            self.set_status("the default workspace cannot be deleted".to_string());
             return;
         }
         let path = self
@@ -601,7 +641,7 @@ impl App {
 
         let _ = self.terminal.close(name); // best-effort; jj is the source of truth
         if let Err(e) = self.jj.forget_workspace(name) {
-            self.status = Some(format!("delete failed: {e}"));
+            self.set_status(format!("delete failed: {e}"));
             return;
         }
         if let Some(p) = path
@@ -612,18 +652,19 @@ impl App {
         }
         let _ = self.persist_cache_remove(name);
         self.reload();
-        self.status = Some(format!("deleted '{name}'"));
+        self.set_status(format!("deleted '{name}'"));
     }
 
     /// `t`: reset idle, empty, undescribed workspace working-copies onto latest
     /// `trunk()`. Non-destructive (workspaces with real work are untouched), so it
     /// runs without confirmation; the poller refreshes each row's `behind` count.
     fn tidyws(&mut self) {
-        self.status = Some(match self.jj.tidyws() {
+        let msg = match self.jj.tidyws() {
             Ok(0) => "tidyws: nothing to reset".to_string(),
             Ok(n) => format!("tidyws: reset {n} workspace(s) onto trunk"),
             Err(e) => format!("tidyws failed: {e}"),
-        });
+        };
+        self.set_status(msg);
         self.reload();
     }
 
@@ -636,11 +677,12 @@ impl App {
     /// Abandon junk empties across the repo (mutable, empty, undescribed,
     /// unbookmarked, untagged, never `@`), after confirmation.
     fn tidy(&mut self) {
-        self.status = Some(match self.jj.tidy() {
+        let msg = match self.jj.tidy() {
             Ok(0) => "tidy: nothing to abandon".to_string(),
             Ok(n) => format!("tidy: abandoned {n} junk empty change(s)"),
             Err(e) => format!("tidy failed: {e}"),
-        });
+        };
+        self.set_status(msg);
         self.reload();
     }
 
@@ -650,21 +692,23 @@ impl App {
         let Some(w) = self.selected_workspace().cloned() else {
             return;
         };
-        self.status = Some(match self.jj.lift(&w.name) {
+        let msg = match self.jj.lift(&w.name) {
             Ok(true) => format!("lifted {} onto trunk", w.name),
             Ok(false) => format!("{}: nothing to lift", w.name),
             Err(e) => format!("lift failed: {e}"),
-        });
+        };
+        self.set_status(msg);
         self.reload();
     }
 
     /// `R`: lift every workspace's stack onto trunk in one rebase.
     fn lift_all(&mut self) {
-        self.status = Some(match self.jj.lift_all() {
+        let msg = match self.jj.lift_all() {
             Ok(true) => "lifted all workspaces onto trunk".to_string(),
             Ok(false) => "nothing to lift".to_string(),
             Err(e) => format!("lift failed: {e}"),
-        });
+        };
+        self.set_status(msg);
         self.reload();
     }
 
@@ -678,7 +722,7 @@ impl App {
             return;
         }
         self.fetching = true;
-        self.status = Some("fetching…".to_string());
+        self.pin_status("fetching…".to_string());
         let tx = self.tx.clone();
         let repo_root = self.store.repo_root.clone();
         tokio::spawn(async move {
@@ -695,7 +739,7 @@ impl App {
     /// refresh the row gets.
     fn on_fetched(&mut self, result: Result<(), String>) {
         self.fetching = false;
-        self.status = Some(match result {
+        self.set_status(match result {
             Ok(()) => "fetched".to_string(),
             Err(e) => format!("fetch failed: {e}"),
         });
@@ -748,7 +792,7 @@ impl App {
             }
         }
         if targets.is_empty() {
-            self.status = Some(match skipped_no_path {
+            self.set_status(match skipped_no_path {
                 Some(name) => format!("no path known for '{name}'"),
                 None => "nothing to forge".to_string(),
             });
@@ -2167,6 +2211,41 @@ mod tests {
             app.status.as_deref(),
             Some("lifted all workspaces onto trunk")
         );
+    }
+
+    #[test]
+    fn status_clears_when_its_expiry_fires() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                lift_ok: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_with_jj(&["default"], Box::new(fake));
+        app.handle(press(KeyCode::Char('r')));
+        assert!(app.status.is_some());
+        app.handle(Msg::StatusExpired(app.status_gen));
+        assert!(app.status.is_none());
+    }
+
+    #[test]
+    fn stale_expiry_leaves_a_newer_status_alone() {
+        let fake = FakeJj {
+            outcome: FakeOutcome {
+                lift_ok: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut app = app_with_jj(&["default"], Box::new(fake));
+        app.handle(press(KeyCode::Char('r')));
+        let stale = app.status_gen;
+        // A second action replaces the message before the first timer fires.
+        app.handle(press(KeyCode::Char('R')));
+        assert_eq!(app.status.as_deref(), Some("nothing to lift"));
+        app.handle(Msg::StatusExpired(stale));
+        assert_eq!(app.status.as_deref(), Some("nothing to lift"));
     }
 
     #[tokio::test]
