@@ -31,9 +31,9 @@ fn tab_title(name: &str) -> String {
 pub trait Terminal: Send {
     /// Is a tab for this workspace currently open?
     fn is_open(&self, name: &str) -> bool;
-    /// Open a tab for the workspace rooted at `path`: claude on the left, and a
-    /// right column split into two stacked shells. `focus` lands on the claude
-    /// pane; otherwise the tab is built without the target taking focus.
+    /// Open a tab for the workspace rooted at `path`: the agent on the left,
+    /// and a right column split into two stacked shells. `focus` lands on the
+    /// agent pane; otherwise the tab is built without the target taking focus.
     fn open(&self, name: &str, path: &Path, focus: bool) -> anyhow::Result<()>;
     /// Focus the workspace's existing tab.
     fn focus(&self, name: &str) -> anyhow::Result<()>;
@@ -53,12 +53,11 @@ pub struct KittyTerminal {
     /// Command (program + args) run to launch the target when its socket isn't
     /// found. Empty never auto-launches.
     launch_command: Vec<String>,
-    /// Command (program + args) run in a tab's left pane. Defaults to claude
-    /// wrapped in the login shell (see [`default_claude_command`]) so it inherits
-    /// the PATH your shell startup files set; kitty execs a `launch` command
-    /// directly, not through a shell, so an unwrapped `claude` would otherwise
-    /// see only the environment kitty itself was started with.
-    claude_command: Vec<String>,
+    /// Command (program + args) run in a tab's left pane - the selected agent,
+    /// already resolved by [`Config::agent_command`](crate::config::Config::agent_command)
+    /// (config decides which agent and whether it gets the login-shell wrap;
+    /// this module just runs what it is given).
+    agent_command: Vec<String>,
 }
 
 /// How long to wait for a freshly-launched target to expose its socket, and how
@@ -68,18 +67,14 @@ const LAUNCH_PROBE_ATTEMPTS: u32 = 25;
 const LAUNCH_PROBE_INTERVAL: Duration = Duration::from_millis(200);
 
 impl KittyTerminal {
-    /// Build from config. Empty config reproduces the pre-config behaviour of
-    /// driving the surrounding kitty.
-    pub fn new(cfg: &TerminalConfig) -> Self {
-        let claude_command = if cfg.claude_command.is_empty() {
-            default_claude_command()
-        } else {
-            cfg.claude_command.clone()
-        };
+    /// Build from config plus the resolved left-pane agent command. Empty
+    /// config reproduces the pre-config behaviour of driving the surrounding
+    /// kitty.
+    pub fn new(cfg: &TerminalConfig, agent_command: Vec<String>) -> Self {
         Self {
             listen_on: cfg.listen_on.clone(),
             launch_command: cfg.launch_command.clone(),
-            claude_command,
+            agent_command,
         }
     }
 
@@ -182,22 +177,22 @@ impl Terminal for KittyTerminal {
         let cwd = path.to_string_lossy();
         let cwd_arg = format!("--cwd={cwd}");
         // A background open builds the tab without pulling focus (or raising the
-        // target window); a foreground open lands on the claude pane below.
+        // target window); a foreground open lands on the agent pane below.
         let no_focus: &[&str] = if focus { &[] } else { &["--dont-take-focus"] };
 
-        // Left pane: a new tab running claude. kitty prints its window id, which
-        // anchors the splits so they land against the right column even when this
-        // tab is not the active one.
-        let mut claude = vec!["launch", "--type=tab", "--tab-title", &title, &cwd_arg];
-        claude.extend_from_slice(no_focus);
-        claude.extend(self.claude_command.iter().map(String::as_str));
-        let win_id = self.launch(&claude)?;
+        // Left pane: a new tab running the agent. kitty prints its window id,
+        // which anchors the splits so they land against the right column even
+        // when this tab is not the active one.
+        let mut agent = vec!["launch", "--type=tab", "--tab-title", &title, &cwd_arg];
+        agent.extend_from_slice(no_focus);
+        agent.extend(self.agent_command.iter().map(String::as_str));
+        let win_id = self.launch(&agent)?;
         if win_id.is_empty() {
             return Ok(()); // tab exists but there is no id to anchor splits to
         }
         let win_match = format!("id:{win_id}");
 
-        // Right column, top: a shell beside claude (a vertical divider).
+        // Right column, top: a shell beside the agent (a vertical divider).
         let mut top = vec![
             "launch",
             "--match",
@@ -223,7 +218,7 @@ impl Terminal for KittyTerminal {
             self.run(&bottom)?;
         }
 
-        // Land on the claude pane (kitty otherwise focuses the last-created one).
+        // Land on the agent pane (kitty otherwise focuses the last-created one).
         self.run(&["focus-window", "--match", &win_match])?;
         Ok(())
     }
@@ -240,22 +235,6 @@ impl Terminal for KittyTerminal {
         self.run(&["close-tab", "--match", &title_match(name)])?;
         Ok(())
     }
-}
-
-/// The default left-pane command: claude wrapped in the user's login shell as
-/// `$SHELL -l -i -c claude`. `-l` sources the login files (`.zprofile`/`.profile`)
-/// and `-i` the interactive ones (`.zshrc`/`.bashrc`), so claude gets the PATH
-/// its neighbouring shells do regardless of where the user exports it. Falls back
-/// to `/bin/sh` when `$SHELL` is unset (a bare cron-like environment).
-fn default_claude_command() -> Vec<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-    vec![
-        shell,
-        "-l".to_string(),
-        "-i".to_string(),
-        "-c".to_string(),
-        "claude".to_string(),
-    ]
 }
 
 /// Build the argv after the `kitten` program name: always the `@` verb, an
@@ -350,15 +329,6 @@ mod tests {
     #[test]
     fn tab_title_is_prefixed() {
         assert_eq!(tab_title("feat"), "jjfx:feat");
-    }
-
-    #[test]
-    fn default_claude_command_wraps_claude_in_a_login_shell() {
-        let cmd = default_claude_command();
-        // Whatever $SHELL resolves to, claude runs through it as a login+
-        // interactive shell so it inherits the user's PATH.
-        assert_eq!(&cmd[1..], ["-l", "-i", "-c", "claude"]);
-        assert!(!cmd[0].is_empty(), "a shell program is always chosen");
     }
 
     #[test]

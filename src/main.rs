@@ -117,7 +117,10 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     let mut app = App::new(
         Store::load(&repo_root),
         initial_agents,
-        Box::new(terminal::KittyTerminal::new(&config.terminal)),
+        Box::new(terminal::KittyTerminal::new(
+            &config.terminal,
+            config.agent_command(),
+        )),
         Box::new(jj::RealJj::new(repo_root.clone())),
         config.forge,
         ui.world_pane,

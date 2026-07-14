@@ -6,6 +6,14 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Changed
 
+- 2026-07-14 - Selectable coding agent (v0.20.0): a new `[terminal] agent`
+  config key picks which agent a workspace tab's left pane runs - `"claude"`
+  (the default) or `"codex"`. Each agent has its own top-level section
+  (`[claude]` / `[codex]`) whose `command` overrides the default login-shell
+  wrap of the agent's binary. Breaking: `[terminal] claude_command` is
+  removed - a config still setting it fails at startup naming the key; move
+  the value to `command` under `[claude]`.
+
 - 2026-07-14 - Footer status messages expire (v0.19.0): the transient result
   line after an action ("lifted feat onto trunk", "fetched", ...) now clears
   itself after 5 seconds instead of sitting in the footer until the next

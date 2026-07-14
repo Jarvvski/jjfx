@@ -17,6 +17,73 @@ pub struct Config {
     pub terminal: TerminalConfig,
     /// How the forge pipeline opens and maintains pull requests.
     pub forge: ForgeConfig,
+    /// Claude-specific settings, active when `[terminal] agent = "claude"`.
+    pub claude: AgentConfig,
+    /// Codex-specific settings, active when `[terminal] agent = "codex"`.
+    pub codex: AgentConfig,
+}
+
+impl Config {
+    /// The command run in a workspace's left pane: the selected agent's
+    /// configured `command`, or (when it is empty) the agent's binary wrapped
+    /// in the user's login shell as `$SHELL -l -i -c <binary>`. `-l` sources
+    /// the login files (`.zprofile`/`.profile`) and `-i` the interactive ones
+    /// (`.zshrc`/`.bashrc`), so the agent gets the PATH its neighbouring shell
+    /// panes do; kitty execs a `launch` command directly rather than through a
+    /// shell, so a GUI-launched kitty would otherwise hand the agent launchd's
+    /// bare environment. Falls back to `/bin/sh` when `$SHELL` is unset (a
+    /// bare cron-like environment).
+    pub fn agent_command(&self) -> Vec<String> {
+        let agent = self.terminal.agent;
+        let cfg = match agent {
+            Agent::Claude => &self.claude,
+            Agent::Codex => &self.codex,
+        };
+        if !cfg.command.is_empty() {
+            return cfg.command.clone();
+        }
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        vec![
+            shell,
+            "-l".to_string(),
+            "-i".to_string(),
+            "-c".to_string(),
+            agent.binary().to_string(),
+        ]
+    }
+}
+
+/// Which coding agent jjfx opens in a workspace's left pane. Selects the
+/// matching top-level section ([`Config::claude`] / [`Config::codex`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Agent {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl Agent {
+    /// The binary the default login-shell wrap runs when the agent's section
+    /// sets no explicit `command`.
+    fn binary(self) -> &'static str {
+        match self {
+            Agent::Claude => "claude",
+            Agent::Codex => "codex",
+        }
+    }
+}
+
+/// Settings for one coding agent. Just the launch command today; each agent
+/// gets its own section so future agent-specific settings have a home.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AgentConfig {
+    /// The command (program + args) run in a workspace's left pane when this
+    /// agent is selected. Empty (the default) wraps the agent's binary in the
+    /// login shell (see [`Config::agent_command`]). Override it to add flags or
+    /// skip the shell wrap, e.g. `["zsh", "-l", "-i", "-c", "codex --profile work"]`.
+    pub command: Vec<String>,
 }
 
 /// How the forge's final step manages pull requests. jjfx submits PRs natively
@@ -62,15 +129,11 @@ pub struct TerminalConfig {
     /// reports the target as not running.
     #[serde(default)]
     pub launch_command: Vec<String>,
-    /// The command (program + args) run in a workspace's left pane. Empty (the
-    /// default) wraps claude in your login shell - `$SHELL -l -i -c claude` - so
-    /// it inherits the PATH your zsh/bash startup files set, matching the two
-    /// shell panes beside it. (kitty execs an explicit `launch` command directly
-    /// rather than through a shell, so a GUI-launched kitty would otherwise hand
-    /// claude launchd's bare environment.) Override it to run a different agent
-    /// or skip the shell wrap, e.g. `["zsh", "-l", "-i", "-c", "claude"]`.
+    /// Which agent runs in a workspace's left pane: `"claude"` (the default) or
+    /// `"codex"`. The command itself comes from the matching top-level
+    /// `[claude]` / `[codex]` section (see [`Config::agent_command`]).
     #[serde(default)]
-    pub claude_command: Vec<String>,
+    pub agent: Agent,
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml` - the same XDG convention as
@@ -113,7 +176,10 @@ mod tests {
         let cfg: Config = toml::from_str("").expect("empty toml parses");
         assert!(cfg.terminal.listen_on.is_none());
         assert!(cfg.terminal.launch_command.is_empty());
-        assert!(cfg.terminal.claude_command.is_empty());
+        // The default agent is claude, with no command override on either agent.
+        assert_eq!(cfg.terminal.agent, Agent::Claude);
+        assert!(cfg.claude.command.is_empty());
+        assert!(cfg.codex.command.is_empty());
         // Forge PR management is on-by-default, drafts on-by-default.
         assert!(cfg.forge.pull_requests);
         assert!(cfg.forge.draft);
@@ -147,7 +213,7 @@ mod tests {
             [terminal]
             listen_on = "unix:/tmp/kitty-visor"
             launch_command = ["kitty", "--detach", "-o", "listen_on=unix:/tmp/kitty-visor"]
-            claude_command = ["zsh", "-l", "-i", "-c", "claude"]
+            agent = "codex"
             "#,
         )
         .expect("toml parses");
@@ -159,10 +225,56 @@ mod tests {
             cfg.terminal.launch_command,
             ["kitty", "--detach", "-o", "listen_on=unix:/tmp/kitty-visor"]
         );
-        assert_eq!(
-            cfg.terminal.claude_command,
-            ["zsh", "-l", "-i", "-c", "claude"]
-        );
+        assert_eq!(cfg.terminal.agent, Agent::Codex);
+    }
+
+    #[test]
+    fn an_unknown_agent_is_rejected() {
+        let err = toml::from_str::<Config>("[terminal]\nagent = \"copilot\"\n")
+            .expect_err("unknown agent is an error");
+        assert!(err.to_string().contains("copilot"), "{err}");
+    }
+
+    #[test]
+    fn the_selected_agents_command_override_wins() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [terminal]
+            agent = "codex"
+
+            [codex]
+            command = ["codex", "--profile", "work"]
+
+            [claude]
+            command = ["claude", "--continue"]
+            "#,
+        )
+        .expect("toml parses");
+        // The codex section drives the pane; the claude one sits unused.
+        assert_eq!(cfg.agent_command(), ["codex", "--profile", "work"]);
+    }
+
+    #[test]
+    fn an_agent_without_a_command_gets_the_login_shell_wrap() {
+        for (agent, binary) in [("claude", "claude"), ("codex", "codex")] {
+            let cfg: Config =
+                toml::from_str(&format!("[terminal]\nagent = \"{agent}\"\n")).expect("toml parses");
+            let cmd = cfg.agent_command();
+            // Whatever $SHELL resolves to, the agent runs through it as a
+            // login+interactive shell so it inherits the user's PATH.
+            assert_eq!(&cmd[1..], ["-l", "-i", "-c", binary]);
+            assert!(!cmd[0].is_empty(), "a shell program is always chosen");
+        }
+    }
+
+    #[test]
+    fn the_removed_claude_command_key_is_rejected() {
+        // `[terminal] claude_command` moved to `[claude] command`; a config
+        // still setting it fails loudly, naming the key, rather than being
+        // silently ignored.
+        let err = toml::from_str::<Config>("[terminal]\nclaude_command = [\"claude\"]\n")
+            .expect_err("removed key is an error");
+        assert!(err.to_string().contains("claude_command"), "{err}");
     }
 
     #[test]
