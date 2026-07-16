@@ -108,7 +108,9 @@ impl WorkState {
 /// dirty/pushed or claim the same PR - only the workspace that uniquely *heads*
 /// that commit owns it, and a base nobody uniquely heads is owned by none.
 pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work> {
-    let prs = derive_repo_slug(repo_root)
+    let prs = crate::jj::derive_repo_slug(repo_root)
+        .ok()
+        .flatten()
         .map(|slug| crate::prs::list(&slug))
         .unwrap_or_default();
 
@@ -407,54 +409,9 @@ fn jj(repo_root: &Path, args: &[&str]) -> Option<String> {
     crate::jj::read_at_repo(repo_root, args).ok()
 }
 
-/// Derive the `owner/repo` slug from jj's `origin` remote URL. `gh` auto-detection
-/// fails in jj workspaces, so every `gh` call must pass `-R <slug>` (CLAUDE.md).
-pub(crate) fn derive_repo_slug(repo_root: &Path) -> Option<String> {
-    let out = jj(repo_root, &["git", "remote", "list"])?;
-    let url = out
-        .lines()
-        .filter_map(|l| l.split_once(char::is_whitespace))
-        .find(|(name, _)| *name == "origin")
-        .map(|(_, url)| url.trim())?;
-    slug_from_url(url)
-}
-
-/// Extract `owner/repo` from an SSH (`git@host:owner/repo.git`) or HTTPS
-/// (`https://host/owner/repo.git`) remote URL.
-fn slug_from_url(url: &str) -> Option<String> {
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let parts: Vec<&str> = url.split(['/', ':']).filter(|s| !s.is_empty()).collect();
-    if parts.len() >= 2 {
-        Some(format!(
-            "{}/{}",
-            parts[parts.len() - 2],
-            parts[parts.len() - 1]
-        ))
-    } else {
-        None
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn slug_from_ssh_and_https() {
-        assert_eq!(
-            slug_from_url("git@github.com:Jarvvski/jjfx.git").as_deref(),
-            Some("Jarvvski/jjfx")
-        );
-        assert_eq!(
-            slug_from_url("https://github.com/Jarvvski/jjfx.git").as_deref(),
-            Some("Jarvvski/jjfx")
-        );
-        assert_eq!(
-            slug_from_url("git@github.com:Jarvvski/jjfx").as_deref(),
-            Some("Jarvvski/jjfx")
-        );
-        assert_eq!(slug_from_url("nonsense").as_deref(), None);
-    }
 
     #[test]
     fn parse_stat_handles_both_clauses_and_singulars() {

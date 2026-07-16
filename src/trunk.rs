@@ -1,7 +1,7 @@
 //! The trunk-selection rule, stated once (ADR-0007).
 //!
 //! "Which commit is trunk?" is needed on two paths that run on different engines:
-//! the CLI reads (`work`, `diff`, `pr`, `jj`) consume a revset string, while the
+//! the CLI reads (`work`, `diff`, `forge`, `jj`) consume a revset string, while the
 //! graph ([`crate::graph`]) resolves a concrete [`CommitId`] by walking the store
 //! through jj-lib. Both derive from the one ordered [`SOURCES`] list here, so the
 //! revset and the walk cannot drift out of agreement.

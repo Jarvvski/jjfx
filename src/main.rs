@@ -16,7 +16,6 @@ mod forge;
 mod graph;
 mod hooks;
 mod jj;
-mod pr;
 mod prs;
 mod repo;
 mod store;

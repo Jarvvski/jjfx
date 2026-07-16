@@ -105,25 +105,6 @@ pub enum Msg {
 /// How long a transient footer status message stays before expiring.
 const STATUS_TTL: Duration = Duration::from_secs(5);
 
-/// The live forge progress for one workspace: the four steps' statuses, whether a
-/// pipeline is still running, and the last skip/abort reason (for the footer).
-#[derive(Default)]
-struct ForgeProgress {
-    steps: [Option<forge::Status>; 4],
-    active: bool,
-    reason: Option<String>,
-}
-
-impl ForgeProgress {
-    /// A clean success: finished with every step OK and no skip reason. Such rows
-    /// drop their progress overlay and revert to the (now-advanced) work state.
-    fn clean_success(&self) -> bool {
-        !self.active
-            && self.reason.is_none()
-            && self.steps.iter().all(|s| *s == Some(forge::Status::Ok))
-    }
-}
-
 /// The whole application state - one owned value on the main task.
 pub struct App {
     store: Store,
@@ -136,13 +117,12 @@ pub struct App {
     work: HashMap<String, Work>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs or after one that ended with a skip/failure.
-    forge: HashMap<String, ForgeProgress>,
+    forge_progress: HashMap<String, forge::Progress>,
     /// A background `jj git fetch` is in flight; a second `u` is ignored until
     /// it resolves (two would just contend on the repo lock).
     fetching: bool,
-    /// How the forge manages pull requests (toggle + draft), handed to each
-    /// [`forge::run`].
-    forge_config: ForgeConfig,
+    /// The deep Forge module owns execution, progress, and Pull Request rules.
+    forge: forge::Forge,
     /// Channel to the app's own message loop, so forge tasks can stream updates
     /// back as [`Msg::Forge`].
     tx: UnboundedSender<Msg>,
@@ -185,13 +165,14 @@ impl App {
         world_pane: bool,
         tx: UnboundedSender<Msg>,
     ) -> Self {
+        let forge = forge::Forge::new(store.repo_root().to_path_buf(), forge_config);
         let mut app = App {
             store,
             agents,
             work: HashMap::new(),
-            forge: HashMap::new(),
+            forge_progress: HashMap::new(),
             fetching: false,
-            forge_config,
+            forge,
             tx,
             terminal,
             jj,
@@ -279,57 +260,45 @@ impl App {
         self.status = Some(msg);
     }
 
-    /// Fold one forge transition into per-workspace progress and the footer.
+    /// Project one already-folded Forge snapshot into presentation state.
     fn on_forge(&mut self, update: forge::Update) {
         match update {
-            forge::Update::Start(names) => {
-                self.status = None;
-                for name in names {
-                    self.forge.insert(
-                        name,
-                        ForgeProgress {
-                            active: true,
-                            ..Default::default()
-                        },
-                    );
-                }
-            }
-            forge::Update::Step {
-                ws,
-                step,
-                status,
-                reason,
+            forge::Update::Progress {
+                workspace,
+                progress,
+                notice,
             } => {
-                let entry = self.forge.entry(ws.clone()).or_default();
-                entry.active = true;
-                entry.steps[step.index()] = Some(status);
-                if let Some(r) = reason {
-                    entry.reason = Some(r.clone());
-                    self.set_status(format!("{ws}: {r}"));
+                debug_assert!(
+                    notice
+                        .as_deref()
+                        .map(|notice| progress.reason() == Some(notice))
+                        .unwrap_or(true),
+                    "a Forge notice must match the retained progress reason"
+                );
+                self.forge_progress.insert(workspace.clone(), progress);
+                if let Some(notice) = notice {
+                    self.set_status(format!("{workspace}: {notice}"));
                 }
             }
-            forge::Update::Skip { ws, reason } => {
-                let entry = self.forge.entry(ws.clone()).or_default();
-                entry.active = false;
-                entry.reason = Some(reason.clone());
-                self.set_status(format!("{ws}: {reason}"));
-            }
-            forge::Update::Done { ws } => {
-                if let Some(entry) = self.forge.get_mut(&ws) {
-                    entry.active = false;
-                    // A clean run leaves nothing to show; the advanced work state
-                    // (picked up by the poller) speaks for itself.
-                    if entry.clean_success() {
-                        self.forge.remove(&ws);
-                        self.set_status(format!("{ws}: forged"));
+            forge::Update::Finished {
+                workspace,
+                progress,
+            } => {
+                match progress {
+                    Some(progress) => {
+                        self.forge_progress.insert(workspace, progress);
+                    }
+                    None => {
+                        self.forge_progress.remove(&workspace);
+                        self.set_status(format!("{workspace}: forged"));
                     }
                 }
                 // A forge moves revisions (weld/push); refresh the graph if shown.
                 self.refresh_graph_if_visible();
             }
-            forge::Update::Aborted(reason) => {
+            forge::Update::Aborted { reason } => {
                 // Drop every still-running overlay; the run did no per-ws work.
-                self.forge.retain(|_, p| !p.active);
+                self.forge_progress.retain(|_, progress| !progress.active());
                 self.set_status(format!("forge aborted: {reason}"));
             }
         }
@@ -785,14 +754,15 @@ impl App {
         let mut targets = Vec::new();
         let mut skipped_no_path = None;
         for w in workspaces {
-            if self.forge.get(&w.name).is_some_and(|p| p.active) {
+            if self
+                .forge_progress
+                .get(&w.name)
+                .is_some_and(forge::Progress::active)
+            {
                 continue; // already forging
             }
             match &w.path {
-                Some(dir) => targets.push(Target {
-                    name: w.name.clone(),
-                    dir: dir.clone(),
-                }),
+                Some(dir) => targets.push(Target::new(w.name.clone(), dir.clone())),
                 None => skipped_no_path = Some(w.name.clone()),
             }
         }
@@ -803,10 +773,15 @@ impl App {
             });
             return;
         }
+        let mut updates = self.forge.start(targets);
         let tx = self.tx.clone();
-        let repo_root = self.store.repo_root().to_path_buf();
-        let cfg = self.forge_config;
-        tokio::spawn(async move { forge::run(tx, repo_root, targets, cfg).await });
+        tokio::spawn(async move {
+            while let Some(update) = updates.recv().await {
+                if tx.send(Msg::Forge(update)).is_err() {
+                    break;
+                }
+            }
+        });
     }
 
     /// The ordered selectable workspace names for the current classification.
@@ -1186,7 +1161,7 @@ impl App {
         ];
         // While a forge is running (or ended with a skip), its live pipeline
         // takes the work column; otherwise the work label shows there.
-        match self.forge.get(&w.name) {
+        match self.forge_progress.get(&w.name) {
             Some(progress) => spans.extend(forge_spans(progress)),
             None => spans.push(Span::styled(
                 format!("{:<16}", work.label()),
@@ -1719,36 +1694,43 @@ fn paused_glyph(kind: AgentKind) -> char {
 
 /// The compact forge pipeline for a row: a `⚒` sigil then one `letter+glyph` per
 /// step (`f w p r`), each coloured by its live status.
-fn forge_spans(progress: &ForgeProgress) -> Vec<Span<'static>> {
-    use crate::forge::Step;
+fn forge_spans(progress: &forge::Progress) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled("⚒ ", Style::default().fg(Color::Magenta))];
-    for step in [Step::Fetch, Step::Weld, Step::Push, Step::Pr] {
-        let status = progress.steps[step.index()];
+    for (step, status) in progress.steps() {
         spans.push(Span::styled(
-            format!("{}{} ", step.letter(), forge_glyph(status)),
+            format!("{}{} ", forge_step_letter(step), forge_glyph(status)),
             Style::default().fg(forge_color(status)),
         ));
     }
     spans
 }
 
+fn forge_step_letter(step: forge::Step) -> char {
+    match step {
+        forge::Step::Fetch => 'f',
+        forge::Step::Weld => 'w',
+        forge::Step::Push => 'p',
+        forge::Step::PullRequest => 'r',
+    }
+}
+
 /// Glyph for a forge step's status: pending, running, done, or skipped.
-fn forge_glyph(status: Option<forge::Status>) -> char {
+fn forge_glyph(status: forge::Status) -> char {
     match status {
-        None => '·',
-        Some(forge::Status::Running) => '…',
-        Some(forge::Status::Ok) => '✓',
-        Some(forge::Status::Skipped) => '~',
+        forge::Status::Pending => '·',
+        forge::Status::Running => '…',
+        forge::Status::Ok => '✓',
+        forge::Status::Skipped => '~',
     }
 }
 
 /// Colour for a forge step's status.
-fn forge_color(status: Option<forge::Status>) -> Color {
+fn forge_color(status: forge::Status) -> Color {
     match status {
-        None => Color::DarkGray,
-        Some(forge::Status::Running) => Color::Cyan,
-        Some(forge::Status::Ok) => Color::Green,
-        Some(forge::Status::Skipped) => Color::Yellow,
+        forge::Status::Pending => Color::DarkGray,
+        forge::Status::Running => Color::Cyan,
+        forge::Status::Ok => Color::Green,
+        forge::Status::Skipped => Color::Yellow,
     }
 }
 
@@ -2130,75 +2112,6 @@ mod tests {
             .unwrap();
         assert_eq!(app.work_state(def), WorkState::Unknown);
         assert_eq!(app.behind(def), 0);
-    }
-
-    #[test]
-    fn forge_updates_fold_into_row_progress_and_footer() {
-        use crate::forge::{Status, Step, Update};
-        let mut app = app_with(&["default", "feat"]);
-
-        // Start marks the workspace as forging with an empty pipeline.
-        app.handle(Msg::Forge(Update::Start(vec!["feat".to_string()])));
-        assert!(app.forge.get("feat").is_some_and(|p| p.active));
-
-        // A running then ok step is recorded in the right slot.
-        app.handle(Msg::Forge(Update::Step {
-            ws: "feat".to_string(),
-            step: Step::Weld,
-            status: Status::Ok,
-            reason: None,
-        }));
-        assert_eq!(
-            app.forge.get("feat").unwrap().steps[Step::Weld.index()],
-            Some(Status::Ok)
-        );
-
-        // A skip carries its reason to the footer.
-        app.handle(Msg::Forge(Update::Step {
-            ws: "feat".to_string(),
-            step: Step::Push,
-            status: Status::Skipped,
-            reason: Some("push: nothing to push".to_string()),
-        }));
-        assert_eq!(app.status.as_deref(), Some("feat: push: nothing to push"));
-
-        // Done on a run that had a skip keeps the overlay visible (not clean).
-        app.handle(Msg::Forge(Update::Done {
-            ws: "feat".to_string(),
-        }));
-        assert!(app.forge.contains_key("feat"));
-        assert!(!app.forge.get("feat").unwrap().active);
-    }
-
-    #[test]
-    fn clean_forge_run_drops_the_overlay() {
-        use crate::forge::{Status, Step, Update};
-        let mut app = app_with(&["feat"]);
-        app.handle(Msg::Forge(Update::Start(vec!["feat".to_string()])));
-        for step in [Step::Fetch, Step::Weld, Step::Push, Step::Pr] {
-            app.handle(Msg::Forge(Update::Step {
-                ws: "feat".to_string(),
-                step,
-                status: Status::Ok,
-                reason: None,
-            }));
-        }
-        app.handle(Msg::Forge(Update::Done {
-            ws: "feat".to_string(),
-        }));
-        // All steps OK, no skip: the overlay clears so the row shows work state.
-        assert!(!app.forge.contains_key("feat"));
-        assert_eq!(app.status.as_deref(), Some("feat: forged"));
-    }
-
-    #[test]
-    fn forge_abort_clears_active_overlays_with_a_reason() {
-        use crate::forge::Update;
-        let mut app = app_with(&["feat"]);
-        app.handle(Msg::Forge(Update::Start(vec!["feat".to_string()])));
-        app.handle(Msg::Forge(Update::Aborted("GPG key locked".to_string())));
-        assert!(!app.forge.contains_key("feat"));
-        assert_eq!(app.status.as_deref(), Some("forge aborted: GPG key locked"));
     }
 
     #[test]

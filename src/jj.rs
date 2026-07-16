@@ -35,6 +35,37 @@ pub fn read_in_dir(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         .checked()
 }
 
+/// Derive the `owner/repo` slug from jj's `origin` remote URL. Every `gh` call
+/// must pass this explicitly because auto-detection fails in jj workspaces.
+pub(crate) fn derive_repo_slug(repo_root: &Path) -> anyhow::Result<Option<String>> {
+    let out = read_at_repo(repo_root, &["git", "remote", "list"])?;
+    let Some(url) = out
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .find(|(name, _)| *name == "origin")
+        .map(|(_, url)| url.trim())
+    else {
+        return Ok(None);
+    };
+    Ok(slug_from_url(url))
+}
+
+fn slug_from_url(url: &str) -> Option<String> {
+    let url = url.strip_suffix(".git").unwrap_or(url);
+    let parts: Vec<&str> = url
+        .split(['/', ':'])
+        .filter(|part| !part.is_empty())
+        .collect();
+    if parts.len() < 2 {
+        return None;
+    }
+    Some(format!(
+        "{}/{}",
+        parts[parts.len() - 2],
+        parts[parts.len() - 1]
+    ))
+}
+
 /// Workspace names jj knows in this repo, via
 /// `jj workspace list -T 'name ++ "\n"'`. `--ignore-working-copy` keeps it a
 /// pure read (no snapshot, no commit churn). Returns an empty list on any
@@ -226,4 +257,26 @@ fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
         .run()?
         .checked()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slug_from_ssh_and_https() {
+        assert_eq!(
+            slug_from_url("git@github.com:Jarvvski/jjfx.git").as_deref(),
+            Some("Jarvvski/jjfx")
+        );
+        assert_eq!(
+            slug_from_url("https://github.com/Jarvvski/jjfx.git").as_deref(),
+            Some("Jarvvski/jjfx")
+        );
+        assert_eq!(
+            slug_from_url("git@github.com:Jarvvski/jjfx").as_deref(),
+            Some("Jarvvski/jjfx")
+        );
+        assert_eq!(slug_from_url("nonsense"), None);
+    }
 }

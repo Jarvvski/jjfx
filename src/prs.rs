@@ -1,6 +1,6 @@
 //! One model of "a pull request as `gh` reports it", and the `gh pr list` reads
-//! jjfx does over it. Both consumers - `work`'s lifecycle overlay and `forge`'s
-//! stacked-PR submission ([`crate::pr`]) - project from the one [`Pr`] here, so
+//! jjfx does over it. Both consumers - `work`'s lifecycle overlay and Forge's
+//! stacked Pull Request submission - project from the one [`Pr`] here, so
 //! the "is this PR merged?" question is answered in exactly one place and the two
 //! callers cannot drift apart (the divergence this module exists to remove).
 

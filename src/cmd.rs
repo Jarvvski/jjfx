@@ -6,7 +6,7 @@
 //! builder method that leaves the streams inherited.
 //!
 //! The one deliberate exception is a probe that must *write* to the child's
-//! stdin (`forge::gpg_unlocked`); it spawns `Command` directly but still nulls
+//! stdin (Forge's GPG adapter); it spawns `Command` directly but still nulls
 //! both output streams. `.output()` closes stdin, so it cannot host that case.
 
 use std::ffi::OsStr;
