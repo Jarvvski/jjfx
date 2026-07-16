@@ -14,5 +14,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: jdx/mise-action@v2
+        with:
+          # Rustup components live outside mise's cached data directory.
+          cache: false
       - uses: Swatinem/rust-cache@v2
       - run: mise run check
