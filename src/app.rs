@@ -3,7 +3,6 @@
 //! redraws (the engine shape from the PRD).
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -23,12 +22,12 @@ use crate::diff::{self, FileDiff};
 use crate::diff_view::Detail;
 use crate::forge::{self, Target};
 use crate::graph;
+use crate::jj;
 use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::workspace_list::{Row, WorkspaceList};
-use crate::{cache, jj};
 
 /// What the key handler is currently collecting: normal navigation, a new
 /// workspace name, or a delete confirmation.
@@ -241,7 +240,7 @@ impl App {
         matches!(self.mode, Mode::Normal | Mode::Help)
             && self
                 .store
-                .workspaces
+                .workspaces()
                 .iter()
                 .any(|w| self.agent_state(w) == AgentState::Working)
     }
@@ -454,7 +453,7 @@ impl App {
         };
         self.mode = Mode::Detail(Detail::loading(w.name.clone()));
         let tx = self.tx.clone();
-        let repo_root = self.store.repo_root.clone();
+        let repo_root = self.store.repo_root().to_path_buf();
         let ws = w.name;
         tokio::spawn(async move {
             let load_ws = ws.clone();
@@ -517,7 +516,7 @@ impl App {
     /// graph simply stays; a graph read must never crash the TUI.
     fn spawn_graph_load(&self) {
         let tx = self.tx.clone();
-        let repo_root = self.store.repo_root.clone();
+        let repo_root = self.store.repo_root().to_path_buf();
         tokio::spawn(async move {
             if let Ok(Ok(graph)) =
                 tokio::task::spawn_blocking(move || graph::load(&repo_root)).await
@@ -587,7 +586,7 @@ impl App {
     fn selected_workspace(&self) -> Option<&Workspace> {
         self.list
             .selected()
-            .and_then(|s| self.store.workspaces.iter().find(|w| w.name == s))
+            .and_then(|name| self.store.workspace(name))
     }
 
     /// `enter`/`o`: focus the selected workspace's tab if it exists, else open a
@@ -630,60 +629,34 @@ impl App {
         self.mode = Mode::ConfirmDelete(w.name.clone());
     }
 
-    /// Create a workspace: `jj workspace add`, persist its chosen path to the
-    /// ws-cache (jj records no path), reload, then open its tab.
-    fn create_workspace(&mut self, name: &str) {
-        let name = name.trim();
-        if name.is_empty() {
-            self.set_status("workspace name required".to_string());
-            return;
-        }
-        if self.store.workspaces.iter().any(|w| w.name == name) {
-            self.set_status(format!("workspace '{name}' already exists"));
-            return;
-        }
-        let path = store::new_workspace_path(&self.store.repo_root, name);
-        if let Err(e) = self.jj.add_workspace(name, &path) {
-            self.set_status(format!("create failed: {e}"));
-            return;
-        }
-        if let Err(e) = self.persist_cache_add(name, &path) {
-            self.set_status(format!("cache write failed: {e}"));
-        }
-        self.reload();
-        match self.terminal.open(name, &path, true) {
-            Ok(()) => self.set_status(format!("created '{name}'")),
-            Err(e) => self.set_status(format!("created '{name}', tab failed: {e}")),
+    /// Create a workspace through the lifecycle module, then present it in the
+    /// terminal. Persistence and reconciliation stay behind the Store interface.
+    fn create_workspace(&mut self, requested_name: &str) {
+        let created = match self.store.create(requested_name) {
+            Ok(created) => created,
+            Err(error) => {
+                self.set_status(format!("{error:#}"));
+                return;
+            }
+        };
+        self.after_store_changed();
+        match self.terminal.open(created.name(), created.path(), true) {
+            Ok(()) => self.set_status(format!("created '{}'", created.name())),
+            Err(error) => {
+                self.set_status(format!("created '{}', tab failed: {error}", created.name()))
+            }
         }
     }
 
-    /// Delete a workspace: close its tab, `jj workspace forget`, remove its
-    /// directory (guarded - never the repo root), drop it from the cache, reload.
+    /// Close a workspace's terminal presentation before deleting it through the
+    /// lifecycle module, preserving the existing best-effort terminal ordering.
     fn delete_workspace(&mut self, name: &str) {
-        if name == store::DEFAULT_WORKSPACE {
-            self.set_status("the default workspace cannot be deleted".to_string());
-            return;
-        }
-        let path = self
-            .store
-            .workspaces
-            .iter()
-            .find(|w| w.name == name)
-            .and_then(|w| w.path.clone());
-
         let _ = self.terminal.close(name); // best-effort; jj is the source of truth
-        if let Err(e) = self.jj.forget_workspace(name) {
-            self.set_status(format!("delete failed: {e}"));
+        if let Err(error) = self.store.delete(name) {
+            self.set_status(format!("{error:#}"));
             return;
         }
-        if let Some(p) = path
-            && p != self.store.repo_root
-            && p.is_dir()
-        {
-            let _ = std::fs::remove_dir_all(&p);
-        }
-        let _ = self.persist_cache_remove(name);
-        self.reload();
+        self.after_store_changed();
         self.set_status(format!("deleted '{name}'"));
     }
 
@@ -756,7 +729,7 @@ impl App {
         self.fetching = true;
         self.pin_status("fetching…".to_string());
         let tx = self.tx.clone();
-        let repo_root = self.store.repo_root.clone();
+        let repo_root = self.store.repo_root().to_path_buf();
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || jj::fetch(&repo_root))
                 .await
@@ -789,7 +762,7 @@ impl App {
     fn forge_default(&mut self) {
         if let Some(w) = self
             .store
-            .workspaces
+            .workspaces()
             .iter()
             .find(|w| w.name == store::DEFAULT_WORKSPACE)
             .cloned()
@@ -800,7 +773,7 @@ impl App {
 
     /// `F`: forge every eligible workspace, sequentially (in one background run).
     fn forge_all(&mut self) {
-        let all: Vec<Workspace> = self.store.workspaces.clone();
+        let all: Vec<Workspace> = self.store.workspaces().to_vec();
         self.start_forge(all);
     }
 
@@ -831,33 +804,9 @@ impl App {
             return;
         }
         let tx = self.tx.clone();
-        let repo_root = self.store.repo_root.clone();
+        let repo_root = self.store.repo_root().to_path_buf();
         let cfg = self.forge_config;
         tokio::spawn(async move { forge::run(tx, repo_root, targets, cfg).await });
-    }
-
-    /// Upsert a `(name, path)` into the ws-cache so the path jj does not record
-    /// survives a reload.
-    fn persist_cache_add(&self, name: &str, path: &Path) -> std::io::Result<()> {
-        let cache_path = cache::path(&self.store.repo_root);
-        let mut entries = cache::read(&cache_path).unwrap_or_default();
-        if !entries.iter().any(|(n, _)| n == name) {
-            entries.push((name.to_string(), path.to_path_buf()));
-        }
-        cache::write_through(&cache_path, &entries)?;
-        Ok(())
-    }
-
-    /// Drop a workspace from the ws-cache.
-    fn persist_cache_remove(&self, name: &str) -> std::io::Result<()> {
-        let cache_path = cache::path(&self.store.repo_root);
-        let entries: Vec<_> = cache::read(&cache_path)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(n, _)| n != name)
-            .collect();
-        cache::write_through(&cache_path, &entries)?;
-        Ok(())
     }
 
     /// The ordered selectable workspace names for the current classification.
@@ -872,7 +821,11 @@ impl App {
 
     /// Re-reconcile from disk; the selection follows its workspace by name.
     fn reload(&mut self) {
-        self.store = Store::load(&self.store.repo_root);
+        self.store.reload();
+        self.after_store_changed();
+    }
+
+    fn after_store_changed(&mut self) {
         self.ensure_selection();
         // The cache/op-log changed on disk (new commits, fetch, workspace edits);
         // refresh the graph if a graph-bearing view is open.
@@ -891,7 +844,7 @@ impl App {
     fn classified(&self) -> Vec<(Attention, &Workspace)> {
         let mut v: Vec<(Attention, &Workspace)> = self
             .store
-            .workspaces
+            .workspaces()
             .iter()
             .map(|w| {
                 (
@@ -925,7 +878,7 @@ impl App {
         .horizontal_margin(2)
         .areas(frame.area());
 
-        let title = format!("jjfx - {} workspace(s)", self.store.workspaces.len());
+        let title = format!("jjfx - {} workspace(s)", self.store.workspaces().len());
         frame.render_widget(
             Paragraph::new(Span::styled(
                 title,
@@ -1882,8 +1835,6 @@ mod tests {
     /// Cloning shares the recorders (like `FakeTerminal`); the outcome is copied.
     #[derive(Clone, Default)]
     struct FakeJj {
-        added: Arc<Mutex<Vec<(String, PathBuf)>>>,
-        forgotten: Arc<Mutex<Vec<String>>>,
         lifted: Arc<Mutex<Vec<String>>>,
         lift_all_calls: Arc<Mutex<usize>>,
         tidyws_calls: Arc<Mutex<usize>>,
@@ -1902,17 +1853,6 @@ mod tests {
     }
 
     impl jj::Jj for FakeJj {
-        fn add_workspace(&self, name: &str, dest: &Path) -> anyhow::Result<()> {
-            self.added
-                .lock()
-                .unwrap()
-                .push((name.to_string(), dest.to_path_buf()));
-            self.result(())
-        }
-        fn forget_workspace(&self, name: &str) -> anyhow::Result<()> {
-            self.forgotten.lock().unwrap().push(name.to_string());
-            self.result(())
-        }
         fn tidyws(&self) -> anyhow::Result<usize> {
             *self.tidyws_calls.lock().unwrap() += 1;
             self.result(self.outcome.tidyws_n)
@@ -1955,13 +1895,23 @@ mod tests {
         // real forge, so nothing needs to receive on this channel.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
-            Store {
-                repo_root: Path::new("/repo").to_path_buf(),
-                workspaces,
-            },
+            Store::from_workspaces_for_test(PathBuf::from("/repo"), workspaces),
             agent::AgentStates::default(),
             terminal,
             jj,
+            ForgeConfig::default(),
+            false,
+            tx,
+        )
+    }
+
+    fn app_with_store(store: Store, terminal: Box<dyn Terminal>) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            store,
+            agent::AgentStates::default(),
+            terminal,
+            Box::new(FakeJj::default()),
             ForgeConfig::default(),
             false,
             tx,
@@ -2126,7 +2076,7 @@ mod tests {
         }));
         let feat = app
             .store
-            .workspaces
+            .workspaces()
             .iter()
             .find(|w| w.name == "feat")
             .unwrap();
@@ -2134,7 +2084,7 @@ mod tests {
         // A workspace with no events stays Absent.
         let def = app
             .store
-            .workspaces
+            .workspaces()
             .iter()
             .find(|w| w.name == "default")
             .unwrap();
@@ -2159,7 +2109,7 @@ mod tests {
         app.handle(Msg::WorkSnapshot(snap));
         let feat = app
             .store
-            .workspaces
+            .workspaces()
             .iter()
             .find(|w| w.name == "feat")
             .unwrap();
@@ -2174,7 +2124,7 @@ mod tests {
         // A workspace absent from the snapshot stays Unknown with zero behind.
         let def = app
             .store
-            .workspaces
+            .workspaces()
             .iter()
             .find(|w| w.name == "default")
             .unwrap();
@@ -2429,56 +2379,74 @@ mod tests {
     }
 
     #[test]
-    fn create_workspace_adds_via_jj_and_opens_the_tab() {
-        let term = FakeTerminal::default();
-        let fake = FakeJj::default();
-        let mut app = app_full(&["default"], Box::new(term.clone()), Box::new(fake.clone()));
-        app.create_workspace("feat");
-        // jj adds the workspace at the derived sibling path, with the chosen name.
+    fn submitted_workspace_name_creates_and_opens_terminal() {
+        let repo = store::test_local_repo("app-create");
+        let terminal = FakeTerminal::default();
+        let mut app = app_with_store(Store::load(&repo), Box::new(terminal.clone()));
+
+        app.handle(press(KeyCode::Char('n')));
+        for character in "feat".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+
         assert_eq!(
-            *fake.added.lock().unwrap(),
-            vec![("feat".to_string(), PathBuf::from("/repo-feat"))]
-        );
-        // The tab opens with focus, and the footer confirms.
-        assert_eq!(
-            term.opened.lock().unwrap().as_slice(),
+            terminal.opened.lock().unwrap().as_slice(),
             &[("feat".to_string(), true)]
         );
         assert_eq!(app.status.as_deref(), Some("created 'feat'"));
-    }
-
-    #[test]
-    fn create_workspace_surfaces_the_jj_error_and_opens_no_tab() {
-        let term = FakeTerminal::default();
-        let fake = FakeJj {
-            outcome: FakeOutcome {
-                fail: Some("path exists".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut app = app_full(&["default"], Box::new(term.clone()), Box::new(fake.clone()));
-        app.create_workspace("feat");
-        assert_eq!(app.status.as_deref(), Some("create failed: path exists"));
-        assert!(term.opened.lock().unwrap().is_empty());
-    }
-
-    #[test]
-    fn delete_workspace_forgets_via_jj_closes_the_tab_and_reports() {
-        let term = FakeTerminal::default();
-        let fake = FakeJj::default();
-        let mut app = app_full(
-            &["default", "feat"],
-            Box::new(term.clone()),
-            Box::new(fake.clone()),
-        );
-        app.delete_workspace("feat");
-        assert_eq!(*fake.forgotten.lock().unwrap(), vec!["feat".to_string()]);
+        let fresh = Store::load(&repo);
+        let path = fresh.workspace("feat").unwrap().path.clone().unwrap();
         assert_eq!(
-            term.closed.lock().unwrap().as_slice(),
-            &["feat".to_string()]
+            fresh.workspace("feat").unwrap().path.as_deref(),
+            Some(path.as_path())
         );
-        assert_eq!(app.status.as_deref(), Some("deleted 'feat'"));
+
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn create_failure_opens_no_terminal() {
+        let repo = store::test_local_repo("app-create-failure");
+        let store = Store::load(&repo);
+        let path = repo.with_file_name(format!(
+            "{}-external-feat",
+            repo.file_name().unwrap().to_string_lossy()
+        ));
+        jj::add_workspace(&repo, "feat", &path).unwrap();
+        let terminal = FakeTerminal::default();
+        let mut app = app_with_store(store, Box::new(terminal.clone()));
+
+        app.handle(press(KeyCode::Char('n')));
+        for character in "feat".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+
+        assert!(app.status.as_deref().unwrap().starts_with("create failed:"));
+        assert!(terminal.opened.lock().unwrap().is_empty());
+
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn confirmed_delete_closes_terminal_and_removes_workspace() {
+        let repo = store::test_local_repo("app-delete");
+        let mut store = Store::load(&repo);
+        store.create("feat").unwrap();
+        let terminal = FakeTerminal::default();
+        let mut app = app_with_store(store, Box::new(terminal.clone()));
+
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Char('d')));
+        app.handle(press(KeyCode::Char('y')));
+
+        assert_eq!(terminal.closed.lock().unwrap().as_slice(), &["feat"]);
+        assert!(Store::load(&repo).workspace("feat").is_none());
+
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
@@ -2705,10 +2673,7 @@ mod tests {
     fn app_starts_with_a_persisted_on_world_pane() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let app = App::new(
-            Store {
-                repo_root: Path::new("/repo").to_path_buf(),
-                workspaces: vec![],
-            },
+            Store::from_workspaces_for_test(PathBuf::from("/repo"), vec![]),
             agent::AgentStates::default(),
             Box::new(FakeTerminal::default()),
             Box::new(FakeJj::default()),

@@ -54,6 +54,22 @@ pub fn workspace_names(repo_root: &Path) -> Vec<String> {
         .collect()
 }
 
+/// Create a new named workspace rooted at `dest` (`jj workspace add`). Workspace
+/// lifecycle ordering lives in [`crate::store::Store`]; this function is only
+/// the local jj adapter for its critical mutation step.
+pub(crate) fn add_workspace(repo_root: &Path, name: &str, dest: &Path) -> anyhow::Result<()> {
+    run_mut(
+        repo_root,
+        &["workspace", "add", "--name", name, &dest.to_string_lossy()],
+    )
+}
+
+/// Forget a workspace (`jj workspace forget`). Workspace cleanup and mirror
+/// ordering remain the responsibility of [`crate::store::Store`].
+pub(crate) fn forget_workspace(repo_root: &Path, name: &str) -> anyhow::Result<()> {
+    run_mut(repo_root, &["workspace", "forget", name])
+}
+
 /// Source revset for `tidyws`: idle, empty, undescribed workspace working-copies
 /// (excluding any that carry a bookmark or tag). Ported from the `tidyws` alias.
 const TIDYWS_SRC: &str =
@@ -71,19 +87,9 @@ fn lift_src(ws: &str) -> String {
     format!("roots(mutable() & mine() & ::{ws}@)")
 }
 
-/// The jj mutations jjfx performs, behind a trait so [`crate::app::App`] holds it
-/// as `Box<dyn Jj>` and tests can inject a fake - the same seam
-/// [`crate::terminal::Terminal`] has. These are the destructive verbs: unlike the
-/// read paths (which degrade silently), each surfaces jj's error text so the
-/// caller can show it in the footer.
+/// Repository-maintenance mutations behind the App's existing test seam. Unlike
+/// the read paths, each surfaces jj's error text for footer presentation.
 pub trait Jj: Send {
-    /// Create a new named workspace rooted at `dest` (`jj workspace add`).
-    fn add_workspace(&self, name: &str, dest: &Path) -> anyhow::Result<()>;
-
-    /// Forget a workspace (`jj workspace forget`), removing jj's record of it. The
-    /// on-disk directory is removed separately by the caller.
-    fn forget_workspace(&self, name: &str) -> anyhow::Result<()>;
-
     /// Reset idle, empty, undescribed workspace working-copies onto the trunk base
     /// (`jj rebase -s <ws-empties> -d <trunk>`), returning how many matched. A
     /// no-op (returning 0) when nothing is eligible, so it never errors on an empty
@@ -129,17 +135,6 @@ impl RealJj {
 }
 
 impl Jj for RealJj {
-    fn add_workspace(&self, name: &str, dest: &Path) -> anyhow::Result<()> {
-        run_mut(
-            &self.repo_root,
-            &["workspace", "add", "--name", name, &dest.to_string_lossy()],
-        )
-    }
-
-    fn forget_workspace(&self, name: &str) -> anyhow::Result<()> {
-        run_mut(&self.repo_root, &["workspace", "forget", name])
-    }
-
     fn tidyws(&self) -> anyhow::Result<usize> {
         let n = count(&self.repo_root, TIDYWS_SRC);
         if n == 0 {
@@ -221,7 +216,10 @@ fn count(repo_root: &Path, revset: &str) -> usize {
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.
 fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
-    cmd("jj")
+    let command = cmd("jj");
+    #[cfg(test)]
+    let command = command.args(["--config", "signing.behavior=drop"]);
+    command
         .arg("--repository")
         .arg(repo_root)
         .args(args)

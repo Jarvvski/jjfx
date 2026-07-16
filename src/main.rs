@@ -63,7 +63,7 @@ fn main() -> anyhow::Result<()> {
     if args.iter().any(|a| a == "--list") {
         let store = Store::load(&repo_root);
         let mut out = std::io::stdout().lock();
-        for w in &store.workspaces {
+        for w in store.workspaces() {
             let path = w
                 .path
                 .as_deref()
