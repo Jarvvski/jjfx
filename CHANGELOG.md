@@ -4,6 +4,17 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-07-16 - Needs-you no longer sticks after a permission is resolved
+  (v0.25.0): no hook fires when a permission dialog is approved/denied, so a
+  row stayed red until the turn's final Stop even though the agent had long
+  resumed. The hook set now also registers `PostToolUse` (both agents), and
+  a tool completing while a workspace is needs-attention folds it back to
+  working. Rerun `jjfx hooks install` to register the new event; running
+  agent sessions pick it up after a restart, and codex will re-prompt for
+  hook trust.
+
 ### Added
 
 - 2026-07-16 - Codex and claude wear their own colours (v0.24.0): the agent

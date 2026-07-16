@@ -24,6 +24,10 @@ const CLAUDE_EVENTS: &[&str] = &[
     "Stop",
     "SessionEnd",
     "PermissionRequest",
+    // No hook fires when a permission dialog is *resolved*; the first tool
+    // completing afterwards is the observable "running again" signal that
+    // clears needs-attention (see agent.rs). Chatty, but the log rotates.
+    "PostToolUse",
 ];
 
 /// Codex supports the same event names and payload shape minus `SessionEnd`,
@@ -34,6 +38,7 @@ const CODEX_EVENTS: &[&str] = &[
     "UserPromptSubmit",
     "Stop",
     "PermissionRequest",
+    "PostToolUse",
 ];
 
 /// One hooks file jjfx manages: whose it is, where it lives, and which

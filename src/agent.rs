@@ -106,6 +106,12 @@ fn transition(current: AgentState, event: &str) -> AgentState {
         "Stop" | "StopFailure" => AgentState::Waiting,
         "PermissionRequest" => AgentState::NeedsAttention,
         "SessionEnd" => AgentState::Ended,
+        // No hook marks a permission dialog being resolved, but the approved
+        // tool completing right after proves the turn resumed - recover from
+        // needs-attention only, so a stray tool event cannot wake other states.
+        "PostToolUse" | "PostToolUseFailure" if current == AgentState::NeedsAttention => {
+            AgentState::Working
+        }
         _ => current,
     }
 }
@@ -243,6 +249,13 @@ mod tests {
         assert_eq!(transition(Working, "StopFailure"), Waiting);
         assert_eq!(transition(Waiting, "PermissionRequest"), NeedsAttention);
         assert_eq!(transition(Working, "SessionEnd"), Ended);
+        // A tool completing right after a permission dialog proves the dialog
+        // was resolved and the turn resumed...
+        assert_eq!(transition(NeedsAttention, "PostToolUse"), Working);
+        assert_eq!(transition(NeedsAttention, "PostToolUseFailure"), Working);
+        // ...but tool events never wake any other state.
+        assert_eq!(transition(Waiting, "PostToolUse"), Waiting);
+        assert_eq!(transition(Working, "PostToolUse"), Working);
         // An event jjfx does not model leaves the state untouched.
         assert_eq!(transition(Working, "PreToolUse"), Working);
     }
