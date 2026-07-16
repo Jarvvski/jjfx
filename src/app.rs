@@ -98,6 +98,9 @@ pub enum Msg {
     /// was armed for; a stale one (an action replaced the message since) is a
     /// no-op.
     StatusExpired(u64),
+    /// The animation ticker fired; advance the working-glyph frame
+    /// ([`App::animate`]).
+    Tick,
 }
 
 /// How long a transient footer status message stays before expiring.
@@ -167,6 +170,9 @@ pub struct App {
     /// the idle fold, and the name-tracked selection + render cursor. `App`
     /// supplies the [`Attention`] per workspace via [`App::classified`].
     list: WorkspaceList,
+    /// The working-glyph animation frame counter, advanced by [`App::animate`]
+    /// on each [`Msg::Tick`].
+    tick: u64,
     pub should_quit: bool,
 }
 
@@ -196,6 +202,7 @@ impl App {
             status: None,
             status_gen: 0,
             list: WorkspaceList::default(),
+            tick: 0,
             should_quit: false,
         };
         app.ensure_selection();
@@ -219,7 +226,24 @@ impl App {
                     self.status = None;
                 }
             }
+            Msg::Tick => {
+                self.animate();
+            }
         }
+    }
+
+    /// Advance the working-glyph animation one frame. Returns whether anything
+    /// on screen is actually animating - the workspace list is visible and some
+    /// agent is mid-turn - so the event loop can skip the redraw for every
+    /// other tick instead of repainting an idle screen ~7 times a second.
+    pub fn animate(&mut self) -> bool {
+        self.tick = self.tick.wrapping_add(1);
+        matches!(self.mode, Mode::Normal | Mode::Help)
+            && self
+                .store
+                .workspaces
+                .iter()
+                .any(|w| self.agent_state(w) == AgentState::Working)
     }
 
     /// Fold a freshly-loaded diff into the detail view, if it is still open for
@@ -1195,6 +1219,7 @@ impl App {
                 format!("{:<15}", att.heading()),
                 Style::default().fg(attention_color(att)),
             ),
+            agent_glyph(agent, self.tick),
             Span::styled(
                 format!("{:<11}", agent.label()),
                 Style::default().fg(agent_color(agent)),
@@ -1640,14 +1665,46 @@ fn attention_color(att: Attention) -> Color {
 }
 
 /// Colour cue for an agent state - drawing the eye to what is live or blocked.
+/// Working wears Claude's signature orange, matching the animated glyph.
 fn agent_color(state: AgentState) -> Color {
     match state {
         AgentState::Absent => Color::DarkGray,
-        AgentState::Working => Color::Green,
+        AgentState::Working => WORKING_ORANGE,
         AgentState::Waiting => Color::Yellow,
         AgentState::NeedsAttention => Color::Red,
         AgentState::Ended => Color::DarkGray,
     }
+}
+
+/// The "claude is working" animation frames, straight from jj-wsx: petal glyphs
+/// bounced back and forth (0 1 2 3 4 5 4 3 2 1 0 ...), one step per
+/// [`Msg::Tick`].
+const WORKING_FRAMES: [char; 6] = ['❀', '✼', '✴', '✳', '✛', '•'];
+
+/// Claude's spinner orange - the colour jj-wsx gave the working animation.
+const WORKING_ORANGE: Color = Color::Rgb(255, 149, 0);
+
+/// The working frame for a tick: a bounce over [`WORKING_FRAMES`], not a wrap,
+/// so the petal blooms and closes instead of jumping back to the start.
+fn working_frame(tick: u64) -> char {
+    let len = WORKING_FRAMES.len() as u64;
+    let cycle = (len - 1) * 2;
+    let pos = tick % cycle;
+    let idx = if pos < len { pos } else { cycle - pos };
+    WORKING_FRAMES[idx as usize]
+}
+
+/// The one-glyph agent status ahead of the label: the animated working frame,
+/// a static `✻` while the agent waits on the human (red when blocked on a
+/// permission), and a dim dot when there is no live session.
+fn agent_glyph(state: AgentState, tick: u64) -> Span<'static> {
+    let (ch, color) = match state {
+        AgentState::Working => (working_frame(tick), WORKING_ORANGE),
+        AgentState::Waiting => ('✻', Color::Yellow),
+        AgentState::NeedsAttention => ('✻', Color::Red),
+        AgentState::Absent | AgentState::Ended => ('·', Color::DarkGray),
+    };
+    Span::styled(format!("{ch} "), Style::default().fg(color))
 }
 
 /// The compact forge pipeline for a row: a `⚒` sigil then one `letter+glyph` per
@@ -2722,5 +2779,52 @@ mod tests {
         // Narrow: the strip is dropped so the diff stays readable (no panic).
         let mut term = Terminal::new(TestBackend::new(70, 30)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
+    }
+
+    #[test]
+    fn working_frames_bounce_instead_of_wrapping() {
+        // One full cycle blooms out and closes back: 0 1 2 3 4 5 4 3 2 1, then
+        // tick 10 starts the next bloom at frame 0 again.
+        let seq: String = (0..=10).map(working_frame).collect();
+        assert_eq!(seq, "❀✼✴✳✛•✛✳✴✼❀");
+    }
+
+    #[test]
+    fn agent_glyph_matches_the_state() {
+        assert_eq!(agent_glyph(AgentState::Waiting, 0).content, "✻ ");
+        assert_eq!(agent_glyph(AgentState::NeedsAttention, 0).content, "✻ ");
+        assert_eq!(agent_glyph(AgentState::Absent, 0).content, "· ");
+        assert_eq!(agent_glyph(AgentState::Ended, 0).content, "· ");
+        // The working glyph animates with the tick.
+        assert_eq!(agent_glyph(AgentState::Working, 0).content, "❀ ");
+        assert_eq!(agent_glyph(AgentState::Working, 3).content, "✳ ");
+    }
+
+    #[test]
+    fn ticks_redraw_only_while_an_agent_works_on_screen() {
+        let mut app = app_with(&["feat"]);
+        // No live agent: ticks advance the frame but warrant no repaint.
+        assert!(!app.animate());
+
+        // A turn starts in the workspace (cwd matches its path): animate.
+        for name in ["SessionStart", "UserPromptSubmit"] {
+            app.handle(Msg::AgentEvent(agent::Event {
+                name: name.to_string(),
+                cwd: "/wt/feat".to_string(),
+            }));
+        }
+        assert!(app.animate());
+
+        // A full-screen view hides the list, so the glyph has nothing to move.
+        app.mode = Mode::Graph(Viewport::default());
+        assert!(!app.animate());
+        app.mode = Mode::Normal;
+
+        // The turn ends: back to a static glyph, no repaint per tick.
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "Stop".to_string(),
+            cwd: "/wt/feat".to_string(),
+        }));
+        assert!(!app.animate());
     }
 }

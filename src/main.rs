@@ -114,6 +114,9 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx.clone());
 
+    // Animation ticker -> Msg::Tick, driving the working-glyph bounce.
+    spawn_animation_ticker(tx.clone());
+
     let mut app = App::new(
         Store::load(&repo_root),
         initial_agents,
@@ -159,6 +162,7 @@ async fn event_loop(
         // but the many filesystem events a single jj command emits collapse into
         // one reload.
         let mut needs_reload = false;
+        let mut needs_redraw = false;
         let mut batch = vec![first];
         while let Ok(next) = rx.try_recv() {
             batch.push(next);
@@ -166,7 +170,13 @@ async fn event_loop(
         for msg in batch {
             match msg {
                 Msg::Reload => needs_reload = true,
-                input => app.handle(input),
+                // A tick redraws only while something is animating on screen;
+                // otherwise the steady tick stream would repaint an idle TUI.
+                Msg::Tick => needs_redraw |= app.animate(),
+                input => {
+                    app.handle(input);
+                    needs_redraw = true;
+                }
             }
         }
         if needs_reload {
@@ -174,12 +184,15 @@ async fn event_loop(
             // A repo change may have altered the work state; nudge the poller so
             // the row refreshes without waiting for the next interval tick.
             let _ = work_tx.send(());
+            needs_redraw = true;
         }
 
         if app.should_quit {
             break;
         }
-        terminal.draw(|f| app.render(f))?;
+        if needs_redraw {
+            terminal.draw(|f| app.render(f))?;
+        }
     }
     Ok(())
 }
@@ -217,6 +230,21 @@ fn spawn_work_poller(
                         break; // sender dropped at shutdown
                     }
                 }
+            }
+        }
+    });
+}
+
+/// Send [`Msg::Tick`] every 150ms (jj-wsx's animation frame rate) to advance
+/// the working-glyph bounce. The app decides per tick whether a redraw is
+/// warranted, so an idle screen costs nothing beyond the channel send.
+fn spawn_animation_ticker(tx: UnboundedSender<Msg>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));
+        loop {
+            interval.tick().await;
+            if tx.send(Msg::Tick).is_err() {
+                break; // app gone
             }
         }
     });

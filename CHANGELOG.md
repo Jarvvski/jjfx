@@ -6,6 +6,15 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-16 - Animated agent status glyphs (v0.23.0): each workspace row now
+  carries a one-glyph agent status ahead of the label, hook-driven for both
+  claude and codex. While a turn is in progress the glyph plays jj-wsx's
+  "claude is working" animation - petal frames `❀ ✼ ✴ ✳ ✛ •` bounced at 150ms
+  in Claude's spinner orange (the working label turns orange to match); a
+  waiting agent shows a static yellow `✻`, one blocked on a permission a red
+  `✻`, and no live session a dim `·`. The animation repaints only while an
+  agent is actually working and the list is on screen.
+
 - 2026-07-14 - Codex lifecycle tracking (v0.21.0): `jjfx hooks install` now
   also installs the append hook into codex's `~/.codex/hooks.json` (same
   events log, same payload shape), so codex sessions drive the agent status
