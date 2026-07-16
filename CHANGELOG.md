@@ -6,6 +6,16 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-16 - Codex and claude wear their own colours (v0.24.0): the agent
+  column now names the agent (`claude` / `codex`) while a session is live,
+  derived per event from the payload's `transcript_path` (`~/.claude/` vs
+  `~/.codex/` - no hook-config change needed). Each gets its own working
+  animation: claude keeps the orange jj-wsx petals, codex fills a cyan
+  hexagon slice by slice (nerd-font `md-hexagon_slice_1..6`, so a
+  nerd-font-patched terminal font is assumed). Waiting/blocked marks are also per-agent
+  (claude `✻`, codex an outline hexagon), coloured by state (yellow/red),
+  and workspaces with no live session show `· -`.
+
 - 2026-07-16 - Animated agent status glyphs (v0.23.0): each workspace row now
   carries a one-glyph agent status ahead of the label, hook-driven for both
   claude and codex. While a turn is in progress the glyph plays jj-wsx's

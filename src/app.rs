@@ -16,7 +16,7 @@ use ratatui::widgets::{Block, Borders, Clear, ListItem, Paragraph};
 use renderdag::{Ancestor, GraphRowRenderer, Renderer};
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::agent::{self, AgentState};
+use crate::agent::{self, AgentKind, AgentState};
 use crate::attention::{self, Attention};
 use crate::config::ForgeConfig;
 use crate::diff::{self, FileDiff};
@@ -343,9 +343,15 @@ impl App {
 
     /// The agent state for a workspace, `Absent` if the log has none for it.
     fn agent_state(&self, w: &Workspace) -> AgentState {
+        self.agent_of(w).state
+    }
+
+    /// The live agent (state + kind) for a workspace, default if the log has
+    /// no events for it.
+    fn agent_of(&self, w: &Workspace) -> agent::Agent {
         w.path
             .as_deref()
-            .map(|p| self.agents.state_for(p))
+            .map(|p| self.agents.agent_for(p))
             .unwrap_or_default()
     }
 
@@ -1190,7 +1196,7 @@ impl App {
     /// A workspace row: Attention badge, then the two lifecycle axes, then name
     /// and path.
     fn workspace_item(&self, w: &Workspace, att: Attention, selected: bool) -> ListItem<'static> {
-        let agent = self.agent_state(w);
+        let agent = self.agent_of(w);
         let work = self.work_state(w);
         let behind = self.behind(w);
         // How far behind trunk: dimmed unless it is far enough to warrant tidyws.
@@ -1221,7 +1227,7 @@ impl App {
             ),
             agent_glyph(agent, self.tick),
             Span::styled(
-                format!("{:<11}", agent.label()),
+                format!("{:<11}", agent_label(agent)),
                 Style::default().fg(agent_color(agent)),
             ),
         ];
@@ -1664,47 +1670,98 @@ fn attention_color(att: Attention) -> Color {
     }
 }
 
-/// Colour cue for an agent state - drawing the eye to what is live or blocked.
-/// Working wears Claude's signature orange, matching the animated glyph.
-fn agent_color(state: AgentState) -> Color {
-    match state {
-        AgentState::Absent => Color::DarkGray,
-        AgentState::Working => WORKING_ORANGE,
+/// The agent column's label: which agent lives here (claude/codex) while a
+/// session is live, `-` otherwise. The *state* is carried by the glyph and the
+/// Attention grouping, so the label is free to name the agent instead.
+fn agent_label(agent: agent::Agent) -> &'static str {
+    match agent.state {
+        AgentState::Absent | AgentState::Ended => "-",
+        _ => agent.kind.label(),
+    }
+}
+
+/// Colour cue for the agent cell - drawing the eye to what is live or blocked.
+/// A working agent wears its brand colour, matching the animated glyph.
+fn agent_color(agent: agent::Agent) -> Color {
+    match agent.state {
+        AgentState::Absent | AgentState::Ended => Color::DarkGray,
+        AgentState::Working => brand_color(agent.kind),
         AgentState::Waiting => Color::Yellow,
         AgentState::NeedsAttention => Color::Red,
-        AgentState::Ended => Color::DarkGray,
     }
 }
 
 /// The "claude is working" animation frames, straight from jj-wsx: petal glyphs
 /// bounced back and forth (0 1 2 3 4 5 4 3 2 1 0 ...), one step per
 /// [`Msg::Tick`].
-const WORKING_FRAMES: [char; 6] = ['❀', '✼', '✴', '✳', '✛', '•'];
+const CLAUDE_FRAMES: [char; 6] = ['❀', '✼', '✴', '✳', '✛', '•'];
+
+/// Codex's working animation: a hexagon filling slice by slice, then
+/// restarting (nerd font `md-hexagon_slice_1..6` - needs a nerd-font-patched
+/// terminal font, which the kitty setup jjfx drives already assumes).
+const CODEX_FRAMES: [char; 6] = [
+    '\u{f0ac3}', // 󰫃 hexagon_slice_1
+    '\u{f0ac4}', // 󰫄 hexagon_slice_2
+    '\u{f0ac5}', // 󰫅 hexagon_slice_3
+    '\u{f0ac6}', // 󰫆 hexagon_slice_4
+    '\u{f0ac7}', // 󰫇 hexagon_slice_5
+    '\u{f0ac8}', // 󰫈 hexagon_slice_6
+];
 
 /// Claude's spinner orange - the colour jj-wsx gave the working animation.
-const WORKING_ORANGE: Color = Color::Rgb(255, 149, 0);
+const CLAUDE_ORANGE: Color = Color::Rgb(255, 149, 0);
 
-/// The working frame for a tick: a bounce over [`WORKING_FRAMES`], not a wrap,
-/// so the petal blooms and closes instead of jumping back to the start.
-fn working_frame(tick: u64) -> char {
-    let len = WORKING_FRAMES.len() as u64;
-    let cycle = (len - 1) * 2;
-    let pos = tick % cycle;
-    let idx = if pos < len { pos } else { cycle - pos };
-    WORKING_FRAMES[idx as usize]
+/// Codex's cyan.
+const CODEX_CYAN: Color = Color::Rgb(34, 211, 238);
+
+/// Each agent's signature colour, worn while working. Unknown falls back to
+/// claude's - the historical default agent.
+fn brand_color(kind: AgentKind) -> Color {
+    match kind {
+        AgentKind::Codex => CODEX_CYAN,
+        AgentKind::Claude | AgentKind::Unknown => CLAUDE_ORANGE,
+    }
 }
 
-/// The one-glyph agent status ahead of the label: the animated working frame,
-/// a static `✻` while the agent waits on the human (red when blocked on a
-/// permission), and a dim dot when there is no live session.
-fn agent_glyph(state: AgentState, tick: u64) -> Span<'static> {
-    let (ch, color) = match state {
-        AgentState::Working => (working_frame(tick), WORKING_ORANGE),
-        AgentState::Waiting => ('✻', Color::Yellow),
-        AgentState::NeedsAttention => ('✻', Color::Red),
+/// The working frame for a tick: claude's petals bloom and close (a bounce over
+/// [`CLAUDE_FRAMES`]), codex's hexagon fills up and restarts (a wrap over
+/// [`CODEX_FRAMES`]).
+fn working_frame(kind: AgentKind, tick: u64) -> char {
+    match kind {
+        AgentKind::Codex => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
+        AgentKind::Claude | AgentKind::Unknown => {
+            let len = CLAUDE_FRAMES.len() as u64;
+            let cycle = (len - 1) * 2;
+            let pos = tick % cycle;
+            let idx = if pos < len { pos } else { cycle - pos };
+            CLAUDE_FRAMES[idx as usize]
+        }
+    }
+}
+
+/// The one-glyph agent status ahead of the label: the agent's own working
+/// animation in its brand colour, its own static mark while it waits on the
+/// human (yellow; red when blocked on a permission), and a dim dot when there
+/// is no live session.
+fn agent_glyph(agent: agent::Agent, tick: u64) -> Span<'static> {
+    let (ch, color) = match agent.state {
+        AgentState::Working => (working_frame(agent.kind, tick), brand_color(agent.kind)),
+        AgentState::Waiting => (paused_glyph(agent.kind), Color::Yellow),
+        AgentState::NeedsAttention => (paused_glyph(agent.kind), Color::Red),
         AgentState::Absent | AgentState::Ended => ('·', Color::DarkGray),
     };
     Span::styled(format!("{ch} "), Style::default().fg(color))
+}
+
+/// The static "session present, not working" mark, per agent so a paused codex
+/// cannot be mistaken for a paused claude: claude's `✻`, codex's hexagon
+/// drained to its outline (nerd font `md-hexagon_outline`). The state still
+/// speaks through the colour (yellow waiting, red blocked).
+fn paused_glyph(kind: AgentKind) -> char {
+    match kind {
+        AgentKind::Codex => '\u{f02d9}', // 󰋙 hexagon_outline
+        AgentKind::Claude | AgentKind::Unknown => '✻',
+    }
 }
 
 /// The compact forge pipeline for a row: a `⚒` sigil then one `letter+glyph` per
@@ -2065,6 +2122,7 @@ mod tests {
         app.handle(Msg::AgentEvent(agent::Event {
             name: "UserPromptSubmit".into(),
             cwd: "/wt/feat".into(),
+            transcript_path: None,
         }));
         let feat = app
             .store
@@ -2446,10 +2504,12 @@ mod tests {
         app.handle(Msg::AgentEvent(agent::Event {
             name: "PermissionRequest".into(),
             cwd: "/wt/blocked".into(),
+            transcript_path: None,
         }));
         app.handle(Msg::AgentEvent(agent::Event {
             name: "UserPromptSubmit".into(),
             cwd: "/wt/busy".into(),
+            transcript_path: None,
         }));
         let mut snap = HashMap::new();
         snap.insert(
@@ -2781,23 +2841,68 @@ mod tests {
         term.draw(|f| app.render(f)).unwrap();
     }
 
-    #[test]
-    fn working_frames_bounce_instead_of_wrapping() {
-        // One full cycle blooms out and closes back: 0 1 2 3 4 5 4 3 2 1, then
-        // tick 10 starts the next bloom at frame 0 again.
-        let seq: String = (0..=10).map(working_frame).collect();
-        assert_eq!(seq, "❀✼✴✳✛•✛✳✴✼❀");
+    fn live(state: AgentState, kind: AgentKind) -> agent::Agent {
+        agent::Agent { state, kind }
     }
 
     #[test]
-    fn agent_glyph_matches_the_state() {
-        assert_eq!(agent_glyph(AgentState::Waiting, 0).content, "✻ ");
-        assert_eq!(agent_glyph(AgentState::NeedsAttention, 0).content, "✻ ");
-        assert_eq!(agent_glyph(AgentState::Absent, 0).content, "· ");
-        assert_eq!(agent_glyph(AgentState::Ended, 0).content, "· ");
-        // The working glyph animates with the tick.
-        assert_eq!(agent_glyph(AgentState::Working, 0).content, "❀ ");
-        assert_eq!(agent_glyph(AgentState::Working, 3).content, "✳ ");
+    fn claude_frames_bounce_and_codex_frames_wrap() {
+        // Claude's petals bloom out and close back: 0 1 2 3 4 5 4 3 2 1, then
+        // tick 10 starts the next bloom at frame 0 again.
+        let seq: String = (0..=10)
+            .map(|t| working_frame(AgentKind::Claude, t))
+            .collect();
+        assert_eq!(seq, "❀✼✴✳✛•✛✳✴✼❀");
+        // Codex's hexagon fills slice by slice, then restarts empty.
+        let seq: String = (0..=6)
+            .map(|t| working_frame(AgentKind::Codex, t))
+            .collect();
+        assert_eq!(
+            seq,
+            "\u{f0ac3}\u{f0ac4}\u{f0ac5}\u{f0ac6}\u{f0ac7}\u{f0ac8}\u{f0ac3}"
+        );
+    }
+
+    #[test]
+    fn agent_glyph_matches_state_and_kind() {
+        use AgentKind::*;
+        use AgentState::*;
+        // Each agent pauses under its own mark; colour carries the state.
+        assert_eq!(agent_glyph(live(Waiting, Claude), 0).content, "✻ ");
+        assert_eq!(agent_glyph(live(Waiting, Codex), 0).content, "\u{f02d9} ");
+        assert_eq!(
+            agent_glyph(live(NeedsAttention, Codex), 0).content,
+            "\u{f02d9} "
+        );
+        assert_eq!(
+            agent_glyph(live(NeedsAttention, Codex), 0).style.fg,
+            Some(Color::Red)
+        );
+        assert_eq!(agent_glyph(live(Absent, Unknown), 0).content, "· ");
+        assert_eq!(agent_glyph(live(Ended, Claude), 0).content, "· ");
+        // Each agent works in its own animation and brand colour.
+        assert_eq!(agent_glyph(live(Working, Claude), 0).content, "❀ ");
+        assert_eq!(agent_glyph(live(Working, Codex), 0).content, "\u{f0ac3} ");
+        assert_eq!(
+            agent_glyph(live(Working, Claude), 0).style.fg,
+            Some(CLAUDE_ORANGE)
+        );
+        assert_eq!(
+            agent_glyph(live(Working, Codex), 0).style.fg,
+            Some(CODEX_CYAN)
+        );
+    }
+
+    #[test]
+    fn agent_label_names_the_agent_only_while_live() {
+        use AgentKind::*;
+        use AgentState::*;
+        assert_eq!(agent_label(live(Working, Claude)), "claude");
+        assert_eq!(agent_label(live(Waiting, Codex)), "codex");
+        assert_eq!(agent_label(live(NeedsAttention, Unknown)), "agent");
+        // No live session: a dash, whoever was here before.
+        assert_eq!(agent_label(live(Absent, Unknown)), "-");
+        assert_eq!(agent_label(live(Ended, Claude)), "-");
     }
 
     #[test]
@@ -2811,6 +2916,7 @@ mod tests {
             app.handle(Msg::AgentEvent(agent::Event {
                 name: name.to_string(),
                 cwd: "/wt/feat".to_string(),
+                transcript_path: None,
             }));
         }
         assert!(app.animate());
@@ -2824,6 +2930,7 @@ mod tests {
         app.handle(Msg::AgentEvent(agent::Event {
             name: "Stop".to_string(),
             cwd: "/wt/feat".to_string(),
+            transcript_path: None,
         }));
         assert!(!app.animate());
     }
