@@ -136,6 +136,15 @@ impl Progress {
     fn clean_success(&self) -> bool {
         self.reason.is_none() && self.steps == [Status::Ok; 4]
     }
+
+    #[cfg(test)]
+    pub(crate) fn finished_for_test(steps: [Status; 4], reason: &str) -> Self {
+        Self {
+            steps,
+            active: false,
+            reason: Some(reason.to_string()),
+        }
+    }
 }
 
 /// One streamed Forge outcome, already folded into valid progress.
@@ -1405,6 +1414,13 @@ mod tests {
                 && progress.reason() == Some("pr: no bookmark to open a PR")
                 && notice == "pr: no bookmark to open a PR"
         )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                workspace,
+                progress: Some(progress),
+            }) if workspace == "feat" && !progress.active()
+        ));
     }
 
     #[tokio::test]

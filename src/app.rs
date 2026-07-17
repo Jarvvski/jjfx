@@ -116,7 +116,7 @@ pub struct App {
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, Work>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
-    /// while a forge runs or after one that ended with a skip/failure.
+    /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
     /// A background `jj git fetch` is in flight; a second `u` is ignored until
     /// it resolves (two would just contend on the repo lock).
@@ -284,14 +284,9 @@ impl App {
                 workspace,
                 progress,
             } => {
-                match progress {
-                    Some(progress) => {
-                        self.forge_progress.insert(workspace, progress);
-                    }
-                    None => {
-                        self.forge_progress.remove(&workspace);
-                        self.set_status(format!("{workspace}: forged"));
-                    }
+                self.forge_progress.remove(&workspace);
+                if progress.is_none() {
+                    self.set_status(format!("{workspace}: forged"));
                 }
                 // A forge moves revisions (weld/push); refresh the graph if shown.
                 self.refresh_graph_if_visible();
@@ -1159,8 +1154,8 @@ impl App {
                 Style::default().fg(agent_color(agent)),
             ),
         ];
-        // While a forge is running (or ended with a skip), its live pipeline
-        // takes the work column; otherwise the work label shows there.
+        // While a forge is running, its live pipeline takes the work column;
+        // otherwise the work label shows there.
         match self.forge_progress.get(&w.name) {
             Some(progress) => spans.extend(forge_spans(progress)),
             None => spans.push(Span::styled(
@@ -1898,6 +1893,39 @@ mod tests {
             false,
             tx,
         )
+    }
+
+    #[test]
+    fn finished_forge_with_skips_clears_the_pipeline_overlay() {
+        let mut app = app_with(&["worker"]);
+        let reason = "pr: no bookmark to open a PR";
+        let progress = forge::Progress::finished_for_test(
+            [
+                forge::Status::Ok,
+                forge::Status::Ok,
+                forge::Status::Skipped,
+                forge::Status::Skipped,
+            ],
+            reason,
+        );
+
+        app.handle(Msg::Forge(forge::Update::Progress {
+            workspace: "worker".to_string(),
+            progress: progress.clone(),
+            notice: Some(reason.to_string()),
+        }));
+        assert!(app.forge_progress.contains_key("worker"));
+
+        app.handle(Msg::Forge(forge::Update::Finished {
+            workspace: "worker".to_string(),
+            progress: Some(progress),
+        }));
+
+        assert!(!app.forge_progress.contains_key("worker"));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("worker: pr: no bookmark to open a PR")
+        );
     }
 
     fn press(code: KeyCode) -> Msg {

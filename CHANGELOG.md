@@ -6,6 +6,11 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-17 - Completed forge pipelines no longer remain in workspace rows
+  (v0.25.1): a skipped push or Pull Request step left its final progress
+  snapshot visible forever. Finished pipelines now return to the normal work
+  status while the skip reason remains briefly in the footer.
+
 - 2026-07-16 - Needs-you no longer sticks after a permission is resolved
   (v0.25.0): no hook fires when a permission dialog is approved/denied, so a
   row stayed red until the turn's final Stop even though the agent had long
