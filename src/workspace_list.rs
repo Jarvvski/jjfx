@@ -1,8 +1,8 @@
-//! The attention-grouped, idle-collapsible, name-tracked workspace list
-//! (ADR 0008). Owns the list's *mechanics*: grouping the classified workspaces
-//! into display rows, folding the idle group away, and tracking the selection by
-//! workspace **name** so it follows a workspace as live state re-sorts it between
-//! Attention groups.
+//! The default-pinned, attention-grouped, idle-collapsible, name-tracked
+//! workspace list (ADR 0008). Owns the list's *mechanics*: pinning `default`,
+//! grouping the remaining classified workspaces into display rows, folding the
+//! idle group away, and tracking the selection by workspace **name** so it
+//! follows a workspace as live state re-sorts it between Attention groups.
 //!
 //! `App` derives each workspace's [`Attention`] (that needs `agents`/`work`, so
 //! it stays there) and hands the already-sorted `(Attention, &Workspace)` pairs
@@ -13,7 +13,7 @@ use ratatui::layout::Rect;
 use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::attention::Attention;
-use crate::store::Workspace;
+use crate::store::{DEFAULT_WORKSPACE, Workspace};
 
 /// One rendered list line: a group header (non-selectable) or a workspace row.
 #[derive(Debug, PartialEq)]
@@ -52,24 +52,33 @@ impl WorkspaceList {
         self.idle_collapsed = !self.idle_collapsed;
     }
 
-    /// The display rows for the classified workspaces: a header per non-empty
-    /// group, then its workspace rows (unless the idle group is collapsed).
+    /// The display rows for the classified workspaces: `default` pinned first,
+    /// then a header per non-empty group and its workspace rows (unless the idle
+    /// group is collapsed).
     ///
     /// `classified` must be grouped by Attention (contiguous runs), which is how
     /// `App::classified` sorts it.
     pub fn rows<'a>(&self, classified: &[(Attention, &'a Workspace)]) -> Vec<Row<'a>> {
         let mut rows = Vec::new();
+        if let Some((attention, workspace)) = classified
+            .iter()
+            .find(|(_, workspace)| workspace.name == DEFAULT_WORKSPACE)
+        {
+            rows.push(Row::Ws(workspace, *attention));
+        }
+
+        let grouped: Vec<_> = classified
+            .iter()
+            .copied()
+            .filter(|(_, workspace)| workspace.name != DEFAULT_WORKSPACE)
+            .collect();
         let mut idx = 0;
-        while idx < classified.len() {
-            let att = classified[idx].0;
-            let end = idx
-                + classified[idx..]
-                    .iter()
-                    .take_while(|(a, _)| *a == att)
-                    .count();
+        while idx < grouped.len() {
+            let att = grouped[idx].0;
+            let end = idx + grouped[idx..].iter().take_while(|(a, _)| *a == att).count();
             rows.push(Row::Header(att, end - idx));
             if !(att == Attention::Idle && self.idle_collapsed) {
-                for (a, w) in &classified[idx..end] {
+                for (a, w) in &grouped[idx..end] {
                     rows.push(Row::Ws(w, *a));
                 }
             }

@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-17 - Default workspace stays pinned at the top (v0.25.2): `default`
+  now remains above every attention group regardless of its current lifecycle.
+  Folding the idle group keeps it visible, and initial selection starts there.
+
 - 2026-07-17 - Completed forge pipelines no longer remain in workspace rows
   (v0.25.1): a skipped push or Pull Request step left its final progress
   snapshot visible forever. Finished pipelines now return to the normal work

@@ -2392,16 +2392,17 @@ mod tests {
 
     #[test]
     fn selection_moves_and_clamps() {
-        // All idle -> one group, sorted by name: a, b, default.
+        // Default is pinned, then the idle group is sorted by name: a, b.
         let mut app = app_with(&["default", "a", "b"]);
-        assert_eq!(app.list.selected(), Some("a"));
+        assert_eq!(app.list.selected(), Some("default"));
         app.handle(press(KeyCode::Up)); // clamp at top
+        assert_eq!(app.list.selected(), Some("default"));
+        app.handle(press(KeyCode::Down));
         assert_eq!(app.list.selected(), Some("a"));
         app.handle(press(KeyCode::Down));
         assert_eq!(app.list.selected(), Some("b"));
         app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Down)); // clamp at bottom
-        assert_eq!(app.list.selected(), Some("default"));
+        assert_eq!(app.list.selected(), Some("b")); // clamp at bottom
     }
 
     #[test]
@@ -2442,19 +2443,53 @@ mod tests {
     }
 
     #[test]
+    fn default_workspace_renders_before_all_attention_groups() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "blocked"]);
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "PermissionRequest".into(),
+            cwd: "/wt/blocked".into(),
+            transcript_path: None,
+        }));
+
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        let width = term.backend().buffer().area.width as usize;
+        let lines: Vec<String> = term
+            .backend()
+            .buffer()
+            .content()
+            .chunks(width)
+            .map(|cells| cells.iter().map(|cell| cell.symbol()).collect())
+            .collect();
+        let default_line = lines
+            .iter()
+            .position(|line| line.contains("default"))
+            .unwrap();
+        let needs_you_line = lines
+            .iter()
+            .position(|line| line.contains("needs you (1)"))
+            .unwrap();
+
+        assert!(default_line < needs_you_line);
+    }
+
+    #[test]
     fn idle_group_folds_and_selection_stays_valid() {
         let mut app = app_with(&["default", "a"]); // both idle
         assert_eq!(app.selectable_names().len(), 2);
-        // Fold idle -> no selectable rows remain, selection clears gracefully.
+        // Fold idle -> pinned default remains visible and selected.
         app.handle(press(KeyCode::Char('c')));
         assert!(app.list.idle_collapsed());
-        assert_eq!(app.selectable_names().len(), 0);
-        assert_eq!(app.list.selected(), None);
-        // Unfold restores selectability and a valid selection.
+        assert_eq!(app.selectable_names(), vec!["default"]);
+        assert_eq!(app.list.selected(), Some("default"));
+        // Unfold restores the grouped workspace without disturbing selection.
         app.handle(press(KeyCode::Char('c')));
         assert!(!app.list.idle_collapsed());
         assert_eq!(app.selectable_names().len(), 2);
-        assert!(app.list.selected().is_some());
+        assert_eq!(app.list.selected(), Some("default"));
     }
 
     /// Two changed files with distinct magnitudes, folded in via `Msg::DiffLoaded`.
