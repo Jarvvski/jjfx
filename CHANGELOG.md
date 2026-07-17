@@ -54,6 +54,12 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Changed
 
+- 2026-07-17 - Agent launch uses one shell command (v0.26.0): configure
+  `[agent] command = "cx"` to run any coding agent command, including aliases
+  and commands with flags. It always runs through `$SHELL -l -i -c`, with
+  `"claude"` as the default. Breaking: `[terminal] agent`, `[claude]`, and
+  `[codex]` are removed; replace them with the single `[agent]` section.
+
 - 2026-07-14 - World graph shows the connected trunk spine (v0.22.2): instead
   of eliding trunk history down to branch points, the world view now renders
   every trunk ancestor as a connected `◆` mainline (the `::trunk()` the

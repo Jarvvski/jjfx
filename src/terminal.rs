@@ -53,10 +53,10 @@ pub struct KittyTerminal {
     /// Command (program + args) run to launch the target when its socket isn't
     /// found. Empty never auto-launches.
     launch_command: Vec<String>,
-    /// Command (program + args) run in a tab's left pane - the selected agent,
+    /// Command (program + args) run in a tab's left pane - the configured agent,
     /// already resolved by [`Config::agent_command`](crate::config::Config::agent_command)
-    /// (config decides which agent and whether it gets the login-shell wrap;
-    /// this module just runs what it is given).
+    /// through the login interactive shell. This module just runs what it is
+    /// given.
     agent_command: Vec<String>,
 }
 

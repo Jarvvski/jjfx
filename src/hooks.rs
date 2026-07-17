@@ -49,9 +49,9 @@ struct Target {
     events: &'static [&'static str],
 }
 
-/// The hooks files jjfx installs into - both agents unconditionally, so a later
-/// `[terminal] agent` switch needs no reinstall. The append hook is inert for
-/// an agent that is never run.
+/// The hooks files jjfx installs into - both agents unconditionally, so changing
+/// `[agent] command` needs no reinstall. The append hook is inert for an agent
+/// that is never run.
 fn targets() -> Vec<Target> {
     vec![
         Target {
