@@ -15,10 +15,21 @@ use serde::Deserialize;
 pub struct Config {
     /// How jjfx launches the coding agent in each workspace.
     pub agent: AgentConfig,
+    /// What jjfx runs after creating a workspace and before opening its tab.
+    pub workspace: WorkspaceConfig,
     /// Which terminal instance hosts workspace sessions, and how to reach it.
     pub terminal: TerminalConfig,
     /// How the forge pipeline opens and maintains pull requests.
     pub forge: ForgeConfig,
+}
+
+/// How jjfx prepares a newly-created workspace before presenting it.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WorkspaceConfig {
+    /// Program and arguments run directly from the new workspace directory.
+    /// Empty disables the hook; no shell parsing or expansion is performed.
+    pub on_create: Vec<String>,
 }
 
 impl Config {
@@ -138,12 +149,39 @@ mod tests {
     #[test]
     fn empty_config_is_all_defaults() {
         let cfg: Config = toml::from_str("").expect("empty toml parses");
+        assert!(cfg.workspace.on_create.is_empty());
         assert!(cfg.terminal.listen_on.is_none());
         assert!(cfg.terminal.launch_command.is_empty());
         assert_eq!(cfg.agent.command, "claude");
         // Forge PR management is on-by-default, drafts on-by-default.
         assert!(cfg.forge.pull_requests);
         assert!(cfg.forge.draft);
+    }
+
+    #[test]
+    fn workspace_on_create_parses_as_direct_argv() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [workspace]
+            on_create = ["mise", "trust"]
+            "#,
+        )
+        .expect("toml parses");
+
+        assert_eq!(cfg.workspace.on_create, ["mise", "trust"]);
+    }
+
+    #[test]
+    fn unknown_workspace_key_is_rejected() {
+        let error = toml::from_str::<Config>(
+            r#"
+            [workspace]
+            on_cretae = ["mise", "trust"]
+            "#,
+        )
+        .expect_err("unknown workspace key is an error");
+
+        assert!(error.to_string().contains("on_cretae"), "{error}");
     }
 
     #[test]

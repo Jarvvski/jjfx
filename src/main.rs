@@ -34,7 +34,7 @@ use anyhow::Context;
 use ratatui::crossterm::event;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-use crate::app::{App, Msg};
+use crate::app::{App, AppConfig, Msg};
 use crate::store::Store;
 
 fn main() -> anyhow::Result<()> {
@@ -124,7 +124,10 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
             config.agent_command(),
         )),
         Box::new(jj::RealJj::new(repo_root.clone())),
-        config.forge,
+        AppConfig {
+            workspace: config.workspace,
+            forge: config.forge,
+        },
         ui.world_pane,
         tx,
     );

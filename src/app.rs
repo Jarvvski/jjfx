@@ -17,7 +17,8 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentKind, AgentState};
 use crate::attention::{self, Attention};
-use crate::config::ForgeConfig;
+use crate::cmd::cmd;
+use crate::config::{ForgeConfig, WorkspaceConfig};
 use crate::diff::{self, FileDiff};
 use crate::diff_view::Detail;
 use crate::forge::{self, Target};
@@ -74,6 +75,13 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Quit", "q / esc"),
 ];
 
+/// The identity of the single workspace whose on-create command is running.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingWorkspace {
+    name: String,
+    path: std::path::PathBuf,
+}
+
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
 pub enum Msg {
@@ -89,6 +97,11 @@ pub enum Msg {
     Forge(forge::Update),
     /// The background `jj git fetch` finished; `Err` carries jj's error text.
     Fetched(Result<(), String>),
+    /// The configured command for a newly-created workspace finished.
+    WorkspaceConfigured {
+        workspace: PendingWorkspace,
+        result: Result<(), String>,
+    },
     /// The diff for a workspace finished loading (ticket 10).
     DiffLoaded { ws: String, files: Vec<FileDiff> },
     /// The commit graph finished loading from jj-lib (ticket 11).
@@ -104,6 +117,26 @@ pub enum Msg {
 
 /// How long a transient footer status message stays before expiring.
 const STATUS_TTL: Duration = Duration::from_secs(5);
+
+/// Run the configured new-workspace command directly from `path`. An empty
+/// argv disables the hook; otherwise its first item is the program and the rest
+/// are passed unchanged as arguments, with no shell interpretation.
+pub(crate) fn run_on_create(command: &[String], path: &std::path::Path) -> anyhow::Result<()> {
+    let Some((program, args)) = command.split_first() else {
+        return Ok(());
+    };
+    cmd(program).args(args).current_dir(path).run()?.checked()?;
+    Ok(())
+}
+
+/// Startup settings owned by the App rather than its terminal or store.
+#[derive(Debug, Default)]
+pub struct AppConfig {
+    /// How newly-created workspaces are prepared before their tabs open.
+    pub workspace: WorkspaceConfig,
+    /// How the forge pipeline opens and maintains pull requests.
+    pub forge: ForgeConfig,
+}
 
 /// The whole application state - one owned value on the main task.
 pub struct App {
@@ -121,6 +154,10 @@ pub struct App {
     /// A background `jj git fetch` is in flight; a second `u` is ignored until
     /// it resolves (two would just contend on the repo lock).
     fetching: bool,
+    /// User-owned command run once after workspace creation. Empty disables it.
+    workspace_config: WorkspaceConfig,
+    /// The single new workspace whose configured command is still running.
+    pending_workspace: Option<PendingWorkspace>,
     /// The deep Forge module owns execution, progress, and Pull Request rules.
     forge: forge::Forge,
     /// Channel to the app's own message loop, so forge tasks can stream updates
@@ -161,17 +198,19 @@ impl App {
         agents: agent::AgentStates,
         terminal: Box<dyn Terminal>,
         jj: Box<dyn jj::Jj>,
-        forge_config: ForgeConfig,
+        config: AppConfig,
         world_pane: bool,
         tx: UnboundedSender<Msg>,
     ) -> Self {
-        let forge = forge::Forge::new(store.repo_root().to_path_buf(), forge_config);
+        let forge = forge::Forge::new(store.repo_root().to_path_buf(), config.forge);
         let mut app = App {
             store,
             agents,
             work: HashMap::new(),
             forge_progress: HashMap::new(),
             fetching: false,
+            workspace_config: config.workspace,
+            pending_workspace: None,
             forge,
             tx,
             terminal,
@@ -199,6 +238,9 @@ impl App {
             Msg::WorkSnapshot(work) => self.work = work,
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
+            Msg::WorkspaceConfigured { workspace, result } => {
+                self.on_workspace_configured(workspace, result);
+            }
             Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
             Msg::GraphLoaded(graph) => self.graph = Some(graph),
             Msg::StatusExpired(generation) => {
@@ -353,6 +395,9 @@ impl App {
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('n') => {
+                if self.refuse_while_configuring() {
+                    return;
+                }
                 self.status = None;
                 self.mode = Mode::NewWorkspace(String::new());
             }
@@ -553,6 +598,26 @@ impl App {
             .and_then(|name| self.store.workspace(name))
     }
 
+    fn refuse_if_configuring(&mut self, name: &str) -> bool {
+        let configuring = self
+            .pending_workspace
+            .as_ref()
+            .is_some_and(|pending| pending.name == name);
+        if configuring {
+            self.set_status(format!("workspace '{name}' is still configuring"));
+        }
+        configuring
+    }
+
+    fn refuse_while_configuring(&mut self) -> bool {
+        let Some(pending) = self.pending_workspace.as_ref() else {
+            return false;
+        };
+        let message = format!("workspace '{}' is still configuring", pending.name);
+        self.set_status(message);
+        true
+    }
+
     /// `enter`/`o`: focus the selected workspace's tab if it exists, else open a
     /// new one. `focus` steals focus (`enter`); otherwise it opens in the
     /// background (`o`) - and when a background target already exists, we leave
@@ -562,6 +627,9 @@ impl App {
         let Some(w) = self.selected_workspace().cloned() else {
             return;
         };
+        if self.refuse_if_configuring(&w.name) {
+            return;
+        }
         let Some(path) = w.path.clone() else {
             self.set_status(format!("no path known for '{}'", w.name));
             return;
@@ -583,14 +651,20 @@ impl App {
     /// `d`: confirm before deleting; the default workspace is undeletable.
     fn begin_delete_selected(&mut self) {
         self.status = None;
-        let Some(w) = self.selected_workspace() else {
+        let Some(name) = self
+            .selected_workspace()
+            .map(|workspace| workspace.name.clone())
+        else {
             return;
         };
-        if w.name == store::DEFAULT_WORKSPACE {
+        if name == store::DEFAULT_WORKSPACE {
             self.set_status("the default workspace cannot be deleted".to_string());
             return;
         }
-        self.mode = Mode::ConfirmDelete(w.name.clone());
+        if self.refuse_if_configuring(&name) {
+            return;
+        }
+        self.mode = Mode::ConfirmDelete(name);
     }
 
     /// Create a workspace through the lifecycle module, then present it in the
@@ -604,11 +678,60 @@ impl App {
             }
         };
         self.after_store_changed();
-        match self.terminal.open(created.name(), created.path(), true) {
-            Ok(()) => self.set_status(format!("created '{}'", created.name())),
-            Err(error) => {
-                self.set_status(format!("created '{}', tab failed: {error}", created.name()))
-            }
+        if self.workspace_config.on_create.is_empty() {
+            self.open_created_workspace(created.name(), created.path());
+            return;
+        }
+
+        let workspace = PendingWorkspace {
+            name: created.name().to_string(),
+            path: created.path().to_path_buf(),
+        };
+        self.pending_workspace = Some(workspace.clone());
+        self.pin_status(format!("configuring '{}'...", workspace.name));
+
+        let command = self.workspace_config.on_create.clone();
+        let tx = self.tx.clone();
+        let run_path = workspace.path.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || run_on_create(&command, &run_path))
+                .await
+                .map_err(|error| format!("{error:#}"))
+                .and_then(|result| result.map_err(|error| format!("{error:#}")));
+            let _ = tx.send(Msg::WorkspaceConfigured { workspace, result });
+        });
+    }
+
+    fn on_workspace_configured(&mut self, workspace: PendingWorkspace, result: Result<(), String>) {
+        if self.pending_workspace.as_ref() != Some(&workspace) {
+            return;
+        }
+        self.pending_workspace = None;
+        let PendingWorkspace { name, path } = workspace;
+
+        if let Err(error) = result {
+            self.set_status(format!("created '{name}', on-create failed: {error}"));
+            return;
+        }
+        let still_exists = self
+            .store
+            .workspace(&name)
+            .and_then(|workspace| workspace.path.as_deref())
+            == Some(path.as_path())
+            && path.is_dir();
+        if !still_exists {
+            self.set_status(format!(
+                "created '{name}', on-create finished after the workspace disappeared"
+            ));
+            return;
+        }
+        self.open_created_workspace(&name, &path);
+    }
+
+    fn open_created_workspace(&mut self, name: &str, path: &std::path::Path) {
+        match self.terminal.open(name, path, true) {
+            Ok(()) => self.set_status(format!("created '{name}'")),
+            Err(error) => self.set_status(format!("created '{name}', tab failed: {error}")),
         }
     }
 
@@ -628,6 +751,9 @@ impl App {
     /// `trunk()`. Non-destructive (workspaces with real work are untouched), so it
     /// runs without confirmation; the poller refreshes each row's `behind` count.
     fn tidyws(&mut self) {
+        if self.refuse_while_configuring() {
+            return;
+        }
         let msg = match self.jj.tidyws() {
             Ok(0) => "tidyws: nothing to reset".to_string(),
             Ok(n) => format!("tidyws: reset {n} workspace(s) onto trunk"),
@@ -639,6 +765,9 @@ impl App {
 
     /// `T`: confirm before the destructive `tidy` sweep.
     fn begin_tidy(&mut self) {
+        if self.refuse_while_configuring() {
+            return;
+        }
         self.status = None;
         self.mode = Mode::ConfirmTidy;
     }
@@ -661,6 +790,9 @@ impl App {
         let Some(w) = self.selected_workspace().cloned() else {
             return;
         };
+        if self.refuse_if_configuring(&w.name) {
+            return;
+        }
         let msg = match self.jj.lift(&w.name) {
             Ok(true) => format!("lifted {} onto trunk", w.name),
             Ok(false) => format!("{}: nothing to lift", w.name),
@@ -672,6 +804,9 @@ impl App {
 
     /// `R`: lift every workspace's stack onto trunk in one rebase.
     fn lift_all(&mut self) {
+        if self.refuse_while_configuring() {
+            return;
+        }
         let msg = match self.jj.lift_all() {
             Ok(true) => "lifted all workspaces onto trunk".to_string(),
             Ok(false) => "nothing to lift".to_string(),
@@ -718,6 +853,9 @@ impl App {
     /// `f`: forge the selected workspace.
     fn forge_selected(&mut self) {
         if let Some(w) = self.selected_workspace().cloned() {
+            if self.refuse_if_configuring(&w.name) {
+                return;
+            }
             self.start_forge(vec![w]);
         }
     }
@@ -737,6 +875,9 @@ impl App {
 
     /// `F`: forge every eligible workspace, sequentially (in one background run).
     fn forge_all(&mut self) {
+        if self.refuse_while_configuring() {
+            return;
+        }
         let all: Vec<Workspace> = self.store.workspaces().to_vec();
         self.start_forge(all);
     }
@@ -1199,12 +1340,16 @@ impl App {
                 " tidy: abandon all junk empty changes? (y/n) ".to_string(),
                 Style::default().fg(Color::Red),
             )),
-            Mode::Normal => match &self.status {
-                Some(msg) => Paragraph::new(Span::styled(
+            Mode::Normal => match (&self.pending_workspace, &self.status) {
+                (Some(workspace), _) => Paragraph::new(Span::styled(
+                    format!(" configuring '{}'... ", workspace.name),
+                    Style::default().fg(Color::Yellow),
+                )),
+                (None, Some(msg)) => Paragraph::new(Span::styled(
                     format!(" {msg} "),
                     Style::default().fg(Color::Yellow),
                 )),
-                None => Paragraph::new(Span::styled(
+                (None, None) => Paragraph::new(Span::styled(
                     if self.world.is_some() {
                         " j/k move  J/K scroll world  ? help  q quit "
                     } else {
@@ -1776,6 +1921,7 @@ mod tests {
         opened: Arc<Mutex<Vec<(String, bool)>>>,
         closed: Arc<Mutex<Vec<String>>>,
         existing: Arc<Mutex<Vec<String>>>,
+        open_error: Arc<Mutex<Option<String>>>,
     }
 
     impl Terminal for FakeTerminal {
@@ -1784,6 +1930,9 @@ mod tests {
         }
         fn open(&self, name: &str, _path: &Path, focus: bool) -> anyhow::Result<()> {
             self.opened.lock().unwrap().push((name.to_string(), focus));
+            if let Some(error) = self.open_error.lock().unwrap().clone() {
+                anyhow::bail!(error);
+            }
             Ok(())
         }
         fn focus(&self, _name: &str) -> anyhow::Result<()> {
@@ -1876,23 +2025,68 @@ mod tests {
             agent::AgentStates::default(),
             terminal,
             jj,
-            ForgeConfig::default(),
+            AppConfig::default(),
             false,
             tx,
         )
     }
 
     fn app_with_store(store: Store, terminal: Box<dyn Terminal>) -> App {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
+        app_with_store_and_workspace_config(store, terminal, WorkspaceConfig::default()).0
+    }
+
+    fn app_with_store_and_workspace_config(
+        store: Store,
+        terminal: Box<dyn Terminal>,
+        workspace_config: WorkspaceConfig,
+    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let app = App::new(
             store,
             agent::AgentStates::default(),
             terminal,
             Box::new(FakeJj::default()),
-            ForgeConfig::default(),
+            AppConfig {
+                workspace: workspace_config,
+                forge: ForgeConfig::default(),
+            },
             false,
             tx,
-        )
+        );
+        (app, rx)
+    }
+
+    fn workspace_config(command: &[&str]) -> WorkspaceConfig {
+        WorkspaceConfig {
+            on_create: command.iter().map(|part| (*part).to_string()).collect(),
+        }
+    }
+
+    fn waiting_workspace_config() -> WorkspaceConfig {
+        workspace_config(&[
+            "sh",
+            "-c",
+            "i=0; while [ \"$i\" -lt 1000 ]; do [ -f on-create-release ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 1",
+        ])
+    }
+
+    fn submit_new_workspace(app: &mut App, name: &str) {
+        app.handle(press(KeyCode::Char('n')));
+        for character in name.chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+    }
+
+    async fn handle_on_create_completion(
+        app: &mut App,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    ) {
+        let completed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("on-create command completes")
+            .expect("completion message arrives");
+        app.handle(completed);
     }
 
     #[test]
@@ -1935,6 +2129,43 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }))
+    }
+
+    #[test]
+    fn on_create_command_runs_exact_argv_in_workspace() {
+        let dir =
+            std::env::temp_dir().join(format!("jjfx-on-create-runner-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf '%s|%s' \"$1\" \"$2\" > on-create-result".to_string(),
+            "on-create".to_string(),
+            "first argument".to_string(),
+            "second argument".to_string(),
+        ];
+
+        run_on_create(&command, &dir).expect("command succeeds");
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("on-create-result")).unwrap(),
+            "first argument|second argument"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn missing_on_create_program_is_an_error() {
+        let command = vec!["jjfx-no-such-on-create-program".to_string()];
+        let error = run_on_create(&command, std::path::Path::new("/tmp"))
+            .expect_err("missing program fails");
+
+        assert!(
+            error
+                .to_string()
+                .contains("running jjfx-no-such-on-create-program"),
+            "{error}"
+        );
     }
 
     #[test]
@@ -2056,6 +2287,45 @@ mod tests {
     }
 
     #[test]
+    fn configuring_workspace_blocks_mutations_that_could_touch_it() {
+        let fake_jj = FakeJj::default();
+        let fake_terminal = FakeTerminal::default();
+        let mut app = app_full(
+            &["default", "feat"],
+            Box::new(fake_terminal.clone()),
+            Box::new(fake_jj.clone()),
+        );
+        app.pending_workspace = Some(PendingWorkspace {
+            name: "feat".to_string(),
+            path: PathBuf::from("/wt/feat"),
+        });
+        app.handle(press(KeyCode::Down));
+
+        for key in [
+            KeyCode::Char('d'),
+            KeyCode::Char('r'),
+            KeyCode::Char('R'),
+            KeyCode::Char('t'),
+            KeyCode::Char('T'),
+            KeyCode::Char('f'),
+            KeyCode::Char('F'),
+        ] {
+            app.handle(press(key));
+            assert!(matches!(app.mode, Mode::Normal));
+            assert_eq!(
+                app.status.as_deref(),
+                Some("workspace 'feat' is still configuring")
+            );
+        }
+
+        assert!(fake_terminal.closed.lock().unwrap().is_empty());
+        assert!(fake_jj.lifted.lock().unwrap().is_empty());
+        assert_eq!(*fake_jj.lift_all_calls.lock().unwrap(), 0);
+        assert_eq!(*fake_jj.tidyws_calls.lock().unwrap(), 0);
+        assert_eq!(*fake_jj.tidy_calls.lock().unwrap(), 0);
+    }
+
+    #[test]
     fn enter_focuses_existing_tab_and_o_opens_background() {
         let fake = FakeTerminal::default();
         // Pretend "default"'s tab already exists.
@@ -2072,6 +2342,77 @@ mod tests {
         assert_eq!(
             fake.opened.lock().unwrap().as_slice(),
             &[("feat".to_string(), false)]
+        );
+    }
+
+    #[test]
+    fn a_configuring_workspace_cannot_be_opened() {
+        let fake = FakeTerminal::default();
+        let mut app = app_with_terminal(&["default", "feat"], Box::new(fake.clone()));
+        app.pending_workspace = Some(PendingWorkspace {
+            name: "feat".to_string(),
+            path: PathBuf::from("/wt/feat"),
+        });
+
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Enter));
+
+        assert!(fake.opened.lock().unwrap().is_empty());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("workspace 'feat' is still configuring")
+        );
+    }
+
+    #[test]
+    fn configuring_footer_remains_visible_without_a_status_message() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        app.pending_workspace = Some(PendingWorkspace {
+            name: "feat".to_string(),
+            path: PathBuf::from("/wt/feat"),
+        });
+        app.status = None;
+        let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
+
+        terminal.draw(|frame| app.render(frame)).unwrap();
+
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("configuring 'feat'..."), "{text}");
+    }
+
+    #[test]
+    fn completed_on_create_does_not_open_a_missing_workspace_path() {
+        let fake = FakeTerminal::default();
+        let mut app = app_with_terminal(&["default", "feat"], Box::new(fake.clone()));
+        let path = PathBuf::from("/jjfx-test-path-that-does-not-exist/feat");
+        app.store.workspace("feat").unwrap();
+        app.pending_workspace = Some(PendingWorkspace {
+            name: "feat".to_string(),
+            path: path.clone(),
+        });
+
+        app.handle(Msg::WorkspaceConfigured {
+            workspace: PendingWorkspace {
+                name: "feat".to_string(),
+                path,
+            },
+            result: Ok(()),
+        });
+
+        assert!(fake.opened.lock().unwrap().is_empty());
+        assert!(app.pending_workspace.is_none());
+        assert_eq!(
+            app.status.as_deref(),
+            Some("created 'feat', on-create finished after the workspace disappeared")
         );
     }
 
@@ -2343,6 +2684,111 @@ mod tests {
             Some(path.as_path())
         );
 
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[tokio::test]
+    async fn configured_workspace_creation_waits_for_command_before_opening() {
+        let repo = store::test_local_repo("app-create-on-create");
+        let terminal = FakeTerminal::default();
+        let (mut app, mut rx) = app_with_store_and_workspace_config(
+            Store::load(&repo),
+            Box::new(terminal.clone()),
+            waiting_workspace_config(),
+        );
+
+        submit_new_workspace(&mut app, "feat");
+
+        assert!(terminal.opened.lock().unwrap().is_empty());
+        assert_eq!(app.status.as_deref(), Some("configuring 'feat'..."));
+        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
+        std::fs::write(path.join("on-create-release"), "").unwrap();
+
+        handle_on_create_completion(&mut app, &mut rx).await;
+
+        assert_eq!(
+            terminal.opened.lock().unwrap().as_slice(),
+            &[("feat".to_string(), true)]
+        );
+        assert_eq!(app.status.as_deref(), Some("created 'feat'"));
+
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_second_creation_is_refused_while_on_create_is_running() {
+        let repo = store::test_local_repo("app-create-on-create-busy");
+        let terminal = FakeTerminal::default();
+        let (mut app, mut rx) = app_with_store_and_workspace_config(
+            Store::load(&repo),
+            Box::new(terminal),
+            waiting_workspace_config(),
+        );
+
+        submit_new_workspace(&mut app, "feat");
+        app.handle(press(KeyCode::Char('n')));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("workspace 'feat' is still configuring")
+        );
+
+        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
+        std::fs::write(path.join("on-create-release"), "").unwrap();
+        handle_on_create_completion(&mut app, &mut rx).await;
+
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_on_create_keeps_workspace_closed_and_reports_stderr() {
+        let repo = store::test_local_repo("app-create-on-create-failure");
+        let terminal = FakeTerminal::default();
+        let (mut app, mut rx) = app_with_store_and_workspace_config(
+            Store::load(&repo),
+            Box::new(terminal.clone()),
+            workspace_config(&["sh", "-c", "printf 'setup boom' >&2; exit 7"]),
+        );
+
+        submit_new_workspace(&mut app, "feat");
+        handle_on_create_completion(&mut app, &mut rx).await;
+
+        assert!(app.store.workspace("feat").is_some());
+        assert!(app.pending_workspace.is_none());
+        assert!(terminal.opened.lock().unwrap().is_empty());
+        let status = app.status.as_deref().unwrap();
+        assert!(status.starts_with("created 'feat', on-create failed:"));
+        assert!(status.contains("setup boom"), "{status}");
+
+        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[tokio::test]
+    async fn successful_on_create_reports_terminal_open_failure() {
+        let repo = store::test_local_repo("app-create-on-create-tab-failure");
+        let terminal = FakeTerminal::default();
+        *terminal.open_error.lock().unwrap() = Some("kitty unavailable".to_string());
+        let (mut app, mut rx) = app_with_store_and_workspace_config(
+            Store::load(&repo),
+            Box::new(terminal),
+            workspace_config(&["true"]),
+        );
+
+        submit_new_workspace(&mut app, "feat");
+        handle_on_create_completion(&mut app, &mut rx).await;
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("created 'feat', tab failed: kitty unavailable")
+        );
+
+        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
         std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
@@ -2653,7 +3099,7 @@ mod tests {
             agent::AgentStates::default(),
             Box::new(FakeTerminal::default()),
             Box::new(FakeJj::default()),
-            ForgeConfig::default(),
+            AppConfig::default(),
             true,
             tx,
         );

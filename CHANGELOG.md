@@ -26,6 +26,12 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-20 - Configurable new-workspace setup (v0.27.0): set
+  `[workspace] on_create = ["mise", "trust"]` to run a program and its
+  arguments from each workspace created through `n`. jjfx runs it in the
+  background before opening the tab, preserves the workspace on failure, and
+  opens and focuses the agent pane only after setup succeeds.
+
 - 2026-07-16 - Codex and claude wear their own colours (v0.24.0): the agent
   column now names the agent (`claude` / `codex`) while a session is live,
   derived per event from the payload's `transcript_path` (`~/.claude/` vs
