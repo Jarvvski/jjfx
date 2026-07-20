@@ -46,6 +46,15 @@ impl ReviewVerdict {
     pub fn is_changes_requested(self) -> bool {
         matches!(self, ReviewVerdict::ChangesRequested)
     }
+
+    fn blocking_rank(self) -> u8 {
+        match self {
+            ReviewVerdict::ChangesRequested => 3,
+            ReviewVerdict::ReviewRequired => 2,
+            ReviewVerdict::None => 1,
+            ReviewVerdict::Approved => 0,
+        }
+    }
 }
 
 /// Where a workspace's change sits on the road to merge.
@@ -241,37 +250,80 @@ fn classify(
     }
 }
 
-/// The pure overlay decision over a workspace's owned commits: PR (the furthest
-/// point on the road to merge) wins, then pushed, then own content, else clean.
-/// A `Dirty` result carries no line counts yet - [`classify`] fills them.
+/// The pure overlay decision over a workspace's owned commits. The least
+/// delivered change wins: local content, then pushed, then an open PR, then
+/// merged. A `Dirty` result carries no line counts yet - [`classify`] fills it.
 fn overlay(owned: &[&ChainCommit], prs: &[crate::prs::Pr]) -> WorkState {
-    if let Some(pr) = prs.iter().find(|pr| {
-        owned
-            .iter()
-            .any(|c| c.local_bookmarks.iter().any(|b| b == &pr.head))
-    }) {
-        if pr.is_merged() {
-            return WorkState::Merged;
-        }
-        if pr.state == "OPEN" {
-            return WorkState::PrOpen {
-                number: pr.number,
-                verdict: ReviewVerdict::parse(pr.review.as_deref()),
-            };
-        }
-        // CLOSED-not-merged: fall back to the jj-derived state.
-    }
-
-    if owned.iter().any(|c| c.pushed) {
-        return WorkState::Pushed;
-    }
-    if owned.iter().any(|c| !c.empty) {
+    if owned
+        .iter()
+        .any(|commit| !commit.empty && !commit.pushed && !represented_by_pr(commit, prs))
+    {
         return WorkState::Dirty {
             added: 0,
             removed: 0,
         };
     }
+
+    if owned
+        .iter()
+        .any(|commit| commit.pushed && !represented_by_pr(commit, prs))
+    {
+        return WorkState::Pushed;
+    }
+
+    let mut selected: Option<(&crate::prs::Pr, ReviewVerdict)> = None;
+    for commit in owned {
+        let Some(pr) = open_pr_for(commit, prs) else {
+            continue;
+        };
+        let verdict = ReviewVerdict::parse(pr.review.as_deref());
+        // `owned` is tip-first, so replacing a tied verdict selects the lower PR.
+        let replace = selected
+            .as_ref()
+            .is_none_or(|(_, current)| verdict.blocking_rank() >= current.blocking_rank());
+        if replace {
+            selected = Some((pr, verdict));
+        }
+    }
+    if let Some((pr, verdict)) = selected {
+        return WorkState::PrOpen {
+            number: pr.number,
+            verdict,
+        };
+    }
+
+    if owned
+        .iter()
+        .any(|commit| merged_pr_for(commit, prs).is_some())
+    {
+        return WorkState::Merged;
+    }
+
     WorkState::Clean
+}
+
+fn represented_by_pr(commit: &ChainCommit, prs: &[crate::prs::Pr]) -> bool {
+    open_pr_for(commit, prs).is_some() || merged_pr_for(commit, prs).is_some()
+}
+
+fn open_pr_for<'a>(commit: &ChainCommit, prs: &'a [crate::prs::Pr]) -> Option<&'a crate::prs::Pr> {
+    prs.iter()
+        .find(|pr| pr.state == "OPEN" && !pr.is_merged() && pr_matches_commit(pr, commit))
+}
+
+fn merged_pr_for<'a>(
+    commit: &ChainCommit,
+    prs: &'a [crate::prs::Pr],
+) -> Option<&'a crate::prs::Pr> {
+    prs.iter()
+        .find(|pr| pr.is_merged() && pr_matches_commit(pr, commit))
+}
+
+fn pr_matches_commit(pr: &crate::prs::Pr, commit: &ChainCommit) -> bool {
+    commit
+        .local_bookmarks
+        .iter()
+        .any(|bookmark| bookmark == &pr.head)
 }
 
 /// One commit on a workspace's own change chain (`trunk..<ws>@`).
@@ -581,6 +633,12 @@ mod tests {
         }
     }
 
+    fn reviewed_pr(number: u64, head: &str, review: &str) -> crate::prs::Pr {
+        let mut pr = pr(number, head, "OPEN", None);
+        pr.review = Some(review.to_string());
+        pr
+    }
+
     #[test]
     fn overlay_reads_a_merged_at_pr_as_merged() {
         // gh sometimes reports a merged PR with a non-MERGED state but a set
@@ -593,7 +651,7 @@ mod tests {
     }
 
     #[test]
-    fn overlay_prefers_pr_then_pushed_then_dirty_then_clean() {
+    fn overlay_classifies_each_single_stage() {
         let prs = [pr(5, "adam/x", "OPEN", None)];
         // PR whose head branch is on an owned commit wins.
         let with_pr = cc("uyr", false, &["adam/x"], true, true);
@@ -612,5 +670,78 @@ mod tests {
         assert_eq!(overlay(&[&empty], &prs), WorkState::Clean);
         // Nothing owned at all -> clean.
         assert_eq!(overlay(&[], &prs), WorkState::Clean);
+    }
+
+    #[test]
+    fn overlay_prefers_local_dirty_change_over_lower_open_pr() {
+        let local = cc("local", false, &[], false, true);
+        let lower = cc("lower", false, &["lower-branch"], true, false);
+        let prs = [reviewed_pr(10, "lower-branch", "APPROVED")];
+
+        assert!(matches!(
+            overlay(&[&local, &lower], &prs),
+            WorkState::Dirty { .. }
+        ));
+    }
+
+    #[test]
+    fn overlay_prefers_pushed_change_over_lower_open_pr() {
+        let pushed = cc("pushed", false, &["pushed-branch"], true, true);
+        let lower = cc("lower", false, &["lower-branch"], true, false);
+        let prs = [reviewed_pr(10, "lower-branch", "APPROVED")];
+
+        assert_eq!(overlay(&[&pushed, &lower], &prs), WorkState::Pushed);
+    }
+
+    #[test]
+    fn overlay_uses_lowest_pr_with_the_most_blocking_verdict() {
+        let top = cc("top", false, &["top-branch"], true, true);
+        let middle = cc("middle", false, &["middle-branch"], true, false);
+        let bottom = cc("bottom", false, &["bottom-branch"], true, false);
+        let prs = [
+            reviewed_pr(10, "bottom-branch", "APPROVED"),
+            reviewed_pr(30, "top-branch", "CHANGES_REQUESTED"),
+            reviewed_pr(20, "middle-branch", "CHANGES_REQUESTED"),
+        ];
+
+        assert_eq!(
+            overlay(&[&top, &middle, &bottom], &prs),
+            WorkState::PrOpen {
+                number: 20,
+                verdict: ReviewVerdict::ChangesRequested,
+            }
+        );
+    }
+
+    #[test]
+    fn overlay_orders_all_open_review_verdicts_by_blocking_priority() {
+        let top = cc("top", false, &["top-branch"], true, true);
+        let middle = cc("middle", false, &["middle-branch"], true, false);
+        let bottom = cc("bottom", false, &["bottom-branch"], true, false);
+        let review_required = [
+            reviewed_pr(30, "top-branch", "APPROVED"),
+            pr(20, "middle-branch", "OPEN", None),
+            reviewed_pr(10, "bottom-branch", "REVIEW_REQUIRED"),
+        ];
+
+        assert_eq!(
+            overlay(&[&top, &middle, &bottom], &review_required),
+            WorkState::PrOpen {
+                number: 10,
+                verdict: ReviewVerdict::ReviewRequired,
+            }
+        );
+
+        let no_decision = [
+            reviewed_pr(30, "top-branch", "APPROVED"),
+            pr(20, "middle-branch", "OPEN", None),
+        ];
+        assert_eq!(
+            overlay(&[&top, &middle], &no_decision),
+            WorkState::PrOpen {
+                number: 20,
+                verdict: ReviewVerdict::None,
+            }
+        );
     }
 }

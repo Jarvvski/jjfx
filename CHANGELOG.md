@@ -6,6 +6,11 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-20 - Workspace rows show the least-delivered change (v0.27.1): a
+  local change now remains dirty, and a pushed change remains pushed, when a
+  lower change already has an open PR. PR-only stacks show the lowest PR with
+  the most blocking review verdict instead of whichever PR was returned first.
+
 - 2026-07-17 - Default workspace stays pinned at the top (v0.25.2): `default`
   now remains above every attention group regardless of its current lifecycle.
   Folding the idle group keeps it visible, and initial selection starts there.
