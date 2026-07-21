@@ -7,9 +7,12 @@ migration. It is intentionally limited to the surfaces named by the migration
 PRD and the fixtures in `crates/wsg-core/tests/fixtures/compatibility/`.
 
 The Go wsg and jj-wsx sources are not present in this repository, so the
-fixtures currently express the PRD's provisional contract. Ticket 03 must be
-revisited against the current Go implementation before Rust writes or mutates
-any Worker Pool state.
+fixtures still express the PRD's provisional persistence contract. The Unix
+primitive spike inspected Go wsg commit
+`e690262ee0f9040f371ed1be9792742045af89e3` and validated its lock names,
+process-group behavior, liveness probe, signal sequence, log redirection, and
+rename pattern. The persisted schemas and full CLI contract still require
+source validation before Rust writes or mutates Worker Pool state.
 
 ## Persisted surfaces
 
@@ -75,17 +78,26 @@ The compatibility implementation must preserve these rules:
 6. A failed serialization, flush, or rename leaves the last valid target file
    in place.
 
-The exact Go lock filenames and sidecar directory names are not discoverable
-from the current repository and remain a required source-validation item
-before production mutation work. No Rust mutation is enabled by this contract
-change.
+The inspected Go implementation establishes `.jj/pool/.dispatch.lock` for
+Worker Pool mutations and `.jj/pool/<worker>.json.lock` for each Worker state
+sidecar. Dispatch Group files are named
+`.jj/pool/dispatch-<lowercase-parent>.json`, but the inspected implementation
+replaces them without a lock. The migration requires a Dispatch Group sidecar
+lock, so ticket 06 must coordinate that new lock with the Go implementation
+before mixed-process Dispatch Group mutation is enabled. No Rust mutation is
+enabled by this contract change.
 
 ## Process and output rules
 
-Worker execution state may include a PID and process-group identity. Readers
-must distinguish a live process from a reaped process and must not infer a
-successful Run from a stale PID. Reconciliation is derived state until the
-persistence ticket explicitly enables a compatible write.
+Worker execution state may include a PID and process-group identity. Go wsg
+starts each background Agent Runtime with the child PID as a new process-group
+ID, probes liveness with signal 0, sends `SIGTERM` to the complete group, waits
+one second, and sends `SIGKILL` to the group if its leader remains live. Rust
+can reproduce this sequence through safe standard-library and rustix
+interfaces. Readers must distinguish a live process from a reaped process and
+must not infer Run identity or success from a numeric PID because PID reuse
+remains possible. Reconciliation is derived state until the persistence ticket
+explicitly enables a compatible write.
 
 The command-facing compatibility surface separates machine-readable values
 from human messages:
