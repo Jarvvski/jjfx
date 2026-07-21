@@ -4,6 +4,11 @@ All notable changes to this project are documented here (newest first). The vers
 
 ## [Unreleased]
 
+### Added
+
+- 2026-07-21 - Added the shared Workspace Dispatch Rust foundation and a
+  repository-independent `wsg` help/version skeleton (v0.28.0).
+
 ### Fixed
 
 - 2026-07-20 - Workspace rows show the least-delivered change (v0.27.1): a

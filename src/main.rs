@@ -33,6 +33,7 @@ use std::io::Write;
 use anyhow::Context;
 use ratatui::crossterm::event;
 use tokio::sync::mpsc::{self, UnboundedSender};
+use wsg_core as _;
 
 use crate::app::{App, AppConfig, Msg};
 use crate::store::Store;

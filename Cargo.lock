@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "jjfx"
-version = "0.27.1"
+version = "0.28.0"
 dependencies = [
  "anyhow",
  "jj-lib",
@@ -1710,6 +1710,7 @@ dependencies = [
  "syntect",
  "tokio",
  "toml",
+ "wsg-core",
 ]
 
 [[package]]
@@ -3192,6 +3193,23 @@ checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
 dependencies = [
  "cfg-if",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "wsg"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "tempfile",
+ "wsg-core",
+]
+
+[[package]]
+name = "wsg-core"
+version = "0.1.0"
+dependencies = [
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

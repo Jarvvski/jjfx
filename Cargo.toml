@@ -1,11 +1,16 @@
+[workspace]
+members = ["crates/wsg-core", "crates/wsg"]
+resolver = "3"
+
 [package]
 name = "jjfx"
-version = "0.27.1"
+version = "0.28.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
+wsg-core = { path = "crates/wsg-core" }
 ratatui = "0.29"
 notify = "8"
 # jj-lib reads the on-disk .jj store directly for the commit graph (ADR 0007),

@@ -1,6 +1,6 @@
 # Create the shared Rust foundation and wsg binary skeleton
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -38,13 +38,13 @@ Test the package interfaces as callers use them. Add binary smoke tests for help
 
 ## Acceptance Criteria
 
-- [ ] Existing jjfx behavior and tests remain unchanged.
-- [ ] One workspace command checks all packages.
-- [ ] Both binary names build successfully.
-- [ ] The wsg skeleton works outside a jj Repository for help and version.
-- [ ] The shared library has no Ratatui or CLI-rendering dependency.
-- [ ] `unsafe_code = "forbid"` remains enforced.
-- [ ] `mise run check` is green.
+- [x] Existing jjfx behavior and tests remain unchanged.
+- [x] One workspace command checks all packages.
+- [x] Both binary names build successfully.
+- [x] The wsg skeleton works outside a jj Repository for help and version.
+- [x] The shared library has no Ratatui or CLI-rendering dependency.
+- [x] `unsafe_code = "forbid"` remains enforced.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
