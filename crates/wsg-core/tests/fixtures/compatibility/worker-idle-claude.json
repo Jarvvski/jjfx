@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "worker_id": "worker-01",
+  "alias": "alpha",
+  "workspace": "worker-alpha",
+  "status": "idle",
+  "ticket": null,
+  "run": null,
+  "agent_runtime": "claude",
+  "started_at": null,
+  "last_activity_at": null
+}

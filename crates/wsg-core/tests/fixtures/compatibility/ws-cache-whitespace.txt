@@ -1,0 +1,2 @@
+feature with spaces	/repository/feature with spaces
+leading	 /repository/with-a-leading-space

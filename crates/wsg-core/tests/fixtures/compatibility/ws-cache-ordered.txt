@@ -1,0 +1,3 @@
+default	/repository
+feature-a	/repository-feature-a
+feature-b	/repository-feature-b

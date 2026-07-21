@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "worker_id": "worker-04",
+  "alias": "delta",
+  "workspace": "worker-delta",
+  "status": "failed",
+  "ticket": "ENG-103",
+  "run": "run-20260721-03",
+  "agent_runtime": "codex",
+  "started_at": "2026-07-21T08:00:00Z",
+  "last_activity_at": "2026-07-21T08:03:00Z",
+  "error": "agent exited with status 1"
+}

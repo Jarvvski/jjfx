@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "worker_id": "worker-02",
+  "alias": "beta",
+  "workspace": "worker-beta",
+  "status": "busy",
+  "ticket": "ENG-101",
+  "run": "run-20260721-01",
+  "agent_runtime": "claude",
+  "started_at": "2026-07-21T10:00:00Z",
+  "last_activity_at": "2026-07-21T10:04:12Z"
+}

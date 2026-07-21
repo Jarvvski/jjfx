@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "parent_ticket": "ENG-100",
+  "status": "merged",
+  "sub_issues": [
+    {"ticket": "ENG-101", "status": "merged", "blocked_by": [], "worker_id": "worker-01", "run": "run-20260721-01"}
+  ]
+}

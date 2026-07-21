@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "worker_id": "worker-legacy",
+  "alias": "legacy",
+  "workspace": "worker-legacy",
+  "status": "idle",
+  "ticket": null,
+  "run": null,
+  "started_at": null,
+  "last_activity_at": null
+}

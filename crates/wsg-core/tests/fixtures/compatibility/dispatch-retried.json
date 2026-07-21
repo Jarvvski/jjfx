@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "parent_ticket": "ENG-100",
+  "status": "retried",
+  "sub_issues": [
+    {"ticket": "ENG-101", "status": "retried", "blocked_by": [], "worker_id": null, "run": null, "attempts": 1}
+  ]
+}

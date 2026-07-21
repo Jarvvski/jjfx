@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "workers": [
+    {"worker_id": "worker-01", "workspace": "worker-alpha"},
+    {"worker_id": "worker-02", "workspace": "worker-beta"},
+    {"worker_id": "worker-03", "workspace": "worker-gamma"},
+    {"worker_id": "worker-04", "workspace": "worker-delta"}
+  ]
+}

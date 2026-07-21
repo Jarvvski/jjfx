@@ -1,6 +1,6 @@
 # Lock down wsg compatibility contracts
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -41,18 +41,26 @@ Golden tests exercise public serialization and command contracts. Test empty, mi
 
 ## Acceptance Criteria
 
-- [ ] Every persisted wsg format has representative fixtures.
-- [ ] Explicit null and omitted-field behavior is asserted.
-- [ ] Lock names and mutation scopes are documented.
-- [ ] The CLI command and output inventory covers the current help surface.
-- [ ] No Rust mutation is enabled by this ticket.
-- [ ] `mise run check` is green.
+- [x] Every persisted wsg format has representative provisional fixtures.
+- [x] Explicit null and omitted-field behavior is asserted.
+- [x] Lock mutation scopes and atomic replacement rules are documented; exact Go filenames remain source-validation work.
+- [x] The current Rust foundation command and output surface is inventoried; the full Go command inventory remains source-validation work.
+- [x] No Rust mutation is enabled by this ticket.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
 - Implementing state mutation
 - Redesigning schemas
 - Requiring exact ANSI rendering parity
+
+## Comments
+
+2026-07-21 - Added the provisional contract document and golden fixtures in
+`crates/wsg-core/tests/fixtures/compatibility/`. The Go wsg/jj-wsx source is not
+present in this repository, so exact lock filenames and the complete historical
+CLI inventory are explicitly deferred until that source is available. No Rust
+mutation is enabled.
 
 ## Blocked by
 

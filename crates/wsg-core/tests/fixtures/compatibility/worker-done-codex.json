@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "worker_id": "worker-03",
+  "alias": "gamma",
+  "workspace": "worker-gamma",
+  "status": "done",
+  "ticket": "ENG-102",
+  "run": "run-20260721-02",
+  "agent_runtime": "codex",
+  "started_at": "2026-07-21T09:00:00Z",
+  "last_activity_at": "2026-07-21T09:21:00Z"
+}
