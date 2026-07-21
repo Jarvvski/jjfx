@@ -18,13 +18,15 @@ The repository's original workspace and stable home. It is always visible and
 cannot be removed through jjfx.
 
 **Agent**:
-A supported coding assistant running inside a workspace. jjfx observes agents;
-it does not autonomously assign them work.
-_Avoid_: worker, bot
+A supported coding assistant running inside a workspace. jjfx observes the
+agent lifecycle and may route selected work to it through Workspace Dispatch;
+an Agent is not an execution slot.
+_Avoid_: bot
 
-**Session**:
-One continuous run of an agent inside a workspace. A workspace may host many
-sessions over its life, but at most one at a time.
+**Agent Session**:
+The logical interaction between an Agent and a person or dispatch coordinator.
+One Agent Session may span several Runs, and a workspace may host many sessions
+over its life, but at most one at a time.
 
 **Attention**:
 The single derived, human-facing signal shown per workspace in the list,
@@ -75,6 +77,67 @@ pushed.
 How far trunk has advanced past a workspace's base - the drift that
 accumulates while a workspace sits idle. Lifting resets it to zero; tidying
 workspaces does the same for idle, empty workspaces.
+
+### Workspace Dispatch
+
+**Worker Pool**:
+The Repository-scoped collection of reusable Workers and their execution
+capacity.
+
+**Worker**:
+A reusable execution slot backed by exactly one Worker Workspace. A Worker is
+not an Agent, Agent Session, Workspace, or process.
+
+**Worker Workspace**:
+The Workspace assigned to one Worker for its Runs. It is a kind of Workspace,
+so it remains visible through the existing Workspace model, but it is not the
+Worker itself.
+
+**Worker Status**:
+The execution-capacity lifecycle of a Worker, separate from the Agent and Work
+lifecycles. It captures whether capacity is available, reserved, occupied by a
+Run, or awaiting reconciliation before it can be used again.
+
+**Run**:
+One execution attempt by an Agent Runtime in a Worker Workspace. A Run is
+shorter-lived than an Agent Session, which may continue across Runs.
+
+**Agent Runtime**:
+The external Claude Code or Codex program that executes a Run. The runtime is
+not the Agent Session or the Worker that hosts it.
+
+**Ticket**:
+A Linear work item selected for implementation. A Ticket can receive a
+Reservation and be routed by Dispatch.
+
+**Reservation**:
+Execution capacity allocated to a Ticket before its Run starts. A Reservation
+prevents competing Dispatch decisions from claiming the same Worker capacity.
+
+**Dispatch**:
+The act of routing a Ticket into execution, including the Reservation and Run
+lifecycle rules.
+
+**Direct Dispatch**:
+A Dispatch that assigns one Ticket directly to one Worker.
+
+**Dispatch Group**:
+Dependency-aware progress for a parent Ticket's direct sub-issues. It tracks
+which sub-issues are eligible for Dispatch and which remain blocked.
+
+**Dispatch Wave**:
+The set of sub-issues in a Dispatch Group whose Dependencies are satisfied and
+that may be dispatched concurrently.
+
+**Process**:
+An operating-system execution instance. A Process may host an Agent Runtime or
+other command, but it is not a Worker, Agent, Agent Session, Run, or Workspace.
+
+Worker, Agent, Agent Session, Workspace, and Process therefore name distinct
+things: capacity, assistant, interaction, Jujutsu working copy, and OS
+execution instance respectively. A Worker is not itself a Workspace; it is
+backed by a Worker Workspace. An Agent Session can continue across Runs, while
+a Process may end and be replaced during that interaction.
 
 ### Maintenance
 

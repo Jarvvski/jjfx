@@ -38,11 +38,11 @@ This is a documentation-only architectural change. Validate terminology against 
 
 ## Acceptance Criteria
 
-- [ ] The accepted architecture explicitly permits Worker Pool orchestration.
-- [ ] New terms are defined once and avoid the glossary's rejected synonyms.
-- [ ] ADR 0001's historical decision remains readable and its superseded scope is clear.
-- [ ] ADR 0005 and ADR 0007 are not contradicted.
-- [ ] `mise run check` is green.
+- [x] The accepted architecture explicitly permits Worker Pool orchestration.
+- [x] New terms are defined once and avoid the glossary's rejected synonyms.
+- [x] ADR 0001's historical decision remains readable and its superseded scope is clear.
+- [x] ADR 0005 and ADR 0007 are not contradicted.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
