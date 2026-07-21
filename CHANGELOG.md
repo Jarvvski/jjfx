@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-07-21 - Added read-only Worker Pool snapshot import to jjfx, including
+  compatibility diagnostics, Worker metadata rows, and a visible read-only
+  indicator (v0.28.1).
+
 - 2026-07-21 - Added the shared Workspace Dispatch Rust foundation and a
   repository-independent `wsg` help/version skeleton (v0.28.0).
 

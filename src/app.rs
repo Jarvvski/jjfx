@@ -29,6 +29,7 @@ use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::workspace_list::{Row, WorkspaceList};
+use wsg_core::{WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus};
 
 /// What the key handler is currently collecting: normal navigation, a new
 /// workspace name, or a delete confirmation.
@@ -93,6 +94,8 @@ pub enum Msg {
     AgentEvent(agent::Event),
     /// A freshly computed work-lifecycle snapshot, keyed by workspace name.
     WorkSnapshot(HashMap<String, Work>),
+    /// A complete immutable read-only Worker Pool snapshot.
+    WorkerPoolSnapshot(WorkerPoolSnapshot),
     /// A forge pipeline transition (ticket 08).
     Forge(forge::Update),
     /// The background `jj git fetch` finished; `Err` carries jj's error text.
@@ -148,6 +151,8 @@ pub struct App {
     /// Latest work-lifecycle snapshot per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, Work>,
+    /// Latest read-only Worker Pool snapshot, if the repository exposes one.
+    worker_pool: Option<WorkerPoolSnapshot>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
@@ -207,6 +212,7 @@ impl App {
             store,
             agents,
             work: HashMap::new(),
+            worker_pool: None,
             forge_progress: HashMap::new(),
             fetching: false,
             workspace_config: config.workspace,
@@ -236,6 +242,7 @@ impl App {
             Msg::Reload => self.reload(),
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
             Msg::WorkSnapshot(work) => self.work = work,
+            Msg::WorkerPoolSnapshot(snapshot) => self.worker_pool = Some(snapshot),
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
             Msg::WorkspaceConfigured { workspace, result } => {
@@ -261,11 +268,17 @@ impl App {
     pub fn animate(&mut self) -> bool {
         self.tick = self.tick.wrapping_add(1);
         matches!(self.mode, Mode::Normal | Mode::Help)
-            && self
+            && (self
                 .store
                 .workspaces()
                 .iter()
                 .any(|w| self.agent_state(w) == AgentState::Working)
+                || self.worker_pool.as_ref().is_some_and(|snapshot| {
+                    snapshot
+                        .workers()
+                        .iter()
+                        .any(|worker| worker.status() == WorkerStatus::Busy)
+                }))
     }
 
     /// Fold a freshly-loaded diff into the detail view, if it is still open for
@@ -989,7 +1002,18 @@ impl App {
         .horizontal_margin(2)
         .areas(frame.area());
 
-        let title = format!("jjfx - {} workspace(s)", self.store.workspaces().len());
+        let title = match &self.worker_pool {
+            Some(snapshot) if snapshot.diagnostics().is_empty() => format!(
+                "jjfx - {} workspace(s)  [wsg pool READ-ONLY]",
+                self.store.workspaces().len()
+            ),
+            Some(snapshot) => format!(
+                "jjfx - {} workspace(s)  [wsg pool READ-ONLY, {} issue(s)]",
+                self.store.workspaces().len(),
+                snapshot.diagnostics().len()
+            ),
+            None => format!("jjfx - {} workspace(s)", self.store.workspaces().len()),
+        };
         frame.render_widget(
             Paragraph::new(Span::styled(
                 title,
@@ -1321,7 +1345,19 @@ impl App {
             format!("{:pad$}{path}", ""),
             Style::default().fg(Color::DarkGray),
         ));
-        ListItem::new(Line::from(spans))
+        let lines = match self.worker_for(w) {
+            Some(worker) => vec![Line::from(spans), worker_line(worker, self.tick)],
+            None => vec![Line::from(spans)],
+        };
+        ListItem::new(lines)
+    }
+
+    fn worker_for(&self, workspace: &Workspace) -> Option<&WorkerSnapshot> {
+        self.worker_pool
+            .as_ref()?
+            .workers()
+            .iter()
+            .find(|worker| worker.workspace() == workspace.name)
     }
 
     /// The footer: a live prompt while entering a name or confirming a delete, a
@@ -1350,7 +1386,9 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )),
                 (None, None) => Paragraph::new(Span::styled(
-                    if self.world.is_some() {
+                    if self.worker_pool.is_some() {
+                        " wsg pool READ-ONLY  ·  j/k move  ? help  q quit "
+                    } else if self.world.is_some() {
                         " j/k move  J/K scroll world  ? help  q quit "
                     } else {
                         " j/k move  ? help  q quit "
@@ -1371,6 +1409,98 @@ impl App {
 
 fn display_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn worker_line(worker: &WorkerSnapshot, _tick: u64) -> Line<'static> {
+    let status = if worker.status() == WorkerStatus::Busy && worker.has_dead_process() {
+        "stale"
+    } else {
+        worker.status().as_str()
+    };
+    let runtime = worker
+        .agent_runtime()
+        .map(|runtime| runtime.as_str())
+        .unwrap_or("runtime?");
+    let ticket = worker.ticket().unwrap_or("-");
+    let activity = worker
+        .last_activity_at()
+        .or_else(|| worker.started_at())
+        .map(elapsed_label)
+        .unwrap_or_else(|| "-".to_string());
+    Line::from(vec![
+        Span::styled("  wsg ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!(
+                "{}  {status:<6} {runtime:<6} ticket:{ticket:<8} {activity}",
+                worker.alias()
+            ),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::styled("  READ-ONLY", Style::default().fg(Color::DarkGray)),
+    ])
+}
+
+fn elapsed_label(timestamp: &str) -> String {
+    let Some(started) = parse_rfc3339_millis(timestamp) else {
+        return timestamp.to_string();
+    };
+    let elapsed = now_millis().saturating_sub(started) / 1_000;
+    if elapsed < 60 {
+        format!("{elapsed}s")
+    } else if elapsed < 3_600 {
+        format!("{}m", elapsed / 60)
+    } else if elapsed < 86_400 {
+        format!("{}h", elapsed / 3_600)
+    } else {
+        format!("{}d", elapsed / 86_400)
+    }
+}
+
+fn parse_rfc3339_millis(value: &str) -> Option<i64> {
+    let (date, time) = value.strip_suffix('Z')?.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year = date_parts.next()?.parse::<i64>().ok()?;
+    let month = date_parts.next()?.parse::<i64>().ok()?;
+    let day = date_parts.next()?.parse::<i64>().ok()?;
+    let mut time_parts = time.split(':');
+    let hour = time_parts.next()?.parse::<i64>().ok()?;
+    let minute = time_parts.next()?.parse::<i64>().ok()?;
+    let seconds = time_parts.next()?;
+    let (second, fraction) = seconds
+        .split_once('.')
+        .map_or((seconds, "0"), |parts| parts);
+    let second = second.parse::<i64>().ok()?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return None;
+    }
+    let fraction = fraction.chars().take(3).collect::<String>();
+    let millis = if fraction.is_empty() {
+        0
+    } else {
+        let digits = fraction.parse::<i64>().ok()?;
+        digits * 10_i64.pow(3 - fraction.len() as u32)
+    };
+    let days = days_from_civil(year, month, day)?;
+    Some(
+        days.saturating_mul(86_400_000)
+            .saturating_add(hour.saturating_mul(3_600_000))
+            .saturating_add(minute.saturating_mul(60_000))
+            .saturating_add(second.saturating_mul(1_000))
+            .saturating_add(millis),
+    )
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    Some(era * 146_097 + day_of_era - 719_468)
 }
 
 /// Width of the changed-file list pane in the detail view (borders included).
@@ -2481,6 +2611,49 @@ mod tests {
             .unwrap();
         assert_eq!(app.work_state(def), WorkState::Unknown);
         assert_eq!(app.behind(def), 0);
+    }
+
+    #[test]
+    fn worker_pool_snapshot_joins_by_workspace_and_renders_read_only_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let workers = temp.path().join(".jj/workers");
+        std::fs::create_dir_all(&workers).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"version":1,"workers":[{"worker_id":"worker-01","workspace":"feat"}]}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            workers.join("worker-01.json"),
+            br#"{"version":1,"worker_id":"worker-01","alias":"alpha","workspace":"feat","status":"busy","ticket":"ENG-101","run":"run-1","agent_runtime":"claude","started_at":"2026-07-21T10:00:00Z","last_activity_at":"2026-07-21T10:04:12Z"}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+
+        let mut app = app_with(&["default", "feat"]);
+        app.handle(Msg::WorkerPoolSnapshot(snapshot));
+
+        let worker = app
+            .worker_for(app.store.workspace("feat").unwrap())
+            .expect("Worker should join its Worker Workspace");
+        assert_eq!(worker.alias(), "alpha");
+        assert_eq!(worker.ticket(), Some("ENG-101"));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("alpha"), "{text}");
+        assert!(text.contains("ENG-101"), "{text}");
+        assert!(text.contains("READ-ONLY"), "{text}");
     }
 
     #[test]

@@ -1697,7 +1697,7 @@ dependencies = [
 
 [[package]]
 name = "jjfx"
-version = "0.28.0"
+version = "0.28.1"
 dependencies = [
  "anyhow",
  "jj-lib",
@@ -1708,6 +1708,7 @@ dependencies = [
  "serde",
  "serde_json",
  "syntect",
+ "tempfile",
  "tokio",
  "toml",
  "wsg-core",

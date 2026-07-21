@@ -111,6 +111,12 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     let (work_tx, work_rx) = mpsc::unbounded_channel::<()>();
     spawn_work_poller(repo_root.clone(), tx.clone(), work_rx);
 
+    // Worker Pool reader: observe existing wsg state without enabling any Rust
+    // mutation. It shares the repository-change nudge but owns its own snapshot
+    // cadence and deduplication.
+    let (worker_tx, worker_rx) = mpsc::unbounded_channel::<()>();
+    spawn_worker_pool_poller(repo_root.clone(), tx.clone(), worker_rx);
+
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx.clone());
 
@@ -137,7 +143,7 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     app.refresh_graph_if_visible();
 
     let mut terminal = tui::init()?;
-    let result = event_loop(&mut terminal, &mut rx, &mut app, work_tx).await;
+    let result = event_loop(&mut terminal, &mut rx, &mut app, work_tx, worker_tx).await;
 
     // Always restore, then surface any loop error.
     tui::restore()?;
@@ -157,6 +163,7 @@ async fn event_loop(
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     app: &mut App,
     work_tx: UnboundedSender<()>,
+    worker_tx: UnboundedSender<()>,
 ) -> anyhow::Result<()> {
     terminal.draw(|f| app.render(f))?;
 
@@ -187,6 +194,7 @@ async fn event_loop(
             // A repo change may have altered the work state; nudge the poller so
             // the row refreshes without waiting for the next interval tick.
             let _ = work_tx.send(());
+            let _ = worker_tx.send(());
             needs_redraw = true;
         }
 
@@ -241,6 +249,44 @@ fn spawn_work_poller(
 /// Send [`Msg::Tick`] every 150ms (jj-wsx's animation frame rate) to advance
 /// the working-glyph bounce. The app decides per tick whether a redraw is
 /// warranted, so an idle screen costs nothing beyond the channel send.
+/// Read the compatibility Worker Pool periodically and after repository
+/// changes, sending only snapshots that differ from the last read. All file
+/// access stays outside the App event loop and the reader itself is read-only.
+fn spawn_worker_pool_poller(
+    repo_root: std::path::PathBuf,
+    tx: UnboundedSender<Msg>,
+    mut refresh_rx: mpsc::UnboundedReceiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut previous = None;
+        loop {
+            let root = repo_root.clone();
+            let snapshot = tokio::task::spawn_blocking(move || {
+                wsg_core::Repository::open(&root)
+                    .map(|repository| repository.read_worker_pool_snapshot())
+            })
+            .await;
+            if let Ok(Ok(snapshot)) = snapshot
+                && previous.as_ref() != Some(&snapshot)
+            {
+                if tx.send(Msg::WorkerPoolSnapshot(snapshot.clone())).is_err() {
+                    break;
+                }
+                previous = Some(snapshot);
+            }
+            tokio::select! {
+                _ = interval.tick() => {}
+                got = refresh_rx.recv() => {
+                    if got.is_none() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn spawn_animation_ticker(tx: UnboundedSender<Msg>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));

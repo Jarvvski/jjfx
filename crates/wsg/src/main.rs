@@ -27,6 +27,10 @@ fn run() -> anyhow::Result<()> {
 
     let repository = Repository::open(".").context("opening the current repository")?;
     match repository.migration_capabilities() {
+        MigrationCapabilities::ReadOnlyWorkerPool => println!(
+            "Workspace Dispatch read-only Worker Pool snapshots available for {}",
+            repository.root().display()
+        ),
         MigrationCapabilities::NotImplemented => println!(
             "Workspace Dispatch migration capabilities are not implemented for {}",
             repository.root().display()

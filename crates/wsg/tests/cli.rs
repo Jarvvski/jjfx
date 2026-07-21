@@ -26,7 +26,7 @@ fn help_and_version_work_outside_a_repository() {
 }
 
 #[test]
-fn no_arguments_report_unimplemented_capabilities_inside_a_repository() {
+fn no_arguments_report_read_only_pool_capabilities_inside_a_repository() {
     let binary = env!("CARGO_BIN_EXE_wsg");
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
     std::fs::create_dir(temporary_directory.path().join(".jj"))
@@ -38,6 +38,9 @@ fn no_arguments_report_unimplemented_capabilities_inside_a_repository() {
         .expect("wsg should run");
 
     assert!(output.status.success());
-    assert!(String::from_utf8_lossy(&output.stdout).contains("not implemented"));
+    assert!(
+        String::from_utf8_lossy(&output.stdout)
+            .contains("read-only Worker Pool snapshots available")
+    );
     assert!(output.stderr.is_empty());
 }

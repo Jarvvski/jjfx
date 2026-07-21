@@ -5,9 +5,18 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+mod pool;
+
+pub use pool::{
+    AgentRuntime, PersistedField, PoolSnapshot, SnapshotDiagnostic, SnapshotDiagnosticKind,
+    WorkerId, WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
+};
+
 /// The migration capabilities currently exposed by a discovered repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationCapabilities {
+    /// The shared Workspace Dispatch implementation can expose read-only pool state.
+    ReadOnlyWorkerPool,
     /// The shared Workspace Dispatch implementation is not available yet.
     NotImplemented,
 }
@@ -56,7 +65,7 @@ impl Repository {
 
     /// Reports which migration capabilities are available for this foundation.
     pub fn migration_capabilities(&self) -> MigrationCapabilities {
-        MigrationCapabilities::NotImplemented
+        MigrationCapabilities::ReadOnlyWorkerPool
     }
 }
 

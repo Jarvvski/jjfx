@@ -29,6 +29,6 @@ fn opens_nested_repository_and_reports_foundation_status() {
     );
     assert_eq!(
         repository.migration_capabilities(),
-        MigrationCapabilities::NotImplemented
+        MigrationCapabilities::ReadOnlyWorkerPool
     );
 }

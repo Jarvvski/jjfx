@@ -1,6 +1,6 @@
 # Import read-only Worker Pool snapshots into jjfx
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -39,12 +39,26 @@ Test snapshot behavior through public readers using golden fixtures and temporar
 
 ## Acceptance Criteria
 
-- [ ] jjfx displays a Go-created Worker Pool and its Worker assignments.
-- [ ] Claude Code and Codex Workers deserialize correctly.
-- [ ] Missing and malformed Worker files produce useful diagnostics.
-- [ ] Read-only refresh changes no Repository file.
-- [ ] Dead recorded PIDs do not remain visually busy, but are not persisted yet.
-- [ ] `mise run check` is green.
+- [x] jjfx displays a Go-created Worker Pool and its Worker assignments.
+- [x] Claude Code and Codex Workers deserialize correctly.
+- [x] Missing and malformed Worker files produce useful diagnostics.
+- [x] Read-only refresh changes no Repository file.
+- [x] Dead recorded PIDs do not remain visually busy, but are not persisted yet.
+- [x] `mise run check` is green.
+
+## Comments
+
+2026-07-21 - Added immutable Worker Pool snapshots to `wsg-core`, including
+status/runtime models, explicit missing-versus-null presence, malformed-state
+diagnostics, safe Worker path validation, and derived dead-PID observation.
+`jjfx` now polls snapshots outside the App event loop, deduplicates unchanged
+values, joins Workers to existing Workspace rows by name, and renders metadata
+with a visible READ-ONLY indicator. The `wsg` skeleton reports the new
+read-only capability. No state files are written by the reader or poller.
+
+The provisional reader uses `.jj/workers/<worker_id>.json` for the per-Worker
+state files. Exact historical Go path and lock naming remains a source
+validation item before mutation work, as documented by ticket 03.
 
 ## Out of Scope
 

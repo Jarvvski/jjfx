@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "jjfx"
-version = "0.28.0"
+version = "0.28.1"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -30,6 +30,9 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # jjfx's own config file (~/.config/jjfx/config.toml); parsed once at startup.
 toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"
