@@ -1,18 +1,23 @@
 use std::env;
 use std::fs;
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
+    RunRequest, RunSupervisor,
 };
 
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "WSG_AGENT_RUNTIME_HELPER_PATH";
 const HELPER_RESULT: &str = "WSG_AGENT_RUNTIME_HELPER_RESULT";
 const HELPER_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_WORKSPACE";
+const HELPER_LOG: &str = "WSG_AGENT_RUNTIME_HELPER_LOG";
+const HELPER_EXECUTED: &str = "WSG_AGENT_RUNTIME_HELPER_EXECUTED";
+const HELPER_RUNTIME: &str = "WSG_AGENT_RUNTIME_HELPER_RUNTIME";
 
 #[test]
 fn fresh_claude_command_preserves_headless_stream_invocation() {
@@ -266,6 +271,339 @@ fn probe_runs_in_the_worker_workspace() {
             .to_str()
             .expect("temporary path")
     );
+}
+
+#[test]
+fn foreground_run_mirrors_terminal_streams_and_log() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf 'stdout:%s\n' \"$(cat)\"\nprintf 'cwd=%s\n' \"$PWD\"\nprintf 'stderr-line\n' >&2\nexit 7\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "foreground_run_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = helper.spawn().expect("foreground helper");
+    child
+        .stdin
+        .take()
+        .expect("helper stdin")
+        .write_all(b"input-value\n")
+        .expect("write helper input");
+    let output = child.wait_with_output().expect("helper output");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let terminal_stdout = String::from_utf8(output.stdout).expect("terminal stdout");
+    assert!(terminal_stdout.contains("stdout:input-value\n"));
+    assert!(terminal_stdout.contains(&format!(
+        "cwd={}\n",
+        workspace
+            .canonicalize()
+            .expect("canonical workspace")
+            .display()
+    )));
+    let terminal_stderr = String::from_utf8(output.stderr).expect("terminal stderr");
+    assert!(terminal_stderr.contains("stderr-line\n"));
+    assert_eq!(
+        fs::read_to_string(&result).expect("foreground result"),
+        "exit=Some(7)"
+    );
+    let log_contents = fs::read_to_string(log).expect("mirrored log");
+    assert!(log_contents.contains("stdout:input-value\n"));
+    assert!(log_contents.contains("stderr-line\n"));
+    assert!(log_contents.contains("cwd="));
+}
+
+#[test]
+fn foreground_run_truncates_existing_log() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    fs::write(&log, "stale output\n").expect("stale log");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf 'fresh output\n'\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args([
+            "--exact",
+            "foreground_run_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("foreground helper");
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(log).expect("foreground log"),
+        "fresh output\n"
+    );
+}
+
+#[test]
+fn foreground_run_log_setup_failure_prevents_workload_spawn() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let missing_log = temporary_directory
+        .path()
+        .join("missing")
+        .join("worker.log");
+    let executed = temporary_directory.path().join("executed");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ntouch \"$WSG_AGENT_RUNTIME_HELPER_EXECUTED\"\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "foreground_run_error_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &missing_log)
+        .env(HELPER_EXECUTED, &executed)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("foreground error helper");
+    assert!(status.success());
+    let error = fs::read_to_string(result).expect("foreground error");
+    assert!(error.starts_with(&format!(
+        "cannot create foreground Run log {}:",
+        missing_log.display()
+    )));
+    assert!(error.contains("No such file or directory"));
+    assert!(!executed.exists(), "workload should not spawn");
+}
+
+#[test]
+fn foreground_run_drains_large_stdout_and_stderr_concurrently() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ndd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'o'\ndd if=/dev/zero bs=1024 count=128 2>/dev/null | tr '\\0' 'e' >&2\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "foreground_run_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("foreground helper");
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(result).expect("foreground result"),
+        "exit=Some(0)"
+    );
+    let log_contents = fs::read(log).expect("large mirrored log");
+    assert_eq!(
+        log_contents.iter().filter(|byte| **byte == b'o').count(),
+        128 * 1024
+    );
+    assert_eq!(
+        log_contents.iter().filter(|byte| **byte == b'e').count(),
+        128 * 1024
+    );
+}
+
+#[test]
+fn foreground_run_uses_the_same_supervisor_for_codex() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("codex"),
+        "#!/bin/sh\nif [ \"$1\" = \"features\" ]; then printf 'multi_agent stable false\n'; exit 0; fi\nprintf 'codex-output\n'\nprintf 'codex-error\n' >&2\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "foreground_run_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_RUNTIME, "codex")
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("foreground helper");
+    assert!(status.success());
+    assert_eq!(
+        fs::read_to_string(result).expect("foreground result"),
+        "exit=Some(0)"
+    );
+    let log_contents = fs::read_to_string(log).expect("Codex log");
+    assert!(log_contents.contains("codex-output\n"));
+    assert!(log_contents.contains("codex-error\n"));
+}
+
+#[test]
+fn foreground_run_spawn_failure_is_typed() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then rm \"$0\"; exit 0; fi\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "foreground_run_spawn_error_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("foreground spawn error helper");
+    assert!(status.success());
+    let error = fs::read_to_string(result).expect("foreground spawn error");
+    assert!(error.starts_with("cannot spawn claude foreground Run:"));
+    assert!(error.contains("No such file or directory"));
+}
+
+#[test]
+#[ignore]
+fn foreground_run_spawn_error_helper() {
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let result = PathBuf::from(env::var_os(HELPER_RESULT).expect("result path"));
+    let request = RunRequest::new(
+        AgentRuntime::Claude,
+        AgentRuntimeInvocation::new("foreground spawn error test"),
+        workspace,
+        log,
+    );
+    let error = RunSupervisor::new()
+        .run_foreground(&request)
+        .expect_err("spawn should fail after probe");
+    fs::write(result, error.to_string()).expect("foreground spawn error result");
+}
+
+#[test]
+#[ignore]
+fn foreground_run_error_helper() {
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let result = PathBuf::from(env::var_os(HELPER_RESULT).expect("result path"));
+    let request = RunRequest::new(
+        AgentRuntime::Claude,
+        AgentRuntimeInvocation::new("foreground error test"),
+        workspace,
+        log,
+    );
+    let error = RunSupervisor::new()
+        .run_foreground(&request)
+        .expect_err("log setup should fail");
+    fs::write(result, error.to_string()).expect("foreground error result");
+}
+
+#[test]
+#[ignore]
+fn foreground_run_helper() {
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let result = PathBuf::from(env::var_os(HELPER_RESULT).expect("result path"));
+    let runtime = match env::var(HELPER_RUNTIME).as_deref() {
+        Ok("codex") => AgentRuntime::Codex,
+        Ok("claude") | Err(_) => AgentRuntime::Claude,
+        Ok(other) => panic!("unknown Agent Runtime {other}"),
+    };
+    let request = RunRequest::new(
+        runtime,
+        AgentRuntimeInvocation::new("foreground test"),
+        workspace,
+        log,
+    );
+    let outcome = RunSupervisor::new()
+        .run_foreground(&request)
+        .expect("foreground Run should complete");
+    fs::write(result, format!("exit={:?}", outcome.exit_code())).expect("foreground result");
 }
 
 #[test]

@@ -1,9 +1,12 @@
 //! Agent Runtime identity and execution capability probing.
 
 use std::fmt;
-use std::io;
-use std::path::Path;
-use std::process::Command;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Read, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use thiserror::Error;
 
@@ -63,6 +66,247 @@ impl AgentRuntimeInvocation {
         self.system_prompt = Some(system_prompt.into());
         self
     }
+}
+
+/// Inputs required to execute one foreground Run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunRequest {
+    runtime: AgentRuntime,
+    invocation: AgentRuntimeInvocation,
+    workspace: PathBuf,
+    log_path: PathBuf,
+}
+
+impl RunRequest {
+    /// Creates a foreground Run request for a Worker Workspace.
+    pub fn new(
+        runtime: AgentRuntime,
+        invocation: AgentRuntimeInvocation,
+        workspace: impl Into<PathBuf>,
+        log_path: impl Into<PathBuf>,
+    ) -> Self {
+        Self {
+            runtime,
+            invocation,
+            workspace: workspace.into(),
+            log_path: log_path.into(),
+        }
+    }
+}
+
+/// Supervises Agent Runtime Runs through the shared execution seam.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct RunSupervisor;
+
+impl RunSupervisor {
+    /// Creates a Run supervisor.
+    pub const fn new() -> Self {
+        Self
+    }
+
+    /// Executes one Run attached to the caller's terminal.
+    pub fn run_foreground(
+        &self,
+        request: &RunRequest,
+    ) -> Result<ForegroundRunOutcome, RunSupervisorError> {
+        let capabilities = request.runtime.probe(&request.workspace)?;
+        let log = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&request.log_path)
+            .map_err(|source| RunSupervisorError::Log {
+                path: request.log_path.clone(),
+                source,
+            })?;
+        let log = Arc::new(Mutex::new(log));
+        let mut command = request.runtime.command(&request.invocation, capabilities);
+        command
+            .current_dir(&request.workspace)
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|source| RunSupervisorError::Spawn {
+                runtime: request.runtime,
+                source,
+            })?;
+        let stdout = child.stdout.take().expect("foreground stdout was piped");
+        let stderr = child.stderr.take().expect("foreground stderr was piped");
+        let stdout_forwarder =
+            spawn_output_forwarder(stdout, io::stdout(), Arc::clone(&log), "stdout");
+        let stderr_forwarder =
+            spawn_output_forwarder(stderr, io::stderr(), Arc::clone(&log), "stderr");
+
+        let (status, wait_error) = match child.wait() {
+            Ok(status) => (Some(status), None),
+            Err(source) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                (None, Some(source))
+            }
+        };
+        let stdout_result = join_output_forwarder(stdout_forwarder, "stdout");
+        let stderr_result = join_output_forwarder(stderr_forwarder, "stderr");
+
+        stdout_result?;
+        stderr_result?;
+        if let Some(source) = wait_error {
+            return Err(RunSupervisorError::Wait {
+                runtime: request.runtime,
+                source,
+            });
+        }
+
+        Ok(ForegroundRunOutcome {
+            exit_code: status.and_then(|status| status.code()),
+        })
+    }
+}
+
+/// The completion result of a foreground Run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ForegroundRunOutcome {
+    exit_code: Option<i32>,
+}
+
+impl ForegroundRunOutcome {
+    /// Returns the process exit code, or `None` when the process was signaled.
+    pub fn exit_code(self) -> Option<i32> {
+        self.exit_code
+    }
+}
+
+/// Errors from foreground Run execution.
+#[derive(Debug, Error)]
+pub enum RunSupervisorError {
+    /// The Agent Runtime capability probe could not start.
+    #[error(transparent)]
+    Probe(#[from] AgentRuntimeProbeError),
+    /// The shared Run log could not be created or truncated.
+    #[error("cannot create foreground Run log {path}: {source}")]
+    Log {
+        /// The configured log path.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
+    /// The Agent Runtime process could not be started.
+    #[error("cannot spawn {runtime} foreground Run: {source}")]
+    Spawn {
+        /// The selected Agent Runtime.
+        runtime: AgentRuntime,
+        /// The process creation error.
+        #[source]
+        source: io::Error,
+    },
+    /// Output could not be forwarded or mirrored.
+    #[error("cannot forward {stream} output: {source}")]
+    Forward {
+        /// The output stream that failed.
+        stream: &'static str,
+        /// The I/O error.
+        #[source]
+        source: io::Error,
+    },
+    /// The Agent Runtime process could not be waited on.
+    #[error("cannot wait for {runtime} foreground Run: {source}")]
+    Wait {
+        /// The selected Agent Runtime.
+        runtime: AgentRuntime,
+        /// The wait error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+fn spawn_output_forwarder<R, W>(
+    reader: R,
+    terminal: W,
+    log: Arc<Mutex<File>>,
+    stream: &'static str,
+) -> JoinHandle<Result<(), RunSupervisorError>>
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    thread::spawn(move || copy_output(reader, terminal, log, stream))
+}
+
+fn join_output_forwarder(
+    forwarder: JoinHandle<Result<(), RunSupervisorError>>,
+    stream: &'static str,
+) -> Result<(), RunSupervisorError> {
+    match forwarder.join() {
+        Ok(result) => result,
+        Err(_) => Err(RunSupervisorError::Forward {
+            stream,
+            source: io::Error::other("output forwarding thread panicked"),
+        }),
+    }
+}
+
+fn copy_output<R, W>(
+    mut reader: R,
+    mut terminal: W,
+    log: Arc<Mutex<File>>,
+    stream: &'static str,
+) -> Result<(), RunSupervisorError>
+where
+    R: Read,
+    W: Write,
+{
+    let mut buffer = [0_u8; 8192];
+    let mut terminal_error = None;
+    let mut log_error = None;
+    let mut read_error = None;
+
+    loop {
+        let count = match reader.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(source) => {
+                read_error = Some(source);
+                break;
+            }
+        };
+
+        if terminal_error.is_none()
+            && let Err(source) = terminal.write_all(&buffer[..count])
+        {
+            terminal_error = Some(source);
+        }
+        if terminal_error.is_none()
+            && let Err(source) = terminal.flush()
+        {
+            terminal_error = Some(source);
+        }
+        if log_error.is_none() {
+            match log.lock() {
+                Ok(mut log) => {
+                    if let Err(source) = log.write_all(&buffer[..count]) {
+                        log_error = Some(source);
+                    }
+                }
+                Err(_) => {
+                    log_error = Some(io::Error::other("foreground Run log lock poisoned"));
+                }
+            }
+        }
+    }
+
+    if let Some(source) = terminal_error {
+        return Err(RunSupervisorError::Forward { stream, source });
+    }
+    if let Some(source) = log_error {
+        return Err(RunSupervisorError::Forward { stream, source });
+    }
+    if let Some(source) = read_error {
+        return Err(RunSupervisorError::Forward { stream, source });
+    }
+    Ok(())
 }
 
 impl fmt::Display for AgentRuntime {

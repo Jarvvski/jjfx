@@ -83,3 +83,12 @@ JSON, approval, and optional capability arguments without shell interpolation.
 Fresh and resumed invocations are covered through the public command builder;
 policy text remains caller-owned for ticket 10. Process launch, PID handling,
 and supervision remain out of scope for this slice.
+
+2026-07-27 - Added the provider-neutral foreground Run supervisor. Foreground
+Runs now probe capabilities, execute in the Worker Workspace, inherit stdin,
+mirror stdout and stderr to the terminal and one compatible truncated log, drain
+both streams concurrently, reap the process, and return typed exit outcomes.
+Coverage includes Claude and Codex fake runtimes, setup and spawn failures, log
+truncation, and large dual-stream output. Background launch, process-group
+cleanup, PID persistence, liveness reconciliation, and terminal finalization
+remain pending.
