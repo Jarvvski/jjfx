@@ -56,7 +56,26 @@ impl PoolGrowth {
     }
 }
 
-/// Errors from Worker Pool creation and growth.
+/// Capacity reserved for one Ticket before an Agent Runtime starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Reservation {
+    worker_id: WorkerId,
+    ticket: String,
+}
+
+impl Reservation {
+    /// Returns the Worker assigned to this Reservation.
+    pub fn worker_id(&self) -> &WorkerId {
+        &self.worker_id
+    }
+
+    /// Returns the Ticket assigned to this Reservation.
+    pub fn ticket(&self) -> &str {
+        &self.ticket
+    }
+}
+
+/// Errors from Worker Pool creation, growth, and Reservation.
 #[derive(Debug, Error)]
 pub enum WorkerPoolError {
     #[error("cannot load Worker Pool state: {0}")]
@@ -67,6 +86,12 @@ pub enum WorkerPoolError {
     CannotShrink { current: usize, requested: usize },
     #[error("Worker Pool mutation conflicted with another process")]
     Conflict,
+    #[error("no idle Worker is available for Ticket {ticket} (available: {available})")]
+    NoIdleWorkers { ticket: String, available: usize },
+    #[error("Worker {worker} is not a member of the Worker Pool")]
+    WorkerNotInPool { worker: WorkerId },
+    #[error("Worker {worker} is not idle")]
+    WorkerNotIdle { worker: WorkerId },
     #[error("cannot discover GitHub repository: {0}")]
     RepositoryDiscovery(String),
     #[error("cannot create a Worker timestamp: {0}")]
@@ -96,6 +121,49 @@ impl WorkerPool {
     /// Reads a compatible Worker Pool snapshot without changing any file.
     pub fn snapshot(&self) -> WorkerPoolSnapshot {
         self.repository.read_worker_pool_snapshot()
+    }
+
+    /// Reserves the first idle Worker for `ticket` in pool order.
+    pub fn reserve(&self, ticket: impl Into<String>) -> Result<Reservation, WorkerPoolError> {
+        self.reserve_inner(None, ticket.into())
+    }
+
+    /// Reserves the named idle Worker for `ticket`.
+    pub fn reserve_named(
+        &self,
+        worker: WorkerId,
+        ticket: impl Into<String>,
+    ) -> Result<Reservation, WorkerPoolError> {
+        self.reserve_inner(Some(worker), ticket.into())
+    }
+
+    fn reserve_inner(
+        &self,
+        requested: Option<WorkerId>,
+        ticket: String,
+    ) -> Result<Reservation, WorkerPoolError> {
+        let started_at = current_timestamp()?;
+        let outcome = self.repository.state_store().reserve_worker(
+            requested.as_ref(),
+            ticket.clone(),
+            started_at,
+            ticket.to_lowercase(),
+        )?;
+        match outcome {
+            crate::state::ReservationOutcome::Reserved { worker } => Ok(Reservation {
+                worker_id: worker,
+                ticket,
+            }),
+            crate::state::ReservationOutcome::NoIdle { available } => {
+                Err(WorkerPoolError::NoIdleWorkers { ticket, available })
+            }
+            crate::state::ReservationOutcome::WorkerNotInPool { worker } => {
+                Err(WorkerPoolError::WorkerNotInPool { worker })
+            }
+            crate::state::ReservationOutcome::WorkerNotIdle { worker } => {
+                Err(WorkerPoolError::WorkerNotIdle { worker })
+            }
+        }
     }
 
     /// Grows the pool to `capacity`, provisioning stable Worker identities.

@@ -3,6 +3,7 @@ use std::path::Path;
 use std::process::Command;
 use std::thread;
 
+use serde_json::Value;
 use tempfile::TempDir;
 use wsg_core::{AgentRuntime, Repository, SnapshotDiagnosticKind, WorkerStatus};
 
@@ -260,6 +261,177 @@ fn concurrent_growth_keeps_registered_workers_in_the_workspace_cache() {
             }),
             "cache should contain {}",
             worker.worker_id()
+        );
+    }
+}
+
+#[test]
+fn reserves_the_first_idle_worker_for_a_ticket() {
+    let (_temp, repository) = repository_with_pool();
+    let reservation = repository
+        .worker_pool()
+        .reserve("ENG-201")
+        .expect("first idle Worker should be reserved");
+
+    assert_eq!(reservation.worker_id().as_str(), "worker-01");
+    assert_eq!(reservation.ticket(), "ENG-201");
+
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot.worker("worker-01").expect("reserved Worker");
+    assert_eq!(worker.status(), WorkerStatus::Busy);
+    assert_eq!(worker.ticket(), Some("ENG-201"));
+    assert_eq!(worker.branch_name(), Some("eng-201"));
+    let expected_log = repository
+        .root()
+        .join(".jj/pool/worker-01.log")
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(worker.log_file(), Some(expected_log.as_str()));
+    assert!(worker.started_at().is_some());
+}
+
+#[test]
+fn reserves_a_named_idle_worker_without_using_pool_order() {
+    let (temp, repository) = repository_with_pool();
+    fs::write(
+        temp.path().join(".jj/pool/worker-04.json"),
+        fixture("worker-idle-claude.json"),
+    )
+    .expect("make named Worker idle");
+    let worker_id = wsg_core::WorkerId::parse("worker-04").expect("Worker ID");
+
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-202")
+        .expect("named idle Worker should be reserved");
+
+    assert_eq!(reservation.worker_id().as_str(), "worker-04");
+    assert_eq!(reservation.ticket(), "ENG-202");
+    let snapshot = repository.worker_pool().snapshot();
+    assert_eq!(
+        snapshot
+            .worker("worker-04")
+            .expect("reserved Worker")
+            .status(),
+        WorkerStatus::Busy
+    );
+    assert_eq!(
+        snapshot.worker("worker-01").expect("first Worker").status(),
+        WorkerStatus::Idle
+    );
+}
+
+#[test]
+fn named_reservation_rejects_unknown_or_busy_workers_without_mutation() {
+    let (_temp, repository) = repository_with_pool();
+    let unknown = wsg_core::WorkerId::parse("worker-nope").expect("Worker ID");
+    let error = repository
+        .worker_pool()
+        .reserve_named(unknown, "ENG-203")
+        .expect_err("unknown Worker should be rejected");
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::WorkerNotInPool { worker }
+            if worker.as_str() == "worker-nope"
+    ));
+
+    let (_temp, repository) = repository_with_pool();
+    let busy = wsg_core::WorkerId::parse("worker-02").expect("Worker ID");
+    let error = repository
+        .worker_pool()
+        .reserve_named(busy, "ENG-204")
+        .expect_err("busy Worker should be rejected");
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::WorkerNotIdle { worker }
+            if worker.as_str() == "worker-02"
+    ));
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot.worker("worker-02").expect("busy Worker");
+    assert_eq!(worker.ticket(), Some("ENG-101"));
+}
+
+#[test]
+fn concurrent_reservations_allocate_distinct_idle_workers() {
+    let (temp, repository) = repository_with_pool();
+    fs::write(
+        temp.path().join(".jj/pool/worker-04.json"),
+        fixture("worker-idle-claude.json"),
+    )
+    .expect("make second Worker idle");
+    let first_pool = repository.worker_pool();
+    let second_pool = first_pool.clone();
+
+    let (first, second) = thread::scope(|scope| {
+        let first = scope.spawn(|| first_pool.reserve("ENG-205"));
+        let second = scope.spawn(|| second_pool.reserve("ENG-206"));
+        (
+            first.join().expect("first reservation should not panic"),
+            second.join().expect("second reservation should not panic"),
+        )
+    });
+    let first = first.expect("first reservation should succeed");
+    let second = second.expect("second reservation should succeed");
+    assert_ne!(first.worker_id(), second.worker_id());
+    assert_eq!(first.ticket(), "ENG-205");
+    assert_eq!(second.ticket(), "ENG-206");
+}
+
+#[test]
+fn reservation_reports_no_idle_capacity_without_mutation() {
+    let (temp, repository) = repository_with_pool();
+    fs::write(
+        temp.path().join(".jj/pool/worker-01.json"),
+        fixture("worker-busy-claude.json"),
+    )
+    .expect("make every Worker non-idle");
+
+    let error = repository
+        .worker_pool()
+        .reserve("ENG-207")
+        .expect_err("a full pool should reject the Reservation");
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::NoIdleWorkers {
+            ticket,
+            available: 0
+        } if ticket == "ENG-207"
+    ));
+    let snapshot = repository.worker_pool().snapshot();
+    assert_eq!(
+        snapshot.worker("worker-01").expect("Worker").ticket(),
+        Some("ENG-101")
+    );
+}
+
+#[test]
+fn reservation_preserves_go_worker_extensions_and_null_fields() {
+    let (temp, repository) = repository_with_pool();
+    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let mut worker: Value =
+        serde_json::from_slice(&fs::read(&worker_path).expect("Go Worker state"))
+            .expect("Worker JSON");
+    worker["future"] = serde_json::json!({"enabled": true});
+    fs::write(
+        &worker_path,
+        serde_json::to_vec(&worker).expect("Worker JSON"),
+    )
+    .expect("Worker state");
+
+    repository
+        .worker_pool()
+        .reserve("ENG-208")
+        .expect("Go-created Worker should be reservable");
+
+    let written: Value =
+        serde_json::from_slice(&fs::read(&worker_path).expect("reserved Worker state"))
+            .expect("reserved Worker JSON");
+    assert_eq!(written["future"]["enabled"], true);
+    assert_eq!(written["agent"], "claude");
+    for field in ["completed_at", "error", "exit_code", "pid"] {
+        assert!(
+            written[field].is_null(),
+            "{field} should remain explicit null"
         );
     }
 }

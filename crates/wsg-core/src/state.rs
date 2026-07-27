@@ -461,6 +461,16 @@ impl StateError {
 pub struct StateStore {
     root: PathBuf,
 }
+
+/// Result of the repository-owned atomic Worker Reservation transition.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReservationOutcome {
+    Reserved { worker: WorkerId },
+    NoIdle { available: usize },
+    WorkerNotInPool { worker: WorkerId },
+    WorkerNotIdle { worker: WorkerId },
+}
+
 /// Pool state repository.
 #[derive(Debug, Clone)]
 pub struct PoolStateRepository {
@@ -508,6 +518,117 @@ impl StateStore {
             root: self.root.clone(),
             parent,
         }
+    }
+
+    /// Atomically reserves an idle Worker while holding the compatible pool
+    /// and Worker sidecar locks. This repository-owned transition reloads
+    /// membership and Worker state under lock so lifecycle callers never
+    /// make a claim from a stale snapshot.
+    pub(crate) fn reserve_worker(
+        &self,
+        requested: Option<&WorkerId>,
+        ticket: String,
+        started_at: WireTimestamp,
+        branch_name: String,
+    ) -> Result<ReservationOutcome, StateError> {
+        let pool_subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
+            let pool = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => {
+                    return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                }
+            };
+            let worker_locks = pool
+                .workers
+                .iter()
+                .map(|worker| {
+                    self.root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.json.lock"))
+                })
+                .collect::<Vec<_>>();
+            with_locks(&worker_locks, pool_subject, || {
+                let pool =
+                    match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+                        Loaded::Present(versioned) => versioned.value,
+                        Loaded::Missing => {
+                            return Err(StateError::new(
+                                "reserve",
+                                pool_subject,
+                                "state is missing",
+                            ));
+                        }
+                    };
+                if let Some(requested) = requested
+                    && !pool.workers.iter().any(|worker| worker == requested)
+                {
+                    return Ok(ReservationOutcome::WorkerNotInPool {
+                        worker: requested.clone(),
+                    });
+                }
+
+                let candidates = requested.into_iter().cloned().chain(
+                    requested
+                        .is_none()
+                        .then(|| pool.workers.clone())
+                        .into_iter()
+                        .flatten(),
+                );
+                let mut available = 0;
+                let mut selected = None;
+                for worker in candidates {
+                    let path = self
+                        .root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.json"));
+                    let state =
+                        match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+                            Loaded::Present(versioned) => versioned.value,
+                            Loaded::Missing => {
+                                return Err(StateError::new(
+                                    "reserve",
+                                    format!("Worker {worker}"),
+                                    "state is missing",
+                                ));
+                            }
+                        };
+                    if state.status.as_str() == "idle" {
+                        available += 1;
+                        if selected.is_none() {
+                            selected = Some((worker, state));
+                        }
+                    } else if requested.is_some() {
+                        return Ok(ReservationOutcome::WorkerNotIdle { worker });
+                    }
+                }
+
+                let Some((worker, mut state)) = selected else {
+                    return Ok(ReservationOutcome::NoIdle { available });
+                };
+                state.status = WireStatus::new("busy");
+                state.ticket = Some(ticket);
+                state.started_at = Some(started_at);
+                state.log_file = Some(
+                    self.root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.log"))
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+                state.branch_name = Some(branch_name);
+                state.completed_at = None;
+                state.pid = None;
+                state.exit_code = None;
+                state.error = None;
+                let path = self
+                    .root
+                    .join(POOL_DIRECTORY)
+                    .join(format!("{worker}.json"));
+                write_atomic(&path, &state, &format!("Worker {worker}"))?;
+                Ok(ReservationOutcome::Reserved { worker })
+            })
+        })
     }
 }
 
@@ -672,8 +793,11 @@ fn with_locks<T>(
     subject: &str,
     operation: impl FnOnce() -> Result<T, StateError>,
 ) -> Result<T, StateError> {
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
     let mut files = Vec::with_capacity(paths.len());
-    for path in paths {
+    for path in &paths {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|error| StateError::new("create lock directory for", subject, error))?;

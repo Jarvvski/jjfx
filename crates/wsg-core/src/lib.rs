@@ -12,8 +12,8 @@ mod workspace;
 
 pub use pool::{
     AgentRuntime, PersistedField, PoolCapacity, PoolCapacityError, PoolGrowth, PoolSnapshot,
-    SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
-    WorkerReference, WorkerSnapshot, WorkerStatus,
+    Reservation, SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError,
+    WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,

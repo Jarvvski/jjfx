@@ -44,7 +44,7 @@ Test public pool operations in temporary jj repositories. Cover partial provisio
 
 - [ ] Rust-created Worker Pools are usable by Go wsg.
 - [ ] Existing Go-created pools can grow and shrink through Rust.
-- [ ] Concurrent Reservations never allocate one Worker twice.
+- [x] Concurrent Reservations never allocate one Worker twice.
 - [ ] Failed provisioning leaves no registered half-Workspace or claimed Worker.
 - [ ] Ad Hoc Workspace behavior remains unchanged.
 - [ ] `mise run check` is green.
@@ -71,3 +71,12 @@ state it no longer owns.
 Added public-seam integration coverage for creation, growth, Go-created pools,
 idempotence, failure, cache projection, and concurrent growth. `mise run check`
 passes.
+
+## Comments
+
+2026-07-27 - Completed the missing Reservation slice through the public
+`WorkerPool` interface. First-idle and named Reservations now atomically mark
+Workers busy under the compatible pool and Worker locks, preserve Go wire
+fields and unknown extensions, reject unavailable Workers without mutation, and
+serialize concurrent claims without duplicate allocation. Focused Worker Pool
+tests pass.
