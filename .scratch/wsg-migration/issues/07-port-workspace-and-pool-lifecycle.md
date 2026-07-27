@@ -1,6 +1,6 @@
 # Port Worker Workspace and Worker Pool lifecycle
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -59,3 +59,15 @@ Test public pool operations in temporary jj repositories. Cover partial provisio
 ## Blocked by
 
 - issues/06-port-state-persistence-and-locking.md
+
+## Answer
+
+Implemented the pool creation and growth slice. The shared `WorkerPool` module now
+creates compatible pool state, provisions stable random Worker IDs, preserves
+existing membership and metadata while growing, rejects shrink requests,
+serializes ws-cache projection, and compensates failed growth without deleting
+state it no longer owns.
+
+Added public-seam integration coverage for creation, growth, Go-created pools,
+idempotence, failure, cache projection, and concurrent growth. `mise run check`
+passes.

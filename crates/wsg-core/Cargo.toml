@@ -7,6 +7,8 @@ license = "GPL-3.0-or-later"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["arbitrary_precision"] }
+getrandom = "0.4"
+jiff = "0.2"
 thiserror = "2"
 rustix = { version = "1", features = ["fs", "process"] }
 tempfile = "3"

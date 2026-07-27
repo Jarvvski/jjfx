@@ -11,8 +11,9 @@ mod state;
 mod workspace;
 
 pub use pool::{
-    AgentRuntime, PersistedField, PoolSnapshot, SnapshotDiagnostic, SnapshotDiagnosticKind,
-    WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
+    AgentRuntime, PersistedField, PoolCapacity, PoolCapacityError, PoolGrowth, PoolSnapshot,
+    SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
+    WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
@@ -77,6 +78,11 @@ impl Repository {
     /// Returns the canonical path of the repository workspace root.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Opens the deep Worker Pool lifecycle module for this repository.
+    pub fn worker_pool(&self) -> WorkerPool {
+        WorkerPool::new(self.clone())
     }
 
     /// Provisions the Worker Workspace and idle Worker state for `worker_id`.

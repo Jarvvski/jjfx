@@ -1,16 +1,18 @@
 //! Repository-owned Worker Workspace lifecycle operations.
 
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use rustix::fs::{FlockOperation, flock};
 use thiserror::Error;
 
 use crate::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, WorkerState};
 
 const CACHE_PATH: &str = ".jj/ws-cache";
+const CACHE_LOCK_PATH: &str = ".jj/ws-cache.lock";
 const DEFAULT_WORKSPACE: &str = "default";
 const SYNAPSE_PATH: &str = "tools/dev-cli/synapse/clone";
 
@@ -115,6 +117,76 @@ pub(crate) fn provision(
     }
 }
 
+/// Removes a provisioned Worker Workspace and all of its compatible state.
+///
+/// This is crate-private because lifecycle callers must decide when a Worker
+/// is no longer owned by a Pool. It is deliberately best-effort across the
+/// external Workspace, state, and cache resources so a failed aggregate
+/// mutation can report every compensation failure.
+pub(crate) fn deprovision(
+    repository: &Repository,
+    worker_id: &WorkerId,
+) -> Result<(), WorkerWorkspaceError> {
+    let root = repository.root();
+    let path = worker_path(root, worker_id);
+    let state = repository.state_store().worker(worker_id.clone());
+    let revision = match state.load() {
+        Ok(Loaded::Present(versioned)) => versioned.revision().clone(),
+        Ok(Loaded::Missing) => {
+            return Err(WorkerWorkspaceError::new(
+                "Worker state is absent during compensation; refusing to remove Workspace",
+            ));
+        }
+        Err(error) => {
+            return Err(WorkerWorkspaceError::new(format!(
+                "load Worker state for compensation: {error}; refusing to remove Workspace"
+            )));
+        }
+    };
+
+    let mut failures = Vec::new();
+    if let Err(error) = forget_workspace(root, worker_id) {
+        failures.push(error.to_string());
+    }
+    if path.exists()
+        && let Err(error) = fs::remove_dir_all(&path)
+    {
+        failures.push(format!("remove Worker Workspace directory: {error}"));
+    }
+    if let Err(error) = unproject_cache(root, worker_id) {
+        failures.push(error.to_string());
+    }
+    if !failures.is_empty() {
+        return Err(WorkerWorkspaceError::new(failures.join("; ")));
+    }
+
+    match state.commit(Expected::Match(revision), StateChange::Remove) {
+        Ok(crate::CommitOutcome::Applied(_)) => Ok(()),
+        Ok(crate::CommitOutcome::Conflict(_)) => Err(WorkerWorkspaceError::new(
+            "Worker state changed during compensation after Workspace cleanup",
+        )),
+        Err(error) => Err(WorkerWorkspaceError::new(format!(
+            "remove Worker state after Workspace cleanup: {error}"
+        ))),
+    }
+}
+
+fn unproject_cache(root: &Path, worker_id: &WorkerId) -> Result<(), WorkerWorkspaceError> {
+    with_cache_lock(root, || {
+        let cache = cache_path(root);
+        let entries = read_cache(&cache)?;
+        let original_len = entries.len();
+        let filtered: Vec<_> = entries
+            .into_iter()
+            .filter(|(name, _)| name != worker_id.as_str())
+            .collect();
+        if filtered.len() != original_len {
+            write_cache(&cache, &filtered)?;
+        }
+        Ok(())
+    })
+}
+
 fn ensure_unclaimed(
     root: &Path,
     worker_id: &WorkerId,
@@ -156,7 +228,7 @@ fn ensure_unclaimed(
     Ok(())
 }
 
-fn worker_path(root: &Path, worker_id: &WorkerId) -> PathBuf {
+pub(crate) fn worker_path(root: &Path, worker_id: &WorkerId) -> PathBuf {
     let base = env::var_os("JJ_WS_DIR")
         .map(PathBuf::from)
         .map(|base| {
@@ -280,17 +352,36 @@ fn project_cache(
     worker_id: &WorkerId,
     path: &Path,
 ) -> Result<(), WorkerWorkspaceError> {
-    let cache = cache_path(root);
-    let mut entries = read_cache(&cache)?;
-    if !entries.iter().any(|(name, _)| name == DEFAULT_WORKSPACE) {
-        entries.insert(0, (DEFAULT_WORKSPACE.to_owned(), root.to_owned()));
-    }
-    entries.push((worker_id.as_str().to_owned(), path.to_path_buf()));
-    write_cache(&cache, &entries)
+    with_cache_lock(root, || {
+        let cache = cache_path(root);
+        let mut entries = read_cache(&cache)?;
+        if !entries.iter().any(|(name, _)| name == DEFAULT_WORKSPACE) {
+            entries.insert(0, (DEFAULT_WORKSPACE.to_owned(), root.to_owned()));
+        }
+        entries.push((worker_id.as_str().to_owned(), path.to_path_buf()));
+        write_cache(&cache, &entries)
+    })
 }
 
 fn cache_path(root: &Path) -> PathBuf {
     root.join(CACHE_PATH)
+}
+
+fn with_cache_lock<T>(
+    root: &Path,
+    operation: impl FnOnce() -> Result<T, WorkerWorkspaceError>,
+) -> Result<T, WorkerWorkspaceError> {
+    let path = root.join(CACHE_LOCK_PATH);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(|error| WorkerWorkspaceError::new(format!("open ws-cache lock: {error}")))?;
+    flock(&file, FlockOperation::LockExclusive)
+        .map_err(|error| WorkerWorkspaceError::new(format!("lock ws-cache: {error}")))?;
+    operation()
 }
 
 fn read_cache(path: &Path) -> Result<Vec<(String, PathBuf)>, WorkerWorkspaceError> {
@@ -347,11 +438,6 @@ fn rollback_provisioning(
     state_revision: Option<crate::StateRevision<WorkerState>>,
 ) -> Result<(), WorkerWorkspaceError> {
     let mut failures = Vec::new();
-    if let Some(revision) = state_revision
-        && let Err(error) = state.commit(Expected::Match(revision), StateChange::Remove)
-    {
-        failures.push(format!("remove Worker state: {error}"));
-    }
     if let Err(error) = forget_workspace(root, worker_id) {
         failures.push(error.to_string());
     }
@@ -360,10 +446,25 @@ fn rollback_provisioning(
     {
         failures.push(format!("remove Worker Workspace directory: {error}"));
     }
-    if failures.is_empty() {
-        Ok(())
+    if let Err(error) = unproject_cache(root, worker_id) {
+        failures.push(error.to_string());
+    }
+    if !failures.is_empty() {
+        return Err(WorkerWorkspaceError::new(failures.join("; ")));
+    }
+
+    if let Some(revision) = state_revision {
+        match state.commit(Expected::Match(revision), StateChange::Remove) {
+            Ok(crate::CommitOutcome::Applied(_)) => Ok(()),
+            Ok(crate::CommitOutcome::Conflict(_)) => Err(WorkerWorkspaceError::new(
+                "Worker state changed during rollback after Workspace cleanup",
+            )),
+            Err(error) => Err(WorkerWorkspaceError::new(format!(
+                "remove Worker state after Workspace cleanup: {error}"
+            ))),
+        }
     } else {
-        Err(WorkerWorkspaceError::new(failures.join("; ")))
+        Ok(())
     }
 }
 

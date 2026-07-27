@@ -1,9 +1,288 @@
 //! Read-only Worker Pool snapshots built over the compatible state repositories.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
-use crate::{Loaded, Repository, WireAgent, WireStatus, WorkerId, WorkerState};
+use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
+use thiserror::Error;
+
+use crate::{
+    CommitOutcome, Expected, Loaded, PoolState, Repository, StateChange, StateError, WireAgent,
+    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
+};
+
+/// A positive number of reusable Worker slots.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PoolCapacity(usize);
+
+impl PoolCapacity {
+    /// Creates a capacity suitable for a Worker Pool.
+    pub fn new(value: usize) -> Result<Self, PoolCapacityError> {
+        if value == 0 {
+            return Err(PoolCapacityError);
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the number of Worker slots.
+    pub fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+/// An invalid Worker Pool capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("Worker Pool capacity must be greater than zero")]
+pub struct PoolCapacityError;
+
+/// The result of growing a Worker Pool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolGrowth {
+    capacity: PoolCapacity,
+    added_workers: Vec<WorkerId>,
+}
+
+impl PoolGrowth {
+    /// Returns the resulting pool capacity.
+    pub fn capacity(&self) -> PoolCapacity {
+        self.capacity
+    }
+
+    /// Returns Workers provisioned by this growth operation in pool order.
+    pub fn added_workers(&self) -> &[WorkerId] {
+        &self.added_workers
+    }
+}
+
+/// Errors from Worker Pool creation and growth.
+#[derive(Debug, Error)]
+pub enum WorkerPoolError {
+    #[error("cannot load Worker Pool state: {0}")]
+    State(#[from] StateError),
+    #[error("Worker Pool state has invalid size {0}")]
+    InvalidSize(i64),
+    #[error("cannot shrink Worker Pool from {current} to {requested}")]
+    CannotShrink { current: usize, requested: usize },
+    #[error("Worker Pool mutation conflicted with another process")]
+    Conflict,
+    #[error("cannot discover GitHub repository: {0}")]
+    RepositoryDiscovery(String),
+    #[error("cannot create a Worker timestamp: {0}")]
+    Timestamp(String),
+    #[error("cannot generate a Worker ID: {0}")]
+    WorkerId(String),
+    #[error("cannot provision Worker {worker}: {source}")]
+    Provision {
+        worker: WorkerId,
+        source: WorkerWorkspaceError,
+    },
+    #[error("Worker Pool compensation failed: {0}")]
+    Compensation(String),
+}
+
+/// The deep Worker Pool lifecycle module for one repository.
+#[derive(Debug, Clone)]
+pub struct WorkerPool {
+    repository: Repository,
+}
+
+impl WorkerPool {
+    pub(crate) fn new(repository: Repository) -> Self {
+        Self { repository }
+    }
+
+    /// Reads a compatible Worker Pool snapshot without changing any file.
+    pub fn snapshot(&self) -> WorkerPoolSnapshot {
+        self.repository.read_worker_pool_snapshot()
+    }
+
+    /// Grows the pool to `capacity`, provisioning stable Worker identities.
+    ///
+    /// A missing pool is first initialized with compatible metadata. Workspace
+    /// commands run outside state locks; the final manifest update uses the
+    /// loaded exact-byte revision, and newly provisioned Workers are
+    /// compensated if another process wins the mutation.
+    pub fn grow_to(&self, capacity: PoolCapacity) -> Result<PoolGrowth, WorkerPoolError> {
+        let pool = self.repository.state_store().pool();
+        let current = self.load_or_create(&pool)?;
+        let current_size = usize::try_from(current.value.size)
+            .map_err(|_| WorkerPoolError::InvalidSize(current.value.size))?;
+        if capacity.as_usize() < current_size {
+            return Err(WorkerPoolError::CannotShrink {
+                current: current_size,
+                requested: capacity.as_usize(),
+            });
+        }
+        if capacity.as_usize() == current_size {
+            return Ok(PoolGrowth {
+                capacity,
+                added_workers: Vec::new(),
+            });
+        }
+
+        let mut known = current
+            .value
+            .workers
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let count = capacity.as_usize() - current_size;
+        let mut added = Vec::with_capacity(count);
+        for _ in 0..count {
+            let worker = next_worker_id(&self.repository, &known)?;
+            match self.repository.provision_worker_workspace(&worker) {
+                Ok(_) => {
+                    known.insert(worker.clone());
+                    added.push(worker);
+                }
+                Err(source) => {
+                    return match self.cleanup_workers(&added) {
+                        Ok(()) => Err(WorkerPoolError::Provision { worker, source }),
+                        Err(cleanup) => Err(WorkerPoolError::Compensation(format!(
+                            "{source}; {cleanup}"
+                        ))),
+                    };
+                }
+            }
+        }
+
+        let mut next = current.value.clone();
+        next.size = i64::try_from(capacity.as_usize())
+            .map_err(|_| WorkerPoolError::InvalidSize(next.size))?;
+        next.workers.extend(added.iter().cloned());
+        let committed = pool.commit(
+            Expected::Match(current.revision().clone()),
+            StateChange::Replace(next),
+        );
+        match committed {
+            Ok(CommitOutcome::Applied(_)) => Ok(PoolGrowth {
+                capacity,
+                added_workers: added,
+            }),
+            Ok(CommitOutcome::Conflict(_)) => match self.cleanup_workers(&added) {
+                Ok(()) => Err(WorkerPoolError::Conflict),
+                Err(cleanup) => Err(WorkerPoolError::Compensation(cleanup.to_string())),
+            },
+            Err(error) => match self.cleanup_workers(&added) {
+                Ok(()) => Err(WorkerPoolError::State(error)),
+                Err(cleanup) => Err(WorkerPoolError::Compensation(format!("{error}; {cleanup}"))),
+            },
+        }
+    }
+
+    fn cleanup_workers(&self, workers: &[WorkerId]) -> Result<(), WorkerPoolError> {
+        let mut failures = Vec::new();
+        for worker in workers {
+            if let Err(error) = crate::workspace::deprovision(&self.repository, worker) {
+                failures.push(format!("{worker}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerPoolError::Compensation(failures.join("; ")))
+        }
+    }
+
+    fn load_or_create(
+        &self,
+        pool: &crate::PoolStateRepository,
+    ) -> Result<crate::Versioned<PoolState>, WorkerPoolError> {
+        match pool.load()? {
+            Loaded::Present(versioned) => Ok(versioned),
+            Loaded::Missing => {
+                let empty = PoolState::new(
+                    0,
+                    discover_gh_repo(&self.repository)?,
+                    Vec::new(),
+                    current_timestamp()?,
+                );
+                match pool.commit(Expected::Missing, StateChange::Replace(empty))? {
+                    CommitOutcome::Applied(Loaded::Present(versioned))
+                    | CommitOutcome::Conflict(Loaded::Present(versioned)) => Ok(versioned),
+                    CommitOutcome::Applied(Loaded::Missing)
+                    | CommitOutcome::Conflict(Loaded::Missing) => Err(WorkerPoolError::Conflict),
+                }
+            }
+        }
+    }
+}
+
+fn next_worker_id(
+    repository: &Repository,
+    known: &BTreeSet<WorkerId>,
+) -> Result<WorkerId, WorkerPoolError> {
+    for _ in 0..32 {
+        let mut bytes = [0_u8; 3];
+        getrandom::fill(&mut bytes)
+            .map_err(|error| WorkerPoolError::WorkerId(error.to_string()))?;
+        let candidate = WorkerId::parse(format!(
+            "worker-{:02x}{:02x}{:02x}",
+            bytes[0], bytes[1], bytes[2]
+        ))
+        .map_err(|error| WorkerPoolError::WorkerId(error.to_string()))?;
+        if !known.contains(&candidate) && !worker_claimed(repository, &candidate) {
+            return Ok(candidate);
+        }
+    }
+    Err(WorkerPoolError::WorkerId(
+        "could not find an unused identifier after 32 attempts".to_owned(),
+    ))
+}
+
+fn worker_claimed(repository: &Repository, worker: &WorkerId) -> bool {
+    crate::workspace::worker_path(repository.root(), worker).exists()
+        || repository
+            .state_store()
+            .worker(worker.clone())
+            .load()
+            .is_ok_and(|state| matches!(state, Loaded::Present(_)))
+}
+
+fn discover_gh_repo(repository: &Repository) -> Result<String, WorkerPoolError> {
+    let output = Command::new("jj")
+        .args(["git", "remote", "list"])
+        .current_dir(repository.root())
+        .output()
+        .map_err(|error| WorkerPoolError::RepositoryDiscovery(error.to_string()))?;
+    if !output.status.success() {
+        return Err(WorkerPoolError::RepositoryDiscovery(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        if fields.len() >= 2 && fields[0] == "origin" {
+            return Ok(remote_slug(fields[1]));
+        }
+    }
+    Ok(String::new())
+}
+
+fn remote_slug(remote: &str) -> String {
+    let remote = remote.trim_end_matches(".git");
+    if let Some((_, path)) = remote.rsplit_once(':') {
+        return path.to_owned();
+    }
+    let mut parts = remote.rsplitn(3, '/');
+    match (parts.next(), parts.next()) {
+        (Some(name), Some(owner)) => format!("{owner}/{name}"),
+        _ => remote.to_owned(),
+    }
+}
+
+fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {
+    let timestamp = Timestamp::now()
+        .round(
+            TimestampRound::new()
+                .smallest(Unit::Second)
+                .mode(RoundMode::Trunc),
+        )
+        .map_err(|error| WorkerPoolError::Timestamp(error.to_string()))?;
+    Ok(WireTimestamp::new(timestamp.to_string()))
+}
 
 /// The Agent Runtime recorded for a Worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -415,7 +694,7 @@ impl<T> TransposeOption<T> for Option<Option<T>> {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    use rustix::process::{Pid, test_kill_process};
+    use rustix::process::{test_kill_process, Pid};
 
     i32::try_from(pid)
         .ok()
