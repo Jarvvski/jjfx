@@ -76,3 +76,10 @@ missing Claude or Codex executables as launch-blocking errors, runs optional
 capability probes in the Worker Workspace, detects Claude forwarding and Codex
 multi-agent support, and treats failed optional probes as unavailable
 capabilities. Fake executable integration tests cover the public interface.
+
+2026-07-27 - Added the typed Agent Runtime invocation seam. Claude and Codex
+commands now preserve the source-validated headless, resume, model, workspace,
+JSON, approval, and optional capability arguments without shell interpolation.
+Fresh and resumed invocations are covered through the public command builder;
+policy text remains caller-owned for ticket 10. Process launch, PID handling,
+and supervision remain out of scope for this slice.

@@ -5,12 +5,151 @@ use std::path::PathBuf;
 use std::process::Command;
 
 use tempfile::TempDir;
-use wsg_core::{AgentRuntime, AgentRuntimeProbeError};
+use wsg_core::{
+    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
+};
 
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "WSG_AGENT_RUNTIME_HELPER_PATH";
 const HELPER_RESULT: &str = "WSG_AGENT_RUNTIME_HELPER_RESULT";
 const HELPER_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_WORKSPACE";
+
+#[test]
+fn fresh_claude_command_preserves_headless_stream_invocation() {
+    let invocation = AgentRuntimeInvocation::new("implement the thing")
+        .with_model("opus")
+        .with_name("pool:worker-abc:AMBA-42")
+        .with_system_prompt("dispatch rules");
+    let command =
+        AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::new(false, true));
+
+    assert_eq!(command.get_program(), "claude");
+    assert_eq!(
+        command_args(&command),
+        vec![
+            "-p",
+            "--model",
+            "opus",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--forward-subagent-text",
+            "--settings",
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+            "--name",
+            "pool:worker-abc:AMBA-42",
+            "--append-system-prompt",
+            "dispatch rules",
+            "implement the thing",
+        ]
+    );
+}
+
+#[test]
+fn resumed_claude_command_does_not_repeat_system_prompt() {
+    let invocation = AgentRuntimeInvocation::new("fix the tests")
+        .with_model("opus")
+        .with_session_id("sess-abc-123")
+        .with_system_prompt("must not be repeated");
+    let command = AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::default());
+
+    assert_eq!(
+        command_args(&command),
+        vec![
+            "-p",
+            "--model",
+            "opus",
+            "--resume",
+            "sess-abc-123",
+            "--fork-session",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+            "--settings",
+            r#"{"permissions":{"defaultMode":"auto"}}"#,
+            "fix the tests",
+        ]
+    );
+}
+
+#[test]
+fn fresh_codex_command_preserves_workspace_dispatch_invocation() {
+    let invocation = AgentRuntimeInvocation::new("implement it")
+        .with_model("gpt-test")
+        .with_system_prompt("system rules");
+    let command =
+        AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::new(true, false));
+
+    assert_eq!(command.get_program(), "codex");
+    assert_eq!(
+        command_args(&command),
+        vec![
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+            "--model",
+            "gpt-test",
+            "--enable",
+            "multi_agent",
+            "exec",
+            "--json",
+            "--skip-git-repo-check",
+            "system rules\n\nimplement it",
+        ]
+    );
+}
+
+#[test]
+fn resumed_codex_command_does_not_repeat_system_prompt() {
+    let invocation = AgentRuntimeInvocation::new("continue")
+        .with_model("gpt-test")
+        .with_session_id("thread-123")
+        .with_system_prompt("must not be repeated");
+    let command =
+        AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::new(true, false));
+
+    assert_eq!(
+        command_args(&command),
+        vec![
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+            "--model",
+            "gpt-test",
+            "--enable",
+            "multi_agent",
+            "exec",
+            "resume",
+            "--json",
+            "--skip-git-repo-check",
+            "thread-123",
+            "continue",
+        ]
+    );
+}
+
+#[test]
+fn command_omits_capability_flags_when_not_supported_by_that_runtime() {
+    let claude = AgentRuntime::Claude.command(
+        &AgentRuntimeInvocation::new("work"),
+        AgentRuntimeCapabilities::new(true, false),
+    );
+    let codex = AgentRuntime::Codex.command(
+        &AgentRuntimeInvocation::new("work"),
+        AgentRuntimeCapabilities::new(false, true),
+    );
+
+    assert!(!command_args(&claude)
+        .iter()
+        .any(|arg| arg == "--forward-subagent-text"));
+    assert!(!command_args(&claude).iter().any(|arg| arg == "multi_agent"));
+    assert!(!command_args(&codex)
+        .iter()
+        .any(|arg| arg == "--forward-subagent-text"));
+    assert!(!command_args(&codex).iter().any(|arg| arg == "multi_agent"));
+}
 
 #[test]
 fn missing_runtime_executable_is_reported_through_probe_interface() {
@@ -179,6 +318,18 @@ fn helper_command(path: &std::path::Path, result: &std::path::Path, mode: &str) 
         .env("PATH", path)
         .current_dir(path);
     command
+}
+
+fn command_args(command: &Command) -> Vec<String> {
+    command
+        .get_args()
+        .map(|argument| {
+            argument
+                .to_str()
+                .expect("command argument should be UTF-8")
+                .to_owned()
+        })
+        .collect()
 }
 
 fn write_executable(path: &std::path::Path, content: &str) {

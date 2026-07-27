@@ -18,6 +18,53 @@ pub enum AgentRuntime {
     Codex,
 }
 
+/// Typed inputs for one Agent Runtime invocation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuntimeInvocation {
+    prompt: String,
+    model: Option<String>,
+    session_id: Option<String>,
+    name: Option<String>,
+    system_prompt: Option<String>,
+}
+
+impl AgentRuntimeInvocation {
+    /// Creates a fresh invocation with the required workload prompt.
+    pub fn new(prompt: impl Into<String>) -> Self {
+        Self {
+            prompt: prompt.into(),
+            model: None,
+            session_id: None,
+            name: None,
+            system_prompt: None,
+        }
+    }
+
+    /// Adds a model override to the invocation.
+    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Adds an Agent Session to resume.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id = Some(session_id.into());
+        self
+    }
+
+    /// Adds a display name for a fresh Claude invocation.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Adds a system prompt for a fresh invocation.
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
+        self
+    }
+}
+
 impl fmt::Display for AgentRuntime {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
@@ -51,6 +98,94 @@ impl AgentRuntime {
             Self::Claude => "claude",
             Self::Codex => "codex",
         }
+    }
+
+    /// Builds the provider command for a typed invocation.
+    ///
+    /// The returned command executes the provider directly and never routes
+    /// caller-provided prompt text through a shell.
+    pub fn command(
+        self,
+        invocation: &AgentRuntimeInvocation,
+        capabilities: AgentRuntimeCapabilities,
+    ) -> Command {
+        let mut command = Command::new(self.as_str());
+        if self == Self::Claude {
+            command.arg("-p");
+            if let Some(model) = invocation
+                .model
+                .as_deref()
+                .filter(|model| !model.is_empty())
+            {
+                command.args(["--model", model]);
+            }
+            if let Some(session_id) = invocation
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.is_empty())
+            {
+                command.args(["--resume", session_id, "--fork-session"]);
+            }
+            command.args(["--output-format", "stream-json", "--verbose"]);
+            if capabilities.forward_subagent_text() {
+                command.arg("--forward-subagent-text");
+            }
+            command.args(["--settings", r#"{"permissions":{"defaultMode":"auto"}}"#]);
+            if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
+                command.args(["--name", name]);
+            }
+            if invocation
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.is_empty())
+                .is_none()
+                && let Some(system_prompt) = invocation
+                    .system_prompt
+                    .as_deref()
+                    .filter(|prompt| !prompt.is_empty())
+            {
+                command.args(["--append-system-prompt", system_prompt]);
+            }
+            command.arg(&invocation.prompt);
+        } else {
+            command.args([
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+            ]);
+            if let Some(model) = invocation
+                .model
+                .as_deref()
+                .filter(|model| !model.is_empty())
+            {
+                command.args(["--model", model]);
+            }
+            if capabilities.multi_agent() {
+                command.args(["--enable", "multi_agent"]);
+            }
+            command.arg("exec");
+            if let Some(session_id) = invocation
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.is_empty())
+            {
+                command.args(["resume", "--json", "--skip-git-repo-check", session_id]);
+                command.arg(&invocation.prompt);
+            } else {
+                command.args(["--json", "--skip-git-repo-check"]);
+                let prompt = match invocation
+                    .system_prompt
+                    .as_deref()
+                    .filter(|prompt| !prompt.is_empty())
+                {
+                    Some(system_prompt) => format!("{system_prompt}\n\n{}", invocation.prompt),
+                    None => invocation.prompt.clone(),
+                };
+                command.arg(prompt);
+            }
+        }
+        command
     }
 
     /// Probes this runtime in `workspace`, requiring its executable to start.
@@ -105,6 +240,14 @@ pub struct AgentRuntimeCapabilities {
 }
 
 impl AgentRuntimeCapabilities {
+    /// Creates capabilities supplied by a runtime probe or a caller-owned adapter.
+    pub const fn new(multi_agent: bool, forward_subagent_text: bool) -> Self {
+        Self {
+            multi_agent,
+            forward_subagent_text,
+        }
+    }
+
     fn from(capability: Capability, supported: bool) -> Self {
         match capability {
             Capability::MultiAgent => Self {

@@ -16,7 +16,9 @@ pub use pool::{
     SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
     WorkerReference, WorkerSnapshot, WorkerStatus,
 };
-pub use runtime::{AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeProbeError};
+pub use runtime::{
+    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
+};
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
     Expected, IdentifierError, Loaded, PoolState, PoolStateRepository, StateChange, StateError,
