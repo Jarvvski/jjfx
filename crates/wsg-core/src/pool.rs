@@ -9,7 +9,7 @@ use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 use thiserror::Error;
 
 use crate::{
-    CommitOutcome, Expected, Loaded, PoolState, Repository, StateChange, StateError, WireAgent,
+    AgentRuntime, CommitOutcome, Expected, Loaded, PoolState, Repository, StateChange, StateError,
     WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
@@ -365,41 +365,6 @@ fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {
         )
         .map_err(|error| WorkerPoolError::Timestamp(error.to_string()))?;
     Ok(WireTimestamp::new(timestamp.to_string()))
-}
-
-/// The Agent Runtime recorded for a Worker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentRuntime {
-    Claude,
-    Codex,
-}
-impl AgentRuntime {
-    fn parse(value: &WireAgent) -> Option<Self> {
-        match value.as_str() {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn from_configured(value: Option<&WireAgent>) -> Result<Self, String> {
-        let configured = value.map_or("", WireAgent::as_str).trim();
-        if configured.is_empty() {
-            return Ok(Self::Claude);
-        }
-        match configured.to_ascii_lowercase().as_str() {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            _ => Err(configured.to_owned()),
-        }
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
 }
 
 /// The execution-capacity state recorded for a Worker.

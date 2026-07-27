@@ -70,3 +70,9 @@ normalize configured Claude/Codex values, reject unknown runtimes without
 mutation, persist canonical runtime identity, and preserve existing Worker
 fields and unknown extensions. Process launch, PID handling, and supervision
 remain out of scope for this slice.
+
+2026-07-27 - Added the shared Agent Runtime probe seam. Rust now reports
+missing Claude or Codex executables as launch-blocking errors, runs optional
+capability probes in the Worker Workspace, detects Claude forwarding and Codex
+multi-agent support, and treats failed optional probes as unavailable
+capabilities. Fake executable integration tests cover the public interface.

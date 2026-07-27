@@ -7,14 +7,16 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod pool;
+mod runtime;
 mod state;
 mod workspace;
 
 pub use pool::{
-    AgentRuntime, PersistedField, PoolCapacity, PoolCapacityError, PoolGrowth, PoolSnapshot,
-    Reservation, SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError,
-    WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
+    PersistedField, PoolCapacity, PoolCapacityError, PoolGrowth, PoolSnapshot, Reservation,
+    SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
+    WorkerReference, WorkerSnapshot, WorkerStatus,
 };
+pub use runtime::{AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeProbeError};
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
     Expected, IdentifierError, Loaded, PoolState, PoolStateRepository, StateChange, StateError,
