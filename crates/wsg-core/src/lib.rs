@@ -1,5 +1,6 @@
 //! Shared Workspace Dispatch foundations for the `jjfx` and `wsg` binaries.
 
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -7,6 +8,7 @@ use thiserror::Error;
 
 mod pool;
 mod state;
+mod workspace;
 
 pub use pool::{
     AgentRuntime, PersistedField, PoolSnapshot, SnapshotDiagnostic, SnapshotDiagnosticKind,
@@ -18,6 +20,7 @@ pub use state::{
     StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
+pub use workspace::{WorkerWorkspace, WorkerWorkspaceError};
 
 /// The migration capabilities currently exposed by a discovered repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +60,13 @@ impl Repository {
 
         loop {
             if directory.join(".jj").is_dir() {
-                return Ok(Self { root: directory });
+                let root = default_workspace_root(&directory).map_err(|source| {
+                    RepositoryError::PathResolution {
+                        path: start.clone(),
+                        source,
+                    }
+                })?;
+                return Ok(Self { root });
             }
             if !directory.pop() {
                 return Err(RepositoryError::NotFound { start });
@@ -70,10 +79,58 @@ impl Repository {
         &self.root
     }
 
+    /// Provisions the Worker Workspace and idle Worker state for `worker_id`.
+    ///
+    /// This is a blocking operation. It creates the Go-compatible Workspace
+    /// path, projects `.jj/ws-cache`, and writes an idle Worker document. If a
+    /// later step fails, resources created by this call are compensated before
+    /// the error is returned. Missing optional setup sources are valid; a
+    /// failure copying a source that exists fails the operation.
+    pub fn provision_worker_workspace(
+        &self,
+        worker_id: &WorkerId,
+    ) -> Result<WorkerWorkspace, WorkerWorkspaceError> {
+        workspace::provision(self, worker_id)
+    }
+
     /// Reports which migration capabilities are available for this foundation.
     pub fn migration_capabilities(&self) -> MigrationCapabilities {
         MigrationCapabilities::ReadOnlyWorkerPool
     }
+}
+
+fn default_workspace_root(workspace_root: &Path) -> io::Result<PathBuf> {
+    let repo_marker = workspace_root.join(".jj/repo");
+    let metadata = match fs::metadata(&repo_marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(workspace_root.to_owned());
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.is_dir() {
+        return Ok(workspace_root.to_owned());
+    }
+
+    let target = match fs::read_to_string(repo_marker) {
+        Ok(target) => target.trim().to_owned(),
+        Err(_) => return Ok(workspace_root.to_owned()),
+    };
+    if target.is_empty() {
+        return Ok(workspace_root.to_owned());
+    }
+    let target = PathBuf::from(target);
+    let target = if target.is_absolute() {
+        target
+    } else {
+        workspace_root.join(".jj").join(target)
+    };
+    let resolved = target.canonicalize().unwrap_or(target);
+    Ok(resolved
+        .parent()
+        .and_then(Path::parent)
+        .unwrap_or(workspace_root)
+        .to_owned())
 }
 
 /// Errors that can occur while discovering a Jujutsu repository.
