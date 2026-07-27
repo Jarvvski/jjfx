@@ -15,6 +15,12 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-07-27 - Worker Pool snapshots now read the actual Go wsg state layout
+  (v0.28.2), including `.jj/pool/<worker>.json`, aliases, Agent Runtime,
+  completion metadata, and partial diagnostics. Shared Pool, Worker, and
+  Dispatch Group repositories now preserve compatible state and serialize
+  concurrent Go and Rust writers through the same sidecar locks.
+
 - 2026-07-20 - Workspace rows show the least-delivered change (v0.27.1): a
   local change now remains dirty, and a pushed change remains pushed, when a
   lower change already has an open PR. PR-only stacks show the lowest PR with

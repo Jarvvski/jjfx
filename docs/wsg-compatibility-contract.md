@@ -1,123 +1,143 @@
 # wsg compatibility contract
 
-Status: provisional
+Status: source-validated
 
-This document is the language-neutral contract for the Workspace Dispatch
-migration. It is intentionally limited to the surfaces named by the migration
-PRD and the fixtures in `crates/wsg-core/tests/fixtures/compatibility/`.
+This document records the persisted Workspace Dispatch contract shared by Go
+wsg and the Rust implementation in `wsg-core`. The Go compatibility peer is
+commit `b85c8e8b24fdf5c5c39e7ceb6941cf045e8b3a10` from the wsg repository.
+The fixtures in `crates/wsg-core/tests/fixtures/compatibility/` are representative
+Go-compatible documents.
 
-The Go wsg and jj-wsx sources are not present in this repository, so the
-fixtures still express the PRD's provisional persistence contract. The Unix
-primitive spike inspected Go wsg commit
-`e690262ee0f9040f371ed1be9792742045af89e3` and validated its lock names,
-process-group behavior, liveness probe, signal sequence, log redirection, and
-rename pattern. The persisted schemas and full CLI contract still require
-source validation before Rust writes or mutates Worker Pool state.
+jj-wsx is not part of this contract. It is an obsolete predecessor to jjfx and
+does not read Worker Pool state.
 
 ## Persisted surfaces
 
-- `.jj/ws-cache`
-  - Contract: UTF-8 lines in `name<TAB>path<LF>` order. Paths and names are
-    not trimmed. Empty, malformed, and missing files are distinct input cases.
-  - Missing state: a missing file is treated as an empty optional surface by
-    readers.
-- `.jj/pool.json`
-  - Contract: a UTF-8 JSON object with a numeric `version` and a `workers`
-    array. The empty pool is represented by `workers: []`.
-  - Missing state: no pool file is not a valid empty write. Readers must report
-    whether the file is absent.
-- Worker state
-  - Contract: a UTF-8 JSON object with `version`, `worker_id`, `workspace`,
-    `status`, and execution metadata. `ticket`, `run`, `started_at`, and
-    `last_activity_at` are explicit `null` when a value is known to be absent.
-  - Missing state: legacy readers must tolerate an omitted `agent_runtime`
-    field. Unknown fields must not be discarded by a future round trip.
-- Dispatch Group state
-  - Contract: a UTF-8 JSON object with `version`, `parent_ticket`, `status`,
-    and a stable-order `sub_issues` array. Each Sub-issue has a Ticket, status,
-    dependency list, Worker reference, and Run reference.
-  - Missing state: an unassigned Worker or Run is represented by `null`.
-    Status values remain strings until the typed model is introduced.
+### Workspace cache
 
-The fixture matrix covers empty and populated pools, idle/busy/done/failed
-Workers, Claude Code and Codex Agent Runtimes, all six named Dispatch Group
-statuses, explicit `null` values, a tolerated legacy omission, and malformed
-or whitespace-sensitive `ws-cache` lines.
+`.jj/ws-cache` contains UTF-8 lines in `name<TAB>path<LF>` order. Names and
+paths are not trimmed. Empty, malformed, and missing files remain distinct
+inputs. A missing cache is an empty optional read surface.
 
-## Status values
+### Worker Pool
 
-The provisional fixture vocabulary is:
+`.jj/pool.json` is a UTF-8 JSON object with these fields:
 
-- Worker Status: `idle`, `busy`, `done`, and `failed`.
-- Dispatch Group status: `pending`, `dispatched`, `retried`, `done`, `failed`,
-  and `merged`.
-- Agent Runtime: `claude` and `codex`.
+- `size`: integer Worker count
+- `gh_repo`: GitHub repository identifier
+- `workers`: stable-order array of Worker identifier strings
+- `created_at`: timestamp string
+- `foreground`: optional boolean, omitted when unset
+- `agent`: optional Agent Runtime string, omitted when empty
+- `names`: optional Worker-to-alias object, omitted when empty
 
-These values describe persisted observations only. They do not authorize a
-mutation or imply that a Worker is an Agent, Agent Session, Run, or Workspace.
-A Worker remains an execution slot backed by a Worker Workspace. A Run remains
-one attempt by an Agent Runtime, while an Agent Session may span multiple Runs.
+A missing pool file is not an empty pool. Readers report absence separately
+from malformed state.
 
-## Replacement and locking rules
+### Worker
 
-The compatibility implementation must preserve these rules:
+`.jj/pool/<worker>.json` is a UTF-8 JSON object with these fields:
 
-1. A state replacement writes a temporary file in the same directory as the
-   target, flushes and closes it, then renames it over the target. Readers see
-   either the previous complete document or the next complete document, never a
-   partial document.
-2. Pool mutations acquire one repository-wide pool mutation lock, reload the
-   current `.jj/pool.json` after acquiring it, validate the mutation, and
-   replace the file while holding the lock.
-3. Worker mutations acquire the sidecar lock for the affected Worker, reload
-   that Worker's state after acquiring it, and replace only that Worker's state.
-4. Dispatch Group mutations acquire the Dispatch Group sidecar lock, reload
-   the group after acquiring it, and replace only that group's state.
-5. Lock files remain sidecars. Renaming a state file must not change the inode
-   used by a lock or allow two independent processes to mutate stale state.
-6. A failed serialization, flush, or rename leaves the last valid target file
-   in place.
+- `status`: Worker Status string
+- `agent`: Agent Runtime string or `null`
+- `ticket`: Ticket string or `null`
+- `pid`: integer or `null`
+- `started_at`: timestamp string or `null`
+- `completed_at`: timestamp string or `null`
+- `log_file`: path string or `null`
+- `branch_name`: bookmark string or `null`
+- `exit_code`: integer or `null`
+- `error`: string or `null`
 
-The inspected Go implementation establishes `.jj/pool/.dispatch.lock` for
-Worker Pool mutations and `.jj/pool/<worker>.json.lock` for each Worker state
-sidecar. Dispatch Group files are named
-`.jj/pool/dispatch-<lowercase-parent>.json`, but the inspected implementation
-replaces them without a lock. The migration requires a Dispatch Group sidecar
-lock, so ticket 06 must coordinate that new lock with the Go implementation
-before mixed-process Dispatch Group mutation is enabled. No Rust mutation is
-enabled by this contract change.
+All pointer-backed Worker fields are emitted explicitly as a value or `null`.
+An empty branch name is canonicalized to `null`. Unknown fields survive a
+read-modify-write through both cooperating implementations.
+
+### Dispatch Group
+
+`.jj/pool/dispatch-<lowercase-parent>.json` is a UTF-8 JSON object with:
+
+- `parent`: Parent Ticket identifier
+- `created_at`: timestamp string
+- `gh_repo`: GitHub repository identifier
+- `sub_issues`: object keyed by Ticket identifier
+- `opts`: Dispatch Group options object
+
+Each Sub-issue contains `title`, `status`, `blocked_by`, `worker`, `branch`,
+`dispatched_at`, `completed_at`, optional `skip_reason`, and `retries`.
+Unassigned Worker, branch, and timestamp values are explicit `null`.
+`skip_reason` is omitted when absent. Options contain optional `agent` and the
+required `model` string.
+
+## Persisted vocabulary
+
+Worker Status values currently written by Go are `idle`, `busy`, `done`, and
+`failed`. Sub-issue Status values are `pending`, `dispatched`, `done`, `failed`,
+and `skipped`. Agent Runtime values are `claude` and `codex`.
+
+Rust persistence keeps these values as open strings so an additive Go value
+does not make the document unreadable. Lifecycle modules interpret the known
+values separately.
+
+## Lock protocol
+
+Lock files are stable sidecars because atomic replacement changes the state
+file inode.
+
+- Pool state uses `.jj/pool/.dispatch.lock`.
+- Worker state uses `.jj/pool/<worker>.json.lock`.
+- Dispatch Group state uses
+  `.jj/pool/dispatch-<lowercase-parent>.json.lock`.
+
+A single-Worker mutation takes that Worker's lock. A Pool mutation takes the
+Pool lock. A Pool operation that also decides from Worker state takes the Pool
+lock first, then all affected Worker locks in deterministic filename order.
+A Dispatch Group mutation takes the Pool lock first, then its Dispatch Group
+lock. Pool destruction uses the same ordering and leaves lock sidecars in
+place.
+
+Every mutation reloads its target after acquiring the required locks. Rust
+then compares the exact loaded bytes with its opaque expected revision. A
+mismatch is a conflict, not permission to overwrite newer state. No Agent
+Runtime, network, or Workspace command runs while a state lock is held.
+
+## Atomic replacement
+
+Writers serialize the complete next document before touching the target. They
+create a uniquely named temporary file in the target directory, set mode
+`0644`, write all bytes, sync and close the file, then rename it over the
+target. Documents use two-space pretty JSON with a trailing newline.
+
+Serialization, temporary creation, write, sync, close, and rename failures
+leave the previous valid target intact. Temporary files are cleaned up on
+failure. Parent-directory sync and network-filesystem lock semantics are not
+part of the current contract.
+
+Readers do not take locks. Atomic rename ensures they see a complete previous
+or next document. Aggregate snapshots are observational and may combine state
+from adjacent commits, so lifecycle decisions must use repository commits
+rather than snapshots.
 
 ## Process and output rules
 
-Worker execution state may include a PID and process-group identity. Go wsg
-starts each background Agent Runtime with the child PID as a new process-group
-ID, probes liveness with signal 0, sends `SIGTERM` to the complete group, waits
-one second, and sends `SIGKILL` to the group if its leader remains live. Rust
-can reproduce this sequence through safe standard-library and rustix
-interfaces. Readers must distinguish a live process from a reaped process and
-must not infer Run identity or success from a numeric PID because PID reuse
-remains possible. Reconciliation is derived state until the persistence ticket
-explicitly enables a compatible write.
+Worker process identifiers are liveness hints, not Run identity. Go wsg starts
+an Agent Runtime in its own process group, probes liveness with signal 0, sends
+`SIGTERM` to the group, waits one second, and sends `SIGKILL` if its leader
+remains live. Rust uses safe standard-library and rustix interfaces for the
+same Unix behavior.
 
-The command-facing compatibility surface separates machine-readable values
-from human messages:
+The compatibility CLI reserves stdout for machine-readable values and stderr
+for human messages. Help and version output succeed on stdout. Repository or
+state failures write contextual errors to stderr and return a non-zero status.
 
-- `wsg --help` / `wsg -h`: help text on stdout, empty stderr, exit 0.
-- `wsg --version` / `wsg -V`: `wsg <version>` on stdout, empty stderr, exit 0.
-- `wsg` inside a Repository during the foundation stage: capability/status
-  text on stdout, empty stderr, exit 0.
-- Repository or state failure: no machine value on stdout, a contextual human
-  error on stderr, and a non-zero exit.
+## Conformance
 
-The full command, alias, option, confirmation, completion, and exit inventory
-for the Go implementation remains a follow-up to source validation. Later CLI
-tickets must extend this table rather than define a second output contract.
+Rust tests exercise state only through public repository `load` and `commit`
+operations. They cover missing and malformed state, Go fixture round trips,
+explicit null and omission semantics, unknown fields, stale revisions, failed
+replacement, and identifier safety.
 
-## Fixture ownership
-
-Contract tests load the fixtures through the `wsg-core` test seam and assert
-field presence, explicit `null` versus omission, status coverage, byte order,
-and malformed-line cases. The fixtures contain representative data only; they
-must not copy Go implementation code. Once the Go source is available, update
-the fixtures and this document in the same focused change, then add exact
-round-trip assertions before enabling any mutation.
+Bounded subprocess tests prove independent Rust writers detect lost updates.
+The mixed suite uses the Go test binary from the source-validated peer and
+proves both implementations honor all three lock sidecars and read each
+other's Pool, Worker, and Dispatch Group writes.

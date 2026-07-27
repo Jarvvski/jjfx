@@ -1,8 +1,21 @@
 {
-  "version": 1,
-  "parent_ticket": "ENG-100",
-  "status": "pending",
-  "sub_issues": [
-    {"ticket": "ENG-101", "status": "pending", "blocked_by": [], "worker_id": null, "run": null}
-  ]
+  "created_at": "2026-07-27T10:00:00Z",
+  "gh_repo": "Jarvvski/jjfx",
+  "opts": {
+    "agent": "claude",
+    "model": "opus"
+  },
+  "parent": "ENG-100",
+  "sub_issues": {
+    "ENG-101": {
+      "blocked_by": [],
+      "branch": null,
+      "completed_at": null,
+      "dispatched_at": null,
+      "retries": 0,
+      "status": "pending",
+      "title": "First child",
+      "worker": null
+    }
+  }
 }

@@ -1,11 +1,11 @@
 {
-  "version": 1,
-  "worker_id": "worker-legacy",
-  "alias": "legacy",
-  "workspace": "worker-legacy",
-  "status": "idle",
-  "ticket": null,
-  "run": null,
+  "branch_name": null,
+  "completed_at": null,
+  "error": null,
+  "exit_code": null,
+  "log_file": null,
+  "pid": null,
   "started_at": null,
-  "last_activity_at": null
+  "status": "idle",
+  "ticket": null
 }

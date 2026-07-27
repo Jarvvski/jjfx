@@ -1,6 +1,6 @@
 # Port compatible state persistence and locking
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -41,12 +41,23 @@ Test repositories through public read and mutate operations. Cover missing files
 
 ## Acceptance Criteria
 
-- [ ] Rust writes state accepted by current Go wsg and jj-wsx.
-- [ ] Go reads Rust-created pool, Worker, and Dispatch Group files.
-- [ ] Concurrent Go and Rust mutations serialize through the same locks.
-- [ ] Every mutation reloads after lock acquisition.
-- [ ] Failed writes preserve the previous valid state.
-- [ ] `mise run check` is green.
+- [x] Rust writes state accepted by current Go wsg.
+- [x] Go reads Rust-created pool, Worker, and Dispatch Group files.
+- [x] Concurrent Go and Rust mutations serialize through the same locks.
+- [x] Every mutation reloads after lock acquisition.
+- [x] Failed writes preserve the previous valid state.
+- [x] `mise run check` is green.
+
+## Comments
+
+2026-07-27 - Go wsg commit `b85c8e8b24fdf5c5c39e7ceb6941cf045e8b3a10`
+established the complete cooperating lock protocol, stale-write detection,
+unknown-field retention, and failure-safe atomic replacement. Rust now exposes
+opaque-revision Pool, Worker, and Dispatch Group repositories over the same
+wire formats and lock order. Public repository tests, independent Rust writer
+tests, and bidirectional Go/Rust subprocess conformance are green. jj-wsx was
+removed from this ticket's active compatibility criteria because it is an
+obsolete predecessor to jjfx and does not consume Worker Pool state.
 
 ## Out of Scope
 

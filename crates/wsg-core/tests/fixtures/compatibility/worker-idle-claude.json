@@ -1,12 +1,12 @@
 {
-  "version": 1,
-  "worker_id": "worker-01",
-  "alias": "alpha",
-  "workspace": "worker-alpha",
-  "status": "idle",
-  "ticket": null,
-  "run": null,
-  "agent_runtime": "claude",
+  "agent": "claude",
+  "branch_name": null,
+  "completed_at": null,
+  "error": null,
+  "exit_code": null,
+  "log_file": null,
+  "pid": null,
   "started_at": null,
-  "last_activity_at": null
+  "status": "idle",
+  "ticket": null
 }

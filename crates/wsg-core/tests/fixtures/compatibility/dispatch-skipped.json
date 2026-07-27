@@ -8,13 +8,14 @@
   "sub_issues": {
     "ENG-101": {
       "blocked_by": [],
-      "branch": null,
-      "completed_at": "2026-07-27T10:10:00Z",
-      "dispatched_at": "2026-07-27T10:01:00Z",
-      "retries": 1,
-      "status": "failed",
+      "branch": "main",
+      "completed_at": null,
+      "dispatched_at": null,
+      "retries": 0,
+      "skip_reason": "cross-repo",
+      "status": "skipped",
       "title": "First child",
-      "worker": "worker-02"
+      "worker": null
     }
   }
 }

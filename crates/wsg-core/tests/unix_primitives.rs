@@ -7,15 +7,15 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::fs::{flock, FlockOperation};
+use rustix::fs::{FlockOperation, flock};
 use rustix::process::{
-    kill_process_group, test_kill_process, test_kill_process_group, Pid, Signal,
+    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
 };
-use tempfile::{tempdir, NamedTempFile};
+use tempfile::{NamedTempFile, tempdir};
 
 const HELPER_MODE: &str = "WSG_UNIX_SPIKE_MODE";
 const HELPER_LOCK_PATH: &str = "WSG_UNIX_SPIKE_LOCK_PATH";

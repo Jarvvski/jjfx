@@ -2616,27 +2616,27 @@ mod tests {
     #[test]
     fn worker_pool_snapshot_joins_by_workspace_and_renders_read_only_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        let workers = temp.path().join(".jj/workers");
-        std::fs::create_dir_all(&workers).unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
             temp.path().join(".jj/pool.json"),
-            br#"{"version":1,"workers":[{"worker_id":"worker-01","workspace":"feat"}]}"#,
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
         std::fs::write(
-            workers.join("worker-01.json"),
-            br#"{"version":1,"worker_id":"worker-01","alias":"alpha","workspace":"feat","status":"busy","ticket":"ENG-101","run":"run-1","agent_runtime":"claude","started_at":"2026-07-21T10:00:00Z","last_activity_at":"2026-07-21T10:04:12Z"}"#,
+            pool.join("worker-01.json"),
+            br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":"2026-07-21T10:00:00Z","completed_at":null,"log_file":"/repo/.jj/pool/worker-01.log","branch_name":"eng-101","exit_code":null,"error":null}"#,
         )
         .unwrap();
         let snapshot = wsg_core::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
 
-        let mut app = app_with(&["default", "feat"]);
+        let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkerPoolSnapshot(snapshot));
 
         let worker = app
-            .worker_for(app.store.workspace("feat").unwrap())
+            .worker_for(app.store.workspace("worker-01").unwrap())
             .expect("Worker should join its Worker Workspace");
         assert_eq!(worker.alias(), "alpha");
         assert_eq!(worker.ticket(), Some("ENG-101"));

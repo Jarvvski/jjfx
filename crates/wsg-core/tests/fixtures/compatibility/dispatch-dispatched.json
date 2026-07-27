@@ -1,8 +1,21 @@
 {
-  "version": 1,
-  "parent_ticket": "ENG-100",
-  "status": "dispatched",
-  "sub_issues": [
-    {"ticket": "ENG-101", "status": "dispatched", "blocked_by": [], "worker_id": "worker-01", "run": "run-20260721-01"}
-  ]
+  "created_at": "2026-07-27T10:00:00Z",
+  "gh_repo": "Jarvvski/jjfx",
+  "opts": {
+    "agent": "codex",
+    "model": "gpt-5"
+  },
+  "parent": "ENG-100",
+  "sub_issues": {
+    "ENG-101": {
+      "blocked_by": [],
+      "branch": null,
+      "completed_at": null,
+      "dispatched_at": "2026-07-27T10:01:00Z",
+      "retries": 0,
+      "status": "dispatched",
+      "title": "First child",
+      "worker": "worker-02"
+    }
+  }
 }

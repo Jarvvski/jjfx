@@ -1,13 +1,12 @@
 {
-  "version": 1,
-  "worker_id": "worker-04",
-  "alias": "delta",
-  "workspace": "worker-delta",
+  "agent": "codex",
+  "branch_name": "eng-103",
+  "completed_at": "2026-07-27T10:12:00Z",
+  "error": "tests failed",
+  "exit_code": 1,
+  "log_file": "/repo/.jj/pool/worker-04.log",
+  "pid": 4244,
+  "started_at": "2026-07-27T10:03:00Z",
   "status": "failed",
-  "ticket": "ENG-103",
-  "run": "run-20260721-03",
-  "agent_runtime": "codex",
-  "started_at": "2026-07-21T08:00:00Z",
-  "last_activity_at": "2026-07-21T08:03:00Z",
-  "error": "agent exited with status 1"
+  "ticket": "ENG-103"
 }

@@ -6,10 +6,17 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod pool;
+mod state;
 
 pub use pool::{
     AgentRuntime, PersistedField, PoolSnapshot, SnapshotDiagnostic, SnapshotDiagnosticKind,
-    WorkerId, WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
+    WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
+};
+pub use state::{
+    CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
+    Expected, IdentifierError, Loaded, PoolState, PoolStateRepository, StateChange, StateError,
+    StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
+    WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 
 /// The migration capabilities currently exposed by a discovered repository.

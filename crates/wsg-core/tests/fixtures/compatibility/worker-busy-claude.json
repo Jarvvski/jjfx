@@ -1,12 +1,12 @@
 {
-  "version": 1,
-  "worker_id": "worker-02",
-  "alias": "beta",
-  "workspace": "worker-beta",
+  "agent": "claude",
+  "branch_name": "eng-101",
+  "completed_at": null,
+  "error": null,
+  "exit_code": null,
+  "log_file": "/repo/.jj/pool/worker-02.log",
+  "pid": 4242,
+  "started_at": "2026-07-27T10:01:00Z",
   "status": "busy",
-  "ticket": "ENG-101",
-  "run": "run-20260721-01",
-  "agent_runtime": "claude",
-  "started_at": "2026-07-21T10:00:00Z",
-  "last_activity_at": "2026-07-21T10:04:12Z"
+  "ticket": "ENG-101"
 }
