@@ -266,6 +266,138 @@ fn concurrent_growth_keeps_registered_workers_in_the_workspace_cache() {
 }
 
 #[test]
+fn reservation_defaults_missing_pool_runtime_to_claude_and_persists_it() {
+    let (temp, repository) = repository_with_pool();
+    fs::write(
+        temp.path().join(".jj/pool/worker-01.json"),
+        fixture("worker-legacy-omits-runtime.json"),
+    )
+    .expect("make Worker omit its legacy runtime");
+
+    let reservation = repository
+        .worker_pool()
+        .reserve("ENG-209")
+        .expect("reservation should select the compatible default runtime");
+
+    assert_eq!(reservation.agent_runtime(), AgentRuntime::Claude);
+    let snapshot = repository.worker_pool().snapshot();
+    assert_eq!(
+        snapshot
+            .worker("worker-01")
+            .expect("reserved Worker")
+            .agent_runtime(),
+        Some(AgentRuntime::Claude)
+    );
+    let worker_json: Value = serde_json::from_slice(
+        &fs::read(temp.path().join(".jj/pool/worker-01.json")).expect("persisted Worker"),
+    )
+    .expect("Worker JSON");
+    assert_eq!(worker_json["agent"], "claude");
+}
+
+#[test]
+fn reservation_normalizes_configured_codex_runtime_before_persisting_it() {
+    let (temp, repository) = repository_with_pool();
+    let pool_path = temp.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = "  CODEX  ".into();
+    fs::write(
+        &pool_path,
+        serde_json::to_vec(&pool).expect("pool JSON serialization"),
+    )
+    .expect("configured pool state");
+
+    let reservation = repository
+        .worker_pool()
+        .reserve("ENG-210")
+        .expect("configured Codex runtime should be accepted");
+
+    assert_eq!(reservation.agent_runtime(), AgentRuntime::Codex);
+    let worker_json: Value = serde_json::from_slice(
+        &fs::read(temp.path().join(".jj/pool/worker-01.json")).expect("persisted Worker"),
+    )
+    .expect("Worker JSON");
+    assert_eq!(worker_json["agent"], "codex");
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker("worker-01")
+            .expect("Worker")
+            .agent_runtime(),
+        Some(AgentRuntime::Codex)
+    );
+}
+
+#[test]
+fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
+    let (temp, repository) = repository_with_pool();
+    let pool_path = temp.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = "other".into();
+    fs::write(
+        &pool_path,
+        serde_json::to_vec(&pool).expect("pool JSON serialization"),
+    )
+    .expect("configured pool state");
+    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let before = fs::read(&worker_path).expect("Worker state");
+
+    let error = repository
+        .worker_pool()
+        .reserve("ENG-211")
+        .expect_err("unknown runtime should be rejected");
+
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::InvalidAgentRuntime { value } if value == "other"
+    ));
+    assert_eq!(fs::read(worker_path).expect("Worker state"), before);
+}
+
+#[test]
+fn reservation_replaces_previous_runtime_while_preserving_worker_state() {
+    let (temp, repository) = repository_with_pool();
+    let pool_path = temp.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = "codex".into();
+    fs::write(
+        &pool_path,
+        serde_json::to_vec(&pool).expect("pool JSON serialization"),
+    )
+    .expect("configured pool state");
+    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let mut worker: Value = serde_json::from_slice(&fs::read(&worker_path).expect("Worker state"))
+        .expect("Worker JSON");
+    worker["future"] = serde_json::json!({"enabled": true});
+    fs::write(
+        &worker_path,
+        serde_json::to_vec(&worker).expect("Worker JSON serialization"),
+    )
+    .expect("Worker state");
+
+    let reservation = repository
+        .worker_pool()
+        .reserve("ENG-212")
+        .expect("Worker should be reservable");
+
+    assert_eq!(reservation.agent_runtime(), AgentRuntime::Codex);
+    let written: Value = serde_json::from_slice(&fs::read(&worker_path).expect("persisted Worker"))
+        .expect("Worker JSON");
+    assert_eq!(written["status"], "busy");
+    assert_eq!(written["agent"], "codex");
+    assert_eq!(written["ticket"], "ENG-212");
+    assert_eq!(written["branch_name"], "eng-212");
+    assert!(written["started_at"].is_string());
+    assert!(written["log_file"].is_string());
+    assert!(written["pid"].is_null());
+    assert_eq!(written["future"]["enabled"], true);
+}
+
+#[test]
 fn reserves_the_first_idle_worker_for_a_ticket() {
     let (_temp, repository) = repository_with_pool();
     let reservation = repository

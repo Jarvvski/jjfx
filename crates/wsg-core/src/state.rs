@@ -465,10 +465,22 @@ pub struct StateStore {
 /// Result of the repository-owned atomic Worker Reservation transition.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum ReservationOutcome {
-    Reserved { worker: WorkerId },
-    NoIdle { available: usize },
-    WorkerNotInPool { worker: WorkerId },
-    WorkerNotIdle { worker: WorkerId },
+    Reserved {
+        worker: WorkerId,
+        agent_runtime: crate::AgentRuntime,
+    },
+    NoIdle {
+        available: usize,
+    },
+    WorkerNotInPool {
+        worker: WorkerId,
+    },
+    WorkerNotIdle {
+        worker: WorkerId,
+    },
+    InvalidAgentRuntime {
+        value: String,
+    },
 }
 
 /// Pool state repository.
@@ -567,6 +579,13 @@ impl StateStore {
                         worker: requested.clone(),
                     });
                 }
+                let agent_runtime = match crate::AgentRuntime::from_configured(pool.agent.as_ref())
+                {
+                    Ok(agent_runtime) => agent_runtime,
+                    Err(value) => {
+                        return Ok(ReservationOutcome::InvalidAgentRuntime { value });
+                    }
+                };
 
                 let candidates = requested.into_iter().cloned().chain(
                     requested
@@ -607,6 +626,7 @@ impl StateStore {
                     return Ok(ReservationOutcome::NoIdle { available });
                 };
                 state.status = WireStatus::new("busy");
+                state.agent = Some(WireAgent::new(agent_runtime.as_str()));
                 state.ticket = Some(ticket);
                 state.started_at = Some(started_at);
                 state.log_file = Some(
@@ -626,7 +646,10 @@ impl StateStore {
                     .join(POOL_DIRECTORY)
                     .join(format!("{worker}.json"));
                 write_atomic(&path, &state, &format!("Worker {worker}"))?;
-                Ok(ReservationOutcome::Reserved { worker })
+                Ok(ReservationOutcome::Reserved {
+                    worker,
+                    agent_runtime,
+                })
             })
         })
     }

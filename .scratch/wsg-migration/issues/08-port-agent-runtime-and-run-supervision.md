@@ -61,3 +61,12 @@ Use fake executable scripts for deterministic provider argument, logging, exit-c
 - issues/05-spike-safe-unix-primitives.md
 - issues/06-port-state-persistence-and-locking.md
 - issues/07-port-workspace-and-pool-lifecycle.md
+
+## Comments
+
+2026-07-27 - Started commit 1 through the public Worker Pool Reservation seam.
+Reservations now resolve missing or blank pool runtime configuration to Claude,
+normalize configured Claude/Codex values, reject unknown runtimes without
+mutation, persist canonical runtime identity, and preserve existing Worker
+fields and unknown extensions. Process launch, PID handling, and supervision
+remain out of scope for this slice.

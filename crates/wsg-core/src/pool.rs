@@ -61,6 +61,7 @@ impl PoolGrowth {
 pub struct Reservation {
     worker_id: WorkerId,
     ticket: String,
+    agent_runtime: AgentRuntime,
 }
 
 impl Reservation {
@@ -72,6 +73,11 @@ impl Reservation {
     /// Returns the Ticket assigned to this Reservation.
     pub fn ticket(&self) -> &str {
         &self.ticket
+    }
+
+    /// Returns the Agent Runtime persisted for this Run.
+    pub fn agent_runtime(&self) -> AgentRuntime {
+        self.agent_runtime
     }
 }
 
@@ -92,6 +98,8 @@ pub enum WorkerPoolError {
     WorkerNotInPool { worker: WorkerId },
     #[error("Worker {worker} is not idle")]
     WorkerNotIdle { worker: WorkerId },
+    #[error("invalid configured Agent Runtime {value:?} (expected claude or codex)")]
+    InvalidAgentRuntime { value: String },
     #[error("cannot discover GitHub repository: {0}")]
     RepositoryDiscovery(String),
     #[error("cannot create a Worker timestamp: {0}")]
@@ -150,9 +158,13 @@ impl WorkerPool {
             ticket.to_lowercase(),
         )?;
         match outcome {
-            crate::state::ReservationOutcome::Reserved { worker } => Ok(Reservation {
+            crate::state::ReservationOutcome::Reserved {
+                worker,
+                agent_runtime,
+            } => Ok(Reservation {
                 worker_id: worker,
                 ticket,
+                agent_runtime,
             }),
             crate::state::ReservationOutcome::NoIdle { available } => {
                 Err(WorkerPoolError::NoIdleWorkers { ticket, available })
@@ -162,6 +174,9 @@ impl WorkerPool {
             }
             crate::state::ReservationOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
+            }
+            crate::state::ReservationOutcome::InvalidAgentRuntime { value } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
         }
     }
@@ -366,6 +381,19 @@ impl AgentRuntime {
             _ => None,
         }
     }
+
+    pub(crate) fn from_configured(value: Option<&WireAgent>) -> Result<Self, String> {
+        let configured = value.map_or("", WireAgent::as_str).trim();
+        if configured.is_empty() {
+            return Ok(Self::Claude);
+        }
+        match configured.to_ascii_lowercase().as_str() {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => Err(configured.to_owned()),
+        }
+    }
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
