@@ -12,7 +12,7 @@ use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
     Expected, PoolCapacity, Repository, RunRequest, RunSupervisor, RunSupervisorError, StateChange,
-    WorkerId, WorkerStatus,
+    WireStatus, WorkerId, WorkerStatus,
 };
 
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
@@ -1017,6 +1017,453 @@ fn foreground_run_spawn_failure_is_typed() {
     let error = fs::read_to_string(result).expect("foreground spawn error");
     assert!(error.starts_with("cannot spawn claude foreground Run:"));
     assert!(error.contains("No such file or directory"));
+}
+
+#[test]
+fn reserved_background_run_finalizes_worker_after_wait() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+    let bin_directory = temporary_directory.path().join("bin");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args([
+            "--exact",
+            "reserved_background_run_finalize_helper",
+            "--ignored",
+        ])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = helper
+        .output()
+        .expect("reserved finalization helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("reserved finalization result"),
+        "exit=Some(0)"
+    );
+
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(worker_id.as_str())
+        .expect("finalized Worker");
+    assert_eq!(worker.status(), WorkerStatus::Done);
+    assert_eq!(worker.exit_code(), Some(0));
+    assert!(worker.completed_at().is_some());
+    assert!(worker.pid().is_some());
+}
+
+#[test]
+fn reserved_background_run_finalizes_failed_worker_after_wait() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+    let bin_directory = temporary_directory.path().join("bin");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 7\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args([
+            "--exact",
+            "reserved_background_run_finalize_helper",
+            "--ignored",
+        ])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = helper
+        .output()
+        .expect("reserved finalization helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("reserved finalization result"),
+        "exit=Some(7)"
+    );
+
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(worker_id.as_str())
+        .expect("finalized Worker");
+    assert_eq!(worker.status(), WorkerStatus::Failed);
+    assert_eq!(worker.exit_code(), Some(7));
+    assert!(worker.completed_at().is_some());
+    assert!(worker.error().is_some());
+}
+
+#[test]
+fn reserved_foreground_run_finalizes_worker_after_completion() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+    let bin_directory = temporary_directory.path().join("bin");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args([
+            "--exact",
+            "reserved_foreground_run_finalize_helper",
+            "--ignored",
+        ])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = helper
+        .output()
+        .expect("reserved foreground finalization helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("reserved foreground result"),
+        "exit=Some(0)"
+    );
+
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(worker_id.as_str())
+        .expect("finalized Worker");
+    assert_eq!(worker.status(), WorkerStatus::Done);
+    assert_eq!(worker.exit_code(), Some(0));
+    assert!(worker.completed_at().is_some());
+}
+
+#[test]
+#[ignore]
+fn reserved_foreground_run_finalize_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-215")
+        .expect("Worker reservation");
+    let result = env::var_os(HELPER_RESULT).expect("result path");
+    let outcome = RunSupervisor::new()
+        .run_reserved_foreground(&reservation, AgentRuntimeInvocation::new("reserved test"))
+        .expect("reserved foreground Run should complete");
+    fs::write(result, format!("exit={:?}", outcome.exit_code())).expect("wait result");
+}
+
+#[test]
+fn stale_background_waiter_cannot_finalize_newer_run() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+    let bin_directory = temporary_directory.path().join("bin");
+    let process = temporary_directory.path().join("process");
+    let reserved = temporary_directory.path().join("reserved");
+    let release = temporary_directory.path().join("release");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\nexit 0\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "stale_background_waiter_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_PROCESS, &process)
+        .env(HELPER_RESERVED, &reserved)
+        .env(HELPER_RELEASE, &release)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let helper = BackgroundHelperGuard::spawn(&mut helper, &release, [&process, &result]);
+    wait_for_file(&reserved);
+
+    let worker_state = repository.state_store().worker(worker_id.clone());
+    let loaded = match worker_state.load().expect("Run A Worker state") {
+        wsg_core::Loaded::Present(versioned) => versioned,
+        wsg_core::Loaded::Missing => panic!("Run A Worker state should exist"),
+    };
+    let revision = loaded.revision().clone();
+    let mut state = loaded.value;
+    state.status = WireStatus::new("idle");
+    state.agent = None;
+    state.ticket = None;
+    state.pid = None;
+    state.started_at = None;
+    state.completed_at = None;
+    state.log_file = None;
+    state.branch_name = None;
+    state.exit_code = None;
+    state.error = None;
+    let outcome = worker_state
+        .commit(Expected::Match(revision), StateChange::Replace(state))
+        .expect("reset Run A state");
+    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    repository
+        .worker_pool()
+        .reserve_named(worker_id.clone(), "ENG-217")
+        .expect("Run B reservation");
+
+    fs::write(&release, []).expect("release Run A");
+    let output = helper.wait_with_output();
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("Run A result"),
+        "exit=Some(0)"
+    );
+
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot.worker(worker_id.as_str()).expect("newer Worker");
+    assert_eq!(worker.status(), WorkerStatus::Busy);
+    assert_eq!(worker.ticket(), Some("ENG-217"));
+    assert_eq!(worker.pid(), None);
+    assert_eq!(worker.completed_at(), None);
+}
+
+#[test]
+#[ignore]
+fn stale_background_waiter_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-216")
+        .expect("Run A reservation");
+    let background = RunSupervisor::new()
+        .run_reserved_background(&reservation, AgentRuntimeInvocation::new("Run A"))
+        .expect("Run A should start");
+    fs::write(
+        env::var_os(HELPER_PROCESS).expect("process path"),
+        background.pid().to_string(),
+    )
+    .expect("Run A PID");
+    fs::write(env::var_os(HELPER_RESERVED).expect("reserved path"), []).expect("Run A ready");
+    wait_for_file(&PathBuf::from(
+        env::var_os(HELPER_RELEASE).expect("release path"),
+    ));
+    let outcome = background.wait().expect("Run A should complete");
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        format!("exit={:?}", outcome.exit_code()),
+    )
+    .expect("Run A result");
+}
+
+#[test]
+#[ignore]
+fn reserved_background_run_finalize_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-214")
+        .expect("Worker reservation");
+    let result = env::var_os(HELPER_RESULT).expect("result path");
+    let background = RunSupervisor::new()
+        .run_reserved_background(&reservation, AgentRuntimeInvocation::new("reserved test"))
+        .expect("reserved background Run should start");
+    let outcome = background.wait().expect("background Run should complete");
+    fs::write(result, format!("exit={:?}", outcome.exit_code())).expect("wait result");
 }
 
 #[test]

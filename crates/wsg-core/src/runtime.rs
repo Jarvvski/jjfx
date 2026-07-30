@@ -14,7 +14,7 @@ use rustix::process::{Pid, Signal, kill_process_group};
 
 use thiserror::Error;
 
-use crate::{Reservation, StateError, WireAgent};
+use crate::{Reservation, StateError, StateRevision, WireAgent, WorkerPoolError, WorkerState};
 
 /// The Agent Runtime recorded for a Worker and selected for a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +165,21 @@ impl RunSupervisor {
         })
     }
 
+    /// Executes a reserved Run and finalizes its Worker through the shared waiter.
+    pub fn run_reserved_foreground(
+        &self,
+        reservation: &Reservation,
+        invocation: AgentRuntimeInvocation,
+    ) -> Result<RunOutcome, RunSupervisorError> {
+        let request = reserved_request(reservation, invocation);
+        let outcome = match self.run_foreground(&request) {
+            Ok(outcome) => outcome,
+            Err(error) => return release_after_failure(reservation, error),
+        };
+        RunCompletion::new(reservation.clone(), reservation.worker_revision()).finalize(outcome)?;
+        Ok(outcome)
+    }
+
     /// Starts a reserved Run and persists its process identifier before success.
     pub fn run_reserved_background(
         &self,
@@ -172,23 +187,17 @@ impl RunSupervisor {
         invocation: AgentRuntimeInvocation,
     ) -> Result<BackgroundRun, RunSupervisorError> {
         let worker_id = reservation.worker_id().clone();
-        let repository = reservation.repository();
-        let request = RunRequest::new(
-            reservation.agent_runtime(),
-            invocation,
-            crate::workspace::worker_path(repository.root(), &worker_id),
-            repository
-                .root()
-                .join(".jj/pool")
-                .join(format!("{worker_id}.log")),
-        );
-        let background = match self.run_background(&request) {
+        let request = reserved_request(reservation, invocation);
+        let mut background = match self.run_background(&request) {
             Ok(background) => background,
             Err(error) => return release_after_failure(reservation, error),
         };
         let pid = background.pid();
         match reservation.persist_pid(pid) {
-            Ok(crate::pool::PidPersistence::Persisted) => Ok(background),
+            Ok(crate::pool::PidPersistence::Persisted(revision)) => {
+                background.completion = Some(RunCompletion::new(reservation.clone(), revision));
+                Ok(background)
+            }
             Ok(crate::pool::PidPersistence::Missing) => persist_pid_failure(
                 reservation,
                 background,
@@ -251,6 +260,7 @@ impl RunSupervisor {
         Ok(BackgroundRun {
             child,
             runtime: request.runtime,
+            completion: None,
         })
     }
 }
@@ -261,6 +271,30 @@ impl RunSupervisor {
 pub struct BackgroundRun {
     child: Child,
     runtime: AgentRuntime,
+    completion: Option<RunCompletion>,
+}
+
+#[derive(Debug)]
+struct RunCompletion {
+    reservation: Reservation,
+    revision: StateRevision<WorkerState>,
+}
+
+impl RunCompletion {
+    fn new(reservation: Reservation, revision: StateRevision<WorkerState>) -> Self {
+        Self {
+            reservation,
+            revision,
+        }
+    }
+
+    fn finalize(self, outcome: RunOutcome) -> Result<(), RunSupervisorError> {
+        let worker = self.reservation.worker_id().clone();
+        self.reservation
+            .finalize(self.revision, outcome.exit_code())
+            .map(|_| ())
+            .map_err(|source| RunSupervisorError::Finalize { worker, source })
+    }
 }
 
 impl BackgroundRun {
@@ -278,9 +312,13 @@ impl BackgroundRun {
                 runtime: self.runtime,
                 source,
             })?;
-        Ok(RunOutcome {
+        let outcome = RunOutcome {
             exit_code: status.code(),
-        })
+        };
+        if let Some(completion) = self.completion.take() {
+            completion.finalize(outcome)?;
+        }
+        Ok(outcome)
     }
 }
 
@@ -338,6 +376,15 @@ pub enum RunSupervisorError {
         /// The process creation error.
         #[source]
         source: io::Error,
+    },
+    /// The Worker terminal state could not be persisted.
+    #[error("cannot finalize Run for Worker {worker}: {source}")]
+    Finalize {
+        /// The Worker whose Run completed.
+        worker: crate::WorkerId,
+        /// The Worker state repository failure.
+        #[source]
+        source: WorkerPoolError,
     },
     /// The Worker PID could not be loaded or persisted.
     #[error("cannot persist PID for Worker {worker}: {source}")]
@@ -407,10 +454,10 @@ pub enum RunSupervisorError {
     },
 }
 
-fn release_after_failure(
+fn release_after_failure<T>(
     reservation: &Reservation,
     primary: RunSupervisorError,
-) -> Result<BackgroundRun, RunSupervisorError> {
+) -> Result<T, RunSupervisorError> {
     match reservation.release() {
         Ok(()) => Err(primary),
         Err(release) => Err(RunSupervisorError::ReservationRelease {
@@ -420,6 +467,20 @@ fn release_after_failure(
             detail: release.to_string(),
         }),
     }
+}
+
+fn reserved_request(reservation: &Reservation, invocation: AgentRuntimeInvocation) -> RunRequest {
+    let worker_id = reservation.worker_id().clone();
+    let repository = reservation.repository();
+    RunRequest::new(
+        reservation.agent_runtime(),
+        invocation,
+        crate::workspace::worker_path(repository.root(), &worker_id),
+        repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker_id}.log")),
+    )
 }
 
 fn failed_pid(error: &RunSupervisorError) -> Option<u32> {

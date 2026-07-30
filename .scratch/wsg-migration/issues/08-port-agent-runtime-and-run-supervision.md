@@ -111,3 +111,12 @@ forced cleanup path for stubborn descendants. Integration coverage verifies
 PID visibility before launch success and cleanup when Worker state changes during
 the launch race. Run finalization, liveness reconciliation, and Reset remain
 pending.
+
+2026-07-30 - Added the shared reserved Run completion seam. Background and
+foreground reserved Runs now carry the exact post-PID Worker revision into one
+waiter/finalizer path. Exit 0 persists `done`; non-zero and signaled exits
+persist `failed` with completion metadata. A stale waiter treats a revision
+conflict as a no-op and cannot overwrite a newer Run. Public integration tests
+cover successful background completion, failed background completion,
+foreground completion, and the stale waiter race. Liveness reconciliation and
+Reset remain pending.

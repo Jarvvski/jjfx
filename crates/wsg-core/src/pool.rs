@@ -67,9 +67,14 @@ pub struct Reservation {
 }
 
 pub(crate) enum PidPersistence {
-    Persisted,
+    Persisted(StateRevision<WorkerState>),
     Missing,
     Conflict,
+}
+
+pub(crate) enum RunFinalization {
+    Applied,
+    Stale,
 }
 
 impl Reservation {
@@ -92,6 +97,10 @@ impl Reservation {
         &self.repository
     }
 
+    pub(crate) fn worker_revision(&self) -> StateRevision<WorkerState> {
+        self.worker_revision.clone()
+    }
+
     pub(crate) fn persist_pid(&self, pid: u32) -> Result<PidPersistence, StateError> {
         let worker_state = self.repository.state_store().worker(self.worker_id.clone());
         let loaded = match worker_state.load()? {
@@ -104,8 +113,50 @@ impl Reservation {
             Expected::Match(self.worker_revision.clone()),
             StateChange::Replace(state),
         )? {
-            CommitOutcome::Applied(_) => Ok(PidPersistence::Persisted),
-            CommitOutcome::Conflict(_) => Ok(PidPersistence::Conflict),
+            CommitOutcome::Applied(Loaded::Present(versioned)) => {
+                Ok(PidPersistence::Persisted(versioned.revision().clone()))
+            }
+            CommitOutcome::Applied(Loaded::Missing) | CommitOutcome::Conflict(Loaded::Missing) => {
+                Ok(PidPersistence::Missing)
+            }
+            CommitOutcome::Conflict(Loaded::Present(_)) => Ok(PidPersistence::Conflict),
+        }
+    }
+
+    pub(crate) fn finalize(
+        &self,
+        revision: StateRevision<WorkerState>,
+        exit_code: Option<i32>,
+    ) -> Result<RunFinalization, WorkerPoolError> {
+        let worker_state = self.repository.state_store().worker(self.worker_id.clone());
+        let loaded = match worker_state.load()? {
+            Loaded::Present(versioned) => versioned,
+            Loaded::Missing => {
+                return Err(WorkerPoolError::WorkerStateMissing {
+                    worker: self.worker_id.clone(),
+                });
+            }
+        };
+        if loaded.value.status.as_str() != "busy" {
+            return Ok(RunFinalization::Stale);
+        }
+        let mut state = loaded.value;
+        let completed_at = current_timestamp()?;
+        let successful = exit_code == Some(0);
+        state.status = WireStatus::new(if successful { "done" } else { "failed" });
+        state.completed_at = Some(completed_at);
+        state.exit_code = exit_code.map(i64::from).or(Some(1));
+        state.error = if successful {
+            None
+        } else {
+            Some(match exit_code {
+                Some(code) => format!("Run exited with code {code}"),
+                None => "Run terminated by signal".to_owned(),
+            })
+        };
+        match worker_state.commit(Expected::Match(revision), StateChange::Replace(state))? {
+            CommitOutcome::Applied(_) => Ok(RunFinalization::Applied),
+            CommitOutcome::Conflict(_) => Ok(RunFinalization::Stale),
         }
     }
 
