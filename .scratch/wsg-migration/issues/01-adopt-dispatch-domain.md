@@ -1,6 +1,6 @@
 # Adopt the Workspace Dispatch domain
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -53,3 +53,20 @@ This is a documentation-only architectural change. Validate terminology against 
 ## Blocked by
 
 Nothing - can start immediately.
+
+## Answer
+
+Delivered as documentation. ADR 0009 accepts Workspace Dispatch as a layer over
+the existing Workspace, Agent, Agent Session, Work, and Forge model. ADR 0001 is
+retitled a historical limitation and records that ADR 0009 supersedes only its
+no-orchestration scope, leaving its observation rationale intact. `CONTEXT.md`
+carries the Workspace Dispatch vocabulary plus the paragraph separating Worker,
+Agent, Agent Session, Workspace, and process, and cross-references the migration
+PRD and the lifecycle ADRs.
+
+## Comments
+
+2026-07-30 - Status corrected to resolved during a tracker audit. The work landed
+with the ADR and glossary changes and every acceptance criterion was already
+checked; only the `Status:` line was stale, which made status-based ticket
+selection point at a finished ticket.

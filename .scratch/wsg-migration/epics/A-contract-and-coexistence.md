@@ -1,7 +1,7 @@
 # Epic A - Contract and coexistence
 
 Type: epic
-Status: tracking
+Status: resolved
 
 ## Goal
 
@@ -33,3 +33,11 @@ None. This epic begins the migration.
 - Golden compatibility fixtures cover every persisted wsg state format.
 - jjfx displays existing Worker Pool and Run state without mutating it.
 - `mise run check` is green.
+
+## Outcome
+
+2026-07-30 - Complete. Tickets 01 through 04 are resolved and every condition
+above holds: ADR 0009 and the `CONTEXT.md` vocabulary are accepted, the Cargo
+workspace builds `jjfx`, `wsg-core`, and the skeletal `wsg` binary, the
+compatibility fixtures cover the Pool, Worker, Dispatch Group, and ws-cache
+formats, jjfx shows Worker Pool state read-only, and `mise run check` is green.
