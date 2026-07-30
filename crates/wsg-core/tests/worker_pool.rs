@@ -569,6 +569,100 @@ fn reservation_preserves_go_worker_extensions_and_null_fields() {
 }
 
 #[test]
+fn reconcile_runs_returns_snapshot_without_mutating_worker_without_pid() {
+    let (temp, repository) = repository_with_pool();
+    let worker_path = temp.path().join(".jj/pool/worker-02.json");
+    let mut worker: Value =
+        serde_json::from_slice(&fs::read(&worker_path).expect("busy Worker state"))
+            .expect("Worker JSON");
+    worker["pid"] = Value::Null;
+    fs::write(
+        &worker_path,
+        serde_json::to_vec(&worker).expect("Worker JSON"),
+    )
+    .expect("Worker state");
+
+    let snapshot = repository.worker_pool().reconcile_runs();
+
+    let worker = snapshot.worker("worker-02").expect("busy Worker");
+    assert_eq!(worker.status(), WorkerStatus::Busy);
+    assert_eq!(worker.pid(), None);
+    assert!(snapshot.diagnostics().is_empty());
+}
+
+#[test]
+fn reconcile_runs_finalizes_busy_worker_with_dead_pid_once() {
+    let (temp, repository) = repository_with_pool();
+    let worker_path = temp.path().join(".jj/pool/worker-02.json");
+    let mut exited = Command::new("sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .expect("dead PID helper");
+    let dead_pid = exited.id();
+    exited.wait().expect("dead PID helper should exit");
+
+    let mut worker: Value =
+        serde_json::from_slice(&fs::read(&worker_path).expect("busy Worker state"))
+            .expect("Worker JSON");
+    worker["pid"] = serde_json::json!(dead_pid);
+    fs::write(
+        &worker_path,
+        serde_json::to_vec(&worker).expect("Worker JSON"),
+    )
+    .expect("Worker state");
+
+    let first = repository.worker_pool().reconcile_runs();
+
+    let worker = first.worker("worker-02").expect("reconciled Worker");
+    assert_eq!(worker.status(), WorkerStatus::Failed);
+    assert_eq!(worker.exit_code(), Some(1));
+    assert_eq!(worker.error(), Some("Process exited unexpectedly"));
+    assert!(worker.completed_at().is_some());
+    assert_eq!(worker.pid(), Some(dead_pid));
+
+    let written = fs::read(&worker_path).expect("reconciled Worker state");
+    let second = repository.worker_pool().reconcile_runs();
+    assert_eq!(second.worker("worker-02"), first.worker("worker-02"));
+    assert_eq!(
+        fs::read(&worker_path).expect("reconciled Worker state"),
+        written
+    );
+}
+
+#[test]
+fn reconcile_runs_continues_past_missing_and_malformed_workers() {
+    let (temp, repository) = repository_with_pool();
+    let pool = temp.path().join(".jj/pool");
+    fs::remove_file(pool.join("worker-03.json")).expect("remove Worker");
+    fs::write(pool.join("worker-04.json"), b"{ not json").expect("malformed Worker");
+    let worker_path = pool.join("worker-02.json");
+    let mut worker: Value =
+        serde_json::from_slice(&fs::read(&worker_path).expect("busy Worker state"))
+            .expect("Worker JSON");
+    worker["pid"] = Value::Null;
+    fs::write(
+        &worker_path,
+        serde_json::to_vec(&worker).expect("Worker JSON"),
+    )
+    .expect("Worker state");
+
+    let snapshot = repository.worker_pool().reconcile_runs();
+
+    assert!(snapshot.worker("worker-01").is_some());
+    assert!(snapshot.worker("worker-02").is_some());
+    assert!(snapshot.worker("worker-03").is_none());
+    assert!(snapshot.worker("worker-04").is_none());
+    assert!(snapshot.diagnostics().iter().any(|diagnostic| {
+        diagnostic.worker_id().map(|id| id.as_str()) == Some("worker-03")
+            && diagnostic.kind() == SnapshotDiagnosticKind::MissingWorker
+    }));
+    assert!(snapshot.diagnostics().iter().any(|diagnostic| {
+        diagnostic.worker_id().map(|id| id.as_str()) == Some("worker-04")
+            && diagnostic.kind() == SnapshotDiagnosticKind::MalformedWorker
+    }));
+}
+
+#[test]
 fn reads_go_pool_workers_as_an_immutable_snapshot() {
     let (_temp, repository) = repository_with_pool();
     let snapshot = repository.read_worker_pool_snapshot();
@@ -619,12 +713,10 @@ fn snapshot_read_changes_no_file_and_creates_no_lock() {
     let _ = repository.read_worker_pool_snapshot();
     assert_eq!(fs::read(pool_file).expect("pool bytes"), before);
     assert!(!repository.root().join(".jj/pool/.dispatch.lock").exists());
-    assert!(
-        !repository
-            .root()
-            .join(".jj/pool/worker-01.json.lock")
-            .exists()
-    );
+    assert!(!repository
+        .root()
+        .join(".jj/pool/worker-01.json.lock")
+        .exists());
 }
 
 #[test]

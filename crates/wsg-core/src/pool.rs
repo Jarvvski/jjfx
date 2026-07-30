@@ -214,6 +214,11 @@ pub enum WorkerPoolError {
     WorkerStateMissing { worker: WorkerId },
     #[error("Worker {worker} changed before its Reservation could be released")]
     ReleaseConflict { worker: WorkerId },
+    #[error("cannot reconcile Worker {worker}: {source}")]
+    Reconciliation {
+        worker: WorkerId,
+        source: StateError,
+    },
     #[error("invalid configured Agent Runtime {value:?} (expected claude or codex)")]
     InvalidAgentRuntime { value: String },
     #[error("cannot discover GitHub repository: {0}")]
@@ -245,6 +250,57 @@ impl WorkerPool {
     /// Reads a compatible Worker Pool snapshot without changing any file.
     pub fn snapshot(&self) -> WorkerPoolSnapshot {
         self.repository.read_worker_pool_snapshot()
+    }
+
+    /// Reconciles observable Worker Run state and returns the resulting snapshot.
+    ///
+    /// A Worker with a dead recorded PID is marked failed using the compatible
+    /// unexpected-exit fallback. Missing, malformed, and concurrently replaced
+    /// Worker state remains observable through the returned snapshot.
+    pub fn reconcile_runs(&self) -> WorkerPoolSnapshot {
+        let before = self.snapshot();
+        let mut diagnostics = Vec::new();
+        for worker in before.workers() {
+            if let Err(error) = self.reconcile_worker(worker.worker_id()) {
+                diagnostics.push(diagnostic(
+                    self.repository.root(),
+                    SnapshotDiagnosticKind::ReconciliationFailed,
+                    Some(worker.worker_id().clone()),
+                    error,
+                ));
+            }
+        }
+        let mut after = self.snapshot();
+        after.diagnostics.extend(diagnostics);
+        after
+    }
+
+    fn reconcile_worker(&self, worker: &WorkerId) -> Result<(), WorkerPoolError> {
+        let repository = self.repository.state_store().worker(worker.clone());
+        let loaded = match repository.load().map_err(WorkerPoolError::State)? {
+            Loaded::Missing => return Ok(()),
+            Loaded::Present(versioned) => versioned,
+        };
+        let Some(pid) = loaded.value.pid else {
+            return Ok(());
+        };
+        if loaded.value.status.as_str() != "busy" || process_is_alive_i64(pid) {
+            return Ok(());
+        }
+
+        let revision = loaded.revision().clone();
+        let mut state = loaded.value;
+        state.status = WireStatus::new("failed");
+        state.completed_at = Some(current_timestamp()?);
+        state.exit_code = Some(1);
+        state.error = Some("Process exited unexpectedly".to_owned());
+        match repository.commit(Expected::Match(revision), StateChange::Replace(state)) {
+            Ok(CommitOutcome::Applied(_)) | Ok(CommitOutcome::Conflict(_)) => Ok(()),
+            Err(source) => Err(WorkerPoolError::Reconciliation {
+                worker: worker.clone(),
+                source,
+            }),
+        }
     }
 
     /// Reserves the first idle Worker for `ticket` in pool order.
@@ -666,6 +722,7 @@ pub enum SnapshotDiagnosticKind {
     MalformedPool,
     MissingWorker,
     MalformedWorker,
+    ReconciliationFailed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -870,6 +927,10 @@ impl<T> TransposeOption<T> for Option<Option<T>> {
             Some(None) => None,
         }
     }
+}
+
+fn process_is_alive_i64(pid: i64) -> bool {
+    u32::try_from(pid).ok().is_some_and(process_is_alive)
 }
 
 #[cfg(unix)]

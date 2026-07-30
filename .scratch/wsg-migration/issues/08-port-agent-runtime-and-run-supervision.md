@@ -45,7 +45,7 @@ Use fake executable scripts for deterministic provider argument, logging, exit-c
 - [ ] Claude Code and Codex commands preserve current invocation behavior.
 - [ ] Foreground and background Runs produce compatible logs.
 - [x] Successful launch returns only after PID persistence.
-- [ ] Dead busy Workers reconcile to done or failed exactly once.
+- [x] Dead busy Workers reconcile to done or failed exactly once.
 - [ ] Reset terminates descendants and cannot finalize a later Run.
 - [ ] `mise run check` is green.
 
@@ -120,3 +120,8 @@ conflict as a no-op and cannot overwrite a newer Run. Public integration tests
 cover successful background completion, failed background completion,
 foreground completion, and the stale waiter race. Liveness reconciliation and
 Reset remain pending.
+
+2026-07-30 - Added `WorkerPool::reconcile_runs()` for dead-PID liveness
+reconciliation. Busy Workers with absent or live PIDs remain unchanged; a dead
+PID receives the compatible unexpected-exit failure state through a revision-
+checked commit, and missing or malformed Workers remain visible as diagnostics.
