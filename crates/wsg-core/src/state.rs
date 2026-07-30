@@ -511,6 +511,13 @@ pub(crate) enum DetachedCleanupStatus {
     NotDetached,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PoolAliasOutcome {
+    Updated,
+    WorkerNotInPool,
+    Destroying,
+}
+
 /// Pool state repository.
 #[derive(Debug, Clone)]
 pub struct PoolStateRepository {
@@ -558,6 +565,39 @@ impl StateStore {
             root: self.root.clone(),
             parent,
         }
+    }
+
+    /// Sets or clears cosmetic Worker metadata under the compatible Pool lock.
+    pub(crate) fn set_worker_alias(
+        &self,
+        worker: &WorkerId,
+        alias: Option<String>,
+    ) -> Result<PoolAliasOutcome, StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            let mut pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => {
+                    return Err(StateError::new("set alias", subject, "state is missing"));
+                }
+            };
+            if self.root.join(DESTROY_MARKER).exists() {
+                return Ok(PoolAliasOutcome::Destroying);
+            }
+            if !pool.workers.iter().any(|member| member == worker) {
+                return Ok(PoolAliasOutcome::WorkerNotInPool);
+            }
+            match alias {
+                Some(alias) => {
+                    pool.names.insert(worker.clone(), alias);
+                }
+                None => {
+                    pool.names.remove(worker);
+                }
+            }
+            write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+            Ok(PoolAliasOutcome::Updated)
+        })
     }
 
     /// Atomically detaches every current Worker while retaining durable cleanup state.

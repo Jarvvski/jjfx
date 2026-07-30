@@ -434,6 +434,31 @@ impl WorkerPool {
         self.reserve_inner(Some(worker), ticket.into())
     }
 
+    /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
+    /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
+    pub fn set_alias(
+        &self,
+        worker: WorkerId,
+        text: impl Into<String>,
+    ) -> Result<(), WorkerPoolError> {
+        let text = text.into();
+        let alias = match text.trim() {
+            "" => None,
+            normalized => Some(normalized.to_owned()),
+        };
+        match self
+            .repository
+            .state_store()
+            .set_worker_alias(&worker, alias)?
+        {
+            crate::state::PoolAliasOutcome::Updated => Ok(()),
+            crate::state::PoolAliasOutcome::WorkerNotInPool => {
+                Err(WorkerPoolError::WorkerNotInPool { worker })
+            }
+            crate::state::PoolAliasOutcome::Destroying => Err(WorkerPoolError::Conflict),
+        }
+    }
+
     fn reserve_inner(
         &self,
         requested: Option<WorkerId>,

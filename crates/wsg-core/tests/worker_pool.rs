@@ -15,6 +15,19 @@ fn fixture(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).expect("fixture")
 }
 
+fn workspace_names(root: &Path) -> Vec<String> {
+    let output = Command::new("jj")
+        .args(["workspace", "list"])
+        .current_dir(root)
+        .output()
+        .expect("jj workspace list");
+    assert!(output.status.success());
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
+        .collect()
+}
+
 #[test]
 #[ignore]
 fn stale_reservation_after_destroy_helper() {
@@ -969,6 +982,248 @@ fn shrinking_permits_a_missing_tail_worker_state() {
         .expect("missing state should not imply busy");
 
     assert_eq!(resized.removed_workers(), &[missing]);
+}
+
+#[test]
+fn worker_alias_is_trimmed_persisted_and_cosmetic() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let state_path = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.json"));
+    let worker_state_before = fs::read(&state_path).expect("Worker state");
+    let workspace_before = workspace_names(repository.root());
+
+    pool.set_alias(worker.clone(), "  backend  ")
+        .expect("set Worker alias");
+
+    let reopened = Repository::open(repository.root()).expect("reopen repository");
+    assert_eq!(
+        reopened
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("Worker snapshot")
+            .alias(),
+        "backend"
+    );
+    assert_eq!(
+        fs::read(state_path).expect("Worker state"),
+        worker_state_before
+    );
+    assert_eq!(workspace_names(repository.root()), workspace_before);
+}
+
+#[test]
+fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    pool.set_alias(worker.clone(), "backend")
+        .expect("set Worker alias");
+
+    pool.set_alias(worker.clone(), " \t ")
+        .expect("clear Worker alias");
+
+    assert_eq!(
+        pool.snapshot()
+            .worker(worker.as_str())
+            .expect("Worker snapshot")
+            .alias(),
+        ""
+    );
+    let pool_path = repository.root().join(".jj/pool.json");
+    let cleared: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    assert!(
+        cleared.get("names").is_none(),
+        "empty names should be omitted"
+    );
+    let before = fs::read(&pool_path).expect("pool bytes");
+    let unknown = wsg_core::WorkerId::parse("worker-unknown").expect("Worker ID");
+
+    let error = pool
+        .set_alias(unknown.clone(), "backend")
+        .expect_err("unknown Worker should be rejected");
+
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
+    ));
+    assert_eq!(fs::read(pool_path).expect("pool bytes"), before);
+}
+
+#[test]
+fn worker_alias_mutates_a_go_created_pool_without_losing_compatible_metadata() {
+    let (temporary_directory, repository) = go_repository_with_pool();
+    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let mut state: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    state["foreground"] = Value::Bool(false);
+    state["agent"] = Value::String("codex".to_owned());
+    state["future"] = serde_json::json!({ "enabled": true });
+    fs::write(
+        &pool_path,
+        serde_json::to_vec_pretty(&state).expect("pool JSON"),
+    )
+    .expect("pool state");
+    let worker_state_path = temporary_directory.path().join(".jj/pool/worker-01.json");
+    let worker_state_before = fs::read(&worker_state_path).expect("Worker state");
+    let worker = wsg_core::WorkerId::parse("worker-01").expect("Worker ID");
+
+    repository
+        .worker_pool()
+        .set_alias(worker.clone(), "primary")
+        .expect("set alias on Go-created Pool");
+
+    let snapshot = repository.worker_pool().snapshot();
+    assert_eq!(
+        snapshot
+            .worker(worker.as_str())
+            .expect("Worker snapshot")
+            .alias(),
+        "primary"
+    );
+    assert_eq!(snapshot.pool().expect("Pool snapshot").size(), 4);
+    assert_eq!(
+        snapshot
+            .worker("worker-02")
+            .expect("existing alias")
+            .alias(),
+        "beta",
+        "unrelated aliases should survive"
+    );
+    assert_eq!(
+        snapshot
+            .pool()
+            .expect("Pool snapshot")
+            .workers()
+            .iter()
+            .map(|worker| worker.worker_id().as_str())
+            .collect::<Vec<_>>(),
+        ["worker-01", "worker-02", "worker-03", "worker-04"]
+    );
+    let written: Value =
+        serde_json::from_slice(&fs::read(pool_path).expect("pool state")).expect("pool JSON");
+    assert_eq!(written["future"], serde_json::json!({ "enabled": true }));
+    assert_eq!(written["foreground"], false);
+    assert_eq!(written["agent"], "codex");
+    assert_eq!(
+        fs::read(worker_state_path).expect("Worker state"),
+        worker_state_before
+    );
+}
+
+#[test]
+fn alias_and_named_removal_serialize_without_reviving_removed_metadata() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let alias_pool = pool.clone();
+    let remove_pool = pool.clone();
+    let alias_worker = worker.clone();
+    let remove_worker = worker.clone();
+
+    let (alias, removal) = thread::scope(|scope| {
+        let alias = scope.spawn(|| alias_pool.set_alias(alias_worker, "backend"));
+        let removal = scope.spawn(|| remove_pool.remove(remove_worker));
+        (
+            alias.join().expect("alias thread"),
+            removal.join().expect("remove thread"),
+        )
+    });
+
+    assert!(removal.is_ok(), "idle Worker removal should succeed");
+    assert!(
+        alias.is_ok()
+            || matches!(
+                alias,
+                Err(wsg_core::WorkerPoolError::WorkerNotInPool { .. })
+            ),
+        "alias must either serialize before removal or observe the removed Worker"
+    );
+    let snapshot = pool.snapshot();
+    assert!(snapshot.worker(worker.as_str()).is_none());
+    assert_eq!(snapshot.pool().expect("Pool snapshot").size(), 0);
+}
+
+#[test]
+fn alias_and_shrink_serialize_without_retaining_a_detached_alias() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow");
+    let worker = grown.added_workers()[1].clone();
+    let alias_pool = pool.clone();
+    let resize_pool = pool.clone();
+    let alias_worker = worker.clone();
+
+    let (alias, resize) = thread::scope(|scope| {
+        let alias = scope.spawn(|| alias_pool.set_alias(alias_worker, "backend"));
+        let resize = scope
+            .spawn(|| resize_pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity")));
+        (
+            alias.join().expect("alias thread"),
+            resize.join().expect("resize thread"),
+        )
+    });
+
+    assert!(resize.is_ok(), "idle tail shrink should succeed");
+    assert!(
+        alias.is_ok()
+            || matches!(
+                alias,
+                Err(wsg_core::WorkerPoolError::WorkerNotInPool { .. })
+            ),
+        "alias must either serialize before shrink or observe the detached Worker"
+    );
+    let snapshot = pool.snapshot();
+    assert!(snapshot.worker(worker.as_str()).is_none());
+    assert_eq!(snapshot.pool().expect("Pool snapshot").size(), 1);
+}
+
+#[test]
+fn alias_rejects_while_pool_destruction_is_in_progress() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let repo_state = repository.root().join(".jj/repo");
+    let disabled = repository.root().join(".jj/repo-disabled");
+    fs::rename(&repo_state, &disabled).expect("disable jj repository");
+    pool.destroy()
+        .expect_err("Workspace cleanup should leave destruction resumable");
+    let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool state");
+
+    let error = pool
+        .set_alias(worker, "backend")
+        .expect_err("alias mutation should not race active destruction");
+
+    assert!(matches!(error, wsg_core::WorkerPoolError::Conflict));
+    assert_eq!(
+        fs::read(repository.root().join(".jj/pool.json")).expect("pool state"),
+        before
+    );
+    fs::rename(&disabled, &repo_state).expect("restore jj repository");
+    pool.destroy().expect("resume destroy");
 }
 
 #[test]

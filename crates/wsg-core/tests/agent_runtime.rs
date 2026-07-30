@@ -1749,7 +1749,10 @@ fn reset_run_clears_a_terminal_run_and_preserves_unknown_fields_and_aliases() {
             "future": { "enabled": true }
         }),
     );
-    set_worker_alias(temporary_directory.path(), &worker_id, "reviewer");
+    repository
+        .worker_pool()
+        .set_alias(worker_id.clone(), "reviewer")
+        .expect("set Worker alias");
 
     let reset = RunSupervisor::new()
         .reset_run(&repository, &worker_id)
@@ -2518,14 +2521,6 @@ fn write_worker_json(path: &std::path::Path, state: Value) {
 
 fn read_worker_json(path: &std::path::Path) -> Value {
     serde_json::from_slice(&fs::read(path).expect("Worker state")).expect("Worker JSON")
-}
-
-fn set_worker_alias(root: &std::path::Path, worker: &WorkerId, alias: &str) {
-    let path = root.join(".jj/pool.json");
-    let mut pool: Value =
-        serde_json::from_slice(&fs::read(&path).expect("pool state")).expect("pool JSON");
-    pool["names"] = serde_json::json!({ worker.as_str(): alias });
-    fs::write(&path, serde_json::to_vec_pretty(&pool).expect("pool JSON")).expect("pool state");
 }
 
 /// Returns a process identifier that has been started and reaped, so the
