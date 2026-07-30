@@ -10,7 +10,9 @@ The owner uses **Jujutsu exclusively** in a colocated repo. **Never invoke `git`
 4. `jj describe -m "<imperative one-liner>"` then `jj bookmark set main --to @` then `jj new`.
 5. Invariant: every time `main` moves, the next command is `jj new`, so `@` is always an empty commit one above main.
 
-**Versioning & changelog.** Keep a single **version of record** (e.g. the manifest's version field) and treat it as authoritative. Semver: PATCH for fixes, MINOR otherwise; **never bump to 1.0.0 (or any MAJOR) without the owner's explicit approval - do not auto-bump.** A user-visible change adds a dated `CHANGELOG.md` entry (newest first) in the same commit; skip pure internal refactors. Push with `jj git push --bookmark main` (`--allow-new` the first time a bookmark is pushed).
+**Landing is strictly local. Agents must NEVER push from this repository.** This rule applies even when the owner invokes `$land` exactly, and it overrides any generic skill contract that treats `$land` as remote-action authorization. Do not run `jj git push`, create a PR as part of landing, or otherwise publish a landed change. The owner handles all pushes.
+
+**Versioning & changelog.** Keep a single **version of record** (e.g. the manifest's version field) and treat it as authoritative. Semver: PATCH for fixes, MINOR otherwise; **never bump to 1.0.0 (or any MAJOR) without the owner's explicit approval - do not auto-bump.** A user-visible change adds a dated `CHANGELOG.md` entry (newest first) in the same commit; skip pure internal refactors.
 
 Remote: `origin` = `Jarvvski/jjfx` (SSH: `git@github.com:Jarvvski/jjfx.git` - SSH avoids the OAuth `workflow`-scope gate on pushing `.github/workflows/`). `gh` auto-detection fails in jj workspaces - always pass `-R Jarvvski/jjfx`.
 
