@@ -10,11 +10,15 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 
 use thiserror::Error;
 
 use crate::{Reservation, StateError, StateRevision, WireAgent, WorkerPoolError, WorkerState};
+
+const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(1);
+const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
+const PROCESS_GROUP_FORCE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The Agent Runtime recorded for a Worker and selected for a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -514,20 +518,88 @@ fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
         .ok()
         .and_then(Pid::from_raw)
         .ok_or_else(|| io::Error::other("background Run PID does not fit a Unix process ID"))?;
-    let _ = kill_process_group(pid, Signal::TERM);
-    let deadline = Instant::now() + Duration::from_millis(250);
-    let leader_exited = loop {
-        match background.child.try_wait()? {
-            Some(_) => break true,
-            None if Instant::now() >= deadline => break false,
-            None => thread::sleep(Duration::from_millis(10)),
+    terminate_process_group(pid, PROCESS_GROUP_GRACE)?;
+    background.child.wait().map(|_| ())
+}
+
+fn terminate_process_group(pid: Pid, grace: Duration) -> io::Result<()> {
+    match kill_process_group(pid, Signal::TERM) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::SRCH => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot send TERM to process group {pid}: {error}"),
+            ));
         }
-    };
-    let _ = kill_process_group(pid, Signal::KILL);
-    if leader_exited {
+    }
+
+    if wait_for_process_group_exit(pid, grace)? {
+        return Ok(());
+    }
+
+    match kill_process_group(pid, Signal::KILL) {
+        Ok(()) => {}
+        Err(error) if error == rustix::io::Errno::SRCH => return Ok(()),
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("cannot send KILL to process group {pid}: {error}"),
+            ));
+        }
+    }
+    if wait_for_forced_process_group_exit(pid, PROCESS_GROUP_FORCE_TIMEOUT)? {
         Ok(())
     } else {
-        background.child.wait().map(|_| ())
+        Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "process group did not exit after forced termination",
+        ))
+    }
+}
+
+fn wait_for_process_group_exit(pid: Pid, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match test_kill_process_group(pid) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::SRCH => return Ok(true),
+            // macOS can report EPERM for a just-signaled group during the
+            // grace window; treat it as live and continue to the forced path.
+            Err(error) if error == rustix::io::Errno::PERM => {}
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot probe process group {pid}: {error}"),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(PROCESS_GROUP_POLL);
+    }
+}
+
+fn wait_for_forced_process_group_exit(pid: Pid, timeout: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        match test_kill_process_group(pid) {
+            Ok(()) => {}
+            Err(error) if error == rustix::io::Errno::SRCH || error == rustix::io::Errno::PERM => {
+                return Ok(true);
+            }
+            Err(error) => {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("cannot probe forced process group {pid}: {error}"),
+                ));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        thread::sleep(PROCESS_GROUP_POLL);
     }
 }
 

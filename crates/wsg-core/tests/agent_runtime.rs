@@ -7,7 +7,9 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{kill_process_group, test_kill_process, Pid, Signal};
+use rustix::process::{
+    kill_process_group, test_kill_process, test_kill_process_group, Pid, Signal,
+};
 use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
@@ -29,6 +31,11 @@ const HELPER_REPOSITORY: &str = "WSG_AGENT_RUNTIME_HELPER_REPOSITORY";
 const HELPER_WORKER: &str = "WSG_AGENT_RUNTIME_HELPER_WORKER";
 const HELPER_RESERVED: &str = "WSG_AGENT_RUNTIME_HELPER_RESERVED";
 const HELPER_PROCEED: &str = "WSG_AGENT_RUNTIME_HELPER_PROCEED";
+const HELPER_GRACEFUL: &str = "WSG_AGENT_RUNTIME_HELPER_GRACEFUL";
+const HELPER_DIAGNOSTIC: &str = "WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC";
+const HELPER_TERM: &str = "WSG_AGENT_RUNTIME_HELPER_TERM";
+const HELPER_LAUNCH: &str = "WSG_AGENT_RUNTIME_HELPER_LAUNCH";
+const HELPER_DESCENDANT: &str = "WSG_AGENT_RUNTIME_HELPER_DESCENDANT";
 
 #[test]
 fn fresh_claude_command_preserves_headless_stream_invocation() {
@@ -579,6 +586,158 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
     assert!(
         !process_alive,
         "untracked runtime process should be cleaned up"
+    );
+}
+
+#[test]
+fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+
+    let bin_directory = temporary_directory.path().join("bin");
+    let result = temporary_directory.path().join("result");
+    let process = temporary_directory.path().join("process");
+    let reserved = temporary_directory.path().join("reserved");
+    let proceed = temporary_directory.path().join("proceed");
+    let graceful = temporary_directory.path().join("graceful");
+    let diagnostic = temporary_directory.path().join("diagnostic");
+    let term = temporary_directory.path().join("term");
+    let launch = temporary_directory.path().join("launch");
+    let descendant = temporary_directory.path().join("descendant");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/bash\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\n( trap '' TERM; while :; do :; done ) &\nprintf '%s\\n' \"$!\" > \"$WSG_AGENT_RUNTIME_HELPER_DESCENDANT\"\ntrap 'printf term > \"$WSG_AGENT_RUNTIME_HELPER_TERM\"; deadline=$(( ${EPOCHREALTIME/./} + 600000 )); while (( ${EPOCHREALTIME/./} < deadline )); do :; done; printf graceful > \"$WSG_AGENT_RUNTIME_HELPER_GRACEFUL\"; exit 0' TERM\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf started > \"$WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_LAUNCH\" ]; do :; done\nwhile :; do :; done\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "reserved_background_run_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROCESS, &process)
+        .env(HELPER_RESERVED, &reserved)
+        .env(HELPER_PROCEED, &proceed)
+        .env(HELPER_GRACEFUL, &graceful)
+        .env(HELPER_DIAGNOSTIC, &diagnostic)
+        .env(HELPER_TERM, &term)
+        .env(HELPER_LAUNCH, &launch)
+        .env(HELPER_DESCENDANT, &descendant)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let helper = BackgroundHelperGuard::spawn(&mut helper, &proceed, [&process, &result]);
+
+    wait_for_file(&reserved);
+    let worker_state = repository.state_store().worker(worker_id.clone());
+    let loaded = match worker_state.load().expect("reserved Worker state") {
+        wsg_core::Loaded::Present(versioned) => versioned,
+        wsg_core::Loaded::Missing => panic!("reserved Worker state should exist"),
+    };
+    let outcome = worker_state
+        .commit(
+            Expected::Match(loaded.revision().clone()),
+            StateChange::Remove,
+        )
+        .expect("remove Worker state for the race");
+    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    let worker_state_path = temporary_directory
+        .path()
+        .join(".jj/pool")
+        .join(format!("{worker_id}.json"));
+    let fifo_status = Command::new("mkfifo")
+        .arg(&worker_state_path)
+        .status()
+        .expect("mkfifo should be installed");
+    assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
+    fs::write(&proceed, []).expect("allow launch to continue");
+    wait_for_file(&diagnostic);
+    wait_for_file(&descendant);
+    fs::write(&worker_state_path, b"not-json").expect("release blocked Worker state read");
+    fs::remove_file(&worker_state_path).expect("remove Worker state FIFO");
+    fs::write(&worker_state_path, b"not-json").expect("preserve failed Worker state for release");
+    fs::write(&launch, []).expect("allow runtime launch to continue");
+
+    wait_for_file(&process);
+    wait_for_file(&result);
+    let error = fs::read_to_string(&result).expect("persistence error");
+    assert!(error.contains("cannot persist PID"), "{error}");
+    wait_for_file(&term);
+    wait_for_file(&graceful);
+    let pid: i32 = fs::read_to_string(&process)
+        .expect("runtime process identity")
+        .split_whitespace()
+        .next()
+        .expect("runtime PID")
+        .parse()
+        .expect("numeric runtime PID");
+    let pid = Pid::from_raw(pid).expect("runtime PID");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        test_kill_process_group(pid).is_err(),
+        "runtime process group should be gone after graceful cleanup"
+    );
+    let descendant_pid = fs::read_to_string(&descendant)
+        .expect("descendant process identity")
+        .trim()
+        .parse::<i32>()
+        .expect("numeric descendant PID");
+    let descendant_pid = Pid::from_raw(descendant_pid).expect("descendant PID");
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while test_kill_process(descendant_pid).is_ok() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        test_kill_process(descendant_pid).is_err(),
+        "stubborn descendant should be gone after group cleanup"
+    );
+
+    let output = helper.wait_with_output();
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

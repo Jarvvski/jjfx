@@ -125,3 +125,10 @@ Reset remain pending.
 reconciliation. Busy Workers with absent or live PIDs remain unchanged; a dead
 PID receives the compatible unexpected-exit failure state through a revision-
 checked commit, and missing or malformed Workers remain visible as diagnostics.
+
+2026-07-30 - Added private graceful-then-forced process-group cleanup for
+untracked background Runs. Cleanup now sends TERM, observes the whole group for
+the compatible one-second grace period, escalates to KILL when needed, verifies
+bounded disappearance, and reaps the owned leader. Public integration coverage
+exercises the existing reserved background Run seam with a delayed TERM handler
+and a stubborn descendant. Reset/finalization locking remains pending.
