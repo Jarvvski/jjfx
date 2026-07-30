@@ -1,6 +1,6 @@
 # Port Worker Workspace and Worker Pool lifecycle
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -42,12 +42,12 @@ Test public pool operations in temporary jj repositories. Cover partial provisio
 
 ## Acceptance Criteria
 
-- [ ] Rust-created Worker Pools are usable by Go wsg.
-- [ ] Existing Go-created pools can grow and shrink through Rust.
+- [x] Rust-created Worker Pools are usable by Go wsg.
+- [x] Existing Go-created pools can grow and shrink through Rust.
 - [x] Concurrent Reservations never allocate one Worker twice.
-- [ ] Failed provisioning leaves no registered half-Workspace or claimed Worker.
-- [ ] Ad Hoc Workspace behavior remains unchanged.
-- [ ] `mise run check` is green.
+- [x] Failed provisioning leaves no registered half-Workspace or claimed Worker.
+- [x] Ad Hoc Workspace behavior remains unchanged.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -62,18 +62,22 @@ Test public pool operations in temporary jj repositories. Cover partial provisio
 
 ## Answer
 
-Partially implemented. Creation, growth, and Reservation are done; shrink, named
-removal, pool destruction, and aliases are not. See the 2026-07-30 comment.
+Implemented the complete Worker Workspace and Worker Pool lifecycle in `wsg-core`.
+The shared `Repository` now owns reusable Ad Hoc and Worker Workspace primitives,
+and jjfx delegates its existing Store lifecycle through that seam without changing
+its behavior.
 
-Implemented the pool creation and growth slice. The shared `WorkerPool` module now
-creates compatible pool state, provisions stable random Worker IDs, preserves
-existing membership and metadata while growing, rejects shrink requests,
-serializes ws-cache projection, and compensates failed growth without deleting
-state it no longer owns.
+`WorkerPool` supports compatible creation, growth, shrinking to zero, named
+removal, Reservations, recoverable destruction, and cosmetic aliases. Membership
+transitions use pool-first locking, protect busy Workers, preserve Go wire
+extensions, and serialize correctly with Reservations. Teardown records durable
+cleanup intent, terminates persisted process groups through Run supervision, and
+retains retry state until external cleanup succeeds.
 
-Added public-seam integration coverage for creation, growth, Go-created pools,
-idempotence, failure, cache projection, and concurrent growth. `mise run check`
-passes.
+Public-seam integration tests cover Rust-created and Go-created state, provisioning
+rollback, concurrent Reservations and membership changes, busy protection,
+interrupted cleanup retries, process termination, alias persistence across reset,
+and unchanged Ad Hoc Workspace behavior. `mise run check` passes.
 
 ## Comments
 
@@ -105,3 +109,9 @@ This does not invalidate ticket 08. Run supervision only consumed Workspace
 provisioning, pool growth, and Reservation, all of which are complete; the
 missing operations are pool-membership teardown and cosmetic metadata, which
 Run supervision never touched.
+
+2026-07-30 - Completed the reopened lifecycle scope in four focused local commits:
+`f4b7d4` shares Workspace lifecycle operations, `430e5e` adds resizing and named
+removal, `19f4b2` adds recoverable destruction, and `714aaa` adds aliases. The
+implementation was reviewed for teardown and membership races, all acceptance
+criteria are covered through public seams, and the full repository gate passes.
