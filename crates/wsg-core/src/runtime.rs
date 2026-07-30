@@ -14,7 +14,11 @@ use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 
 use thiserror::Error;
 
-use crate::{Reservation, StateError, StateRevision, WireAgent, WorkerPoolError, WorkerState};
+use crate::pool::RunClearing;
+use crate::{
+    Repository, Reservation, StateError, StateRevision, WireAgent, WorkerId, WorkerPoolError,
+    WorkerState,
+};
 
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(1);
 const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
@@ -227,6 +231,50 @@ impl RunSupervisor {
         }
     }
 
+    /// Abandons a Worker's current Run and returns the Worker to idle.
+    ///
+    /// This is the only operation that ends a Run that is still executing. It
+    /// terminates the recorded Agent Runtime process group, waiting for a
+    /// graceful exit before forcing one, then clears the Run from Worker state.
+    /// No state lock is held while the process group is signaled.
+    ///
+    /// An idle Worker, a Worker whose Run already finished, and a Worker whose
+    /// recorded process is already gone are all reset without an error. A Run
+    /// that a newer Reservation already replaced is reported as superseded and
+    /// left untouched.
+    pub fn reset_run(
+        &self,
+        repository: &Repository,
+        worker: &WorkerId,
+    ) -> Result<RunReset, RunSupervisorError> {
+        let pool = repository.worker_pool();
+        let reset = |source| RunSupervisorError::Reset {
+            worker: worker.clone(),
+            source,
+        };
+        let Some(target) = pool.run_target(worker).map_err(reset)? else {
+            return Ok(RunReset::AlreadyIdle);
+        };
+        let terminated_pid = match target.pid().and_then(live_process_group) {
+            Some(pid) => {
+                terminate_process_group(pid, PROCESS_GROUP_GRACE).map_err(|source| {
+                    RunSupervisorError::ResetCleanup {
+                        worker: worker.clone(),
+                        pid: pid.as_raw_nonzero().get().unsigned_abs(),
+                        source,
+                    }
+                })?;
+                Some(pid.as_raw_nonzero().get().unsigned_abs())
+            }
+            None => None,
+        };
+        match pool.clear_run(worker, target).map_err(reset)? {
+            RunClearing::Cleared => Ok(RunReset::Abandoned { terminated_pid }),
+            RunClearing::AlreadyIdle => Ok(RunReset::AlreadyIdle),
+            RunClearing::Superseded => Ok(RunReset::Superseded),
+        }
+    }
+
     /// Starts one Run detached from the caller's terminal.
     pub fn run_background(
         &self,
@@ -324,6 +372,21 @@ impl BackgroundRun {
         }
         Ok(outcome)
     }
+}
+
+/// The result of abandoning a Worker's Run through [`RunSupervisor::reset_run`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunReset {
+    /// The Run was ended and the Worker is idle again.
+    Abandoned {
+        /// The process group that was terminated, absent when no live Agent
+        /// Runtime process remained.
+        terminated_pid: Option<u32>,
+    },
+    /// The Worker held no Run to abandon and is idle.
+    AlreadyIdle,
+    /// A newer Run owns the Worker, so the requested Run was left untouched.
+    Superseded,
 }
 
 /// The process completion result of an Agent Runtime Run.
@@ -426,6 +489,26 @@ pub enum RunSupervisorError {
         #[source]
         source: io::Error,
     },
+    /// The Worker's Run could not be read or cleared while resetting it.
+    #[error("cannot reset Run for Worker {worker}: {source}")]
+    Reset {
+        /// The Worker whose Run was being abandoned.
+        worker: WorkerId,
+        /// The Worker Pool state failure.
+        #[source]
+        source: WorkerPoolError,
+    },
+    /// The Agent Runtime process group survived Reset, so the Worker keeps its Run.
+    #[error("cannot terminate Run process group {pid} for Worker {worker}: {source}")]
+    ResetCleanup {
+        /// The Worker whose Run was being abandoned.
+        worker: WorkerId,
+        /// The process group that could not be terminated.
+        pid: u32,
+        /// The process cleanup failure.
+        #[source]
+        source: io::Error,
+    },
     /// The Reservation could not be released after a failed launch.
     #[error("{primary}; cannot release Reservation for Worker {worker}: {detail}")]
     ReservationRelease {
@@ -520,6 +603,13 @@ fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
         .ok_or_else(|| io::Error::other("background Run PID does not fit a Unix process ID"))?;
     terminate_process_group(pid, PROCESS_GROUP_GRACE)?;
     background.child.wait().map(|_| ())
+}
+
+/// Returns the process group for `pid` when at least one of its members is
+/// still present, so a Reset can report whether it actually signaled a Run.
+fn live_process_group(pid: u32) -> Option<Pid> {
+    let pid = i32::try_from(pid).ok().and_then(Pid::from_raw)?;
+    test_kill_process_group(pid).is_ok().then_some(pid)
 }
 
 fn terminate_process_group(pid: Pid, grace: Duration) -> io::Result<()> {

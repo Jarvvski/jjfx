@@ -713,10 +713,12 @@ fn snapshot_read_changes_no_file_and_creates_no_lock() {
     let _ = repository.read_worker_pool_snapshot();
     assert_eq!(fs::read(pool_file).expect("pool bytes"), before);
     assert!(!repository.root().join(".jj/pool/.dispatch.lock").exists());
-    assert!(!repository
-        .root()
-        .join(".jj/pool/worker-01.json.lock")
-        .exists());
+    assert!(
+        !repository
+            .root()
+            .join(".jj/pool/worker-01.json.lock")
+            .exists()
+    );
 }
 
 #[test]

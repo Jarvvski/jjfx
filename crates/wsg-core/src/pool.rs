@@ -13,6 +13,10 @@ use crate::{
     StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
+/// Bounded retries for a Reset losing the Worker revision to its own Run's
+/// natural finalization.
+const CLEAR_RUN_ATTEMPTS: usize = 3;
+
 /// A positive number of reusable Worker slots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolCapacity(usize);
@@ -75,6 +79,49 @@ pub(crate) enum PidPersistence {
 pub(crate) enum RunFinalization {
     Applied,
     Stale,
+}
+
+/// The persisted Run a Reset intends to abandon.
+///
+/// The identity fields are the Run-owned values a natural finalization leaves
+/// untouched, so a Reset can tell "my Run finished while I was terminating it"
+/// apart from "a different Run now owns this Worker".
+pub(crate) struct RunTarget {
+    revision: StateRevision<WorkerState>,
+    pid: Option<i64>,
+    ticket: Option<String>,
+    started_at: Option<WireTimestamp>,
+    log_file: Option<String>,
+}
+
+impl RunTarget {
+    fn new(state: &WorkerState, revision: StateRevision<WorkerState>) -> Self {
+        Self {
+            revision,
+            pid: state.pid,
+            ticket: state.ticket.clone(),
+            started_at: state.started_at.clone(),
+            log_file: state.log_file.clone(),
+        }
+    }
+
+    pub(crate) fn pid(&self) -> Option<u32> {
+        self.pid.and_then(|pid| u32::try_from(pid).ok())
+    }
+
+    fn is_same_run(&self, state: &WorkerState) -> bool {
+        self.pid == state.pid
+            && self.ticket == state.ticket
+            && self.started_at == state.started_at
+            && self.log_file == state.log_file
+    }
+}
+
+/// The outcome of returning a Worker to idle after its Run was abandoned.
+pub(crate) enum RunClearing {
+    Cleared,
+    AlreadyIdle,
+    Superseded,
 }
 
 impl Reservation {
@@ -171,16 +218,7 @@ impl Reservation {
             }
         };
         let mut state = loaded.value;
-        state.status = WireStatus::new("idle");
-        state.agent = None;
-        state.ticket = None;
-        state.pid = None;
-        state.started_at = None;
-        state.completed_at = None;
-        state.log_file = None;
-        state.branch_name = None;
-        state.exit_code = None;
-        state.error = None;
+        clear_run_fields(&mut state);
         match worker_state.commit(
             Expected::Match(self.worker_revision.clone()),
             StateChange::Replace(state),
@@ -214,6 +252,8 @@ pub enum WorkerPoolError {
     WorkerStateMissing { worker: WorkerId },
     #[error("Worker {worker} changed before its Reservation could be released")]
     ReleaseConflict { worker: WorkerId },
+    #[error("Worker {worker} kept changing while its Run was being reset")]
+    ResetConflict { worker: WorkerId },
     #[error("cannot reconcile Worker {worker}: {source}")]
     Reconciliation {
         worker: WorkerId,
@@ -301,6 +341,76 @@ impl WorkerPool {
                 source,
             }),
         }
+    }
+
+    /// Reads the Run a Reset would abandon, or `None` when the Worker is idle.
+    pub(crate) fn run_target(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<Option<RunTarget>, WorkerPoolError> {
+        let loaded = match self.worker_repository(worker).load()? {
+            Loaded::Present(versioned) => versioned,
+            Loaded::Missing => {
+                return Err(WorkerPoolError::WorkerStateMissing {
+                    worker: worker.clone(),
+                });
+            }
+        };
+        if loaded.value.status.as_str() == WorkerStatus::Idle.as_str() {
+            return Ok(None);
+        }
+        let (state, revision) = loaded.into_parts();
+        Ok(Some(RunTarget::new(&state, revision)))
+    }
+
+    /// Returns a Worker to idle once its Run is no longer executing.
+    ///
+    /// A natural finalization of the same Run only changes completion fields,
+    /// so the clearing retries against the fresh revision. A Worker that a
+    /// different Run already owns is reported as superseded and left untouched.
+    pub(crate) fn clear_run(
+        &self,
+        worker: &WorkerId,
+        target: RunTarget,
+    ) -> Result<RunClearing, WorkerPoolError> {
+        let repository = self.worker_repository(worker);
+        let mut expected = target.revision.clone();
+        for _ in 0..CLEAR_RUN_ATTEMPTS {
+            let loaded = match repository.load()? {
+                Loaded::Present(versioned) => versioned,
+                Loaded::Missing => {
+                    return Err(WorkerPoolError::WorkerStateMissing {
+                        worker: worker.clone(),
+                    });
+                }
+            };
+            if loaded.value.status.as_str() == WorkerStatus::Idle.as_str() {
+                return Ok(RunClearing::AlreadyIdle);
+            }
+            if !target.is_same_run(&loaded.value) {
+                return Ok(RunClearing::Superseded);
+            }
+            let mut state = loaded.value;
+            clear_run_fields(&mut state);
+            match repository.commit(Expected::Match(expected), StateChange::Replace(state))? {
+                CommitOutcome::Applied(_) => return Ok(RunClearing::Cleared),
+                CommitOutcome::Conflict(Loaded::Present(versioned)) => {
+                    expected = versioned.revision().clone();
+                }
+                CommitOutcome::Conflict(Loaded::Missing) => {
+                    return Err(WorkerPoolError::WorkerStateMissing {
+                        worker: worker.clone(),
+                    });
+                }
+            }
+        }
+        Err(WorkerPoolError::ResetConflict {
+            worker: worker.clone(),
+        })
+    }
+
+    fn worker_repository(&self, worker: &WorkerId) -> crate::WorkerStateRepository {
+        self.repository.state_store().worker(worker.clone())
     }
 
     /// Reserves the first idle Worker for `ticket` in pool order.
@@ -529,6 +639,21 @@ fn remote_slug(remote: &str) -> String {
         (Some(name), Some(owner)) => format!("{owner}/{name}"),
         _ => remote.to_owned(),
     }
+}
+
+/// Clears every Run-owned Worker field, leaving alias metadata and unknown
+/// persisted extensions to the caller's loaded document.
+fn clear_run_fields(state: &mut WorkerState) {
+    state.status = WireStatus::new(WorkerStatus::Idle.as_str());
+    state.agent = None;
+    state.ticket = None;
+    state.pid = None;
+    state.started_at = None;
+    state.completed_at = None;
+    state.log_file = None;
+    state.branch_name = None;
+    state.exit_code = None;
+    state.error = None;
 }
 
 fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {
@@ -935,7 +1060,7 @@ fn process_is_alive_i64(pid: i64) -> bool {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    use rustix::process::{test_kill_process, Pid};
+    use rustix::process::{Pid, test_kill_process};
 
     i32::try_from(pid)
         .ok()

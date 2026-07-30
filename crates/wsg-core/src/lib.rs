@@ -18,7 +18,7 @@ pub use pool::{
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    BackgroundRun, RunOutcome, RunRequest, RunSupervisor, RunSupervisorError,
+    BackgroundRun, RunOutcome, RunRequest, RunReset, RunSupervisor, RunSupervisorError,
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,

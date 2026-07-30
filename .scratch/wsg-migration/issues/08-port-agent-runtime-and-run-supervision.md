@@ -1,6 +1,6 @@
 # Port Agent Runtime invocation and Run supervision
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -42,12 +42,12 @@ Use fake executable scripts for deterministic provider argument, logging, exit-c
 
 ## Acceptance Criteria
 
-- [ ] Claude Code and Codex commands preserve current invocation behavior.
-- [ ] Foreground and background Runs produce compatible logs.
+- [x] Claude Code and Codex commands preserve current invocation behavior.
+- [x] Foreground and background Runs produce compatible logs.
 - [x] Successful launch returns only after PID persistence.
 - [x] Dead busy Workers reconcile to done or failed exactly once.
-- [ ] Reset terminates descendants and cannot finalize a later Run.
-- [ ] `mise run check` is green.
+- [x] Reset terminates descendants and cannot finalize a later Run.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -132,3 +132,40 @@ the compatible one-second grace period, escalates to KILL when needed, verifies
 bounded disappearance, and reaps the owned leader. Public integration coverage
 exercises the existing reserved background Run seam with a delayed TERM handler
 and a stubborn descendant. Reset/finalization locking remains pending.
+
+2026-07-30 - Completed the ticket with `RunSupervisor::reset_run()`, the single
+public seam that abandons a Worker's current Run. It reads the target Run, ends
+the recorded process group with the compatible graceful-then-forced sequence
+while holding no state lock, then clears the Run under the Worker lock.
+
+Run identity (PID, Ticket, start timestamp, log path) distinguishes the two
+races that look alike through a bare revision conflict. A natural finalization
+of the same Run only rewrites completion fields, so the clearing retries against
+the fresh revision and the Worker still reaches idle. A Run that a newer
+Reservation already owns is reported as `Superseded` and left untouched, and the
+abandoned Run's own waiter still cannot finalize it.
+
+Idle, terminal, missing-PID, and dead-PID Workers reset without an error;
+missing and unreadable Worker state fail without a write; a process group that
+survives cleanup returns an error before any state change, so Reset never
+exposes idle capacity it did not reclaim. Coverage adds real process-group tests
+with a stubborn descendant plus Reset races against natural finalization,
+dead-PID reconciliation, and a concurrent Reset. Provider log parsing, Agent
+Session continuation, and the frontend-neutral Reset action remain ticket 09.
+
+Process-group termination and every state transition stay private to the shared
+library; `RunReset` is the only new public type.
+
+The two remaining boxes are closed by coverage landed in earlier slices rather
+than by new work: provider invocation by the fresh and resumed Claude/Codex
+command tests plus the capability-flag test, and compatible logs by the
+foreground mirroring, truncation, and concurrent-drain tests together with the
+background child-owned log test.
+
+Source-validated compatibility note: a foreground Run intentionally records no
+PID and leads no process group, matching Go's `startForeground`, which uses a
+plain synchronous run with no `Setpgid` and never calls `SetPID`. A foreground
+Run is therefore owned by the terminal that invoked it, and `reset_run` clears
+such a Worker while reporting no terminated process group. Giving foreground
+Runs their own process group would be a deliberate divergence from the
+compatibility peer, so it is not done here.
