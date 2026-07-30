@@ -1,0 +1,15 @@
+# rustfmt defaults, with the edition stated explicitly.
+#
+# `cargo fmt` reads the edition from Cargo.toml and passes `--edition 2024`, but
+# a bare `rustfmt <file>` (what editor format-on-save and agent tooling invoke)
+# defaults to edition 2015. That split produced two failure modes: files using
+# 2024-only syntax such as let chains failed to parse and were silently skipped,
+# and the rest were reformatted with 2015 style rules - most visibly the older
+# `use` sort order - which `cargo fmt` then reverted, so the two tools fought
+# over the same lines. Declaring both keys here makes every invocation path
+# agree, because rustfmt reads this file from the target's ancestor directories.
+#
+# These are not style overrides. They pin which rustfmt default set applies, so
+# the repo convention stays "rustfmt defaults, no hand-formatting".
+edition = "2024"
+style_edition = "2024"
