@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::{cache, jj};
+use wsg_core::Repository;
 
 #[cfg(test)]
 /// Create an isolated local jj repository with signing disabled for tests.
@@ -40,7 +41,7 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
         "jj git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    repo
+    repo.canonicalize().unwrap()
 }
 
 /// A single workspace. `path` is `None` when jj knows the workspace but the
@@ -83,6 +84,7 @@ pub(crate) const DEFAULT_WORKSPACE: &str = "default";
 /// Derive the on-disk path for a new named workspace: a sibling of the repo root
 /// named `<repo>-<name>`. jj does not record workspace paths (spike 02), so jjfx
 /// chooses this and persists it in the ws-cache (ADR 0006).
+#[cfg(test)]
 fn new_workspace_path(repo_root: &Path, name: &str) -> PathBuf {
     let base = repo_root
         .file_name()
@@ -146,22 +148,16 @@ impl Store {
             anyhow::bail!("workspace '{name}' already exists");
         }
 
-        let path = new_workspace_path(&self.repo_root, name);
-        jj::add_workspace(&self.repo_root, name, &path).context("create failed")?;
-        let cache_path = cache::path(&self.repo_root);
-        let mut entries = cache::read(&cache_path).unwrap_or_default();
-        if !entries.iter().any(|(entry_name, _)| entry_name == name) {
-            entries.push((name.to_string(), path.clone()));
-        }
-        // The mirror is deliberately lossy and best-effort (ADR 0006). jj is
-        // already authoritative for existence, so projection failure must not
-        // turn a successfully-created workspace into a reported failure.
-        let _ = cache::write_through(&cache_path, &entries);
+        let repository = Repository::open(&self.repo_root).context("create failed")?;
+        let workspace = repository
+            .create_ad_hoc_workspace(name)
+            .context("create failed")?;
+        let created = CreatedWorkspace {
+            name: workspace.name().to_owned(),
+            path: workspace.path().to_owned(),
+        };
         self.reload();
-        Ok(CreatedWorkspace {
-            name: name.to_string(),
-            path,
-        })
+        Ok(created)
     }
 
     /// Reconcile the Store from jj and the ws-cache mirror.
@@ -179,20 +175,10 @@ impl Store {
         let path = self
             .workspace(name)
             .and_then(|workspace| workspace.path.clone());
-        jj::forget_workspace(&self.repo_root, name).context("delete failed")?;
-        if let Some(path) = path
-            && path != self.repo_root
-            && path.is_dir()
-        {
-            let _ = std::fs::remove_dir_all(path);
-        }
-        let cache_path = cache::path(&self.repo_root);
-        let entries: Vec<_> = cache::read(&cache_path)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|(entry_name, _)| entry_name != name)
-            .collect();
-        let _ = cache::write_through(&cache_path, &entries);
+        let repository = Repository::open(&self.repo_root).context("delete failed")?;
+        repository
+            .remove_ad_hoc_workspace(name, path.as_deref())
+            .context("delete failed")?;
         self.reload();
         Ok(())
     }

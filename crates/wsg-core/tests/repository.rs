@@ -117,6 +117,72 @@ fn opens_a_secondary_workspace_at_the_default_workspace_root() {
 }
 
 #[test]
+fn creates_and_removes_an_ad_hoc_workspace_through_the_shared_repository() {
+    let (_temporary_directory, repository) = local_repository();
+
+    let workspace = repository
+        .create_ad_hoc_workspace(" feat ")
+        .expect("Ad Hoc Workspace should be created");
+    let expected_path = repository.root().with_file_name(format!(
+        "{}-feat",
+        repository
+            .root()
+            .file_name()
+            .expect("repository name")
+            .to_string_lossy()
+    ));
+
+    assert_eq!(workspace.name(), "feat");
+    assert_eq!(workspace.path(), expected_path);
+    assert!(workspace_names(repository.root()).contains(&"feat".to_owned()));
+    assert!(
+        fs::read_to_string(repository.root().join(".jj/ws-cache"))
+            .expect("workspace cache")
+            .lines()
+            .any(|line| line == format!("feat\t{}", expected_path.display()))
+    );
+
+    repository
+        .remove_ad_hoc_workspace(workspace.name(), Some(workspace.path()))
+        .expect("Ad Hoc Workspace should be removed");
+
+    assert!(!workspace_names(repository.root()).contains(&"feat".to_owned()));
+    assert!(!expected_path.exists());
+    assert!(
+        !fs::read_to_string(repository.root().join(".jj/ws-cache"))
+            .expect("workspace cache")
+            .lines()
+            .any(|line| line.starts_with("feat\t"))
+    );
+}
+
+#[test]
+fn ad_hoc_workspace_cache_failures_do_not_reverse_successful_jj_mutations() {
+    let (_temporary_directory, repository) = local_repository();
+    let cache = repository.root().join(".jj/ws-cache");
+    fs::create_dir(&cache).expect("cache collision directory");
+
+    let workspace = repository
+        .create_ad_hoc_workspace("feat")
+        .expect("jj creation should remain successful");
+
+    assert!(workspace.path().is_dir());
+    assert!(workspace_names(repository.root()).contains(&"feat".to_owned()));
+}
+
+#[test]
+fn ad_hoc_workspace_removal_protects_default() {
+    let (_temporary_directory, repository) = local_repository();
+
+    let error = repository
+        .remove_ad_hoc_workspace("default", Some(repository.root()))
+        .expect_err("default Workspace should be protected");
+
+    assert_eq!(error.to_string(), "the default workspace cannot be deleted");
+    assert!(repository.root().is_dir());
+}
+
+#[test]
 fn provisions_a_compatible_worker_workspace_and_idle_state() {
     let (_temporary_directory, repository) = local_repository();
     let worker = WorkerId::parse("worker-01").expect("Worker ID should be valid");

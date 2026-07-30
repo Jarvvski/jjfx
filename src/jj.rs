@@ -88,17 +88,12 @@ pub fn workspace_names(repo_root: &Path) -> Vec<String> {
 /// Create a new named workspace rooted at `dest` (`jj workspace add`). Workspace
 /// lifecycle ordering lives in [`crate::store::Store`]; this function is only
 /// the local jj adapter for its critical mutation step.
+#[cfg(test)]
 pub(crate) fn add_workspace(repo_root: &Path, name: &str, dest: &Path) -> anyhow::Result<()> {
     run_mut(
         repo_root,
         &["workspace", "add", "--name", name, &dest.to_string_lossy()],
     )
-}
-
-/// Forget a workspace (`jj workspace forget`). Workspace cleanup and mirror
-/// ordering remain the responsibility of [`crate::store::Store`].
-pub(crate) fn forget_workspace(repo_root: &Path, name: &str) -> anyhow::Result<()> {
-    run_mut(repo_root, &["workspace", "forget", name])
 }
 
 /// Source revset for `tidyws`: idle, empty, undescribed workspace working-copies

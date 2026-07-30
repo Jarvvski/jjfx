@@ -26,7 +26,7 @@ pub use state::{
     StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
-pub use workspace::{WorkerWorkspace, WorkerWorkspaceError};
+pub use workspace::{AdHocWorkspace, AdHocWorkspaceError, WorkerWorkspace, WorkerWorkspaceError};
 
 /// The migration capabilities currently exposed by a discovered repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +88,23 @@ impl Repository {
     /// Opens the deep Worker Pool lifecycle module for this repository.
     pub fn worker_pool(&self) -> WorkerPool {
         WorkerPool::new(self.clone())
+    }
+
+    /// Creates an Ad Hoc Workspace at the compatible sibling path.
+    pub fn create_ad_hoc_workspace(
+        &self,
+        requested_name: &str,
+    ) -> Result<AdHocWorkspace, AdHocWorkspaceError> {
+        workspace::create_ad_hoc(self, requested_name)
+    }
+
+    /// Removes an Ad Hoc Workspace and its optional known directory.
+    pub fn remove_ad_hoc_workspace(
+        &self,
+        name: &str,
+        known_path: Option<&Path>,
+    ) -> Result<(), AdHocWorkspaceError> {
+        workspace::remove_ad_hoc(self, name, known_path)
     }
 
     /// Provisions the Worker Workspace and idle Worker state for `worker_id`.

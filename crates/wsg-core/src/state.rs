@@ -717,6 +717,48 @@ repository_methods!(
     |s: &WorkerStateRepository| format!("Worker {}", s.worker),
     validate_worker
 );
+
+impl WorkerStateRepository {
+    /// Removes detached Worker state and its log together under the Worker lock.
+    ///
+    /// When `expected` is present, a newer Worker state is left untouched and
+    /// reported as a conflict. With no expected revision the operation is
+    /// idempotent and removes whichever detached state remains.
+    pub(crate) fn remove_detached(
+        &self,
+        expected: Option<StateRevision<WorkerState>>,
+    ) -> Result<bool, StateError> {
+        let path = self
+            .root
+            .join(POOL_DIRECTORY)
+            .join(format!("{}.json", self.worker));
+        let subject = format!("Worker {}", self.worker);
+        with_locks(&[sidecar(&path)], &subject, || {
+            let current = load_state(&path, &subject, &validate_worker)?;
+            if let Some(expected) = expected
+                && !matches!(
+                    &current,
+                    Loaded::Present(versioned) if expected.bytes == versioned.revision.bytes
+                )
+            {
+                return Ok(false);
+            }
+            let log = self
+                .root
+                .join(POOL_DIRECTORY)
+                .join(format!("{}.log", self.worker));
+            for target in [&log, &path] {
+                match fs::remove_file(target) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(StateError::new("remove", &subject, error)),
+                }
+            }
+            Ok(true)
+        })
+    }
+}
+
 impl DispatchGroupStateRepository {
     fn path(&self) -> PathBuf {
         self.root.join(POOL_DIRECTORY).join(format!(
