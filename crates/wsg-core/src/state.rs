@@ -22,6 +22,7 @@ use crate::Repository;
 const POOL_PATH: &str = ".jj/pool.json";
 const POOL_DIRECTORY: &str = ".jj/pool";
 const POOL_LOCK: &str = ".jj/pool/.dispatch.lock";
+const DESTROY_MARKER: &str = ".jj/pool/.destroying";
 const CLEANUP_SUFFIX: &str = ".cleanup";
 
 type Extensions = BTreeMap<String, Value>;
@@ -506,7 +507,7 @@ pub(crate) enum PoolMembershipOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DetachedCleanupStatus {
     Ready,
-    Busy,
+    Busy { pid: Option<u32> },
     NotDetached,
 }
 
@@ -557,6 +558,184 @@ impl StateStore {
             root: self.root.clone(),
             parent,
         }
+    }
+
+    /// Atomically detaches every current Worker while retaining durable cleanup state.
+    pub(crate) fn detach_pool_for_destroy(&self) -> Result<Vec<WorkerId>, StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            write_destroy_marker(&self.root, subject)?;
+            let pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => return Ok(Vec::new()),
+            };
+            if pool.workers.is_empty() {
+                return Ok(Vec::new());
+            }
+            let workers = pool.workers.clone();
+            let mut locks = workers
+                .iter()
+                .map(|worker| {
+                    self.root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.json.lock"))
+                })
+                .collect::<Vec<_>>();
+            locks.sort();
+            with_locks(&locks, subject, || {
+                let mut pool =
+                    match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                        Loaded::Present(versioned) => versioned.value,
+                        Loaded::Missing => return Ok(Vec::new()),
+                    };
+                let workers = pool.workers.clone();
+                for worker in &workers {
+                    write_cleanup_marker(&self.root, worker, subject)?;
+                }
+                pool.workers.clear();
+                pool.names.clear();
+                pool.size = 0;
+                write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                Ok(workers)
+            })
+        })
+    }
+
+    /// Removes Pool state and every non-lock Pool artifact under compatible locks.
+    pub(crate) fn finish_pool_destroy(&self) -> Result<(), StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            if let Loaded::Present(pool) =
+                load_state(&self.root.join(POOL_PATH), subject, &validate_pool)?
+                && !pool.value.workers.is_empty()
+            {
+                return Err(StateError::new(
+                    "finish destroy",
+                    subject,
+                    "Pool membership changed during destruction",
+                ));
+            }
+            let directory = self.root.join(POOL_DIRECTORY);
+            let entries = fs::read_dir(&directory)
+                .map_err(|error| StateError::new("inspect destroy", subject, error))?;
+            let mut locks = Vec::new();
+            for entry in entries {
+                let entry =
+                    entry.map_err(|error| StateError::new("inspect destroy", subject, error))?;
+                let path = entry.path();
+                if path
+                    .extension()
+                    .is_some_and(|extension| extension == "json")
+                {
+                    locks.push(sidecar(&path));
+                }
+            }
+            locks.sort();
+            locks.dedup();
+            with_locks(&locks, subject, || {
+                let entries = fs::read_dir(&directory)
+                    .map_err(|error| StateError::new("inspect destroy", subject, error))?;
+                for entry in entries {
+                    let entry = entry
+                        .map_err(|error| StateError::new("inspect destroy", subject, error))?;
+                    let path = entry.path();
+                    if path == self.root.join(DESTROY_MARKER)
+                        || path
+                            .file_name()
+                            .is_some_and(|name| name.to_string_lossy().ends_with(".lock"))
+                    {
+                        continue;
+                    }
+                    let is_directory = entry
+                        .file_type()
+                        .map_err(|error| StateError::new("inspect destroy", subject, error))?
+                        .is_dir();
+                    let result = if is_directory {
+                        fs::remove_dir_all(&path)
+                    } else {
+                        fs::remove_file(&path)
+                    };
+                    if let Err(error) = result
+                        && error.kind() != io::ErrorKind::NotFound
+                    {
+                        return Err(StateError::new(
+                            "remove destroy artifact",
+                            path.display().to_string(),
+                            error,
+                        ));
+                    }
+                }
+                remove_file_if_present(&self.root.join(POOL_PATH), "remove", subject)?;
+                remove_file_if_present(&self.root.join(DESTROY_MARKER), "finish destroy", subject)
+            })
+        })
+    }
+
+    /// Commits externally provisioned growth only while Pool destruction is absent.
+    pub(crate) fn commit_pool_growth(
+        &self,
+        expected: StateRevision<PoolState>,
+        next: PoolState,
+    ) -> Result<CommitOutcome<PoolState>, StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            let current = load_state(&self.root.join(POOL_PATH), subject, &validate_pool)?;
+            if self.root.join(DESTROY_MARKER).exists() {
+                return Ok(CommitOutcome::Conflict(current));
+            }
+            let matches = matches!(
+                &current,
+                Loaded::Present(versioned) if versioned.revision.bytes == expected.bytes
+            );
+            if !matches {
+                return Ok(CommitOutcome::Conflict(current));
+            }
+            validate_pool(&next)
+                .map_err(|error| StateError::new("validate growth for", subject, error))?;
+            write_atomic(&self.root.join(POOL_PATH), &next, subject)?;
+            load_state(&self.root.join(POOL_PATH), subject, &validate_pool)
+                .map(CommitOutcome::Applied)
+        })
+    }
+
+    /// Persists a launched PID only while its exact Reservation still owns Pool capacity.
+    pub(crate) fn persist_reserved_pid(
+        &self,
+        worker: &WorkerId,
+        expected: StateRevision<WorkerState>,
+        pid: u32,
+    ) -> Result<CommitOutcome<WorkerState>, StateError> {
+        let subject = format!("Worker {worker}");
+        with_locks(&[self.root.join(POOL_LOCK)], &subject, || {
+            let worker_path = self
+                .root
+                .join(POOL_DIRECTORY)
+                .join(format!("{worker}.json"));
+            let worker_lock = sidecar(&worker_path);
+            with_locks(&[worker_lock], &subject, || {
+                let current = load_state(&worker_path, &subject, &validate_worker)?;
+                let pool = load_state(&self.root.join(POOL_PATH), "Worker Pool", &validate_pool)?;
+                let owns_capacity = matches!(
+                    pool,
+                    Loaded::Present(ref versioned)
+                        if versioned.value.workers.iter().any(|member| member == worker)
+                ) && !self.root.join(DESTROY_MARKER).exists()
+                    && !cleanup_marker_path(&self.root, worker).exists();
+                let revision_matches = matches!(
+                    &current,
+                    Loaded::Present(versioned) if versioned.revision.bytes == expected.bytes
+                );
+                if !owns_capacity || !revision_matches {
+                    return Ok(CommitOutcome::Conflict(current));
+                }
+                let Loaded::Present(mut versioned) = current else {
+                    return Ok(CommitOutcome::Conflict(Loaded::Missing));
+                };
+                versioned.value.pid = Some(i64::from(pid));
+                write_atomic(&worker_path, &versioned.value, &subject)?;
+                load_state(&worker_path, &subject, &validate_worker).map(CommitOutcome::Applied)
+            })
+        })
     }
 
     /// Atomically detaches the stable Pool tail when every selected Worker is non-busy.
@@ -737,7 +916,9 @@ impl StateStore {
                     .join(format!("{worker}.json"));
                 match load_state(&path, &subject, &validate_worker)? {
                     Loaded::Present(versioned) if versioned.value.status.as_str() == "busy" => {
-                        Ok(DetachedCleanupStatus::Busy)
+                        Ok(DetachedCleanupStatus::Busy {
+                            pid: versioned.value.pid.and_then(|pid| u32::try_from(pid).ok()),
+                        })
                     }
                     Loaded::Present(_) | Loaded::Missing => Ok(DetachedCleanupStatus::Ready),
                 }
@@ -785,6 +966,13 @@ impl StateStore {
     ) -> Result<ReservationOutcome, StateError> {
         let pool_subject = "Worker Pool";
         with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
+            if self.root.join(DESTROY_MARKER).exists() {
+                return Err(StateError::new(
+                    "reserve",
+                    pool_subject,
+                    "Pool destruction is in progress",
+                ));
+            }
             let pool = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
@@ -1041,6 +1229,18 @@ impl DispatchGroupStateRepository {
 fn cleanup_marker_path(root: &Path, worker: &WorkerId) -> PathBuf {
     root.join(POOL_DIRECTORY)
         .join(format!("{worker}{CLEANUP_SUFFIX}"))
+}
+
+fn write_destroy_marker(root: &Path, subject: &str) -> Result<(), StateError> {
+    let marker = root.join(DESTROY_MARKER);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(marker)
+        .map_err(|error| StateError::new("mark destroy", subject, error))?;
+    file.sync_all()
+        .map_err(|error| StateError::new("sync destroy marker", subject, error))
 }
 
 fn write_cleanup_marker(root: &Path, worker: &WorkerId, subject: &str) -> Result<(), StateError> {

@@ -155,16 +155,10 @@ impl Reservation {
     }
 
     pub(crate) fn persist_pid(&self, pid: u32) -> Result<PidPersistence, StateError> {
-        let worker_state = self.repository.state_store().worker(self.worker_id.clone());
-        let loaded = match worker_state.load()? {
-            Loaded::Present(versioned) => versioned,
-            Loaded::Missing => return Ok(PidPersistence::Missing),
-        };
-        let mut state = loaded.value;
-        state.pid = Some(i64::from(pid));
-        match worker_state.commit(
-            Expected::Match(self.worker_revision.clone()),
-            StateChange::Replace(state),
+        match self.repository.state_store().persist_reserved_pid(
+            &self.worker_id,
+            self.worker_revision.clone(),
+            pid,
         )? {
             CommitOutcome::Applied(Loaded::Present(versioned)) => {
                 Ok(PidPersistence::Persisted(versioned.revision().clone()))
@@ -282,6 +276,11 @@ pub enum WorkerPoolError {
     Compensation(String),
     #[error("Worker Pool membership changed but detached Worker cleanup failed: {0}")]
     Cleanup(String),
+    #[error("Worker Pool destruction left residual Workers {workers:?}: {details}")]
+    DestroyCleanup {
+        workers: Vec<WorkerId>,
+        details: String,
+    },
 }
 
 /// The deep Worker Pool lifecycle module for one repository.
@@ -552,6 +551,77 @@ impl WorkerPool {
         }
     }
 
+    /// Destroys the Pool, terminating recorded Runs and removing all Pool resources.
+    ///
+    /// Membership is detached before any process or Workspace operation runs.
+    /// Worker state and cleanup markers remain durable until external cleanup
+    /// succeeds, so repeating this operation resumes an interrupted destroy.
+    pub fn destroy(&self) -> Result<(), WorkerPoolError> {
+        let state_store = self.repository.state_store();
+        state_store.detach_pool_for_destroy()?;
+        let workers = state_store.detached_cleanup_markers()?;
+        self.destroy_detached(&workers)?;
+        state_store.finish_pool_destroy()?;
+        Ok(())
+    }
+
+    fn destroy_detached(&self, workers: &[WorkerId]) -> Result<(), WorkerPoolError> {
+        let state_store = self.repository.state_store();
+        let mut residual = Vec::new();
+        let mut failures = Vec::new();
+        for worker in workers {
+            let status = match state_store.detached_cleanup_status(worker) {
+                Ok(status) => status,
+                Err(error) => {
+                    residual.push(worker.clone());
+                    failures.push(format!("{worker}: {error}"));
+                    continue;
+                }
+            };
+            match status {
+                crate::state::DetachedCleanupStatus::Busy { pid: Some(pid) } => {
+                    if let Err(error) = crate::RunSupervisor::new().terminate_recorded_process(pid)
+                    {
+                        residual.push(worker.clone());
+                        failures.push(format!(
+                            "{worker}: cannot terminate process group {pid}: {error}"
+                        ));
+                        continue;
+                    }
+                }
+                crate::state::DetachedCleanupStatus::Busy { pid: None }
+                | crate::state::DetachedCleanupStatus::Ready => {}
+                crate::state::DetachedCleanupStatus::NotDetached => continue,
+            }
+            if let Err(error) = crate::workspace::teardown_detached(&self.repository, worker) {
+                residual.push(worker.clone());
+                failures.push(format!("{worker}: {error}"));
+                continue;
+            }
+            match state_store.finish_detached_cleanup(worker) {
+                Ok(true) => {}
+                Ok(false) => {
+                    residual.push(worker.clone());
+                    failures.push(format!(
+                        "{worker}: Worker rejoined the Pool during destruction"
+                    ));
+                }
+                Err(error) => {
+                    residual.push(worker.clone());
+                    failures.push(format!("{worker}: {error}"));
+                }
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerPoolError::DestroyCleanup {
+                workers: residual,
+                details: failures.join("; "),
+            })
+        }
+    }
+
     fn current_capacity(&self) -> Result<PoolCapacity, WorkerPoolError> {
         let loaded = self.repository.state_store().pool().load()?;
         let Loaded::Present(pool) = loaded else {
@@ -614,10 +684,10 @@ impl WorkerPool {
         next.size = i64::try_from(capacity.as_usize())
             .map_err(|_| WorkerPoolError::InvalidSize(next.size))?;
         next.workers.extend(added.iter().cloned());
-        let committed = pool.commit(
-            Expected::Match(current.revision().clone()),
-            StateChange::Replace(next),
-        );
+        let committed = self
+            .repository
+            .state_store()
+            .commit_pool_growth(current.revision().clone(), next);
         match committed {
             Ok(CommitOutcome::Applied(_)) => Ok(PoolResize {
                 capacity,
@@ -661,7 +731,7 @@ impl WorkerPool {
                         Err(error) => failures.push(format!("{worker}: {error}")),
                     }
                 }
-                Ok(crate::state::DetachedCleanupStatus::Busy) => busy.push(worker.clone()),
+                Ok(crate::state::DetachedCleanupStatus::Busy { .. }) => busy.push(worker.clone()),
                 Ok(crate::state::DetachedCleanupStatus::NotDetached) => {}
                 Err(error) => failures.push(format!("{worker}: {error}")),
             }

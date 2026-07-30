@@ -275,6 +275,25 @@ impl RunSupervisor {
         }
     }
 
+    /// Terminates a persisted background Run without changing Worker state.
+    ///
+    /// Pool destruction uses this after atomically detaching membership. No
+    /// state lock is held while the process group is signaled.
+    pub(crate) fn terminate_recorded_process(&self, pid: u32) -> io::Result<()> {
+        let pid = i32::try_from(pid)
+            .ok()
+            .and_then(Pid::from_raw)
+            .ok_or_else(|| io::Error::other("recorded Run PID does not fit a Unix process ID"))?;
+        match test_kill_process_group(pid) {
+            Ok(()) => terminate_process_group(pid, PROCESS_GROUP_GRACE),
+            Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
+            Err(error) => Err(io::Error::new(
+                error.kind(),
+                format!("cannot probe recorded process group {pid}: {error}"),
+            )),
+        }
+    }
+
     /// Starts one Run detached from the caller's terminal.
     pub fn run_background(
         &self,
@@ -601,8 +620,15 @@ fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
         .ok()
         .and_then(Pid::from_raw)
         .ok_or_else(|| io::Error::other("background Run PID does not fit a Unix process ID"))?;
-    terminate_process_group(pid, PROCESS_GROUP_GRACE)?;
-    background.child.wait().map(|_| ())
+    let termination = terminate_process_group(pid, PROCESS_GROUP_GRACE);
+    background.child.wait()?;
+    match termination {
+        Ok(()) => Ok(()),
+        Err(primary) => match test_kill_process_group(pid) {
+            Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
+            _ => Err(primary),
+        },
+    }
 }
 
 /// Returns the process group for `pid` when at least one of its members is

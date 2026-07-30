@@ -1,7 +1,10 @@
+use std::env;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tempfile::TempDir;
@@ -10,6 +13,91 @@ use wsg_core::{AgentRuntime, Repository, SnapshotDiagnosticKind, WorkerStatus};
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
 fn fixture(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).expect("fixture")
+}
+
+#[test]
+#[ignore]
+fn stale_reservation_after_destroy_helper() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let reservation = pool
+        .reserve_named(worker.clone(), "AMBA-STALE")
+        .expect("reserve Worker");
+    let repo_state = repository.root().join(".jj/repo");
+    let disabled = repository.root().join(".jj/repo-disabled");
+    fs::rename(&repo_state, &disabled).expect("disable jj repository");
+    pool.destroy()
+        .expect_err("destroy should stop after detaching membership");
+    fs::rename(&disabled, &repo_state).expect("restore jj repository");
+
+    let workspace = repository
+        .root()
+        .parent()
+        .expect("repository parent")
+        .join(format!(
+            "{}-workspaces/{worker}",
+            repository
+                .root()
+                .file_name()
+                .expect("repository name")
+                .to_string_lossy()
+        ));
+    fs::create_dir_all(&workspace).expect("recreate detached Workspace path");
+    let error = wsg_core::RunSupervisor::new()
+        .run_reserved_background(
+            &reservation,
+            wsg_core::AgentRuntimeInvocation::new("stale reservation"),
+        )
+        .expect_err("detached Reservation must not persist a launched PID");
+    assert!(
+        matches!(
+            error,
+            wsg_core::RunSupervisorError::PersistPidConflict { worker: ref rejected }
+                if rejected == &worker
+        ),
+        "unexpected stale Reservation error: {error:?}"
+    );
+    let wsg_core::Loaded::Present(state) = repository
+        .state_store()
+        .worker(worker)
+        .load()
+        .expect("Worker state")
+    else {
+        panic!("detached Worker state should remain for destroy recovery");
+    };
+    assert_eq!(state.value.pid, None);
+    pool.destroy().expect("destroy should resume");
+}
+
+#[test]
+#[ignore]
+fn destroy_live_process_helper() {
+    let pid_path = env::var_os("WSG_DESTROY_PID").expect("PID path");
+    let mut child = Command::new("sh")
+        .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done"])
+        .process_group(0)
+        .spawn()
+        .expect("spawn live Run");
+    fs::write(pid_path, child.id().to_string()).expect("write live PID");
+    let status = child.wait().expect("wait for destroyed Run");
+    assert!(status.success(), "Run should handle TERM successfully");
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn local_repository_with_origin() -> (TempDir, Repository) {
@@ -92,6 +180,354 @@ fn pool_capacity_accepts_an_empty_pool() {
     assert_eq!(capacity.as_usize(), 0);
     #[cfg(target_pointer_width = "64")]
     assert!(wsg_core::PoolCapacity::new(usize::MAX).is_err());
+}
+
+#[test]
+fn stale_reservation_cannot_persist_a_pid_after_destroy_detaches_membership() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temporary_directory = tempfile::tempdir().expect("temporary directory");
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("runtime bin");
+    let runtime = bin.join("claude");
+    fs::write(
+        &runtime,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n",
+    )
+    .expect("fake runtime");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o755)).expect("runtime permissions");
+    let mut paths = vec![bin.clone()];
+    paths.extend(env::split_paths(
+        &env::var_os("PATH").expect("test process PATH"),
+    ));
+    let path = env::join_paths(paths).expect("runtime PATH");
+    let mut child = Command::new(env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "stale_reservation_after_destroy_helper",
+            "--ignored",
+        ])
+        .env("PATH", path)
+        .spawn()
+        .expect("spawn stale Reservation helper");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait().expect("helper status") {
+            assert!(
+                status.success(),
+                "stale Reservation helper failed: {status}"
+            );
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("stale Reservation helper timed out");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn destroy_is_idempotent_for_a_missing_or_empty_pool() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("missing Pool destroy should succeed");
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("repeated destroy should succeed");
+
+    assert!(repository.worker_pool().snapshot().is_missing());
+    assert!(repository.root().join(".jj/pool/.dispatch.lock").exists());
+}
+
+#[test]
+fn destroy_removes_worker_workspaces_state_and_cache_entries() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let grown = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow");
+    let workers = grown.added_workers().to_vec();
+    let workspace_paths = workers
+        .iter()
+        .map(|worker| {
+            repository
+                .root()
+                .parent()
+                .expect("repository parent")
+                .join(format!(
+                    "{}-workspaces/{worker}",
+                    repository
+                        .root()
+                        .file_name()
+                        .expect("repository name")
+                        .to_string_lossy()
+                ))
+        })
+        .collect::<Vec<_>>();
+
+    repository.worker_pool().destroy().expect("destroy Pool");
+
+    assert!(repository.worker_pool().snapshot().is_missing());
+    for (worker, workspace) in workers.iter().zip(workspace_paths) {
+        assert!(!workspace.exists());
+        assert!(
+            !repository
+                .root()
+                .join(".jj/pool")
+                .join(format!("{worker}.json"))
+                .exists()
+        );
+        let output = Command::new("jj")
+            .args(["workspace", "list"])
+            .current_dir(repository.root())
+            .output()
+            .expect("jj workspace list");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains(worker.as_str()));
+    }
+    let cache = fs::read_to_string(repository.root().join(".jj/ws-cache")).expect("ws-cache");
+    assert!(
+        workers
+            .iter()
+            .all(|worker| !cache.contains(worker.as_str()))
+    );
+}
+
+#[test]
+fn destroy_removes_dispatch_and_unknown_artifacts_but_preserves_lock_sidecars() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let worker = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let parent = wsg_core::TicketId::parse("AMBA-99").expect("Ticket ID");
+    let group = wsg_core::DispatchGroupState::new(
+        parent.clone(),
+        wsg_core::WireTimestamp::new("2026-07-30T10:00:00Z"),
+        "owner/repo",
+        wsg_core::DispatchGroupOptions::new(""),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent)
+        .commit(
+            wsg_core::Expected::Missing,
+            wsg_core::StateChange::Replace(group),
+        )
+        .expect("Dispatch Group state");
+    let pool_directory = repository.root().join(".jj/pool");
+    fs::write(pool_directory.join("unknown.tmp"), "unknown").expect("unknown file");
+    fs::create_dir(pool_directory.join("unknown-dir")).expect("unknown directory");
+    fs::write(pool_directory.join("unknown-dir/value"), "unknown").expect("unknown value");
+
+    repository.worker_pool().destroy().expect("destroy Pool");
+
+    for artifact in [
+        repository.root().join(".jj/pool.json"),
+        pool_directory.join(".destroying"),
+        pool_directory.join(format!("{worker}.cleanup")),
+        pool_directory.join("dispatch-amba-99.json"),
+        pool_directory.join("unknown.tmp"),
+        pool_directory.join("unknown-dir"),
+    ] {
+        assert!(
+            !artifact.exists(),
+            "{} should be removed",
+            artifact.display()
+        );
+    }
+    for lock in [
+        pool_directory.join(".dispatch.lock"),
+        pool_directory.join(format!("{worker}.json.lock")),
+        pool_directory.join("dispatch-amba-99.json.lock"),
+        repository.root().join(".jj/ws-cache.lock"),
+    ] {
+        assert!(lock.exists(), "{} should remain", lock.display());
+    }
+}
+
+#[test]
+fn destroy_marker_blocks_growth_until_destroy_completes() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    pool.resize_to(wsg_core::PoolCapacity::new(0).expect("empty capacity"))
+        .expect("create empty Pool");
+    fs::write(repository.root().join(".jj/pool/.destroying"), "")
+        .expect("interrupted destroy marker");
+
+    let error = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect_err("growth must not commit during destroy");
+
+    assert!(matches!(error, wsg_core::WorkerPoolError::Conflict));
+    assert_eq!(pool.snapshot().pool().expect("empty Pool").size(), 0);
+    pool.destroy()
+        .expect("destroy should remove its durable marker");
+    assert!(!repository.root().join(".jj/pool/.destroying").exists());
+
+    let growth = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("growth should resume after destroy completes");
+    assert_eq!(growth.capacity().as_usize(), 1);
+}
+
+#[test]
+fn repeated_destroy_retries_interrupted_workspace_cleanup() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let worker = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let repo_state = repository.root().join(".jj/repo");
+    let disabled = repository.root().join(".jj/repo-disabled");
+    fs::rename(&repo_state, &disabled).expect("disable jj repository");
+
+    let error = repository
+        .worker_pool()
+        .destroy()
+        .expect_err("Workspace cleanup should fail after detachment");
+
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::DestroyCleanup { ref workers, .. }
+            if workers == &vec![worker.clone()]
+    ));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .expect("Pool")
+            .size(),
+        0
+    );
+    assert!(
+        repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker}.json"))
+            .exists()
+    );
+    assert!(
+        repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker}.cleanup"))
+            .exists()
+    );
+    fs::rename(&disabled, &repo_state).expect("restore jj repository");
+
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("repeated destroy should resume cleanup");
+
+    assert!(repository.worker_pool().snapshot().is_missing());
+    assert!(
+        !repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker}.cleanup"))
+            .exists()
+    );
+}
+
+#[test]
+fn destroy_accepts_busy_workers_with_dead_or_absent_pids() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let grown = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow");
+    let first = grown.added_workers()[0].clone();
+    let second = grown.added_workers()[1].clone();
+    repository
+        .worker_pool()
+        .reserve_named(first.clone(), "AMBA-DEAD")
+        .expect("reserve first");
+    repository
+        .worker_pool()
+        .reserve_named(second, "AMBA-NO-PID")
+        .expect("reserve second");
+    let state_repository = repository.state_store().worker(first);
+    let wsg_core::Loaded::Present(loaded) = state_repository.load().expect("Worker state") else {
+        panic!("Worker state should exist");
+    };
+    let (mut state, revision) = loaded.into_parts();
+    state.pid = Some(99_999_999);
+    state_repository
+        .commit(
+            wsg_core::Expected::Match(revision),
+            wsg_core::StateChange::Replace(state),
+        )
+        .expect("persist dead PID");
+
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("dead and missing PIDs should not block destroy");
+
+    assert!(repository.worker_pool().snapshot().is_missing());
+}
+
+#[test]
+fn destroy_terminates_a_live_recorded_process_group() {
+    let (temporary_directory, repository) = local_repository_with_origin();
+    let worker = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    repository
+        .worker_pool()
+        .reserve_named(worker.clone(), "AMBA-LIVE")
+        .expect("reserve Worker");
+    let pid_path = temporary_directory.path().join("live-pid");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "destroy_live_process_helper", "--ignored"])
+        .env("WSG_DESTROY_PID", &pid_path);
+    let helper = helper.spawn().expect("spawn process owner");
+    wait_for_file(&pid_path);
+    let pid = fs::read_to_string(&pid_path)
+        .expect("read PID")
+        .parse::<i64>()
+        .expect("numeric PID");
+    let state_repository = repository.state_store().worker(worker);
+    let wsg_core::Loaded::Present(loaded) = state_repository.load().expect("Worker state") else {
+        panic!("Worker state should exist");
+    };
+    let (mut state, revision) = loaded.into_parts();
+    state.pid = Some(pid);
+    state_repository
+        .commit(
+            wsg_core::Expected::Match(revision),
+            wsg_core::StateChange::Replace(state),
+        )
+        .expect("persist live PID");
+
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("destroy should terminate the live Run");
+
+    let output = helper.wait_with_output().expect("wait for process owner");
+    assert!(
+        output.status.success(),
+        "process owner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(repository.worker_pool().snapshot().is_missing());
 }
 
 #[test]
