@@ -8,10 +8,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use rustix::process::{Pid, Signal, kill_process_group};
 
 use thiserror::Error;
 
-use crate::WireAgent;
+use crate::{Reservation, StateError, WireAgent};
 
 /// The Agent Runtime recorded for a Worker and selected for a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,6 +165,55 @@ impl RunSupervisor {
         })
     }
 
+    /// Starts a reserved Run and persists its process identifier before success.
+    pub fn run_reserved_background(
+        &self,
+        reservation: &Reservation,
+        invocation: AgentRuntimeInvocation,
+    ) -> Result<BackgroundRun, RunSupervisorError> {
+        let worker_id = reservation.worker_id().clone();
+        let repository = reservation.repository();
+        let request = RunRequest::new(
+            reservation.agent_runtime(),
+            invocation,
+            crate::workspace::worker_path(repository.root(), &worker_id),
+            repository
+                .root()
+                .join(".jj/pool")
+                .join(format!("{worker_id}.log")),
+        );
+        let background = match self.run_background(&request) {
+            Ok(background) => background,
+            Err(error) => return release_after_failure(reservation, error),
+        };
+        let pid = background.pid();
+        match reservation.persist_pid(pid) {
+            Ok(crate::pool::PidPersistence::Persisted) => Ok(background),
+            Ok(crate::pool::PidPersistence::Missing) => persist_pid_failure(
+                reservation,
+                background,
+                RunSupervisorError::PersistPidMissing {
+                    worker: worker_id,
+                    pid,
+                },
+            ),
+            Ok(crate::pool::PidPersistence::Conflict) => persist_pid_failure(
+                reservation,
+                background,
+                RunSupervisorError::PersistPidConflict { worker: worker_id },
+            ),
+            Err(source) => persist_pid_failure(
+                reservation,
+                background,
+                RunSupervisorError::PersistPid {
+                    worker: worker_id,
+                    pid,
+                    source,
+                },
+            ),
+        }
+    }
+
     /// Starts one Run detached from the caller's terminal.
     pub fn run_background(
         &self,
@@ -287,6 +339,54 @@ pub enum RunSupervisorError {
         #[source]
         source: io::Error,
     },
+    /// The Worker PID could not be loaded or persisted.
+    #[error("cannot persist PID for Worker {worker}: {source}")]
+    PersistPid {
+        /// The Worker whose Run was launched.
+        worker: crate::WorkerId,
+        /// The process identifier that could not be recorded.
+        pid: u32,
+        /// The state repository failure.
+        #[source]
+        source: StateError,
+    },
+    /// The Worker state disappeared before PID persistence.
+    #[error("cannot persist PID for Worker {worker}: Worker state is missing")]
+    PersistPidMissing {
+        /// The Worker whose Run was launched.
+        worker: crate::WorkerId,
+        /// The process identifier that could not be recorded.
+        pid: u32,
+    },
+    /// Another mutation replaced the reserved Worker state before PID persistence.
+    #[error("cannot persist PID for Worker {worker}: Worker state changed after reservation")]
+    PersistPidConflict {
+        /// The Worker whose Run was launched.
+        worker: crate::WorkerId,
+    },
+    /// The untracked process group could not be cleaned up after persistence failed.
+    #[error("cannot clean up untracked Run for Worker {worker}: {source}")]
+    PersistPidCleanup {
+        /// The Worker whose Run was launched.
+        worker: crate::WorkerId,
+        /// The original persistence failure.
+        primary: Box<RunSupervisorError>,
+        /// The process cleanup failure.
+        #[source]
+        source: io::Error,
+    },
+    /// The Reservation could not be released after a failed launch.
+    #[error("{primary}; cannot release Reservation for Worker {worker}: {detail}")]
+    ReservationRelease {
+        /// The Worker whose Reservation was leaked.
+        worker: crate::WorkerId,
+        /// The spawned process identifier, if launch reached that stage.
+        pid: Option<u32>,
+        /// The original launch or persistence failure.
+        primary: Box<RunSupervisorError>,
+        /// The release failure.
+        detail: String,
+    },
     /// Output could not be forwarded or mirrored.
     #[error("cannot forward {stream} output: {source}")]
     Forward {
@@ -305,6 +405,69 @@ pub enum RunSupervisorError {
         #[source]
         source: io::Error,
     },
+}
+
+fn release_after_failure(
+    reservation: &Reservation,
+    primary: RunSupervisorError,
+) -> Result<BackgroundRun, RunSupervisorError> {
+    match reservation.release() {
+        Ok(()) => Err(primary),
+        Err(release) => Err(RunSupervisorError::ReservationRelease {
+            worker: reservation.worker_id().clone(),
+            pid: failed_pid(&primary),
+            primary: Box::new(primary),
+            detail: release.to_string(),
+        }),
+    }
+}
+
+fn failed_pid(error: &RunSupervisorError) -> Option<u32> {
+    match error {
+        RunSupervisorError::PersistPid { pid, .. }
+        | RunSupervisorError::PersistPidMissing { pid, .. } => Some(*pid),
+        RunSupervisorError::PersistPidCleanup { primary, .. }
+        | RunSupervisorError::ReservationRelease { primary, .. } => failed_pid(primary),
+        _ => None,
+    }
+}
+
+fn persist_pid_failure(
+    reservation: &Reservation,
+    background: BackgroundRun,
+    primary: RunSupervisorError,
+) -> Result<BackgroundRun, RunSupervisorError> {
+    let primary = match cleanup_untracked_run(background) {
+        Ok(()) => primary,
+        Err(source) => RunSupervisorError::PersistPidCleanup {
+            worker: reservation.worker_id().clone(),
+            primary: Box::new(primary),
+            source,
+        },
+    };
+    release_after_failure(reservation, primary)
+}
+
+fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
+    let pid = i32::try_from(background.pid())
+        .ok()
+        .and_then(Pid::from_raw)
+        .ok_or_else(|| io::Error::other("background Run PID does not fit a Unix process ID"))?;
+    let _ = kill_process_group(pid, Signal::TERM);
+    let deadline = Instant::now() + Duration::from_millis(250);
+    let leader_exited = loop {
+        match background.child.try_wait()? {
+            Some(_) => break true,
+            None if Instant::now() >= deadline => break false,
+            None => thread::sleep(Duration::from_millis(10)),
+        }
+    };
+    let _ = kill_process_group(pid, Signal::KILL);
+    if leader_exited {
+        Ok(())
+    } else {
+        background.child.wait().map(|_| ())
+    }
 }
 
 fn spawn_output_forwarder<R, W>(

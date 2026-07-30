@@ -468,6 +468,7 @@ pub(crate) enum ReservationOutcome {
     Reserved {
         worker: WorkerId,
         agent_runtime: crate::AgentRuntime,
+        revision: StateRevision<WorkerState>,
     },
     NoIdle {
         available: usize,
@@ -646,9 +647,21 @@ impl StateStore {
                     .join(POOL_DIRECTORY)
                     .join(format!("{worker}.json"));
                 write_atomic(&path, &state, &format!("Worker {worker}"))?;
+                let revision =
+                    match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+                        Loaded::Present(versioned) => versioned.revision().clone(),
+                        Loaded::Missing => {
+                            return Err(StateError::new(
+                                "reserve",
+                                format!("Worker {worker}"),
+                                "state disappeared after reservation",
+                            ));
+                        }
+                    };
                 Ok(ReservationOutcome::Reserved {
                     worker,
                     agent_runtime,
+                    revision,
                 })
             })
         })

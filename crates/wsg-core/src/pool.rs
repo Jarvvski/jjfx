@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     AgentRuntime, CommitOutcome, Expected, Loaded, PoolState, Repository, StateChange, StateError,
-    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
+    StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
 /// A positive number of reusable Worker slots.
@@ -62,6 +62,14 @@ pub struct Reservation {
     worker_id: WorkerId,
     ticket: String,
     agent_runtime: AgentRuntime,
+    repository: Repository,
+    worker_revision: StateRevision<WorkerState>,
+}
+
+pub(crate) enum PidPersistence {
+    Persisted,
+    Missing,
+    Conflict,
 }
 
 impl Reservation {
@@ -78,6 +86,59 @@ impl Reservation {
     /// Returns the Agent Runtime persisted for this Run.
     pub fn agent_runtime(&self) -> AgentRuntime {
         self.agent_runtime
+    }
+
+    pub(crate) fn repository(&self) -> &Repository {
+        &self.repository
+    }
+
+    pub(crate) fn persist_pid(&self, pid: u32) -> Result<PidPersistence, StateError> {
+        let worker_state = self.repository.state_store().worker(self.worker_id.clone());
+        let loaded = match worker_state.load()? {
+            Loaded::Present(versioned) => versioned,
+            Loaded::Missing => return Ok(PidPersistence::Missing),
+        };
+        let mut state = loaded.value;
+        state.pid = Some(i64::from(pid));
+        match worker_state.commit(
+            Expected::Match(self.worker_revision.clone()),
+            StateChange::Replace(state),
+        )? {
+            CommitOutcome::Applied(_) => Ok(PidPersistence::Persisted),
+            CommitOutcome::Conflict(_) => Ok(PidPersistence::Conflict),
+        }
+    }
+
+    pub(crate) fn release(&self) -> Result<(), WorkerPoolError> {
+        let worker_state = self.repository.state_store().worker(self.worker_id.clone());
+        let loaded = match worker_state.load()? {
+            Loaded::Present(versioned) => versioned,
+            Loaded::Missing => {
+                return Err(WorkerPoolError::WorkerStateMissing {
+                    worker: self.worker_id.clone(),
+                });
+            }
+        };
+        let mut state = loaded.value;
+        state.status = WireStatus::new("idle");
+        state.agent = None;
+        state.ticket = None;
+        state.pid = None;
+        state.started_at = None;
+        state.completed_at = None;
+        state.log_file = None;
+        state.branch_name = None;
+        state.exit_code = None;
+        state.error = None;
+        match worker_state.commit(
+            Expected::Match(self.worker_revision.clone()),
+            StateChange::Replace(state),
+        )? {
+            CommitOutcome::Applied(_) => Ok(()),
+            CommitOutcome::Conflict(_) => Err(WorkerPoolError::ReleaseConflict {
+                worker: self.worker_id.clone(),
+            }),
+        }
     }
 }
 
@@ -98,6 +159,10 @@ pub enum WorkerPoolError {
     WorkerNotInPool { worker: WorkerId },
     #[error("Worker {worker} is not idle")]
     WorkerNotIdle { worker: WorkerId },
+    #[error("Worker {worker} state is missing")]
+    WorkerStateMissing { worker: WorkerId },
+    #[error("Worker {worker} changed before its Reservation could be released")]
+    ReleaseConflict { worker: WorkerId },
     #[error("invalid configured Agent Runtime {value:?} (expected claude or codex)")]
     InvalidAgentRuntime { value: String },
     #[error("cannot discover GitHub repository: {0}")]
@@ -161,10 +226,13 @@ impl WorkerPool {
             crate::state::ReservationOutcome::Reserved {
                 worker,
                 agent_runtime,
+                revision,
             } => Ok(Reservation {
                 worker_id: worker,
                 ticket,
                 agent_runtime,
+                repository: self.repository.clone(),
+                worker_revision: revision,
             }),
             crate::state::ReservationOutcome::NoIdle { available } => {
                 Err(WorkerPoolError::NoIdleWorkers { ticket, available })
@@ -755,7 +823,7 @@ impl<T> TransposeOption<T> for Option<Option<T>> {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    use rustix::process::{Pid, test_kill_process};
+    use rustix::process::{test_kill_process, Pid};
 
     i32::try_from(pid)
         .ok()

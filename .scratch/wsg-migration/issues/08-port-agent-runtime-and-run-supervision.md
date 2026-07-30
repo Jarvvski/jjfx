@@ -44,7 +44,7 @@ Use fake executable scripts for deterministic provider argument, logging, exit-c
 
 - [ ] Claude Code and Codex commands preserve current invocation behavior.
 - [ ] Foreground and background Runs produce compatible logs.
-- [ ] Successful launch returns only after PID persistence.
+- [x] Successful launch returns only after PID persistence.
 - [ ] Dead busy Workers reconcile to done or failed exactly once.
 - [ ] Reset terminates descendants and cannot finalize a later Run.
 - [ ] `mise run check` is green.
@@ -101,3 +101,13 @@ only the leader PID and process completion outcome while retaining reaping
 ownership. Public integration coverage verifies prompt return, process-group
 identity, delayed child-owned output, log setup failure, spawn failure, and strict
 test cleanup. Worker PID persistence and terminal finalization remain pending.
+
+2026-07-30 - Added the reserved background Run seam. A Reservation now retains
+its exact post-reservation Worker revision privately, and RunSupervisor derives
+the Worker Workspace and compatible log path, launches the runtime, and commits
+the PID under the Worker lock before reporting success. Revision conflicts and
+state-load failures terminate and reap the untracked process group, including a
+forced cleanup path for stubborn descendants. Integration coverage verifies
+PID visibility before launch success and cleanup when Worker state changes during
+the launch race. Run finalization, liveness reconciliation, and Reset remain
+pending.
