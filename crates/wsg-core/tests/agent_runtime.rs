@@ -328,7 +328,7 @@ fn reserved_background_run_persists_pid_before_returning() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
 
@@ -417,7 +417,7 @@ fn reserved_background_run_releases_worker_when_runtime_probe_fails() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
     let bin_directory = temporary_directory.path().join("bin");
@@ -505,7 +505,7 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
 
@@ -626,7 +626,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
 
@@ -1215,7 +1215,7 @@ fn reserved_background_run_finalizes_worker_after_wait() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
     let bin_directory = temporary_directory.path().join("bin");
@@ -1300,7 +1300,7 @@ fn reserved_background_run_finalizes_failed_worker_after_wait() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
     let bin_directory = temporary_directory.path().join("bin");
@@ -1385,7 +1385,7 @@ fn reserved_foreground_run_finalizes_worker_after_completion() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
     let bin_directory = temporary_directory.path().join("bin");
@@ -1491,7 +1491,7 @@ fn stale_background_waiter_cannot_finalize_newer_run() {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
     let bin_directory = temporary_directory.path().join("bin");
@@ -1636,7 +1636,7 @@ fn reset_run_terminates_the_run_process_group_and_returns_the_worker_to_idle() {
     let repository = initialize_repository(temporary_directory.path());
     let growth = repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
 
@@ -2498,7 +2498,7 @@ const STUBBORN_RUNTIME: &str = concat!(
 fn grow_one_worker(repository: &Repository) -> WorkerId {
     repository
         .worker_pool()
-        .grow_to(PoolCapacity::new(1).expect("capacity"))
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned")
         .added_workers()[0]
         .clone()

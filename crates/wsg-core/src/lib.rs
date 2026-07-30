@@ -12,7 +12,7 @@ mod state;
 mod workspace;
 
 pub use pool::{
-    PersistedField, PoolCapacity, PoolCapacityError, PoolGrowth, PoolSnapshot, Reservation,
+    PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot, Reservation,
     SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
     WorkerReference, WorkerSnapshot, WorkerStatus,
 };

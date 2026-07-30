@@ -247,10 +247,6 @@ pub(crate) fn deprovision(
 /// Worker state remains as the durable cleanup marker until the external jj,
 /// directory, and cache operations have succeeded. Repeating this operation is
 /// safe after either partial or complete cleanup.
-#[expect(
-    dead_code,
-    reason = "the next Worker Pool lifecycle slice consumes this recovery operation"
-)]
 pub(crate) fn teardown_detached(
     repository: &Repository,
     worker_id: &WorkerId,

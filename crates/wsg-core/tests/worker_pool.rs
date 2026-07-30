@@ -86,12 +86,21 @@ fn repository_with_pool() -> (TempDir, Repository) {
 }
 
 #[test]
+fn pool_capacity_accepts_an_empty_pool() {
+    let capacity = wsg_core::PoolCapacity::new(0).expect("zero capacity should be valid");
+
+    assert_eq!(capacity.as_usize(), 0);
+    #[cfg(target_pointer_width = "64")]
+    assert!(wsg_core::PoolCapacity::new(usize::MAX).is_err());
+}
+
+#[test]
 fn creates_a_pool_with_one_worker_visible_through_its_snapshot() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
 
     let growth = pool
-        .grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("pool should grow");
 
     assert_eq!(growth.added_workers().len(), 1);
@@ -118,12 +127,12 @@ fn grows_a_pool_without_changing_existing_worker_ids_or_metadata() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let first = pool
-        .grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
     let existing = first.added_workers()[0].clone();
 
     let second = pool
-        .grow_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
         .expect("pool should grow again");
 
     assert_eq!(second.capacity().as_usize(), 3);
@@ -142,12 +151,12 @@ fn growing_to_current_capacity_does_not_change_the_pool() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let first = pool
-        .grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
     let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
 
     let second = pool
-        .grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("same capacity should be accepted");
 
     assert!(second.added_workers().is_empty());
@@ -160,23 +169,139 @@ fn growing_to_current_capacity_does_not_change_the_pool() {
 }
 
 #[test]
-fn growing_to_a_lower_capacity_rejects_without_mutation() {
+fn shrinking_removes_the_stable_pool_tail_and_reports_it() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
-    pool.grow_to(wsg_core::PoolCapacity::new(2).expect("capacity should be valid"))
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
         .expect("initial pool should grow");
+    let expected_removed = grown.added_workers()[1..].to_vec();
+
+    let resized = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .expect("idle tail should shrink");
+
+    assert_eq!(resized.capacity().as_usize(), 1);
+    assert!(resized.added_workers().is_empty());
+    assert_eq!(resized.removed_workers(), expected_removed);
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.pool().expect("pool manifest").size(), 1);
+    assert_eq!(snapshot.workers().len(), 1);
+    for worker in resized.removed_workers() {
+        assert!(
+            !repository
+                .root()
+                .join(".jj/pool")
+                .join(format!("{worker}.json"))
+                .exists()
+        );
+    }
+}
+
+#[test]
+fn pool_can_shrink_to_zero_and_regrow_with_new_stable_workers() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let initial = pool
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow");
+    let old_workers = initial.added_workers().to_vec();
+
+    let empty = pool
+        .resize_to(wsg_core::PoolCapacity::new(0).expect("zero capacity"))
+        .expect("shrink to empty");
+    let regrown = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("regrow");
+
+    assert_eq!(empty.capacity().as_usize(), 0);
+    assert_eq!(empty.removed_workers(), old_workers);
+    assert_eq!(regrown.capacity().as_usize(), 1);
+    assert_eq!(regrown.added_workers().len(), 1);
+    assert!(!old_workers.contains(&regrown.added_workers()[0]));
+}
+
+#[test]
+fn shrinking_rejects_the_whole_tail_when_a_selected_worker_is_busy() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .expect("grow");
+    let busy = grown.added_workers()[2].clone();
+    pool.reserve_named(busy.clone(), "AMBA-7")
+        .expect("tail Worker should reserve");
     let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
 
     let error = pool
-        .grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
-        .expect_err("shrinking belongs to a later lifecycle operation");
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect_err("busy tail should reject shrink");
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::CannotShrink {
-            current: 2,
-            requested: 1
-        }
+        wsg_core::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
+    ));
+    assert_eq!(
+        fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
+        before
+    );
+    assert_eq!(pool.snapshot().pool().expect("manifest").size(), 3);
+}
+
+#[test]
+fn named_removal_detaches_an_idle_worker_without_reordering_the_rest() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .expect("grow");
+    let removed = grown.added_workers()[1].clone();
+    let expected = vec![
+        grown.added_workers()[0].clone(),
+        grown.added_workers()[2].clone(),
+    ];
+
+    let resized = pool.remove(removed.clone()).expect("remove middle Worker");
+
+    assert_eq!(resized.capacity().as_usize(), 2);
+    assert_eq!(resized.removed_workers(), &[removed]);
+    let workers = pool
+        .snapshot()
+        .pool()
+        .expect("manifest")
+        .workers()
+        .iter()
+        .map(|worker| worker.worker_id().clone())
+        .collect::<Vec<_>>();
+    assert_eq!(workers, expected);
+}
+
+#[test]
+fn named_removal_rejects_unknown_and_busy_workers_without_mutation() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow");
+    let busy = grown.added_workers()[0].clone();
+    pool.reserve_named(busy.clone(), "AMBA-8").expect("reserve");
+    let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
+
+    let busy_error = pool
+        .remove(busy.clone())
+        .expect_err("busy Worker should not be removed");
+    let unknown = wsg_core::WorkerId::parse("worker-unknown").expect("Worker ID");
+    let unknown_error = pool
+        .remove(unknown.clone())
+        .expect_err("unknown Worker should not be removed");
+
+    assert!(matches!(
+        busy_error,
+        wsg_core::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
+    ));
+    assert!(matches!(
+        unknown_error,
+        wsg_core::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
     ));
     assert_eq!(
         fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
@@ -190,7 +315,7 @@ fn grows_a_go_created_pool_without_replacing_its_membership_or_metadata() {
     let pool = repository.worker_pool();
 
     let growth = pool
-        .grow_to(wsg_core::PoolCapacity::new(5).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(5).expect("capacity should be valid"))
         .expect("Go-created pool should grow");
 
     assert_eq!(growth.added_workers().len(), 1);
@@ -206,6 +331,234 @@ fn grows_a_go_created_pool_without_replacing_its_membership_or_metadata() {
 }
 
 #[test]
+fn shrinks_a_go_created_pool_by_removing_a_terminal_tail_worker() {
+    let (_temporary_directory, repository) = go_repository_with_pool();
+    let pool = repository.worker_pool();
+
+    let resized = pool
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .expect("failed Worker is terminal and removable");
+
+    assert_eq!(resized.removed_workers()[0].as_str(), "worker-04");
+    let snapshot = pool.snapshot();
+    let manifest = snapshot.pool().expect("manifest");
+    assert_eq!(manifest.size(), 3);
+    assert_eq!(manifest.gh_repo(), "Jarvvski/jjfx");
+    assert_eq!(manifest.workers()[2].worker_id().as_str(), "worker-03");
+}
+
+#[test]
+fn repeated_resize_retries_detached_worker_cleanup() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow");
+    let detached = grown.added_workers()[1].clone();
+    let repo_state = repository.root().join(".jj/repo");
+    let disabled = repository.root().join(".jj/repo-disabled");
+    fs::rename(&repo_state, &disabled).expect("disable jj repository");
+
+    let error = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect_err("Workspace cleanup should fail after membership commit");
+
+    assert!(matches!(error, wsg_core::WorkerPoolError::Cleanup(_)));
+    assert_eq!(pool.snapshot().pool().expect("manifest").size(), 1);
+    let state = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{detached}.json"));
+    let marker = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{detached}.cleanup"));
+    assert!(
+        state.exists(),
+        "Worker state remains until cleanup succeeds"
+    );
+    assert!(
+        marker.exists(),
+        "membership removal leaves a cleanup marker"
+    );
+    fs::rename(&disabled, &repo_state).expect("restore jj repository");
+
+    let retried = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("same resize should retry detached cleanup");
+
+    assert_eq!(retried.removed_workers(), &[detached]);
+    assert!(!state.exists());
+    assert!(!marker.exists());
+}
+
+#[test]
+fn repeated_named_removal_retries_detached_worker_cleanup() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let repo_state = repository.root().join(".jj/repo");
+    let disabled = repository.root().join(".jj/repo-disabled");
+    fs::rename(&repo_state, &disabled).expect("disable jj repository");
+
+    let error = pool
+        .remove(worker.clone())
+        .expect_err("Workspace cleanup should fail after membership commit");
+
+    assert!(matches!(error, wsg_core::WorkerPoolError::Cleanup(_)));
+    let marker = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.cleanup"));
+    assert!(marker.exists());
+    fs::rename(&disabled, &repo_state).expect("restore jj repository");
+
+    let retried = pool
+        .remove(worker.clone())
+        .expect("same removal should retry detached cleanup");
+
+    assert_eq!(retried.capacity().as_usize(), 0);
+    assert_eq!(retried.removed_workers(), &[worker]);
+    assert!(!marker.exists());
+}
+
+#[test]
+fn no_op_resize_preserves_nonmember_state_without_a_cleanup_marker() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow");
+    let in_flight = wsg_core::WorkerId::parse("worker-in-flight").expect("Worker ID");
+    let state = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{in_flight}.json"));
+    fs::write(&state, fixture("worker-idle-claude.json")).expect("in-flight Worker state");
+
+    let resized = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("no-op resize");
+
+    assert!(resized.removed_workers().is_empty());
+    assert!(
+        state.exists(),
+        "unmarked in-flight state must not be cleaned"
+    );
+}
+
+#[test]
+fn named_removal_preserves_unknown_state_without_a_cleanup_marker() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow");
+    let unknown = wsg_core::WorkerId::parse("worker-unknown-state").expect("Worker ID");
+    let state = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{unknown}.json"));
+    fs::write(&state, fixture("worker-idle-claude.json")).expect("unknown Worker state");
+
+    let error = pool
+        .remove(unknown.clone())
+        .expect_err("unmarked nonmember must remain unknown");
+
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
+    ));
+    assert!(state.exists(), "unknown state must not be cleaned");
+}
+
+#[test]
+fn busy_detached_cleanup_marker_is_not_torn_down() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let repo_state = repository.root().join(".jj/repo");
+    let disabled = repository.root().join(".jj/repo-disabled");
+    fs::rename(&repo_state, &disabled).expect("disable jj repository");
+    pool.remove(worker.clone())
+        .expect_err("cleanup should leave a durable marker");
+    fs::rename(&disabled, &repo_state).expect("restore jj repository");
+    let state = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.json"));
+    let marker = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.cleanup"));
+    fs::write(&state, fixture("worker-busy-claude.json")).expect("busy detached state");
+
+    let error = pool
+        .resize_to(wsg_core::PoolCapacity::new(0).expect("capacity"))
+        .expect_err("busy detached Worker must not be torn down");
+
+    assert!(matches!(
+        error,
+        wsg_core::WorkerPoolError::WorkersBusy { workers } if workers == vec![worker]
+    ));
+    assert!(state.exists());
+    assert!(marker.exists());
+}
+
+#[test]
+fn shrinking_permits_a_missing_tail_worker_state() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let grown = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow");
+    let missing = grown.added_workers()[1].clone();
+    fs::remove_file(
+        repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{missing}.json")),
+    )
+    .expect("remove Worker state");
+
+    let resized = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("missing state should not imply busy");
+
+    assert_eq!(resized.removed_workers(), &[missing]);
+}
+
+#[test]
+fn named_removal_clears_a_go_created_worker_alias() {
+    let (temporary_directory, repository) = go_repository_with_pool();
+    fs::write(
+        temporary_directory.path().join(".jj/pool/worker-02.json"),
+        fixture("worker-idle-claude.json"),
+    )
+    .expect("make aliased Worker idle");
+    let worker = wsg_core::WorkerId::parse("worker-02").expect("Worker ID");
+
+    repository
+        .worker_pool()
+        .remove(worker.clone())
+        .expect("remove aliased Worker");
+
+    let loaded = repository.state_store().pool().load().expect("pool state");
+    let wsg_core::Loaded::Present(pool) = loaded else {
+        panic!("pool should remain");
+    };
+    assert!(!pool.value.names.contains_key(&worker));
+    assert_eq!(pool.value.workers[1].as_str(), "worker-03");
+}
+
+#[test]
 fn failed_pool_growth_leaves_no_registered_worker() {
     let (temporary_directory, repository) = local_repository_with_origin();
     fs::create_dir(temporary_directory.path().join(".env"))
@@ -213,7 +566,7 @@ fn failed_pool_growth_leaves_no_registered_worker() {
     let pool = repository.worker_pool();
 
     let error = pool
-        .grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect_err("invalid setup source should fail growth");
 
     assert!(matches!(error, wsg_core::WorkerPoolError::Provision { .. }));
@@ -227,17 +580,17 @@ fn failed_pool_growth_leaves_no_registered_worker() {
 fn concurrent_growth_keeps_registered_workers_in_the_workspace_cache() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
-    pool.grow_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+    pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
 
     let first_pool = pool.clone();
     let second_pool = pool.clone();
     let (first, second) = thread::scope(|scope| {
         let first = scope.spawn(|| {
-            first_pool.grow_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+            first_pool.resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
         });
         let second = scope.spawn(|| {
-            second_pool.grow_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+            second_pool.resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
         });
         (
             first.join().expect("first growth should not panic"),
@@ -262,6 +615,81 @@ fn concurrent_growth_keeps_registered_workers_in_the_workspace_cache() {
             "cache should contain {}",
             worker.worker_id()
         );
+    }
+}
+
+#[test]
+fn reservation_and_named_removal_never_claim_and_remove_the_same_worker() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let worker = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow")
+        .added_workers()[0]
+        .clone();
+    let reserve_pool = pool.clone();
+    let remove_pool = pool.clone();
+    let requested = worker.clone();
+
+    let (reservation, removal) = thread::scope(|scope| {
+        let reservation = scope.spawn(|| reserve_pool.reserve_named(requested, "AMBA-RACE"));
+        let removal = scope.spawn(|| remove_pool.remove(worker.clone()));
+        (
+            reservation.join().expect("reservation thread"),
+            removal.join().expect("removal thread"),
+        )
+    });
+
+    assert_ne!(reservation.is_ok(), removal.is_ok());
+    if reservation.is_ok() {
+        assert!(pool.snapshot().worker(worker.as_str()).is_some());
+    } else {
+        assert!(pool.snapshot().worker(worker.as_str()).is_none());
+    }
+}
+
+#[test]
+fn reservation_and_shrink_never_claim_and_remove_the_same_worker() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let grown = pool
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .expect("grow");
+    for (worker, ticket) in grown.added_workers()[..2]
+        .iter()
+        .cloned()
+        .zip(["AMBA-1", "AMBA-2"])
+    {
+        pool.reserve_named(worker, ticket).expect("reserve head");
+    }
+    let tail = grown.added_workers()[2].clone();
+    let reserve_pool = pool.clone();
+    let resize_pool = pool.clone();
+
+    let (reservation, resize) = thread::scope(|scope| {
+        let reservation = scope.spawn(|| reserve_pool.reserve("AMBA-RACE"));
+        let resize = scope
+            .spawn(|| resize_pool.resize_to(wsg_core::PoolCapacity::new(2).expect("capacity")));
+        (
+            reservation.join().expect("reservation thread"),
+            resize.join().expect("resize thread"),
+        )
+    });
+
+    if let Ok(reservation) = reservation {
+        assert_eq!(reservation.worker_id(), &tail);
+        assert!(resize.is_err());
+        assert!(
+            pool.snapshot()
+                .pool()
+                .expect("manifest")
+                .workers()
+                .iter()
+                .any(|worker| worker.worker_id() == &tail)
+        );
+    } else {
+        assert!(resize.is_ok());
+        assert!(pool.snapshot().worker(tail.as_str()).is_none());
     }
 }
 

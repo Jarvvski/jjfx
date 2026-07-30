@@ -1,4 +1,4 @@
-//! Read-only Worker Pool snapshots built over the compatible state repositories.
+//! Worker Pool lifecycle operations and snapshots over compatible state repositories.
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -17,16 +17,14 @@ use crate::{
 /// natural finalization.
 const CLEAR_RUN_ATTEMPTS: usize = 3;
 
-/// A positive number of reusable Worker slots.
+/// A Go-compatible number of reusable Worker slots, including an empty Pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolCapacity(usize);
 
 impl PoolCapacity {
-    /// Creates a capacity suitable for a Worker Pool.
+    /// Creates a capacity that fits the persisted signed 64-bit Pool size.
     pub fn new(value: usize) -> Result<Self, PoolCapacityError> {
-        if value == 0 {
-            return Err(PoolCapacityError);
-        }
+        i64::try_from(value).map_err(|_| PoolCapacityError { value })?;
         Ok(Self(value))
     }
 
@@ -36,27 +34,35 @@ impl PoolCapacity {
     }
 }
 
-/// An invalid Worker Pool capacity.
+/// A Worker Pool capacity too large for the compatible persisted size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-#[error("Worker Pool capacity must be greater than zero")]
-pub struct PoolCapacityError;
-
-/// The result of growing a Worker Pool.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PoolGrowth {
-    capacity: PoolCapacity,
-    added_workers: Vec<WorkerId>,
+#[error("Worker Pool capacity {value} exceeds the compatible signed 64-bit size")]
+pub struct PoolCapacityError {
+    value: usize,
 }
 
-impl PoolGrowth {
-    /// Returns the resulting pool capacity.
+/// The result of changing Worker Pool capacity or named membership.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolResize {
+    capacity: PoolCapacity,
+    added_workers: Vec<WorkerId>,
+    removed_workers: Vec<WorkerId>,
+}
+
+impl PoolResize {
+    /// Returns the resulting Pool capacity.
     pub fn capacity(&self) -> PoolCapacity {
         self.capacity
     }
 
-    /// Returns Workers provisioned by this growth operation in pool order.
+    /// Returns Workers provisioned by this operation in Pool order.
     pub fn added_workers(&self) -> &[WorkerId] {
         &self.added_workers
+    }
+
+    /// Returns Workers detached by this operation in their prior Pool order.
+    pub fn removed_workers(&self) -> &[WorkerId] {
+        &self.removed_workers
     }
 }
 
@@ -231,15 +237,15 @@ impl Reservation {
     }
 }
 
-/// Errors from Worker Pool creation, growth, and Reservation.
+/// Errors from Worker Pool lifecycle and Reservation operations.
 #[derive(Debug, Error)]
 pub enum WorkerPoolError {
     #[error("cannot load Worker Pool state: {0}")]
     State(#[from] StateError),
     #[error("Worker Pool state has invalid size {0}")]
     InvalidSize(i64),
-    #[error("cannot shrink Worker Pool from {current} to {requested}")]
-    CannotShrink { current: usize, requested: usize },
+    #[error("cannot change Worker Pool membership because Workers are busy: {workers:?}")]
+    WorkersBusy { workers: Vec<WorkerId> },
     #[error("Worker Pool mutation conflicted with another process")]
     Conflict,
     #[error("no idle Worker is available for Ticket {ticket} (available: {available})")]
@@ -274,6 +280,8 @@ pub enum WorkerPoolError {
     },
     #[error("Worker Pool compensation failed: {0}")]
     Compensation(String),
+    #[error("Worker Pool membership changed but detached Worker cleanup failed: {0}")]
+    Cleanup(String),
 }
 
 /// The deep Worker Pool lifecycle module for one repository.
@@ -466,27 +474,113 @@ impl WorkerPool {
         }
     }
 
+    /// Resizes the Pool, provisioning new Workers or detaching its stable tail.
+    pub fn resize_to(&self, capacity: PoolCapacity) -> Result<PoolResize, WorkerPoolError> {
+        let mut recovered = self.retry_detached_cleanup()?;
+        let pool_repository = self.repository.state_store().pool();
+        let current = self.load_or_create(&pool_repository)?;
+        let current_size = usize::try_from(current.value.size)
+            .map_err(|_| WorkerPoolError::InvalidSize(current.value.size))?;
+        if capacity.as_usize() >= current_size {
+            let mut growth = self.grow(capacity)?;
+            growth.removed_workers = recovered;
+            return Ok(growth);
+        }
+
+        match self
+            .repository
+            .state_store()
+            .shrink_pool(capacity.as_usize())?
+        {
+            crate::state::PoolMembershipOutcome::Changed { capacity, removed } => {
+                recovered.extend(self.cleanup_detached(&removed)?);
+                Ok(PoolResize {
+                    capacity: PoolCapacity::new(capacity)
+                        .map_err(|_| WorkerPoolError::InvalidSize(capacity as i64))?,
+                    added_workers: Vec::new(),
+                    removed_workers: recovered,
+                })
+            }
+            crate::state::PoolMembershipOutcome::NoChange { capacity } => Ok(PoolResize {
+                capacity: PoolCapacity::new(capacity)
+                    .map_err(|_| WorkerPoolError::InvalidSize(capacity as i64))?,
+                added_workers: Vec::new(),
+                removed_workers: recovered,
+            }),
+            crate::state::PoolMembershipOutcome::NeedsGrowth => Err(WorkerPoolError::Conflict),
+            crate::state::PoolMembershipOutcome::Busy { workers } => {
+                Err(WorkerPoolError::WorkersBusy { workers })
+            }
+            crate::state::PoolMembershipOutcome::WorkerNotInPool { .. } => {
+                Err(WorkerPoolError::Conflict)
+            }
+        }
+    }
+
+    /// Removes one named non-busy Worker while preserving remaining Pool order.
+    pub fn remove(&self, worker: WorkerId) -> Result<PoolResize, WorkerPoolError> {
+        match self.repository.state_store().remove_pool_worker(&worker)? {
+            crate::state::PoolMembershipOutcome::Changed { capacity, removed } => {
+                let removed = self.cleanup_detached(&removed)?;
+                Ok(PoolResize {
+                    capacity: PoolCapacity::new(capacity)
+                        .map_err(|_| WorkerPoolError::InvalidSize(capacity as i64))?,
+                    added_workers: Vec::new(),
+                    removed_workers: removed,
+                })
+            }
+            crate::state::PoolMembershipOutcome::Busy { workers } => {
+                Err(WorkerPoolError::WorkersBusy { workers })
+            }
+            crate::state::PoolMembershipOutcome::WorkerNotInPool { worker } => {
+                if !self.worker_repository(&worker).cleanup_marker_exists() {
+                    return Err(WorkerPoolError::WorkerNotInPool { worker });
+                }
+                let removed = self.cleanup_detached(std::slice::from_ref(&worker))?;
+                if removed.is_empty() {
+                    return Err(WorkerPoolError::WorkerNotInPool { worker });
+                }
+                let capacity = self.current_capacity()?;
+                Ok(PoolResize {
+                    capacity,
+                    added_workers: Vec::new(),
+                    removed_workers: removed,
+                })
+            }
+            crate::state::PoolMembershipOutcome::NoChange { .. }
+            | crate::state::PoolMembershipOutcome::NeedsGrowth => Err(WorkerPoolError::Conflict),
+        }
+    }
+
+    fn current_capacity(&self) -> Result<PoolCapacity, WorkerPoolError> {
+        let loaded = self.repository.state_store().pool().load()?;
+        let Loaded::Present(pool) = loaded else {
+            return Err(WorkerPoolError::Conflict);
+        };
+        let size = usize::try_from(pool.value.size)
+            .map_err(|_| WorkerPoolError::InvalidSize(pool.value.size))?;
+        PoolCapacity::new(size).map_err(|_| WorkerPoolError::InvalidSize(pool.value.size))
+    }
+
     /// Grows the pool to `capacity`, provisioning stable Worker identities.
     ///
     /// A missing pool is first initialized with compatible metadata. Workspace
     /// commands run outside state locks; the final manifest update uses the
     /// loaded exact-byte revision, and newly provisioned Workers are
     /// compensated if another process wins the mutation.
-    pub fn grow_to(&self, capacity: PoolCapacity) -> Result<PoolGrowth, WorkerPoolError> {
+    fn grow(&self, capacity: PoolCapacity) -> Result<PoolResize, WorkerPoolError> {
         let pool = self.repository.state_store().pool();
         let current = self.load_or_create(&pool)?;
         let current_size = usize::try_from(current.value.size)
             .map_err(|_| WorkerPoolError::InvalidSize(current.value.size))?;
         if capacity.as_usize() < current_size {
-            return Err(WorkerPoolError::CannotShrink {
-                current: current_size,
-                requested: capacity.as_usize(),
-            });
+            return Err(WorkerPoolError::Conflict);
         }
         if capacity.as_usize() == current_size {
-            return Ok(PoolGrowth {
+            return Ok(PoolResize {
                 capacity,
                 added_workers: Vec::new(),
+                removed_workers: Vec::new(),
             });
         }
 
@@ -525,9 +619,10 @@ impl WorkerPool {
             StateChange::Replace(next),
         );
         match committed {
-            Ok(CommitOutcome::Applied(_)) => Ok(PoolGrowth {
+            Ok(CommitOutcome::Applied(_)) => Ok(PoolResize {
                 capacity,
                 added_workers: added,
+                removed_workers: Vec::new(),
             }),
             Ok(CommitOutcome::Conflict(_)) => match self.cleanup_workers(&added) {
                 Ok(()) => Err(WorkerPoolError::Conflict),
@@ -537,6 +632,47 @@ impl WorkerPool {
                 Ok(()) => Err(WorkerPoolError::State(error)),
                 Err(cleanup) => Err(WorkerPoolError::Compensation(format!("{error}; {cleanup}"))),
             },
+        }
+    }
+
+    fn retry_detached_cleanup(&self) -> Result<Vec<WorkerId>, WorkerPoolError> {
+        let markers = self.repository.state_store().detached_cleanup_markers()?;
+        self.cleanup_detached(&markers)
+    }
+
+    fn cleanup_detached(&self, workers: &[WorkerId]) -> Result<Vec<WorkerId>, WorkerPoolError> {
+        let state_store = self.repository.state_store();
+        let mut cleaned = Vec::new();
+        let mut busy = Vec::new();
+        let mut failures = Vec::new();
+        for worker in workers {
+            match state_store.detached_cleanup_status(worker) {
+                Ok(crate::state::DetachedCleanupStatus::Ready) => {
+                    if let Err(error) =
+                        crate::workspace::teardown_detached(&self.repository, worker)
+                    {
+                        failures.push(format!("{worker}: {error}"));
+                        continue;
+                    }
+                    match state_store.finish_detached_cleanup(worker) {
+                        Ok(true) => cleaned.push(worker.clone()),
+                        Ok(false) => failures
+                            .push(format!("{worker}: Worker rejoined the Pool during cleanup")),
+                        Err(error) => failures.push(format!("{worker}: {error}")),
+                    }
+                }
+                Ok(crate::state::DetachedCleanupStatus::Busy) => busy.push(worker.clone()),
+                Ok(crate::state::DetachedCleanupStatus::NotDetached) => {}
+                Err(error) => failures.push(format!("{worker}: {error}")),
+            }
+        }
+        if !busy.is_empty() {
+            return Err(WorkerPoolError::WorkersBusy { workers: busy });
+        }
+        if failures.is_empty() {
+            Ok(cleaned)
+        } else {
+            Err(WorkerPoolError::Cleanup(failures.join("; ")))
         }
     }
 
@@ -601,10 +737,10 @@ fn next_worker_id(
 }
 
 fn worker_claimed(repository: &Repository, worker: &WorkerId) -> bool {
+    let state = repository.state_store().worker(worker.clone());
     crate::workspace::worker_path(repository.root(), worker).exists()
-        || repository
-            .state_store()
-            .worker(worker.clone())
+        || state.cleanup_marker_exists()
+        || state
             .load()
             .is_ok_and(|state| matches!(state, Loaded::Present(_)))
 }

@@ -22,6 +22,7 @@ use crate::Repository;
 const POOL_PATH: &str = ".jj/pool.json";
 const POOL_DIRECTORY: &str = ".jj/pool";
 const POOL_LOCK: &str = ".jj/pool/.dispatch.lock";
+const CLEANUP_SUFFIX: &str = ".cleanup";
 
 type Extensions = BTreeMap<String, Value>;
 
@@ -484,6 +485,31 @@ pub(crate) enum ReservationOutcome {
     },
 }
 
+#[derive(Debug)]
+pub(crate) enum PoolMembershipOutcome {
+    Changed {
+        capacity: usize,
+        removed: Vec<WorkerId>,
+    },
+    NoChange {
+        capacity: usize,
+    },
+    NeedsGrowth,
+    Busy {
+        workers: Vec<WorkerId>,
+    },
+    WorkerNotInPool {
+        worker: WorkerId,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum DetachedCleanupStatus {
+    Ready,
+    Busy,
+    NotDetached,
+}
+
 /// Pool state repository.
 #[derive(Debug, Clone)]
 pub struct PoolStateRepository {
@@ -531,6 +557,219 @@ impl StateStore {
             root: self.root.clone(),
             parent,
         }
+    }
+
+    /// Atomically detaches the stable Pool tail when every selected Worker is non-busy.
+    pub(crate) fn shrink_pool(
+        &self,
+        requested: usize,
+    ) -> Result<PoolMembershipOutcome, StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            let pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => {
+                    return Err(StateError::new("resize", subject, "state is missing"));
+                }
+            };
+            let current = usize::try_from(pool.size)
+                .map_err(|_| StateError::new("resize", subject, "size is invalid"))?;
+            if requested > current {
+                return Ok(PoolMembershipOutcome::NeedsGrowth);
+            }
+            if requested == current {
+                return Ok(PoolMembershipOutcome::NoChange { capacity: current });
+            }
+            let selected = pool.workers[requested..].to_vec();
+            let mut locks = selected
+                .iter()
+                .map(|worker| {
+                    self.root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.json.lock"))
+                })
+                .collect::<Vec<_>>();
+            locks.sort();
+            with_locks(&locks, subject, || {
+                let mut pool =
+                    match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                        Loaded::Present(versioned) => versioned.value,
+                        Loaded::Missing => {
+                            return Err(StateError::new("resize", subject, "state is missing"));
+                        }
+                    };
+                let mut busy = Vec::new();
+                for worker in &selected {
+                    let path = self
+                        .root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.json"));
+                    match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+                        Loaded::Present(versioned) if versioned.value.status.as_str() == "busy" => {
+                            busy.push(worker.clone());
+                        }
+                        Loaded::Present(_) | Loaded::Missing => {}
+                    }
+                }
+                if !busy.is_empty() {
+                    return Ok(PoolMembershipOutcome::Busy { workers: busy });
+                }
+                for worker in &selected {
+                    write_cleanup_marker(&self.root, worker, subject)?;
+                    pool.names.remove(worker);
+                }
+                pool.workers.truncate(requested);
+                pool.size = i64::try_from(requested)
+                    .map_err(|_| StateError::new("resize", subject, "size is too large"))?;
+                write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                Ok(PoolMembershipOutcome::Changed {
+                    capacity: requested,
+                    removed: selected,
+                })
+            })
+        })
+    }
+
+    /// Atomically detaches one named non-busy Worker from Pool membership.
+    pub(crate) fn remove_pool_worker(
+        &self,
+        requested: &WorkerId,
+    ) -> Result<PoolMembershipOutcome, StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            let mut pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => {
+                    return Err(StateError::new("remove", subject, "state is missing"));
+                }
+            };
+            let Some(index) = pool.workers.iter().position(|worker| worker == requested) else {
+                return Ok(PoolMembershipOutcome::WorkerNotInPool {
+                    worker: requested.clone(),
+                });
+            };
+            let lock = self
+                .root
+                .join(POOL_DIRECTORY)
+                .join(format!("{requested}.json.lock"));
+            with_locks(&[lock], subject, || {
+                let path = self
+                    .root
+                    .join(POOL_DIRECTORY)
+                    .join(format!("{requested}.json"));
+                if let Loaded::Present(versioned) =
+                    load_state(&path, &format!("Worker {requested}"), &validate_worker)?
+                    && versioned.value.status.as_str() == "busy"
+                {
+                    return Ok(PoolMembershipOutcome::Busy {
+                        workers: vec![requested.clone()],
+                    });
+                }
+                write_cleanup_marker(&self.root, requested, subject)?;
+                pool.workers.remove(index);
+                pool.names.remove(requested);
+                pool.size = i64::try_from(pool.workers.len())
+                    .map_err(|_| StateError::new("remove", subject, "size is too large"))?;
+                write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                Ok(PoolMembershipOutcome::Changed {
+                    capacity: pool.workers.len(),
+                    removed: vec![requested.clone()],
+                })
+            })
+        })
+    }
+
+    /// Finds durable markers left by interrupted detached Worker cleanup.
+    pub(crate) fn detached_cleanup_markers(&self) -> Result<Vec<WorkerId>, StateError> {
+        let directory = self.root.join(POOL_DIRECTORY);
+        let entries = match fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StateError::new("discover cleanup", "Worker Pool", error)),
+        };
+        let mut workers = Vec::new();
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| StateError::new("discover cleanup", "Worker Pool", error))?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Some(worker) = name.strip_suffix(CLEANUP_SUFFIX) else {
+                continue;
+            };
+            workers.push(
+                WorkerId::parse(worker)
+                    .map_err(|error| StateError::new("discover cleanup", "Worker Pool", error))?,
+            );
+        }
+        workers.sort();
+        Ok(workers)
+    }
+
+    /// Revalidates a cleanup marker under the Pool lock followed by its Worker lock.
+    pub(crate) fn detached_cleanup_status(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<DetachedCleanupStatus, StateError> {
+        let subject = format!("Worker {worker}");
+        with_locks(&[self.root.join(POOL_LOCK)], &subject, || {
+            let worker_lock = self
+                .root
+                .join(POOL_DIRECTORY)
+                .join(format!("{worker}.json.lock"));
+            with_locks(&[worker_lock], &subject, || {
+                let marker = cleanup_marker_path(&self.root, worker);
+                if !marker.exists() {
+                    return Ok(DetachedCleanupStatus::NotDetached);
+                }
+                let pool = load_state(&self.root.join(POOL_PATH), "Worker Pool", &validate_pool)?;
+                if matches!(
+                    pool,
+                    Loaded::Present(ref versioned)
+                        if versioned.value.workers.iter().any(|member| member == worker)
+                ) {
+                    remove_file_if_present(&marker, "remove stale cleanup marker", &subject)?;
+                    return Ok(DetachedCleanupStatus::NotDetached);
+                }
+                let path = self
+                    .root
+                    .join(POOL_DIRECTORY)
+                    .join(format!("{worker}.json"));
+                match load_state(&path, &subject, &validate_worker)? {
+                    Loaded::Present(versioned) if versioned.value.status.as_str() == "busy" => {
+                        Ok(DetachedCleanupStatus::Busy)
+                    }
+                    Loaded::Present(_) | Loaded::Missing => Ok(DetachedCleanupStatus::Ready),
+                }
+            })
+        })
+    }
+
+    /// Removes a completed cleanup marker if the Worker remains detached.
+    pub(crate) fn finish_detached_cleanup(&self, worker: &WorkerId) -> Result<bool, StateError> {
+        let subject = format!("Worker {worker}");
+        with_locks(&[self.root.join(POOL_LOCK)], &subject, || {
+            let worker_lock = self
+                .root
+                .join(POOL_DIRECTORY)
+                .join(format!("{worker}.json.lock"));
+            with_locks(&[worker_lock], &subject, || {
+                let pool = load_state(&self.root.join(POOL_PATH), "Worker Pool", &validate_pool)?;
+                if matches!(
+                    pool,
+                    Loaded::Present(ref versioned)
+                        if versioned.value.workers.iter().any(|member| member == worker)
+                ) {
+                    return Ok(false);
+                }
+                remove_file_if_present(
+                    &cleanup_marker_path(&self.root, worker),
+                    "finish cleanup",
+                    &subject,
+                )?;
+                Ok(true)
+            })
+        })
     }
 
     /// Atomically reserves an idle Worker while holding the compatible pool
@@ -719,6 +958,11 @@ repository_methods!(
 );
 
 impl WorkerStateRepository {
+    /// Reports whether Pool membership removal left a durable cleanup marker.
+    pub(crate) fn cleanup_marker_exists(&self) -> bool {
+        cleanup_marker_path(&self.root, &self.worker).exists()
+    }
+
     /// Removes detached Worker state and its log together under the Worker lock.
     ///
     /// When `expected` is present, a newer Worker state is left untouched and
@@ -791,6 +1035,35 @@ impl DispatchGroupStateRepository {
             change,
             |group| validate_dispatch_group_for(&self.parent, group),
         )
+    }
+}
+
+fn cleanup_marker_path(root: &Path, worker: &WorkerId) -> PathBuf {
+    root.join(POOL_DIRECTORY)
+        .join(format!("{worker}{CLEANUP_SUFFIX}"))
+}
+
+fn write_cleanup_marker(root: &Path, worker: &WorkerId, subject: &str) -> Result<(), StateError> {
+    let marker = cleanup_marker_path(root, worker);
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&marker)
+        .map_err(|error| StateError::new("mark cleanup", subject, error))?;
+    file.sync_all()
+        .map_err(|error| StateError::new("sync cleanup marker", subject, error))
+}
+
+fn remove_file_if_present(
+    path: &Path,
+    operation: &'static str,
+    subject: &str,
+) -> Result<(), StateError> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::new(operation, subject, error)),
     }
 }
 
