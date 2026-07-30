@@ -3,8 +3,9 @@
 use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 
@@ -68,7 +69,7 @@ impl AgentRuntimeInvocation {
     }
 }
 
-/// Inputs required to execute one foreground Run.
+/// Inputs required to execute one Run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunRequest {
     runtime: AgentRuntime,
@@ -78,7 +79,7 @@ pub struct RunRequest {
 }
 
 impl RunRequest {
-    /// Creates a foreground Run request for a Worker Workspace.
+    /// Creates a Run request for a Worker Workspace.
     pub fn new(
         runtime: AgentRuntime,
         invocation: AgentRuntimeInvocation,
@@ -105,10 +106,7 @@ impl RunSupervisor {
     }
 
     /// Executes one Run attached to the caller's terminal.
-    pub fn run_foreground(
-        &self,
-        request: &RunRequest,
-    ) -> Result<ForegroundRunOutcome, RunSupervisorError> {
+    pub fn run_foreground(&self, request: &RunRequest) -> Result<RunOutcome, RunSupervisorError> {
         let capabilities = request.runtime.probe(&request.workspace)?;
         let log = OpenOptions::new()
             .create(true)
@@ -159,26 +157,95 @@ impl RunSupervisor {
             });
         }
 
-        Ok(ForegroundRunOutcome {
+        Ok(RunOutcome {
             exit_code: status.and_then(|status| status.code()),
+        })
+    }
+
+    /// Starts one Run detached from the caller's terminal.
+    pub fn run_background(
+        &self,
+        request: &RunRequest,
+    ) -> Result<BackgroundRun, RunSupervisorError> {
+        let capabilities = request.runtime.probe(&request.workspace)?;
+        let log = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&request.log_path)
+            .map_err(|source| RunSupervisorError::BackgroundLog {
+                path: request.log_path.clone(),
+                source,
+            })?;
+        let error_log = log
+            .try_clone()
+            .map_err(|source| RunSupervisorError::BackgroundLog {
+                path: request.log_path.clone(),
+                source,
+            })?;
+        let mut command = request.runtime.command(&request.invocation, capabilities);
+        command
+            .current_dir(&request.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::from(log))
+            .stderr(Stdio::from(error_log))
+            .process_group(0);
+        let child = command
+            .spawn()
+            .map_err(|source| RunSupervisorError::BackgroundSpawn {
+                runtime: request.runtime,
+                source,
+            })?;
+        Ok(BackgroundRun {
+            child,
+            runtime: request.runtime,
         })
     }
 }
 
-/// The completion result of a foreground Run.
+/// One running background Agent Runtime process.
+#[must_use = "background Runs must be waited on so their process is reaped"]
+#[derive(Debug)]
+pub struct BackgroundRun {
+    child: Child,
+    runtime: AgentRuntime,
+}
+
+impl BackgroundRun {
+    /// Returns the process ID, which is also the Run's process-group ID.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// Waits for the background Run and reaps its process.
+    pub fn wait(mut self) -> Result<RunOutcome, RunSupervisorError> {
+        let status = self
+            .child
+            .wait()
+            .map_err(|source| RunSupervisorError::Wait {
+                runtime: self.runtime,
+                source,
+            })?;
+        Ok(RunOutcome {
+            exit_code: status.code(),
+        })
+    }
+}
+
+/// The process completion result of an Agent Runtime Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ForegroundRunOutcome {
+pub struct RunOutcome {
     exit_code: Option<i32>,
 }
 
-impl ForegroundRunOutcome {
+impl RunOutcome {
     /// Returns the process exit code, or `None` when the process was signaled.
     pub fn exit_code(self) -> Option<i32> {
         self.exit_code
     }
 }
 
-/// Errors from foreground Run execution.
+/// Errors from Agent Runtime Run execution.
 #[derive(Debug, Error)]
 pub enum RunSupervisorError {
     /// The Agent Runtime capability probe could not start.
@@ -193,9 +260,27 @@ pub enum RunSupervisorError {
         #[source]
         source: io::Error,
     },
+    /// The background Run log could not be created or duplicated.
+    #[error("cannot create background Run log {path}: {source}")]
+    BackgroundLog {
+        /// The configured log path.
+        path: PathBuf,
+        /// The filesystem error.
+        #[source]
+        source: io::Error,
+    },
     /// The Agent Runtime process could not be started.
     #[error("cannot spawn {runtime} foreground Run: {source}")]
     Spawn {
+        /// The selected Agent Runtime.
+        runtime: AgentRuntime,
+        /// The process creation error.
+        #[source]
+        source: io::Error,
+    },
+    /// The background Agent Runtime process could not be started.
+    #[error("cannot spawn {runtime} background Run: {source}")]
+    BackgroundSpawn {
         /// The selected Agent Runtime.
         runtime: AgentRuntime,
         /// The process creation error.
@@ -212,7 +297,7 @@ pub enum RunSupervisorError {
         source: io::Error,
     },
     /// The Agent Runtime process could not be waited on.
-    #[error("cannot wait for {runtime} foreground Run: {source}")]
+    #[error("cannot wait for {runtime} Run: {source}")]
     Wait {
         /// The selected Agent Runtime.
         runtime: AgentRuntime,

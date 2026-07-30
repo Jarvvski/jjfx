@@ -234,10 +234,12 @@ fn provisions_present_setup_sources_without_copying_synapse_git_metadata() {
         .expect("Synapse file should copy"),
         "prompt"
     );
-    assert!(!workspace
-        .path()
-        .join("tools/dev-cli/synapse/clone/.git")
-        .exists());
+    assert!(
+        !workspace
+            .path()
+            .join("tools/dev-cli/synapse/clone/.git")
+            .exists()
+    );
 }
 
 #[test]
@@ -251,9 +253,11 @@ fn provisioning_rejects_a_claimed_worker_without_touching_it() {
         .provision_worker_workspace(&worker)
         .expect_err("existing Worker Workspace should be rejected");
 
-    assert!(error
-        .to_string()
-        .contains("Worker Workspace path already exists"));
+    assert!(
+        error
+            .to_string()
+            .contains("Worker Workspace path already exists")
+    );
     assert!(existing.is_dir());
     assert!(!workspace_names(repository.root()).contains(&"worker-01".to_owned()));
     assert!(!repository.root().join(".jj/pool/worker-01.json").exists());

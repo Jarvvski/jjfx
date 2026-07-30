@@ -92,3 +92,12 @@ Coverage includes Claude and Codex fake runtimes, setup and spawn failures, log
 truncation, and large dual-stream output. Background launch, process-group
 cleanup, PID persistence, liveness reconciliation, and terminal finalization
 remain pending.
+
+2026-07-27 - Added background Run launch through the shared supervisor. Background
+Runs now execute the typed provider command directly in the Worker Workspace,
+lead a new process group, detach from terminal input, and own a single truncated
+stdout/stderr log through child file descriptors. The opaque launch handle exposes
+only the leader PID and process completion outcome while retaining reaping
+ownership. Public integration coverage verifies prompt return, process-group
+identity, delayed child-owned output, log setup failure, spawn failure, and strict
+test cleanup. Worker PID persistence and terminal finalization remain pending.

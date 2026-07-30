@@ -755,7 +755,7 @@ impl<T> TransposeOption<T> for Option<Option<T>> {
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    use rustix::process::{test_kill_process, Pid};
+    use rustix::process::{Pid, test_kill_process};
 
     i32::try_from(pid)
         .ok()

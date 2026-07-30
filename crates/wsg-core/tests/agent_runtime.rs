@@ -3,8 +3,11 @@ use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, Signal, kill_process_group};
 use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
@@ -18,6 +21,9 @@ const HELPER_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_WORKSPACE";
 const HELPER_LOG: &str = "WSG_AGENT_RUNTIME_HELPER_LOG";
 const HELPER_EXECUTED: &str = "WSG_AGENT_RUNTIME_HELPER_EXECUTED";
 const HELPER_RUNTIME: &str = "WSG_AGENT_RUNTIME_HELPER_RUNTIME";
+const HELPER_PROCESS: &str = "WSG_AGENT_RUNTIME_HELPER_PROCESS";
+const HELPER_RELEASE: &str = "WSG_AGENT_RUNTIME_HELPER_RELEASE";
+const HELPER_EXIT: &str = "WSG_AGENT_RUNTIME_HELPER_EXIT";
 
 #[test]
 fn fresh_claude_command_preserves_headless_stream_invocation() {
@@ -146,13 +152,17 @@ fn command_omits_capability_flags_when_not_supported_by_that_runtime() {
         AgentRuntimeCapabilities::new(false, true),
     );
 
-    assert!(!command_args(&claude)
-        .iter()
-        .any(|arg| arg == "--forward-subagent-text"));
+    assert!(
+        !command_args(&claude)
+            .iter()
+            .any(|arg| arg == "--forward-subagent-text")
+    );
     assert!(!command_args(&claude).iter().any(|arg| arg == "multi_agent"));
-    assert!(!command_args(&codex)
-        .iter()
-        .any(|arg| arg == "--forward-subagent-text"));
+    assert!(
+        !command_args(&codex)
+            .iter()
+            .any(|arg| arg == "--forward-subagent-text")
+    );
     assert!(!command_args(&codex).iter().any(|arg| arg == "multi_agent"));
 }
 
@@ -271,6 +281,169 @@ fn probe_runs_in_the_worker_workspace() {
             .to_str()
             .expect("temporary path")
     );
+}
+
+#[test]
+fn background_run_returns_process_group_leader_with_child_owned_log() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    let process = temporary_directory.path().join("process");
+    let release = temporary_directory.path().join("release");
+    let exit = temporary_directory.path().join("exit");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    fs::write(&log, "stale output\n").expect("stale log");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf 'stdout-before\\n'\nprintf 'stderr-before\\n' >&2\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\nprintf 'stdout-after\\n'\nprintf 'stderr-after\\n' >&2\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "background_run_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROCESS, &process)
+        .env(HELPER_RELEASE, &release)
+        .env(HELPER_EXIT, &exit)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
+
+    wait_for_file(&result);
+    wait_for_file(&process);
+    assert!(
+        child.is_running(),
+        "background launch should return before the runtime exits"
+    );
+    let pid: u32 = fs::read_to_string(&result)
+        .expect("background result")
+        .parse()
+        .expect("background PID");
+    let process_identity = fs::read_to_string(&process).expect("process identity");
+    let mut identity_parts = process_identity.split_whitespace();
+    let runtime_pid: u32 = identity_parts
+        .next()
+        .expect("runtime PID")
+        .parse()
+        .expect("numeric runtime PID");
+    let process_group: u32 = identity_parts
+        .next()
+        .expect("process group")
+        .parse()
+        .expect("numeric process group");
+    assert_eq!(pid, runtime_pid);
+    assert_eq!(pid, process_group);
+
+    fs::write(&release, []).expect("release runtime");
+    let output = child.wait_with_output();
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(exit).expect("background exit outcome"),
+        "exit=Some(0)"
+    );
+    let log_contents = fs::read_to_string(log).expect("background log");
+    assert!(!log_contents.contains("stale output"));
+    assert!(log_contents.contains("stdout-before\n"));
+    assert!(log_contents.contains("stderr-before\n"));
+    assert!(log_contents.contains("stdout-after\n"));
+    assert!(log_contents.contains("stderr-after\n"));
+}
+
+#[test]
+fn background_run_log_setup_failure_prevents_workload_spawn() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let missing_log = temporary_directory
+        .path()
+        .join("missing")
+        .join("worker.log");
+    let executed = temporary_directory.path().join("executed");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ntouch \"$WSG_AGENT_RUNTIME_HELPER_EXECUTED\"\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "background_run_error_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &missing_log)
+        .env(HELPER_EXECUTED, &executed)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("background error helper");
+    assert!(status.success());
+    let error = fs::read_to_string(result).expect("background error");
+    assert!(error.starts_with(&format!(
+        "cannot create background Run log {}:",
+        missing_log.display()
+    )));
+    assert!(error.contains("No such file or directory"));
+    assert!(!executed.exists(), "workload should not spawn");
+}
+
+#[test]
+fn background_run_spawn_failure_is_typed() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then rm \"$0\"; exit 0; fi\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "background_run_spawn_error_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let status = helper.status().expect("background spawn error helper");
+    assert!(status.success());
+    let error = fs::read_to_string(result).expect("background spawn error");
+    assert!(error.starts_with("cannot spawn claude background Run:"));
+    assert!(error.contains("No such file or directory"));
 }
 
 #[test]
@@ -549,6 +722,63 @@ fn foreground_run_spawn_failure_is_typed() {
 
 #[test]
 #[ignore]
+fn background_run_helper() {
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let result = PathBuf::from(env::var_os(HELPER_RESULT).expect("result path"));
+    let exit = PathBuf::from(env::var_os(HELPER_EXIT).expect("exit path"));
+    let request = RunRequest::new(
+        AgentRuntime::Claude,
+        AgentRuntimeInvocation::new("background test"),
+        workspace,
+        log,
+    );
+    let background = RunSupervisor::new()
+        .run_background(&request)
+        .expect("background Run should start");
+    fs::write(result, background.pid().to_string()).expect("background PID result");
+    let outcome = background.wait().expect("background Run should complete");
+    fs::write(exit, format!("exit={:?}", outcome.exit_code())).expect("background exit result");
+}
+
+#[test]
+#[ignore]
+fn background_run_error_helper() {
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let result = PathBuf::from(env::var_os(HELPER_RESULT).expect("result path"));
+    let request = RunRequest::new(
+        AgentRuntime::Claude,
+        AgentRuntimeInvocation::new("background error test"),
+        workspace,
+        log,
+    );
+    let error = RunSupervisor::new()
+        .run_background(&request)
+        .expect_err("log setup should fail");
+    fs::write(result, error.to_string()).expect("background error result");
+}
+
+#[test]
+#[ignore]
+fn background_run_spawn_error_helper() {
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let result = PathBuf::from(env::var_os(HELPER_RESULT).expect("result path"));
+    let request = RunRequest::new(
+        AgentRuntime::Claude,
+        AgentRuntimeInvocation::new("background spawn error test"),
+        workspace,
+        log,
+    );
+    let error = RunSupervisor::new()
+        .run_background(&request)
+        .expect_err("spawn should fail after probe");
+    fs::write(result, error.to_string()).expect("background spawn error result");
+}
+
+#[test]
+#[ignore]
 fn foreground_run_spawn_error_helper() {
     let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
     let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
@@ -643,6 +873,73 @@ fn agent_runtime_probe_helper() {
     };
     fs::write(result, contents).expect("write probe result");
     assert!(path.is_dir(), "helper PATH should be a directory");
+}
+
+struct BackgroundHelperGuard {
+    child: Option<Child>,
+    release: PathBuf,
+    process_ids: [PathBuf; 2],
+}
+
+impl BackgroundHelperGuard {
+    fn spawn(
+        command: &mut Command,
+        release: &std::path::Path,
+        process_ids: [&std::path::Path; 2],
+    ) -> Self {
+        Self {
+            child: Some(command.spawn().expect("background helper")),
+            release: release.to_owned(),
+            process_ids: process_ids.map(std::path::Path::to_owned),
+        }
+    }
+
+    fn is_running(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .expect("background helper")
+            .try_wait()
+            .expect("background helper status")
+            .is_none()
+    }
+
+    fn wait_with_output(mut self) -> std::process::Output {
+        self.child
+            .take()
+            .expect("background helper")
+            .wait_with_output()
+            .expect("background helper output")
+    }
+}
+
+impl Drop for BackgroundHelperGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let _ = fs::write(&self.release, []);
+        for path in &self.process_ids {
+            let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .and_then(|contents| contents.split_whitespace().next()?.parse::<i32>().ok())
+                .and_then(Pid::from_raw)
+            else {
+                continue;
+            };
+            let _ = kill_process_group(pid, Signal::KILL);
+            break;
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn wait_for_file(path: &std::path::Path) {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !path.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(path.exists(), "{} should be created", path.display());
 }
 
 fn helper_command(path: &std::path::Path, result: &std::path::Path, mode: &str) -> Command {
