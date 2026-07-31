@@ -1,6 +1,6 @@
 # Port Reservations and Direct Dispatch
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

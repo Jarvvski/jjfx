@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+mod direct_dispatch;
 mod dispatch_prompt;
 mod pool;
 mod run_log;
@@ -15,6 +16,11 @@ mod ticket;
 mod worker_actions;
 mod workspace;
 
+pub use direct_dispatch::{
+    DirectDispatchExecution, DirectDispatchFailure, DirectDispatchFailurePhase,
+    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess,
+    DispatchDependencyContext,
+};
 pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
     DispatchPromptError,
