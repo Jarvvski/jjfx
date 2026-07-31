@@ -1602,6 +1602,58 @@ fn bulk_reservation_reports_exact_shortage_without_writing_any_worker() {
 }
 
 #[test]
+fn caller_approved_growth_adopts_and_reserves_only_the_reported_gap() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let original = pool
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    pool.reserve_named(original, "ENG-BUSY")
+        .expect("seed busy Worker");
+    let pool_path = repository.root().join(".jj/pool.json");
+    let before_rejection = fs::read(&pool_path).expect("Pool before rejected growth");
+
+    let error = pool
+        .grow_and_reserve_many(&["ENG-305", "ENG-306"], 1)
+        .expect_err("approval smaller than the gap must be rejected");
+    let wsg_core::WorkerPoolError::CapacityShortage(shortage) = error else {
+        panic!("expected capacity shortage");
+    };
+    assert_eq!(shortage.gap(), 2);
+    assert_eq!(
+        fs::read(&pool_path).expect("Pool after rejected growth"),
+        before_rejection
+    );
+
+    let reservations = pool
+        .grow_and_reserve_many(&["ENG-305", "ENG-306"], shortage.gap())
+        .expect("approved growth and Reservation");
+
+    assert_eq!(reservations.len(), 2);
+    assert_eq!(reservations[0].ticket(), "ENG-305");
+    assert_eq!(reservations[1].ticket(), "ENG-306");
+    assert_ne!(reservations[0].worker_id(), reservations[1].worker_id());
+    let snapshot = pool.snapshot();
+    assert_eq!(snapshot.pool().expect("Pool").size(), 3);
+    assert_eq!(
+        snapshot
+            .worker(reservations[0].worker_id().as_str())
+            .expect("first added Worker")
+            .status(),
+        WorkerStatus::Busy
+    );
+    assert_eq!(
+        snapshot
+            .worker(reservations[1].worker_id().as_str())
+            .expect("second added Worker")
+            .status(),
+        WorkerStatus::Busy
+    );
+}
+
+#[test]
 fn reserves_the_first_idle_worker_for_a_ticket() {
     let (_temp, repository) = repository_with_pool();
     let reservation = repository

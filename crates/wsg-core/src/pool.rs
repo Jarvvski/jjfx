@@ -540,6 +540,105 @@ impl WorkerPool {
         }
     }
 
+    /// Reserves a complete batch, provisioning at most the caller-approved gap.
+    ///
+    /// Provisioning runs outside state locks. Final Pool adoption and batch
+    /// Reservation share one locked transition, so concurrent claimers cannot
+    /// take newly added capacity between those steps.
+    pub fn grow_and_reserve_many<S: AsRef<str>>(
+        &self,
+        tickets: &[S],
+        approved_additional: usize,
+    ) -> Result<Vec<Reservation>, WorkerPoolError> {
+        let shortage = match self.reserve_many(tickets) {
+            Ok(reservations) => return Ok(reservations),
+            Err(WorkerPoolError::CapacityShortage(shortage)) => shortage,
+            Err(error) => return Err(error),
+        };
+        if shortage.gap() > approved_additional {
+            return Err(shortage.into());
+        }
+
+        let pool_repository = self.repository.state_store().pool();
+        let current = self.load_or_create(&pool_repository)?;
+        let current_size = usize::try_from(current.value.size)
+            .map_err(|_| WorkerPoolError::InvalidSize(current.value.size))?;
+        let mut known = current
+            .value
+            .workers
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let mut added = Vec::with_capacity(shortage.gap());
+        for _ in 0..shortage.gap() {
+            let worker = next_worker_id(&self.repository, &known)?;
+            match self.repository.provision_worker_workspace(&worker) {
+                Ok(_) => {
+                    known.insert(worker.clone());
+                    added.push(worker);
+                }
+                Err(source) => {
+                    return match self.cleanup_workers(&added) {
+                        Ok(()) => Err(WorkerPoolError::Provision { worker, source }),
+                        Err(cleanup) => Err(WorkerPoolError::Compensation(format!(
+                            "{source}; {cleanup}"
+                        ))),
+                    };
+                }
+            }
+        }
+
+        let mut next = current.value.clone();
+        next.size = i64::try_from(current_size + added.len())
+            .map_err(|_| WorkerPoolError::InvalidSize(next.size))?;
+        next.workers.extend(added.iter().cloned());
+        let inputs = tickets
+            .iter()
+            .map(|ticket| {
+                let ticket = ticket.as_ref().to_owned();
+                Ok(crate::state::ReservationInput {
+                    branch_name: ticket.to_lowercase(),
+                    ticket,
+                    started_at: current_timestamp()?,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerPoolError>>()?;
+        let outcome = self.repository.state_store().grow_and_reserve_workers(
+            current.revision().clone(),
+            next,
+            inputs,
+        );
+        let result = match outcome {
+            Ok(crate::state::GrowReservationsOutcome::Reserved(reserved)) => Ok(reserved
+                .into_iter()
+                .map(|reserved| Reservation {
+                    worker_id: reserved.worker,
+                    ticket: reserved.ticket,
+                    agent_runtime: reserved.agent_runtime,
+                    repository: self.repository.clone(),
+                    worker_revision: reserved.revision,
+                    rollback: reserved.rollback,
+                })
+                .collect()),
+            Ok(crate::state::GrowReservationsOutcome::Conflict) => Err(WorkerPoolError::Conflict),
+            Ok(crate::state::GrowReservationsOutcome::NoIdle { available }) => {
+                Err(CapacityShortage::new(tickets.len(), available).into())
+            }
+            Ok(crate::state::GrowReservationsOutcome::InvalidAgentRuntime { value }) => {
+                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            }
+            Err(error) => Err(WorkerPoolError::State(error)),
+        };
+        if result.is_err()
+            && let Err(cleanup) = self.cleanup_workers(&added)
+        {
+            return Err(WorkerPoolError::Compensation(format!(
+                "{result:?}; {cleanup}"
+            )));
+        }
+        result
+    }
+
     /// Reserves the named idle Worker for `ticket`.
     pub fn reserve_named(
         &self,

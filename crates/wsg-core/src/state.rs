@@ -507,6 +507,13 @@ pub(crate) enum ReservationsOutcome {
     InvalidAgentRuntime { value: String },
 }
 
+pub(crate) enum GrowReservationsOutcome {
+    Reserved(Vec<ReservedWorker>),
+    Conflict,
+    NoIdle { available: usize },
+    InvalidAgentRuntime { value: String },
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FollowUpOutcome {
     Started {
@@ -1113,6 +1120,92 @@ impl StateStore {
         })
     }
 
+    /// Adopts provisioned Workers and reserves a complete batch in one locked transition.
+    pub(crate) fn grow_and_reserve_workers(
+        &self,
+        expected: StateRevision<PoolState>,
+        next: PoolState,
+        inputs: Vec<ReservationInput>,
+    ) -> Result<GrowReservationsOutcome, StateError> {
+        let pool_subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
+            if self.root.join(DESTROY_MARKER).exists() {
+                return Err(StateError::new(
+                    "grow and reserve",
+                    pool_subject,
+                    "Pool destruction is in progress",
+                ));
+            }
+            let loaded = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)?
+            {
+                Loaded::Present(versioned) => versioned,
+                Loaded::Missing => return Ok(GrowReservationsOutcome::Conflict),
+            };
+            if loaded.revision() != &expected {
+                return Ok(GrowReservationsOutcome::Conflict);
+            }
+            validate_pool(&next)
+                .map_err(|detail| StateError::new("grow and reserve", pool_subject, detail))?;
+            let worker_locks = next
+                .workers
+                .iter()
+                .map(|worker| {
+                    self.root
+                        .join(POOL_DIRECTORY)
+                        .join(format!("{worker}.json.lock"))
+                })
+                .collect::<Vec<_>>();
+            with_locks(&worker_locks, pool_subject, || {
+                let loaded =
+                    match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+                        Loaded::Present(versioned) => versioned,
+                        Loaded::Missing => return Ok(GrowReservationsOutcome::Conflict),
+                    };
+                if loaded.revision() != &expected {
+                    return Ok(GrowReservationsOutcome::Conflict);
+                }
+                let reserved = match reserve_batch_locked(&self.root, &next, inputs)? {
+                    ReservationsOutcome::Reserved(reserved) => reserved,
+                    ReservationsOutcome::NoIdle { available } => {
+                        return Ok(GrowReservationsOutcome::NoIdle { available });
+                    }
+                    ReservationsOutcome::InvalidAgentRuntime { value } => {
+                        return Ok(GrowReservationsOutcome::InvalidAgentRuntime { value });
+                    }
+                };
+                if let Err(primary) = write_atomic(&self.root.join(POOL_PATH), &next, pool_subject)
+                {
+                    let rollback_failures = reserved
+                        .iter()
+                        .filter_map(|reserved| {
+                            let path = self
+                                .root
+                                .join(POOL_DIRECTORY)
+                                .join(format!("{}.json", reserved.worker));
+                            write_atomic(
+                                &path,
+                                &reserved.rollback,
+                                &format!("Worker {}", reserved.worker),
+                            )
+                            .err()
+                            .map(|error| format!("{}: {error}", reserved.worker))
+                        })
+                        .collect::<Vec<_>>();
+                    let detail = if rollback_failures.is_empty() {
+                        primary.to_string()
+                    } else {
+                        format!(
+                            "{primary}; reservation rollback failed: {}",
+                            rollback_failures.join("; ")
+                        )
+                    };
+                    return Err(StateError::new("grow and reserve", pool_subject, detail));
+                }
+                Ok(GrowReservationsOutcome::Reserved(reserved))
+            })
+        })
+    }
+
     /// Atomically reserves enough idle Workers for the complete input batch.
     ///
     /// Selection and every write happen while holding the Pool lock followed
@@ -1159,106 +1252,7 @@ impl StateStore {
                             ));
                         }
                     };
-                let agent_runtime = match crate::AgentRuntime::from_configured(pool.agent.as_ref())
-                {
-                    Ok(agent_runtime) => agent_runtime,
-                    Err(value) => {
-                        return Ok(ReservationsOutcome::InvalidAgentRuntime { value });
-                    }
-                };
-
-                let mut idle = Vec::new();
-                for worker in &pool.workers {
-                    let path = self
-                        .root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json"));
-                    let state =
-                        match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
-                            Loaded::Present(versioned) => versioned.value,
-                            Loaded::Missing => {
-                                return Err(StateError::new(
-                                    "reserve",
-                                    format!("Worker {worker}"),
-                                    "state is missing",
-                                ));
-                            }
-                        };
-                    if state.status.as_str() == "idle" {
-                        idle.push((worker.clone(), state));
-                    }
-                }
-                if idle.len() < inputs.len() {
-                    return Ok(ReservationsOutcome::NoIdle {
-                        available: idle.len(),
-                    });
-                }
-
-                let mut written = Vec::<(PathBuf, WorkerId, WorkerState)>::new();
-                let mut reserved = Vec::with_capacity(inputs.len());
-                for ((worker, mut state), input) in idle.into_iter().zip(inputs) {
-                    let rollback = state.clone();
-                    let ticket = input.ticket;
-                    state.status = WireStatus::new("busy");
-                    state.agent = Some(WireAgent::new(agent_runtime.as_str()));
-                    state.ticket = Some(ticket.clone());
-                    state.started_at = Some(input.started_at);
-                    state.log_file = Some(
-                        self.root
-                            .join(POOL_DIRECTORY)
-                            .join(format!("{worker}.log"))
-                            .to_string_lossy()
-                            .into_owned(),
-                    );
-                    state.branch_name = Some(input.branch_name);
-                    state.completed_at = None;
-                    state.pid = None;
-                    state.exit_code = None;
-                    state.error = None;
-                    let path = self
-                        .root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json"));
-                    if let Err(primary) = write_atomic(&path, &state, &format!("Worker {worker}")) {
-                        let rollback_failures = written
-                            .iter()
-                            .filter_map(|(path, worker, rollback)| {
-                                write_atomic(path, rollback, &format!("Worker {worker}"))
-                                    .err()
-                                    .map(|error| format!("{worker}: {error}"))
-                            })
-                            .collect::<Vec<_>>();
-                        let detail = if rollback_failures.is_empty() {
-                            primary.to_string()
-                        } else {
-                            format!(
-                                "{primary}; reservation rollback failed: {}",
-                                rollback_failures.join("; ")
-                            )
-                        };
-                        return Err(StateError::new("reserve", pool_subject, detail));
-                    }
-                    written.push((path.clone(), worker.clone(), rollback.clone()));
-                    let revision =
-                        match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
-                            Loaded::Present(versioned) => versioned.revision().clone(),
-                            Loaded::Missing => {
-                                return Err(StateError::new(
-                                    "reserve",
-                                    format!("Worker {worker}"),
-                                    "state disappeared after reservation",
-                                ));
-                            }
-                        };
-                    reserved.push(ReservedWorker {
-                        worker,
-                        ticket,
-                        agent_runtime,
-                        revision,
-                        rollback,
-                    });
-                }
-                Ok(ReservationsOutcome::Reserved(reserved))
+                reserve_batch_locked(&self.root, &pool, inputs)
             })
         })
     }
@@ -1405,6 +1399,100 @@ impl StateStore {
             })
         })
     }
+}
+
+fn reserve_batch_locked(
+    root: &Path,
+    pool: &PoolState,
+    inputs: Vec<ReservationInput>,
+) -> Result<ReservationsOutcome, StateError> {
+    let agent_runtime = match crate::AgentRuntime::from_configured(pool.agent.as_ref()) {
+        Ok(agent_runtime) => agent_runtime,
+        Err(value) => return Ok(ReservationsOutcome::InvalidAgentRuntime { value }),
+    };
+    let mut idle = Vec::new();
+    for worker in &pool.workers {
+        let path = root.join(POOL_DIRECTORY).join(format!("{worker}.json"));
+        let state = match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+            Loaded::Present(versioned) => versioned.value,
+            Loaded::Missing => {
+                return Err(StateError::new(
+                    "reserve",
+                    format!("Worker {worker}"),
+                    "state is missing",
+                ));
+            }
+        };
+        if state.status.as_str() == "idle" {
+            idle.push((worker.clone(), state));
+        }
+    }
+    if idle.len() < inputs.len() {
+        return Ok(ReservationsOutcome::NoIdle {
+            available: idle.len(),
+        });
+    }
+
+    let mut written = Vec::<(PathBuf, WorkerId, WorkerState)>::new();
+    let mut reserved = Vec::with_capacity(inputs.len());
+    for ((worker, mut state), input) in idle.into_iter().zip(inputs) {
+        let rollback = state.clone();
+        let ticket = input.ticket;
+        state.status = WireStatus::new("busy");
+        state.agent = Some(WireAgent::new(agent_runtime.as_str()));
+        state.ticket = Some(ticket.clone());
+        state.started_at = Some(input.started_at);
+        state.log_file = Some(
+            root.join(POOL_DIRECTORY)
+                .join(format!("{worker}.log"))
+                .to_string_lossy()
+                .into_owned(),
+        );
+        state.branch_name = Some(input.branch_name);
+        state.completed_at = None;
+        state.pid = None;
+        state.exit_code = None;
+        state.error = None;
+        let path = root.join(POOL_DIRECTORY).join(format!("{worker}.json"));
+        if let Err(primary) = write_atomic(&path, &state, &format!("Worker {worker}")) {
+            let rollback_failures = written
+                .iter()
+                .filter_map(|(path, worker, rollback)| {
+                    write_atomic(path, rollback, &format!("Worker {worker}"))
+                        .err()
+                        .map(|error| format!("{worker}: {error}"))
+                })
+                .collect::<Vec<_>>();
+            let detail = if rollback_failures.is_empty() {
+                primary.to_string()
+            } else {
+                format!(
+                    "{primary}; reservation rollback failed: {}",
+                    rollback_failures.join("; ")
+                )
+            };
+            return Err(StateError::new("reserve", "Worker Pool", detail));
+        }
+        written.push((path.clone(), worker.clone(), rollback.clone()));
+        let revision = match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+            Loaded::Present(versioned) => versioned.revision().clone(),
+            Loaded::Missing => {
+                return Err(StateError::new(
+                    "reserve",
+                    format!("Worker {worker}"),
+                    "state disappeared after reservation",
+                ));
+            }
+        };
+        reserved.push(ReservedWorker {
+            worker,
+            ticket,
+            agent_runtime,
+            revision,
+            rollback,
+        });
+    }
+    Ok(ReservationsOutcome::Reserved(reserved))
 }
 
 macro_rules! repository_methods {
