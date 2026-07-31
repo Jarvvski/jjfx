@@ -16,6 +16,27 @@ The owner uses **Jujutsu exclusively** in a colocated repo. **Never invoke `git`
 
 Remote: `origin` = `Jarvvski/jjfx` (SSH: `git@github.com:Jarvvski/jjfx.git` - SSH avoids the OAuth `workflow`-scope gate on pushing `.github/workflows/`). `gh` auto-detection fails in jj workspaces - always pass `-R Jarvvski/jjfx`.
 
+## Ticket execution scope
+
+When the user asks to pick or implement a ticket, the entire remaining ticket
+is the default scope for that agent session.
+
+- Plan and complete every remaining item under `## Commits`.
+- Satisfy every acceptance criterion before reporting the ticket complete.
+- Treat commit-list items as focused commits and TDD cycles within the same
+  session, not as separate session boundaries.
+- Do not stop after the first green TDD slice or focused commit.
+- For a ticket with multiple focused commits, describe each completed commit
+  and start the next with `jj new`, but do not move `main` between them. After
+  the whole ticket passes, move `main` to the stack tip and immediately run
+  `jj new`.
+- Update the ticket status to `resolved` only after `mise run check` passes.
+- If the ticket cannot reasonably fit in one session, identify that before
+  editing and ask the user to split it. Do not silently implement only the
+  first slice.
+- After implementation starts, stop early only for a hard blocker,
+  contradictory requirements, or a required human decision.
+
 ## Toolchain
 
 **mise** owns tasks and the Rust pin (see `mise.toml`, `rust-toolchain.toml`). Use the tasks, don't hand-roll cargo:

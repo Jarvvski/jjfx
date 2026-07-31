@@ -18,6 +18,18 @@ Create a new file under `.scratch/<feature-slug>/` (creating the directory if ne
 
 Read the file at the referenced path. The user will normally pass the path or the issue number directly.
 
+## Tickets as execution units
+
+A ticket is the default unit of planning and execution.
+
+- `## Commits` describes the ordered focused commits expected within the ticket.
+  It is not a list of separate agent sessions.
+- A plan for a ticket covers all remaining commit items and acceptance criteria.
+- Partial progress is recorded in `## Comments`, but the session continues
+  unless blocked.
+- A ticket becomes `resolved` only when its acceptance criteria and repository
+  verification gate pass.
+
 ## Wayfinding operations
 
 Used by `/wayfinder`. The **map** is a file with one **child** file per ticket.

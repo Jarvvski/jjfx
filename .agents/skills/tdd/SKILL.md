@@ -34,3 +34,12 @@ Ask: "What's the public interface, and which seams should we test?"
 - **Red before green.** Write the failing test first, then only enough code to pass it. Don't anticipate future tests or add speculative features.
 - **One slice at a time.** One seam, one test, one minimal implementation per cycle.
 - **Refactoring is not part of the loop.** It belongs to the review stage (see the `code-review` skill), not the red → green implementation cycle.
+
+## Completion scope
+
+"One slice at a time" defines the granularity of each red-green cycle. It does
+not define the scope of the agent session.
+
+When the approved work is a ticket, repeat vertical red-green cycles until every
+remaining ticket item and acceptance criterion is complete. Do not report the
+ticket complete or stop for landing after only one tracer bullet.
