@@ -1,6 +1,6 @@
 # Port structured logs, Agent Sessions, and Worker actions
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -42,12 +42,12 @@ Port behavioral scenarios, not Go parser structure. Use fixture lines for both p
 
 ## Acceptance Criteria
 
-- [ ] Run finalization reads compatible provider results and costs.
-- [ ] Current activity is available without scanning unbounded log data.
-- [ ] Follow-up reports resumed versus fresh behavior.
-- [ ] Worker actions return typed outcomes suitable for CLI and TUI rendering.
-- [ ] Reset restores capacity and cleans the process group.
-- [ ] `mise run check` is green.
+- [x] Run finalization reads compatible provider results and costs.
+- [x] Current activity is available without scanning unbounded log data.
+- [x] Follow-up reports resumed versus fresh behavior.
+- [x] Worker actions return typed outcomes suitable for CLI and TUI rendering.
+- [x] Reset restores capacity and cleans the process group.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -174,3 +174,8 @@ rollback, missing state, structured log access, and interactive Session resume.
 
 All implementation slices are complete. Ticket and Epic status closure remain
 pending the final acceptance check.
+
+2026-07-31 - Resolved after `mise run check` passed. The public seams now cover
+both provider log formats, bounded activity, structured exactly-once
+finalization, explicit Agent Session continuation, all eight Worker actions,
+and Reset capacity/process cleanup. Every acceptance criterion is satisfied.

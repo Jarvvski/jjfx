@@ -1,7 +1,7 @@
 # Epic B - Worker Pool and runtime
 
 Type: epic
-Status: tracking
+Status: resolved
 
 ## Goal
 
@@ -38,3 +38,13 @@ The Unix spike may run while Epic A finishes, but no production dependency may b
 - Reset terminates the complete Agent Runtime process group.
 - Logs, Agent Session IDs, Send, Review, Rebase, Open PR, Mount, and Reset work through shared interfaces.
 - `mise run check` is green.
+
+## Outcome
+
+2026-07-31 - Complete. Tickets 05 through 09 are resolved and every condition
+above holds: safe Unix primitives and shared locks preserve Go interoperability;
+Rust creates, resizes, resets, and destroys compatible Worker Pools; Claude Code
+and Codex Runs launch and finalize exactly once; Reset terminates process groups
+before releasing capacity and restores Workspaces asynchronously; and structured
+logs, Agent Sessions, Send, Review, Rebase, Open PR, Logs, Mount, and Reset are
+available through shared frontend-neutral interfaces. `mise run check` is green.
