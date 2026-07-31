@@ -466,6 +466,51 @@ impl WorkerPool {
         self.reserve_inner(None, ticket.into())
     }
 
+    /// Atomically reserves one idle Worker per Ticket in input order.
+    ///
+    /// The complete batch is all-or-nothing. When fewer idle Workers exist,
+    /// no Worker state is changed.
+    pub fn reserve_many<S: AsRef<str>>(
+        &self,
+        tickets: &[S],
+    ) -> Result<Vec<Reservation>, WorkerPoolError> {
+        let inputs = tickets
+            .iter()
+            .map(|ticket| {
+                let ticket = ticket.as_ref().to_owned();
+                Ok(crate::state::ReservationInput {
+                    branch_name: ticket.to_lowercase(),
+                    ticket,
+                    started_at: current_timestamp()?,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerPoolError>>()?;
+        match self.repository.state_store().reserve_workers(inputs)? {
+            crate::state::ReservationsOutcome::Reserved(reserved) => Ok(reserved
+                .into_iter()
+                .map(|reserved| Reservation {
+                    worker_id: reserved.worker,
+                    ticket: reserved.ticket,
+                    agent_runtime: reserved.agent_runtime,
+                    repository: self.repository.clone(),
+                    worker_revision: reserved.revision,
+                    rollback: reserved.rollback,
+                })
+                .collect()),
+            crate::state::ReservationsOutcome::NoIdle { available } => {
+                Err(WorkerPoolError::NoIdleWorkers {
+                    ticket: tickets
+                        .first()
+                        .map_or_else(|| "batch".to_owned(), |ticket| ticket.as_ref().to_owned()),
+                    available,
+                })
+            }
+            crate::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            }
+        }
+    }
+
     /// Reserves the named idle Worker for `ticket`.
     pub fn reserve_named(
         &self,

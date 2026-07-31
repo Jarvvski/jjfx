@@ -1517,6 +1517,49 @@ fn reservation_replaces_previous_runtime_while_preserving_worker_state() {
 }
 
 #[test]
+fn bulk_reservation_assigns_idle_workers_to_tickets_atomically_in_pool_order() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let workers = pool
+        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()
+        .to_vec();
+
+    let reservations = pool
+        .reserve_many(&["ENG-301", "ENG-302"])
+        .expect("reserve complete batch");
+
+    assert_eq!(reservations.len(), 2);
+    assert_eq!(reservations[0].worker_id(), &workers[0]);
+    assert_eq!(reservations[0].ticket(), "ENG-301");
+    assert_eq!(reservations[1].worker_id(), &workers[1]);
+    assert_eq!(reservations[1].ticket(), "ENG-302");
+    let snapshot = pool.snapshot();
+    assert_eq!(
+        snapshot
+            .worker(workers[0].as_str())
+            .expect("first Worker")
+            .ticket(),
+        Some("ENG-301")
+    );
+    assert_eq!(
+        snapshot
+            .worker(workers[1].as_str())
+            .expect("second Worker")
+            .ticket(),
+        Some("ENG-302")
+    );
+    assert_eq!(
+        snapshot
+            .worker(workers[2].as_str())
+            .expect("unselected Worker")
+            .status(),
+        WorkerStatus::Idle
+    );
+}
+
+#[test]
 fn reserves_the_first_idle_worker_for_a_ticket() {
     let (_temp, repository) = repository_with_pool();
     let reservation = repository
