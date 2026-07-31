@@ -89,3 +89,17 @@ JSON returns a typed parse error.
 Bounded tail and final-result scanning is the next focused slice. Agent Session
 identity, supervisor finalization, and Worker actions remain later work in this
 ticket.
+
+2026-07-31 - Completed bounded activity and full result scanning through the
+public `RunLog` facade. Current activity reads only the final 65,536 bytes,
+discards a split leading record, tolerates malformed and partially written log
+records, and returns the latest provider-neutral activity. Final result scanning
+streams the complete log, selects the latest terminal result, and preserves
+Claude duration, turns, cost, and failure details plus all Codex usage counters.
+Missing or unreadable logs and semantic provider failures retain path-aware typed
+errors, while a readable log without a meaningful activity or result returns
+`None`.
+
+Agent Session identity with explicit fresh-session fallback reasons is the next
+focused slice. Supervisor finalization and Worker actions remain later work in
+this ticket.

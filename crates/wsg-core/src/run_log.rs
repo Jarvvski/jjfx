@@ -1,6 +1,9 @@
 //! Provider-neutral parsing and values for structured Agent Runtime logs.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -8,6 +11,142 @@ use serde_json::{Number, Value};
 use thiserror::Error;
 
 use crate::runtime::AgentRuntime;
+
+const ACTIVITY_TAIL_BYTES: u64 = 65_536;
+
+/// One structured Agent Runtime log.
+#[derive(Debug)]
+pub struct RunLog {
+    path: PathBuf,
+    runtime: AgentRuntime,
+}
+
+impl RunLog {
+    /// Opens a provider log through the shared Run log interface.
+    pub fn new(path: impl AsRef<Path>, runtime: AgentRuntime) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+            runtime,
+        }
+    }
+
+    /// Returns the latest provider-neutral activity in the final 64 KiB of the log.
+    pub fn current_activity(&self) -> Result<Option<RunActivity>, RunLogError> {
+        let mut file = fs::File::open(&self.path).map_err(|source| self.io_error(source))?;
+        let length = file
+            .metadata()
+            .map_err(|source| self.io_error(source))?
+            .len();
+        let tail_start = length.saturating_sub(ACTIVITY_TAIL_BYTES);
+        let read_start = tail_start.saturating_sub(1);
+        file.seek(SeekFrom::Start(read_start))
+            .map_err(|source| self.io_error(source))?;
+
+        let read_length = length.saturating_sub(read_start);
+        let mut contents = Vec::with_capacity(read_length as usize);
+        file.take(read_length)
+            .read_to_end(&mut contents)
+            .map_err(|source| self.io_error(source))?;
+
+        let contents = if tail_start == 0 {
+            contents.as_slice()
+        } else if contents.first() == Some(&b'\n') {
+            &contents[1..]
+        } else {
+            contents
+                .iter()
+                .position(|byte| *byte == b'\n')
+                .map_or(&[][..], |line_end| &contents[line_end + 1..])
+        };
+
+        let mut parser = RunLogParser::new(self.runtime);
+        let mut latest = None;
+        for record in contents.split(|byte| *byte == b'\n') {
+            for event in self.parse_record(&mut parser, record)? {
+                if let RunLogEvent::Activity(activity) = event {
+                    latest = Some(activity);
+                }
+            }
+        }
+
+        Ok(latest)
+    }
+
+    /// Returns the latest terminal result after scanning the complete log.
+    pub fn final_result(&self) -> Result<Option<RunResult>, RunLogError> {
+        let file = fs::File::open(&self.path).map_err(|source| self.io_error(source))?;
+        let mut reader = BufReader::new(file);
+        let mut parser = RunLogParser::new(self.runtime);
+        let mut buffer = Vec::new();
+        let mut latest = None;
+
+        loop {
+            buffer.clear();
+            if reader
+                .read_until(b'\n', &mut buffer)
+                .map_err(|source| self.io_error(source))?
+                == 0
+            {
+                break;
+            }
+            for event in self.parse_record(&mut parser, &buffer)? {
+                if let RunLogEvent::Result(result) = event {
+                    latest = Some(result);
+                }
+            }
+        }
+
+        Ok(latest)
+    }
+
+    fn parse_record(
+        &self,
+        parser: &mut RunLogParser,
+        record: &[u8],
+    ) -> Result<Vec<RunLogEvent>, RunLogError> {
+        let Ok(line) = str::from_utf8(record) else {
+            return Ok(Vec::new());
+        };
+        match parser.parse_line(line) {
+            Ok(events) => Ok(events),
+            Err(RunLogParseError::InvalidEvent { .. }) => Ok(Vec::new()),
+            Err(source) => Err(RunLogError::Parse {
+                path: self.path.clone(),
+                source,
+            }),
+        }
+    }
+
+    fn io_error(&self, source: std::io::Error) -> RunLogError {
+        RunLogError::Io {
+            path: self.path.clone(),
+            source,
+        }
+    }
+}
+
+/// Failure to read or semantically decode a structured Run log.
+#[derive(Debug, Error)]
+pub enum RunLogError {
+    /// The Run log could not be read.
+    #[error("failed to read Run log {path}: {source}")]
+    Io {
+        /// Path to the Run log.
+        path: PathBuf,
+        /// File access failure.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A provider event was syntactically valid but semantically unsupported.
+    #[error("failed to decode Run log {path}: {source}")]
+    Parse {
+        /// Path to the Run log.
+        path: PathBuf,
+        /// Provider event decoding failure.
+        #[source]
+        source: RunLogParseError,
+    },
+}
 
 /// One provider-neutral value decoded from an Agent Runtime log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
