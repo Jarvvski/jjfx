@@ -1,6 +1,6 @@
 # Port Linear Ticket discovery and prompt construction
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

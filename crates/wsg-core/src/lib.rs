@@ -10,6 +10,7 @@ mod pool;
 mod run_log;
 mod runtime;
 mod state;
+mod ticket;
 mod worker_actions;
 mod workspace;
 
@@ -34,6 +35,9 @@ pub use state::{
     Expected, IdentifierError, Loaded, PoolState, PoolStateRepository, StateChange, StateError,
     StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
+};
+pub use ticket::{
+    Blocker, ParentTicket, Ticket, TicketStatus, TicketTitle, TicketValueError,
 };
 pub use worker_actions::{
     FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome, RebaseOutcome,
