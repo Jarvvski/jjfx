@@ -1,12 +1,76 @@
+use std::ffi::OsStr;
 use std::process::Command;
 
 use tempfile::TempDir;
 use wsg_core::{
-    DirectDispatchExecution, DirectDispatchFailure, DirectDispatchFailurePhase,
-    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess,
-    DispatchBudget, DispatchDependencyContext, PoolCapacity, Repository, RunMode, Ticket, TicketId,
-    TicketStatus, TicketTitle, WorkerId, WorkerStatus,
+    AgentRuntimeCapabilities, DirectDispatchExecution, DirectDispatchFailure,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
+    DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, PoolCapacity, Repository,
+    RunMode, Ticket, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerStatus,
 };
+
+#[test]
+fn direct_dispatch_resolves_delivery_identity_and_builds_dependency_aware_prompts() {
+    let (_temporary_directory, repository) = local_repository();
+    for arguments in [
+        vec!["config", "set", "--repo", "user.email", "owner@example.com"],
+        vec!["config", "set", "--repo", "user.name", "Owner Person"],
+        vec![
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ],
+    ] {
+        let output = Command::new("jj")
+            .args(arguments)
+            .current_dir(repository.root())
+            .output()
+            .expect("configure repository identity");
+        assert!(
+            output.status.success(),
+            "repository configuration failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    let dependency = DispatchDependencyContext::new(
+        vec!["owner/eng-400-foundation".to_owned(), "main".to_owned()],
+        "- Branch owner/eng-400-foundation implements ENG-400",
+        "owner/eng-400-foundation",
+    );
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-404", "Build dependency-aware prompt"),
+        RunMode::Background,
+    )
+    .with_model("opus")
+    .with_dependency_context(dependency);
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+
+    let invocation = dispatch
+        .build_invocation(&reservation, &request)
+        .expect("build Direct Dispatch invocation");
+    let command = reservation
+        .agent_runtime()
+        .command(&invocation, AgentRuntimeCapabilities::default());
+    let rendered = command
+        .get_args()
+        .map(OsStr::to_string_lossy)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("owner/repo"));
+    assert!(rendered.contains("owner@example.com"));
+    assert!(rendered.contains("owner/eng-404"));
+    assert!(rendered.contains("STACKED BRANCH"));
+    assert!(rendered.contains("owner/eng-400-foundation implements ENG-400"));
+    assert!(rendered.contains("--base owner/eng-400-foundation"));
+}
 
 #[test]
 fn direct_dispatch_prepares_the_worker_workspace_on_main_under_an_operation_lock() {

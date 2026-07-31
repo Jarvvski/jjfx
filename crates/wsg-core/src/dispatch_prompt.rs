@@ -2,7 +2,9 @@
 
 use thiserror::Error;
 
-use crate::{AgentRuntime, AgentRuntimeInvocation, RepositoryIdentity, Ticket};
+use crate::{
+    AgentRuntime, AgentRuntimeInvocation, DispatchDependencyContext, RepositoryIdentity, Ticket,
+};
 
 /// Delivery obligations supplied by a Dispatch caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,6 +58,7 @@ pub struct DispatchPromptContext {
     delivery: DeliveryContract,
     model: Option<String>,
     budget: DispatchBudget,
+    dependency_context: Option<DispatchDependencyContext>,
 }
 
 impl DispatchPromptContext {
@@ -73,6 +76,7 @@ impl DispatchPromptContext {
             delivery,
             model: None,
             budget: DispatchBudget::ProviderManaged,
+            dependency_context: None,
         }
     }
 
@@ -85,6 +89,12 @@ impl DispatchPromptContext {
     /// Supplies a caller-selected spending override.
     pub fn with_budget(mut self, budget: DispatchBudget) -> Self {
         self.budget = budget;
+        self
+    }
+
+    /// Supplies stacked-branch obligations derived from Ticket Dependencies.
+    pub fn with_dependency_context(mut self, context: DispatchDependencyContext) -> Self {
+        self.dependency_context = Some(context);
         self
     }
 }
@@ -105,12 +115,22 @@ impl DispatchPromptBuilder {
         context: DispatchPromptContext,
     ) -> Result<AgentRuntimeInvocation, DispatchPromptError> {
         let ticket_lower = context.ticket.id().as_str().to_ascii_lowercase();
-        let system_prompt = format!(
+        let mut system_prompt = format!(
             "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- The gh CLI requires: gh -R {} pr create ...\n- Branch naming: {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- To push your work: jj git push --named <branch>=@\n- You have access to Linear MCP tools for fetching Ticket details and updating status.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the PR description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
             context.repository.as_str(),
             context.delivery.branch_prefix,
             ticket_lower,
         );
+        if let Some(dependency) = context
+            .dependency_context
+            .as_ref()
+            .filter(|dependency| !dependency.description().trim().is_empty())
+        {
+            system_prompt.push_str(&format!(
+                "\n\nSTACKED BRANCH: Your Workspace is based on prerequisite work:\n{}\n\nCRITICAL: Do NOT rebase onto main. Your changes build on the prerequisite branch or branches.",
+                dependency.description()
+            ));
+        }
         let worker_prompt = format!(
             "Implement Linear Ticket {}: {}.\n\n1. Fetch the Ticket through Linear MCP and verify its acceptance criteria.\n2. Claim it by moving it to In Progress and assigning {}.\n3. Derive a bookmark beginning {}/{}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe.\n8. Push with jj git push.\n9. Create the Pull Request with: {}\n10. Move {} to Reviewable and add a Linear comment summarizing the implementation, PR URL, and assumptions.",
             context.ticket.id(),

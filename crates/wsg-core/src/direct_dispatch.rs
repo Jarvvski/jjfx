@@ -1,10 +1,13 @@
 //! Coordinated Direct Dispatch requests and outcomes.
 
+use std::process::Command;
+
 use thiserror::Error;
 
 use crate::{
-    CompletedRun, DispatchBudget, Repository, Reservation, RunMode, Ticket, WorkerId,
-    WorkerPoolError,
+    AgentRuntimeInvocation, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
+    DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
+    RunMode, Ticket, WorkerId, WorkerPoolError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -163,6 +166,131 @@ impl DirectDispatch {
             }
         }
     }
+
+    /// Resolves Repository delivery identity and builds one initial invocation.
+    pub fn build_invocation(
+        &self,
+        reservation: &Reservation,
+        request: &DirectDispatchRequest,
+    ) -> Result<AgentRuntimeInvocation, DirectDispatchError> {
+        if reservation.ticket() != request.ticket().id().as_str() {
+            return Err(DirectDispatchError::ReservationTicketMismatch {
+                reserved: reservation.ticket().to_owned(),
+                requested: request.ticket().id().as_str().to_owned(),
+            });
+        }
+        let repository = self.repository_identity()?;
+        let assignee = self.jj_config("user.email")?;
+        let user_name = self.jj_config("user.name")?;
+        let branch_prefix = user_name
+            .split_whitespace()
+            .next()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| DirectDispatchError::Identity("jj user.name is blank".to_owned()))?
+            .to_ascii_lowercase();
+        let pull_request_command = match request.dependency_context() {
+            Some(context) if !context.pull_request_base().trim().is_empty() => format!(
+                "gh -R {} pr create --head <branch> --base {} --title \"{}: <title from Ticket>\" --body \"<summary of changes and link to Linear Ticket>\"",
+                repository.as_str(),
+                context.pull_request_base(),
+                request.ticket().id(),
+            ),
+            _ => format!(
+                "gh -R {} pr create --head <branch> --title \"{}: <title from Ticket>\" --body \"<summary of changes and link to Linear Ticket>\"",
+                repository.as_str(),
+                request.ticket().id(),
+            ),
+        };
+        let delivery = DeliveryContract::new(assignee, branch_prefix, pull_request_command)?;
+        let mut context = DispatchPromptContext::new(
+            reservation.agent_runtime(),
+            repository,
+            request.ticket().clone(),
+            delivery,
+        )
+        .with_budget(request.budget());
+        if let Some(model) = request.model() {
+            context = context.with_model(model);
+        }
+        if let Some(dependency) = request.dependency_context() {
+            context = context.with_dependency_context(dependency.clone());
+        }
+        Ok(DispatchPromptBuilder::new()
+            .initial(context)?
+            .with_name(format!(
+                "pool:{}:{}",
+                reservation.worker_id(),
+                request.ticket().id()
+            )))
+    }
+
+    fn repository_identity(&self) -> Result<RepositoryIdentity, DirectDispatchError> {
+        let configured = self
+            .repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .map(|pool| pool.gh_repo().trim_end_matches(".git").to_owned())
+            .filter(|value| !value.is_empty());
+        let slug = match configured {
+            Some(slug) => slug,
+            None => {
+                let output = Command::new("jj")
+                    .args(["git", "remote", "list"])
+                    .current_dir(self.repository.root())
+                    .output()
+                    .map_err(|error| DirectDispatchError::Identity(error.to_string()))?;
+                if !output.status.success() {
+                    return Err(DirectDispatchError::Identity(
+                        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                    ));
+                }
+                String::from_utf8_lossy(&output.stdout)
+                    .lines()
+                    .find_map(|line| {
+                        let mut fields = line.split_whitespace();
+                        match (fields.next(), fields.next()) {
+                            (Some("origin"), Some(remote)) => Some(remote_slug(remote)),
+                            _ => None,
+                        }
+                    })
+                    .unwrap_or_default()
+            }
+        };
+        RepositoryIdentity::parse(slug)
+            .map_err(|error| DirectDispatchError::Identity(error.to_string()))
+    }
+
+    fn jj_config(&self, key: &'static str) -> Result<String, DirectDispatchError> {
+        let output = Command::new("jj")
+            .args(["config", "get", key])
+            .current_dir(self.repository.root())
+            .output()
+            .map_err(|error| DirectDispatchError::Identity(format!("read jj {key}: {error}")))?;
+        if !output.status.success() {
+            return Err(DirectDispatchError::Identity(format!(
+                "read jj {key}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let value = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        if value.is_empty() {
+            return Err(DirectDispatchError::Identity(format!("jj {key} is blank")));
+        }
+        Ok(value)
+    }
+}
+
+fn remote_slug(remote: &str) -> String {
+    let remote = remote.trim_end_matches(".git");
+    if let Some((_, path)) = remote.rsplit_once(':') {
+        return path.to_owned();
+    }
+    let mut parts = remote.rsplitn(3, '/');
+    match (parts.next(), parts.next()) {
+        (Some(name), Some(owner)) => format!("{owner}/{name}"),
+        _ => remote.to_owned(),
+    }
 }
 
 /// Failures that prevent Direct Dispatch coordination from starting or completing.
@@ -171,6 +299,15 @@ pub enum DirectDispatchError {
     /// Worker Pool Reservation or lifecycle mutation failed.
     #[error(transparent)]
     WorkerPool(#[from] WorkerPoolError),
+    /// Repository or jj delivery identity could not be resolved.
+    #[error("cannot resolve Direct Dispatch identity: {0}")]
+    Identity(String),
+    /// The Reservation belongs to another Ticket.
+    #[error("Reservation belongs to Ticket {reserved}, not requested Ticket {requested}")]
+    ReservationTicketMismatch { reserved: String, requested: String },
+    /// Typed initial prompt construction failed.
+    #[error(transparent)]
+    Prompt(#[from] DispatchPromptError),
 }
 
 /// The execution side of one successfully launched Direct Dispatch.
