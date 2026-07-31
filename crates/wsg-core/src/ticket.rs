@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
 use thiserror::Error;
 
 use crate::TicketId;
@@ -145,9 +146,7 @@ where
             filter.status.as_str(),
             filter.status.as_str(),
         );
-        let output = self.query.query(&prompt)?;
-        let payload: RawReadyTickets = serde_json::from_str(&output)
-            .map_err(|source| TicketDiscoveryError::MalformedResponse { source })?;
+        let payload: RawReadyTickets = self.query_payload(&prompt)?;
         let mut tickets = Vec::with_capacity(payload.tickets.len());
         let mut diagnostics = Vec::new();
         for raw in payload.tickets {
@@ -173,9 +172,7 @@ where
             parent.id(),
             repository.as_str(),
         );
-        let output = self.query.query(&prompt)?;
-        let payload: RawDependencyGraph = serde_json::from_str(&output)
-            .map_err(|source| TicketDiscoveryError::MalformedResponse { source })?;
+        let payload: RawDependencyGraph = self.query_payload(&prompt)?;
         let entry_count = payload.sub_issues.len();
         let mut candidates = BTreeMap::new();
         let mut diagnostics = Vec::new();
@@ -269,6 +266,37 @@ where
             diagnostics,
         })
     }
+
+    fn query_payload<T>(&self, prompt: &str) -> Result<T, TicketDiscoveryError>
+    where
+        T: DeserializeOwned,
+    {
+        let first = match self.query_attempt(prompt) {
+            Ok(payload) => return Ok(payload),
+            Err(error) => error,
+        };
+        self.query_attempt(prompt)
+            .map_err(|second| TicketDiscoveryError::RetriesExhausted {
+                first: first.to_string(),
+                second: second.to_string(),
+            })
+    }
+
+    fn query_attempt<T>(&self, prompt: &str) -> Result<T, QueryAttemptError>
+    where
+        T: DeserializeOwned,
+    {
+        let output = self.query.query(prompt)?;
+        serde_json::from_str(&output).map_err(QueryAttemptError::MalformedResponse)
+    }
+}
+
+#[derive(Debug, Error)]
+enum QueryAttemptError {
+    #[error("query failed: {0}")]
+    Query(#[from] TicketQueryError),
+    #[error("response was malformed: {0}")]
+    MalformedResponse(serde_json::Error),
 }
 
 #[derive(Debug, Deserialize)]
@@ -324,21 +352,19 @@ fn ready_ticket(
 /// A failure that makes a Ticket discovery result unusable as a whole.
 #[derive(Debug, Error)]
 pub enum TicketDiscoveryError {
-    /// The selected Agent Runtime query failed.
-    #[error("Ticket query failed: {0}")]
-    Query(#[from] TicketQueryError),
+    /// Both bounded query attempts failed.
+    #[error("Ticket discovery failed after one retry: first attempt {first}; second attempt {second}")]
+    RetriesExhausted {
+        /// Context from the initial failure.
+        first: String,
+        /// Context from the retry failure.
+        second: String,
+    },
     /// Every returned child was invalid, so an empty result would be unsafe.
     #[error("Ticket query returned an unusable dependency graph ({invalid_entries} invalid entries)")]
     UnusableGraph {
         /// Number of diagnostics produced while validating the graph.
         invalid_entries: usize,
-    },
-    /// The Agent Runtime did not return the constrained response shape.
-    #[error("Ticket query returned malformed JSON: {source}")]
-    MalformedResponse {
-        /// JSON shape or syntax failure.
-        #[source]
-        source: serde_json::Error,
     },
 }
 

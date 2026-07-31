@@ -12,8 +12,14 @@ struct StubQuery {
 
 impl StubQuery {
     fn returning(response: &str) -> Self {
+        Self::responding([Ok(response.to_owned())])
+    }
+
+    fn responding(
+        responses: impl IntoIterator<Item = Result<String, TicketQueryError>>,
+    ) -> Self {
         Self {
-            responses: Mutex::new(VecDeque::from([Ok(response.to_owned())])),
+            responses: Mutex::new(responses.into_iter().collect()),
         }
     }
 }
@@ -26,6 +32,62 @@ impl TicketQuery for StubQuery {
             .pop_front()
             .expect("a configured query response")
     }
+}
+
+#[test]
+fn dependency_graph_retries_one_malformed_response() {
+    let discovery = TicketDiscovery::new(StubQuery::responding([
+        Ok("not JSON".to_owned()),
+        Ok(r#"{"sub_issues":[]}"#.to_owned()),
+    ]));
+    let parent = ParentTicket::new(TicketId::parse("AMBA-40").expect("Parent Ticket ID"));
+    let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+    let graph = discovery
+        .dependency_graph(&parent, &repository)
+        .expect("the retry should recover");
+
+    assert!(graph.sub_issues().is_empty());
+}
+
+#[test]
+fn persistent_discovery_failure_reports_both_attempts() {
+    let discovery = TicketDiscovery::new(StubQuery::responding([
+        Err(TicketQueryError::new("network unavailable")),
+        Ok("still not JSON".to_owned()),
+    ]));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let error = discovery
+        .ready_tickets(&filter)
+        .expect_err("both failed attempts should surface");
+    let message = error.to_string();
+
+    assert!(message.contains("first attempt query failed: network unavailable"));
+    assert!(message.contains("second attempt response was malformed"));
+}
+
+#[test]
+fn ready_ticket_discovery_retries_one_transient_query_failure() {
+    let discovery = TicketDiscovery::new(StubQuery::responding([
+        Err(TicketQueryError::new("Linear MCP unavailable")),
+        Ok(r#"{"tickets":[{"id":"AMBA-42","title":"Recovered","status":"Todo"}]}"#.to_owned()),
+    ]));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("the retry should recover");
+
+    assert_eq!(tickets.tickets()[0].title().as_str(), "Recovered");
 }
 
 #[test]
