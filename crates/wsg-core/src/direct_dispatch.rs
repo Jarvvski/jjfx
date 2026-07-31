@@ -1,13 +1,15 @@
 //! Coordinated Direct Dispatch requests and outcomes.
 
 use std::process::Command;
+use std::thread;
 
 use thiserror::Error;
 
 use crate::{
     AgentRuntimeInvocation, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
     DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
-    RunMode, Ticket, WorkerId, WorkerPoolError,
+    RunMode, RunSupervisor, RunSupervisorError, Ticket, WorkerId, WorkerPoolError,
+    WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -167,6 +169,40 @@ impl DirectDispatch {
         }
     }
 
+    /// Launches a previously persisted Reservation and transfers its ownership.
+    pub fn dispatch_reserved(
+        &self,
+        reservation: Reservation,
+        request: &DirectDispatchRequest,
+    ) -> Result<DirectDispatchSuccess, DirectDispatchError> {
+        let worker = reservation.worker_id().clone();
+        let bases = request
+            .dependency_context()
+            .map(DispatchDependencyContext::base_revisions)
+            .unwrap_or_default();
+        self.repository.prepare_worker_workspace(&worker, bases)?;
+        let invocation = self.build_invocation(&reservation, request)?;
+        let execution = match request.mode() {
+            RunMode::Foreground => DirectDispatchExecution::Foreground(
+                RunSupervisor::new().run_reserved_foreground(reservation, invocation)?,
+            ),
+            RunMode::Background => {
+                let background =
+                    RunSupervisor::new().run_reserved_background(reservation, invocation)?;
+                let pid = background.pid();
+                thread::spawn(move || {
+                    let _ = background.wait();
+                });
+                DirectDispatchExecution::Background { pid }
+            }
+        };
+        Ok(DirectDispatchSuccess::new(
+            request.ticket().clone(),
+            worker,
+            execution,
+        ))
+    }
+
     /// Resolves Repository delivery identity and builds one initial invocation.
     pub fn build_invocation(
         &self,
@@ -308,6 +344,12 @@ pub enum DirectDispatchError {
     /// Typed initial prompt construction failed.
     #[error(transparent)]
     Prompt(#[from] DispatchPromptError),
+    /// Worker Workspace preparation failed.
+    #[error(transparent)]
+    Workspace(#[from] WorkerWorkspaceError),
+    /// Agent Runtime launch or supervision failed.
+    #[error(transparent)]
+    Runtime(#[from] RunSupervisorError),
 }
 
 /// The execution side of one successfully launched Direct Dispatch.

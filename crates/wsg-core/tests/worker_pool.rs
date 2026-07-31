@@ -63,7 +63,7 @@ fn stale_reservation_after_destroy_helper() {
     fs::create_dir_all(&workspace).expect("recreate detached Workspace path");
     let error = wsg_core::RunSupervisor::new()
         .run_reserved_background(
-            &reservation,
+            reservation,
             wsg_core::AgentRuntimeInvocation::new("stale reservation"),
         )
         .expect_err("detached Reservation must not persist a launched PID");

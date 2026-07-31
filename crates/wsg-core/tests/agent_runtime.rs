@@ -1478,7 +1478,7 @@ fn reserved_foreground_run_finalize_helper() {
         .expect("Worker reservation");
     let result = env::var_os(HELPER_RESULT).expect("result path");
     let outcome = RunSupervisor::new()
-        .run_reserved_foreground(&reservation, AgentRuntimeInvocation::new("reserved test"))
+        .run_reserved_foreground(reservation, AgentRuntimeInvocation::new("reserved test"))
         .expect("reserved foreground Run should complete");
     fs::write(result, format!("exit={:?}", outcome.exit_code())).expect("wait result");
 }
@@ -1612,7 +1612,7 @@ fn stale_background_waiter_helper() {
         .reserve_named(worker_id, "ENG-216")
         .expect("Run A reservation");
     let background = RunSupervisor::new()
-        .run_reserved_background(&reservation, AgentRuntimeInvocation::new("Run A"))
+        .run_reserved_background(reservation, AgentRuntimeInvocation::new("Run A"))
         .expect("Run A should start");
     fs::write(
         env::var_os(HELPER_PROCESS).expect("process path"),
@@ -1648,7 +1648,7 @@ fn reserved_background_run_finalize_helper() {
         .expect("Worker reservation");
     let result = env::var_os(HELPER_RESULT).expect("result path");
     let background = RunSupervisor::new()
-        .run_reserved_background(&reservation, AgentRuntimeInvocation::new("reserved test"))
+        .run_reserved_background(reservation, AgentRuntimeInvocation::new("reserved test"))
         .expect("reserved background Run should start");
     let outcome = background.wait().expect("background Run should complete");
     fs::write(
@@ -2086,7 +2086,7 @@ fn reset_run_helper() {
         .reserve_named(worker_id, "ENG-218")
         .expect("Worker reservation");
     let background = RunSupervisor::new()
-        .run_reserved_background(&reservation, AgentRuntimeInvocation::new("reset test"))
+        .run_reserved_background(reservation, AgentRuntimeInvocation::new("reset test"))
         .expect("reserved background Run should start");
     fs::write(
         env::var_os(HELPER_RESULT).expect("result path"),
@@ -2124,7 +2124,7 @@ fn reserved_background_run_helper() {
     }
     let result = env::var_os(HELPER_RESULT).expect("result path");
     match RunSupervisor::new()
-        .run_reserved_background(&reservation, AgentRuntimeInvocation::new("reserved test"))
+        .run_reserved_background(reservation, AgentRuntimeInvocation::new("reserved test"))
     {
         Ok(background) => {
             fs::write(&result, background.pid().to_string()).expect("background PID result");

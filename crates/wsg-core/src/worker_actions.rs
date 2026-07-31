@@ -466,11 +466,11 @@ impl WorkerActions {
         let execution = match mode {
             RunMode::Foreground => FollowUpExecution::Foreground(
                 self.supervisor
-                    .run_reserved_foreground(&reservation, invocation)?,
+                    .run_reserved_foreground(reservation, invocation)?,
             ),
             RunMode::Background => FollowUpExecution::Background(Box::new(
                 self.supervisor
-                    .run_reserved_background(&reservation, invocation)?,
+                    .run_reserved_background(reservation, invocation)?,
             )),
         };
         Ok(FollowUpOutcome {

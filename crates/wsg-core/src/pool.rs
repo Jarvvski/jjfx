@@ -100,7 +100,7 @@ impl PoolResize {
 }
 
 /// Capacity reserved for one Ticket before an Agent Runtime starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Reservation {
     worker_id: WorkerId,
     ticket: String,

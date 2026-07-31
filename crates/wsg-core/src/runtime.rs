@@ -145,6 +145,14 @@ impl RunSupervisor {
 
     /// Executes one Run attached to the caller's terminal.
     pub fn run_foreground(&self, request: &RunRequest) -> Result<RunOutcome, RunSupervisorError> {
+        self.run_foreground_started(request, |_| Ok(()))
+    }
+
+    fn run_foreground_started(
+        &self,
+        request: &RunRequest,
+        started: impl FnOnce(u32) -> Result<(), RunSupervisorError>,
+    ) -> Result<RunOutcome, RunSupervisorError> {
         let capabilities = request.runtime.probe(&request.workspace)?;
         let log = OpenOptions::new()
             .create(true)
@@ -168,6 +176,11 @@ impl RunSupervisor {
                 runtime: request.runtime,
                 source,
             })?;
+        if let Err(error) = started(child.id()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error);
+        }
         let stdout = child.stdout.take().expect("foreground stdout was piped");
         let stderr = child.stderr.take().expect("foreground stderr was piped");
         let stdout_forwarder =
@@ -203,37 +216,76 @@ impl RunSupervisor {
     /// Executes a reserved Run and finalizes its Worker through the shared waiter.
     pub fn run_reserved_foreground(
         &self,
-        reservation: &Reservation,
+        reservation: Reservation,
         invocation: AgentRuntimeInvocation,
     ) -> Result<CompletedRun, RunSupervisorError> {
-        let request = reserved_request(reservation, invocation);
-        let outcome = match self.run_foreground(&request) {
+        self.run_reserved_foreground_with_handoff(reservation, invocation, || {})
+    }
+
+    pub(crate) fn run_reserved_foreground_with_handoff(
+        &self,
+        reservation: Reservation,
+        invocation: AgentRuntimeInvocation,
+        handoff: impl FnOnce(),
+    ) -> Result<CompletedRun, RunSupervisorError> {
+        let worker = reservation.worker_id().clone();
+        let request = reserved_request(&reservation, invocation);
+        let mut persisted_revision = None;
+        let outcome = match self.run_foreground_started(&request, |pid| {
+            let revision = match reservation.persist_pid(pid) {
+                Ok(crate::pool::PidPersistence::Persisted(revision)) => revision,
+                Ok(crate::pool::PidPersistence::Missing) => {
+                    return Err(RunSupervisorError::PersistPidMissing {
+                        worker: worker.clone(),
+                        pid,
+                    });
+                }
+                Ok(crate::pool::PidPersistence::Conflict) => {
+                    return Err(RunSupervisorError::PersistPidConflict {
+                        worker: worker.clone(),
+                    });
+                }
+                Err(source) => {
+                    return Err(RunSupervisorError::PersistPid {
+                        worker: worker.clone(),
+                        pid,
+                        source,
+                    });
+                }
+            };
+            persisted_revision = Some(revision);
+            handoff();
+            Ok(())
+        }) {
             Ok(outcome) => outcome,
-            Err(error) => return release_after_failure(reservation, error),
+            Err(error) => return release_after_failure(&reservation, error),
         };
-        RunCompletion::new(reservation.clone(), reservation.worker_revision()).finalize(outcome)
+        let Some(revision) = persisted_revision else {
+            return Err(RunSupervisorError::PersistPidConflict { worker });
+        };
+        RunCompletion::new(reservation, revision).finalize(outcome)
     }
 
     /// Starts a reserved Run and persists its process identifier before success.
     pub fn run_reserved_background(
         &self,
-        reservation: &Reservation,
+        reservation: Reservation,
         invocation: AgentRuntimeInvocation,
     ) -> Result<BackgroundRun, RunSupervisorError> {
         let worker_id = reservation.worker_id().clone();
-        let request = reserved_request(reservation, invocation);
+        let request = reserved_request(&reservation, invocation);
         let mut background = match self.run_background(&request) {
             Ok(background) => background,
-            Err(error) => return release_after_failure(reservation, error),
+            Err(error) => return release_after_failure(&reservation, error),
         };
         let pid = background.pid();
         match reservation.persist_pid(pid) {
             Ok(crate::pool::PidPersistence::Persisted(revision)) => {
-                background.completion = Some(RunCompletion::new(reservation.clone(), revision));
+                background.completion = Some(RunCompletion::new(reservation, revision));
                 Ok(background)
             }
             Ok(crate::pool::PidPersistence::Missing) => persist_pid_failure(
-                reservation,
+                &reservation,
                 background,
                 RunSupervisorError::PersistPidMissing {
                     worker: worker_id,
@@ -241,12 +293,12 @@ impl RunSupervisor {
                 },
             ),
             Ok(crate::pool::PidPersistence::Conflict) => persist_pid_failure(
-                reservation,
+                &reservation,
                 background,
                 RunSupervisorError::PersistPidConflict { worker: worker_id },
             ),
             Err(source) => persist_pid_failure(
-                reservation,
+                &reservation,
                 background,
                 RunSupervisorError::PersistPid {
                     worker: worker_id,
