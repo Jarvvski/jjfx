@@ -1,6 +1,6 @@
 //! Linear Ticket discovery and provider-neutral Dispatch inputs.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -176,29 +176,97 @@ where
         let output = self.query.query(&prompt)?;
         let payload: RawDependencyGraph = serde_json::from_str(&output)
             .map_err(|source| TicketDiscoveryError::MalformedResponse { source })?;
-        let mut sub_issues = BTreeMap::new();
+        let entry_count = payload.sub_issues.len();
+        let mut candidates = BTreeMap::new();
+        let mut diagnostics = Vec::new();
         for raw in payload.sub_issues {
-            let id = TicketId::parse(raw.id).map_err(TicketDiscoveryError::InvalidIdentifier)?;
-            let title = TicketTitle::parse(raw.title)?;
-            let status = TicketStatus::parse(raw.status)?;
-            let blockers = raw
-                .blocked_by
-                .into_iter()
-                .map(TicketId::parse)
-                .collect::<Result<Vec<_>, _>>()?
-                .into_iter()
-                .map(Blocker::new)
-                .collect();
-            let ticket = Ticket::new(id.clone(), title, status);
+            let subject = raw.id.clone();
+            let id = match TicketId::parse(raw.id) {
+                Ok(id) => id,
+                Err(error) => {
+                    diagnostics.push(DiscoveryDiagnostic::new(subject, error.to_string()));
+                    continue;
+                }
+            };
+            if &id == parent.id() {
+                diagnostics.push(DiscoveryDiagnostic::new(
+                    id.as_str(),
+                    "parent cannot be its own child",
+                ));
+                continue;
+            }
+            if candidates.contains_key(&id) {
+                diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), "duplicate child"));
+                continue;
+            }
+            let title = match TicketTitle::parse(raw.title) {
+                Ok(title) => title,
+                Err(error) => {
+                    diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), error.to_string()));
+                    continue;
+                }
+            };
+            let status = match TicketStatus::parse(raw.status) {
+                Ok(status) => status,
+                Err(error) => {
+                    diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), error.to_string()));
+                    continue;
+                }
+            };
+            candidates.insert(
+                id.clone(),
+                (
+                    Ticket::new(id, title, status),
+                    raw.blocked_by,
+                    raw.cross_repo,
+                ),
+            );
+        }
+        if entry_count > 0 && candidates.is_empty() {
+            return Err(TicketDiscoveryError::UnusableGraph {
+                invalid_entries: diagnostics.len(),
+            });
+        }
+
+        let known_children = candidates.keys().cloned().collect::<BTreeSet<_>>();
+        let mut sub_issues = BTreeMap::new();
+        for (id, (ticket, raw_blockers, cross_repository)) in candidates {
+            let mut blockers = BTreeSet::new();
+            for raw_blocker in raw_blockers {
+                let blocker = match TicketId::parse(raw_blocker) {
+                    Ok(blocker) => blocker,
+                    Err(error) => {
+                        diagnostics.push(DiscoveryDiagnostic::new(
+                            id.as_str(),
+                            format!("invalid Blocker: {error}"),
+                        ));
+                        continue;
+                    }
+                };
+                if blocker == id {
+                    diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), "self-blocker"));
+                } else if !known_children.contains(&blocker) {
+                    diagnostics.push(DiscoveryDiagnostic::new(
+                        id.as_str(),
+                        format!("unknown Blocker {blocker}"),
+                    ));
+                } else {
+                    blockers.insert(blocker);
+                }
+            }
             sub_issues.insert(
                 id,
-                DiscoveredSubIssue::new(ticket, blockers, raw.cross_repo),
+                DiscoveredSubIssue::new(
+                    ticket,
+                    blockers.into_iter().map(Blocker::new).collect(),
+                    cross_repository,
+                ),
             );
         }
         Ok(DependencyGraph {
             parent: parent.clone(),
             sub_issues,
-            diagnostics: Vec::new(),
+            diagnostics,
         })
     }
 }
@@ -259,12 +327,12 @@ pub enum TicketDiscoveryError {
     /// The selected Agent Runtime query failed.
     #[error("Ticket query failed: {0}")]
     Query(#[from] TicketQueryError),
-    /// A discovered Ticket identifier was unsafe.
-    #[error("Ticket query returned an invalid identifier: {0}")]
-    InvalidIdentifier(#[from] crate::IdentifierError),
-    /// A discovered Ticket value was unusable.
-    #[error("Ticket query returned an invalid value: {0}")]
-    InvalidValue(#[from] TicketValueError),
+    /// Every returned child was invalid, so an empty result would be unsafe.
+    #[error("Ticket query returned an unusable dependency graph ({invalid_entries} invalid entries)")]
+    UnusableGraph {
+        /// Number of diagnostics produced while validating the graph.
+        invalid_entries: usize,
+    },
     /// The Agent Runtime did not return the constrained response shape.
     #[error("Ticket query returned malformed JSON: {source}")]
     MalformedResponse {

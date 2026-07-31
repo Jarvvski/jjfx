@@ -29,6 +29,67 @@ impl TicketQuery for StubQuery {
 }
 
 #[test]
+fn dependency_graph_fails_when_every_reported_child_is_invalid() {
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"sub_issues":[{"id":"AMBA-40","title":"Parent","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-41","title":"   ","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    ));
+    let parent = ParentTicket::new(TicketId::parse("AMBA-40").expect("Parent Ticket ID"));
+    let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+    let error = discovery
+        .dependency_graph(&parent, &repository)
+        .expect_err("an unusable graph should fail");
+
+    assert_eq!(
+        error.to_string(),
+        "Ticket query returned an unusable dependency graph (2 invalid entries)"
+    );
+}
+
+#[test]
+fn dependency_graph_excludes_unsafe_children_and_relationships() {
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"sub_issues":[{"id":"AMBA-40","title":"Parent","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-41","title":"Foundation","status":"Todo","blocked_by":["AMBA-41","AMBA-999"],"cross_repo":false},{"id":"AMBA-41","title":"Duplicate","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-42","title":"   ","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-43","title":"Malformed status","status":"   ","blocked_by":[],"cross_repo":false},{"id":"AMBA-44","title":"Safe child","status":"Todo","blocked_by":["AMBA-41"],"cross_repo":false}]}"#,
+    ));
+    let parent = ParentTicket::new(TicketId::parse("AMBA-40").expect("Parent Ticket ID"));
+    let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+    let graph = discovery
+        .dependency_graph(&parent, &repository)
+        .expect("partly valid graph should remain usable");
+
+    let ids = graph
+        .sub_issues()
+        .keys()
+        .map(TicketId::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, ["AMBA-41", "AMBA-44"]);
+    assert!(
+        graph
+            .sub_issue(&TicketId::parse("AMBA-41").expect("Ticket ID"))
+            .expect("retained Sub-issue")
+            .blockers()
+            .is_empty()
+    );
+    let reasons = graph
+        .diagnostics()
+        .iter()
+        .map(|diagnostic| diagnostic.reason())
+        .collect::<Vec<_>>()
+        .join("\n");
+    for expected in [
+        "parent cannot be its own child",
+        "duplicate child",
+        "Ticket title cannot be blank",
+        "Ticket status cannot be blank",
+        "self-blocker",
+        "unknown Blocker",
+    ] {
+        assert!(reasons.contains(expected), "missing {expected:?} in {reasons}");
+    }
+}
+
+#[test]
 fn parent_ticket_discovery_returns_a_typed_dependency_graph() {
     let discovery = TicketDiscovery::new(StubQuery::returning(
         r#"{"sub_issues":[{"id":"AMBA-41","title":"Foundation","status":"Done","blocked_by":[],"cross_repo":false},{"id":"AMBA-42","title":"Ship typed discovery","status":"Todo","blocked_by":["AMBA-41"],"cross_repo":false}]}"#,
