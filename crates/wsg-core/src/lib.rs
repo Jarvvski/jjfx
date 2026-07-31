@@ -37,7 +37,9 @@ pub use state::{
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
-    Blocker, ParentTicket, Ticket, TicketStatus, TicketTitle, TicketValueError,
+    Blocker, DiscoveryDiagnostic, ParentTicket, ReadyTicketFilter, ReadyTickets, Ticket,
+    TicketDiscovery, TicketDiscoveryError, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
+    TicketValueError,
 };
 pub use worker_actions::{
     FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome, RebaseOutcome,
