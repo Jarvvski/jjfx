@@ -12,8 +12,8 @@ fn fresh_and_resumed_agent_sessions_receive_the_same_delegation_contract() {
         let fresh = DispatchPromptBuilder::new()
             .initial(dispatch_context(runtime))
             .expect("fresh Dispatch prompt");
-        let resumed = AgentRuntimeInvocation::new("continue the Ticket")
-            .with_session_id("session-42");
+        let resumed =
+            AgentRuntimeInvocation::new("continue the Ticket").with_session_id("session-42");
 
         for invocation in [fresh, resumed] {
             let command = runtime.command(&invocation, AgentRuntimeCapabilities::default());
@@ -67,8 +67,8 @@ fn unsupported_budget_override_is_rejected_before_invocation() {
 #[test]
 fn initial_dispatch_prompt_pins_delivery_obligations_and_supported_overrides() {
     let context = dispatch_context(AgentRuntime::Claude)
-    .with_model("opus")
-    .with_budget(DispatchBudget::maximum_usd(12).expect("Dispatch budget"));
+        .with_model("opus")
+        .with_budget(DispatchBudget::maximum_usd(12).expect("Dispatch budget"));
 
     let invocation = DispatchPromptBuilder::new()
         .initial(context)

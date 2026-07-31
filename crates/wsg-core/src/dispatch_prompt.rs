@@ -121,7 +121,8 @@ impl DispatchPromptBuilder {
             context.delivery.pull_request_command,
             context.ticket.id(),
         );
-        let mut invocation = AgentRuntimeInvocation::new(worker_prompt).with_system_prompt(system_prompt);
+        let mut invocation =
+            AgentRuntimeInvocation::new(worker_prompt).with_system_prompt(system_prompt);
         if let Some(model) = context.model.filter(|model| !model.trim().is_empty()) {
             invocation = invocation.with_model(model);
         }

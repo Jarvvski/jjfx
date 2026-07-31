@@ -93,10 +93,7 @@ impl AgentRuntimeInvocation {
             .as_deref()
             .is_some_and(|session_id| !session_id.is_empty())
         {
-            return (
-                None,
-                format!("{DELEGATION_RULES}\n\n{}", self.prompt),
-            );
+            return (None, format!("{DELEGATION_RULES}\n\n{}", self.prompt));
         }
         let system_prompt = self
             .system_prompt

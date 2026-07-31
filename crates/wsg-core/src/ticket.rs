@@ -33,8 +33,6 @@ impl AgentRuntimeQuery {
             AgentRuntime::Claude => {
                 command.args([
                     "-p",
-                    "--model",
-                    "haiku",
                     "--output-format",
                     "json",
                     "--no-session-persistence",
@@ -62,38 +60,62 @@ impl AgentRuntimeQuery {
 impl TicketQuery for AgentRuntimeQuery {
     fn query(&self, prompt: &str) -> Result<String, TicketQueryError> {
         let output = self.command(prompt).output().map_err(|source| {
-            TicketQueryError::new(format!("cannot start {} query: {source}", self.runtime))
+            TicketQueryError::permanent(format!("cannot start {} query: {source}", self.runtime))
         })?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         if !output.status.success() {
             let diagnostic = if stderr.is_empty() { stdout } else { stderr };
-            return Err(TicketQueryError::new(format!(
+            return Err(TicketQueryError::transient(format!(
                 "{} query failed: {diagnostic}",
                 self.runtime
             )));
         }
         normalize_query_output(self.runtime, &stdout).ok_or_else(|| {
-            TicketQueryError::new(format!("{} query returned no JSON object", self.runtime))
+            TicketQueryError::transient(format!("{} query returned no JSON object", self.runtime))
         })
     }
 }
 
 fn normalize_query_output(runtime: AgentRuntime, output: &str) -> Option<String> {
-    let output = if runtime == AgentRuntime::Claude {
-        #[derive(Deserialize)]
-        struct ClaudeResult {
-            result: String,
-        }
+    let output = match runtime {
+        AgentRuntime::Claude => {
+            #[derive(Deserialize)]
+            struct ClaudeResult {
+                result: String,
+            }
 
-        serde_json::from_str::<ClaudeResult>(output)
-            .ok()
-            .filter(|wrapper| !wrapper.result.is_empty())
-            .map_or_else(|| output.to_owned(), |wrapper| wrapper.result)
-    } else {
-        output.to_owned()
+            serde_json::from_str::<ClaudeResult>(output)
+                .ok()
+                .filter(|wrapper| !wrapper.result.is_empty())
+                .map_or_else(|| output.to_owned(), |wrapper| wrapper.result)
+        }
+        AgentRuntime::Codex => codex_query_text(output).unwrap_or_else(|| output.to_owned()),
     };
     extract_json_object(&output).map(str::to_owned)
+}
+
+fn codex_query_text(output: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct CodexQueryEvent {
+        item: Option<CodexQueryItem>,
+    }
+
+    #[derive(Deserialize)]
+    struct CodexQueryItem {
+        #[serde(rename = "type")]
+        item_type: String,
+        #[serde(default)]
+        text: String,
+    }
+
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<CodexQueryEvent>(line).ok())
+        .filter_map(|event| event.item)
+        .filter(|item| item.item_type == "agent_message" && !item.text.trim().is_empty())
+        .map(|item| item.text)
+        .next_back()
 }
 
 fn extract_json_object(output: &str) -> Option<&str> {
@@ -138,13 +160,23 @@ pub trait TicketQuery {
 #[error("{message}")]
 pub struct TicketQueryError {
     message: String,
+    retryable: bool,
 }
 
 impl TicketQueryError {
-    /// Creates an adapter failure with provider context already attached.
-    pub fn new(message: impl Into<String>) -> Self {
+    /// Creates a failure that may recover on the single bounded retry.
+    pub fn transient(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            retryable: true,
+        }
+    }
+
+    /// Creates a failure that must surface without repeating the query.
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable: false,
         }
     }
 }
@@ -158,10 +190,7 @@ pub struct ReadyTicketFilter {
 
 impl ReadyTicketFilter {
     /// Creates a validated Ready Ticket filter.
-    pub fn new(
-        label: impl Into<String>,
-        status: TicketStatus,
-    ) -> Result<Self, TicketValueError> {
+    pub fn new(label: impl Into<String>, status: TicketStatus) -> Result<Self, TicketValueError> {
         let label = label.into().trim().to_owned();
         if label.is_empty() {
             return Err(TicketValueError::BlankLabel);
@@ -260,16 +289,17 @@ where
         filter: &ReadyTicketFilter,
     ) -> Result<ReadyTickets, TicketDiscoveryError> {
         let prompt = format!(
-            "Use Linear to find issues with label {:?} in {:?} status. Return only JSON as {{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"{}\"}}]}}.",
+            "Use Linear to find issues with label {:?} in {:?} status. Return only JSON as {{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"{}\",\"labels\":[{:?}]}}]}}.",
             filter.label,
             filter.status.as_str(),
             filter.status.as_str(),
+            filter.label,
         );
         let payload: RawReadyTickets = self.query_payload(&prompt)?;
         let mut tickets = Vec::with_capacity(payload.tickets.len());
         let mut diagnostics = Vec::new();
         for raw in payload.tickets {
-            match ready_ticket(raw, &filter.status) {
+            match ready_ticket(raw, &filter.label, &filter.status) {
                 Ok(ticket) => tickets.push(ticket),
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
@@ -293,10 +323,25 @@ where
         );
         let payload: RawDependencyGraph = self.query_payload(&prompt)?;
         let entry_count = payload.sub_issues.len();
+        let mut child_counts = BTreeMap::new();
+        for raw in &payload.sub_issues {
+            *child_counts.entry(raw.id.clone()).or_insert(0_usize) += 1;
+        }
+        let duplicate_children = child_counts
+            .into_iter()
+            .filter_map(|(id, count)| (count > 1).then_some(id))
+            .collect::<BTreeSet<_>>();
+        let mut reported_duplicates = BTreeSet::new();
         let mut candidates = BTreeMap::new();
         let mut diagnostics = Vec::new();
         for raw in payload.sub_issues {
             let subject = raw.id.clone();
+            if duplicate_children.contains(&subject) {
+                if reported_duplicates.insert(subject.clone()) {
+                    diagnostics.push(DiscoveryDiagnostic::new(&subject, "duplicate child"));
+                }
+                continue;
+            }
             let id = match TicketId::parse(raw.id) {
                 Ok(id) => id,
                 Err(error) => {
@@ -309,10 +354,6 @@ where
                     id.as_str(),
                     "parent cannot be its own child",
                 ));
-                continue;
-            }
-            if candidates.contains_key(&id) {
-                diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), "duplicate child"));
                 continue;
             }
             let title = match TicketTitle::parse(raw.title) {
@@ -338,45 +379,64 @@ where
                 ),
             );
         }
+
+        loop {
+            let known_children = candidates.keys().cloned().collect::<BTreeSet<_>>();
+            let mut unsafe_children = BTreeSet::new();
+            for (id, (_, raw_blockers, _)) in &candidates {
+                for raw_blocker in raw_blockers {
+                    let blocker = match TicketId::parse(raw_blocker.clone()) {
+                        Ok(blocker) => blocker,
+                        Err(error) => {
+                            diagnostics.push(DiscoveryDiagnostic::new(
+                                id.as_str(),
+                                format!("invalid Blocker: {error}"),
+                            ));
+                            unsafe_children.insert(id.clone());
+                            continue;
+                        }
+                    };
+                    if blocker == *id {
+                        diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), "self-blocker"));
+                        unsafe_children.insert(id.clone());
+                    } else if !known_children.contains(&blocker) {
+                        diagnostics.push(DiscoveryDiagnostic::new(
+                            id.as_str(),
+                            format!("unknown Blocker {blocker}"),
+                        ));
+                        unsafe_children.insert(id.clone());
+                    }
+                }
+            }
+            if unsafe_children.is_empty() {
+                break;
+            }
+            for id in unsafe_children {
+                candidates.remove(&id);
+            }
+        }
+
         if entry_count > 0 && candidates.is_empty() {
             return Err(TicketDiscoveryError::UnusableGraph {
                 invalid_entries: diagnostics.len(),
             });
         }
 
-        let known_children = candidates.keys().cloned().collect::<BTreeSet<_>>();
         let mut sub_issues = BTreeMap::new();
         for (id, (ticket, raw_blockers, cross_repository)) in candidates {
-            let mut blockers = BTreeSet::new();
-            for raw_blocker in raw_blockers {
-                let blocker = match TicketId::parse(raw_blocker) {
-                    Ok(blocker) => blocker,
-                    Err(error) => {
-                        diagnostics.push(DiscoveryDiagnostic::new(
-                            id.as_str(),
-                            format!("invalid Blocker: {error}"),
-                        ));
-                        continue;
-                    }
-                };
-                if blocker == id {
-                    diagnostics.push(DiscoveryDiagnostic::new(id.as_str(), "self-blocker"));
-                } else if !known_children.contains(&blocker) {
-                    diagnostics.push(DiscoveryDiagnostic::new(
-                        id.as_str(),
-                        format!("unknown Blocker {blocker}"),
-                    ));
-                } else {
-                    blockers.insert(blocker);
-                }
-            }
+            let blockers = raw_blockers
+                .into_iter()
+                .map(TicketId::parse)
+                .collect::<Result<BTreeSet<_>, _>>()
+                .map_err(|_| TicketDiscoveryError::UnusableGraph {
+                    invalid_entries: diagnostics.len() + 1,
+                })?
+                .into_iter()
+                .map(Blocker::new)
+                .collect();
             sub_issues.insert(
                 id,
-                DiscoveredSubIssue::new(
-                    ticket,
-                    blockers.into_iter().map(Blocker::new).collect(),
-                    cross_repository,
-                ),
+                DiscoveredSubIssue::new(ticket, blockers, cross_repository),
             );
         }
         Ok(DependencyGraph {
@@ -394,6 +454,11 @@ where
             Ok(payload) => return Ok(payload),
             Err(error) => error,
         };
+        if !first.retryable() {
+            return Err(TicketDiscoveryError::QueryFailed {
+                error: first.to_string(),
+            });
+        }
         self.query_attempt(prompt)
             .map_err(|second| TicketDiscoveryError::RetriesExhausted {
                 first: first.to_string(),
@@ -418,6 +483,15 @@ enum QueryAttemptError {
     MalformedResponse(serde_json::Error),
 }
 
+impl QueryAttemptError {
+    fn retryable(&self) -> bool {
+        match self {
+            Self::Query(error) => error.retryable,
+            Self::MalformedResponse(_) => true,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawReadyTickets {
     tickets: Vec<RawTicket>,
@@ -428,6 +502,7 @@ struct RawTicket {
     id: String,
     title: String,
     status: String,
+    labels: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -446,6 +521,7 @@ struct RawSubIssue {
 
 fn ready_ticket(
     raw: RawTicket,
+    expected_label: &str,
     expected_status: &TicketStatus,
 ) -> Result<Ticket, DiscoveryDiagnostic> {
     let subject = raw.id.clone();
@@ -455,6 +531,12 @@ fn ready_ticket(
         .map_err(|error| DiscoveryDiagnostic::new(&subject, error.to_string()))?;
     let status = TicketStatus::parse(raw.status)
         .map_err(|error| DiscoveryDiagnostic::new(&subject, error.to_string()))?;
+    if !raw.labels.iter().any(|label| label == expected_label) {
+        return Err(DiscoveryDiagnostic::new(
+            subject,
+            format!("missing label {expected_label:?}"),
+        ));
+    }
     if status != *expected_status {
         return Err(DiscoveryDiagnostic::new(
             subject,
@@ -471,8 +553,16 @@ fn ready_ticket(
 /// A failure that makes a Ticket discovery result unusable as a whole.
 #[derive(Debug, Error)]
 pub enum TicketDiscoveryError {
+    /// A permanent query failure surfaced without a retry.
+    #[error("Ticket discovery query failed: {error}")]
+    QueryFailed {
+        /// Adapter context for the permanent failure.
+        error: String,
+    },
     /// Both bounded query attempts failed.
-    #[error("Ticket discovery failed after one retry: first attempt {first}; second attempt {second}")]
+    #[error(
+        "Ticket discovery failed after one retry: first attempt {first}; second attempt {second}"
+    )]
     RetriesExhausted {
         /// Context from the initial failure.
         first: String,
@@ -480,7 +570,9 @@ pub enum TicketDiscoveryError {
         second: String,
     },
     /// Every returned child was invalid, so an empty result would be unsafe.
-    #[error("Ticket query returned an unusable dependency graph ({invalid_entries} invalid entries)")]
+    #[error(
+        "Ticket query returned an unusable dependency graph ({invalid_entries} invalid entries)"
+    )]
     UnusableGraph {
         /// Number of diagnostics produced while validating the graph.
         invalid_entries: usize,

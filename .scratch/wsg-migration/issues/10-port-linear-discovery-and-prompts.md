@@ -1,6 +1,6 @@
 # Port Linear Ticket discovery and prompt construction
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -40,12 +40,12 @@ Use deterministic query adapters returning valid, malformed, and transiently fai
 
 ## Acceptance Criteria
 
-- [ ] Ready Tickets are discovered through either configured Agent Runtime.
-- [ ] Parent Ticket dependency graphs reject unsafe relationships.
-- [ ] One transient failure retries and a persistent failure surfaces context.
-- [ ] Prompt tests pin delivery and delegation obligations.
-- [ ] No Worker is reserved during discovery.
-- [ ] `mise run check` is green.
+- [x] Ready Tickets are discovered through either configured Agent Runtime.
+- [x] Parent Ticket dependency graphs reject unsafe relationships.
+- [x] One transient failure retries and a persistent failure surfaces context.
+- [x] Prompt tests pin delivery and delegation obligations.
+- [x] No Worker is reserved during discovery.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -57,3 +57,19 @@ Use deterministic query adapters returning valid, malformed, and transiently fai
 ## Blocked by
 
 - issues/08-port-agent-runtime-and-run-supervision.md
+
+## Comments
+
+2026-07-31 - Resolved after `mise run check` passed. The shared library now
+exposes typed Ticket, Ready Ticket, Parent Ticket, Blocker, and dependency graph
+values behind the deep `TicketDiscovery` interface. Short-lived Claude Code and
+Codex adapters perform read-only Linear queries without touching Worker Pool
+capacity, normalize provider responses including Codex JSONL, validate labels,
+workflow states, children, and dependency safety, and retry one transient query
+or parse failure while surfacing permanent and persistent failures with context.
+
+Typed Dispatch prompt construction now owns Repository identity, delivery,
+model, and supported budget choices without exposing provider flags. Initial
+Runs and fresh or resumed Follow-ups receive the same read-only delegation
+contract while the top-level Agent Runtime retains edits, jj operations,
+verification, and delivery.

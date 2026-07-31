@@ -8,9 +8,8 @@ use std::sync::Mutex;
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, ReadyTicketFilter,
-    RepositoryIdentity, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
-    TicketStatus, TicketTitle,
+    AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, ReadyTicketFilter, RepositoryIdentity,
+    Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
 };
 
 const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
@@ -27,9 +26,7 @@ impl StubQuery {
         Self::responding([Ok(response.to_owned())])
     }
 
-    fn responding(
-        responses: impl IntoIterator<Item = Result<String, TicketQueryError>>,
-    ) -> Self {
+    fn responding(responses: impl IntoIterator<Item = Result<String, TicketQueryError>>) -> Self {
         Self {
             responses: Mutex::new(responses.into_iter().collect()),
         }
@@ -59,12 +56,14 @@ fn ready_tickets_are_discovered_through_either_configured_agent_runtime() {
         let response = if runtime == AgentRuntime::Claude {
             r#"#!/bin/sh
 printf '%s\n' "$@" > "$WSG_TICKET_QUERY_HELPER_ARGS"
-printf '%s\n' '{"result":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Claude result\",\"status\":\"Todo\"}]}"}'
+printf '%s\n' '{"result":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Claude result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}]}"}'
 "#
         } else {
             r#"#!/bin/sh
 printf '%s\n' "$@" > "$WSG_TICKET_QUERY_HELPER_ARGS"
-printf '%s\n' 'result: {"tickets":[{"id":"AMBA-42","title":"Codex result","status":"Todo"}]}'
+printf '%s\n' '{"type":"thread.started","thread_id":"thread-42"}'
+printf '%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Codex result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}]}"}}'
+printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'
 "#
         };
         write_executable(&bin.join(runtime.as_str()), response);
@@ -92,7 +91,7 @@ printf '%s\n' 'result: {"tickets":[{"id":"AMBA-42","title":"Codex result","statu
         );
         let args = fs::read_to_string(captured_args).expect("captured query arguments");
         if runtime == AgentRuntime::Claude {
-            assert!(args.contains("--model\nhaiku\n"));
+            assert!(!args.contains("--model\n"));
             assert!(args.contains("--no-session-persistence\n"));
             assert!(args.contains("--allowedTools=mcp__claude_ai_Linear__list_issues"));
         } else {
@@ -149,9 +148,30 @@ fn dependency_graph_retries_one_malformed_response() {
 }
 
 #[test]
+fn permanent_query_failure_is_not_retried() {
+    let discovery = TicketDiscovery::new(StubQuery::responding([Err(
+        TicketQueryError::permanent("runtime executable missing"),
+    )]));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let error = discovery
+        .ready_tickets(&filter)
+        .expect_err("permanent failure should surface immediately");
+
+    assert_eq!(
+        error.to_string(),
+        "Ticket discovery query failed: query failed: runtime executable missing"
+    );
+}
+
+#[test]
 fn persistent_discovery_failure_reports_both_attempts() {
     let discovery = TicketDiscovery::new(StubQuery::responding([
-        Err(TicketQueryError::new("network unavailable")),
+        Err(TicketQueryError::transient("network unavailable")),
         Ok("still not JSON".to_owned()),
     ]));
     let filter = ReadyTicketFilter::new(
@@ -172,8 +192,8 @@ fn persistent_discovery_failure_reports_both_attempts() {
 #[test]
 fn ready_ticket_discovery_retries_one_transient_query_failure() {
     let discovery = TicketDiscovery::new(StubQuery::responding([
-        Err(TicketQueryError::new("Linear MCP unavailable")),
-        Ok(r#"{"tickets":[{"id":"AMBA-42","title":"Recovered","status":"Todo"}]}"#.to_owned()),
+        Err(TicketQueryError::transient("Linear MCP unavailable")),
+        Ok(r#"{"tickets":[{"id":"AMBA-42","title":"Recovered","status":"Todo","labels":["ready-for-agent"]}]}"#.to_owned()),
     ]));
     let filter = ReadyTicketFilter::new(
         "ready-for-agent",
@@ -209,7 +229,7 @@ fn dependency_graph_fails_when_every_reported_child_is_invalid() {
 #[test]
 fn dependency_graph_excludes_unsafe_children_and_relationships() {
     let discovery = TicketDiscovery::new(StubQuery::returning(
-        r#"{"sub_issues":[{"id":"AMBA-40","title":"Parent","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-41","title":"Foundation","status":"Todo","blocked_by":["AMBA-41","AMBA-999"],"cross_repo":false},{"id":"AMBA-41","title":"Duplicate","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-42","title":"   ","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-43","title":"Malformed status","status":"   ","blocked_by":[],"cross_repo":false},{"id":"AMBA-44","title":"Safe child","status":"Todo","blocked_by":["AMBA-41"],"cross_repo":false}]}"#,
+        r#"{"sub_issues":[{"id":"AMBA-40","title":"Parent","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-41","title":"Foundation","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-41","title":"Duplicate","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-46","title":"Unsafe blockers","status":"Todo","blocked_by":["AMBA-46","AMBA-999"],"cross_repo":false},{"id":"AMBA-42","title":"   ","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"AMBA-43","title":"Malformed status","status":"   ","blocked_by":[],"cross_repo":false},{"id":"AMBA-44","title":"Depends on excluded child","status":"Todo","blocked_by":["AMBA-41"],"cross_repo":false},{"id":"AMBA-45","title":"Safe child","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
     ));
     let parent = ParentTicket::new(TicketId::parse("AMBA-40").expect("Parent Ticket ID"));
     let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
@@ -223,14 +243,7 @@ fn dependency_graph_excludes_unsafe_children_and_relationships() {
         .keys()
         .map(TicketId::as_str)
         .collect::<Vec<_>>();
-    assert_eq!(ids, ["AMBA-41", "AMBA-44"]);
-    assert!(
-        graph
-            .sub_issue(&TicketId::parse("AMBA-41").expect("Ticket ID"))
-            .expect("retained Sub-issue")
-            .blockers()
-            .is_empty()
-    );
+    assert_eq!(ids, ["AMBA-45"]);
     let reasons = graph
         .diagnostics()
         .iter()
@@ -245,7 +258,10 @@ fn dependency_graph_excludes_unsafe_children_and_relationships() {
         "self-blocker",
         "unknown Blocker",
     ] {
-        assert!(reasons.contains(expected), "missing {expected:?} in {reasons}");
+        assert!(
+            reasons.contains(expected),
+            "missing {expected:?} in {reasons}"
+        );
     }
 }
 
@@ -273,9 +289,31 @@ fn parent_ticket_discovery_returns_a_typed_dependency_graph() {
 }
 
 #[test]
+fn ready_ticket_discovery_excludes_tickets_without_the_configured_label() {
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"tickets":[{"id":"AMBA-42","title":"Wrong label","status":"Todo","labels":["ready-for-human"]}]}"#,
+    ));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("partly invalid Ready Ticket response");
+
+    assert!(tickets.tickets().is_empty());
+    assert_eq!(
+        tickets.diagnostics()[0].reason(),
+        "missing label \"ready-for-agent\""
+    );
+}
+
+#[test]
 fn ready_ticket_discovery_returns_typed_tickets_matching_the_filter() {
     let discovery = TicketDiscovery::new(StubQuery::returning(
-        r#"{"tickets":[{"id":"AMBA-42","title":"Ship typed discovery","status":"Todo"}]}"#,
+        r#"{"tickets":[{"id":"AMBA-42","title":"Ship typed discovery","status":"Todo","labels":["ready-for-agent"]}]}"#,
     ));
     let filter = ReadyTicketFilter::new(
         "ready-for-agent",
@@ -319,11 +357,15 @@ fn ticket_values_preserve_valid_linear_identity_and_relationships() {
 #[test]
 fn ticket_values_reject_missing_titles_and_statuses() {
     assert_eq!(
-        TicketTitle::parse("   ").expect_err("blank title should fail").to_string(),
+        TicketTitle::parse("   ")
+            .expect_err("blank title should fail")
+            .to_string(),
         "Ticket title cannot be blank"
     );
     assert_eq!(
-        TicketStatus::parse("").expect_err("blank status should fail").to_string(),
+        TicketStatus::parse("")
+            .expect_err("blank status should fail")
+            .to_string(),
         "Ticket status cannot be blank"
     );
 }
