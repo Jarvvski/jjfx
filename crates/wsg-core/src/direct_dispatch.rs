@@ -180,8 +180,16 @@ impl DirectDispatch {
             .dependency_context()
             .map(DispatchDependencyContext::base_revisions)
             .unwrap_or_default();
-        self.repository.prepare_worker_workspace(&worker, bases)?;
-        let invocation = self.build_invocation(&reservation, request)?;
+        if let Err(source) = self.repository.prepare_worker_workspace(&worker, bases) {
+            return Err(release_before_launch(
+                &reservation,
+                DirectDispatchError::Workspace(source),
+            ));
+        }
+        let invocation = match self.build_invocation(&reservation, request) {
+            Ok(invocation) => invocation,
+            Err(error) => return Err(release_before_launch(&reservation, error)),
+        };
         let execution = match request.mode() {
             RunMode::Foreground => DirectDispatchExecution::Foreground(
                 RunSupervisor::new().run_reserved_foreground(reservation, invocation)?,
@@ -317,6 +325,19 @@ impl DirectDispatch {
     }
 }
 
+fn release_before_launch(
+    reservation: &Reservation,
+    primary: DirectDispatchError,
+) -> DirectDispatchError {
+    match reservation.release() {
+        Ok(()) => primary,
+        Err(release) => DirectDispatchError::ReservationRelease {
+            primary: Box::new(primary),
+            release,
+        },
+    }
+}
+
 fn remote_slug(remote: &str) -> String {
     let remote = remote.trim_end_matches(".git");
     if let Some((_, path)) = remote.rsplit_once(':') {
@@ -350,6 +371,12 @@ pub enum DirectDispatchError {
     /// Agent Runtime launch or supervision failed.
     #[error(transparent)]
     Runtime(#[from] RunSupervisorError),
+    /// Pre-launch compensation conflicted while preserving the primary failure.
+    #[error("{primary}; additionally failed to release Reservation: {release}")]
+    ReservationRelease {
+        primary: Box<DirectDispatchError>,
+        release: WorkerPoolError,
+    },
 }
 
 /// The execution side of one successfully launched Direct Dispatch.

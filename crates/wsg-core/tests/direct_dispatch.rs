@@ -1,12 +1,15 @@
 use std::ffi::OsStr;
+use std::fs;
 use std::process::Command;
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntimeCapabilities, DirectDispatchExecution, DirectDispatchFailure,
-    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
-    DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, PoolCapacity, Repository,
-    RunMode, Ticket, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerStatus,
+    AgentRuntimeCapabilities, CommitOutcome, DirectDispatchError, DirectDispatchExecution,
+    DirectDispatchFailure, DirectDispatchFailurePhase, DirectDispatchOutcome,
+    DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess, DispatchBudget,
+    DispatchDependencyContext, Expected, Loaded, PoolCapacity, Repository, RunMode, StateChange,
+    Ticket, TicketId, TicketStatus, TicketTitle, WireAgent, WorkerId, WorkerPoolError,
+    WorkerStatus,
 };
 
 #[test]
@@ -70,6 +73,193 @@ fn direct_dispatch_resolves_delivery_identity_and_builds_dependency_aware_prompt
     assert!(rendered.contains("STACKED BRANCH"));
     assert!(rendered.contains("owner/eng-400-foundation implements ENG-400"));
     assert!(rendered.contains("--base owner/eng-400-foundation"));
+}
+
+#[test]
+fn direct_dispatch_releases_only_its_reservation_after_workspace_failure() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let workspace = repository
+        .root()
+        .parent()
+        .expect("Repository parent")
+        .join(format!(
+            "{}-workspaces/{worker}",
+            repository
+                .root()
+                .file_name()
+                .expect("Repository name")
+                .to_string_lossy()
+        ));
+    fs::remove_dir_all(workspace).expect("remove Worker Workspace");
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-405", "Fail Workspace preparation"),
+        RunMode::Foreground,
+    );
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("missing Workspace must fail before launch");
+
+    assert!(matches!(error, DirectDispatchError::Workspace(_)));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("released Worker")
+            .status(),
+        WorkerStatus::Idle
+    );
+}
+
+#[test]
+fn direct_dispatch_preserves_primary_and_release_conflict_without_clobbering_newer_state() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-405A", "Preserve compensation conflicts"),
+        RunMode::Foreground,
+    );
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+    let worker_state = repository.state_store().worker(worker.clone());
+    let Loaded::Present(versioned) = worker_state.load().expect("Worker state") else {
+        panic!("Worker state must exist");
+    };
+    let revision = versioned.revision().clone();
+    let mut state = versioned.value;
+    state.error = Some("newer mutation".to_owned());
+    assert!(matches!(
+        worker_state
+            .commit(Expected::Match(revision), StateChange::Replace(state))
+            .expect("write newer Worker state"),
+        CommitOutcome::Applied(_)
+    ));
+    let workspace = repository
+        .root()
+        .parent()
+        .expect("Repository parent")
+        .join(format!(
+            "{}-workspaces/{worker}",
+            repository
+                .root()
+                .file_name()
+                .expect("Repository name")
+                .to_string_lossy()
+        ));
+    fs::remove_dir_all(workspace).expect("remove Worker Workspace");
+
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("Workspace and compensation must fail");
+
+    assert!(matches!(
+        error,
+        DirectDispatchError::ReservationRelease { primary, release }
+            if matches!(*primary, DirectDispatchError::Workspace(_))
+                && matches!(&release, WorkerPoolError::ReleaseConflict { worker: rejected } if rejected == &worker)
+    ));
+    let snapshot = repository.worker_pool().snapshot();
+    let current = snapshot
+        .worker(worker.as_str())
+        .expect("newer Worker state");
+    assert_eq!(current.status(), WorkerStatus::Busy);
+    assert_eq!(current.error(), Some("newer mutation"));
+}
+
+#[test]
+fn direct_dispatch_releases_its_reservation_after_identity_failure() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    create_main(&repository);
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-406", "Fail identity resolution"),
+        RunMode::Foreground,
+    );
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("missing Repository remote must fail before launch");
+
+    assert!(matches!(error, DirectDispatchError::Identity(_)));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("released Worker")
+            .status(),
+        WorkerStatus::Idle
+    );
+}
+
+#[test]
+fn direct_dispatch_releases_its_reservation_after_prompt_failure() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let pool = repository.state_store().pool();
+    let Loaded::Present(versioned) = pool.load().expect("Pool state") else {
+        panic!("Pool state must exist");
+    };
+    let revision = versioned.revision().clone();
+    let mut state = versioned.value;
+    state.agent = Some(WireAgent::new("codex"));
+    assert!(matches!(
+        pool.commit(Expected::Match(revision), StateChange::Replace(state))
+            .expect("configure Codex Pool"),
+        CommitOutcome::Applied(_)
+    ));
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-407", "Fail prompt construction"),
+        RunMode::Foreground,
+    )
+    .with_budget(DispatchBudget::maximum_usd(1).expect("budget"));
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("unsupported Codex budget must fail before launch");
+
+    assert!(matches!(error, DirectDispatchError::Prompt(_)));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("released Worker")
+            .status(),
+        WorkerStatus::Idle
+    );
 }
 
 #[test]
@@ -210,6 +400,44 @@ fn local_repository() -> (TempDir, Repository) {
     );
     let repository = Repository::open(temporary_directory.path()).expect("open repository");
     (temporary_directory, repository)
+}
+
+fn configure_jj_identity(repository: &Repository) {
+    for arguments in [
+        ["config", "set", "--repo", "user.email", "owner@example.com"],
+        ["config", "set", "--repo", "user.name", "Owner Person"],
+    ] {
+        let output = Command::new("jj")
+            .args(arguments)
+            .current_dir(repository.root())
+            .output()
+            .expect("configure jj identity");
+        assert!(output.status.success());
+    }
+}
+
+fn add_origin(repository: &Repository) {
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(repository.root())
+        .output()
+        .expect("add origin");
+    assert!(output.status.success());
+}
+
+fn create_main(repository: &Repository) {
+    let output = Command::new("jj")
+        .args(["bookmark", "create", "main", "-r", "@"])
+        .current_dir(repository.root())
+        .output()
+        .expect("create main");
+    assert!(output.status.success());
 }
 
 fn ticket(id: &str, title: &str) -> Ticket {
