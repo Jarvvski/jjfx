@@ -103,3 +103,14 @@ errors, while a readable log without a meaningful activity or result returns
 Agent Session identity with explicit fresh-session fallback reasons is the next
 focused slice. Supervisor finalization and Worker actions remain later work in
 this ticket.
+
+2026-07-31 - Completed Agent Session identity resolution through the public
+`resolve_agent_session` seam. The shared library now scans prior Run logs without
+requiring persisted provider metadata, recognizes Claude Session IDs and Codex
+thread IDs, skips malformed and partial records, and returns the first valid
+identity. Missing, empty, unreadable, and identity-free logs produce explicit
+typed reasons for starting a fresh Session instead of failing a Follow-up.
+
+Connecting structured Run results to exactly-once supervisor finalization is the
+next focused slice. Follow-up launch and Worker actions remain later work in this
+ticket.

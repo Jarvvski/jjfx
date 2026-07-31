@@ -1,13 +1,162 @@
 use std::fs;
 use std::io::ErrorKind;
+use std::path::Path;
 use std::time::Duration;
 
 use tempfile::tempdir;
 use wsg_core::{
-    AgentRuntime, CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind,
-    RunActivityStatus, RunConclusion, RunCost, RunLog, RunLogError, RunLogEvent, RunLogParseError,
-    RunLogParser, RunResult, RunUsage,
+    AgentRuntime, AgentSessionResolution, CollaborationEvent, CollaborationParticipant,
+    FreshSessionReason, RunActivity, RunActivityKind, RunActivityStatus, RunConclusion, RunCost,
+    RunLog, RunLogError, RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunUsage,
+    resolve_agent_session,
 };
+
+#[test]
+fn claude_session_identity_resumes_the_prior_agent_session() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("worker.log");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"system","subtype":"status","status":null}"#,
+            "\n",
+            r#"{"type":"system","subtype":"init","session_id":"claude-session-123"}"#,
+            "\n",
+        ),
+    )
+    .expect("Run log should be written");
+
+    let resolution = resolve_agent_session(Some(path.as_path()));
+
+    assert_eq!(
+        resolution,
+        AgentSessionResolution::Resumed {
+            session_id: "claude-session-123".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn codex_session_identity_resumes_the_prior_agent_session() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("worker.log");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"thread.started","thread_id":"codex-thread-123"}"#,
+            "\n",
+        ),
+    )
+    .expect("Run log should be written");
+
+    let resolution = resolve_agent_session(Some(path.as_path()));
+
+    assert_eq!(
+        resolution,
+        AgentSessionResolution::Resumed {
+            session_id: "codex-thread-123".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn absent_or_empty_prior_log_starts_a_fresh_agent_session() {
+    for prior_log in [None, Some(Path::new(""))] {
+        let resolution = resolve_agent_session(prior_log);
+
+        assert_eq!(
+            resolution,
+            AgentSessionResolution::Fresh {
+                reason: FreshSessionReason::NoPriorLog,
+            }
+        );
+    }
+}
+
+#[test]
+fn unreadable_prior_log_starts_a_fresh_agent_session_with_context() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("missing.log");
+
+    let resolution = resolve_agent_session(Some(path.as_path()));
+
+    match resolution {
+        AgentSessionResolution::Fresh {
+            reason:
+                FreshSessionReason::UnreadableLog {
+                    path: unreadable_path,
+                    detail,
+                },
+        } => {
+            assert_eq!(unreadable_path, path);
+            assert!(!detail.is_empty());
+        }
+        other => panic!("expected unreadable-log fallback, got {other:?}"),
+    }
+}
+
+#[test]
+fn readable_log_without_a_session_identity_starts_fresh() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let cases: [(&str, &[u8]); 5] = [
+        ("malformed", b"not structured log data\n"),
+        ("invalid-utf8", b"\xff\n"),
+        ("truncated", br#"{"type":"system","subtype":"init""#),
+        (
+            "plain-text",
+            b"Agent Runtime started without structured output\n",
+        ),
+        (
+            "structured-without-identity",
+            concat!(r#"{"type":"assistant","message":{"content":[]}}"#, "\n",).as_bytes(),
+        ),
+    ];
+
+    for (name, contents) in cases {
+        let path = directory.path().join(format!("{name}.log"));
+        fs::write(&path, contents).expect("Run log should be written");
+
+        let resolution = resolve_agent_session(Some(path.as_path()));
+
+        assert_eq!(
+            resolution,
+            AgentSessionResolution::Fresh {
+                reason: FreshSessionReason::MissingIdentity,
+            },
+            "case {name}",
+        );
+    }
+}
+
+#[test]
+fn session_resolution_skips_noise_and_blank_ids_until_the_first_identity() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("worker.log");
+    fs::write(
+        &path,
+        concat!(
+            "warning: runtime emitted plain text\n",
+            r#"{"type":"system","subtype":"init","session_id":""}"#,
+            "\n",
+            r#"{"type":"thread.started","thread_id":""}"#,
+            "\n",
+            r#"{"type":"thread.started","thread_id":"first-session"}"#,
+            "\n",
+            r#"{"type":"system","subtype":"init","session_id":"later-session"}"#,
+            "\n",
+        ),
+    )
+    .expect("Run log should be written");
+
+    let resolution = resolve_agent_session(Some(path.as_path()));
+
+    assert_eq!(
+        resolution,
+        AgentSessionResolution::Resumed {
+            session_id: "first-session".to_owned(),
+        }
+    );
+}
 
 #[test]
 fn current_activity_returns_the_latest_provider_neutral_activity() {

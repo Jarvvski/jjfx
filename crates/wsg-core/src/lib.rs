@@ -18,9 +18,9 @@ pub use pool::{
     WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use run_log::{
-    CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind, RunActivityStatus,
-    RunConclusion, RunCost, RunLog, RunLogError, RunLogEvent, RunLogParseError, RunLogParser,
-    RunResult, RunUsage,
+    AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,
+    RunActivity, RunActivityKind, RunActivityStatus, RunConclusion, RunCost, RunLog, RunLogError,
+    RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunUsage, resolve_agent_session,
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,

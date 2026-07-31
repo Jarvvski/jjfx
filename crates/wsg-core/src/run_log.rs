@@ -1,6 +1,7 @@
 //! Provider-neutral parsing and values for structured Agent Runtime logs.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -13,6 +14,113 @@ use thiserror::Error;
 use crate::runtime::AgentRuntime;
 
 const ACTIVITY_TAIL_BYTES: u64 = 65_536;
+
+/// The result of resolving a prior Agent Session from a structured Run log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentSessionResolution {
+    /// The prior Agent Session can be resumed.
+    Resumed {
+        /// Provider-reported Agent Session identity.
+        session_id: String,
+    },
+    /// A Follow-up must start a fresh Agent Session.
+    Fresh {
+        /// Why the prior Agent Session could not be resumed.
+        reason: FreshSessionReason,
+    },
+}
+
+/// Why a Follow-up must start a fresh Agent Session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FreshSessionReason {
+    /// The Worker has no prior Run log.
+    NoPriorLog,
+    /// The prior Run log could not be read.
+    UnreadableLog {
+        /// Path that could not be read.
+        path: PathBuf,
+        /// Filesystem failure detail.
+        detail: String,
+    },
+    /// The prior Run log does not contain a provider Session identity.
+    MissingIdentity,
+}
+
+impl fmt::Display for FreshSessionReason {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NoPriorLog => formatter.write_str("no prior session log"),
+            Self::UnreadableLog { path, detail } => {
+                write!(
+                    formatter,
+                    "log file unreadable ({}: {detail})",
+                    path.display()
+                )
+            }
+            Self::MissingIdentity => formatter.write_str("log has no session id yet"),
+        }
+    }
+}
+
+/// Resolves whether a Follow-up can resume the Agent Session in `prior_log`.
+pub fn resolve_agent_session(prior_log: Option<&Path>) -> AgentSessionResolution {
+    let Some(path) = prior_log.filter(|path| !path.as_os_str().is_empty()) else {
+        return AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::NoPriorLog,
+        };
+    };
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) => return unreadable_agent_session_log(path, source),
+    };
+    let mut reader = BufReader::new(file);
+    let mut record = Vec::new();
+
+    loop {
+        record.clear();
+        match reader.read_until(b'\n', &mut record) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(source) => return unreadable_agent_session_log(path, source),
+        }
+        let Ok(event) = serde_json::from_slice::<AgentSessionEvent>(&record) else {
+            continue;
+        };
+        let session_id = match event.event_type.as_str() {
+            "system" if event.subtype == "init" => event.session_id,
+            "thread.started" => event.thread_id,
+            _ => continue,
+        };
+        if !session_id.is_empty() {
+            return AgentSessionResolution::Resumed { session_id };
+        }
+    }
+
+    AgentSessionResolution::Fresh {
+        reason: FreshSessionReason::MissingIdentity,
+    }
+}
+
+fn unreadable_agent_session_log(path: &Path, source: std::io::Error) -> AgentSessionResolution {
+    AgentSessionResolution::Fresh {
+        reason: FreshSessionReason::UnreadableLog {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        },
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct AgentSessionEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    subtype: String,
+    #[serde(default)]
+    session_id: String,
+    #[serde(default)]
+    thread_id: String,
+}
 
 /// One structured Agent Runtime log.
 #[derive(Debug)]
