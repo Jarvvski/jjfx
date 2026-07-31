@@ -42,6 +42,38 @@ pub struct PoolCapacityError {
     value: usize,
 }
 
+/// Exact idle-capacity shortage reported before a batch Reservation writes state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("Worker Pool has {available} idle Workers but {requested} are required")]
+pub struct CapacityShortage {
+    requested: usize,
+    available: usize,
+}
+
+impl CapacityShortage {
+    fn new(requested: usize, available: usize) -> Self {
+        Self {
+            requested,
+            available,
+        }
+    }
+
+    /// Returns the number of requested Worker slots.
+    pub const fn requested(self) -> usize {
+        self.requested
+    }
+
+    /// Returns the number of idle Worker slots observed under lock.
+    pub const fn available(self) -> usize {
+        self.available
+    }
+
+    /// Returns the exact additional idle capacity required at observation time.
+    pub const fn gap(self) -> usize {
+        self.requested.saturating_sub(self.available)
+    }
+}
+
 /// The result of changing Worker Pool capacity or named membership.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PoolResize {
@@ -224,6 +256,8 @@ pub enum WorkerPoolError {
     Conflict,
     #[error("no idle Worker is available for Ticket {ticket} (available: {available})")]
     NoIdleWorkers { ticket: String, available: usize },
+    #[error(transparent)]
+    CapacityShortage(#[from] CapacityShortage),
     #[error("Worker {worker} is not a member of the Worker Pool")]
     WorkerNotInPool { worker: WorkerId },
     #[error("Worker {worker} is not idle")]
@@ -498,12 +532,7 @@ impl WorkerPool {
                 })
                 .collect()),
             crate::state::ReservationsOutcome::NoIdle { available } => {
-                Err(WorkerPoolError::NoIdleWorkers {
-                    ticket: tickets
-                        .first()
-                        .map_or_else(|| "batch".to_owned(), |ticket| ticket.as_ref().to_owned()),
-                    available,
-                })
+                Err(CapacityShortage::new(tickets.len(), available).into())
             }
             crate::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })

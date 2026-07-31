@@ -26,9 +26,9 @@ pub use dispatch_prompt::{
     DispatchPromptError,
 };
 pub use pool::{
-    PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot, Reservation,
-    SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
-    WorkerReference, WorkerSnapshot, WorkerStatus,
+    CapacityShortage, PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot,
+    Reservation, SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError,
+    WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use run_log::{
     AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,

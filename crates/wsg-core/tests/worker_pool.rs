@@ -1560,6 +1560,48 @@ fn bulk_reservation_assigns_idle_workers_to_tickets_atomically_in_pool_order() {
 }
 
 #[test]
+fn bulk_reservation_reports_exact_shortage_without_writing_any_worker() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    let pool = repository.worker_pool();
+    let workers = pool
+        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()
+        .to_vec();
+    pool.reserve_named(workers[0].clone(), "ENG-BUSY")
+        .expect("seed busy Worker");
+    let state_paths = workers
+        .iter()
+        .map(|worker| {
+            repository
+                .root()
+                .join(".jj/pool")
+                .join(format!("{worker}.json"))
+        })
+        .collect::<Vec<_>>();
+    let before = state_paths
+        .iter()
+        .map(|path| fs::read(path).expect("Worker state before shortage"))
+        .collect::<Vec<_>>();
+
+    let error = pool
+        .reserve_many(&["ENG-303", "ENG-304"])
+        .expect_err("one idle Worker cannot satisfy two Tickets");
+
+    let wsg_core::WorkerPoolError::CapacityShortage(shortage) = error else {
+        panic!("expected typed capacity shortage");
+    };
+    assert_eq!(shortage.requested(), 2);
+    assert_eq!(shortage.available(), 1);
+    assert_eq!(shortage.gap(), 1);
+    let after = state_paths
+        .iter()
+        .map(|path| fs::read(path).expect("Worker state after shortage"))
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+}
+
+#[test]
 fn reserves_the_first_idle_worker_for_a_ticket() {
     let (_temp, repository) = repository_with_pool();
     let reservation = repository
