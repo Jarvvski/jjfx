@@ -23,6 +23,7 @@ use crate::{
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(1);
 const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
 const PROCESS_GROUP_FORCE_TIMEOUT: Duration = Duration::from_secs(1);
+const DELEGATION_RULES: &str = "Delegated work is read-only.\n\n- Use in-session background tasks or subagents only for independent exploration, documentation lookup, test or log analysis, or review.\n- Explicitly tell every subagent not to edit tracked files or run jj commands.\n- Do not use detached sessions, nested delegation, or worktree or workspace creation.\n- Await all delegated work before finishing.\n- If delegation is unavailable or fails, continue the work directly.\n- The main agent alone owns tracked edits, jj operations, verification, and delivery.";
 
 /// The Agent Runtime recorded for a Worker and selected for a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,6 +85,28 @@ impl AgentRuntimeInvocation {
     pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(system_prompt.into());
         self
+    }
+
+    fn session_prompts(&self) -> (Option<String>, String) {
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|session_id| !session_id.is_empty())
+        {
+            return (
+                None,
+                format!("{DELEGATION_RULES}\n\n{}", self.prompt),
+            );
+        }
+        let system_prompt = self
+            .system_prompt
+            .as_deref()
+            .filter(|prompt| !prompt.is_empty())
+            .map_or_else(
+                || DELEGATION_RULES.to_owned(),
+                |prompt| format!("{prompt}\n\n{DELEGATION_RULES}"),
+            );
+        (Some(system_prompt), self.prompt.clone())
     }
 }
 
@@ -901,6 +924,7 @@ impl AgentRuntime {
         invocation: &AgentRuntimeInvocation,
         capabilities: AgentRuntimeCapabilities,
     ) -> Command {
+        let (system_prompt, prompt) = invocation.session_prompts();
         let mut command = Command::new(self.as_str());
         if self == Self::Claude {
             command.arg("-p");
@@ -934,14 +958,11 @@ impl AgentRuntime {
                 .as_deref()
                 .filter(|session_id| !session_id.is_empty())
                 .is_none()
-                && let Some(system_prompt) = invocation
-                    .system_prompt
-                    .as_deref()
-                    .filter(|prompt| !prompt.is_empty())
+                && let Some(system_prompt) = system_prompt.as_deref()
             {
                 command.args(["--append-system-prompt", system_prompt]);
             }
-            command.arg(&invocation.prompt);
+            command.arg(&prompt);
         } else {
             command.args([
                 "--sandbox",
@@ -966,16 +987,12 @@ impl AgentRuntime {
                 .filter(|session_id| !session_id.is_empty())
             {
                 command.args(["resume", "--json", "--skip-git-repo-check", session_id]);
-                command.arg(&invocation.prompt);
+                command.arg(&prompt);
             } else {
                 command.args(["--json", "--skip-git-repo-check"]);
-                let prompt = match invocation
-                    .system_prompt
-                    .as_deref()
-                    .filter(|prompt| !prompt.is_empty())
-                {
-                    Some(system_prompt) => format!("{system_prompt}\n\n{}", invocation.prompt),
-                    None => invocation.prompt.clone(),
+                let prompt = match system_prompt.as_deref() {
+                    Some(system_prompt) => format!("{system_prompt}\n\n{prompt}"),
+                    None => prompt,
                 };
                 command.arg(prompt);
             }

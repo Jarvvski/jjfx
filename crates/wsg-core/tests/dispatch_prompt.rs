@@ -1,10 +1,36 @@
 use std::ffi::OsStr;
 
 use wsg_core::{
-    AgentRuntime, AgentRuntimeCapabilities, DeliveryContract, DispatchBudget,
-    DispatchPromptBuilder, DispatchPromptContext, RepositoryIdentity, Ticket, TicketId,
-    TicketStatus, TicketTitle,
+    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, DeliveryContract,
+    DispatchBudget, DispatchPromptBuilder, DispatchPromptContext, RepositoryIdentity, Ticket,
+    TicketId, TicketStatus, TicketTitle,
 };
+
+#[test]
+fn fresh_and_resumed_agent_sessions_receive_the_same_delegation_contract() {
+    for runtime in [AgentRuntime::Claude, AgentRuntime::Codex] {
+        let fresh = DispatchPromptBuilder::new()
+            .initial(dispatch_context(runtime))
+            .expect("fresh Dispatch prompt");
+        let resumed = AgentRuntimeInvocation::new("continue the Ticket")
+            .with_session_id("session-42");
+
+        for invocation in [fresh, resumed] {
+            let command = runtime.command(&invocation, AgentRuntimeCapabilities::default());
+            let prompt = command
+                .get_args()
+                .map(OsStr::to_string_lossy)
+                .collect::<Vec<_>>()
+                .join("\n");
+
+            assert!(prompt.contains("Delegated work is read-only"));
+            assert!(prompt.contains("not to edit tracked files or run jj commands"));
+            assert!(prompt.contains("Do not use detached sessions, nested delegation"));
+            assert!(prompt.contains("Await all delegated work before finishing"));
+            assert!(prompt.contains("The main agent alone owns tracked edits"));
+        }
+    }
+}
 
 #[test]
 fn provider_managed_model_and_budget_add_no_command_overrides() {

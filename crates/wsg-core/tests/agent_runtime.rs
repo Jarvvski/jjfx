@@ -48,9 +48,10 @@ fn fresh_claude_command_preserves_headless_stream_invocation() {
         AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::new(false, true));
 
     assert_eq!(command.get_program(), "claude");
+    let args = command_args(&command);
     assert_eq!(
-        command_args(&command),
-        vec![
+        &args[..12],
+        [
             "-p",
             "--model",
             "opus",
@@ -63,10 +64,10 @@ fn fresh_claude_command_preserves_headless_stream_invocation() {
             "--name",
             "pool:worker-abc:AMBA-42",
             "--append-system-prompt",
-            "dispatch rules",
-            "implement the thing",
         ]
     );
+    assert!(args[12].starts_with("dispatch rules\n\nDelegated work is read-only."));
+    assert_eq!(args[13], "implement the thing");
 }
 
 #[test]
@@ -77,9 +78,10 @@ fn resumed_claude_command_does_not_repeat_system_prompt() {
         .with_system_prompt("must not be repeated");
     let command = AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::default());
 
+    let args = command_args(&command);
     assert_eq!(
-        command_args(&command),
-        vec![
+        &args[..11],
+        [
             "-p",
             "--model",
             "opus",
@@ -91,9 +93,11 @@ fn resumed_claude_command_does_not_repeat_system_prompt() {
             "--verbose",
             "--settings",
             r#"{"permissions":{"defaultMode":"auto"}}"#,
-            "fix the tests",
         ]
     );
+    assert!(args[11].starts_with("Delegated work is read-only."));
+    assert!(args[11].ends_with("\n\nfix the tests"));
+    assert!(!args.iter().any(|arg| arg == "must not be repeated"));
 }
 
 #[test]
@@ -105,9 +109,10 @@ fn fresh_codex_command_preserves_workspace_dispatch_invocation() {
         AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::new(true, false));
 
     assert_eq!(command.get_program(), "codex");
+    let args = command_args(&command);
     assert_eq!(
-        command_args(&command),
-        vec![
+        &args[..11],
+        [
             "--sandbox",
             "workspace-write",
             "--ask-for-approval",
@@ -119,9 +124,10 @@ fn fresh_codex_command_preserves_workspace_dispatch_invocation() {
             "exec",
             "--json",
             "--skip-git-repo-check",
-            "system rules\n\nimplement it",
         ]
     );
+    assert!(args[11].starts_with("system rules\n\nDelegated work is read-only."));
+    assert!(args[11].ends_with("\n\nimplement it"));
 }
 
 #[test]
@@ -133,9 +139,10 @@ fn resumed_codex_command_does_not_repeat_system_prompt() {
     let command =
         AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::new(true, false));
 
+    let args = command_args(&command);
     assert_eq!(
-        command_args(&command),
-        vec![
+        &args[..13],
+        [
             "--sandbox",
             "workspace-write",
             "--ask-for-approval",
@@ -149,9 +156,11 @@ fn resumed_codex_command_does_not_repeat_system_prompt() {
             "--json",
             "--skip-git-repo-check",
             "thread-123",
-            "continue",
         ]
     );
+    assert!(args[13].starts_with("Delegated work is read-only."));
+    assert!(args[13].ends_with("\n\ncontinue"));
+    assert!(!args.iter().any(|arg| arg == "must not be repeated"));
 }
 
 #[test]
