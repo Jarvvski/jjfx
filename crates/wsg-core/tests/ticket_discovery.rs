@@ -16,6 +16,7 @@ use wsg_core::{
 const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
 const HELPER_WORKSPACE: &str = "WSG_TICKET_QUERY_HELPER_WORKSPACE";
 const HELPER_RESULT: &str = "WSG_TICKET_QUERY_HELPER_RESULT";
+const HELPER_ARGS: &str = "WSG_TICKET_QUERY_HELPER_ARGS";
 
 struct StubQuery {
     responses: Mutex<VecDeque<Result<String, TicketQueryError>>>,
@@ -52,14 +53,17 @@ fn ready_tickets_are_discovered_through_either_configured_agent_runtime() {
         let bin = temporary_directory.path().join("bin");
         let workspace = temporary_directory.path().join("workspace");
         let result = temporary_directory.path().join("result");
+        let captured_args = temporary_directory.path().join("args");
         fs::create_dir(&bin).expect("runtime directory");
         fs::create_dir(&workspace).expect("query workspace");
         let response = if runtime == AgentRuntime::Claude {
             r#"#!/bin/sh
+printf '%s\n' "$@" > "$WSG_TICKET_QUERY_HELPER_ARGS"
 printf '%s\n' '{"result":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Claude result\",\"status\":\"Todo\"}]}"}'
 "#
         } else {
             r#"#!/bin/sh
+printf '%s\n' "$@" > "$WSG_TICKET_QUERY_HELPER_ARGS"
 printf '%s\n' 'result: {"tickets":[{"id":"AMBA-42","title":"Codex result","status":"Todo"}]}'
 "#
         };
@@ -72,6 +76,7 @@ printf '%s\n' 'result: {"tickets":[{"id":"AMBA-42","title":"Codex result","statu
             .env(HELPER_RUNTIME, runtime.as_str())
             .env(HELPER_WORKSPACE, &workspace)
             .env(HELPER_RESULT, &result)
+            .env(HELPER_ARGS, &captured_args)
             .stdin(Stdio::null())
             .output()
             .expect("query helper should run");
@@ -85,6 +90,17 @@ printf '%s\n' 'result: {"tickets":[{"id":"AMBA-42","title":"Codex result","statu
             fs::read_to_string(&result).expect("query result"),
             format!("{runtime}:AMBA-42")
         );
+        let args = fs::read_to_string(captured_args).expect("captured query arguments");
+        if runtime == AgentRuntime::Claude {
+            assert!(args.contains("--model\nhaiku\n"));
+            assert!(args.contains("--no-session-persistence\n"));
+            assert!(args.contains("--allowedTools=mcp__claude_ai_Linear__list_issues"));
+        } else {
+            assert!(args.contains("--sandbox\nread-only\n"));
+            assert!(args.contains("--ephemeral\n"));
+        }
+        assert!(!args.contains("multi_agent"));
+        assert!(!args.contains("forward-subagent"));
     }
 }
 
