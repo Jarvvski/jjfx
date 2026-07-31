@@ -144,6 +144,85 @@ impl WorkerWorkspaceError {
     }
 }
 
+/// Exclusive ownership of one Worker's external Workspace operations.
+pub(crate) struct WorkspaceOperationGuard {
+    _lock: std::fs::File,
+}
+
+/// A prepared Workspace whose operation lock remains held for Run handoff.
+pub(crate) struct PreparedWorkerWorkspace {
+    _workspace: WorkerWorkspace,
+    _operation: WorkspaceOperationGuard,
+}
+
+pub(crate) fn lock_worker_operation(
+    repository: &Repository,
+    worker: &WorkerId,
+) -> Result<WorkspaceOperationGuard, WorkerWorkspaceError> {
+    let pool = repository.root().join(".jj/pool");
+    fs::create_dir_all(&pool).map_err(|error| {
+        WorkerWorkspaceError::new(format!("create Worker operation lock directory: {error}"))
+    })?;
+    let path = pool.join(format!("{worker}.workspace.lock"));
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .map_err(|error| {
+            WorkerWorkspaceError::new(format!(
+                "open Worker operation lock {}: {error}",
+                path.display()
+            ))
+        })?;
+    flock(&lock, FlockOperation::LockExclusive).map_err(|error| {
+        WorkerWorkspaceError::new(format!(
+            "lock Worker operation sidecar {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(WorkspaceOperationGuard { _lock: lock })
+}
+
+pub(crate) fn prepare_for_dispatch(
+    repository: &Repository,
+    worker: &WorkerId,
+    base_revisions: &[String],
+) -> Result<PreparedWorkerWorkspace, WorkerWorkspaceError> {
+    let operation = lock_worker_operation(repository, worker)?;
+    let path = worker_path(repository.root(), worker);
+    if !path.is_dir() {
+        return Err(WorkerWorkspaceError::new(format!(
+            "Worker {worker} Workspace is missing at {}",
+            path.display()
+        )));
+    }
+    let mut command = Command::new("jj");
+    command.arg("new");
+    if base_revisions.is_empty() {
+        command.arg("main");
+    } else {
+        command.args(base_revisions);
+    }
+    let output = command.current_dir(&path).output().map_err(|error| {
+        WorkerWorkspaceError::new(format!("start jj new for Worker {worker}: {error}"))
+    })?;
+    if !output.status.success() {
+        return Err(WorkerWorkspaceError::new(format!(
+            "prepare Worker {worker} on requested base: {}",
+            command_error(&output)
+        )));
+    }
+    Ok(PreparedWorkerWorkspace {
+        _workspace: WorkerWorkspace {
+            worker_id: worker.clone(),
+            path,
+        },
+        _operation: operation,
+    })
+}
+
 /// Provisions one Go-compatible Worker Workspace and its idle Worker state.
 pub(crate) fn provision(
     repository: &Repository,

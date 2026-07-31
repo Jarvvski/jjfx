@@ -9,6 +9,43 @@ use wsg_core::{
 };
 
 #[test]
+fn direct_dispatch_prepares_the_worker_workspace_on_main_under_an_operation_lock() {
+    let (_temporary_directory, repository) = local_repository();
+    let main = Command::new("jj")
+        .args(["bookmark", "create", "main", "-r", "@"])
+        .current_dir(repository.root())
+        .output()
+        .expect("create main bookmark");
+    assert!(main.status.success());
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+
+    let workspace = repository
+        .prepare_worker_workspace(&worker, &[])
+        .expect("prepare Worker Workspace");
+
+    assert!(workspace.path().is_dir());
+    assert!(
+        repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker}.workspace.lock"))
+            .is_file()
+    );
+    let parent = Command::new("jj")
+        .args(["log", "-r", "@-", "--no-graph", "-T", "bookmarks"])
+        .current_dir(workspace.path())
+        .output()
+        .expect("read prepared parent");
+    assert!(parent.status.success());
+    assert!(String::from_utf8_lossy(&parent.stdout).contains("main"));
+}
+
+#[test]
 fn named_direct_dispatch_reserves_only_the_requested_idle_worker() {
     let (_temporary_directory, repository) = local_repository();
     let workers = repository

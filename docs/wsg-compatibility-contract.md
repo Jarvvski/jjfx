@@ -88,6 +88,9 @@ file inode.
 - Worker state uses `.jj/pool/<worker>.json.lock`.
 - Dispatch Group state uses
   `.jj/pool/dispatch-<lowercase-parent>.json.lock`.
+- Rust Workspace preparation and Reset restoration additionally serialize on
+  `.jj/pool/<worker>.workspace.lock`. This additive operation lock is never a
+  state lock and is not held by the Go compatibility peer.
 
 A single-Worker mutation takes that Worker's lock. A Pool mutation takes the
 Pool lock. A Pool operation that also decides from Worker state takes the Pool

@@ -345,6 +345,12 @@ impl WorkerActions {
 
     /// Abandons the current Run, releases capacity, and restores the Workspace.
     pub fn reset(&self, worker: &WorkerId) -> Result<ResetOutcome, WorkerActionError> {
+        let operation = crate::workspace::lock_worker_operation(&self.repository, worker).map_err(
+            |source| WorkerActionError::WorkspaceOperation {
+                worker: worker.clone(),
+                detail: source.to_string(),
+            },
+        )?;
         let run = self.supervisor.reset_run(&self.repository, worker)?;
         let workspace = crate::workspace::worker_path(self.repository.root(), worker);
         let restoration = if workspace.is_dir() {
@@ -352,7 +358,9 @@ impl WorkerActions {
             let thread_worker = worker.clone();
             let join = thread::Builder::new()
                 .name(format!("wsg-restore-{worker}"))
-                .spawn(move || SystemCommands::restore_workspace(&thread_worker, &workspace))
+                .spawn(move || {
+                    SystemCommands::restore_workspace(&thread_worker, &workspace, operation)
+                })
                 .map_err(|source| WorkerActionError::RestorationSpawn {
                     worker: worker.clone(),
                     detail: source.to_string(),
@@ -615,6 +623,7 @@ impl SystemCommands {
     fn restore_workspace(
         worker: &WorkerId,
         workspace: &Path,
+        _operation: crate::workspace::WorkspaceOperationGuard,
     ) -> Result<(), WorkspaceRestorationError> {
         Self::run_workspace_command(worker, workspace, "restore Workspace", &["restore"])?;
         Self::run_workspace_command(worker, workspace, "create fresh change", &["new", "main"])
@@ -895,6 +904,9 @@ pub enum WorkerActionError {
         operation: &'static str,
         detail: String,
     },
+    /// A Worker Workspace operation could not acquire its serialization lock.
+    #[error("cannot lock Workspace operations for Worker {worker}: {detail}")]
+    WorkspaceOperation { worker: WorkerId, detail: String },
     /// The asynchronous Workspace restoration thread could not start.
     #[error("cannot start Workspace restoration for Worker {worker}: {detail}")]
     RestorationSpawn { worker: WorkerId, detail: String },

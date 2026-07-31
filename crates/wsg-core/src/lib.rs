@@ -158,6 +158,14 @@ impl Repository {
         workspace::provision(self, worker_id)
     }
 
+    pub(crate) fn prepare_worker_workspace_for_dispatch(
+        &self,
+        worker_id: &WorkerId,
+        base_revisions: &[String],
+    ) -> Result<workspace::PreparedWorkerWorkspace, WorkerWorkspaceError> {
+        workspace::prepare_for_dispatch(self, worker_id, base_revisions)
+    }
+
     /// Reports which migration capabilities are available for this foundation.
     pub fn migration_capabilities(&self) -> MigrationCapabilities {
         MigrationCapabilities::ReadOnlyWorkerPool
