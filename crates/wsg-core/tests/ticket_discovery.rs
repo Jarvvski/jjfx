@@ -1,10 +1,21 @@
 use std::collections::VecDeque;
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
+use tempfile::TempDir;
 use wsg_core::{
-    Blocker, ParentTicket, ReadyTicketFilter, RepositoryIdentity, Ticket, TicketDiscovery,
-    TicketId, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
+    AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, ReadyTicketFilter,
+    RepositoryIdentity, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
+    TicketStatus, TicketTitle,
 };
+
+const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
+const HELPER_WORKSPACE: &str = "WSG_TICKET_QUERY_HELPER_WORKSPACE";
+const HELPER_RESULT: &str = "WSG_TICKET_QUERY_HELPER_RESULT";
 
 struct StubQuery {
     responses: Mutex<VecDeque<Result<String, TicketQueryError>>>,
@@ -32,6 +43,77 @@ impl TicketQuery for StubQuery {
             .pop_front()
             .expect("a configured query response")
     }
+}
+
+#[test]
+fn ready_tickets_are_discovered_through_either_configured_agent_runtime() {
+    for runtime in [AgentRuntime::Claude, AgentRuntime::Codex] {
+        let temporary_directory = TempDir::new().expect("temporary directory");
+        let bin = temporary_directory.path().join("bin");
+        let workspace = temporary_directory.path().join("workspace");
+        let result = temporary_directory.path().join("result");
+        fs::create_dir(&bin).expect("runtime directory");
+        fs::create_dir(&workspace).expect("query workspace");
+        let response = if runtime == AgentRuntime::Claude {
+            r#"#!/bin/sh
+printf '%s\n' '{"result":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Claude result\",\"status\":\"Todo\"}]}"}'
+"#
+        } else {
+            r#"#!/bin/sh
+printf '%s\n' 'result: {"tickets":[{"id":"AMBA-42","title":"Codex result","status":"Todo"}]}'
+"#
+        };
+        write_executable(&bin.join(runtime.as_str()), response);
+        let path = env::join_paths([bin.as_os_str()]).expect("runtime PATH");
+
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .args(["--exact", "agent_runtime_query_helper", "--ignored"])
+            .env("PATH", path)
+            .env(HELPER_RUNTIME, runtime.as_str())
+            .env(HELPER_WORKSPACE, &workspace)
+            .env(HELPER_RESULT, &result)
+            .stdin(Stdio::null())
+            .output()
+            .expect("query helper should run");
+
+        assert!(
+            output.status.success(),
+            "{runtime} helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            fs::read_to_string(&result).expect("query result"),
+            format!("{runtime}:AMBA-42")
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn agent_runtime_query_helper() {
+    let runtime = match env::var(HELPER_RUNTIME).expect("runtime").as_str() {
+        "claude" => AgentRuntime::Claude,
+        "codex" => AgentRuntime::Codex,
+        value => panic!("unexpected runtime {value}"),
+    };
+    let query = AgentRuntimeQuery::new(
+        runtime,
+        env::var_os(HELPER_WORKSPACE).expect("query workspace"),
+    );
+    let discovery = TicketDiscovery::new(query);
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        format!("{runtime}:{}", tickets.tickets()[0].id()),
+    )
+    .expect("write result");
 }
 
 #[test]
@@ -228,4 +310,11 @@ fn ticket_values_reject_missing_titles_and_statuses() {
         TicketStatus::parse("").expect_err("blank status should fail").to_string(),
         "Ticket status cannot be blank"
     );
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write fake runtime");
+    let mut permissions = fs::metadata(path).expect("runtime metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("make runtime executable");
 }

@@ -37,8 +37,8 @@ pub use state::{
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
-    Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic, ParentTicket,
-    ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket, TicketDiscovery,
+    AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
+    ParentTicket, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket, TicketDiscovery,
     TicketDiscoveryError, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
     TicketValueError,
 };

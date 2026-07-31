@@ -1,12 +1,131 @@
 //! Linear Ticket discovery and provider-neutral Dispatch inputs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
+use std::process::Command;
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::TicketId;
+use crate::{AgentRuntime, TicketId};
+
+/// A short-lived Agent Runtime adapter for read-only Linear discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuntimeQuery {
+    runtime: AgentRuntime,
+    workspace: PathBuf,
+}
+
+impl AgentRuntimeQuery {
+    /// Selects the Agent Runtime and working directory for short-lived queries.
+    pub fn new(runtime: AgentRuntime, workspace: impl Into<PathBuf>) -> Self {
+        Self {
+            runtime,
+            workspace: workspace.into(),
+        }
+    }
+
+    fn command(&self, prompt: &str) -> Command {
+        let mut command = Command::new(self.runtime.as_str());
+        command.current_dir(&self.workspace);
+        match self.runtime {
+            AgentRuntime::Claude => {
+                command.args([
+                    "-p",
+                    "--model",
+                    "haiku",
+                    "--output-format",
+                    "json",
+                    "--no-session-persistence",
+                    "--allowedTools=mcp__claude_ai_Linear__list_issues,mcp__claude_ai_Linear__get_issue",
+                    prompt,
+                ]);
+            }
+            AgentRuntime::Codex => {
+                command.args([
+                    "--sandbox",
+                    "read-only",
+                    "--ask-for-approval",
+                    "never",
+                    "exec",
+                    "--ephemeral",
+                    "--skip-git-repo-check",
+                    prompt,
+                ]);
+            }
+        }
+        command
+    }
+}
+
+impl TicketQuery for AgentRuntimeQuery {
+    fn query(&self, prompt: &str) -> Result<String, TicketQueryError> {
+        let output = self.command(prompt).output().map_err(|source| {
+            TicketQueryError::new(format!("cannot start {} query: {source}", self.runtime))
+        })?;
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        if !output.status.success() {
+            let diagnostic = if stderr.is_empty() { stdout } else { stderr };
+            return Err(TicketQueryError::new(format!(
+                "{} query failed: {diagnostic}",
+                self.runtime
+            )));
+        }
+        normalize_query_output(self.runtime, &stdout).ok_or_else(|| {
+            TicketQueryError::new(format!("{} query returned no JSON object", self.runtime))
+        })
+    }
+}
+
+fn normalize_query_output(runtime: AgentRuntime, output: &str) -> Option<String> {
+    let output = if runtime == AgentRuntime::Claude {
+        #[derive(Deserialize)]
+        struct ClaudeResult {
+            result: String,
+        }
+
+        serde_json::from_str::<ClaudeResult>(output)
+            .ok()
+            .filter(|wrapper| !wrapper.result.is_empty())
+            .map_or_else(|| output.to_owned(), |wrapper| wrapper.result)
+    } else {
+        output.to_owned()
+    };
+    extract_json_object(&output).map(str::to_owned)
+}
+
+fn extract_json_object(output: &str) -> Option<&str> {
+    let start = output.find('{')?;
+    let mut depth = 0_u32;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, character) in output[start..].char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match character {
+            '"' => in_string = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&output[start..start + offset + character.len_utf8()]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 /// Executes one short-lived, read-only query against Linear through an Agent Runtime.
 pub trait TicketQuery {
