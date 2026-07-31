@@ -35,6 +35,75 @@ fn send_rejects_a_busy_worker_through_the_actions_facade() {
 }
 
 #[test]
+fn review_rejects_a_worker_without_a_branch_before_launch() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+
+    let error = WorkerActions::new(repository)
+        .review(&worker, RunMode::Background)
+        .expect_err("review without a branch should fail");
+
+    assert!(error.to_string().contains("has no branch"));
+}
+
+#[test]
+fn review_builds_one_provider_neutral_follow_up_from_pr_state() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let prior_log = repository.root().join("review-prior.log");
+    fs::write(
+        &prior_log,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"review-session\"}\n",
+    )
+    .expect("prior Session log");
+    set_terminal_worker(&repository, &worker, &prior_log);
+    let bin = temporary_directory.path().join("review-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    let captured = temporary_directory.path().join("review-prompt");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"mergeable\":\"CONFLICTING\",\"reviewDecision\":\"CHANGES_REQUESTED\"}]' ;;\n  *\"pr checks\"*) printf '%s\\n' '[{\"name\":\"tests\",\"conclusion\":\"FAILURE\"},{\"name\":\"lint\",\"conclusion\":\"SUCCESS\"}]'; exit 1 ;;\nesac\n",
+    );
+    write_executable(
+        &bin.join("claude"),
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}}'\n",
+            captured.display()
+        ),
+    );
+    let result = temporary_directory.path().join("review-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("review PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "review_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .output()
+        .expect("Review helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("Review result"),
+        "session=resumed:review-session; completed=true"
+    );
+    let prompt = fs::read_to_string(captured).expect("captured Review prompt");
+    assert!(prompt.contains("Current review state: changes requested"));
+    assert!(prompt.contains("has merge conflicts"));
+    assert!(prompt.contains("tests"));
+    assert!(!prompt.contains("   - lint"));
+}
+
+#[test]
 fn send_resumes_the_prior_claude_session_and_reports_it() {
     let (temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
@@ -175,6 +244,27 @@ fn failed_send_launch_restores_the_prior_terminal_worker() {
         restored.log_file(),
         Some(prior_log.to_string_lossy().as_ref())
     );
+}
+
+#[test]
+#[ignore]
+fn review_action_helper() {
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let outcome = WorkerActions::new(repository)
+        .review(&worker, RunMode::Foreground)
+        .expect("Review should launch");
+    let session = match outcome.session() {
+        AgentSessionResolution::Resumed { session_id } => format!("resumed:{session_id}"),
+        AgentSessionResolution::Fresh { reason } => format!("fresh:{reason}"),
+    };
+    let completed = matches!(outcome.execution(), FollowUpExecution::Foreground(_));
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        format!("session={session}; completed={completed}"),
+    )
+    .expect("Review result");
 }
 
 #[test]

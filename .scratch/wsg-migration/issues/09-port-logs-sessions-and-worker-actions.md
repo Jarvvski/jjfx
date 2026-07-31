@@ -138,3 +138,15 @@ instead of leaking busy capacity.
 
 Review prompt construction and launch through the same Follow-up path is the
 next focused slice.
+
+2026-07-31 - Implemented Review through `WorkerActions` without exposing
+GitHub DTOs or prompt builders. The internal GitHub adapter normalizes review
+decision, mergeability, and failing checks, including useful JSON returned with
+a failing checks exit status. The generated Follow-up covers comments, inline
+threads, requested changes, conflict repair, failing CI, verification, push,
+and response obligations, then launches through the same resumed-versus-fresh
+Session path as Send. Missing Workers, branches, repositories, Pull Requests,
+and command or decode failures remain typed at the facade.
+
+Reset with observable asynchronous Workspace restoration is the next focused
+slice.
