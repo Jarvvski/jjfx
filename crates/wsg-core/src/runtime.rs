@@ -38,6 +38,7 @@ pub enum AgentRuntime {
 pub struct AgentRuntimeInvocation {
     prompt: String,
     model: Option<String>,
+    max_budget_usd: Option<u32>,
     session_id: Option<String>,
     name: Option<String>,
     system_prompt: Option<String>,
@@ -49,6 +50,7 @@ impl AgentRuntimeInvocation {
         Self {
             prompt: prompt.into(),
             model: None,
+            max_budget_usd: None,
             session_id: None,
             name: None,
             system_prompt: None,
@@ -58,6 +60,11 @@ impl AgentRuntimeInvocation {
     /// Adds a model override to the invocation.
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    pub(crate) fn with_max_budget_usd(mut self, dollars: u32) -> Self {
+        self.max_budget_usd = Some(dollars);
         self
     }
 
@@ -903,6 +910,9 @@ impl AgentRuntime {
                 .filter(|model| !model.is_empty())
             {
                 command.args(["--model", model]);
+            }
+            if let Some(max_budget_usd) = invocation.max_budget_usd {
+                command.args(["--max-budget-usd", &max_budget_usd.to_string()]);
             }
             if let Some(session_id) = invocation
                 .session_id

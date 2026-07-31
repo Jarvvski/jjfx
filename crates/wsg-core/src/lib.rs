@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+mod dispatch_prompt;
 mod pool;
 mod run_log;
 mod runtime;
@@ -14,6 +15,10 @@ mod ticket;
 mod worker_actions;
 mod workspace;
 
+pub use dispatch_prompt::{
+    DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
+    DispatchPromptError,
+};
 pub use pool::{
     PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot, Reservation,
     SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
