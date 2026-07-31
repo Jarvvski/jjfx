@@ -17,9 +17,9 @@ mod worker_actions;
 mod workspace;
 
 pub use direct_dispatch::{
-    DirectDispatchExecution, DirectDispatchFailure, DirectDispatchFailurePhase,
-    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess,
-    DispatchDependencyContext,
+    DirectDispatch, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
+    DirectDispatchSuccess, DirectDispatchTarget, DispatchDependencyContext,
 };
 pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
@@ -120,6 +120,11 @@ impl Repository {
     /// Opens the deep Worker Pool lifecycle module for this repository.
     pub fn worker_pool(&self) -> WorkerPool {
         WorkerPool::new(self.clone())
+    }
+
+    /// Opens the deep Direct Dispatch coordinator for this repository.
+    pub fn direct_dispatch(&self) -> DirectDispatch {
+        DirectDispatch::new(self.clone())
     }
 
     /// Creates an Ad Hoc Workspace at the compatible sibling path.

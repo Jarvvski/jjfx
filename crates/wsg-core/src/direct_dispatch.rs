@@ -1,6 +1,11 @@
 //! Coordinated Direct Dispatch requests and outcomes.
 
-use crate::{CompletedRun, DispatchBudget, RunMode, Ticket, WorkerId};
+use thiserror::Error;
+
+use crate::{
+    CompletedRun, DispatchBudget, Repository, Reservation, RunMode, Ticket, WorkerId,
+    WorkerPoolError,
+};
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,10 +45,21 @@ impl DispatchDependencyContext {
     }
 }
 
+/// Worker selection for one Direct Dispatch request.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum DirectDispatchTarget {
+    /// Select the first idle Worker in Pool order.
+    #[default]
+    FirstIdle,
+    /// Require one exact Worker without fallback.
+    Worker(WorkerId),
+}
+
 /// Typed inputs for one Ticket in a Direct Dispatch batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectDispatchRequest {
     ticket: Ticket,
+    target: DirectDispatchTarget,
     model: Option<String>,
     budget: DispatchBudget,
     mode: RunMode,
@@ -55,11 +71,18 @@ impl DirectDispatchRequest {
     pub fn new(ticket: Ticket, mode: RunMode) -> Self {
         Self {
             ticket,
+            target: DirectDispatchTarget::FirstIdle,
             model: None,
             budget: DispatchBudget::ProviderManaged,
             mode,
             dependency_context: None,
         }
+    }
+
+    /// Selects one exact Worker and disables first-idle fallback.
+    pub fn to_worker(mut self, worker: WorkerId) -> Self {
+        self.target = DirectDispatchTarget::Worker(worker);
+        self
     }
 
     /// Supplies a caller-selected model override.
@@ -86,6 +109,11 @@ impl DirectDispatchRequest {
         &self.ticket
     }
 
+    /// Returns first-idle or exact-Worker selection.
+    pub const fn target(&self) -> &DirectDispatchTarget {
+        &self.target
+    }
+
     /// Returns the optional model override.
     pub fn model(&self) -> Option<&str> {
         self.model.as_deref()
@@ -105,6 +133,44 @@ impl DirectDispatchRequest {
     pub const fn dependency_context(&self) -> Option<&DispatchDependencyContext> {
         self.dependency_context.as_ref()
     }
+}
+
+/// The deep frontend-neutral coordinator for Direct Dispatch.
+#[derive(Debug, Clone)]
+pub struct DirectDispatch {
+    repository: Repository,
+}
+
+impl DirectDispatch {
+    /// Opens Direct Dispatch for one Repository.
+    pub fn new(repository: Repository) -> Self {
+        Self { repository }
+    }
+
+    /// Reserves capacity for one request using its deterministic target.
+    ///
+    /// This is the narrow Reservation handoff used by persistent orchestration
+    /// before it records the Worker assignment and launches the Run.
+    pub fn reserve(
+        &self,
+        request: &DirectDispatchRequest,
+    ) -> Result<Reservation, DirectDispatchError> {
+        let pool = self.repository.worker_pool();
+        match request.target() {
+            DirectDispatchTarget::FirstIdle => Ok(pool.reserve(request.ticket().id().as_str())?),
+            DirectDispatchTarget::Worker(worker) => {
+                Ok(pool.reserve_named(worker.clone(), request.ticket().id().as_str())?)
+            }
+        }
+    }
+}
+
+/// Failures that prevent Direct Dispatch coordination from starting or completing.
+#[derive(Debug, Error)]
+pub enum DirectDispatchError {
+    /// Worker Pool Reservation or lifecycle mutation failed.
+    #[error(transparent)]
+    WorkerPool(#[from] WorkerPoolError),
 }
 
 /// The execution side of one successfully launched Direct Dispatch.
