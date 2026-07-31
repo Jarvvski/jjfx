@@ -67,3 +67,14 @@ exposes provider-neutral Run results, normalized token usage, exact micro-USD
 costs, structured activity, and collaboration values through one public seam.
 Provider DTOs, parsing, bounded scanning, Session resolution, finalization, and
 Worker actions remain in the later slices of this ticket.
+
+2026-07-31 - Completed the Claude Code parser slice through the public
+`RunLogParser` seam. Private provider DTOs now normalize session starts,
+ordered assistant messages, token usage, correlated tool lifecycles, legacy
+tool completions, and terminal results with duration, turn count, failure
+context, and micro-USD cost. Unknown well-formed events remain forward
+compatible while malformed JSON returns a typed parse error.
+
+Codex parsing remains the next focused slice. Bounded tail and final-result
+scanning, Agent Session extraction, supervisor finalization, and Worker actions
+remain later work in this ticket.

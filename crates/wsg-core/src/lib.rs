@@ -19,7 +19,7 @@ pub use pool::{
 };
 pub use run_log::{
     CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind, RunActivityStatus,
-    RunConclusion, RunCost, RunResult, RunUsage,
+    RunConclusion, RunCost, RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunUsage,
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,

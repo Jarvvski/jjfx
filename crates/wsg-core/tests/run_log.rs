@@ -1,9 +1,206 @@
 use std::time::Duration;
 
 use wsg_core::{
-    CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind, RunActivityStatus,
-    RunConclusion, RunCost, RunResult, RunUsage,
+    AgentRuntime, CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind,
+    RunActivityStatus, RunConclusion, RunCost, RunLogEvent, RunLogParser, RunResult, RunUsage,
 };
+
+#[test]
+fn claude_session_initialization_becomes_provider_neutral_activity() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"system","subtype":"init","session_id":"e046ef61-7c94-48cc-9852-c3e98adae73a"}"#,
+        )
+        .expect("Claude session initialization should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::SessionStarted,
+        ))]
+    );
+}
+
+#[test]
+fn claude_assistant_text_normalizes_message_and_usage() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+    let usage = RunUsage::new(30_000, 4_000)
+        .with_cached_input_tokens(10_000)
+        .with_cache_write_input_tokens(5_000);
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Checking the failure"}],"usage":{"input_tokens":30000,"output_tokens":4000,"cache_read_input_tokens":10000,"cache_creation_input_tokens":5000}}}"#,
+        )
+        .expect("Claude assistant text should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Activity(
+            RunActivity::new(RunActivityKind::Message {
+                text: "Checking the failure".to_owned(),
+            })
+            .with_usage(usage),
+        )]
+    );
+}
+
+#[test]
+fn claude_tool_lifecycle_preserves_content_order_and_concise_detail() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+
+    let started = parser
+        .parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"text","text":"Running checks"},{"type":"tool_use","id":"tool-1","name":"Bash","input":{"command":"mise run check"}}]}}"#,
+        )
+        .expect("Claude tool start should parse");
+    assert_eq!(
+        started,
+        [
+            RunLogEvent::Activity(RunActivity::new(RunActivityKind::Message {
+                text: "Running checks".to_owned(),
+            })),
+            RunLogEvent::Activity(RunActivity::new(RunActivityKind::Tool {
+                name: "Bash".to_owned(),
+                detail: Some("mise run check".to_owned()),
+                status: RunActivityStatus::InProgress,
+            })),
+        ]
+    );
+
+    let completed = parser
+        .parse_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","content":"checks passed"}]}}"#,
+        )
+        .expect("Claude tool completion should parse");
+    assert_eq!(
+        completed,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Bash".to_owned(),
+                detail: Some("mise run check".to_owned()),
+                status: RunActivityStatus::Completed,
+            },
+        ))]
+    );
+}
+
+#[test]
+fn claude_legacy_tool_result_completes_the_correlated_tool() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+    parser
+        .parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"agent-1","name":"Agent","input":{"description":"Inspect logs"}}]}}"#,
+        )
+        .expect("Claude Agent tool start should parse");
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"tool","tool":{"type":"tool_result","name":"Agent","tool_use_id":"agent-1"}}"#,
+        )
+        .expect("legacy Claude tool result should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Agent".to_owned(),
+                detail: Some("Inspect logs".to_owned()),
+                status: RunActivityStatus::Completed,
+            },
+        ))]
+    );
+}
+
+#[test]
+fn claude_failed_tool_result_preserves_provider_message() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+    parser
+        .parse_line(
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"tool-1","name":"Write","input":{"file_path":"src/lib.rs"}}]}}"#,
+        )
+        .expect("Claude tool start should parse");
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"tool-1","is_error":true,"content":"approval denied"}]}}"#,
+        )
+        .expect("Claude failed tool result should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Write".to_owned(),
+                detail: Some("src/lib.rs".to_owned()),
+                status: RunActivityStatus::Failed {
+                    message: Some("approval denied".to_owned()),
+                },
+            },
+        ))]
+    );
+}
+
+#[test]
+fn claude_success_result_normalizes_completion_metrics() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"result","subtype":"success","duration_ms":5000,"num_turns":3,"total_cost_usd":0.42,"is_error":false,"result":"All done"}"#,
+        )
+        .expect("Claude success result should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Result(
+            RunResult::succeeded()
+                .with_duration(Duration::from_secs(5))
+                .with_turns(3)
+                .with_cost(RunCost::from_micro_usd(420_000)),
+        )]
+    );
+}
+
+#[test]
+fn claude_failure_result_uses_subtype_fallback_and_rounds_to_micro_usd() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"result","subtype":"error_during_execution","duration_ms":1500,"num_turns":2,"total_cost_usd":0.0103125,"is_error":true,"result":""}"#,
+        )
+        .expect("Claude failure result should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Result(
+            RunResult::failed("error_during_execution")
+                .with_duration(Duration::from_millis(1_500))
+                .with_turns(2)
+                .with_cost(RunCost::from_micro_usd(10_313)),
+        )]
+    );
+}
+
+#[test]
+fn claude_parser_ignores_unknown_events_but_rejects_malformed_json() {
+    let mut parser = RunLogParser::new(AgentRuntime::Claude);
+
+    let unknown = parser
+        .parse_line(r#"{"type":"rate_limit_event","rate_limit_info":{}}"#)
+        .expect("unknown Claude events should remain forward compatible");
+    assert!(unknown.is_empty());
+
+    assert!(
+        parser
+            .parse_line(r#"{"type":"assistant","message":{"#)
+            .is_err(),
+        "truncated Claude JSON should report a typed parse failure",
+    );
+}
 
 #[test]
 fn failed_run_result_preserves_normalized_usage_and_completion_details() {

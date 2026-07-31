@@ -1,6 +1,303 @@
-//! Provider-neutral values for structured Agent Runtime logs.
+//! Provider-neutral parsing and values for structured Agent Runtime logs.
 
+use std::collections::HashMap;
 use std::time::Duration;
+
+use serde::Deserialize;
+use serde_json::{Number, Value};
+use thiserror::Error;
+
+use crate::runtime::AgentRuntime;
+
+/// One provider-neutral value decoded from an Agent Runtime log line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunLogEvent {
+    /// One meaningful activity reported during a Run.
+    Activity(RunActivity),
+    /// The Agent Runtime's terminal Run result.
+    Result(RunResult),
+}
+
+/// Parses provider log lines without exposing provider event shapes.
+#[derive(Debug)]
+pub struct RunLogParser {
+    runtime: AgentRuntime,
+    claude_tools: HashMap<String, ClaudeToolCall>,
+}
+
+impl RunLogParser {
+    /// Creates a parser for one Agent Runtime's log protocol.
+    pub fn new(runtime: AgentRuntime) -> Self {
+        Self {
+            runtime,
+            claude_tools: HashMap::new(),
+        }
+    }
+
+    /// Parses one complete log line into zero or more provider-neutral events.
+    pub fn parse_line(&mut self, line: &str) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+        match self.runtime {
+            AgentRuntime::Claude => parse_claude_line(line, &mut self.claude_tools),
+            AgentRuntime::Codex => Err(RunLogParseError::UnsupportedRuntime {
+                runtime: self.runtime,
+            }),
+        }
+    }
+}
+
+/// Failure to decode a provider log line.
+#[derive(Debug, Error)]
+pub enum RunLogParseError {
+    /// The selected provider adapter has not been implemented yet.
+    #[error("Run log parsing is not implemented for {runtime:?}")]
+    UnsupportedRuntime {
+        /// Runtime whose log protocol is not implemented.
+        runtime: AgentRuntime,
+    },
+    /// A log line was not valid provider JSON.
+    #[error("invalid {runtime:?} Run log event: {source}")]
+    InvalidEvent {
+        /// Runtime whose event failed to decode.
+        runtime: AgentRuntime,
+        /// Provider JSON decoding failure.
+        #[source]
+        source: serde_json::Error,
+    },
+    /// A provider reported a cost outside the supported non-negative range.
+    #[error("invalid {runtime:?} Run cost: {value}")]
+    InvalidCost {
+        /// Runtime that reported the invalid cost.
+        runtime: AgentRuntime,
+        /// Provider value that could not be represented in micro-USD.
+        value: String,
+    },
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    #[serde(default)]
+    subtype: String,
+    message: Option<ClaudeMessage>,
+    tool: Option<ClaudeToolResult>,
+    duration_ms: Option<u64>,
+    num_turns: Option<u64>,
+    total_cost_usd: Option<Number>,
+    #[serde(default)]
+    is_error: bool,
+    #[serde(default)]
+    result: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeMessage {
+    #[serde(default)]
+    content: Vec<ClaudeContent>,
+    usage: Option<ClaudeUsage>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeToolResult {
+    #[serde(default)]
+    tool_use_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeContent {
+    #[serde(rename = "type")]
+    content_type: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    tool_use_id: String,
+    #[serde(default)]
+    input: Value,
+    #[serde(default)]
+    content: Value,
+    #[serde(default)]
+    is_error: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ClaudeUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    cache_read_input_tokens: u64,
+    #[serde(default)]
+    cache_creation_input_tokens: u64,
+}
+
+impl ClaudeUsage {
+    fn normalized(&self) -> RunUsage {
+        RunUsage::new(self.input_tokens, self.output_tokens)
+            .with_cached_input_tokens(self.cache_read_input_tokens)
+            .with_cache_write_input_tokens(self.cache_creation_input_tokens)
+    }
+}
+
+#[derive(Debug)]
+struct ClaudeToolCall {
+    name: String,
+    detail: Option<String>,
+}
+
+fn parse_claude_line(
+    line: &str,
+    tools: &mut HashMap<String, ClaudeToolCall>,
+) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+    let event: ClaudeEvent =
+        serde_json::from_str(line).map_err(|source| RunLogParseError::InvalidEvent {
+            runtime: AgentRuntime::Claude,
+            source,
+        })?;
+
+    match (event.event_type.as_str(), event.subtype.as_str()) {
+        ("system", "init") => Ok(vec![RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::SessionStarted,
+        ))]),
+        ("assistant", _) => Ok(parse_claude_message(event.message, tools, false)),
+        ("user", _) => Ok(parse_claude_message(event.message, tools, true)),
+        ("tool", _) => Ok(event
+            .tool
+            .and_then(|tool| complete_claude_tool(tools, &tool.tool_use_id, false, None))
+            .map(RunActivity::new)
+            .map(RunLogEvent::Activity)
+            .into_iter()
+            .collect()),
+        ("result", _) => parse_claude_result(event).map(|result| vec![result]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_claude_message(
+    message: Option<ClaudeMessage>,
+    tools: &mut HashMap<String, ClaudeToolCall>,
+    is_user: bool,
+) -> Vec<RunLogEvent> {
+    let Some(message) = message else {
+        return Vec::new();
+    };
+    let usage = message.usage.map(|usage| usage.normalized());
+    let mut events = Vec::new();
+
+    for content in message.content {
+        let kind = match content.content_type.as_str() {
+            "text" if !is_user && !content.text.is_empty() => {
+                Some(RunActivityKind::Message { text: content.text })
+            }
+            "tool_use" if !is_user && !content.name.is_empty() => {
+                let detail = summarize_claude_input(&content.input);
+                if !content.id.is_empty() {
+                    tools.insert(
+                        content.id,
+                        ClaudeToolCall {
+                            name: content.name.clone(),
+                            detail: detail.clone(),
+                        },
+                    );
+                }
+                Some(RunActivityKind::Tool {
+                    name: content.name,
+                    detail,
+                    status: RunActivityStatus::InProgress,
+                })
+            }
+            "tool_result" if is_user => {
+                let message = content
+                    .content
+                    .as_str()
+                    .filter(|message| !message.is_empty())
+                    .map(ToOwned::to_owned);
+                complete_claude_tool(tools, &content.tool_use_id, content.is_error, message)
+            }
+            _ => None,
+        };
+
+        if let Some(kind) = kind {
+            let activity = RunActivity::new(kind);
+            events.push(RunLogEvent::Activity(match &usage {
+                Some(usage) => activity.with_usage(usage.clone()),
+                None => activity,
+            }));
+        }
+    }
+
+    events
+}
+
+fn complete_claude_tool(
+    tools: &mut HashMap<String, ClaudeToolCall>,
+    tool_use_id: &str,
+    is_error: bool,
+    message: Option<String>,
+) -> Option<RunActivityKind> {
+    let tool = tools.remove(tool_use_id)?;
+    Some(RunActivityKind::Tool {
+        name: tool.name,
+        detail: tool.detail,
+        status: if is_error {
+            RunActivityStatus::Failed { message }
+        } else {
+            RunActivityStatus::Completed
+        },
+    })
+}
+
+fn summarize_claude_input(input: &Value) -> Option<String> {
+    let fields = input.as_object()?;
+    ["command", "file_path", "description", "pattern", "query"]
+        .into_iter()
+        .find_map(|key| fields.get(key)?.as_str().map(ToOwned::to_owned))
+}
+
+fn parse_claude_result(event: ClaudeEvent) -> Result<RunLogEvent, RunLogParseError> {
+    let mut result = if event.subtype == "success" && !event.is_error {
+        RunResult::succeeded()
+    } else {
+        let message = if event.result.is_empty() {
+            event.subtype
+        } else {
+            event.result
+        };
+        RunResult::failed(message)
+    };
+    if let Some(duration_ms) = event.duration_ms {
+        result = result.with_duration(Duration::from_millis(duration_ms));
+    }
+    if let Some(turns) = event.num_turns {
+        result = result.with_turns(turns);
+    }
+    if let Some(cost) = event.total_cost_usd {
+        result = result.with_cost(parse_claude_cost(&cost)?);
+    }
+    Ok(RunLogEvent::Result(result))
+}
+
+fn parse_claude_cost(cost: &Number) -> Result<RunCost, RunLogParseError> {
+    let value = cost
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| RunLogParseError::InvalidCost {
+            runtime: AgentRuntime::Claude,
+            value: cost.to_string(),
+        })?;
+    let micro_usd = (value * 1_000_000.0).round();
+    if micro_usd > u64::MAX as f64 {
+        return Err(RunLogParseError::InvalidCost {
+            runtime: AgentRuntime::Claude,
+            value: cost.to_string(),
+        });
+    }
+    Ok(RunCost::from_micro_usd(micro_usd as u64))
+}
 
 /// Token usage normalized across Agent Runtime providers.
 #[derive(Debug, Clone, PartialEq, Eq)]
