@@ -75,6 +75,7 @@ pub struct Reservation {
     agent_runtime: AgentRuntime,
     repository: Repository,
     worker_revision: StateRevision<WorkerState>,
+    rollback: WorkerState,
 }
 
 pub(crate) enum PidPersistence {
@@ -198,19 +199,9 @@ impl Reservation {
 
     pub(crate) fn release(&self) -> Result<(), WorkerPoolError> {
         let worker_state = self.repository.state_store().worker(self.worker_id.clone());
-        let loaded = match worker_state.load()? {
-            Loaded::Present(versioned) => versioned,
-            Loaded::Missing => {
-                return Err(WorkerPoolError::WorkerStateMissing {
-                    worker: self.worker_id.clone(),
-                });
-            }
-        };
-        let mut state = loaded.value;
-        clear_run_fields(&mut state);
         match worker_state.commit(
             Expected::Match(self.worker_revision.clone()),
-            StateChange::Replace(state),
+            StateChange::Replace(self.rollback.clone()),
         )? {
             CommitOutcome::Applied(_) => Ok(()),
             CommitOutcome::Conflict(_) => Err(WorkerPoolError::ReleaseConflict {
@@ -420,6 +411,56 @@ impl WorkerPool {
         self.repository.state_store().worker(worker.clone())
     }
 
+    pub(crate) fn begin_follow_up(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<(Reservation, Option<PathBuf>), WorkerPoolError> {
+        let started_at = current_timestamp()?;
+        let log_path = self
+            .repository
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker}.log"));
+        match self.repository.state_store().begin_follow_up(
+            worker,
+            started_at,
+            log_path.to_string_lossy().into_owned(),
+        )? {
+            crate::state::FollowUpOutcome::Started {
+                agent_runtime,
+                prior_log,
+                revision,
+                rollback,
+            } => Ok((
+                Reservation {
+                    worker_id: worker.clone(),
+                    ticket: rollback.ticket.clone().unwrap_or_default(),
+                    agent_runtime,
+                    repository: self.repository.clone(),
+                    worker_revision: revision,
+                    rollback: *rollback,
+                },
+                prior_log.map(PathBuf::from),
+            )),
+            crate::state::FollowUpOutcome::WorkerNotInPool => {
+                Err(WorkerPoolError::WorkerNotInPool {
+                    worker: worker.clone(),
+                })
+            }
+            crate::state::FollowUpOutcome::WorkerBusy => Err(WorkerPoolError::WorkerNotIdle {
+                worker: worker.clone(),
+            }),
+            crate::state::FollowUpOutcome::WorkerStateMissing => {
+                Err(WorkerPoolError::WorkerStateMissing {
+                    worker: worker.clone(),
+                })
+            }
+            crate::state::FollowUpOutcome::InvalidAgentRuntime { value } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            }
+        }
+    }
+
     /// Reserves the first idle Worker for `ticket` in pool order.
     pub fn reserve(&self, ticket: impl Into<String>) -> Result<Reservation, WorkerPoolError> {
         self.reserve_inner(None, ticket.into())
@@ -476,12 +517,14 @@ impl WorkerPool {
                 worker,
                 agent_runtime,
                 revision,
+                rollback,
             } => Ok(Reservation {
                 worker_id: worker,
                 ticket,
                 agent_runtime,
                 repository: self.repository.clone(),
                 worker_revision: revision,
+                rollback: *rollback,
             }),
             crate::state::ReservationOutcome::NoIdle { available } => {
                 Err(WorkerPoolError::NoIdleWorkers { ticket, available })

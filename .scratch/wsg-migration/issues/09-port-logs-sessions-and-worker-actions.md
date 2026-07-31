@@ -126,3 +126,15 @@ finalizers share the same result policy.
 
 Send and Agent Session continuation through the Worker actions facade is the
 next focused slice.
+
+2026-07-31 - Added the deep `WorkerActions` facade and implemented Send as an
+atomic Follow-up Run. Follow-ups preserve Ticket and branch context, prefer the
+persisted Agent Runtime, fall back to Pool configuration for never-run Workers,
+and capture the prior log before the compatible per-Worker log is truncated.
+The typed outcome reports foreground/background execution plus resumed or fresh
+Session behavior and its explicit fallback reason. Probe, log, spawn, or PID
+persistence failures restore the complete prior terminal or idle Worker state
+instead of leaking busy capacity.
+
+Review prompt construction and launch through the same Follow-up path is the
+next focused slice.

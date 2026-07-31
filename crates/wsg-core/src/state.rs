@@ -213,7 +213,7 @@ impl PoolState {
 }
 
 /// The exact Go-compatible Worker state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerState {
     /// Persisted Worker Status.
     pub status: WireStatus,
@@ -471,6 +471,7 @@ pub(crate) enum ReservationOutcome {
         worker: WorkerId,
         agent_runtime: crate::AgentRuntime,
         revision: StateRevision<WorkerState>,
+        rollback: Box<WorkerState>,
     },
     NoIdle {
         available: usize,
@@ -481,6 +482,22 @@ pub(crate) enum ReservationOutcome {
     WorkerNotIdle {
         worker: WorkerId,
     },
+    InvalidAgentRuntime {
+        value: String,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum FollowUpOutcome {
+    Started {
+        agent_runtime: crate::AgentRuntime,
+        prior_log: Option<String>,
+        revision: StateRevision<WorkerState>,
+        rollback: Box<WorkerState>,
+    },
+    WorkerNotInPool,
+    WorkerBusy,
+    WorkerStateMissing,
     InvalidAgentRuntime {
         value: String,
     },
@@ -993,6 +1010,89 @@ impl StateStore {
         })
     }
 
+    /// Atomically starts a Follow-up Run while preserving prior Worker context.
+    pub(crate) fn begin_follow_up(
+        &self,
+        worker: &WorkerId,
+        started_at: WireTimestamp,
+        log_file: String,
+    ) -> Result<FollowUpOutcome, StateError> {
+        let pool_subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
+            let pool = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => return Ok(FollowUpOutcome::WorkerNotInPool),
+            };
+            if !pool.workers.iter().any(|candidate| candidate == worker) {
+                return Ok(FollowUpOutcome::WorkerNotInPool);
+            }
+            let worker_lock = self
+                .root
+                .join(POOL_DIRECTORY)
+                .join(format!("{worker}.json.lock"));
+            with_locks(&[worker_lock], &format!("Worker {worker}"), || {
+                let path = self
+                    .root
+                    .join(POOL_DIRECTORY)
+                    .join(format!("{worker}.json"));
+                let mut state =
+                    match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+                        Loaded::Present(versioned) => versioned.value,
+                        Loaded::Missing => return Ok(FollowUpOutcome::WorkerStateMissing),
+                    };
+                if state.status.as_str() == "busy" {
+                    return Ok(FollowUpOutcome::WorkerBusy);
+                }
+                let agent_runtime = match state
+                    .agent
+                    .as_ref()
+                    .filter(|agent| !agent.as_str().trim().is_empty())
+                {
+                    Some(agent) => match crate::AgentRuntime::parse(agent) {
+                        Some(runtime) => runtime,
+                        None => {
+                            return Ok(FollowUpOutcome::InvalidAgentRuntime {
+                                value: agent.as_str().to_owned(),
+                            });
+                        }
+                    },
+                    None => match crate::AgentRuntime::from_configured(pool.agent.as_ref()) {
+                        Ok(runtime) => runtime,
+                        Err(value) => return Ok(FollowUpOutcome::InvalidAgentRuntime { value }),
+                    },
+                };
+                let prior_log = state.log_file.clone();
+                let rollback = state.clone();
+                state.status = WireStatus::new("busy");
+                state.agent = Some(WireAgent::new(agent_runtime.as_str()));
+                state.pid = None;
+                state.started_at = Some(started_at);
+                state.completed_at = None;
+                state.log_file = Some(log_file);
+                state.exit_code = None;
+                state.error = None;
+                write_atomic(&path, &state, &format!("Worker {worker}"))?;
+                let revision =
+                    match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
+                        Loaded::Present(versioned) => versioned.revision().clone(),
+                        Loaded::Missing => {
+                            return Err(StateError::new(
+                                "follow up",
+                                format!("Worker {worker}"),
+                                "state disappeared after transition",
+                            ));
+                        }
+                    };
+                Ok(FollowUpOutcome::Started {
+                    agent_runtime,
+                    prior_log,
+                    revision,
+                    rollback: Box::new(rollback),
+                })
+            })
+        })
+    }
+
     /// Atomically reserves an idle Worker while holding the compatible pool
     /// and Worker sidecar locks. This repository-owned transition reloads
     /// membership and Worker state under lock so lifecycle callers never
@@ -1093,6 +1193,7 @@ impl StateStore {
                 let Some((worker, mut state)) = selected else {
                     return Ok(ReservationOutcome::NoIdle { available });
                 };
+                let rollback = state.clone();
                 state.status = WireStatus::new("busy");
                 state.agent = Some(WireAgent::new(agent_runtime.as_str()));
                 state.ticket = Some(ticket);
@@ -1129,6 +1230,7 @@ impl StateStore {
                     worker,
                     agent_runtime,
                     revision,
+                    rollback: Box::new(rollback),
                 })
             })
         })

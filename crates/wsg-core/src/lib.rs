@@ -10,6 +10,7 @@ mod pool;
 mod run_log;
 mod runtime;
 mod state;
+mod worker_actions;
 mod workspace;
 
 pub use pool::{
@@ -33,6 +34,9 @@ pub use state::{
     Expected, IdentifierError, Loaded, PoolState, PoolStateRepository, StateChange, StateError,
     StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
+};
+pub use worker_actions::{
+    FollowUpExecution, FollowUpOutcome, RunMode, WorkerActionError, WorkerActions,
 };
 pub use workspace::{AdHocWorkspace, AdHocWorkspaceError, WorkerWorkspace, WorkerWorkspaceError};
 
