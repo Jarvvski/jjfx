@@ -36,8 +36,9 @@ pub use state::{
     WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use worker_actions::{
-    FollowUpExecution, FollowUpOutcome, ResetOutcome, RunMode, WorkerActionError, WorkerActions,
-    WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
+    FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome, RebaseOutcome,
+    ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration,
+    WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
 pub use workspace::{AdHocWorkspace, AdHocWorkspaceError, WorkerWorkspace, WorkerWorkspaceError};
 

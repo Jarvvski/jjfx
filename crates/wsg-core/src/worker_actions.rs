@@ -1,5 +1,7 @@
 //! Frontend-neutral actions over one Worker.
 
+use std::env;
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 use std::thread::{self, JoinHandle};
@@ -8,9 +10,9 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    AgentRuntime, AgentRuntimeInvocation, AgentSessionResolution, BackgroundRun, CompletedRun,
-    Repository, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
-    resolve_agent_session,
+    AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError, AgentSessionResolution,
+    BackgroundRun, CompletedRun, Loaded, Repository, RunLog, RunSupervisor, RunSupervisorError,
+    WorkerId, WorkerPoolError, resolve_agent_session,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -128,6 +130,81 @@ pub enum WorkspaceRestorationError {
     ThreadPanicked { worker: WorkerId },
 }
 
+/// The result of rebasing and pushing one Worker bookmark.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RebaseOutcome {
+    branch: String,
+}
+
+impl RebaseOutcome {
+    /// Returns the rebased bookmark.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+}
+
+/// The result of opening one Worker's pull request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPullRequestOutcome {
+    branch: String,
+}
+
+impl OpenPullRequestOutcome {
+    /// Returns the bookmark used to find the pull request.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+}
+
+/// A typed reference to one Worker's structured provider log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerLogs {
+    path: std::path::PathBuf,
+    runtime: AgentRuntime,
+}
+
+impl WorkerLogs {
+    /// Returns the compatible provider log path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the provider required to interpret the log.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
+    }
+
+    /// Opens the log through the provider-neutral parser facade.
+    pub fn open(&self) -> RunLog {
+        RunLog::new(&self.path, self.runtime)
+    }
+}
+
+/// The result of mounting a Worker Workspace into kitty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountOutcome {
+    runtime: AgentRuntime,
+    session: AgentSessionResolution,
+    tab_id: String,
+}
+
+impl MountOutcome {
+    /// Returns the interactive Agent Runtime opened in the tab.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
+    }
+
+    /// Reports whether the interactive Agent Session can resume.
+    pub const fn session(&self) -> &AgentSessionResolution {
+        &self.session
+    }
+
+    /// Returns kitty's new tab window identifier.
+    pub fn tab_id(&self) -> &str {
+        &self.tab_id
+    }
+}
+
 /// The deep frontend-neutral interface for operational Worker actions.
 #[derive(Debug, Clone)]
 pub struct WorkerActions {
@@ -164,6 +241,106 @@ impl WorkerActions {
             Some(send_system_prompt(&repository_slug(&self.repository))),
             mode,
         )
+    }
+
+    /// Returns the Worker's structured Run log without choosing a rendering.
+    pub fn logs(&self, worker: &WorkerId) -> Result<WorkerLogs, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        let path = state
+            .log_file()
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from)
+            .ok_or_else(|| WorkerActionError::MissingLog {
+                worker: worker.clone(),
+            })?;
+        if !path.is_file() {
+            return Err(WorkerActionError::MissingLog {
+                worker: worker.clone(),
+            });
+        }
+        let runtime = state
+            .agent_runtime()
+            .ok_or_else(|| WorkerActionError::MissingRuntime {
+                worker: worker.clone(),
+            })?;
+        Ok(WorkerLogs { path, runtime })
+    }
+
+    /// Rebases the Worker's bookmark onto `main` and pushes it.
+    pub fn rebase(&self, worker: &WorkerId) -> Result<RebaseOutcome, WorkerActionError> {
+        let (branch, workspace) = self.branch_and_workspace(worker)?;
+        self.commands
+            .rebase(&workspace, &branch)
+            .map_err(|detail| WorkerActionError::Command {
+                operation: "rebase Worker bookmark",
+                detail,
+            })?;
+        if let Err(push) = self.commands.push(&workspace, &branch) {
+            let rollback = self.commands.undo(&workspace).err();
+            return Err(WorkerActionError::RebasePush {
+                branch,
+                push,
+                rollback,
+            });
+        }
+        Ok(RebaseOutcome { branch })
+    }
+
+    /// Opens the pull request for the Worker's bookmark in the default browser.
+    pub fn open_pull_request(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<OpenPullRequestOutcome, WorkerActionError> {
+        let (branch, _) = self.branch_and_workspace(worker)?;
+        let repository = repository_slug(&self.repository);
+        if repository.is_empty() {
+            return Err(WorkerActionError::RepositoryUnavailable);
+        }
+        self.commands.open_pull_request(&repository, &branch)?;
+        Ok(OpenPullRequestOutcome { branch })
+    }
+
+    /// Opens an interactive provider Session for the Worker in kitty.
+    pub fn mount(&self, worker: &WorkerId) -> Result<MountOutcome, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        let workspace = crate::workspace::worker_path(self.repository.root(), worker);
+        if !workspace.is_dir() {
+            return Err(WorkerActionError::MissingWorkspace {
+                worker: worker.clone(),
+            });
+        }
+        let session = resolve_agent_session(state.log_file().map(Path::new));
+        let runtime = match (state.agent_runtime(), &session) {
+            (Some(runtime), _) => runtime,
+            (None, AgentSessionResolution::Resumed { .. }) => AgentRuntime::Claude,
+            (None, AgentSessionResolution::Fresh { .. }) => {
+                let configured = match self.repository.state_store().pool().load()? {
+                    Loaded::Present(versioned) => versioned.value.agent,
+                    Loaded::Missing => None,
+                };
+                AgentRuntime::from_configured(configured.as_ref())
+                    .map_err(|value| WorkerPoolError::InvalidAgentRuntime { value })?
+            }
+        };
+        runtime.probe(&workspace)?;
+        let tab_id = self.commands.mount(worker, &workspace, runtime, &session)?;
+        Ok(MountOutcome {
+            runtime,
+            session,
+            tab_id,
+        })
     }
 
     /// Abandons the current Run, releases capacity, and restores the Workspace.
@@ -224,6 +401,33 @@ impl WorkerActions {
             .failing_checks(&repository, pull_request.number)?;
         let prompt = build_review_prompt(&repository, &pull_request, &checks);
         self.follow_up(worker, prompt, None, mode)
+    }
+
+    fn branch_and_workspace(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<(String, std::path::PathBuf), WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        let branch = state
+            .branch_name()
+            .filter(|branch| !branch.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| WorkerActionError::MissingBranch {
+                worker: worker.clone(),
+            })?;
+        let workspace = crate::workspace::worker_path(self.repository.root(), worker);
+        if !workspace.is_dir() {
+            return Err(WorkerActionError::MissingWorkspace {
+                worker: worker.clone(),
+            });
+        }
+        Ok((branch, workspace))
     }
 
     fn follow_up(
@@ -290,6 +494,124 @@ struct Check {
 }
 
 impl SystemCommands {
+    fn mount(
+        self,
+        worker: &WorkerId,
+        workspace: &Path,
+        runtime: AgentRuntime,
+        session: &AgentSessionResolution,
+    ) -> Result<String, WorkerActionError> {
+        let address = kitty_address()?;
+        let session_id = match session {
+            AgentSessionResolution::Resumed { session_id } => Some(session_id.as_str()),
+            AgentSessionResolution::Fresh { .. } => None,
+        };
+        let command = interactive_agent_command(runtime, session_id);
+        let cwd = format!("--cwd={}", workspace.display());
+        let title = worker.as_str();
+        let tab_id = self.run(
+            "create kitty tab",
+            "kitten",
+            &[
+                "@",
+                &address,
+                "launch",
+                "--type=tab",
+                "--tab-title",
+                title,
+                &cwd,
+                "--",
+                "zsh",
+                "-ic",
+                &command,
+            ],
+        )?;
+        let tab_id = tab_id.trim().to_owned();
+        if !tab_id.is_empty() {
+            let match_id = format!("id:{tab_id}");
+            let right = self
+                .run(
+                    "split kitty tab",
+                    "kitten",
+                    &[
+                        "@",
+                        &address,
+                        "launch",
+                        "--match",
+                        &match_id,
+                        "--location=vsplit",
+                        &cwd,
+                        "--",
+                        "zsh",
+                        "-ic",
+                        "clear; exec zsh",
+                    ],
+                )
+                .unwrap_or_default();
+            let right = right.trim();
+            if !right.is_empty() {
+                let right_match = format!("id:{right}");
+                let _ = self.run(
+                    "split kitty pane",
+                    "kitten",
+                    &[
+                        "@",
+                        &address,
+                        "launch",
+                        "--match",
+                        &right_match,
+                        "--location=hsplit",
+                        &cwd,
+                        "--",
+                        "zsh",
+                        "-ic",
+                        "clear; exec zsh",
+                    ],
+                );
+            }
+            let _ = self.run(
+                "focus kitty tab",
+                "kitten",
+                &["@", &address, "focus-window", "--match", &match_id],
+            );
+        }
+        Ok(tab_id)
+    }
+
+    fn rebase(self, workspace: &Path, branch: &str) -> Result<(), String> {
+        self.run_status(workspace, "jj", &["rebase", "-b", branch, "-d", "main"])
+    }
+
+    fn push(self, workspace: &Path, branch: &str) -> Result<(), String> {
+        self.run_status(workspace, "jj", &["git", "push", "-b", branch])
+    }
+
+    fn undo(self, workspace: &Path) -> Result<(), String> {
+        self.run_status(workspace, "jj", &["op", "undo"])
+    }
+
+    fn open_pull_request(self, repository: &str, branch: &str) -> Result<(), WorkerActionError> {
+        self.run(
+            "open pull request",
+            "gh",
+            &["-R", repository, "pr", "view", branch, "--web"],
+        )
+        .map(|_| ())
+    }
+
+    fn run_status(self, workspace: &Path, program: &str, arguments: &[&str]) -> Result<(), String> {
+        let output = Command::new(program)
+            .args(arguments)
+            .current_dir(workspace)
+            .output()
+            .map_err(|source| source.to_string())?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_owned())
+        }
+    }
+
     fn restore_workspace(
         worker: &WorkerId,
         workspace: &Path,
@@ -423,6 +745,47 @@ impl SystemCommands {
     }
 }
 
+fn kitty_address() -> Result<String, WorkerActionError> {
+    if let Some(address) = env::var_os("KITTY_LISTEN_ON")
+        && !address.is_empty()
+    {
+        return Ok(format!("--to={}", address.to_string_lossy()));
+    }
+    let entries = fs::read_dir("/tmp").map_err(|source| WorkerActionError::KittyUnavailable {
+        detail: source.to_string(),
+    })?;
+    for entry in entries.flatten() {
+        if let Some(name) = entry.file_name().to_str()
+            && name.starts_with("kitty-visor-")
+        {
+            return Ok(format!("--to=unix:/tmp/{name}"));
+        }
+    }
+    Err(WorkerActionError::KittyUnavailable {
+        detail: "no kitty visor socket found".to_owned(),
+    })
+}
+
+fn interactive_agent_command(runtime: AgentRuntime, session_id: Option<&str>) -> String {
+    let resumed = session_id.map(shell_quote);
+    match (runtime, resumed) {
+        (AgentRuntime::Claude, Some(session)) => {
+            format!("claude --resume {session}; exec zsh")
+        }
+        (AgentRuntime::Claude, None) => "claude; exec zsh".to_owned(),
+        (AgentRuntime::Codex, Some(session)) => format!(
+            "codex --sandbox workspace-write --ask-for-approval on-request resume {session}; exec zsh"
+        ),
+        (AgentRuntime::Codex, None) => {
+            "codex --sandbox workspace-write --ask-for-approval on-request; exec zsh".to_owned()
+        }
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[Check]) -> String {
     let header = if pull_request.url.is_empty() {
         format!("#{}", pull_request.number)
@@ -501,12 +864,31 @@ pub enum WorkerActionError {
     /// Review and repository actions require a resolved Worker bookmark.
     #[error("Worker {worker} has no branch")]
     MissingBranch { worker: WorkerId },
+    /// The compatible structured log is absent.
+    #[error("Worker {worker} has no Run log")]
+    MissingLog { worker: WorkerId },
+    /// A log cannot be interpreted without its persisted Agent Runtime.
+    #[error("Worker {worker} has no Agent Runtime")]
+    MissingRuntime { worker: WorkerId },
+    /// An operational action requires the provisioned Worker Workspace.
+    #[error("Workspace directory is missing for Worker {worker}")]
+    MissingWorkspace { worker: WorkerId },
+    /// kitty could not be located for Mount.
+    #[error("kitty is unavailable: {detail}")]
+    KittyUnavailable { detail: String },
     /// The Repository has no compatible GitHub slug.
     #[error("cannot detect GitHub repository")]
     RepositoryUnavailable,
     /// No open pull request exists for the Worker bookmark.
     #[error("no pull request found for branch {branch}")]
     PullRequestNotFound { branch: String },
+    /// Pushing a rebased bookmark failed after the local operation completed.
+    #[error("cannot push rebased branch {branch}: {push}; rollback: {rollback:?}")]
+    RebasePush {
+        branch: String,
+        push: String,
+        rollback: Option<String>,
+    },
     /// An external action adapter failed.
     #[error("cannot {operation}: {detail}")]
     Command {
@@ -519,6 +901,12 @@ pub enum WorkerActionError {
     /// The Worker lifecycle transition failed.
     #[error(transparent)]
     WorkerPool(#[from] WorkerPoolError),
+    /// The Agent Runtime executable required by Mount is unavailable.
+    #[error(transparent)]
+    Probe(#[from] AgentRuntimeProbeError),
+    /// A compatibility state document could not be read.
+    #[error(transparent)]
+    State(#[from] crate::StateError),
     /// The Agent Runtime could not launch or finalize.
     #[error(transparent)]
     Run(#[from] RunSupervisorError),

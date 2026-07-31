@@ -6,14 +6,16 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentSessionResolution, Expected, FollowUpExecution, Loaded, PoolCapacity, Repository, RunMode,
-    RunReset, StateChange, WireAgent, WireStatus, WireTimestamp, WorkerActions, WorkerId,
-    WorkspaceRestoration,
+    AgentRuntime, AgentSessionResolution, Expected, FollowUpExecution, Loaded, PoolCapacity,
+    Repository, RunMode, RunReset, StateChange, WireAgent, WireStatus, WireTimestamp,
+    WorkerActions, WorkerId, WorkspaceRestoration,
 };
 
 const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
 const HELPER_WORKER: &str = "WSG_ACTION_WORKER";
 const HELPER_RESULT: &str = "WSG_ACTION_RESULT";
+const HELPER_CAPTURE: &str = "WSG_ACTION_CAPTURE";
+const HELPER_MODE: &str = "WSG_ACTION_MODE";
 
 #[test]
 fn send_rejects_a_busy_worker_through_the_actions_facade() {
@@ -33,6 +35,222 @@ fn send_rejects_a_busy_worker_through_the_actions_facade() {
 
     assert!(result.is_err());
     drop(temporary_directory);
+}
+
+#[test]
+fn logs_returns_a_typed_provider_log_without_rendering_it() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("typed-worker.log");
+    fs::write(
+        &log,
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}\n",
+    )
+    .expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let logs = WorkerActions::new(repository)
+        .logs(&worker)
+        .expect("Logs should resolve");
+
+    assert_eq!(logs.runtime(), AgentRuntime::Claude);
+    assert_eq!(logs.path(), log);
+    assert!(logs.open().final_result().expect("Run result").is_some());
+}
+
+#[test]
+fn repository_actions_reject_a_worker_without_a_branch() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let actions = WorkerActions::new(repository);
+
+    assert!(actions.rebase(&worker).is_err());
+    assert!(actions.open_pull_request(&worker).is_err());
+}
+
+#[test]
+fn rebase_and_open_pull_request_use_compatible_typed_actions() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("repository-actions.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    let command_script =
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n";
+    write_executable(&bin.join("jj"), command_script);
+    write_executable(&bin.join("gh"), command_script);
+    let capture = temporary_directory.path().join("commands");
+    let result = temporary_directory.path().join("result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "repository")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("repository action helper should run");
+
+    assert!(
+        output.status.success(),
+        "repository action helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&result).expect("action result"),
+        "owner/eng-301-action\nowner/eng-301-action\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("command capture"),
+        concat!(
+            "jj rebase -b owner/eng-301-action -d main\n",
+            "jj git push -b owner/eng-301-action\n",
+            "gh -R owner/repo pr view owner/eng-301-action --web\n"
+        )
+    );
+}
+
+#[test]
+fn failed_rebase_push_rolls_back_the_local_operation() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("failed-rebase.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "if [ \"$1\" = git ] && [ \"$2\" = push ]; then echo rejected >&2; exit 1; fi\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("commands");
+    let result = temporary_directory.path().join("result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "rebase-failure")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("repository action helper should run");
+
+    assert!(output.status.success());
+    assert!(
+        fs::read_to_string(&result)
+            .expect("action result")
+            .contains("cannot push rebased branch")
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("command capture"),
+        concat!(
+            "jj rebase -b owner/eng-301-action -d main\n",
+            "jj git push -b owner/eng-301-action\n",
+            "jj op undo\n"
+        )
+    );
+}
+
+#[test]
+fn mount_opens_a_resumable_provider_session_and_reports_the_tab() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("mount.log");
+    fs::write(
+        &log,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-mount\"}\n",
+    )
+    .expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\necho --forward-subagent-text\n",
+    );
+    write_executable(
+        &bin.join("kitten"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "case \"$*\" in\n",
+            "  *--type=tab*) echo 42 ;;\n",
+            "  *--location=vsplit*) echo 43 ;;\n",
+            "  *--location=hsplit*) echo 44 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("commands");
+    let result = temporary_directory.path().join("result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("Mount action helper should run");
+
+    assert!(
+        output.status.success(),
+        "Mount action helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&result).expect("Mount result"),
+        "claude\nresumed:session-mount\n42\n"
+    );
+    let commands = fs::read_to_string(&capture).expect("command capture");
+    assert!(commands.contains("@ --to=unix:/tmp/fake-kitty launch --type=tab"));
+    assert!(commands.contains("claude --resume 'session-mount'; exec zsh"));
+    assert!(commands.contains("--location=vsplit"));
+    assert!(commands.contains("--location=hsplit"));
+    assert!(commands.contains("focus-window --match id:42"));
+}
+
+#[test]
+fn mount_rejects_a_missing_worker_workspace() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    fs::remove_dir_all(worker_workspace_path(&repository, &worker))
+        .expect("remove Worker Workspace");
+
+    let error = WorkerActions::new(repository)
+        .mount(&worker)
+        .expect_err("Mount without a Workspace should fail");
+
+    assert!(error.to_string().contains("Workspace directory is missing"));
 }
 
 #[test]
@@ -297,6 +515,57 @@ fn failed_send_launch_restores_the_prior_terminal_worker() {
         restored.log_file(),
         Some(prior_log.to_string_lossy().as_ref())
     );
+}
+
+#[test]
+#[ignore]
+fn mount_action_helper() {
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let outcome = WorkerActions::new(repository)
+        .mount(&worker)
+        .expect("Mount should succeed");
+    let session = match outcome.session() {
+        AgentSessionResolution::Resumed { session_id } => format!("resumed:{session_id}"),
+        AgentSessionResolution::Fresh { reason } => format!("fresh:{reason}"),
+    };
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        format!(
+            "{}\n{}\n{}\n",
+            outcome.runtime().as_str(),
+            session,
+            outcome.tab_id()
+        ),
+    )
+    .expect("Mount result");
+}
+
+#[test]
+#[ignore]
+fn repository_action_helper() {
+    let mode = env::var(HELPER_MODE).unwrap_or_default();
+    if mode != "repository" && mode != "rebase-failure" {
+        return;
+    }
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let actions = WorkerActions::new(repository);
+    let result = if mode == "repository" {
+        let rebase = actions.rebase(&worker).expect("Rebase should succeed");
+        let open = actions
+            .open_pull_request(&worker)
+            .expect("Open PR should succeed");
+        format!("{}\n{}\n", rebase.branch(), open.branch())
+    } else {
+        actions
+            .rebase(&worker)
+            .expect_err("Push should fail")
+            .to_string()
+    };
+    fs::write(env::var_os(HELPER_RESULT).expect("result path"), result).expect("action result");
 }
 
 #[test]

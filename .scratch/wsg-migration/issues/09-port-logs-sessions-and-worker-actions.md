@@ -161,3 +161,16 @@ active Run, and the existing descendant-cleanup and stale-Run race coverage
 continues through the delegated supervisor seam.
 
 Rebase, Open PR, Logs, and Mount are the remaining typed Worker actions.
+
+2026-07-31 - Completed the `WorkerActions` facade with typed Rebase, Open PR,
+Logs, and Mount outcomes. Rebase invokes the compatible `jj` sequence and
+rolls back a failed push with `jj op undo`; Open PR keeps repository detection
+and `gh` invocation internal. Logs returns a provider-neutral `RunLog` without
+choosing frontend rendering. Mount resolves the persisted or configured Agent
+Runtime, resumes a compatible Session when available, verifies the executable,
+and delegates the kitty tab, split, and focus sequence to an internal adapter.
+Public-interface tests cover successful command construction, failed-push
+rollback, missing state, structured log access, and interactive Session resume.
+
+All implementation slices are complete. Ticket and Epic status closure remain
+pending the final acceptance check.
