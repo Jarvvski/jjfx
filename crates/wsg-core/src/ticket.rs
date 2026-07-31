@@ -1,5 +1,7 @@
 //! Linear Ticket discovery and provider-neutral Dispatch inputs.
 
+use std::collections::BTreeMap;
+
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -45,6 +47,30 @@ impl ReadyTicketFilter {
             return Err(TicketValueError::BlankLabel);
         }
         Ok(Self { label, status })
+    }
+}
+
+/// A canonical GitHub Repository identity used to scope Dispatch delivery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryIdentity(String);
+
+impl RepositoryIdentity {
+    /// Validates an `owner/name` Repository slug.
+    pub fn parse(value: impl Into<String>) -> Result<Self, TicketValueError> {
+        let value = value.into().trim().to_owned();
+        let mut parts = value.split('/');
+        if parts.next().is_none_or(str::is_empty)
+            || parts.next().is_none_or(str::is_empty)
+            || parts.next().is_some()
+        {
+            return Err(TicketValueError::InvalidRepositoryIdentity(value));
+        }
+        Ok(Self(value))
+    }
+
+    /// Returns the canonical `owner/name` slug.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -135,6 +161,46 @@ where
             diagnostics,
         })
     }
+
+    /// Discovers and validates the direct children of one Parent Ticket.
+    pub fn dependency_graph(
+        &self,
+        parent: &ParentTicket,
+        repository: &RepositoryIdentity,
+    ) -> Result<DependencyGraph, TicketDiscoveryError> {
+        let prompt = format!(
+            "Fetch the direct children of Linear issue {} and their blockedBy relations. Determine cross_repo relative to {}. Return only JSON as {{\"sub_issues\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"Todo\",\"blocked_by\":[\"AMBA-41\"],\"cross_repo\":false}}]}}.",
+            parent.id(),
+            repository.as_str(),
+        );
+        let output = self.query.query(&prompt)?;
+        let payload: RawDependencyGraph = serde_json::from_str(&output)
+            .map_err(|source| TicketDiscoveryError::MalformedResponse { source })?;
+        let mut sub_issues = BTreeMap::new();
+        for raw in payload.sub_issues {
+            let id = TicketId::parse(raw.id).map_err(TicketDiscoveryError::InvalidIdentifier)?;
+            let title = TicketTitle::parse(raw.title)?;
+            let status = TicketStatus::parse(raw.status)?;
+            let blockers = raw
+                .blocked_by
+                .into_iter()
+                .map(TicketId::parse)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_iter()
+                .map(Blocker::new)
+                .collect();
+            let ticket = Ticket::new(id.clone(), title, status);
+            sub_issues.insert(
+                id,
+                DiscoveredSubIssue::new(ticket, blockers, raw.cross_repo),
+            );
+        }
+        Ok(DependencyGraph {
+            parent: parent.clone(),
+            sub_issues,
+            diagnostics: Vec::new(),
+        })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -147,6 +213,20 @@ struct RawTicket {
     id: String,
     title: String,
     status: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawDependencyGraph {
+    sub_issues: Vec<RawSubIssue>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSubIssue {
+    id: String,
+    title: String,
+    status: String,
+    blocked_by: Vec<String>,
+    cross_repo: bool,
 }
 
 fn ready_ticket(
@@ -179,6 +259,12 @@ pub enum TicketDiscoveryError {
     /// The selected Agent Runtime query failed.
     #[error("Ticket query failed: {0}")]
     Query(#[from] TicketQueryError),
+    /// A discovered Ticket identifier was unsafe.
+    #[error("Ticket query returned an invalid identifier: {0}")]
+    InvalidIdentifier(#[from] crate::IdentifierError),
+    /// A discovered Ticket value was unusable.
+    #[error("Ticket query returned an invalid value: {0}")]
+    InvalidValue(#[from] TicketValueError),
     /// The Agent Runtime did not return the constrained response shape.
     #[error("Ticket query returned malformed JSON: {source}")]
     MalformedResponse {
@@ -290,9 +376,75 @@ impl Blocker {
     }
 }
 
+/// A validated direct child and its sibling Blockers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredSubIssue {
+    ticket: Ticket,
+    blockers: Vec<Blocker>,
+    cross_repository: bool,
+}
+
+impl DiscoveredSubIssue {
+    fn new(ticket: Ticket, blockers: Vec<Blocker>, cross_repository: bool) -> Self {
+        Self {
+            ticket,
+            blockers,
+            cross_repository,
+        }
+    }
+
+    /// Returns the typed child Ticket.
+    pub fn ticket(&self) -> &Ticket {
+        &self.ticket
+    }
+
+    /// Returns direct sibling Blockers.
+    pub fn blockers(&self) -> &[Blocker] {
+        &self.blockers
+    }
+
+    /// Returns whether the child targets another Repository.
+    pub fn is_cross_repository(&self) -> bool {
+        self.cross_repository
+    }
+}
+
+/// A Parent Ticket's validated direct children and Dependencies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DependencyGraph {
+    parent: ParentTicket,
+    sub_issues: BTreeMap<TicketId, DiscoveredSubIssue>,
+    diagnostics: Vec<DiscoveryDiagnostic>,
+}
+
+impl DependencyGraph {
+    /// Returns the Parent Ticket whose children were discovered.
+    pub fn parent(&self) -> &ParentTicket {
+        &self.parent
+    }
+
+    /// Returns all direct children keyed by Ticket identifier.
+    pub fn sub_issues(&self) -> &BTreeMap<TicketId, DiscoveredSubIssue> {
+        &self.sub_issues
+    }
+
+    /// Returns one direct child by Ticket identifier.
+    pub fn sub_issue(&self, id: &TicketId) -> Option<&DiscoveredSubIssue> {
+        self.sub_issues.get(id)
+    }
+
+    /// Returns diagnostics for safely excluded or repaired relationships.
+    pub fn diagnostics(&self) -> &[DiscoveryDiagnostic] {
+        &self.diagnostics
+    }
+}
+
 /// Invalid provider-neutral Ticket data.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TicketValueError {
+    /// Repository identity was not an `owner/name` slug.
+    #[error("Repository identity {0:?} must use owner/name format")]
+    InvalidRepositoryIdentity(String),
     /// Ready Ticket discovery was configured without a label.
     #[error("Ready Ticket label cannot be blank")]
     BlankLabel,

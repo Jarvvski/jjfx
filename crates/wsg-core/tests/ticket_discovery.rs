@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use wsg_core::{
-    Blocker, ParentTicket, ReadyTicketFilter, Ticket, TicketDiscovery, TicketId, TicketQuery,
-    TicketQueryError, TicketStatus, TicketTitle,
+    Blocker, ParentTicket, ReadyTicketFilter, RepositoryIdentity, Ticket, TicketDiscovery,
+    TicketId, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
 };
 
 struct StubQuery {
@@ -26,6 +26,29 @@ impl TicketQuery for StubQuery {
             .pop_front()
             .expect("a configured query response")
     }
+}
+
+#[test]
+fn parent_ticket_discovery_returns_a_typed_dependency_graph() {
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"sub_issues":[{"id":"AMBA-41","title":"Foundation","status":"Done","blocked_by":[],"cross_repo":false},{"id":"AMBA-42","title":"Ship typed discovery","status":"Todo","blocked_by":["AMBA-41"],"cross_repo":false}]}"#,
+    ));
+    let parent = ParentTicket::new(TicketId::parse("AMBA-40").expect("Parent Ticket ID"));
+    let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+    let graph = discovery
+        .dependency_graph(&parent, &repository)
+        .expect("dependency graph should be discovered");
+
+    assert_eq!(graph.parent(), &parent);
+    assert_eq!(graph.sub_issues().len(), 2);
+    let ticket = TicketId::parse("AMBA-42").expect("Ticket ID");
+    let child = graph.sub_issue(&ticket).expect("discovered Sub-issue");
+    assert_eq!(child.ticket().title().as_str(), "Ship typed discovery");
+    assert_eq!(child.blockers().len(), 1);
+    assert_eq!(child.blockers()[0].id().as_str(), "AMBA-41");
+    assert!(!child.is_cross_repository());
+    assert!(graph.diagnostics().is_empty());
 }
 
 #[test]
