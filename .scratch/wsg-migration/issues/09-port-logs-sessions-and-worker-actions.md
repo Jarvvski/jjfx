@@ -59,3 +59,11 @@ Port behavioral scenarios, not Go parser structure. Use fixture lines for both p
 ## Blocked by
 
 - issues/08-port-agent-runtime-and-run-supervision.md
+
+## Comments
+
+2026-07-31 - Started ticket 09 with its first focused slice. `wsg-core` now
+exposes provider-neutral Run results, normalized token usage, exact micro-USD
+costs, structured activity, and collaboration values through one public seam.
+Provider DTOs, parsing, bounded scanning, Session resolution, finalization, and
+Worker actions remain in the later slices of this ticket.

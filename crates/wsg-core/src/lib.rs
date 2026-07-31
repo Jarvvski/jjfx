@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod pool;
+mod run_log;
 mod runtime;
 mod state;
 mod workspace;
@@ -15,6 +16,10 @@ pub use pool::{
     PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot, Reservation,
     SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError, WorkerPoolSnapshot,
     WorkerReference, WorkerSnapshot, WorkerStatus,
+};
+pub use run_log::{
+    CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind, RunActivityStatus,
+    RunConclusion, RunCost, RunResult, RunUsage,
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
