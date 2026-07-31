@@ -110,6 +110,11 @@ pub struct Reservation {
     rollback: WorkerState,
 }
 
+pub(crate) struct AvailableReservations {
+    pub(crate) claimed: Vec<(usize, Reservation)>,
+    pub(crate) unavailable: Vec<usize>,
+}
+
 pub(crate) enum PidPersistence {
     Persisted(StateRevision<WorkerState>),
     Missing,
@@ -182,10 +187,6 @@ impl Reservation {
 
     pub(crate) fn repository(&self) -> &Repository {
         &self.repository
-    }
-
-    pub(crate) fn worker_revision(&self) -> StateRevision<WorkerState> {
-        self.worker_revision.clone()
     }
 
     pub(crate) fn persist_pid(&self, pid: u32) -> Result<PidPersistence, StateError> {
@@ -508,34 +509,119 @@ impl WorkerPool {
         &self,
         tickets: &[S],
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
-        let inputs = tickets
+        let requests = tickets
             .iter()
-            .map(|ticket| {
-                let ticket = ticket.as_ref().to_owned();
+            .map(|ticket| (ticket.as_ref().to_owned(), None))
+            .collect::<Vec<_>>();
+        self.reserve_targeted(&requests)
+    }
+
+    pub(crate) fn reserve_targeted(
+        &self,
+        requests: &[(String, Option<WorkerId>)],
+    ) -> Result<Vec<Reservation>, WorkerPoolError> {
+        let inputs = requests
+            .iter()
+            .map(|(ticket, worker)| {
                 Ok(crate::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
-                    ticket,
+                    ticket: ticket.clone(),
+                    requested_worker: worker.clone(),
                     started_at: current_timestamp()?,
                 })
             })
             .collect::<Result<Vec<_>, WorkerPoolError>>()?;
         match self.repository.state_store().reserve_workers(inputs)? {
-            crate::state::ReservationsOutcome::Reserved(reserved) => Ok(reserved
-                .into_iter()
-                .map(|reserved| Reservation {
-                    worker_id: reserved.worker,
-                    ticket: reserved.ticket,
-                    agent_runtime: reserved.agent_runtime,
-                    repository: self.repository.clone(),
-                    worker_revision: reserved.revision,
-                    rollback: reserved.rollback,
-                })
-                .collect()),
+            crate::state::ReservationsOutcome::Reserved {
+                workers,
+                unavailable,
+            } => {
+                debug_assert!(unavailable.is_empty());
+                Ok(workers
+                    .into_iter()
+                    .map(|reserved| Reservation {
+                        worker_id: reserved.worker,
+                        ticket: reserved.ticket,
+                        agent_runtime: reserved.agent_runtime,
+                        repository: self.repository.clone(),
+                        worker_revision: reserved.revision,
+                        rollback: reserved.rollback,
+                    })
+                    .collect())
+            }
             crate::state::ReservationsOutcome::NoIdle { available } => {
-                Err(CapacityShortage::new(tickets.len(), available).into())
+                Err(CapacityShortage::new(requests.len(), available).into())
+            }
+            crate::state::ReservationsOutcome::WorkerNotInPool { worker } => {
+                Err(WorkerPoolError::WorkerNotInPool { worker })
+            }
+            crate::state::ReservationsOutcome::WorkerNotIdle { worker } => {
+                Err(WorkerPoolError::WorkerNotIdle { worker })
             }
             crate::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
+            }
+        }
+    }
+
+    pub(crate) fn reserve_available_targeted(
+        &self,
+        requests: &[(String, Option<WorkerId>)],
+    ) -> Result<AvailableReservations, WorkerPoolError> {
+        let inputs = requests
+            .iter()
+            .map(|(ticket, worker)| {
+                Ok(crate::state::ReservationInput {
+                    branch_name: ticket.to_lowercase(),
+                    ticket: ticket.clone(),
+                    requested_worker: worker.clone(),
+                    started_at: current_timestamp()?,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkerPoolError>>()?;
+        match self
+            .repository
+            .state_store()
+            .reserve_available_workers(inputs)?
+        {
+            crate::state::ReservationsOutcome::Reserved {
+                workers,
+                unavailable,
+            } => {
+                let unavailable_set = unavailable.iter().copied().collect::<BTreeSet<_>>();
+                let claimed = (0..requests.len())
+                    .filter(|index| !unavailable_set.contains(index))
+                    .zip(workers)
+                    .map(|(index, reserved)| {
+                        (
+                            index,
+                            Reservation {
+                                worker_id: reserved.worker,
+                                ticket: reserved.ticket,
+                                agent_runtime: reserved.agent_runtime,
+                                repository: self.repository.clone(),
+                                worker_revision: reserved.revision,
+                                rollback: reserved.rollback,
+                            },
+                        )
+                    })
+                    .collect();
+                Ok(AvailableReservations {
+                    claimed,
+                    unavailable,
+                })
+            }
+            crate::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            }
+            crate::state::ReservationsOutcome::NoIdle { available } => {
+                Err(CapacityShortage::new(requests.len(), available).into())
+            }
+            crate::state::ReservationsOutcome::WorkerNotInPool { worker } => {
+                Err(WorkerPoolError::WorkerNotInPool { worker })
+            }
+            crate::state::ReservationsOutcome::WorkerNotIdle { worker } => {
+                Err(WorkerPoolError::WorkerNotIdle { worker })
             }
         }
     }
@@ -550,7 +636,19 @@ impl WorkerPool {
         tickets: &[S],
         approved_additional: usize,
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
-        let shortage = match self.reserve_many(tickets) {
+        let requests = tickets
+            .iter()
+            .map(|ticket| (ticket.as_ref().to_owned(), None))
+            .collect::<Vec<_>>();
+        self.grow_and_reserve_targeted(&requests, approved_additional)
+    }
+
+    pub(crate) fn grow_and_reserve_targeted(
+        &self,
+        requests: &[(String, Option<WorkerId>)],
+        approved_additional: usize,
+    ) -> Result<Vec<Reservation>, WorkerPoolError> {
+        let shortage = match self.reserve_targeted(requests) {
             Ok(reservations) => return Ok(reservations),
             Err(WorkerPoolError::CapacityShortage(shortage)) => shortage,
             Err(error) => return Err(error),
@@ -592,13 +690,13 @@ impl WorkerPool {
         next.size = i64::try_from(current_size + added.len())
             .map_err(|_| WorkerPoolError::InvalidSize(next.size))?;
         next.workers.extend(added.iter().cloned());
-        let inputs = tickets
+        let inputs = requests
             .iter()
-            .map(|ticket| {
-                let ticket = ticket.as_ref().to_owned();
+            .map(|(ticket, worker)| {
                 Ok(crate::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
-                    ticket,
+                    ticket: ticket.clone(),
+                    requested_worker: worker.clone(),
                     started_at: current_timestamp()?,
                 })
             })
@@ -622,7 +720,7 @@ impl WorkerPool {
                 .collect()),
             Ok(crate::state::GrowReservationsOutcome::Conflict) => Err(WorkerPoolError::Conflict),
             Ok(crate::state::GrowReservationsOutcome::NoIdle { available }) => {
-                Err(CapacityShortage::new(tickets.len(), available).into())
+                Err(CapacityShortage::new(requests.len(), available).into())
             }
             Ok(crate::state::GrowReservationsOutcome::InvalidAgentRuntime { value }) => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })

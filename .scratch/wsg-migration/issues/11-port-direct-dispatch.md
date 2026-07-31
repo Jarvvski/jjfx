@@ -1,6 +1,6 @@
 # Port Reservations and Direct Dispatch
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -42,12 +42,12 @@ Test Direct Dispatch against fake Workspace, prompt, and Run adapters plus real 
 
 ## Acceptance Criteria
 
-- [ ] Concurrent Direct Dispatch never double-assigns a Worker.
-- [ ] Every pre-launch failure releases its Reservation.
-- [ ] Explicit Worker selection is deterministic.
-- [ ] Bulk Dispatch reports success and failure per Ticket in input order.
-- [ ] Go wsg observes compatible busy state and can reconcile a Rust-launched Run.
-- [ ] `mise run check` is green.
+- [x] Concurrent Direct Dispatch never double-assigns a Worker.
+- [x] Every pre-launch failure releases its Reservation.
+- [x] Explicit Worker selection is deterministic.
+- [x] Bulk Dispatch reports success and failure per Ticket in input order.
+- [x] Go wsg observes compatible busy state and can reconcile a Rust-launched Run.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -61,3 +61,11 @@ Test Direct Dispatch against fake Workspace, prompt, and Run adapters plus real 
 - issues/07-port-workspace-and-pool-lifecycle.md
 - issues/09-port-logs-sessions-and-worker-actions.md
 - issues/10-port-linear-discovery-and-prompts.md
+
+## Comments
+
+- 2026-07-31: Completed the ten planned Direct Dispatch commits. Coverage
+  includes atomic and partial claims, approved growth, named Workers,
+  Workspace handoff locking, identity and prompt failures, foreground and
+  background fake Runtime launches, launch compensation, and compatible Go
+  Worker state. `mise run check` passed before resolution.

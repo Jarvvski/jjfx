@@ -169,6 +169,90 @@ impl DirectDispatch {
         }
     }
 
+    /// Atomically reserves the complete batch before launching ordered outcomes.
+    pub fn dispatch(
+        &self,
+        requests: &[DirectDispatchRequest],
+    ) -> Result<DirectDispatchResult, DirectDispatchError> {
+        if requests.is_empty() {
+            return Ok(DirectDispatchResult::default());
+        }
+        let targets = requests
+            .iter()
+            .map(|request| {
+                let worker = match request.target() {
+                    DirectDispatchTarget::FirstIdle => None,
+                    DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
+                };
+                (request.ticket().id().as_str().to_owned(), worker)
+            })
+            .collect::<Vec<_>>();
+        let reservations = self.repository.worker_pool().reserve_targeted(&targets)?;
+        Ok(self.dispatch_claimed(
+            requests,
+            reservations.into_iter().enumerate().collect(),
+            Vec::new(),
+            false,
+        ))
+    }
+
+    /// Provisions only caller-approved missing capacity, then reserves atomically.
+    pub fn dispatch_with_approved_growth(
+        &self,
+        requests: &[DirectDispatchRequest],
+        approved_additional: usize,
+    ) -> Result<DirectDispatchResult, DirectDispatchError> {
+        if requests.is_empty() {
+            return Ok(DirectDispatchResult::default());
+        }
+        let targets = requests
+            .iter()
+            .map(|request| {
+                let worker = match request.target() {
+                    DirectDispatchTarget::FirstIdle => None,
+                    DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
+                };
+                (request.ticket().id().as_str().to_owned(), worker)
+            })
+            .collect::<Vec<_>>();
+        let reservations = self
+            .repository
+            .worker_pool()
+            .grow_and_reserve_targeted(&targets, approved_additional)?;
+        Ok(self.dispatch_claimed(
+            requests,
+            reservations.into_iter().enumerate().collect(),
+            Vec::new(),
+            false,
+        ))
+    }
+
+    /// Explicitly dispatches only the currently available subset of a batch.
+    pub fn dispatch_use_available(
+        &self,
+        requests: &[DirectDispatchRequest],
+    ) -> Result<DirectDispatchResult, DirectDispatchError> {
+        if requests.is_empty() {
+            return Ok(DirectDispatchResult::default());
+        }
+        let targets = requests
+            .iter()
+            .map(|request| {
+                let worker = match request.target() {
+                    DirectDispatchTarget::FirstIdle => None,
+                    DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
+                };
+                (request.ticket().id().as_str().to_owned(), worker)
+            })
+            .collect::<Vec<_>>();
+        let available = self
+            .repository
+            .worker_pool()
+            .reserve_available_targeted(&targets)?;
+        let partial = !available.unavailable.is_empty();
+        Ok(self.dispatch_claimed(requests, available.claimed, available.unavailable, partial))
+    }
+
     /// Launches a previously persisted Reservation and transfers its ownership.
     pub fn dispatch_reserved(
         &self,
@@ -176,27 +260,45 @@ impl DirectDispatch {
         request: &DirectDispatchRequest,
     ) -> Result<DirectDispatchSuccess, DirectDispatchError> {
         let worker = reservation.worker_id().clone();
+        if reservation.ticket() != request.ticket().id().as_str() {
+            let mismatch = DirectDispatchError::ReservationTicketMismatch {
+                reserved: reservation.ticket().to_owned(),
+                requested: request.ticket().id().as_str().to_owned(),
+            };
+            return Err(release_before_launch(&reservation, mismatch));
+        }
         let bases = request
             .dependency_context()
             .map(DispatchDependencyContext::base_revisions)
             .unwrap_or_default();
-        if let Err(source) = self.repository.prepare_worker_workspace(&worker, bases) {
-            return Err(release_before_launch(
-                &reservation,
-                DirectDispatchError::Workspace(source),
-            ));
-        }
+        let _prepared = match self
+            .repository
+            .prepare_worker_workspace_for_dispatch(&worker, bases)
+        {
+            Ok(prepared) => prepared,
+            Err(source) => {
+                return Err(release_before_launch(
+                    &reservation,
+                    DirectDispatchError::Workspace(source),
+                ));
+            }
+        };
         let invocation = match self.build_invocation(&reservation, request) {
             Ok(invocation) => invocation,
             Err(error) => return Err(release_before_launch(&reservation, error)),
         };
         let execution = match request.mode() {
             RunMode::Foreground => DirectDispatchExecution::Foreground(
-                RunSupervisor::new().run_reserved_foreground(reservation, invocation)?,
+                RunSupervisor::new().run_reserved_foreground_with_handoff(
+                    reservation,
+                    invocation,
+                    move || drop(_prepared),
+                )?,
             ),
             RunMode::Background => {
                 let background =
                     RunSupervisor::new().run_reserved_background(reservation, invocation)?;
+                drop(_prepared);
                 let pid = background.pid();
                 thread::spawn(move || {
                     let _ = background.wait();
@@ -211,18 +313,50 @@ impl DirectDispatch {
         ))
     }
 
-    /// Resolves Repository delivery identity and builds one initial invocation.
-    pub fn build_invocation(
+    fn dispatch_claimed(
+        &self,
+        requests: &[DirectDispatchRequest],
+        claimed: Vec<(usize, Reservation)>,
+        unavailable: Vec<usize>,
+        partial: bool,
+    ) -> DirectDispatchResult {
+        let mut outcomes = requests
+            .iter()
+            .map(|request| {
+                DirectDispatchOutcome::Failed(DirectDispatchFailure::new(
+                    request.ticket().clone(),
+                    match request.target() {
+                        DirectDispatchTarget::FirstIdle => None,
+                        DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
+                    },
+                    DirectDispatchFailurePhase::Capacity,
+                    "no matching idle Worker was available",
+                ))
+            })
+            .collect::<Vec<_>>();
+        for index in unavailable {
+            debug_assert!(matches!(outcomes[index], DirectDispatchOutcome::Failed(_)));
+        }
+        for (index, reservation) in claimed {
+            let worker = reservation.worker_id().clone();
+            outcomes[index] = match self.dispatch_reserved(reservation, &requests[index]) {
+                Ok(success) => DirectDispatchOutcome::Succeeded(success),
+                Err(error) => DirectDispatchOutcome::Failed(DirectDispatchFailure::new(
+                    requests[index].ticket().clone(),
+                    Some(worker),
+                    failure_phase(&error),
+                    error.to_string(),
+                )),
+            };
+        }
+        DirectDispatchResult::new(outcomes, partial)
+    }
+
+    fn build_invocation(
         &self,
         reservation: &Reservation,
         request: &DirectDispatchRequest,
     ) -> Result<AgentRuntimeInvocation, DirectDispatchError> {
-        if reservation.ticket() != request.ticket().id().as_str() {
-            return Err(DirectDispatchError::ReservationTicketMismatch {
-                reserved: reservation.ticket().to_owned(),
-                requested: request.ticket().id().as_str().to_owned(),
-            });
-        }
         let repository = self.repository_identity()?;
         let assignee = self.jj_config("user.email")?;
         let user_name = self.jj_config("user.name")?;
@@ -322,6 +456,21 @@ impl DirectDispatch {
             return Err(DirectDispatchError::Identity(format!("jj {key} is blank")));
         }
         Ok(value)
+    }
+}
+
+fn failure_phase(error: &DirectDispatchError) -> DirectDispatchFailurePhase {
+    match error {
+        DirectDispatchError::Workspace(_) => DirectDispatchFailurePhase::Workspace,
+        DirectDispatchError::Identity(_) => DirectDispatchFailurePhase::Identity,
+        DirectDispatchError::Prompt(_) => DirectDispatchFailurePhase::Prompt,
+        DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(_)) => {
+            DirectDispatchFailurePhase::Capacity
+        }
+        DirectDispatchError::ReservationRelease { primary, .. } => failure_phase(primary),
+        DirectDispatchError::WorkerPool(_)
+        | DirectDispatchError::ReservationTicketMismatch { .. }
+        | DirectDispatchError::Runtime(_) => DirectDispatchFailurePhase::Launch,
     }
 }
 

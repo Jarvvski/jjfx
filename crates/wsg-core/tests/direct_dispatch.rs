@@ -1,78 +1,332 @@
-use std::ffi::OsStr;
-use std::fs;
-use std::process::Command;
+#![cfg(unix)]
 
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Barrier};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntimeCapabilities, CommitOutcome, DirectDispatchError, DirectDispatchExecution,
-    DirectDispatchFailure, DirectDispatchFailurePhase, DirectDispatchOutcome,
-    DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess, DispatchBudget,
-    DispatchDependencyContext, Expected, Loaded, PoolCapacity, Repository, RunMode, StateChange,
-    Ticket, TicketId, TicketStatus, TicketTitle, WireAgent, WorkerId, WorkerPoolError,
-    WorkerStatus,
+    CommitOutcome, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
+    DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, Expected, Loaded,
+    PoolCapacity, Repository, RunMode, StateChange, Ticket, TicketId, TicketStatus, TicketTitle,
+    WireAgent, WorkerId, WorkerPoolError, WorkerStatus,
 };
 
+const HELPER_REPOSITORY: &str = "WSG_DIRECT_DISPATCH_REPOSITORY";
+const HELPER_RESULT: &str = "WSG_DIRECT_DISPATCH_RESULT";
+const HELPER_CAPTURE: &str = "WSG_DIRECT_DISPATCH_CAPTURE";
+const HELPER_COMPATIBILITY: &str = "WSG_DIRECT_DISPATCH_COMPATIBILITY";
+const HELPER_RELEASE: &str = "WSG_DIRECT_DISPATCH_RELEASE";
+
 #[test]
-fn direct_dispatch_resolves_delivery_identity_and_builds_dependency_aware_prompts() {
-    let (_temporary_directory, repository) = local_repository();
-    for arguments in [
-        vec!["config", "set", "--repo", "user.email", "owner@example.com"],
-        vec!["config", "set", "--repo", "user.name", "Owner Person"],
-        vec![
-            "git",
-            "remote",
-            "add",
-            "origin",
-            "git@github.com:owner/repo.git",
-        ],
-    ] {
-        let output = Command::new("jj")
-            .args(arguments)
-            .current_dir(repository.root())
-            .output()
-            .expect("configure repository identity");
-        assert!(
-            output.status.success(),
-            "repository configuration failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+fn failed_runtime_launch_releases_the_direct_dispatch_reservation() {
+    let (temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
     repository
         .worker_pool()
         .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("grow Worker Pool");
-    let dependency = DispatchDependencyContext::new(
-        vec!["owner/eng-400-foundation".to_owned(), "main".to_owned()],
-        "- Branch owner/eng-400-foundation implements ENG-400",
-        "owner/eng-400-foundation",
+    let bin = temporary_directory.path().join("isolated-bin");
+    fs::create_dir(&bin).expect("isolated runtime bin");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then /bin/rm \"$0\"; exit 0; fi\nexit 1\n",
     );
+    let jj = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("jj"))
+        .find(|path| path.is_file())
+        .expect("jj executable on PATH");
+    std::os::unix::fs::symlink(jj, bin.join("jj")).expect("isolated jj executable");
+    let result = temporary_directory.path().join("failed-launch-result");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args([
+            "--exact",
+            "failed_runtime_launch_direct_dispatch_helper",
+            "--ignored",
+        ])
+        .env("PATH", &bin)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run failed-launch Direct Dispatch helper");
+    assert!(
+        output.status.success(),
+        "failed-launch helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("failed-launch result"),
+        "idle"
+    );
+}
+
+#[test]
+#[ignore]
+fn failed_runtime_launch_direct_dispatch_helper() {
+    let repository = Repository::open(env::var_os(HELPER_REPOSITORY).expect("Repository path"))
+        .expect("open Repository");
     let request = DirectDispatchRequest::new(
-        ticket("ENG-404", "Build dependency-aware prompt"),
-        RunMode::Background,
+        ticket("ENG-502", "Compensate failed launch"),
+        RunMode::Foreground,
+    );
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("Reservation");
+    let worker = reservation.worker_id().clone();
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("removed Runtime executable must fail launch");
+    assert!(
+        matches!(error, DirectDispatchError::Runtime(_)),
+        "unexpected failed-launch error: {error:?}"
+    );
+    let status = repository
+        .worker_pool()
+        .snapshot()
+        .worker(worker.as_str())
+        .expect("released Worker")
+        .status();
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("failed-launch result"),
+        status.as_str(),
+    )
+    .expect("write failed-launch result");
+}
+
+#[test]
+fn production_direct_dispatch_launches_foreground_and_background_fake_runtimes() {
+    let (temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(2).expect("capacity"))
+        .expect("grow Worker Pool");
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("runtime bin directory");
+    let release = temporary_directory.path().join("release-background");
+    let capture = temporary_directory.path().join("captured-arguments");
+    let compatibility = temporary_directory
+        .path()
+        .join("compatible-busy-state.json");
+    let result = temporary_directory.path().join("dispatch-result");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$WSG_DIRECT_DISPATCH_CAPTURE\"\ncase \"$*\" in *ENG-501*) while [ ! -f \"$WSG_DIRECT_DISPATCH_RELEASE\" ]; do sleep 0.02; done ;; esac\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
+    );
+    let mut paths = vec![bin];
+    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+    let path = env::join_paths(paths).expect("runtime PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "production_direct_dispatch_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env(HELPER_COMPATIBILITY, &compatibility)
+        .env(HELPER_RELEASE, &release)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run production Direct Dispatch helper");
+    assert!(
+        output.status.success(),
+        "Direct Dispatch helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let result = fs::read_to_string(result).expect("Dispatch result");
+    assert!(result.contains("foreground=Some(0)"));
+    assert!(result.contains("background_pid="));
+    let captured = fs::read_to_string(capture).expect("captured Runtime arguments");
+    assert!(captured.contains("owner/repo"));
+    assert!(captured.contains("owner@example.com"));
+    assert!(captured.contains("STACKED BRANCH"));
+    assert!(captured.contains("--model"));
+    assert!(captured.contains("opus"));
+    let compatible: Value =
+        serde_json::from_slice(&fs::read(&compatibility).expect("compatible busy Worker state"))
+            .expect("Go-compatible Worker JSON");
+    assert_eq!(compatible["status"], "busy");
+    assert_eq!(compatible["agent"], "claude");
+    assert_eq!(compatible["ticket"], "ENG-501");
+    assert!(compatible["pid"].as_u64().is_some_and(|pid| pid > 0));
+    assert!(compatible["started_at"].is_string());
+    assert!(compatible["log_file"].is_string());
+
+    if let Some(go_helper) = env::var_os("WSG_GO_TEST_BINARY") {
+        let go_result = temporary_directory.path().join("go-observed-worker.json");
+        let observed = Command::new(&go_helper)
+            .arg("-test.run")
+            .arg("^TestStateLockSubprocessHelper$")
+            .env("WSG_STATE_HELPER_MODE", "rewrite")
+            .env("WSG_STATE_HELPER_KIND", "worker")
+            .env("WSG_STATE_HELPER_STATE", &compatibility)
+            .env("WSG_STATE_HELPER_RESULT", &go_result)
+            .output()
+            .expect("run Go wsg typed Worker reader");
+        assert!(
+            observed.status.success(),
+            "Go wsg could not observe Rust-launched state: {}",
+            String::from_utf8_lossy(&observed.stderr)
+        );
+        let observed: Value =
+            serde_json::from_slice(&fs::read(go_result).expect("Go-observed Worker state"))
+                .expect("Go-observed Worker JSON");
+        assert_eq!(observed["status"], "busy");
+        assert_eq!(observed["ticket"], "ENG-501");
+
+        let reconciled = Command::new(go_helper)
+            .arg("-test.run")
+            .arg("^TestLoadLiveWorkerReconcilesDeadBusyWorker$")
+            .output()
+            .expect("run Go wsg reconciliation contract");
+        assert!(
+            reconciled.status.success(),
+            "Go wsg reconciliation contract failed: {}",
+            String::from_utf8_lossy(&reconciled.stderr)
+        );
+    }
+}
+
+#[test]
+#[ignore]
+fn production_direct_dispatch_helper() {
+    let repository = Repository::open(env::var_os(HELPER_REPOSITORY).expect("Repository path"))
+        .expect("open Repository");
+    let dispatch = repository.direct_dispatch();
+    let dependency = DispatchDependencyContext::new(
+        vec!["main".to_owned()],
+        "- main provides the prerequisite implementation",
+        "main",
+    );
+    let foreground_request = DirectDispatchRequest::new(
+        ticket("ENG-500", "Launch foreground Runtime"),
+        RunMode::Foreground,
     )
     .with_model("opus")
+    .with_dependency_context(dependency.clone());
+    let foreground = dispatch
+        .dispatch_reserved(
+            dispatch
+                .reserve(&foreground_request)
+                .expect("foreground Reservation"),
+            &foreground_request,
+        )
+        .expect("foreground Direct Dispatch");
+    let DirectDispatchExecution::Foreground(completed) = foreground.execution() else {
+        panic!("expected foreground completion");
+    };
+
+    let background_request = DirectDispatchRequest::new(
+        ticket("ENG-501", "Launch background Runtime"),
+        RunMode::Background,
+    )
     .with_dependency_context(dependency);
-    let dispatch = repository.direct_dispatch();
-    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+    let background = dispatch
+        .dispatch_reserved(
+            dispatch
+                .reserve(&background_request)
+                .expect("background Reservation"),
+            &background_request,
+        )
+        .expect("background Direct Dispatch");
+    let DirectDispatchExecution::Background { pid } = background.execution() else {
+        panic!("expected background PID");
+    };
+    let state_path = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{}.json", background.worker()));
+    fs::copy(
+        state_path,
+        env::var_os(HELPER_COMPATIBILITY).expect("compatibility result"),
+    )
+    .expect("capture Go-compatible busy state");
+    fs::write(env::var_os(HELPER_RELEASE).expect("background release"), [])
+        .expect("release background Runtime");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let snapshot = repository.worker_pool().snapshot();
+        let status = snapshot
+            .worker(background.worker().as_str())
+            .expect("background Worker")
+            .status();
+        if status == WorkerStatus::Done {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "background waiter did not finalize"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("Dispatch result"),
+        format!(
+            "foreground={:?};background_pid={pid}",
+            completed.exit_code()
+        ),
+    )
+    .expect("write Dispatch result");
+}
 
-    let invocation = dispatch
-        .build_invocation(&reservation, &request)
-        .expect("build Direct Dispatch invocation");
-    let command = reservation
-        .agent_runtime()
-        .command(&invocation, AgentRuntimeCapabilities::default());
-    let rendered = command
-        .get_args()
-        .map(OsStr::to_string_lossy)
-        .collect::<Vec<_>>()
-        .join("\n");
+#[test]
+fn concurrent_direct_dispatch_claims_never_double_assign_one_worker() {
+    let (_temporary_directory, repository) = local_repository();
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    let barrier = Arc::new(Barrier::new(2));
+    let claimed = thread::scope(|scope| {
+        let handles = ["ENG-503", "ENG-504"].map(|id| {
+            let dispatch = repository.direct_dispatch();
+            let barrier = Arc::clone(&barrier);
+            scope.spawn(move || {
+                let request = DirectDispatchRequest::new(
+                    ticket(id, "Concurrent Direct Dispatch claim"),
+                    RunMode::Background,
+                );
+                barrier.wait();
+                dispatch.reserve(&request).is_ok()
+            })
+        });
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("claim thread"))
+            .filter(|claimed| *claimed)
+            .count()
+    });
 
-    assert!(rendered.contains("owner/repo"));
-    assert!(rendered.contains("owner@example.com"));
-    assert!(rendered.contains("owner/eng-404"));
-    assert!(rendered.contains("STACKED BRANCH"));
-    assert!(rendered.contains("owner/eng-400-foundation implements ENG-400"));
-    assert!(rendered.contains("--base owner/eng-400-foundation"));
+    assert_eq!(claimed, 1);
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .workers()
+            .iter()
+            .filter(|worker| worker.status() == WorkerStatus::Busy)
+            .count(),
+        1
+    );
 }
 
 #[test]
@@ -265,24 +519,38 @@ fn direct_dispatch_releases_its_reservation_after_prompt_failure() {
 #[test]
 fn direct_dispatch_prepares_the_worker_workspace_on_main_under_an_operation_lock() {
     let (_temporary_directory, repository) = local_repository();
-    let main = Command::new("jj")
-        .args(["bookmark", "create", "main", "-r", "@"])
-        .current_dir(repository.root())
-        .output()
-        .expect("create main bookmark");
-    assert!(main.status.success());
+    configure_jj_identity(&repository);
+    create_main(&repository);
     let worker = repository
         .worker_pool()
         .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("grow Worker Pool")
         .added_workers()[0]
         .clone();
-
     let workspace = repository
-        .prepare_worker_workspace(&worker, &[])
-        .expect("prepare Worker Workspace");
+        .root()
+        .parent()
+        .expect("Repository parent")
+        .join(format!(
+            "{}-workspaces/{worker}",
+            repository
+                .root()
+                .file_name()
+                .expect("Repository name")
+                .to_string_lossy()
+        ));
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-412", "Prepare Worker on main"),
+        RunMode::Foreground,
+    );
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("Reservation");
 
-    assert!(workspace.path().is_dir());
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("missing remote must fail after Workspace preparation");
+
+    assert!(matches!(error, DirectDispatchError::Identity(_)));
     assert!(
         repository
             .root()
@@ -292,11 +560,92 @@ fn direct_dispatch_prepares_the_worker_workspace_on_main_under_an_operation_lock
     );
     let parent = Command::new("jj")
         .args(["log", "-r", "@-", "--no-graph", "-T", "bookmarks"])
-        .current_dir(workspace.path())
+        .current_dir(workspace)
         .output()
         .expect("read prepared parent");
     assert!(parent.status.success());
     assert!(String::from_utf8_lossy(&parent.stdout).contains("main"));
+}
+
+#[test]
+fn direct_dispatch_growth_requires_and_honors_exact_caller_approval() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(0).expect("empty capacity"))
+        .expect("create empty Worker Pool");
+    let requests = [DirectDispatchRequest::new(
+        ticket("ENG-413", "Grow approved capacity"),
+        RunMode::Foreground,
+    )];
+
+    let shortage = repository
+        .direct_dispatch()
+        .dispatch_with_approved_growth(&requests, 0)
+        .expect_err("growth beyond approval must be rejected");
+    assert!(matches!(
+        shortage,
+        DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(shortage))
+            if shortage.gap() == 1
+    ));
+    let result = repository
+        .direct_dispatch()
+        .dispatch_with_approved_growth(&requests, 1)
+        .expect("approved growth and Reservation");
+
+    assert!(matches!(
+        &result.outcomes()[0],
+        DirectDispatchOutcome::Failed(failure)
+            if failure.phase() == DirectDispatchFailurePhase::Identity
+    ));
+    let snapshot = repository.worker_pool().snapshot();
+    assert_eq!(snapshot.pool().expect("Pool").size(), 1);
+    assert_eq!(snapshot.workers()[0].status(), WorkerStatus::Idle);
+}
+
+#[test]
+fn reserved_handoff_validates_the_ticket_before_workspace_mutation() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let reserved_request =
+        DirectDispatchRequest::new(ticket("ENG-414", "Reserved Ticket"), RunMode::Foreground);
+    let mismatched_request =
+        DirectDispatchRequest::new(ticket("ENG-415", "Different Ticket"), RunMode::Foreground)
+            .with_dependency_context(DispatchDependencyContext::new(
+                vec!["missing-revision".to_owned()],
+                "mismatched dependency",
+                "main",
+            ));
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch
+        .reserve(&reserved_request)
+        .expect("Reservation for first Ticket");
+
+    let error = dispatch
+        .dispatch_reserved(reservation, &mismatched_request)
+        .expect_err("mismatched handoff must fail before Workspace preparation");
+
+    assert!(matches!(
+        error,
+        DirectDispatchError::ReservationTicketMismatch { reserved, requested }
+            if reserved == "ENG-414" && requested == "ENG-415"
+    ));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("released Worker")
+            .status(),
+        WorkerStatus::Idle
+    );
 }
 
 #[test]
@@ -334,6 +683,94 @@ fn named_direct_dispatch_reserves_only_the_requested_idle_worker() {
             .expect("selected Worker")
             .ticket(),
         Some("ENG-403")
+    );
+}
+
+#[test]
+fn default_bulk_dispatch_is_all_or_nothing_before_any_workspace_or_prompt_work() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let requests = [
+        DirectDispatchRequest::new(ticket("ENG-408", "First bulk Ticket"), RunMode::Foreground),
+        DirectDispatchRequest::new(ticket("ENG-409", "Second bulk Ticket"), RunMode::Foreground),
+    ];
+
+    let error = repository
+        .direct_dispatch()
+        .dispatch(&requests)
+        .expect_err("default bulk Dispatch must reject a shortage atomically");
+
+    assert!(matches!(
+        error,
+        DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(shortage))
+            if shortage.requested() == 2 && shortage.available() == 1
+    ));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("unclaimed Worker")
+            .status(),
+        WorkerStatus::Idle
+    );
+}
+
+#[test]
+fn explicit_use_available_dispatch_preserves_ticket_order_and_capacity_failures() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    let requests = [
+        DirectDispatchRequest::new(
+            ticket("ENG-410", "Claim available Worker"),
+            RunMode::Foreground,
+        ),
+        DirectDispatchRequest::new(
+            ticket("ENG-411", "Report unavailable Worker"),
+            RunMode::Foreground,
+        ),
+    ];
+
+    let result = repository
+        .direct_dispatch()
+        .dispatch_use_available(&requests)
+        .expect("explicit partial Dispatch");
+
+    assert!(result.is_partial());
+    assert_eq!(result.outcomes()[0].ticket().id().as_str(), "ENG-410");
+    assert_eq!(result.outcomes()[1].ticket().id().as_str(), "ENG-411");
+    assert!(matches!(
+        &result.outcomes()[0],
+        DirectDispatchOutcome::Failed(failure)
+            if failure.phase() == DirectDispatchFailurePhase::Identity
+                && failure.worker().is_some()
+    ));
+    assert!(matches!(
+        &result.outcomes()[1],
+        DirectDispatchOutcome::Failed(failure)
+            if failure.phase() == DirectDispatchFailurePhase::Capacity
+                && failure.worker().is_none()
+    ));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .workers()
+            .iter()
+            .next()
+            .expect("Worker")
+            .status(),
+        WorkerStatus::Idle
     );
 }
 
@@ -406,6 +843,7 @@ fn configure_jj_identity(repository: &Repository) {
     for arguments in [
         ["config", "set", "--repo", "user.email", "owner@example.com"],
         ["config", "set", "--repo", "user.name", "Owner Person"],
+        ["config", "set", "--repo", "signing.behavior", "drop"],
     ] {
         let output = Command::new("jj")
             .args(arguments)
@@ -438,6 +876,15 @@ fn create_main(repository: &Repository) {
         .output()
         .expect("create main");
     assert!(output.status.success());
+}
+
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).expect("write executable");
+    let mut permissions = fs::metadata(path)
+        .expect("executable metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("executable permissions");
 }
 
 fn ticket(id: &str, title: &str) -> Ticket {
