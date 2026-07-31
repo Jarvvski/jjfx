@@ -1,6 +1,8 @@
 //! Frontend-neutral actions over one Worker.
 
+use std::path::Path;
 use std::process::Command;
+use std::thread::{self, JoinHandle};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -59,6 +61,73 @@ impl FollowUpOutcome {
     }
 }
 
+/// The typed outcome of abandoning a Run and restoring its Workspace.
+#[derive(Debug)]
+pub struct ResetOutcome {
+    run: crate::RunReset,
+    restoration: WorkspaceRestoration,
+}
+
+impl ResetOutcome {
+    /// Returns how Run cleanup changed the Worker lifecycle.
+    pub const fn run(&self) -> crate::RunReset {
+        self.run
+    }
+
+    /// Returns the asynchronous Workspace restoration state.
+    pub const fn restoration(&self) -> &WorkspaceRestoration {
+        &self.restoration
+    }
+
+    /// Consumes the outcome and returns the restoration state or handle.
+    pub fn into_restoration(self) -> WorkspaceRestoration {
+        self.restoration
+    }
+}
+
+/// Workspace restoration scheduled after a Reset releases capacity.
+#[derive(Debug)]
+pub enum WorkspaceRestoration {
+    /// The Worker Workspace directory no longer exists, so no command is needed.
+    SkippedMissingWorkspace,
+    /// Restoration is running independently of the now-idle Worker state.
+    Pending(WorkspaceRestorationHandle),
+}
+
+/// An observable asynchronous Workspace restoration.
+#[must_use = "Workspace restoration failures are observed by waiting on the handle"]
+#[derive(Debug)]
+pub struct WorkspaceRestorationHandle {
+    worker: WorkerId,
+    join: JoinHandle<Result<(), WorkspaceRestorationError>>,
+}
+
+impl WorkspaceRestorationHandle {
+    /// Waits for `jj restore` and `jj new main` to complete.
+    pub fn wait(self) -> Result<(), WorkspaceRestorationError> {
+        self.join
+            .join()
+            .map_err(|_| WorkspaceRestorationError::ThreadPanicked {
+                worker: self.worker,
+            })?
+    }
+}
+
+/// Failure while asynchronously restoring a Worker Workspace.
+#[derive(Debug, Error)]
+pub enum WorkspaceRestorationError {
+    /// A restoration command could not start or returned a failure.
+    #[error("cannot {operation} for Worker {worker}: {detail}")]
+    Command {
+        worker: WorkerId,
+        operation: &'static str,
+        detail: String,
+    },
+    /// The restoration worker thread panicked.
+    #[error("Workspace restoration thread panicked for Worker {worker}")]
+    ThreadPanicked { worker: WorkerId },
+}
+
 /// The deep frontend-neutral interface for operational Worker actions.
 #[derive(Debug, Clone)]
 pub struct WorkerActions {
@@ -95,6 +164,30 @@ impl WorkerActions {
             Some(send_system_prompt(&repository_slug(&self.repository))),
             mode,
         )
+    }
+
+    /// Abandons the current Run, releases capacity, and restores the Workspace.
+    pub fn reset(&self, worker: &WorkerId) -> Result<ResetOutcome, WorkerActionError> {
+        let run = self.supervisor.reset_run(&self.repository, worker)?;
+        let workspace = crate::workspace::worker_path(self.repository.root(), worker);
+        let restoration = if workspace.is_dir() {
+            let handle_worker = worker.clone();
+            let thread_worker = worker.clone();
+            let join = thread::Builder::new()
+                .name(format!("wsg-restore-{worker}"))
+                .spawn(move || SystemCommands::restore_workspace(&thread_worker, &workspace))
+                .map_err(|source| WorkerActionError::RestorationSpawn {
+                    worker: worker.clone(),
+                    detail: source.to_string(),
+                })?;
+            WorkspaceRestoration::Pending(WorkspaceRestorationHandle {
+                worker: handle_worker,
+                join,
+            })
+        } else {
+            WorkspaceRestoration::SkippedMissingWorkspace
+        };
+        Ok(ResetOutcome { run, restoration })
     }
 
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
@@ -197,6 +290,39 @@ struct Check {
 }
 
 impl SystemCommands {
+    fn restore_workspace(
+        worker: &WorkerId,
+        workspace: &Path,
+    ) -> Result<(), WorkspaceRestorationError> {
+        Self::run_workspace_command(worker, workspace, "restore Workspace", &["restore"])?;
+        Self::run_workspace_command(worker, workspace, "create fresh change", &["new", "main"])
+    }
+
+    fn run_workspace_command(
+        worker: &WorkerId,
+        workspace: &Path,
+        operation: &'static str,
+        arguments: &[&str],
+    ) -> Result<(), WorkspaceRestorationError> {
+        let output = Command::new("jj")
+            .args(arguments)
+            .current_dir(workspace)
+            .output()
+            .map_err(|source| WorkspaceRestorationError::Command {
+                worker: worker.clone(),
+                operation,
+                detail: source.to_string(),
+            })?;
+        if output.status.success() {
+            return Ok(());
+        }
+        Err(WorkspaceRestorationError::Command {
+            worker: worker.clone(),
+            operation,
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })
+    }
+
     fn pull_request(
         self,
         repository: &str,
@@ -387,6 +513,9 @@ pub enum WorkerActionError {
         operation: &'static str,
         detail: String,
     },
+    /// The asynchronous Workspace restoration thread could not start.
+    #[error("cannot start Workspace restoration for Worker {worker}: {detail}")]
+    RestorationSpawn { worker: WorkerId, detail: String },
     /// The Worker lifecycle transition failed.
     #[error(transparent)]
     WorkerPool(#[from] WorkerPoolError),

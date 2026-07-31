@@ -150,3 +150,14 @@ and command or decode failures remain typed at the facade.
 
 Reset with observable asynchronous Workspace restoration is the next focused
 slice.
+
+2026-07-31 - Added typed Reset to `WorkerActions`. It delegates process-group
+termination and revision-safe state clearing to the existing supervisor, then
+preserves the compatible ordering by releasing capacity before starting
+Workspace restoration. Existing Workspaces return a must-use handle whose
+`wait` reports `jj restore` or `jj new main` failures; missing Workspaces return
+an explicit skipped outcome. Reset remains the sole action that abandons an
+active Run, and the existing descendant-cleanup and stale-Run race coverage
+continues through the delegated supervisor seam.
+
+Rebase, Open PR, Logs, and Mount are the remaining typed Worker actions.

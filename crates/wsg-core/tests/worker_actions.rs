@@ -7,7 +7,8 @@ use std::process::{Command, Stdio};
 use tempfile::TempDir;
 use wsg_core::{
     AgentSessionResolution, Expected, FollowUpExecution, Loaded, PoolCapacity, Repository, RunMode,
-    StateChange, WireAgent, WireStatus, WireTimestamp, WorkerActions, WorkerId,
+    RunReset, StateChange, WireAgent, WireStatus, WireTimestamp, WorkerActions, WorkerId,
+    WorkspaceRestoration,
 };
 
 const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
@@ -32,6 +33,58 @@ fn send_rejects_a_busy_worker_through_the_actions_facade() {
 
     assert!(result.is_err());
     drop(temporary_directory);
+}
+
+#[test]
+fn reset_reports_a_missing_workspace_without_hiding_released_capacity() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let workspace = worker_workspace_path(&repository, &worker);
+    fs::remove_dir_all(workspace).expect("remove Worker Workspace");
+
+    let outcome = WorkerActions::new(repository)
+        .reset(&worker)
+        .expect("Reset should succeed");
+
+    assert_eq!(outcome.run(), RunReset::AlreadyIdle);
+    assert!(matches!(
+        outcome.restoration(),
+        WorkspaceRestoration::SkippedMissingWorkspace
+    ));
+}
+
+#[test]
+fn reset_returns_a_handle_for_successful_workspace_restoration() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+
+    let restoration = WorkerActions::new(repository)
+        .reset(&worker)
+        .expect("Reset should succeed")
+        .into_restoration();
+
+    let WorkspaceRestoration::Pending(handle) = restoration else {
+        panic!("existing Workspace should be restored asynchronously");
+    };
+    handle.wait().expect("Workspace restoration should succeed");
+}
+
+#[test]
+fn reset_handle_reports_workspace_command_failure() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let workspace = worker_workspace_path(&repository, &worker);
+    fs::remove_dir_all(workspace.join(".jj")).expect("break Worker Workspace marker");
+
+    let restoration = WorkerActions::new(repository)
+        .reset(&worker)
+        .expect("Run cleanup should still succeed")
+        .into_restoration();
+    let WorkspaceRestoration::Pending(handle) = restoration else {
+        panic!("existing Workspace should attempt restoration");
+    };
+    let error = handle.wait().expect_err("broken Workspace should fail");
+    assert!(error.to_string().contains("restore Workspace"));
 }
 
 #[test]
@@ -307,6 +360,20 @@ fn send_action_helper() {
     .expect("Send result");
 }
 
+fn worker_workspace_path(repository: &Repository, worker: &WorkerId) -> PathBuf {
+    let name = repository
+        .root()
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("repo");
+    repository
+        .root()
+        .parent()
+        .unwrap_or(repository.root())
+        .join(format!("{name}-workspaces"))
+        .join(worker.as_str())
+}
+
 fn grow_one_worker(repository: &Repository) -> WorkerId {
     repository
         .worker_pool()
@@ -372,6 +439,16 @@ fn local_repository() -> (TempDir, Repository) {
     assert!(
         output.status.success(),
         "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args(["bookmark", "create", "main", "-r", "@"])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj bookmark create should run");
+    assert!(
+        output.status.success(),
+        "jj bookmark create failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let repository = Repository::open(temporary_directory.path()).expect("repository");
