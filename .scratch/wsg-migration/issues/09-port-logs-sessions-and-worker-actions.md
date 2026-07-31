@@ -78,3 +78,14 @@ compatible while malformed JSON returns a typed parse error.
 Codex parsing remains the next focused slice. Bounded tail and final-result
 scanning, Agent Session extraction, supervisor finalization, and Worker actions
 remain later work in this ticket.
+
+2026-07-31 - Completed the Codex parser slice through the same public
+`RunLogParser` seam. Private Codex DTOs now normalize session starts, narrative
+items, command and MCP diagnostics, web searches, file changes, plans, warnings,
+collaboration state, all reported token counters, and terminal results. Unknown
+well-formed events and item kinds remain forward compatible while malformed
+JSON returns a typed parse error.
+
+Bounded tail and final-result scanning is the next focused slice. Agent Session
+identity, supervisor finalization, and Worker actions remain later work in this
+ticket.

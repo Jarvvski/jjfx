@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use wsg_core::{
     AgentRuntime, CollaborationEvent, CollaborationParticipant, RunActivity, RunActivityKind,
-    RunActivityStatus, RunConclusion, RunCost, RunLogEvent, RunLogParser, RunResult, RunUsage,
+    RunActivityStatus, RunConclusion, RunCost, RunLogEvent, RunLogParseError, RunLogParser,
+    RunResult, RunUsage,
 };
 
 #[test]
@@ -200,6 +201,322 @@ fn claude_parser_ignores_unknown_events_but_rejects_malformed_json() {
             .is_err(),
         "truncated Claude JSON should report a typed parse failure",
     );
+}
+
+#[test]
+fn codex_thread_start_becomes_provider_neutral_session_activity() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let events = parser
+        .parse_line(r#"{"type":"thread.started","thread_id":"thread-1"}"#)
+        .expect("Codex thread start should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::SessionStarted,
+        ))]
+    );
+}
+
+#[test]
+fn codex_narrative_items_become_provider_neutral_activity() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let message = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"message-1","type":"agent_message","text":"Implemented the fix"}}"#,
+        )
+        .expect("Codex agent message should parse");
+    assert_eq!(
+        message,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Message {
+                text: "Implemented the fix".to_owned(),
+            },
+        ))]
+    );
+
+    let reasoning = parser
+        .parse_line(
+            r#"{"type":"item.updated","item":{"id":"reasoning-1","type":"reasoning","text":"Checking the failure"}}"#,
+        )
+        .expect("Codex reasoning should parse");
+    assert_eq!(
+        reasoning,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Reasoning {
+                text: "Checking the failure".to_owned(),
+            },
+        ))]
+    );
+}
+
+#[test]
+fn codex_command_execution_preserves_status_and_failure_diagnostics() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let started = parser
+        .parse_line(
+            r#"{"type":"item.started","item":{"id":"command-1","type":"command_execution","command":"mise run check","status":"in_progress"}}"#,
+        )
+        .expect("Codex command start should parse");
+    assert_eq!(
+        started,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Command".to_owned(),
+                detail: Some("mise run check".to_owned()),
+                status: RunActivityStatus::InProgress,
+            },
+        ))]
+    );
+
+    let failed = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"command-1","type":"command_execution","command":"mise run check","aggregated_output":"tests failed","status":"failed"}}"#,
+        )
+        .expect("Codex command failure should parse");
+    assert_eq!(
+        failed,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Command".to_owned(),
+                detail: Some("mise run check".to_owned()),
+                status: RunActivityStatus::Failed {
+                    message: Some("tests failed".to_owned()),
+                },
+            },
+        ))]
+    );
+
+    let declined = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"command-2","type":"command_execution","command":"rm file","status":"declined"}}"#,
+        )
+        .expect("Codex declined command should parse");
+    assert_eq!(
+        declined,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Command".to_owned(),
+                detail: Some("rm file".to_owned()),
+                status: RunActivityStatus::Declined,
+            },
+        ))]
+    );
+
+    let failed_with_exit_code = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"command-3","type":"command_execution","command":"false","aggregated_output":"","exit_code":17,"status":"failed"}}"#,
+        )
+        .expect("Codex command exit code should parse");
+    assert_eq!(
+        failed_with_exit_code,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "Command".to_owned(),
+                detail: Some("false".to_owned()),
+                status: RunActivityStatus::Failed {
+                    message: Some("exit code 17".to_owned()),
+                },
+            },
+        ))]
+    );
+}
+
+#[test]
+fn codex_external_tools_preserve_targets_and_failure_diagnostics() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let mcp = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"mcp-1","type":"mcp_tool_call","server":"linear","tool":"save_issue","status":"failed","error":{"message":"approval denied"}}}"#,
+        )
+        .expect("Codex MCP failure should parse");
+    assert_eq!(
+        mcp,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "linear.save_issue".to_owned(),
+                detail: None,
+                status: RunActivityStatus::Failed {
+                    message: Some("approval denied".to_owned()),
+                },
+            },
+        ))]
+    );
+
+    let search = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"search-1","type":"web_search","query":"Codex JSON events"}}"#,
+        )
+        .expect("Codex web search should parse");
+    assert_eq!(
+        search,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: "WebSearch".to_owned(),
+                detail: Some("Codex JSON events".to_owned()),
+                status: RunActivityStatus::Completed,
+            },
+        ))]
+    );
+}
+
+#[test]
+fn codex_structured_items_preserve_files_plan_progress_and_warnings() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let files = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"files-1","type":"file_change","changes":[{"path":"src/lib.rs","kind":"update"},{"path":"tests/lib.rs","kind":"add"}],"status":"completed"}}"#,
+        )
+        .expect("Codex file changes should parse");
+    assert_eq!(
+        files,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::FileChanges {
+                paths: vec!["src/lib.rs".to_owned(), "tests/lib.rs".to_owned()],
+            },
+        ))]
+    );
+
+    let plan = parser
+        .parse_line(
+            r#"{"type":"item.updated","item":{"id":"plan-1","type":"todo_list","items":[{"text":"Inspect","completed":true},{"text":"Fix","completed":false}]}}"#,
+        )
+        .expect("Codex plan update should parse");
+    assert_eq!(
+        plan,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Plan {
+                completed: 1,
+                total: 2,
+            },
+        ))]
+    );
+
+    let warning = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"warning-1","type":"error","message":"PATH alias unavailable"}}"#,
+        )
+        .expect("Codex warning item should parse");
+    assert_eq!(
+        warning,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Warning {
+                message: "PATH alias unavailable".to_owned(),
+            },
+        ))]
+    );
+}
+
+#[test]
+fn codex_collaboration_preserves_context_and_deterministic_participants() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"wait-1","type":"collab_tool_call","tool":"wait","sender_thread_id":"thread-main","receiver_thread_ids":["agent-b","agent-a"],"prompt":"Inspect\n  failing logs","agents_states":{"agent-b":{"status":"errored","message":"timed\n out"},"agent-a":{"status":"completed","message":"found issue"}},"status":"failed","error":{"message":"collaboration timed out"}}}"#,
+        )
+        .expect("Codex collaboration should parse");
+
+    let expected = CollaborationEvent::new(
+        "wait",
+        RunActivityStatus::Failed {
+            message: Some("collaboration timed out".to_owned()),
+        },
+    )
+    .with_sender("thread-main")
+    .with_receivers(["agent-b", "agent-a"])
+    .with_prompt("Inspect failing logs")
+    .with_participant(
+        CollaborationParticipant::new("agent-a", "completed").with_message("found issue"),
+    )
+    .with_participant(
+        CollaborationParticipant::new("agent-b", "errored").with_message("timed out"),
+    );
+    assert_eq!(
+        events,
+        [RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Collaboration(expected),
+        ))]
+    );
+}
+
+#[test]
+fn codex_completed_turn_normalizes_all_usage_counters() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let events = parser
+        .parse_line(
+            r#"{"type":"turn.completed","usage":{"input_tokens":1200,"cached_input_tokens":400,"cache_write_input_tokens":50,"output_tokens":300,"reasoning_output_tokens":75}}"#,
+        )
+        .expect("Codex completed turn should parse");
+
+    assert_eq!(
+        events,
+        [RunLogEvent::Result(
+            RunResult::succeeded().with_usage(
+                RunUsage::new(1_200, 300)
+                    .with_cached_input_tokens(400)
+                    .with_cache_write_input_tokens(50)
+                    .with_reasoning_output_tokens(75),
+            )
+        )]
+    );
+}
+
+#[test]
+fn codex_terminal_errors_preserve_provider_failure_details() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let turn_failed = parser
+        .parse_line(
+            r#"{"type":"turn.failed","error":{"message":"sandbox denied"},"message":"less specific"}"#,
+        )
+        .expect("Codex turn failure should parse");
+    assert_eq!(
+        turn_failed,
+        [RunLogEvent::Result(RunResult::failed("sandbox denied"))]
+    );
+
+    let fatal = parser
+        .parse_line(r#"{"type":"error","message":"connection lost"}"#)
+        .expect("Codex fatal error should parse");
+    assert_eq!(
+        fatal,
+        [RunLogEvent::Result(RunResult::failed("connection lost"))]
+    );
+}
+
+#[test]
+fn codex_parser_ignores_unknown_events_but_rejects_malformed_json() {
+    let mut parser = RunLogParser::new(AgentRuntime::Codex);
+
+    let unknown_event = parser
+        .parse_line(r#"{"type":"thread.metadata","version":2}"#)
+        .expect("unknown Codex events should remain forward compatible");
+    assert!(unknown_event.is_empty());
+
+    let unknown_item = parser
+        .parse_line(
+            r#"{"type":"item.completed","item":{"id":"future-1","type":"future_item","detail":"preserved by Codex"}}"#,
+        )
+        .expect("unknown Codex items should remain forward compatible");
+    assert!(unknown_item.is_empty());
+
+    let error = parser
+        .parse_line(r#"{"type":"item.completed","item":{"#)
+        .expect_err("truncated Codex JSON should fail");
+    assert!(matches!(
+        error,
+        RunLogParseError::InvalidEvent {
+            runtime: AgentRuntime::Codex,
+            ..
+        }
+    ));
 }
 
 #[test]

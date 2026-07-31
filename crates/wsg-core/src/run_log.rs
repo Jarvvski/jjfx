@@ -1,6 +1,6 @@
 //! Provider-neutral parsing and values for structured Agent Runtime logs.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -38,9 +38,7 @@ impl RunLogParser {
     pub fn parse_line(&mut self, line: &str) -> Result<Vec<RunLogEvent>, RunLogParseError> {
         match self.runtime {
             AgentRuntime::Claude => parse_claude_line(line, &mut self.claude_tools),
-            AgentRuntime::Codex => Err(RunLogParseError::UnsupportedRuntime {
-                runtime: self.runtime,
-            }),
+            AgentRuntime::Codex => parse_codex_line(line),
         }
     }
 }
@@ -147,6 +145,252 @@ impl ClaudeUsage {
 struct ClaudeToolCall {
     name: String,
     detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    item: Option<CodexItem>,
+    usage: Option<CodexUsage>,
+    error: Option<CodexError>,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    command: String,
+    #[serde(default)]
+    aggregated_output: String,
+    exit_code: Option<i32>,
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    server: String,
+    #[serde(default)]
+    tool: String,
+    #[serde(default)]
+    query: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    changes: Vec<CodexFileChange>,
+    #[serde(default)]
+    items: Vec<CodexTodoItem>,
+    #[serde(default)]
+    sender_thread_id: String,
+    #[serde(default)]
+    receiver_thread_ids: Vec<String>,
+    prompt: Option<String>,
+    #[serde(default)]
+    agents_states: BTreeMap<String, CodexAgentState>,
+    error: Option<CodexError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexFileChange {
+    path: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexTodoItem {
+    #[serde(default)]
+    completed: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexAgentState {
+    status: String,
+    message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsage {
+    #[serde(default)]
+    input_tokens: u64,
+    #[serde(default)]
+    cached_input_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+    #[serde(default)]
+    output_tokens: u64,
+    #[serde(default)]
+    reasoning_output_tokens: u64,
+}
+
+impl CodexUsage {
+    fn normalized(self) -> RunUsage {
+        RunUsage::new(self.input_tokens, self.output_tokens)
+            .with_cached_input_tokens(self.cached_input_tokens)
+            .with_cache_write_input_tokens(self.cache_write_input_tokens)
+            .with_reasoning_output_tokens(self.reasoning_output_tokens)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexError {
+    #[serde(default)]
+    message: String,
+}
+
+fn parse_codex_line(line: &str) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+    let event: CodexEvent =
+        serde_json::from_str(line).map_err(|source| RunLogParseError::InvalidEvent {
+            runtime: AgentRuntime::Codex,
+            source,
+        })?;
+
+    match event.event_type.as_str() {
+        "thread.started" => Ok(vec![RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::SessionStarted,
+        ))]),
+        "turn.completed" => {
+            let result = match event.usage {
+                Some(usage) => RunResult::succeeded().with_usage(usage.normalized()),
+                None => RunResult::succeeded(),
+            };
+            Ok(vec![RunLogEvent::Result(result)])
+        }
+        "turn.failed" => Ok(vec![RunLogEvent::Result(RunResult::failed(
+            codex_failure_message("turn.failed", event.error, event.message),
+        ))]),
+        "error" => Ok(vec![RunLogEvent::Result(RunResult::failed(
+            codex_failure_message("error", event.error, event.message),
+        ))]),
+        "item.started" | "item.updated" | "item.completed" => Ok(event
+            .item
+            .and_then(|item| parse_codex_item(&event.event_type, item))
+            .map(RunActivity::new)
+            .map(RunLogEvent::Activity)
+            .into_iter()
+            .collect()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn codex_failure_message(event_type: &str, error: Option<CodexError>, message: String) -> String {
+    error
+        .and_then(|error| non_empty(error.message))
+        .or_else(|| non_empty(message))
+        .unwrap_or_else(|| event_type.to_owned())
+}
+
+fn parse_codex_item(event_type: &str, item: CodexItem) -> Option<RunActivityKind> {
+    match item.item_type.as_str() {
+        "agent_message" if !item.text.is_empty() => {
+            Some(RunActivityKind::Message { text: item.text })
+        }
+        "reasoning" if !item.text.is_empty() => {
+            Some(RunActivityKind::Reasoning { text: item.text })
+        }
+        "command_execution" if !item.command.is_empty() => Some(RunActivityKind::Tool {
+            name: "Command".to_owned(),
+            detail: Some(item.command),
+            status: parse_codex_status(
+                &item.status,
+                non_empty(item.aggregated_output)
+                    .or_else(|| item.exit_code.map(|code| format!("exit code {code}"))),
+            )?,
+        }),
+        "mcp_tool_call" => {
+            let name = format!("{}.{}", item.server, item.tool)
+                .trim_matches('.')
+                .to_owned();
+            if name.is_empty() {
+                return None;
+            }
+            Some(RunActivityKind::Tool {
+                name,
+                detail: None,
+                status: parse_codex_status(
+                    &item.status,
+                    item.error.and_then(|error| non_empty(error.message)),
+                )?,
+            })
+        }
+        "web_search" if !item.query.is_empty() => Some(RunActivityKind::Tool {
+            name: "WebSearch".to_owned(),
+            detail: Some(item.query),
+            status: parse_codex_lifecycle_status(event_type)?,
+        }),
+        "file_change" if event_type == "item.completed" => Some(RunActivityKind::FileChanges {
+            paths: item.changes.into_iter().map(|change| change.path).collect(),
+        }),
+        "todo_list" => Some(RunActivityKind::Plan {
+            completed: item.items.iter().filter(|item| item.completed).count(),
+            total: item.items.len(),
+        }),
+        "error" if event_type == "item.completed" && !item.message.is_empty() => {
+            Some(RunActivityKind::Warning {
+                message: item.message,
+            })
+        }
+        "collab_tool_call" if !item.tool.is_empty() => Some(RunActivityKind::Collaboration(
+            parse_codex_collaboration(item)?,
+        )),
+        _ => None,
+    }
+}
+
+fn parse_codex_collaboration(item: CodexItem) -> Option<CollaborationEvent> {
+    let failure_message = item.error.and_then(|error| non_empty(error.message));
+    let mut collaboration = CollaborationEvent::new(
+        item.tool,
+        parse_codex_status(&item.status, failure_message)?,
+    )
+    .with_receivers(item.receiver_thread_ids);
+    if !item.sender_thread_id.is_empty() {
+        collaboration = collaboration.with_sender(item.sender_thread_id);
+    }
+    if let Some(prompt) = item.prompt.and_then(|prompt| normalize_whitespace(&prompt)) {
+        collaboration = collaboration.with_prompt(prompt);
+    }
+    for (id, state) in item.agents_states {
+        let mut participant = CollaborationParticipant::new(id, state.status);
+        if let Some(message) = state
+            .message
+            .and_then(|message| normalize_whitespace(&message))
+        {
+            participant = participant.with_message(message);
+        }
+        collaboration = collaboration.with_participant(participant);
+    }
+    Some(collaboration)
+}
+
+fn normalize_whitespace(value: &str) -> Option<String> {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!normalized.is_empty()).then_some(normalized)
+}
+
+fn parse_codex_lifecycle_status(event_type: &str) -> Option<RunActivityStatus> {
+    match event_type {
+        "item.started" | "item.updated" => Some(RunActivityStatus::InProgress),
+        "item.completed" => Some(RunActivityStatus::Completed),
+        _ => None,
+    }
+}
+
+fn parse_codex_status(status: &str, failure_message: Option<String>) -> Option<RunActivityStatus> {
+    match status {
+        "in_progress" => Some(RunActivityStatus::InProgress),
+        "completed" => Some(RunActivityStatus::Completed),
+        "failed" => Some(RunActivityStatus::Failed {
+            message: failure_message,
+        }),
+        "declined" => Some(RunActivityStatus::Declined),
+        _ => None,
+    }
+}
+
+fn non_empty(value: String) -> Option<String> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn parse_claude_line(
