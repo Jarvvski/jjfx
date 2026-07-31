@@ -9,8 +9,9 @@ use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 use thiserror::Error;
 
 use crate::{
-    AgentRuntime, CommitOutcome, Expected, Loaded, PoolState, Repository, StateChange, StateError,
-    StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
+    AgentRuntime, CommitOutcome, Expected, Loaded, PoolState, Repository, RunConclusion, RunResult,
+    StateChange, StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
+    WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -173,7 +174,7 @@ impl Reservation {
     pub(crate) fn finalize(
         &self,
         revision: StateRevision<WorkerState>,
-        exit_code: Option<i32>,
+        result: &RunResult,
     ) -> Result<RunFinalization, WorkerPoolError> {
         let worker_state = self.repository.state_store().worker(self.worker_id.clone());
         let loaded = match worker_state.load()? {
@@ -188,19 +189,7 @@ impl Reservation {
             return Ok(RunFinalization::Stale);
         }
         let mut state = loaded.value;
-        let completed_at = current_timestamp()?;
-        let successful = exit_code == Some(0);
-        state.status = WireStatus::new(if successful { "done" } else { "failed" });
-        state.completed_at = Some(completed_at);
-        state.exit_code = exit_code.map(i64::from).or(Some(1));
-        state.error = if successful {
-            None
-        } else {
-            Some(match exit_code {
-                Some(code) => format!("Run exited with code {code}"),
-                None => "Run terminated by signal".to_owned(),
-            })
-        };
+        apply_run_result(&mut state, result)?;
         match worker_state.commit(Expected::Match(revision), StateChange::Replace(state))? {
             CommitOutcome::Applied(_) => Ok(RunFinalization::Applied),
             CommitOutcome::Conflict(_) => Ok(RunFinalization::Stale),
@@ -337,10 +326,21 @@ impl WorkerPool {
 
         let revision = loaded.revision().clone();
         let mut state = loaded.value;
-        state.status = WireStatus::new("failed");
-        state.completed_at = Some(current_timestamp()?);
-        state.exit_code = Some(1);
-        state.error = Some("Process exited unexpectedly".to_owned());
+        let result = state
+            .agent
+            .as_ref()
+            .and_then(AgentRuntime::parse)
+            .zip(state.log_file.as_deref())
+            .map_or_else(
+                || {
+                    crate::run_log::unexpected_result(
+                        crate::RunResultFallback::MissingTerminalEvent,
+                    )
+                },
+                |(runtime, path)| crate::run_log::result_for_finalization(Path::new(path), runtime),
+            )
+            .0;
+        apply_run_result(&mut state, &result)?;
         match repository.commit(Expected::Match(revision), StateChange::Replace(state)) {
             Ok(CommitOutcome::Applied(_)) | Ok(CommitOutcome::Conflict(_)) => Ok(()),
             Err(source) => Err(WorkerPoolError::Reconciliation {
@@ -885,6 +885,23 @@ fn clear_run_fields(state: &mut WorkerState) {
     state.branch_name = None;
     state.exit_code = None;
     state.error = None;
+}
+
+fn apply_run_result(state: &mut WorkerState, result: &RunResult) -> Result<(), WorkerPoolError> {
+    state.completed_at = Some(current_timestamp()?);
+    match result.conclusion() {
+        RunConclusion::Succeeded => {
+            state.status = WireStatus::new("done");
+            state.exit_code = Some(0);
+            state.error = None;
+        }
+        RunConclusion::Failed { message } => {
+            state.status = WireStatus::new("failed");
+            state.exit_code = Some(1);
+            state.error = Some(message.clone());
+        }
+    }
+    Ok(())
 }
 
 fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {

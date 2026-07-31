@@ -114,3 +114,15 @@ typed reasons for starting a fresh Session instead of failing a Follow-up.
 Connecting structured Run results to exactly-once supervisor finalization is the
 next focused slice. Follow-up launch and Worker actions remain later work in this
 ticket.
+
+2026-07-31 - Connected provider-neutral results to the single supervisor
+finalization path. Provider terminal conclusions now override process exit
+status, usage and exact micro-USD cost remain observable through `CompletedRun`,
+and compatible Worker state persists only done/failed, exit code, completion,
+and error fields. Missing, unreadable, or semantically invalid terminal events
+produce the compatible unexpected-exit failure instead of leaving dead capacity
+busy. Foreground waits, background waits, dead-PID reconciliation, and stale
+finalizers share the same result policy.
+
+Send and Agent Session continuation through the Worker actions facade is the
+next focused slice.

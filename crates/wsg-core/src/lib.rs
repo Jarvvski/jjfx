@@ -20,11 +20,13 @@ pub use pool::{
 pub use run_log::{
     AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,
     RunActivity, RunActivityKind, RunActivityStatus, RunConclusion, RunCost, RunLog, RunLogError,
-    RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunUsage, resolve_agent_session,
+    RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunResultFallback, RunResultSource,
+    RunUsage, resolve_agent_session,
 };
 pub use runtime::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    BackgroundRun, RunOutcome, RunRequest, RunReset, RunSupervisor, RunSupervisorError,
+    BackgroundRun, CompletedRun, RunOutcome, RunRequest, RunReset, RunSupervisor,
+    RunSupervisorError,
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,

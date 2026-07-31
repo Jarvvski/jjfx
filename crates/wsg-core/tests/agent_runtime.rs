@@ -1223,7 +1223,12 @@ fn reserved_background_run_finalizes_worker_after_wait() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n",
+        concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--help\" ]; then exit 0; fi\n",
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\",\"total_cost_usd\":0.125}'\n",
+            "exit 0\n",
+        ),
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -1255,7 +1260,7 @@ fn reserved_background_run_finalizes_worker_after_wait() {
     );
     assert_eq!(
         fs::read_to_string(result).expect("reserved finalization result"),
-        "exit=Some(0)"
+        "exit=Some(0); conclusion=Succeeded; cost=Some(125000); source=Provider"
     );
 
     let snapshot = repository.worker_pool().snapshot();
@@ -1308,7 +1313,12 @@ fn reserved_background_run_finalizes_failed_worker_after_wait() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 7\n",
+        concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--help\" ]; then exit 0; fi\n",
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true,\"result\":\"provider rejected the Run\"}'\n",
+            "exit 0\n",
+        ),
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -1340,7 +1350,7 @@ fn reserved_background_run_finalizes_failed_worker_after_wait() {
     );
     assert_eq!(
         fs::read_to_string(result).expect("reserved finalization result"),
-        "exit=Some(7)"
+        "exit=Some(0); conclusion=Failed { message: \"provider rejected the Run\" }; cost=None; source=Provider"
     );
 
     let snapshot = repository.worker_pool().snapshot();
@@ -1348,9 +1358,9 @@ fn reserved_background_run_finalizes_failed_worker_after_wait() {
         .worker(worker_id.as_str())
         .expect("finalized Worker");
     assert_eq!(worker.status(), WorkerStatus::Failed);
-    assert_eq!(worker.exit_code(), Some(7));
+    assert_eq!(worker.exit_code(), Some(1));
     assert!(worker.completed_at().is_some());
-    assert!(worker.error().is_some());
+    assert_eq!(worker.error(), Some("provider rejected the Run"));
 }
 
 #[test]
@@ -1393,7 +1403,12 @@ fn reserved_foreground_run_finalizes_worker_after_completion() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n",
+        concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--help\" ]; then exit 0; fi\n",
+            "printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
+            "exit 0\n",
+        ),
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -1627,7 +1642,17 @@ fn reserved_background_run_finalize_helper() {
         .run_reserved_background(&reservation, AgentRuntimeInvocation::new("reserved test"))
         .expect("reserved background Run should start");
     let outcome = background.wait().expect("background Run should complete");
-    fs::write(result, format!("exit={:?}", outcome.exit_code())).expect("wait result");
+    fs::write(
+        result,
+        format!(
+            "exit={:?}; conclusion={:?}; cost={:?}; source={:?}",
+            outcome.exit_code(),
+            outcome.result().conclusion(),
+            outcome.result().cost().map(|cost| cost.as_micro_usd()),
+            outcome.result_source(),
+        ),
+    )
+    .expect("wait result");
 }
 
 #[test]

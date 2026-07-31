@@ -16,8 +16,8 @@ use thiserror::Error;
 
 use crate::pool::RunClearing;
 use crate::{
-    Repository, Reservation, StateError, StateRevision, WireAgent, WorkerId, WorkerPoolError,
-    WorkerState,
+    Repository, Reservation, RunResult, RunResultSource, StateError, StateRevision, WireAgent,
+    WorkerId, WorkerPoolError, WorkerState,
 };
 
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(1);
@@ -178,14 +178,13 @@ impl RunSupervisor {
         &self,
         reservation: &Reservation,
         invocation: AgentRuntimeInvocation,
-    ) -> Result<RunOutcome, RunSupervisorError> {
+    ) -> Result<CompletedRun, RunSupervisorError> {
         let request = reserved_request(reservation, invocation);
         let outcome = match self.run_foreground(&request) {
             Ok(outcome) => outcome,
             Err(error) => return release_after_failure(reservation, error),
         };
-        RunCompletion::new(reservation.clone(), reservation.worker_revision()).finalize(outcome)?;
-        Ok(outcome)
+        RunCompletion::new(reservation.clone(), reservation.worker_revision()).finalize(outcome)
     }
 
     /// Starts a reserved Run and persists its process identifier before success.
@@ -331,6 +330,7 @@ impl RunSupervisor {
         Ok(BackgroundRun {
             child,
             runtime: request.runtime,
+            log_path: request.log_path.clone(),
             completion: None,
         })
     }
@@ -342,6 +342,7 @@ impl RunSupervisor {
 pub struct BackgroundRun {
     child: Child,
     runtime: AgentRuntime,
+    log_path: PathBuf,
     completion: Option<RunCompletion>,
 }
 
@@ -359,12 +360,24 @@ impl RunCompletion {
         }
     }
 
-    fn finalize(self, outcome: RunOutcome) -> Result<(), RunSupervisorError> {
+    fn finalize(self, outcome: RunOutcome) -> Result<CompletedRun, RunSupervisorError> {
         let worker = self.reservation.worker_id().clone();
+        let log_path = self
+            .reservation
+            .repository()
+            .root()
+            .join(".jj/pool")
+            .join(format!("{worker}.log"));
+        let (result, source) =
+            crate::run_log::result_for_finalization(&log_path, self.reservation.agent_runtime());
         self.reservation
-            .finalize(self.revision, outcome.exit_code())
-            .map(|_| ())
-            .map_err(|source| RunSupervisorError::Finalize { worker, source })
+            .finalize(self.revision, &result)
+            .map_err(|source| RunSupervisorError::Finalize { worker, source })?;
+        Ok(CompletedRun {
+            process: outcome,
+            result,
+            result_source: source,
+        })
     }
 }
 
@@ -375,7 +388,7 @@ impl BackgroundRun {
     }
 
     /// Waits for the background Run and reaps its process.
-    pub fn wait(mut self) -> Result<RunOutcome, RunSupervisorError> {
+    pub fn wait(mut self) -> Result<CompletedRun, RunSupervisorError> {
         let status = self
             .child
             .wait()
@@ -387,9 +400,40 @@ impl BackgroundRun {
             exit_code: status.code(),
         };
         if let Some(completion) = self.completion.take() {
-            completion.finalize(outcome)?;
+            return completion.finalize(outcome);
         }
-        Ok(outcome)
+        let (result, result_source) =
+            crate::run_log::result_for_finalization(&self.log_path, self.runtime);
+        Ok(CompletedRun {
+            process: outcome,
+            result,
+            result_source,
+        })
+    }
+}
+
+/// A reaped Run together with its provider-neutral terminal result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompletedRun {
+    process: RunOutcome,
+    result: RunResult,
+    result_source: RunResultSource,
+}
+
+impl CompletedRun {
+    /// Returns the operating-system exit code, or `None` when signaled.
+    pub fn exit_code(&self) -> Option<i32> {
+        self.process.exit_code()
+    }
+
+    /// Returns the provider-neutral terminal result used for finalization.
+    pub fn result(&self) -> &RunResult {
+        &self.result
+    }
+
+    /// Returns whether the result came from the provider or the fallback path.
+    pub fn result_source(&self) -> &RunResultSource {
+        &self.result_source
     }
 }
 

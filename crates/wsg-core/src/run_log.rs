@@ -256,6 +256,57 @@ pub enum RunLogError {
     },
 }
 
+/// Where the terminal result used to finalize a Run came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunResultSource {
+    /// The Agent Runtime emitted a recognized terminal event.
+    Provider,
+    /// No compatible terminal result was available, so finalization used the
+    /// compatible unexpected-exit failure.
+    Fallback {
+        /// Why the provider result could not be used.
+        reason: RunResultFallback,
+    },
+}
+
+/// Why Run finalization had to use the compatible unexpected-exit result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RunResultFallback {
+    /// The readable log contained no recognized terminal event.
+    MissingTerminalEvent,
+    /// The configured log could not be read.
+    UnreadableLog { detail: String },
+    /// A terminal event could not be normalized safely.
+    InvalidTerminalEvent { detail: String },
+}
+
+pub(crate) fn result_for_finalization(
+    path: &Path,
+    runtime: AgentRuntime,
+) -> (RunResult, RunResultSource) {
+    match RunLog::new(path, runtime).final_result() {
+        Ok(Some(result)) => (result, RunResultSource::Provider),
+        Ok(None) => unexpected_result(RunResultFallback::MissingTerminalEvent),
+        Err(RunLogError::Io { source, .. }) => {
+            unexpected_result(RunResultFallback::UnreadableLog {
+                detail: source.to_string(),
+            })
+        }
+        Err(RunLogError::Parse { source, .. }) => {
+            unexpected_result(RunResultFallback::InvalidTerminalEvent {
+                detail: source.to_string(),
+            })
+        }
+    }
+}
+
+pub(crate) fn unexpected_result(reason: RunResultFallback) -> (RunResult, RunResultSource) {
+    (
+        RunResult::failed("Process exited unexpectedly"),
+        RunResultSource::Fallback { reason },
+    )
+}
+
 /// One provider-neutral value decoded from an Agent Runtime log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunLogEvent {
