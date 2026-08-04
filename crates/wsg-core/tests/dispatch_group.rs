@@ -174,6 +174,41 @@ fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_b
 }
 
 #[test]
+fn maximum_wave_size_is_zero_for_an_empty_group_and_width_for_independent_tickets() {
+    assert_eq!(
+        DispatchGroup::from_state(state())
+            .expect("empty group")
+            .maximum_wave_size(),
+        0
+    );
+    let independent = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"First","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Second","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-103","title":"Third","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    assert_eq!(independent.maximum_wave_size(), 3);
+}
+
+#[test]
+fn maximum_wave_size_is_one_for_a_chain_and_two_for_a_diamond() {
+    let chain = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"First","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Second","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Third","status":"Todo","blocked_by":["ENG-102"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(chain.maximum_wave_size(), 1);
+
+    let diamond = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Root","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Left","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Right","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-104","title":"Tip","status":"Todo","blocked_by":["ENG-102","ENG-103"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(diamond.maximum_wave_size(), 2);
+}
+
+#[test]
+fn maximum_wave_size_excludes_already_skipped_nodes() {
+    let group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Merged","status":"Merged","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Left","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Right","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(group.maximum_wave_size(), 2);
+}
+
+#[test]
 fn aggregate_wraps_valid_wire_state_without_persistence() {
     let group = DispatchGroup::from_state(state()).expect("valid state");
     assert_eq!(group.state().parent.as_str(), "ENG-100");

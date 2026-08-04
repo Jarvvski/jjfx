@@ -182,6 +182,42 @@ impl DispatchGroup {
             .collect()
     }
 
+    /// Returns the largest dependency wave in the group's graph.
+    pub fn maximum_wave_size(&self) -> usize {
+        let mut resolved = self
+            .state
+            .sub_issues
+            .iter()
+            .filter_map(|(id, issue)| {
+                (status_of(issue) == SubIssueStatus::Skipped).then_some(id.clone())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut maximum = 0;
+        loop {
+            let wave = self
+                .state
+                .sub_issues
+                .iter()
+                .filter_map(|(id, issue)| {
+                    if resolved.contains(id) || status_of(issue) == SubIssueStatus::Skipped {
+                        return None;
+                    }
+                    issue
+                        .blocked_by
+                        .iter()
+                        .all(|blocker| resolved.contains(blocker))
+                        .then_some(id.clone())
+                })
+                .collect::<Vec<_>>();
+            if wave.is_empty() {
+                break;
+            }
+            maximum = maximum.max(wave.len());
+            resolved.extend(wave);
+        }
+        maximum
+    }
+
     /// Returns the compatible state without performing persistence.
     pub fn into_state(self) -> DispatchGroupState {
         self.state
