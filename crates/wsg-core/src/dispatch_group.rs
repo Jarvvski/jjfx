@@ -8,7 +8,10 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::{DispatchGroupState, WireStatus};
+use crate::{
+    DependencyGraph, DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus,
+    WireTimestamp,
+};
 
 /// The five Sub-issue statuses persisted by Go wsg.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,6 +89,29 @@ impl UnknownSubIssueStatus {
     }
 }
 
+/// Inputs required to construct a Dispatch Group without performing I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchGroupBuildOptions {
+    created_at: WireTimestamp,
+    gh_repo: String,
+    opts: DispatchGroupOptions,
+}
+
+impl DispatchGroupBuildOptions {
+    /// Creates construction metadata from caller-owned repository and provider values.
+    pub fn new(
+        created_at: WireTimestamp,
+        gh_repo: impl Into<String>,
+        opts: DispatchGroupOptions,
+    ) -> Self {
+        Self {
+            created_at,
+            gh_repo: gh_repo.into(),
+            opts,
+        }
+    }
+}
+
 /// The pure Dispatch Group aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchGroup {
@@ -93,6 +119,43 @@ pub struct DispatchGroup {
 }
 
 impl DispatchGroup {
+    /// Builds a group from a validated Ticket dependency graph.
+    pub fn from_dependency_graph(
+        graph: &DependencyGraph,
+        options: DispatchGroupBuildOptions,
+    ) -> Result<Self, DispatchGroupError> {
+        let mut state = DispatchGroupState::new(
+            graph.parent().id().clone(),
+            options.created_at,
+            options.gh_repo,
+            options.opts,
+        );
+        for (id, discovered) in graph.sub_issues() {
+            let blocked_by = discovered
+                .blockers()
+                .iter()
+                .map(|blocker| blocker.id().clone())
+                .collect();
+            let mut issue = SubIssueState::new(
+                discovered.ticket().title().as_str(),
+                WireStatus::new("pending"),
+                blocked_by,
+            );
+            if discovered.is_cross_repository() {
+                issue.status = WireStatus::new("skipped");
+                issue.skip_reason = Some("cross-repo".to_owned());
+            } else if !is_dispatchable_status(discovered.ticket().status().as_str()) {
+                issue.status = WireStatus::new("skipped");
+                issue.skip_reason = Some(discovered.ticket().status().as_str().to_owned());
+                if is_merged_status(discovered.ticket().status().as_str()) {
+                    issue.branch = Some("main".to_owned());
+                }
+            }
+            state.sub_issues.insert(id.clone(), issue);
+        }
+        Self::from_state(state)
+    }
+
     /// Wraps a compatible state after validating its domain status vocabulary.
     pub fn from_state(state: DispatchGroupState) -> Result<Self, DispatchGroupError> {
         for issue in state.sub_issues.values() {
@@ -110,6 +173,17 @@ impl DispatchGroup {
     pub fn state(&self) -> &DispatchGroupState {
         &self.state
     }
+}
+
+fn is_dispatchable_status(status: &str) -> bool {
+    matches!(
+        status.to_ascii_lowercase().as_str(),
+        "backlog" | "todo" | "triage"
+    )
+}
+
+fn is_merged_status(status: &str) -> bool {
+    matches!(status.to_ascii_lowercase().as_str(), "merged" | "done")
 }
 
 /// A pure Dispatch Group construction or transition error.
