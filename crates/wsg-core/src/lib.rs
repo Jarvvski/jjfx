@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod direct_dispatch;
+mod dispatch_group;
 mod dispatch_prompt;
 mod pool;
 mod run_log;
@@ -20,6 +21,9 @@ pub use direct_dispatch::{
     DirectDispatch, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
     DirectDispatchSuccess, DirectDispatchTarget, DispatchDependencyContext,
+};
+pub use dispatch_group::{
+    DispatchGroup, DispatchGroupError, SubIssueStatus, UnknownSubIssueStatus,
 };
 pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,

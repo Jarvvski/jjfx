@@ -260,7 +260,7 @@ impl WorkerState {
 }
 
 /// One Sub-issue entry in a Dispatch Group.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubIssueState {
     /// Human-facing Ticket title.
     pub title: String,
@@ -304,7 +304,7 @@ impl SubIssueState {
 }
 
 /// Provider options persisted with a Dispatch Group.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchGroupOptions {
     #[serde(default, skip_serializing_if = "wire_agent_is_absent")]
     /// Optional Agent Runtime override.
@@ -327,7 +327,7 @@ impl DispatchGroupOptions {
 }
 
 /// The exact Go-compatible Dispatch Group state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchGroupState {
     /// Parent Ticket that owns this Dispatch Group.
     pub parent: TicketId,
