@@ -3,8 +3,8 @@ use std::sync::Mutex;
 
 use wsg_core::{
     DispatchGroup, DispatchGroupBuildOptions, DispatchGroupOptions, DispatchGroupState,
-    ParentTicket, SubIssueStatus, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
-    WireStatus, WireTimestamp,
+    ParentTicket, SubIssueState, SubIssueStatus, TicketDiscovery, TicketId, TicketQuery,
+    TicketQueryError, WireStatus, WireTimestamp,
 };
 
 struct StubQuery(Mutex<VecDeque<String>>);
@@ -28,6 +28,18 @@ fn graph(response: &str) -> wsg_core::DependencyGraph {
             &wsg_core::RepositoryIdentity::parse("owner/repo").expect("repository identity"),
         )
         .expect("dependency graph")
+}
+
+fn group_from_response(response: &str) -> DispatchGroup {
+    DispatchGroup::from_dependency_graph(
+        &graph(response),
+        DispatchGroupBuildOptions::new(
+            WireTimestamp::new("2026-08-01T10:00:00Z"),
+            "owner/repo",
+            DispatchGroupOptions::new("opus"),
+        ),
+    )
+    .expect("Dispatch Group")
 }
 
 fn state() -> DispatchGroupState {
@@ -101,6 +113,64 @@ fn dependency_graph_builds_dispatchable_and_previously_delivered_sub_issues() {
             .as_deref(),
         Some("In Progress")
     );
+}
+
+#[test]
+fn ready_selection_returns_independent_tickets_in_ticket_order() {
+    let group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-103","title":"Third","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-101","title":"First","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Second","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        group.ready(),
+        [
+            TicketId::parse("ENG-101").expect("Ticket"),
+            TicketId::parse("ENG-102").expect("Ticket"),
+            TicketId::parse("ENG-103").expect("Ticket"),
+        ]
+    );
+}
+
+#[test]
+fn ready_selection_waits_for_every_blocker_in_a_chain_and_diamond() {
+    let chain = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"First","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Second","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Third","status":"Todo","blocked_by":["ENG-102"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(chain.ready(), [TicketId::parse("ENG-101").expect("Ticket")]);
+
+    let diamond = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Root","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Left","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Right","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-104","title":"Tip","status":"Todo","blocked_by":["ENG-102","ENG-103"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        diamond.ready(),
+        [TicketId::parse("ENG-101").expect("Ticket")]
+    );
+}
+
+#[test]
+fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_blocking() {
+    let skipped = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Merged","status":"Merged","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Ready","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        skipped.ready(),
+        [TicketId::parse("ENG-102").expect("Ticket")]
+    );
+
+    let mut failed_state = state();
+    failed_state.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Ticket"),
+        SubIssueState::new("Failed", WireStatus::new("failed"), Vec::new()),
+    );
+    failed_state.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Ticket"),
+        SubIssueState::new(
+            "Blocked",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Ticket")],
+        ),
+    );
+    let failed = DispatchGroup::from_state(failed_state).expect("Dispatch Group");
+    assert!(failed.ready().is_empty());
 }
 
 #[test]

@@ -164,6 +164,24 @@ impl DispatchGroup {
         Ok(Self { state })
     }
 
+    /// Returns pending Tickets whose direct blockers all satisfy their dependencies.
+    pub fn ready(&self) -> Vec<crate::TicketId> {
+        self.state
+            .sub_issues
+            .iter()
+            .filter_map(|(id, issue)| {
+                (status_of(issue) == SubIssueStatus::Pending
+                    && issue.blocked_by.iter().all(|blocker| {
+                        self.state
+                            .sub_issues
+                            .get(blocker)
+                            .is_none_or(|dependency| status_of(dependency).unblocks())
+                    }))
+                .then_some(id.clone())
+            })
+            .collect()
+    }
+
     /// Returns the compatible state without performing persistence.
     pub fn into_state(self) -> DispatchGroupState {
         self.state
@@ -173,6 +191,11 @@ impl DispatchGroup {
     pub fn state(&self) -> &DispatchGroupState {
         &self.state
     }
+}
+
+fn status_of(issue: &SubIssueState) -> SubIssueStatus {
+    SubIssueStatus::try_from(&issue.status)
+        .expect("DispatchGroup validates every Sub-issue status at construction")
 }
 
 fn is_dispatchable_status(status: &str) -> bool {
