@@ -1,10 +1,13 @@
 use std::collections::VecDeque;
+use std::fs;
+use std::path::Path;
 use std::sync::Mutex;
 
 use wsg_core::{
-    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent, DispatchGroupOptions,
-    DispatchGroupState, DispatchGroupTransition, ParentTicket, SubIssueState, SubIssueStatus,
-    TicketDiscovery, TicketId, TicketQuery, TicketQueryError, WireStatus, WireTimestamp, WorkerId,
+    CommitOutcome, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent,
+    DispatchGroupOptions, DispatchGroupState, DispatchGroupTransition, Expected, Loaded,
+    ParentTicket, Repository, StateChange, SubIssueState, SubIssueStatus, TicketDiscovery,
+    TicketId, TicketQuery, TicketQueryError, WireStatus, WireTimestamp, WorkerId,
 };
 
 struct StubQuery(Mutex<VecDeque<String>>);
@@ -42,6 +45,19 @@ fn group_from_response(response: &str) -> DispatchGroup {
     .expect("Dispatch Group")
 }
 
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
+
+fn fixture(name: &str) -> Vec<u8> {
+    fs::read(Path::new(FIXTURES).join(name)).expect("fixture")
+}
+
+fn repository() -> (tempfile::TempDir, Repository) {
+    let temp = tempfile::tempdir().expect("temp repository");
+    fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(temp.path()).expect("repository");
+    (temp, repository)
+}
+
 fn state() -> DispatchGroupState {
     DispatchGroupState::new(
         TicketId::parse("ENG-100").expect("parent Ticket ID"),
@@ -49,6 +65,72 @@ fn state() -> DispatchGroupState {
         "owner/repo",
         DispatchGroupOptions::new("model"),
     )
+}
+
+#[test]
+fn every_go_dispatch_group_fixture_loads_and_round_trips_through_the_aggregate() {
+    for name in [
+        "dispatch-pending.json",
+        "dispatch-dispatched.json",
+        "dispatch-done.json",
+        "dispatch-failed.json",
+        "dispatch-skipped.json",
+    ] {
+        let source: serde_json::Value =
+            serde_json::from_slice(&fixture(name)).expect("source JSON");
+        let state: DispatchGroupState = serde_json::from_value(source.clone()).expect("wire state");
+        let round_tripped = serde_json::to_value(
+            DispatchGroup::from_state(state)
+                .expect("compatible aggregate")
+                .into_state(),
+        )
+        .expect("round-trip JSON");
+        assert_eq!(round_tripped, source, "fixture {name}");
+    }
+}
+
+#[test]
+fn aggregate_round_trip_preserves_unknown_group_and_sub_issue_fields() {
+    let mut source: serde_json::Value =
+        serde_json::from_slice(&fixture("dispatch-pending.json")).expect("source JSON");
+    source["future_group"] = serde_json::json!({"enabled": true});
+    source["sub_issues"]["ENG-101"]["future_child"] = serde_json::json!("kept");
+    let state: DispatchGroupState = serde_json::from_value(source.clone()).expect("wire state");
+    let round_tripped = serde_json::to_value(
+        DispatchGroup::from_state(state)
+            .expect("aggregate")
+            .into_state(),
+    )
+    .expect("round-trip JSON");
+    assert_eq!(round_tripped["future_group"]["enabled"], true);
+    assert_eq!(
+        round_tripped["sub_issues"]["ENG-101"]["future_child"],
+        "kept"
+    );
+}
+
+#[test]
+fn aggregate_round_trip_can_be_committed_and_loaded_by_the_compatible_repository() {
+    let (_temp, repository) = repository();
+    let parent = TicketId::parse("ENG-100").expect("Ticket");
+    let source: DispatchGroupState =
+        serde_json::from_slice(&fixture("dispatch-pending.json")).expect("wire state");
+    let aggregate = DispatchGroup::from_state(source).expect("aggregate");
+    let store = repository.state_store().dispatch_group(parent.clone());
+    assert!(matches!(
+        store
+            .commit(
+                Expected::Missing,
+                StateChange::Replace(aggregate.into_state())
+            )
+            .expect("commit"),
+        CommitOutcome::Applied(_)
+    ));
+    let loaded = match store.load().expect("load") {
+        Loaded::Present(versioned) => versioned.value,
+        Loaded::Missing => panic!("Dispatch Group disappeared"),
+    };
+    DispatchGroup::from_state(loaded).expect("loaded aggregate");
 }
 
 #[test]
