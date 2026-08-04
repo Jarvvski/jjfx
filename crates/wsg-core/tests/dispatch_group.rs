@@ -58,6 +58,29 @@ fn repository() -> (tempfile::TempDir, Repository) {
     (temp, repository)
 }
 
+struct FakeEventWorld {
+    group: DispatchGroup,
+    transitions: Vec<DispatchGroupTransition>,
+}
+
+impl FakeEventWorld {
+    fn new(group: DispatchGroup) -> Self {
+        Self {
+            group,
+            transitions: Vec::new(),
+        }
+    }
+
+    fn from_state(state: DispatchGroupState) -> Self {
+        Self::new(DispatchGroup::from_state(state).expect("restart state"))
+    }
+
+    fn apply(&mut self, event: DispatchGroupEvent) {
+        let transition = self.group.apply(event).expect("scenario event");
+        self.transitions.push(transition);
+    }
+}
+
 fn state() -> DispatchGroupState {
     DispatchGroupState::new(
         TicketId::parse("ENG-100").expect("parent Ticket ID"),
@@ -87,6 +110,47 @@ fn every_go_dispatch_group_fixture_loads_and_round_trips_through_the_aggregate()
         .expect("round-trip JSON");
         assert_eq!(round_tripped, source, "fixture {name}");
     }
+}
+
+#[test]
+fn fake_event_world_drives_a_dependency_chain_across_a_restart() {
+    let group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Foundation","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Consumer","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    let mut world = FakeEventWorld::new(group);
+    let first = TicketId::parse("ENG-101").expect("Ticket");
+    let second = TicketId::parse("ENG-102").expect("Ticket");
+    let worker_one = WorkerId::parse("worker-01").expect("Worker");
+    let worker_two = WorkerId::parse("worker-02").expect("Worker");
+    world.apply(DispatchGroupEvent::Dispatched {
+        ticket: first.clone(),
+        worker: worker_one.clone(),
+        at: WireTimestamp::new("2026-08-01T10:01:00Z"),
+    });
+    world.apply(DispatchGroupEvent::Completed {
+        ticket: first,
+        worker: worker_one,
+        branch: Some("adam/eng-101-foundation".to_owned()),
+        at: WireTimestamp::new("2026-08-01T10:05:00Z"),
+    });
+    assert_eq!(world.group.ready(), [second.clone()]);
+
+    let resumed_state = world.group.clone().into_state();
+    let mut resumed = FakeEventWorld::from_state(resumed_state);
+    resumed.apply(DispatchGroupEvent::Dispatched {
+        ticket: second.clone(),
+        worker: worker_two.clone(),
+        at: WireTimestamp::new("2026-08-01T10:06:00Z"),
+    });
+    resumed.apply(DispatchGroupEvent::Completed {
+        ticket: second.clone(),
+        worker: worker_two,
+        branch: Some("adam/eng-102-consumer".to_owned()),
+        at: WireTimestamp::new("2026-08-01T10:10:00Z"),
+    });
+    assert!(resumed.group.is_terminal());
+    assert_eq!(resumed.transitions.len(), 2);
+    assert_eq!(resumed.group.status_counts().done(), 2);
 }
 
 #[test]
