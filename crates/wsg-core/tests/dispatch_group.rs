@@ -174,6 +174,33 @@ fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_b
 }
 
 #[test]
+fn empty_and_mixed_groups_report_terminal_state_and_status_counts() {
+    let empty = DispatchGroup::from_state(state()).expect("empty group");
+    assert!(empty.is_terminal());
+    assert_eq!(empty.status_counts().done(), 0);
+    assert_eq!(empty.status_counts().failed(), 0);
+    assert_eq!(empty.status_counts().skipped(), 0);
+
+    let mut mixed_state = state();
+    for (id, status) in [
+        ("ENG-101", "done"),
+        ("ENG-102", "failed"),
+        ("ENG-103", "skipped"),
+        ("ENG-104", "pending"),
+    ] {
+        mixed_state.sub_issues.insert(
+            TicketId::parse(id).expect("Ticket"),
+            SubIssueState::new(id, WireStatus::new(status), Vec::new()),
+        );
+    }
+    let mixed = DispatchGroup::from_state(mixed_state).expect("mixed group");
+    assert!(!mixed.is_terminal());
+    assert_eq!(mixed.status_counts().done(), 1);
+    assert_eq!(mixed.status_counts().failed(), 1);
+    assert_eq!(mixed.status_counts().skipped(), 1);
+}
+
+#[test]
 fn maximum_wave_size_is_zero_for_an_empty_group_and_width_for_independent_tickets() {
     assert_eq!(
         DispatchGroup::from_state(state())

@@ -112,6 +112,31 @@ impl DispatchGroupBuildOptions {
     }
 }
 
+/// Counts of terminal Sub-issue outcomes in a Dispatch Group.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DispatchGroupStatusCounts {
+    done: usize,
+    failed: usize,
+    skipped: usize,
+}
+
+impl DispatchGroupStatusCounts {
+    /// Returns the number of successfully completed Sub-issues.
+    pub const fn done(self) -> usize {
+        self.done
+    }
+
+    /// Returns the number of exhausted failed Sub-issues.
+    pub const fn failed(self) -> usize {
+        self.failed
+    }
+
+    /// Returns the number of skipped Sub-issues.
+    pub const fn skipped(self) -> usize {
+        self.skipped
+    }
+}
+
 /// The pure Dispatch Group aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchGroup {
@@ -180,6 +205,30 @@ impl DispatchGroup {
                 .then_some(id.clone())
             })
             .collect()
+    }
+
+    /// Returns whether every Sub-issue is terminal.
+    pub fn is_terminal(&self) -> bool {
+        self.state
+            .sub_issues
+            .values()
+            .all(|issue| status_of(issue).is_terminal())
+    }
+
+    /// Counts done, failed, and skipped Sub-issues.
+    pub fn status_counts(&self) -> DispatchGroupStatusCounts {
+        self.state.sub_issues.values().fold(
+            DispatchGroupStatusCounts::default(),
+            |mut counts, issue| {
+                match status_of(issue) {
+                    SubIssueStatus::Done => counts.done += 1,
+                    SubIssueStatus::Failed => counts.failed += 1,
+                    SubIssueStatus::Skipped => counts.skipped += 1,
+                    SubIssueStatus::Pending | SubIssueStatus::Dispatched => {}
+                }
+                counts
+            },
+        )
     }
 
     /// Returns the largest dependency wave in the group's graph.
