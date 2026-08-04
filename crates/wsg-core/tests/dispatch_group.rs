@@ -133,7 +133,10 @@ fn fake_event_world_drives_a_dependency_chain_across_a_restart() {
         branch: Some("adam/eng-101-foundation".to_owned()),
         at: WireTimestamp::new("2026-08-01T10:05:00Z"),
     });
-    assert_eq!(world.group.ready(), [second.clone()]);
+    assert_eq!(
+        world.group.ready().as_slice(),
+        std::slice::from_ref(&second)
+    );
 
     let resumed_state = world.group.clone().into_state();
     let mut resumed = FakeEventWorld::from_state(resumed_state);

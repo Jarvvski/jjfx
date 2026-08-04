@@ -551,12 +551,12 @@ fn validate_acyclic(
             "dependency cycle includes Ticket {ticket}"
         )));
     }
-    let blockers = &state
-        .sub_issues
-        .get(ticket)
-        .expect("validation iterates over known Tickets")
-        .blocked_by;
-    for blocker in blockers {
+    let Some(issue) = state.sub_issues.get(ticket) else {
+        return Err(DispatchGroupError::Invalid(format!(
+            "dependency references unknown Ticket {ticket}"
+        )));
+    };
+    for blocker in &issue.blocked_by {
         validate_acyclic(blocker, state, visiting, visited)?;
     }
     visiting.remove(ticket);
@@ -578,8 +578,10 @@ fn ensure_assigned(
 }
 
 fn status_of(issue: &SubIssueState) -> SubIssueStatus {
-    SubIssueStatus::try_from(&issue.status)
-        .expect("DispatchGroup validates every Sub-issue status at construction")
+    match SubIssueStatus::try_from(&issue.status) {
+        Ok(status) => status,
+        Err(_) => unreachable!("DispatchGroup validates every Sub-issue status at construction"),
+    }
 }
 
 fn is_dispatchable_status(status: &str) -> bool {

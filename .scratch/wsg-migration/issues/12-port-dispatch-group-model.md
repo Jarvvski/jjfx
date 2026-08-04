@@ -1,6 +1,6 @@
 # Port the Dispatch Group dependency model
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -8,22 +8,31 @@ epics/C-dispatch-and-orchestration.md
 
 ## Problem Statement
 
-Parent Tickets require a persistent dependency state machine that decides readiness, Dispatch Waves, retry eligibility, branch bases, and terminal completion. If these rules are mixed with live process and file operations, they become difficult to verify and easy to diverge from Go during coexistence.
+Parent Tickets require a persistent dependency state machine that decides
+readiness, Dispatch Waves, retry eligibility, branch bases, and terminal
+completion. If these rules are mixed with live process and file operations,
+they become difficult to verify and easy to diverge from Go during coexistence.
 
 ## Solution
 
-Implement a pure Dispatch Group aggregate over typed Sub-issue state. It computes Ready Sub-issues, maximum wave size, base branches, dependency context, status counts, retries, and terminal state. Persist through the compatible state repository but keep all live effects behind a narrow execution interface.
+Implement a pure Dispatch Group aggregate over typed Sub-issue state. It
+computes Ready Sub-issues, maximum wave size, base branches, dependency
+context, status counts, retries, and terminal state. Persist through the
+compatible state repository but keep all live effects behind a narrow
+execution interface.
 
 ## Commits
 
-1. Add typed Sub-issue Status and Dispatch Group values matching compatible wire states.
+1. Add typed Sub-issue Status and Dispatch Group values matching compatible
+   wire states.
 2. Build a Dispatch Group from a validated Parent Ticket dependency graph.
 3. Implement Ready selection in stable Ticket order.
 4. Implement maximum Dispatch Wave size for pool planning.
 5. Implement terminal and status-count queries.
 6. Implement base-branch and dependency context selection for Stacked Pull Requests.
 7. Implement dispatched, done, failed, merged, and retry transitions.
-8. Add invariants preventing unknown Workers, duplicate launches, and impossible self-dependencies.
+8. Add invariants preventing unknown Workers, duplicate launches, and
+   impossible self-dependencies.
 9. Round-trip every Dispatch Group golden fixture.
 10. Add a fake execution world for full state-machine tests without external commands.
 
@@ -38,16 +47,19 @@ Implement a pure Dispatch Group aggregate over typed Sub-issue state. It compute
 
 ## Testing Decisions
 
-Test through aggregate methods and the fake execution seam. Cover chains, diamonds, independent Sub-issues, already merged work, malformed cycles, failed reset, exhausted retry, missing branches, and restart round trips. Do not assert private collection choices.
+Test through aggregate methods and the fake execution seam. Cover chains,
+diamonds, independent Sub-issues, already merged work, malformed cycles,
+failed reset, exhausted retry, missing branches, and restart round trips. Do
+not assert private collection choices.
 
 ## Acceptance Criteria
 
-- [ ] Every Go-created Dispatch Group fixture loads and round-trips.
-- [ ] Ready and wave-size calculations match dependency expectations.
-- [ ] Retry and terminal behavior is explicit and exhaustively tested.
-- [ ] Base selection supports Stacked Pull Requests.
-- [ ] The model performs no filesystem, process, Linear, or terminal I/O.
-- [ ] `mise run check` is green.
+- [x] Every Go-created Dispatch Group fixture loads and round-trips.
+- [x] Ready and wave-size calculations match dependency expectations.
+- [x] Retry and terminal behavior is explicit and exhaustively tested.
+- [x] Base selection supports Stacked Pull Requests.
+- [x] The model performs no filesystem, process, Linear, or terminal I/O.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -60,3 +72,16 @@ Test through aggregate methods and the fake execution seam. Cover chains, diamon
 
 - issues/03-lock-down-compatibility-contracts.md
 - issues/10-port-linear-discovery-and-prompts.md
+
+## Comments
+
+- 2026-08-04: Implemented the pure Rust Dispatch Group aggregate in
+  `crates/wsg-core/src/dispatch_group.rs`. The aggregate builds from validated
+  dependency graphs, selects stable Ready Tickets, computes maximum waves,
+  reports terminal summaries, derives stacked Pull Request context, and applies
+  typed dispatch, completion, retry, failure, and merge events.
+- 2026-08-04: Added cycle, self-dependency, unknown blocker, duplicate Worker,
+  retry-boundary, fixture round-trip, unknown-field preservation, repository
+  persistence, and restart scenario coverage. First failure remains dispatched
+  until the caller confirms Worker Reset; exhausted failed Dependencies preserve
+  the compatible Go stalled behavior. `mise run check` passes.
