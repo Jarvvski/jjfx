@@ -23,8 +23,8 @@ pub use direct_dispatch::{
     DirectDispatchSuccess, DirectDispatchTarget, DispatchDependencyContext,
 };
 pub use dispatch_group::{
-    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupStatusCounts,
-    SubIssueStatus, UnknownSubIssueStatus,
+    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent,
+    DispatchGroupStatusCounts, DispatchGroupTransition, SubIssueStatus, UnknownSubIssueStatus,
 };
 pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,

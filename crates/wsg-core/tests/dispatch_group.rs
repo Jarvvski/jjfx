@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use wsg_core::{
-    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupOptions, DispatchGroupState,
-    ParentTicket, SubIssueState, SubIssueStatus, TicketDiscovery, TicketId, TicketQuery,
-    TicketQueryError, WireStatus, WireTimestamp,
+    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent, DispatchGroupOptions,
+    DispatchGroupState, DispatchGroupTransition, ParentTicket, SubIssueState, SubIssueStatus,
+    TicketDiscovery, TicketId, TicketQuery, TicketQueryError, WireStatus, WireTimestamp, WorkerId,
 };
 
 struct StubQuery(Mutex<VecDeque<String>>);
@@ -171,6 +171,139 @@ fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_b
     );
     let failed = DispatchGroup::from_state(failed_state).expect("Dispatch Group");
     assert!(failed.ready().is_empty());
+}
+
+#[test]
+fn lifecycle_events_dispatch_and_complete_a_ticket_with_a_branch() {
+    let mut group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Build","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    let ticket = TicketId::parse("ENG-101").expect("Ticket");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    assert_eq!(
+        group
+            .apply(DispatchGroupEvent::Dispatched {
+                ticket: ticket.clone(),
+                worker: worker.clone(),
+                at: WireTimestamp::new("2026-08-01T10:01:00Z"),
+            })
+            .expect("dispatch"),
+        DispatchGroupTransition::Dispatched
+    );
+    assert_eq!(
+        group
+            .apply(DispatchGroupEvent::Completed {
+                ticket: ticket.clone(),
+                worker,
+                branch: Some("adam/eng-101-build".to_owned()),
+                at: WireTimestamp::new("2026-08-01T10:05:00Z"),
+            })
+            .expect("completion"),
+        DispatchGroupTransition::Completed
+    );
+    let state = group.state();
+    let issue = &state.sub_issues[&ticket];
+    assert_eq!(issue.status.as_str(), "done");
+    assert_eq!(issue.branch.as_deref(), Some("adam/eng-101-build"));
+    assert_eq!(
+        issue.completed_at.as_ref().map(WireTimestamp::as_str),
+        Some("2026-08-01T10:05:00Z")
+    );
+}
+
+#[test]
+fn first_failure_requires_reset_before_retry_and_second_failure_is_terminal() {
+    let mut group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Build","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    let ticket = TicketId::parse("ENG-101").expect("Ticket");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    let dispatch = || DispatchGroupEvent::Dispatched {
+        ticket: ticket.clone(),
+        worker: worker.clone(),
+        at: WireTimestamp::new("2026-08-01T10:01:00Z"),
+    };
+    group.apply(dispatch()).expect("first dispatch");
+    assert_eq!(
+        group
+            .apply(DispatchGroupEvent::Failed {
+                ticket: ticket.clone(),
+                worker: worker.clone(),
+                at: WireTimestamp::new("2026-08-01T10:02:00Z"),
+            })
+            .expect("first failure"),
+        DispatchGroupTransition::RetryRequired
+    );
+    assert_eq!(
+        group.state().sub_issues[&ticket].status.as_str(),
+        "dispatched"
+    );
+    group
+        .apply(DispatchGroupEvent::Retried {
+            ticket: ticket.clone(),
+            worker: worker.clone(),
+        })
+        .expect("retry after reset");
+    assert_eq!(group.state().sub_issues[&ticket].retries, 1);
+    group.apply(dispatch()).expect("second dispatch");
+    assert_eq!(
+        group
+            .apply(DispatchGroupEvent::Failed {
+                ticket: ticket.clone(),
+                worker,
+                at: WireTimestamp::new("2026-08-01T10:04:00Z"),
+            })
+            .expect("second failure"),
+        DispatchGroupTransition::Failed
+    );
+    assert_eq!(group.state().sub_issues[&ticket].status.as_str(), "failed");
+    assert!(group.is_terminal());
+}
+
+#[test]
+fn merged_event_uses_the_compatible_skipped_on_main_representation() {
+    let mut group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Already delivered","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    let ticket = TicketId::parse("ENG-101").expect("Ticket");
+    assert_eq!(
+        group
+            .apply(DispatchGroupEvent::Merged {
+                ticket: ticket.clone(),
+                at: WireTimestamp::new("2026-08-01T10:06:00Z"),
+            })
+            .expect("merge"),
+        DispatchGroupTransition::Merged
+    );
+    let issue = &group.state().sub_issues[&ticket];
+    assert_eq!(issue.status.as_str(), "skipped");
+    assert_eq!(issue.branch.as_deref(), Some("main"));
+    assert_eq!(issue.skip_reason.as_deref(), Some("merged"));
+}
+
+#[test]
+fn lifecycle_events_reject_a_worker_that_does_not_own_the_ticket() {
+    let mut group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Build","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    let ticket = TicketId::parse("ENG-101").expect("Ticket");
+    group
+        .apply(DispatchGroupEvent::Dispatched {
+            ticket: ticket.clone(),
+            worker: WorkerId::parse("worker-01").expect("Worker"),
+            at: WireTimestamp::new("2026-08-01T10:01:00Z"),
+        })
+        .expect("dispatch");
+    assert!(
+        group
+            .apply(DispatchGroupEvent::Completed {
+                ticket,
+                worker: WorkerId::parse("worker-02").expect("Worker"),
+                branch: None,
+                at: WireTimestamp::new("2026-08-01T10:02:00Z"),
+            })
+            .is_err()
+    );
 }
 
 #[test]

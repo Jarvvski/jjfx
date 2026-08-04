@@ -10,7 +10,7 @@ use thiserror::Error;
 
 use crate::{
     DependencyGraph, DispatchDependencyContext, DispatchGroupOptions, DispatchGroupState,
-    SubIssueState, WireStatus, WireTimestamp,
+    SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
 };
 
 /// The five Sub-issue statuses persisted by Go wsg.
@@ -137,6 +137,71 @@ impl DispatchGroupStatusCounts {
     }
 }
 
+/// A pure lifecycle event applied to one Sub-issue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DispatchGroupEvent {
+    /// Assigns a pending Ticket to a Worker before launch.
+    Dispatched {
+        /// Ticket being launched.
+        ticket: TicketId,
+        /// Worker reserved for the launch.
+        worker: WorkerId,
+        /// Caller-provided dispatch timestamp.
+        at: WireTimestamp,
+    },
+    /// Records a successful Run outcome.
+    Completed {
+        /// Ticket whose Run completed.
+        ticket: TicketId,
+        /// Worker that ran the Ticket.
+        worker: WorkerId,
+        /// Resulting bookmark, when one was created.
+        branch: Option<String>,
+        /// Caller-provided completion timestamp.
+        at: WireTimestamp,
+    },
+    /// Records a failed Run observation.
+    Failed {
+        /// Ticket whose Run failed.
+        ticket: TicketId,
+        /// Worker that ran the Ticket.
+        worker: WorkerId,
+        /// Caller-provided failure timestamp.
+        at: WireTimestamp,
+    },
+    /// Makes a first failed Run pending again after Worker Reset succeeds.
+    Retried {
+        /// Ticket becoming dispatchable again.
+        ticket: TicketId,
+        /// Worker that was reset.
+        worker: WorkerId,
+    },
+    /// Records work delivered outside a Worker Run.
+    Merged {
+        /// Ticket now present on the main branch.
+        ticket: TicketId,
+        /// Caller-provided delivery timestamp.
+        at: WireTimestamp,
+    },
+}
+
+/// The observable result of a successful aggregate transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DispatchGroupTransition {
+    /// A Ticket was recorded as dispatched.
+    Dispatched,
+    /// A Ticket was recorded as completed.
+    Completed,
+    /// A first failure needs a successful Worker Reset before retry.
+    RetryRequired,
+    /// A failed Ticket was returned to pending after Reset.
+    Retried,
+    /// A Ticket reached terminal failure.
+    Failed,
+    /// A Ticket was recorded as merged on main.
+    Merged,
+}
+
 /// The pure Dispatch Group aggregate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchGroup {
@@ -187,6 +252,92 @@ impl DispatchGroup {
             SubIssueStatus::try_from(&issue.status)?;
         }
         Ok(Self { state })
+    }
+
+    /// Applies one pure lifecycle event and returns the resulting transition.
+    pub fn apply(
+        &mut self,
+        event: DispatchGroupEvent,
+    ) -> Result<DispatchGroupTransition, DispatchGroupError> {
+        match event {
+            DispatchGroupEvent::Dispatched { ticket, worker, at } => {
+                if self.state.sub_issues.iter().any(|(other, other_issue)| {
+                    other != &ticket
+                        && status_of(other_issue) == SubIssueStatus::Dispatched
+                        && other_issue.worker.as_ref() == Some(&worker)
+                }) {
+                    return Err(DispatchGroupError::Invalid(format!(
+                        "Worker {worker} is already assigned to an active Ticket"
+                    )));
+                }
+                let ready = self.ready();
+                let issue = self.issue_mut(&ticket)?;
+                if status_of(issue) != SubIssueStatus::Pending
+                    || issue.worker.is_some()
+                    || !ready.contains(&ticket)
+                {
+                    return Err(DispatchGroupError::Invalid(format!(
+                        "Ticket {ticket} is not dispatchable"
+                    )));
+                }
+                issue.status = WireStatus::new("dispatched");
+                issue.worker = Some(worker);
+                issue.dispatched_at = Some(at);
+                issue.completed_at = None;
+                Ok(DispatchGroupTransition::Dispatched)
+            }
+            DispatchGroupEvent::Completed {
+                ticket,
+                worker,
+                branch,
+                at,
+            } => {
+                let issue = self.issue_mut(&ticket)?;
+                ensure_assigned(issue, &ticket, &worker)?;
+                issue.status = WireStatus::new("done");
+                issue.completed_at = Some(at);
+                issue.branch = branch.filter(|branch| !branch.is_empty());
+                Ok(DispatchGroupTransition::Completed)
+            }
+            DispatchGroupEvent::Failed { ticket, worker, at } => {
+                let issue = self.issue_mut(&ticket)?;
+                ensure_assigned(issue, &ticket, &worker)?;
+                if issue.retries < 1 {
+                    return Ok(DispatchGroupTransition::RetryRequired);
+                }
+                issue.status = WireStatus::new("failed");
+                issue.completed_at = Some(at);
+                Ok(DispatchGroupTransition::Failed)
+            }
+            DispatchGroupEvent::Retried { ticket, worker } => {
+                let issue = self.issue_mut(&ticket)?;
+                ensure_assigned(issue, &ticket, &worker)?;
+                if issue.retries >= 1 {
+                    return Err(DispatchGroupError::Invalid(format!(
+                        "Ticket {ticket} has exhausted its retry allowance"
+                    )));
+                }
+                issue.status = WireStatus::new("pending");
+                issue.worker = None;
+                issue.dispatched_at = None;
+                issue.completed_at = None;
+                issue.retries += 1;
+                Ok(DispatchGroupTransition::Retried)
+            }
+            DispatchGroupEvent::Merged { ticket, at } => {
+                let issue = self.issue_mut(&ticket)?;
+                if status_of(issue) == SubIssueStatus::Dispatched {
+                    return Err(DispatchGroupError::Invalid(format!(
+                        "dispatched Ticket {ticket} cannot be marked merged"
+                    )));
+                }
+                issue.status = WireStatus::new("skipped");
+                issue.skip_reason = Some("merged".to_owned());
+                issue.branch = Some("main".to_owned());
+                issue.completed_at = Some(at);
+                Ok(DispatchGroupTransition::Merged)
+            }
+        }
     }
 
     /// Returns pending Tickets whose direct blockers all satisfy their dependencies.
@@ -312,6 +463,13 @@ impl DispatchGroup {
         maximum
     }
 
+    fn issue_mut(&mut self, ticket: &TicketId) -> Result<&mut SubIssueState, DispatchGroupError> {
+        self.state
+            .sub_issues
+            .get_mut(ticket)
+            .ok_or_else(|| DispatchGroupError::UnknownTicket(ticket.to_string()))
+    }
+
     /// Returns the compatible state without performing persistence.
     pub fn into_state(self) -> DispatchGroupState {
         self.state
@@ -321,6 +479,19 @@ impl DispatchGroup {
     pub fn state(&self) -> &DispatchGroupState {
         &self.state
     }
+}
+
+fn ensure_assigned(
+    issue: &SubIssueState,
+    ticket: &TicketId,
+    worker: &WorkerId,
+) -> Result<(), DispatchGroupError> {
+    if status_of(issue) != SubIssueStatus::Dispatched || issue.worker.as_ref() != Some(worker) {
+        return Err(DispatchGroupError::Invalid(format!(
+            "Ticket {ticket} is not assigned to Worker {worker}"
+        )));
+    }
+    Ok(())
 }
 
 fn status_of(issue: &SubIssueState) -> SubIssueStatus {
