@@ -9,8 +9,8 @@ use std::fmt;
 use thiserror::Error;
 
 use crate::{
-    DependencyGraph, DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus,
-    WireTimestamp,
+    DependencyGraph, DispatchDependencyContext, DispatchGroupOptions, DispatchGroupState,
+    SubIssueState, WireStatus, WireTimestamp,
 };
 
 /// The five Sub-issue statuses persisted by Go wsg.
@@ -205,6 +205,51 @@ impl DispatchGroup {
                 .then_some(id.clone())
             })
             .collect()
+    }
+
+    /// Builds stacked-branch context for a Ticket from its direct blockers.
+    pub fn dependency_context(
+        &self,
+        ticket: &crate::TicketId,
+    ) -> Result<Option<DispatchDependencyContext>, DispatchGroupError> {
+        let issue = self
+            .state
+            .sub_issues
+            .get(ticket)
+            .ok_or_else(|| DispatchGroupError::UnknownTicket(ticket.to_string()))?;
+        let branches = issue
+            .blocked_by
+            .iter()
+            .filter_map(|blocker| {
+                self.state
+                    .sub_issues
+                    .get(blocker)
+                    .and_then(|dependency| dependency.branch.clone())
+            })
+            .collect::<Vec<_>>();
+        if branches.is_empty() || branches.iter().all(|branch| branch == "main") {
+            return Ok(None);
+        }
+        let description = issue
+            .blocked_by
+            .iter()
+            .filter_map(|blocker| {
+                let dependency = self.state.sub_issues.get(blocker)?;
+                let branch = dependency.branch.as_deref()?;
+                (!branch.is_empty() && branch != "main").then(|| {
+                    format!(
+                        "- Branch: {branch} (implements {blocker}: \"{}\")",
+                        dependency.title
+                    )
+                })
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(Some(DispatchDependencyContext::new(
+            branches.clone(),
+            description,
+            branches[0].clone(),
+        )))
     }
 
     /// Returns whether every Sub-issue is terminal.

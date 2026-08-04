@@ -174,6 +174,88 @@ fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_b
 }
 
 #[test]
+fn dependency_context_is_absent_without_blockers_or_when_all_bases_are_main() {
+    let no_dependencies = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Standalone","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    assert!(
+        no_dependencies
+            .dependency_context(&TicketId::parse("ENG-101").expect("Ticket"))
+            .expect("context query")
+            .is_none()
+    );
+
+    let mut main_state = state();
+    let mut blocker = SubIssueState::new("Merged", WireStatus::new("skipped"), Vec::new());
+    blocker.branch = Some("main".to_owned());
+    main_state
+        .sub_issues
+        .insert(TicketId::parse("ENG-101").expect("Ticket"), blocker);
+    main_state.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Ticket"),
+        SubIssueState::new(
+            "Child",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Ticket")],
+        ),
+    );
+    let main_group = DispatchGroup::from_state(main_state).expect("main group");
+    assert!(
+        main_group
+            .dependency_context(&TicketId::parse("ENG-102").expect("Ticket"))
+            .expect("context query")
+            .is_none()
+    );
+}
+
+#[test]
+fn dependency_context_preserves_blocker_branch_order_and_uses_the_first_as_pr_base() {
+    let mut group_state = state();
+    for (id, title, branch) in [
+        ("ENG-101", "Auth", "adam/eng-101-auth"),
+        ("ENG-102", "API", "adam/eng-102-api"),
+    ] {
+        let mut blocker = SubIssueState::new(title, WireStatus::new("done"), Vec::new());
+        blocker.branch = Some(branch.to_owned());
+        group_state
+            .sub_issues
+            .insert(TicketId::parse(id).expect("Ticket"), blocker);
+    }
+    group_state.sub_issues.insert(
+        TicketId::parse("ENG-103").expect("Ticket"),
+        SubIssueState::new(
+            "Stacked child",
+            WireStatus::new("pending"),
+            vec![
+                TicketId::parse("ENG-101").expect("Ticket"),
+                TicketId::parse("ENG-102").expect("Ticket"),
+            ],
+        ),
+    );
+    let group = DispatchGroup::from_state(group_state).expect("Dispatch Group");
+    let context = group
+        .dependency_context(&TicketId::parse("ENG-103").expect("Ticket"))
+        .expect("context query")
+        .expect("stacked context");
+    assert_eq!(
+        context.base_revisions(),
+        ["adam/eng-101-auth", "adam/eng-102-api"]
+    );
+    assert_eq!(context.pull_request_base(), "adam/eng-101-auth");
+    assert!(context.description().contains("ENG-101"));
+    assert!(context.description().contains("ENG-102"));
+}
+
+#[test]
+fn dependency_context_rejects_a_ticket_outside_the_group() {
+    let group = DispatchGroup::from_state(state()).expect("empty group");
+    let error = group
+        .dependency_context(&TicketId::parse("ENG-999").expect("Ticket"))
+        .expect_err("unknown Ticket");
+    assert!(error.to_string().contains("ENG-999"));
+}
+
+#[test]
 fn empty_and_mixed_groups_report_terminal_state_and_status_counts() {
     let empty = DispatchGroup::from_state(state()).expect("empty group");
     assert!(empty.is_terminal());
