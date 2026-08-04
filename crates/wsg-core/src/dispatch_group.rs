@@ -4,6 +4,7 @@
 //! aggregate accepts and returns the wire state, but never reads files, clocks,
 //! processes, Linear, or terminal output.
 
+use std::collections::BTreeSet;
 use std::fmt;
 
 use thiserror::Error;
@@ -248,9 +249,7 @@ impl DispatchGroup {
 
     /// Wraps a compatible state after validating its domain status vocabulary.
     pub fn from_state(state: DispatchGroupState) -> Result<Self, DispatchGroupError> {
-        for issue in state.sub_issues.values() {
-            SubIssueStatus::try_from(&issue.status)?;
-        }
+        validate_state(&state)?;
         Ok(Self { state })
     }
 
@@ -479,6 +478,90 @@ impl DispatchGroup {
     pub fn state(&self) -> &DispatchGroupState {
         &self.state
     }
+}
+
+fn validate_state(state: &DispatchGroupState) -> Result<(), DispatchGroupError> {
+    let mut active_workers = BTreeSet::new();
+    for (ticket, issue) in &state.sub_issues {
+        let status = SubIssueStatus::try_from(&issue.status)?;
+        if issue.retries < 0 || issue.retries > 1 {
+            return Err(DispatchGroupError::Invalid(format!(
+                "Ticket {ticket} has invalid retry count {}",
+                issue.retries
+            )));
+        }
+        let mut blockers = BTreeSet::new();
+        for blocker in &issue.blocked_by {
+            if blocker == ticket {
+                return Err(DispatchGroupError::Invalid(format!(
+                    "Ticket {ticket} cannot block itself"
+                )));
+            }
+            if !blockers.insert(blocker) {
+                return Err(DispatchGroupError::Invalid(format!(
+                    "Ticket {ticket} lists Blocker {blocker} more than once"
+                )));
+            }
+            if !state.sub_issues.contains_key(blocker) {
+                return Err(DispatchGroupError::Invalid(format!(
+                    "Ticket {ticket} has unknown Blocker {blocker}"
+                )));
+            }
+        }
+        if status == SubIssueStatus::Dispatched {
+            let worker = issue.worker.as_ref().ok_or_else(|| {
+                DispatchGroupError::Invalid(format!("dispatched Ticket {ticket} has no Worker"))
+            })?;
+            if issue.dispatched_at.is_none() {
+                return Err(DispatchGroupError::Invalid(format!(
+                    "dispatched Ticket {ticket} has no dispatch timestamp"
+                )));
+            }
+            if !active_workers.insert(worker.clone()) {
+                return Err(DispatchGroupError::Invalid(format!(
+                    "Worker {worker} is assigned to multiple active Tickets"
+                )));
+            }
+        } else if status == SubIssueStatus::Pending && issue.worker.is_some() {
+            return Err(DispatchGroupError::Invalid(format!(
+                "pending Ticket {ticket} still has a Worker"
+            )));
+        }
+    }
+
+    let mut visiting = BTreeSet::new();
+    let mut visited = BTreeSet::new();
+    for ticket in state.sub_issues.keys() {
+        validate_acyclic(ticket, state, &mut visiting, &mut visited)?;
+    }
+    Ok(())
+}
+
+fn validate_acyclic(
+    ticket: &TicketId,
+    state: &DispatchGroupState,
+    visiting: &mut BTreeSet<TicketId>,
+    visited: &mut BTreeSet<TicketId>,
+) -> Result<(), DispatchGroupError> {
+    if visited.contains(ticket) {
+        return Ok(());
+    }
+    if !visiting.insert(ticket.clone()) {
+        return Err(DispatchGroupError::Invalid(format!(
+            "dependency cycle includes Ticket {ticket}"
+        )));
+    }
+    let blockers = &state
+        .sub_issues
+        .get(ticket)
+        .expect("validation iterates over known Tickets")
+        .blocked_by;
+    for blocker in blockers {
+        validate_acyclic(blocker, state, visiting, visited)?;
+    }
+    visiting.remove(ticket);
+    visited.insert(ticket.clone());
+    Ok(())
 }
 
 fn ensure_assigned(

@@ -261,6 +261,75 @@ fn first_failure_requires_reset_before_retry_and_second_failure_is_terminal() {
 }
 
 #[test]
+fn construction_rejects_cycles_and_impossible_persisted_relationships() {
+    let cyclic = graph(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"A","status":"Todo","blocked_by":["ENG-102"],"cross_repo":false},{"id":"ENG-102","title":"B","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    assert!(
+        DispatchGroup::from_dependency_graph(
+            &cyclic,
+            DispatchGroupBuildOptions::new(
+                WireTimestamp::new("2026-08-01T10:00:00Z"),
+                "owner/repo",
+                DispatchGroupOptions::new("opus"),
+            ),
+        )
+        .is_err()
+    );
+
+    let mut duplicate = state();
+    duplicate.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Ticket"),
+        SubIssueState::new(
+            "Duplicate blockers",
+            WireStatus::new("pending"),
+            vec![
+                TicketId::parse("ENG-102").expect("Ticket"),
+                TicketId::parse("ENG-102").expect("Ticket"),
+            ],
+        ),
+    );
+    duplicate.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Ticket"),
+        SubIssueState::new("Blocker", WireStatus::new("done"), Vec::new()),
+    );
+    assert!(DispatchGroup::from_state(duplicate).is_err());
+
+    let mut unknown = state();
+    unknown.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Ticket"),
+        SubIssueState::new(
+            "Unknown blocker",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-999").expect("Ticket")],
+        ),
+    );
+    assert!(DispatchGroup::from_state(unknown).is_err());
+}
+
+#[test]
+fn construction_rejects_duplicate_active_workers_and_excessive_retries() {
+    let mut invalid = state();
+    for id in ["ENG-101", "ENG-102"] {
+        let mut issue = SubIssueState::new(id, WireStatus::new("dispatched"), Vec::new());
+        issue.worker = Some(WorkerId::parse("worker-01").expect("Worker"));
+        issue.dispatched_at = Some(WireTimestamp::new("2026-08-01T10:01:00Z"));
+        invalid
+            .sub_issues
+            .insert(TicketId::parse(id).expect("Ticket"), issue);
+    }
+    assert!(DispatchGroup::from_state(invalid).is_err());
+
+    let mut retries = state();
+    let mut issue = SubIssueState::new("Too many retries", WireStatus::new("failed"), Vec::new());
+    issue.retries = 2;
+    retries
+        .sub_issues
+        .insert(TicketId::parse("ENG-101").expect("Ticket"), issue);
+    assert!(DispatchGroup::from_state(retries).is_err());
+}
+
+#[test]
 fn merged_event_uses_the_compatible_skipped_on_main_representation() {
     let mut group = group_from_response(
         r#"{"sub_issues":[{"id":"ENG-101","title":"Already delivered","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
