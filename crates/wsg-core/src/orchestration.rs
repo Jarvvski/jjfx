@@ -6,7 +6,16 @@
 
 use std::path::Path;
 
-use crate::{AgentRuntime, DispatchGroupStatusCounts, Repository, TicketId, WorkerId};
+use thiserror::Error;
+
+use crate::{
+    AgentRuntime, DispatchGroupError, DispatchGroupStatusCounts, Repository, TicketId, WorkerId,
+};
+
+#[cfg(test)]
+use crate::{DispatchGroup, DispatchGroupEvent, SubIssueStatus, WireTimestamp, WorkerStatus};
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,6 +154,125 @@ impl OrchestrationSummary {
     }
 }
 
+/// A failure to start, advance, or resume persistent orchestration.
+#[derive(Debug, Error)]
+pub enum OrchestrationError {
+    /// Compatible Dispatch Group state violated a domain invariant.
+    #[error(transparent)]
+    DispatchGroup(#[from] DispatchGroupError),
+    /// A dispatched Sub-issue has no persisted Worker assignment.
+    #[error("dispatched Ticket {ticket} has no Worker assignment")]
+    UnassignedWorker {
+        /// Dispatched Sub-issue.
+        ticket: TicketId,
+    },
+    /// A dispatched Sub-issue references a Worker that is not observable.
+    #[error("dispatched Ticket {ticket} references missing Worker {worker}")]
+    MissingWorker {
+        /// Dispatched Sub-issue.
+        ticket: TicketId,
+        /// Missing Worker assignment.
+        worker: WorkerId,
+    },
+    /// A Worker's persisted Ticket differs from its Dispatch Group assignment.
+    #[error("Worker {worker} belongs to Ticket {actual:?}, not dispatched Ticket {expected}")]
+    WorkerTicketMismatch {
+        /// Worker whose assignment disagrees.
+        worker: WorkerId,
+        /// Ticket expected by the Dispatch Group.
+        expected: TicketId,
+        /// Ticket currently persisted on the Worker.
+        actual: Option<String>,
+    },
+    /// A production or test execution adapter failed.
+    #[error("orchestration execution failed: {0}")]
+    Execution(String),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct WorkerObservation {
+    worker: WorkerId,
+    status: WorkerStatus,
+    ticket: Option<String>,
+    branch: Option<String>,
+}
+
+#[cfg(test)]
+trait OrchestrationExecution {
+    fn load_group(&mut self, parent: &TicketId) -> Result<DispatchGroup, OrchestrationError>;
+    fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError>;
+    fn save_group(&mut self, group: &DispatchGroup) -> Result<(), OrchestrationError>;
+    fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError>;
+    fn claim_ready(&mut self, ticket: &TicketId) -> Result<(), OrchestrationError>;
+    fn now(&mut self) -> Result<WireTimestamp, OrchestrationError>;
+}
+
+#[cfg(test)]
+fn run_with_execution<E: OrchestrationExecution>(
+    request: &OrchestrationRequest,
+    execution: &mut E,
+    observer: &mut impl FnMut(OrchestrationEvent),
+) -> Result<(), OrchestrationError> {
+    let mut group = execution.load_group(request.parent())?;
+    let workers = execution
+        .workers()?
+        .into_iter()
+        .map(|worker| (worker.worker.clone(), worker))
+        .collect::<BTreeMap<_, _>>();
+    let dispatched = group
+        .state()
+        .sub_issues
+        .iter()
+        .filter(|&(_ticket, issue)| {
+            SubIssueStatus::try_from(&issue.status).ok() == Some(SubIssueStatus::Dispatched)
+        })
+        .map(|(ticket, issue)| (ticket.clone(), issue.worker.clone()))
+        .collect::<Vec<_>>();
+
+    for (ticket, assigned_worker) in dispatched {
+        let worker = assigned_worker.ok_or_else(|| OrchestrationError::UnassignedWorker {
+            ticket: ticket.clone(),
+        })?;
+        let observation =
+            workers
+                .get(&worker)
+                .ok_or_else(|| OrchestrationError::MissingWorker {
+                    ticket: ticket.clone(),
+                    worker: worker.clone(),
+                })?;
+        if observation.ticket.as_deref() != Some(ticket.as_str()) {
+            return Err(OrchestrationError::WorkerTicketMismatch {
+                worker,
+                expected: ticket,
+                actual: observation.ticket.clone(),
+            });
+        }
+        if observation.status != WorkerStatus::Done {
+            continue;
+        }
+        let branch = observation.branch.clone();
+        group.apply(DispatchGroupEvent::Completed {
+            ticket: ticket.clone(),
+            worker: worker.clone(),
+            branch: branch.clone(),
+            at: execution.now()?,
+        })?;
+        execution.save_group(&group)?;
+        observer(OrchestrationEvent::Completed {
+            ticket,
+            worker: worker.clone(),
+            branch,
+        });
+        execution.reset_worker(&worker)?;
+    }
+
+    for ticket in group.ready() {
+        execution.claim_ready(&ticket)?;
+    }
+    Ok(())
+}
+
 /// The deep application interface for persistent orchestration.
 #[derive(Debug, Clone)]
 pub struct OrchestrationRunner {
@@ -159,5 +287,123 @@ impl OrchestrationRunner {
     /// Returns the Repository root owned by this runner.
     pub fn repository_root(&self) -> &Path {
         self.repository.root()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus};
+
+    struct FakeExecution {
+        group: DispatchGroup,
+        workers: Vec<WorkerObservation>,
+        calls: Vec<String>,
+    }
+
+    impl FakeExecution {
+        fn completed_blocker_chain() -> Self {
+            let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+            let dependent = TicketId::parse("ENG-102").expect("dependent Ticket");
+            let worker = WorkerId::parse("worker-01").expect("Worker");
+            let mut state = DispatchGroupState::new(
+                TicketId::parse("ENG-100").expect("Parent Ticket"),
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+                "owner/repo",
+                DispatchGroupOptions::new(""),
+            );
+            let mut completed_blocker = SubIssueState::new(
+                "Build the foundation",
+                WireStatus::new("dispatched"),
+                Vec::new(),
+            );
+            completed_blocker.worker = Some(worker.clone());
+            completed_blocker.dispatched_at = Some(WireTimestamp::new("2026-08-04T12:01:00Z"));
+            state.sub_issues.insert(blocker.clone(), completed_blocker);
+            state.sub_issues.insert(
+                dependent,
+                SubIssueState::new(
+                    "Use the foundation",
+                    WireStatus::new("pending"),
+                    vec![blocker.clone()],
+                ),
+            );
+            Self {
+                group: DispatchGroup::from_state(state).expect("valid group"),
+                workers: vec![WorkerObservation {
+                    worker,
+                    status: WorkerStatus::Done,
+                    ticket: Some(blocker.as_str().to_owned()),
+                    branch: Some("adam/eng-101-foundation".to_owned()),
+                }],
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl OrchestrationExecution for FakeExecution {
+        fn load_group(&mut self, _parent: &TicketId) -> Result<DispatchGroup, OrchestrationError> {
+            Ok(self.group.clone())
+        }
+
+        fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError> {
+            self.calls.push("workers".to_owned());
+            Ok(self.workers.clone())
+        }
+
+        fn save_group(&mut self, group: &DispatchGroup) -> Result<(), OrchestrationError> {
+            let ticket = TicketId::parse("ENG-101").expect("Ticket");
+            let status = group
+                .state()
+                .sub_issues
+                .get(&ticket)
+                .expect("saved Ticket")
+                .status
+                .as_str();
+            self.calls.push(format!("save:{ticket}:{status}"));
+            self.group = group.clone();
+            Ok(())
+        }
+
+        fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError> {
+            self.calls.push(format!("reset:{worker}"));
+            Ok(())
+        }
+
+        fn claim_ready(&mut self, ticket: &TicketId) -> Result<(), OrchestrationError> {
+            self.calls.push(format!("claim:{ticket}"));
+            Ok(())
+        }
+
+        fn now(&mut self) -> Result<WireTimestamp, OrchestrationError> {
+            Ok(WireTimestamp::new("2026-08-04T12:02:00Z"))
+        }
+    }
+
+    #[test]
+    fn existing_workers_are_reconciled_before_ready_dependents_are_claimed() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::completed_blocker_chain();
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("advance orchestration");
+
+        assert_eq!(
+            execution.calls,
+            vec![
+                "workers".to_owned(),
+                "save:ENG-101:done".to_owned(),
+                "reset:worker-01".to_owned(),
+                "claim:ENG-102".to_owned(),
+            ]
+        );
+        assert!(matches!(
+            events.first(),
+            Some(OrchestrationEvent::Completed { ticket, .. }) if ticket.as_str() == "ENG-101"
+        ));
     }
 }
