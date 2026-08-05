@@ -270,6 +270,35 @@ fn pool_commands_create_resize_list_remove_reset_and_destroy() {
 }
 
 #[test]
+fn status_displays_cosmetic_worker_aliases_without_changing_worker_input() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let create = run(binary, directory.path(), &["pool", "1"]);
+    assert!(create.status.success());
+
+    let status = run(binary, directory.path(), &["status"]);
+    let short_worker = String::from_utf8_lossy(&status.stdout)
+        .lines()
+        .nth(2)
+        .and_then(|line| line.split_whitespace().next())
+        .expect("status should include a Worker")
+        .to_owned();
+    let repository = wsg_core::Repository::open(directory.path()).expect("repository should open");
+    let worker = wsg_core::WorkerId::parse(format!("worker-{short_worker}"))
+        .expect("Worker ID should be valid");
+    repository
+        .worker_pool()
+        .set_alias(worker, "primary")
+        .expect("alias should be stored");
+
+    let aliased = run(binary, directory.path(), &["pool", "ls"]);
+    assert!(aliased.status.success());
+    let text = String::from_utf8_lossy(&aliased.stdout);
+    assert!(text.contains(&short_worker), "{text}");
+    assert!(text.contains("primary"), "{text}");
+}
+
+#[test]
 fn no_arguments_report_read_only_pool_capabilities_inside_a_repository() {
     let binary = env!("CARGO_BIN_EXE_wsg");
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
