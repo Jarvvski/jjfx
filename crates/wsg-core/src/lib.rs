@@ -33,7 +33,7 @@ pub use dispatch_prompt::{
 };
 pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationRequest,
-    OrchestrationRunner, OrchestrationSummary,
+    OrchestrationRunner, OrchestrationStart, OrchestrationSummary,
 };
 pub use pool::{
     CapacityShortage, PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot,

@@ -6,9 +6,42 @@ use rustix::fs::{FlockOperation, flock};
 use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
-    OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, PoolState, Repository,
-    StateChange, SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
+    OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, ParentTicket, PoolState,
+    Repository, RepositoryIdentity, StateChange, SubIssueState, TicketDiscovery, TicketId,
+    TicketQuery, TicketQueryError, WireStatus, WireTimestamp, WorkerId, WorkerState,
 };
+
+struct StaticQuery(&'static str);
+
+impl TicketQuery for StaticQuery {
+    fn query(&self, _prompt: &str) -> Result<String, TicketQueryError> {
+        Ok(self.0.to_owned())
+    }
+}
+
+fn install_idle_worker(repository: &Repository, worker: &WorkerId) {
+    repository
+        .state_store()
+        .pool()
+        .commit(
+            Expected::Missing,
+            StateChange::Replace(PoolState::new(
+                1,
+                "owner/repo",
+                vec![worker.clone()],
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+            )),
+        )
+        .expect("save pool");
+    repository
+        .state_store()
+        .worker(worker.clone())
+        .commit(
+            Expected::Missing,
+            StateChange::Replace(WorkerState::new(WireStatus::new("idle"))),
+        )
+        .expect("save idle Worker");
+}
 
 #[test]
 fn orchestration_request_and_repository_expose_the_frontend_neutral_seam() {
@@ -138,6 +171,120 @@ fn competing_parent_runner_returns_already_running_without_waiting() {
         error,
         wsg_core::OrchestrationError::AlreadyRunning { parent: actual } if actual == parent
     ));
+}
+
+#[test]
+fn discovery_releases_placeholder_before_persisting_a_real_group() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker(&repository, &worker);
+    let parent_id = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+    let discovery = TicketDiscovery::new(StaticQuery(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Foundation","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    ));
+
+    let result = repository
+        .orchestration_runner()
+        .discover(
+            &OrchestrationRequest::new(parent_id.clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+            &RepositoryIdentity::parse("owner/repo").expect("repository identity"),
+            "owner/repo",
+        )
+        .expect("discover group");
+    assert!(matches!(result, wsg_core::OrchestrationStart::Group));
+    let loaded = match repository
+        .state_store()
+        .dispatch_group(parent_id.clone())
+        .load()
+        .expect("load group")
+    {
+        wsg_core::Loaded::Present(value) => value.value,
+        wsg_core::Loaded::Missing => panic!("group missing"),
+    };
+    assert!(loaded.sub_issues.contains_key(&TicketId::parse("ENG-101").expect("Ticket")));
+    let worker_state = match repository
+        .state_store()
+        .worker(worker)
+        .load()
+        .expect("load Worker")
+    {
+        wsg_core::Loaded::Present(value) => value.value,
+        wsg_core::Loaded::Missing => panic!("Worker missing"),
+    };
+    assert_eq!(worker_state.status.as_str(), "idle");
+}
+
+#[test]
+fn failed_graph_discovery_releases_placeholder_and_surfaces_the_query_error() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker(&repository, &worker);
+    let parent_id = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+    let discovery = TicketDiscovery::new(StaticQuery("not JSON"));
+
+    let error = repository
+        .orchestration_runner()
+        .discover(
+            &OrchestrationRequest::new(parent_id, AgentRuntime::Claude),
+            &parent,
+            &discovery,
+            &RepositoryIdentity::parse("owner/repo").expect("repository identity"),
+            "owner/repo",
+        )
+        .expect_err("malformed graph should fail");
+    assert!(matches!(error, wsg_core::OrchestrationError::Execution(_)));
+    let worker_state = match repository
+        .state_store()
+        .worker(worker)
+        .load()
+        .expect("load Worker")
+    {
+        wsg_core::Loaded::Present(value) => value.value,
+        wsg_core::Loaded::Missing => panic!("Worker missing"),
+    };
+    assert_eq!(worker_state.status.as_str(), "idle");
+}
+
+#[test]
+fn empty_graph_uses_the_reserved_parent_fallback_and_releases_on_launch_failure() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker(&repository, &worker);
+    let parent_id = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+    let discovery = TicketDiscovery::new(StaticQuery(r#"{"sub_issues":[]}"#));
+
+    let error = repository
+        .orchestration_runner()
+        .discover(
+            &OrchestrationRequest::new(parent_id, AgentRuntime::Claude),
+            &parent,
+            &discovery,
+            &RepositoryIdentity::parse("owner/repo").expect("repository identity"),
+            "owner/repo",
+        )
+        .expect_err("fallback launch needs a provisioned Worker workspace");
+    assert!(matches!(error, wsg_core::OrchestrationError::Execution(_)));
+    let worker_state = match repository
+        .state_store()
+        .worker(worker)
+        .load()
+        .expect("load Worker")
+    {
+        wsg_core::Loaded::Present(value) => value.value,
+        wsg_core::Loaded::Missing => panic!("Worker missing"),
+    };
+    assert_eq!(worker_state.status.as_str(), "idle");
 }
 
 #[test]

@@ -16,11 +16,13 @@ use thiserror::Error;
 
 use crate::pool::current_timestamp;
 use crate::{
-    AgentRuntime, CommitOutcome, DirectDispatchError, DirectDispatchRequest, DispatchGroup,
-    DispatchGroupError, DispatchGroupEvent, DispatchGroupState, DispatchGroupStatusCounts,
-    Expected, Loaded, Repository, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus,
-    Ticket, TicketId, TicketStatus, TicketTitle, WireTimestamp, WorkerActions, WorkerId,
-    WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    AgentRuntime, CommitOutcome, DirectDispatchError, DirectDispatchRequest, DirectDispatchSuccess,
+    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent,
+    DispatchGroupOptions, DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded,
+    ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision,
+    SubIssueStatus, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle,
+    WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
+    WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -180,6 +182,15 @@ pub enum OrchestrationEvent {
     Terminal(OrchestrationSummary),
 }
 
+/// The result of graph discovery before orchestration begins.
+#[derive(Debug)]
+pub enum OrchestrationStart {
+    /// A persisted Dispatch Group is ready for foreground or detached watching.
+    Group,
+    /// No children existed, so the reserved placeholder launched the Parent directly.
+    Direct(DirectDispatchSuccess),
+}
+
 /// Terminal information returned without choosing terminal formatting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationSummary {
@@ -255,6 +266,14 @@ pub enum OrchestrationError {
     AlreadyRunning {
         /// Parent Ticket whose runner lock is held.
         parent: TicketId,
+    },
+    /// Discovery failed while a placeholder Worker was reserved.
+    #[error("discovery failed: {primary}; additionally failed to release placeholder Reservation: {cleanup}")]
+    DiscoveryCleanup {
+        /// Original graph discovery failure.
+        primary: String,
+        /// Placeholder release failure.
+        cleanup: String,
     },
     /// The configured polling cycle bound was reached before terminal state.
     #[error("Dispatch Group {parent} did not reach terminal state within {cycles} cycles")]
@@ -703,6 +722,79 @@ impl OrchestrationRunner {
     /// Returns the Repository root owned by this runner.
     pub fn repository_root(&self) -> &Path {
         self.repository.root()
+    }
+
+    /// Reserves a placeholder while discovering children, then releases it before
+    /// persisting a real group or hands it to the Parent fallback Run.
+    pub fn discover<Q: TicketQuery>(
+        &self,
+        request: &OrchestrationRequest,
+        parent: &ParentTicket,
+        discovery: &TicketDiscovery<Q>,
+        repository: &RepositoryIdentity,
+        gh_repo: impl Into<String>,
+    ) -> Result<OrchestrationStart, OrchestrationError> {
+        let title = TicketTitle::parse(parent.id().as_str())
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        let status = TicketStatus::parse("Todo")
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        let mut placeholder = DirectDispatchRequest::new(
+            Ticket::new(parent.id().clone(), title, status),
+            RunMode::Background,
+        );
+        if let Some(model) = request.model() {
+            placeholder = placeholder.with_model(model);
+        }
+        let reservation = match self.repository.direct_dispatch().reserve(&placeholder) {
+            Ok(reservation) => reservation,
+            Err(error) => return Err(OrchestrationError::Execution(error.to_string())),
+        };
+        let graph = match discovery.dependency_graph(parent, repository) {
+            Ok(graph) => graph,
+            Err(error) => {
+                let primary = error.to_string();
+                return match reservation.release() {
+                    Ok(()) => Err(OrchestrationError::Execution(primary)),
+                    Err(cleanup) => Err(OrchestrationError::DiscoveryCleanup {
+                        primary,
+                        cleanup: cleanup.to_string(),
+                    }),
+                };
+            }
+        };
+        if graph.sub_issues().is_empty() {
+            return self
+                .repository
+                .direct_dispatch()
+                .dispatch_reserved(reservation, &placeholder)
+                .map(OrchestrationStart::Direct)
+                .map_err(|error| OrchestrationError::Execution(error.to_string()));
+        }
+        reservation
+            .release()
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        let mut group_options =
+            DispatchGroupOptions::new(request.model().unwrap_or_default().to_owned());
+        group_options.agent = Some(WireAgent::new(request.agent_runtime().as_str()));
+        let options = DispatchGroupBuildOptions::new(
+            current_timestamp().map_err(|error| OrchestrationError::Execution(error.to_string()))?,
+            gh_repo,
+            group_options,
+        );
+        let group = DispatchGroup::from_dependency_graph(&graph, options)?;
+        let state = group.clone().into_state();
+        match self
+            .repository
+            .state_store()
+            .dispatch_group(parent.id().clone())
+            .commit(Expected::Missing, StateChange::Replace(state))
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?
+        {
+            CommitOutcome::Applied(_) => Ok(OrchestrationStart::Group),
+            CommitOutcome::Conflict(_) => Err(OrchestrationError::ConcurrentChange {
+                parent: parent.id().clone(),
+            }),
+        }
     }
 
     /// Reconciles one persisted group and dispatches every currently ready Ticket that fits.
