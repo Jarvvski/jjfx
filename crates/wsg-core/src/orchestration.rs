@@ -184,6 +184,12 @@ pub enum OrchestrationError {
         /// Ticket currently persisted on the Worker.
         actual: Option<String>,
     },
+    /// Another runner committed the Dispatch Group first.
+    #[error("Dispatch Group {parent} changed concurrently")]
+    ConcurrentChange {
+        /// Parent Ticket whose optimistic revision was stale.
+        parent: TicketId,
+    },
     /// A production or test execution adapter failed.
     #[error("orchestration execution failed: {0}")]
     Execution(String),
@@ -199,10 +205,25 @@ struct WorkerObservation {
 }
 
 #[cfg(test)]
+struct LoadedOrchestration<R> {
+    group: DispatchGroup,
+    revision: R,
+}
+
+#[cfg(test)]
 trait OrchestrationExecution {
-    fn load_group(&mut self, parent: &TicketId) -> Result<DispatchGroup, OrchestrationError>;
+    type Revision;
+
+    fn load_group(
+        &mut self,
+        parent: &TicketId,
+    ) -> Result<LoadedOrchestration<Self::Revision>, OrchestrationError>;
     fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError>;
-    fn save_group(&mut self, group: &DispatchGroup) -> Result<(), OrchestrationError>;
+    fn save_group(
+        &mut self,
+        expected: &Self::Revision,
+        group: &DispatchGroup,
+    ) -> Result<Self::Revision, OrchestrationError>;
     fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError>;
     fn claim_ready(&mut self, ticket: &TicketId) -> Result<(), OrchestrationError>;
     fn now(&mut self) -> Result<WireTimestamp, OrchestrationError>;
@@ -213,8 +234,10 @@ fn run_with_execution<E: OrchestrationExecution>(
     request: &OrchestrationRequest,
     execution: &mut E,
     observer: &mut impl FnMut(OrchestrationEvent),
-) -> Result<(), OrchestrationError> {
-    let mut group = execution.load_group(request.parent())?;
+) -> Result<E::Revision, OrchestrationError> {
+    let loaded = execution.load_group(request.parent())?;
+    let mut group = loaded.group;
+    let mut revision = loaded.revision;
     let workers = execution
         .workers()?
         .into_iter()
@@ -258,7 +281,7 @@ fn run_with_execution<E: OrchestrationExecution>(
             branch: branch.clone(),
             at: execution.now()?,
         })?;
-        execution.save_group(&group)?;
+        revision = execution.save_group(&revision, &group)?;
         observer(OrchestrationEvent::Completed {
             ticket,
             worker: worker.clone(),
@@ -270,7 +293,7 @@ fn run_with_execution<E: OrchestrationExecution>(
     for ticket in group.ready() {
         execution.claim_ready(&ticket)?;
     }
-    Ok(())
+    Ok(revision)
 }
 
 /// The deep application interface for persistent orchestration.
@@ -297,8 +320,10 @@ mod tests {
 
     struct FakeExecution {
         group: DispatchGroup,
+        revision: u64,
         workers: Vec<WorkerObservation>,
         calls: Vec<String>,
+        fail_next_save: bool,
     }
 
     impl FakeExecution {
@@ -330,6 +355,7 @@ mod tests {
             );
             Self {
                 group: DispatchGroup::from_state(state).expect("valid group"),
+                revision: 0,
                 workers: vec![WorkerObservation {
                     worker,
                     status: WorkerStatus::Done,
@@ -337,13 +363,26 @@ mod tests {
                     branch: Some("adam/eng-101-foundation".to_owned()),
                 }],
                 calls: Vec::new(),
+                fail_next_save: false,
             }
+        }
+
+        fn fail_next_save(&mut self) {
+            self.fail_next_save = true;
         }
     }
 
     impl OrchestrationExecution for FakeExecution {
-        fn load_group(&mut self, _parent: &TicketId) -> Result<DispatchGroup, OrchestrationError> {
-            Ok(self.group.clone())
+        type Revision = u64;
+
+        fn load_group(
+            &mut self,
+            _parent: &TicketId,
+        ) -> Result<LoadedOrchestration<Self::Revision>, OrchestrationError> {
+            Ok(LoadedOrchestration {
+                group: self.group.clone(),
+                revision: self.revision,
+            })
         }
 
         fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError> {
@@ -351,7 +390,11 @@ mod tests {
             Ok(self.workers.clone())
         }
 
-        fn save_group(&mut self, group: &DispatchGroup) -> Result<(), OrchestrationError> {
+        fn save_group(
+            &mut self,
+            expected: &Self::Revision,
+            group: &DispatchGroup,
+        ) -> Result<Self::Revision, OrchestrationError> {
             let ticket = TicketId::parse("ENG-101").expect("Ticket");
             let status = group
                 .state()
@@ -360,9 +403,17 @@ mod tests {
                 .expect("saved Ticket")
                 .status
                 .as_str();
-            self.calls.push(format!("save:{ticket}:{status}"));
+            self.calls
+                .push(format!("save:r{expected}:{ticket}:{status}"));
+            if self.fail_next_save || *expected != self.revision {
+                self.fail_next_save = false;
+                return Err(OrchestrationError::ConcurrentChange {
+                    parent: group.state().parent.clone(),
+                });
+            }
             self.group = group.clone();
-            Ok(())
+            self.revision += 1;
+            Ok(self.revision)
         }
 
         fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError> {
@@ -381,6 +432,27 @@ mod tests {
     }
 
     #[test]
+    fn a_persistence_conflict_stops_before_events_resets_or_new_claims() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::completed_blocker_chain();
+        execution.fail_next_save();
+        let mut events = Vec::new();
+
+        let error = run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect_err("stale revision must stop the advance");
+
+        assert!(matches!(error, OrchestrationError::ConcurrentChange { .. }));
+        assert_eq!(
+            execution.calls,
+            vec!["workers".to_owned(), "save:r0:ENG-101:done".to_owned()]
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
     fn existing_workers_are_reconciled_before_ready_dependents_are_claimed() {
         let request = OrchestrationRequest::new(
             TicketId::parse("ENG-100").expect("Parent Ticket"),
@@ -396,7 +468,7 @@ mod tests {
             execution.calls,
             vec![
                 "workers".to_owned(),
-                "save:ENG-101:done".to_owned(),
+                "save:r0:ENG-101:done".to_owned(),
                 "reset:worker-01".to_owned(),
                 "claim:ENG-102".to_owned(),
             ]
