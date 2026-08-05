@@ -1,6 +1,6 @@
 # Restore wsg Workspace and Worker Pool CLI compatibility
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 
@@ -58,3 +58,7 @@ Use black-box binary tests against temporary jj repositories and compare semanti
 
 - issues/07-port-workspace-and-pool-lifecycle.md
 - issues/09-port-logs-sessions-and-worker-actions.md
+
+## Comments
+
+2026-08-05 - Claimed for implementation. The approved compatibility decisions are to match the local Go wsg behavior, deepen wsg-core with a Repository-owned Workspaces module, accept full and short Worker IDs but not cosmetic aliases as input, set wsg to 0.8.1 and jjfx to 0.29.0, and use status as the non-TTY no-argument fallback with a repo-local test install.

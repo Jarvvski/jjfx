@@ -50,6 +50,279 @@ impl AdHocWorkspaceError {
     }
 }
 
+/// The frontend's explicit decision for a clean operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CleanDecision {
+    /// Apply the clean plan.
+    Confirmed,
+    /// Leave every planned Workspace untouched.
+    Declined,
+}
+
+/// A Workspace entry projected from jj and the compatible cache.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceEntry {
+    name: String,
+    path: PathBuf,
+}
+
+impl WorkspaceEntry {
+    /// Returns the stable jj Workspace name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Returns the projected filesystem path.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Reports whether the projected Workspace directory is absent.
+    pub fn is_missing(&self) -> bool {
+        !self.path.is_dir()
+    }
+}
+
+/// An ordered Workspace projection used by CLI adapters and tests.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceSnapshot {
+    entries: Vec<WorkspaceEntry>,
+}
+
+impl WorkspaceSnapshot {
+    /// Returns Workspaces in compatible cache order.
+    pub fn entries(&self) -> &[WorkspaceEntry] {
+        &self.entries
+    }
+}
+
+/// A Workspace add result that distinguishes default, existing, and created paths.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceAddOutcome {
+    /// The default Workspace was requested.
+    Default(PathBuf),
+    /// The requested Workspace already existed.
+    Existing(AdHocWorkspace),
+    /// A new Workspace was created.
+    Created(AdHocWorkspace),
+}
+
+/// An immutable set of Workspace names selected for cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceCleanPlan {
+    entries: Vec<WorkspaceEntry>,
+}
+
+impl WorkspaceCleanPlan {
+    /// Returns the ordered non-default entries selected for cleanup.
+    pub fn entries(&self) -> &[WorkspaceEntry] {
+        &self.entries
+    }
+}
+
+/// Deep Repository-owned Workspace discovery and lifecycle operations.
+#[derive(Debug, Clone)]
+pub struct Workspaces {
+    repository: Repository,
+}
+
+impl Workspaces {
+    pub(crate) fn new(repository: Repository) -> Self {
+        Self { repository }
+    }
+
+    /// Returns the compatible base directory for named Workspaces.
+    pub fn base_dir(&self) -> PathBuf {
+        workspace_base(self.repository.root())
+    }
+
+    /// Resolves a Workspace name without requiring it to exist.
+    pub fn path(&self, name: &str) -> PathBuf {
+        if name == DEFAULT_WORKSPACE {
+            self.repository.root().to_path_buf()
+        } else {
+            self.base_dir().join(name)
+        }
+    }
+
+    /// Reads the ordered Workspace projection, refreshing a missing or stale cache.
+    pub fn snapshot(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
+        let cache = cache_path(self.repository.root());
+        if !cache.is_file() || cache_is_stale(self.repository.root(), &cache) {
+            return self.refresh();
+        }
+        let entries = read_cache(&cache)
+            .map_err(|error| AdHocWorkspaceError::new(error.message))?
+            .into_iter()
+            .map(|(name, path)| WorkspaceEntry { name, path })
+            .collect();
+        Ok(WorkspaceSnapshot { entries })
+    }
+
+    /// Rebuilds the compatible Workspace cache from jj's live Workspace list.
+    pub fn refresh(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
+        let names = workspace_names(self.repository.root())
+            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        let mut entries = Vec::with_capacity(names.len() + 1);
+        let mut has_default = false;
+        for name in names {
+            if name == DEFAULT_WORKSPACE {
+                has_default = true;
+            }
+            entries.push(WorkspaceEntry {
+                path: self.path(&name),
+                name,
+            });
+        }
+        if !has_default {
+            entries.insert(
+                0,
+                WorkspaceEntry {
+                    name: DEFAULT_WORKSPACE.to_owned(),
+                    path: self.repository.root().to_path_buf(),
+                },
+            );
+        }
+        let cache_entries = entries
+            .iter()
+            .map(|entry| (entry.name.clone(), entry.path.clone()))
+            .collect::<Vec<_>>();
+        write_cache(&cache_path(self.repository.root()), &cache_entries)
+            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        Ok(WorkspaceSnapshot { entries })
+    }
+
+    /// Adds a Workspace, preserving the Go-compatible idempotent behavior.
+    pub fn add(
+        &self,
+        requested_name: &str,
+        revision: Option<&str>,
+    ) -> Result<WorkspaceAddOutcome, AdHocWorkspaceError> {
+        let name = requested_name.trim();
+        validate_workspace_name(name)?;
+        if name == DEFAULT_WORKSPACE {
+            return Ok(WorkspaceAddOutcome::Default(
+                self.repository.root().to_path_buf(),
+            ));
+        }
+        let snapshot = self.snapshot()?;
+        if let Some(existing) = snapshot.entries.iter().find(|entry| entry.name == name) {
+            return Ok(WorkspaceAddOutcome::Existing(AdHocWorkspace {
+                name: name.to_owned(),
+                path: existing.path.clone(),
+            }));
+        }
+        let path = self.path(name);
+        let base = path
+            .parent()
+            .ok_or_else(|| AdHocWorkspaceError::new("workspace path has no parent"))?;
+        fs::create_dir_all(base).map_err(|error| {
+            AdHocWorkspaceError::new(format!("create workspace directory: {error}"))
+        })?;
+        add_workspace_with_revision(self.repository.root(), name, &path, revision)
+            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        copy_setup_sources(self.repository.root(), &path)
+            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        self.refresh()?;
+        Ok(WorkspaceAddOutcome::Created(AdHocWorkspace {
+            name: name.to_owned(),
+            path,
+        }))
+    }
+
+    /// Removes one named Workspace, optionally skipping the repository cleanup hook.
+    pub fn remove(&self, name: &str, force: bool) -> Result<bool, AdHocWorkspaceError> {
+        if name == DEFAULT_WORKSPACE {
+            return Err(AdHocWorkspaceError::new(
+                "the default workspace cannot be deleted",
+            ));
+        }
+        let path = self.path(name);
+        if !force && path.is_dir() {
+            let output = Command::new("mise")
+                .args(["run", ":dev", "--", "murder"])
+                .current_dir(&path)
+                .output()
+                .map_err(|error| {
+                    AdHocWorkspaceError::new(format!("run workspace cleanup: {error}"))
+                })?;
+            if !output.status.success() {
+                return Err(AdHocWorkspaceError::new(format!(
+                    "Cleanup failed for {name}:\n{}",
+                    command_error(&output)
+                )));
+            }
+        }
+        let existed = path.is_dir();
+        let names = workspace_names(self.repository.root())
+            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        if names.iter().any(|candidate| candidate == name) {
+            forget_workspace(self.repository.root(), name)
+                .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        }
+        if existed {
+            fs::remove_dir_all(&path).map_err(|error| {
+                AdHocWorkspaceError::new(format!("remove Workspace directory: {error}"))
+            })?;
+        }
+        let _ = unproject_cache_entry(self.repository.root(), name);
+        Ok(existed)
+    }
+
+    /// Plans removal of every non-default Workspace in projection order.
+    pub fn plan_clean(&self) -> Result<WorkspaceCleanPlan, AdHocWorkspaceError> {
+        let snapshot = self.snapshot()?;
+        Ok(WorkspaceCleanPlan {
+            entries: snapshot
+                .entries
+                .into_iter()
+                .filter(|entry| entry.name != DEFAULT_WORKSPACE)
+                .collect(),
+        })
+    }
+
+    /// Applies or declines a previously rendered clean plan.
+    pub fn clean(
+        &self,
+        plan: &WorkspaceCleanPlan,
+        decision: CleanDecision,
+    ) -> Result<(), AdHocWorkspaceError> {
+        if decision == CleanDecision::Declined {
+            return Ok(());
+        }
+        for entry in &plan.entries {
+            self.remove(&entry.name, false)?;
+        }
+        Ok(())
+    }
+}
+
+fn validate_workspace_name(name: &str) -> Result<(), AdHocWorkspaceError> {
+    let path = Path::new(name);
+    if name.is_empty()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(AdHocWorkspaceError::new("workspace name required"));
+    }
+    Ok(())
+}
+
+fn cache_is_stale(root: &Path, cache: &Path) -> bool {
+    let operation_heads = root.join(".jj/repo/op_heads/heads");
+    match (fs::metadata(cache), fs::metadata(operation_heads)) {
+        (Ok(cache), Ok(operation_heads)) => operation_heads
+            .modified()
+            .ok()
+            .zip(cache.modified().ok())
+            .is_some_and(|(operation, cached)| operation > cached),
+        _ => false,
+    }
+}
+
 /// Creates an Ad Hoc Workspace without applying Worker Pool policy.
 pub(crate) fn create_ad_hoc(
     repository: &Repository,
@@ -443,8 +716,8 @@ fn ensure_unclaimed(
     Ok(())
 }
 
-pub(crate) fn worker_path(root: &Path, worker_id: &WorkerId) -> PathBuf {
-    let base = env::var_os("JJ_WS_DIR")
+fn workspace_base(root: &Path) -> PathBuf {
+    env::var_os("JJ_WS_DIR")
         .map(PathBuf::from)
         .map(|base| {
             if base.is_absolute() {
@@ -461,13 +734,29 @@ pub(crate) fn worker_path(root: &Path, worker_id: &WorkerId) -> PathBuf {
             root.parent()
                 .unwrap_or(root)
                 .join(format!("{name}-workspaces"))
-        });
-    base.join(worker_id.as_str())
+        })
+}
+
+pub(crate) fn worker_path(root: &Path, worker_id: &WorkerId) -> PathBuf {
+    workspace_base(root).join(worker_id.as_str())
 }
 
 fn add_workspace(root: &Path, name: &str, path: &Path) -> Result<(), WorkerWorkspaceError> {
-    let output = Command::new("jj")
-        .args(["workspace", "add", "--name", name])
+    add_workspace_with_revision(root, name, path, None)
+}
+
+fn add_workspace_with_revision(
+    root: &Path,
+    name: &str,
+    path: &Path,
+    revision: Option<&str>,
+) -> Result<(), WorkerWorkspaceError> {
+    let mut command = Command::new("jj");
+    command.args(["workspace", "add", "--name", name]);
+    if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
+        command.args(["--revision", revision]);
+    }
+    let output = command
         .arg(path)
         .current_dir(root)
         .output()

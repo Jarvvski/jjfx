@@ -68,7 +68,10 @@ pub use worker_actions::{
     ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration,
     WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
-pub use workspace::{AdHocWorkspace, AdHocWorkspaceError, WorkerWorkspace, WorkerWorkspaceError};
+pub use workspace::{
+    AdHocWorkspace, AdHocWorkspaceError, CleanDecision, WorkerWorkspace, WorkerWorkspaceError,
+    WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceSnapshot, Workspaces,
+};
 
 /// The migration capabilities currently exposed by a discovered repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +145,12 @@ impl Repository {
         OrchestrationRunner::new(self.clone())
     }
 
-    /// Creates an Ad Hoc Workspace at the compatible sibling path.
+    /// Opens the deep Repository-owned Workspace module.
+    pub fn workspaces(&self) -> Workspaces {
+        Workspaces::new(self.clone())
+    }
+
+    /// Creates an Ad Hoc Workspace at the jjfx-compatible sibling path.
     pub fn create_ad_hoc_workspace(
         &self,
         requested_name: &str,

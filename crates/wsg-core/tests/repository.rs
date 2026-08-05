@@ -4,7 +4,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use wsg_core::{Loaded, MigrationCapabilities, Repository, RepositoryError, WorkerId};
+use wsg_core::{
+    CleanDecision, Loaded, MigrationCapabilities, Repository, RepositoryError, WorkerId,
+    WorkspaceAddOutcome,
+};
 
 fn local_repository() -> (TempDir, Repository) {
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -59,6 +62,46 @@ fn workspace_names(root: &Path) -> Vec<String> {
         .lines()
         .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
         .collect()
+}
+
+#[test]
+fn workspaces_facade_exposes_compatible_paths_and_idempotent_add() {
+    let (_temporary_directory, repository) = local_repository();
+    let workspaces = repository.workspaces();
+
+    assert_eq!(workspaces.path("default"), repository.root().to_path_buf());
+    assert_eq!(
+        workspaces.base_dir(),
+        repository
+            .root()
+            .parent()
+            .expect("repository parent")
+            .join(format!(
+                "{}-workspaces",
+                repository
+                    .root()
+                    .file_name()
+                    .expect("repository name")
+                    .to_string_lossy()
+            ))
+    );
+
+    let added = workspaces
+        .add("feature", None)
+        .expect("workspace should be added");
+    assert!(matches!(added, WorkspaceAddOutcome::Created(_)));
+    let existing = workspaces
+        .add("feature", None)
+        .expect("existing workspace should be idempotent");
+    assert!(matches!(existing, WorkspaceAddOutcome::Existing(_)));
+
+    let plan = workspaces.plan_clean().expect("clean plan should load");
+    assert_eq!(plan.entries().len(), 1);
+    assert_eq!(plan.entries()[0].name(), "feature");
+    workspaces
+        .clean(&plan, CleanDecision::Declined)
+        .expect("declining clean should succeed");
+    assert!(workspaces.path("feature").is_dir());
 }
 
 #[test]
