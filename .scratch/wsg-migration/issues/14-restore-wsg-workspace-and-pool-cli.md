@@ -1,6 +1,6 @@
 # Restore wsg Workspace and Worker Pool CLI compatibility
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -40,12 +40,12 @@ Use black-box binary tests against temporary jj repositories and compare semanti
 
 ## Acceptance Criteria
 
-- [ ] Workspace and Worker Pool commands cover the current compatibility inventory.
-- [ ] Scripts receive paths only on stdout.
-- [ ] Status reconciles dead Workers before display.
-- [ ] Versioning is explicit for both binaries.
-- [ ] Installing for test does not overwrite the user's current Go wsg binary.
-- [ ] `mise run check` is green.
+- [x] Workspace and Worker Pool commands cover the current compatibility inventory.
+- [x] Scripts receive paths only on stdout.
+- [x] Status reconciles dead Workers before display.
+- [x] Versioning is explicit for both binaries.
+- [x] Installing for test does not overwrite the user's current Go wsg binary.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -62,3 +62,15 @@ Use black-box binary tests against temporary jj repositories and compare semanti
 ## Comments
 
 2026-08-05 - Claimed for implementation. The approved compatibility decisions are to match the local Go wsg behavior, deepen wsg-core with a Repository-owned Workspaces module, accept full and short Worker IDs but not cosmetic aliases as input, set wsg to 0.8.1 and jjfx to 0.29.0, and use status as the non-TTY no-argument fallback with a repo-local test install.
+
+## Answer
+
+Implemented and verified the Rust Workspace and Worker Pool CLI surface. The
+shared `Workspaces` module now owns compatible cache/path policy, revisions,
+idempotent add, removal, clean planning, and cleanup. The `wsg` binary exposes
+Workspace and Pool commands, aliases, reconciled status, short/full Worker ID
+resolution, independent version output, and safe no-Pool behavior. The
+repository-local `wsg-test-install` task never writes to the user's PATH.
+
+Verification: `mise run check` passed, all 11 black-box wsg CLI tests passed,
+and the isolated install reported `wsg 0.8.1`.
