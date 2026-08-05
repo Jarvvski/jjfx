@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-05 - Restored the compatible Workspace and Worker Pool command surface
+  in the Rust `wsg` binary, including independent versioning (`wsg` 0.8.1 and
+  `jjfx` 0.29.0) without changing the installed Go binary.
+
 - 2026-07-21 - Added read-only Worker Pool snapshot import to jjfx, including
   compatibility diagnostics, Worker metadata rows, and a visible read-only
   indicator (v0.28.1).

@@ -72,15 +72,17 @@ fn help_and_version_work_outside_a_repository() {
     assert!(help.stderr.is_empty());
     assert!(String::from_utf8_lossy(&help.stdout).contains("Usage: wsg [OPTIONS]"));
 
-    let version = Command::new(binary)
-        .arg("--version")
-        .current_dir(temporary_directory.path())
-        .output()
-        .expect("wsg should run");
-    assert!(version.status.success());
-    let expected_version = format!("wsg {}\n", env!("CARGO_PKG_VERSION"));
-    assert_eq!(String::from_utf8_lossy(&version.stdout), expected_version);
-    assert!(version.stderr.is_empty());
+    for argument in ["version", "--version"] {
+        let version = Command::new(binary)
+            .arg(argument)
+            .current_dir(temporary_directory.path())
+            .output()
+            .expect("wsg should run");
+        assert!(version.status.success());
+        let expected_version = format!("wsg {}\n", env!("CARGO_PKG_VERSION"));
+        assert_eq!(String::from_utf8_lossy(&version.stdout), expected_version);
+        assert!(version.stderr.is_empty());
+    }
 }
 
 #[test]
