@@ -206,7 +206,11 @@ fn discovery_releases_placeholder_before_persisting_a_real_group() {
         wsg_core::Loaded::Present(value) => value.value,
         wsg_core::Loaded::Missing => panic!("group missing"),
     };
-    assert!(loaded.sub_issues.contains_key(&TicketId::parse("ENG-101").expect("Ticket")));
+    assert!(
+        loaded
+            .sub_issues
+            .contains_key(&TicketId::parse("ENG-101").expect("Ticket"))
+    );
     let worker_state = match repository
         .state_store()
         .worker(worker)

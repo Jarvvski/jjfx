@@ -188,7 +188,7 @@ pub enum OrchestrationStart {
     /// A persisted Dispatch Group is ready for foreground or detached watching.
     Group,
     /// No children existed, so the reserved placeholder launched the Parent directly.
-    Direct(DirectDispatchSuccess),
+    Direct(Box<DirectDispatchSuccess>),
 }
 
 /// Terminal information returned without choosing terminal formatting.
@@ -268,7 +268,9 @@ pub enum OrchestrationError {
         parent: TicketId,
     },
     /// Discovery failed while a placeholder Worker was reserved.
-    #[error("discovery failed: {primary}; additionally failed to release placeholder Reservation: {cleanup}")]
+    #[error(
+        "discovery failed: {primary}; additionally failed to release placeholder Reservation: {cleanup}"
+    )]
     DiscoveryCleanup {
         /// Original graph discovery failure.
         primary: String,
@@ -544,7 +546,16 @@ fn revalidate_branches(root: &Path, group: &mut DispatchGroup) -> Vec<BranchRepa
 
 fn revision_exists(root: &Path, revision: &str) -> bool {
     Command::new("jj")
-        .args(["log", "-r", revision, "--no-graph", "-T", "\"ok\"", "--limit", "1"])
+        .args([
+            "log",
+            "-r",
+            revision,
+            "--no-graph",
+            "-T",
+            "\"ok\"",
+            "--limit",
+            "1",
+        ])
         .current_dir(root)
         .output()
         .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
@@ -767,7 +778,7 @@ impl OrchestrationRunner {
                 .repository
                 .direct_dispatch()
                 .dispatch_reserved(reservation, &placeholder)
-                .map(OrchestrationStart::Direct)
+                .map(|success| OrchestrationStart::Direct(Box::new(success)))
                 .map_err(|error| OrchestrationError::Execution(error.to_string()));
         }
         reservation
@@ -777,7 +788,8 @@ impl OrchestrationRunner {
             DispatchGroupOptions::new(request.model().unwrap_or_default().to_owned());
         group_options.agent = Some(WireAgent::new(request.agent_runtime().as_str()));
         let options = DispatchGroupBuildOptions::new(
-            current_timestamp().map_err(|error| OrchestrationError::Execution(error.to_string()))?,
+            current_timestamp()
+                .map_err(|error| OrchestrationError::Execution(error.to_string()))?,
             gh_repo,
             group_options,
         );
@@ -835,7 +847,10 @@ impl OrchestrationRunner {
         let directory = self.repository.root().join(".jj/pool");
         fs::create_dir_all(&directory)
             .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
-        let path = directory.join(format!("orchestrate-{}.lock", parent.as_str().to_ascii_lowercase()));
+        let path = directory.join(format!(
+            "orchestrate-{}.lock",
+            parent.as_str().to_ascii_lowercase()
+        ));
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)

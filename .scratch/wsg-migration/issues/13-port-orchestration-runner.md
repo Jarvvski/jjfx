@@ -1,6 +1,6 @@
 # Port the persistent orchestration runner
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -43,12 +43,12 @@ Drive the runner with a fake world for deterministic wave and failure tests, the
 
 ## Acceptance Criteria
 
-- [ ] Dependency waves launch only when all Blockers unblock them.
-- [ ] A failed Run retries once and then becomes terminal.
-- [ ] Restart resumes without duplicate launches.
-- [ ] Every state mutation is durable before the next wait cycle.
-- [ ] Existing Go-created live groups can continue under Rust.
-- [ ] `mise run check` is green.
+- [x] Dependency waves launch only when all Blockers unblock them.
+- [x] A failed Run retries once and then becomes terminal.
+- [x] Restart resumes without duplicate launches.
+- [x] Every state mutation is durable before the next wait cycle.
+- [x] Existing Go-created live groups can continue under Rust.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -61,3 +61,11 @@ Drive the runner with a fake world for deterministic wave and failure tests, the
 
 - issues/11-port-direct-dispatch.md
 - issues/12-port-dispatch-group-model.md
+
+## Comments
+
+### 2026-08-05 - Completed
+
+Implemented and verified the persistent orchestration runner across the approved 13-step plan. The implementation now supports durable reconcile-before-claim ordering, one safe retry, Reservation compensation, stacked dependency context, branch revalidation, typed progress and terminal events, bounded foreground and detached-compatible watching, one active Parent runner, restart-safe assignment handling, and placeholder Reservation cleanup during discovery.
+
+Verification: `mise run check` passed after the final implementation. One concurrent full-suite invocation exposed an unrelated flaky temporary-workspace collision in `store::tests::load_represents_jj_only_workspace_without_path`; the test passed when rerun independently before the final gate rerun.
