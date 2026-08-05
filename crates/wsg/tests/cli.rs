@@ -1,4 +1,28 @@
+use std::path::Path;
 use std::process::Command;
+
+fn local_repository() -> tempfile::TempDir {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(directory.path())
+        .output()
+        .expect("jj should run");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    directory
+}
+
+fn run(binary: &str, directory: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(binary)
+        .args(args)
+        .current_dir(directory)
+        .output()
+        .expect("wsg should run")
+}
 
 #[test]
 fn help_and_version_work_outside_a_repository() {
@@ -53,6 +77,47 @@ fn unknown_commands_are_reported_on_stderr() {
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("Unknown command: not-a-command"));
     assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn repository_commands_keep_paths_on_stdout_and_refresh_on_stderr() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("root should resolve");
+
+    let root_output = run(binary, directory.path(), &["root"]);
+    assert!(root_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&root_output.stdout),
+        format!("{}\n", root.display())
+    );
+    assert!(root_output.stderr.is_empty());
+
+    let path_output = run(binary, directory.path(), &["path", "default"]);
+    assert!(path_output.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&path_output.stdout),
+        format!("{}\n", root.display())
+    );
+    assert!(path_output.stderr.is_empty());
+
+    let where_output = run(binary, directory.path(), &["where"]);
+    assert!(where_output.status.success());
+    let where_text = String::from_utf8_lossy(&where_output.stdout);
+    assert!(where_text.contains(&format!("repo:       {}", root.display())));
+    assert!(where_text.contains("workspaces:"));
+    assert!(where_output.stderr.is_empty());
+
+    let refresh_output = run(binary, directory.path(), &["refresh"]);
+    assert!(refresh_output.status.success());
+    assert!(refresh_output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&refresh_output.stderr),
+        "Cache refreshed\n"
+    );
 }
 
 #[test]

@@ -187,8 +187,41 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Command::Help => print!("{HELP}"),
         Command::Version => println!("wsg {}", env!("CARGO_PKG_VERSION")),
         Command::Default => default_command()?,
+        Command::Root => root_command(&repository()?)?,
+        Command::Where => where_command(&repository()?)?,
+        Command::Path { name } => path_command(&repository()?, &name)?,
+        Command::Refresh => refresh_command(&repository()?)?,
         command => bail!("command is not implemented yet: {command:?}"),
     }
+    Ok(())
+}
+
+fn repository() -> Result<Repository> {
+    Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))
+}
+
+fn root_command(repository: &Repository) -> Result<()> {
+    println!("{}", repository.root().display());
+    Ok(())
+}
+
+fn where_command(repository: &Repository) -> Result<()> {
+    println!("repo:       {}", repository.root().display());
+    println!(
+        "workspaces: {}",
+        repository.workspaces().base_dir().display()
+    );
+    Ok(())
+}
+
+fn path_command(repository: &Repository, name: &str) -> Result<()> {
+    println!("{}", repository.workspaces().path(name).display());
+    Ok(())
+}
+
+fn refresh_command(repository: &Repository) -> Result<()> {
+    repository.workspaces().refresh()?;
+    eprintln!("Cache refreshed");
     Ok(())
 }
 
