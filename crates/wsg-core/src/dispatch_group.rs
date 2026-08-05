@@ -496,6 +496,10 @@ impl DispatchGroup {
     pub fn state(&self) -> &DispatchGroupState {
         &self.state
     }
+
+    pub(crate) fn state_mut(&mut self) -> &mut DispatchGroupState {
+        &mut self.state
+    }
 }
 
 fn validate_state(state: &DispatchGroupState) -> Result<(), DispatchGroupError> {

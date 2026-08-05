@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::process::Command;
 
 use thiserror::Error;
 
@@ -221,6 +222,13 @@ struct LaunchFailure {
     compensated: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BranchRepair {
+    ticket: TicketId,
+    previous: String,
+    current: String,
+}
+
 trait OrchestrationExecution {
     type Revision;
     type Claim;
@@ -230,6 +238,10 @@ trait OrchestrationExecution {
         parent: &TicketId,
     ) -> Result<LoadedOrchestration<Self::Revision>, OrchestrationError>;
     fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError>;
+    fn revalidate_branches(
+        &mut self,
+        group: &mut DispatchGroup,
+    ) -> Result<Vec<BranchRepair>, OrchestrationError>;
     fn save_group(
         &mut self,
         expected: &Self::Revision,
@@ -258,6 +270,14 @@ fn run_with_execution<E: OrchestrationExecution>(
     let loaded = execution.load_group(request.parent())?;
     let mut group = loaded.group;
     let mut revision = loaded.revision;
+    for repair in execution.revalidate_branches(&mut group)? {
+        revision = execution.save_group(&revision, &group)?;
+        observer(OrchestrationEvent::BranchRevalidated {
+            ticket: repair.ticket,
+            previous: repair.previous,
+            current: repair.current,
+        });
+    }
     let workers = execution
         .workers()?
         .into_iter()
@@ -412,6 +432,59 @@ fn dispatch_request(
     Ok(request)
 }
 
+fn revalidate_branches(root: &Path, group: &mut DispatchGroup) -> Vec<BranchRepair> {
+    let mut repairs = Vec::new();
+    let ticket_ids = group.state().sub_issues.keys().cloned().collect::<Vec<_>>();
+    for ticket in ticket_ids {
+        let Some(previous) = group
+            .state()
+            .sub_issues
+            .get(&ticket)
+            .and_then(|issue| issue.branch.clone())
+        else {
+            continue;
+        };
+        if previous == "main" || revision_exists(root, &previous) {
+            continue;
+        }
+        let current = resolve_ticket_branch(root, &ticket).unwrap_or_else(|| "main".to_owned());
+        if let Some(issue) = group.state_mut().sub_issues.get_mut(&ticket) {
+            issue.branch = Some(current.clone());
+        }
+        repairs.push(BranchRepair {
+            ticket,
+            previous,
+            current,
+        });
+    }
+    repairs
+}
+
+fn revision_exists(root: &Path, revision: &str) -> bool {
+    Command::new("jj")
+        .args(["log", "-r", revision, "--no-graph", "-T", "\"ok\"", "--limit", "1"])
+        .current_dir(root)
+        .output()
+        .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
+}
+
+fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
+    let prefix = format!("adam/{}-", ticket.as_str().to_ascii_lowercase());
+    let output = Command::new("jj")
+        .args(["bookmark", "list", "-T", "name ++ \"\\n\""])
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout)
+        .ok()?
+        .lines()
+        .find(|name| name.starts_with(&prefix))
+        .map(str::to_owned)
+}
+
 struct LiveExecution {
     repository: Repository,
 }
@@ -464,6 +537,13 @@ impl OrchestrationExecution for LiveExecution {
                 error: worker.error().map(str::to_owned),
             })
             .collect())
+    }
+
+    fn revalidate_branches(
+        &mut self,
+        group: &mut DispatchGroup,
+    ) -> Result<Vec<BranchRepair>, OrchestrationError> {
+        Ok(revalidate_branches(self.repository.root(), group))
     }
 
     fn save_group(
@@ -783,6 +863,13 @@ mod tests {
         fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError> {
             self.calls.push("workers".to_owned());
             Ok(self.workers.clone())
+        }
+
+        fn revalidate_branches(
+            &mut self,
+            _group: &mut DispatchGroup,
+        ) -> Result<Vec<BranchRepair>, OrchestrationError> {
+            Ok(Vec::new())
         }
 
         fn save_group(
