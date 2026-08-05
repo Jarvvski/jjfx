@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 fn local_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -13,6 +14,16 @@ fn local_repository() -> tempfile::TempDir {
         "jj init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    let remote = Command::new("jj")
+        .args(["git", "remote", "add", "origin", "owner/repo"])
+        .current_dir(directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        remote.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&remote.stderr)
+    );
     directory
 }
 
@@ -22,6 +33,29 @@ fn run(binary: &str, directory: &Path, args: &[&str]) -> std::process::Output {
         .current_dir(directory)
         .output()
         .expect("wsg should run")
+}
+
+fn run_with_input(
+    binary: &str,
+    directory: &Path,
+    args: &[&str],
+    input: &[u8],
+) -> std::process::Output {
+    let mut child = Command::new(binary)
+        .args(args)
+        .current_dir(directory)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("wsg should run");
+    child
+        .stdin
+        .take()
+        .expect("stdin should be piped")
+        .write_all(input)
+        .expect("input should be written");
+    child.wait_with_output().expect("wsg should finish")
 }
 
 #[test]
@@ -118,6 +152,121 @@ fn repository_commands_keep_paths_on_stdout_and_refresh_on_stderr() {
         String::from_utf8_lossy(&refresh_output.stderr),
         "Cache refreshed\n"
     );
+}
+
+#[test]
+fn workspace_commands_are_compatible_and_clean_requires_explicit_confirmation() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let root = directory
+        .path()
+        .canonicalize()
+        .expect("root should resolve");
+    let expected = root.parent().expect("repository parent").join(format!(
+        "{}-workspaces/feature",
+        root.file_name().expect("repository name").to_string_lossy()
+    ));
+
+    let add = run(binary, directory.path(), &["a", "feature"]);
+    assert!(add.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&add.stdout),
+        format!("{}\n", expected.display())
+    );
+    assert!(add.stderr.is_empty());
+
+    let existing = run(binary, directory.path(), &["add", "feature"]);
+    assert!(existing.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&existing.stdout),
+        format!("{}\n", expected.display())
+    );
+
+    let list = run(binary, directory.path(), &["ls"]);
+    assert!(list.status.success());
+    let list_text = String::from_utf8_lossy(&list.stdout);
+    assert!(list_text.contains("  default ➜ "));
+    assert!(list_text.contains(&format!("  feature ➜ {}", expected.display())));
+
+    let clean_declined = run_with_input(binary, directory.path(), &["clean"], b"n\n");
+    assert!(clean_declined.status.success());
+    assert!(expected.is_dir());
+
+    let remove = run(binary, directory.path(), &["remove", "--force", "feature"]);
+    assert!(remove.status.success());
+    assert!(String::from_utf8_lossy(&remove.stderr).contains("Deleted"));
+    assert!(!expected.exists());
+}
+
+#[test]
+fn pool_commands_create_resize_list_remove_reset_and_destroy() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+
+    let create = run(binary, directory.path(), &["pool", "create", "1"]);
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert!(create.stdout.is_empty());
+
+    let list = run(binary, directory.path(), &["status"]);
+    assert!(list.status.success());
+    let list_text = String::from_utf8_lossy(&list.stdout);
+    assert!(list_text.contains("WORKER"));
+    assert!(list_text.contains("Pool: 1 idle"));
+    let first_worker = list_text
+        .lines()
+        .nth(2)
+        .and_then(|line| line.split_whitespace().next())
+        .expect("status should include a Worker")
+        .to_owned();
+
+    let resize = run(binary, directory.path(), &["pool", "r", "--size", "2"]);
+    assert!(
+        resize.status.success(),
+        "{}",
+        String::from_utf8_lossy(&resize.stderr)
+    );
+    assert!(String::from_utf8_lossy(&resize.stderr).contains("expanded"));
+
+    let remove = run(binary, directory.path(), &["pool", "remove", &first_worker]);
+    assert!(
+        remove.status.success(),
+        "{}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert!(String::from_utf8_lossy(&remove.stderr).contains("Removed worker-"));
+
+    let second_list = run(binary, directory.path(), &["pool", "list"]);
+    assert!(second_list.status.success());
+    let second_worker = String::from_utf8_lossy(&second_list.stdout)
+        .lines()
+        .nth(2)
+        .and_then(|line| line.split_whitespace().next())
+        .expect("remaining Worker should be listed")
+        .to_owned();
+    let reset = run(binary, directory.path(), &["reset", &second_worker]);
+    assert!(
+        reset.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&reset.stderr)
+            .contains(&format!("Reset worker-{second_worker} to idle")),
+        "{}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+
+    let destroy = run(binary, directory.path(), &["pool", "destroy"]);
+    assert!(
+        destroy.status.success(),
+        "{}",
+        String::from_utf8_lossy(&destroy.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&destroy.stderr), "Pool destroyed\n");
 }
 
 #[test]

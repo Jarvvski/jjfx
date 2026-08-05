@@ -1,5 +1,10 @@
+use std::io::Read;
+
 use anyhow::{Result, bail};
-use wsg_core::{MigrationCapabilities, Repository};
+use wsg_core::{
+    CleanDecision, MigrationCapabilities, PoolCapacity, Repository, WorkerActions, WorkerId,
+    WorkerStatus, WorkspaceAddOutcome,
+};
 
 pub const HELP: &str = r#"wsg - jj workspace manager
 
@@ -191,7 +196,12 @@ pub fn run(args: Vec<String>) -> Result<()> {
         Command::Where => where_command(&repository()?)?,
         Command::Path { name } => path_command(&repository()?, &name)?,
         Command::Refresh => refresh_command(&repository()?)?,
-        command => bail!("command is not implemented yet: {command:?}"),
+        Command::Add { name, revision } => add_command(&repository()?, &name, revision.as_deref())?,
+        Command::List => list_command(&repository()?)?,
+        Command::Remove { force, names } => remove_command(&repository()?, force, &names)?,
+        Command::Clean => clean_command(&repository()?)?,
+        Command::Status => pool_list_command(&repository()?)?,
+        Command::Pool(command) => pool_command(&repository()?, command)?,
     }
     Ok(())
 }
@@ -222,6 +232,211 @@ fn path_command(repository: &Repository, name: &str) -> Result<()> {
 fn refresh_command(repository: &Repository) -> Result<()> {
     repository.workspaces().refresh()?;
     eprintln!("Cache refreshed");
+    Ok(())
+}
+
+fn add_command(repository: &Repository, name: &str, revision: Option<&str>) -> Result<()> {
+    match repository.workspaces().add(name, revision)? {
+        WorkspaceAddOutcome::Default(path) => println!("{}", path.display()),
+        WorkspaceAddOutcome::Existing(workspace) | WorkspaceAddOutcome::Created(workspace) => {
+            println!("{}", workspace.path().display())
+        }
+    }
+    Ok(())
+}
+
+fn list_command(repository: &Repository) -> Result<()> {
+    let entries = repository.workspaces().snapshot()?.entries().to_owned();
+    if entries.is_empty() {
+        println!("  No workspaces");
+        return Ok(());
+    }
+    for entry in entries {
+        let missing = if entry.name() != "default" && entry.is_missing() {
+            " (missing)"
+        } else {
+            ""
+        };
+        println!("  {} ➜ {}{}", entry.name(), entry.path().display(), missing);
+    }
+    Ok(())
+}
+
+fn remove_command(repository: &Repository, force: bool, names: &[String]) -> Result<()> {
+    let workspaces = repository.workspaces();
+    let mut failure = None;
+    for name in names {
+        if name == "default" {
+            eprintln!("Cannot remove default workspace");
+            continue;
+        }
+        let path = workspaces.path(name);
+        match workspaces.remove(name, force) {
+            Ok(true) => eprintln!("Deleted {}", path.display()),
+            Ok(false) => {}
+            Err(error) => {
+                eprintln!("{error}");
+                failure.get_or_insert(error);
+            }
+        }
+    }
+    if let Some(error) = failure {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn clean_command(repository: &Repository) -> Result<()> {
+    let workspaces = repository.workspaces();
+    let plan = workspaces.plan_clean()?;
+    if plan.entries().is_empty() {
+        println!("No workspaces to remove");
+        return Ok(());
+    }
+    println!("Remove {} workspace(s)?", plan.entries().len());
+    for entry in plan.entries() {
+        println!("  {}", entry.name());
+    }
+    print!("Confirm? (y/n) ");
+    let mut input = String::new();
+    std::io::stdin().read_to_string(&mut input)?;
+    let decision = if input.trim().eq_ignore_ascii_case("y") {
+        CleanDecision::Confirmed
+    } else {
+        CleanDecision::Declined
+    };
+    workspaces.clean(&plan, decision)?;
+    Ok(())
+}
+
+fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
+    match command {
+        PoolCommand::Resize { size } => resize_pool_command(repository, &size),
+        PoolCommand::List => pool_list_command(repository),
+        PoolCommand::Remove { worker } => remove_worker_command(repository, &worker),
+        PoolCommand::Reset { worker } => reset_worker_command(repository, &worker),
+        PoolCommand::Destroy => destroy_pool_command(repository),
+        PoolCommand::Help => {
+            print!("{HELP}");
+            Ok(())
+        }
+    }
+}
+
+fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
+    let size = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("Invalid pool size: {value}"))?;
+    let capacity = PoolCapacity::new(size)?;
+    let before = repository
+        .worker_pool()
+        .snapshot()
+        .pool()
+        .map_or(0, |pool| usize::try_from(pool.size()).unwrap_or_default());
+    let resize = repository.worker_pool().resize_to(capacity)?;
+    for worker in resize.added_workers() {
+        eprintln!("  Created {worker}");
+    }
+    for worker in resize.removed_workers() {
+        eprintln!("  Removed {worker}");
+    }
+    if before == size {
+        eprintln!("Pool is already size {size}");
+    } else if before < size {
+        eprintln!("Pool expanded from {before} to {size}");
+    } else {
+        eprintln!("Pool shrunk from {before} to {size}");
+    }
+    Ok(())
+}
+
+fn pool_list_command(repository: &Repository) -> Result<()> {
+    let snapshot = repository.worker_pool().reconcile_runs();
+    let pool = snapshot
+        .pool()
+        .ok_or_else(|| anyhow::anyhow!("No pool. Run: wsg pool create --size N"))?;
+    for diagnostic in snapshot.diagnostics() {
+        eprintln!("{}", diagnostic.message());
+    }
+    println!(
+        "{:<10} {:<12} {:<10} {:<14} ELAPSED",
+        "WORKER", "NAME", "STATUS", "TICKET"
+    );
+    println!(
+        "{:<10} {:<12} {:<10} {:<14} -------",
+        "------", "----", "------", "------"
+    );
+    let mut counts = [0usize; 4];
+    for worker in snapshot.workers() {
+        let index = match worker.status() {
+            WorkerStatus::Idle => 0,
+            WorkerStatus::Busy => 1,
+            WorkerStatus::Done => 2,
+            WorkerStatus::Failed => 3,
+        };
+        counts[index] += 1;
+        let short = worker
+            .worker_id()
+            .as_str()
+            .strip_prefix("worker-")
+            .unwrap_or(worker.worker_id().as_str());
+        let name = if worker.alias().is_empty() {
+            "-"
+        } else {
+            worker.alias()
+        };
+        let ticket = worker.ticket().unwrap_or("-");
+        println!(
+            "{short:<10} {name:<12} {:<10} {ticket:<14} -",
+            worker.status().as_str()
+        );
+    }
+    println!();
+    println!(
+        "Pool: {} idle, {} busy, {} done, {} failed ({} total)",
+        counts[0],
+        counts[1],
+        counts[2],
+        counts[3],
+        pool.size()
+    );
+    Ok(())
+}
+
+fn normalize_worker(value: &str) -> Result<WorkerId> {
+    let value = if value.starts_with("worker-") {
+        value.to_owned()
+    } else {
+        format!("worker-{value}")
+    };
+    Ok(WorkerId::parse(value)?)
+}
+
+fn remove_worker_command(repository: &Repository, value: &str) -> Result<()> {
+    let worker = normalize_worker(value)?;
+    let resize = repository.worker_pool().remove(worker.clone())?;
+    eprintln!(
+        "Removed {worker} (pool size: {})",
+        resize.capacity().as_usize()
+    );
+    Ok(())
+}
+
+fn reset_worker_command(repository: &Repository, value: &str) -> Result<()> {
+    let worker = normalize_worker(value)?;
+    let outcome = WorkerActions::new(repository.clone()).reset(&worker)?;
+    let _restoration = outcome.into_restoration();
+    eprintln!("Reset {worker} to idle");
+    Ok(())
+}
+
+fn destroy_pool_command(repository: &Repository) -> Result<()> {
+    if repository.worker_pool().snapshot().is_missing() {
+        eprintln!("No pool to destroy");
+        return Ok(());
+    }
+    repository.worker_pool().destroy()?;
+    eprintln!("Pool destroyed");
     Ok(())
 }
 
