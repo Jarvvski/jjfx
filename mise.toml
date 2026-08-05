@@ -18,6 +18,10 @@ run = "cargo run -p jjfx"
 description = "Build every workspace package"
 run = "cargo build --workspace"
 
+[tasks.wsg-test-install]
+description = "Install Rust wsg into an isolated repository-local target"
+run = "mkdir -p target/wsg-test-install/bin && cargo build -p wsg && cp target/debug/wsg target/wsg-test-install/bin/wsg"
+
 [tasks.test]
 description = "Run tests for every workspace package"
 run = "cargo test --workspace"

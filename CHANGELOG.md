@@ -8,7 +8,9 @@ All notable changes to this project are documented here (newest first). The vers
 
 - 2026-08-05 - Restored the compatible Workspace and Worker Pool command surface
   in the Rust `wsg` binary, including independent versioning (`wsg` 0.8.1 and
-  `jjfx` 0.29.0) without changing the installed Go binary.
+  `jjfx` 0.29.0) without changing the installed Go binary. An isolated
+  `mise run wsg-test-install` task places the Rust binary under `target/`
+  without touching the user's PATH.
 
 - 2026-07-21 - Added read-only Worker Pool snapshot import to jjfx, including
   compatibility diagnostics, Worker metadata rows, and a visible read-only
