@@ -202,6 +202,7 @@ struct WorkerObservation {
     status: WorkerStatus,
     ticket: Option<String>,
     branch: Option<String>,
+    error: Option<String>,
 }
 
 #[cfg(test)]
@@ -250,10 +251,10 @@ fn run_with_execution<E: OrchestrationExecution>(
         .filter(|&(_ticket, issue)| {
             SubIssueStatus::try_from(&issue.status).ok() == Some(SubIssueStatus::Dispatched)
         })
-        .map(|(ticket, issue)| (ticket.clone(), issue.worker.clone()))
+        .map(|(ticket, issue)| (ticket.clone(), issue.worker.clone(), issue.retries))
         .collect::<Vec<_>>();
 
-    for (ticket, assigned_worker) in dispatched {
+    for (ticket, assigned_worker, retries) in dispatched {
         let worker = assigned_worker.ok_or_else(|| OrchestrationError::UnassignedWorker {
             ticket: ticket.clone(),
         })?;
@@ -271,23 +272,56 @@ fn run_with_execution<E: OrchestrationExecution>(
                 actual: observation.ticket.clone(),
             });
         }
-        if observation.status != WorkerStatus::Done {
-            continue;
+        match observation.status {
+            WorkerStatus::Done => {
+                let branch = observation.branch.clone();
+                group.apply(DispatchGroupEvent::Completed {
+                    ticket: ticket.clone(),
+                    worker: worker.clone(),
+                    branch: branch.clone(),
+                    at: execution.now()?,
+                })?;
+                revision = execution.save_group(&revision, &group)?;
+                observer(OrchestrationEvent::Completed {
+                    ticket,
+                    worker: worker.clone(),
+                    branch,
+                });
+                execution.reset_worker(&worker)?;
+            }
+            WorkerStatus::Failed if retries < 1 => {
+                execution.reset_worker(&worker)?;
+                let _retry_required = group.apply(DispatchGroupEvent::Failed {
+                    ticket: ticket.clone(),
+                    worker: worker.clone(),
+                    at: execution.now()?,
+                })?;
+                group.apply(DispatchGroupEvent::Retried {
+                    ticket: ticket.clone(),
+                    worker: worker.clone(),
+                })?;
+                revision = execution.save_group(&revision, &group)?;
+                observer(OrchestrationEvent::Retrying {
+                    ticket,
+                    worker,
+                    attempt: 2,
+                });
+            }
+            WorkerStatus::Failed => {
+                group.apply(DispatchGroupEvent::Failed {
+                    ticket: ticket.clone(),
+                    worker: worker.clone(),
+                    at: execution.now()?,
+                })?;
+                revision = execution.save_group(&revision, &group)?;
+                observer(OrchestrationEvent::Failed {
+                    ticket,
+                    worker,
+                    detail: observation.error.clone(),
+                });
+            }
+            WorkerStatus::Idle | WorkerStatus::Busy => {}
         }
-        let branch = observation.branch.clone();
-        group.apply(DispatchGroupEvent::Completed {
-            ticket: ticket.clone(),
-            worker: worker.clone(),
-            branch: branch.clone(),
-            at: execution.now()?,
-        })?;
-        revision = execution.save_group(&revision, &group)?;
-        observer(OrchestrationEvent::Completed {
-            ticket,
-            worker: worker.clone(),
-            branch,
-        });
-        execution.reset_worker(&worker)?;
     }
 
     for ticket in group.ready() {
@@ -324,6 +358,7 @@ mod tests {
         workers: Vec<WorkerObservation>,
         calls: Vec<String>,
         fail_next_save: bool,
+        reset_fails: bool,
     }
 
     impl FakeExecution {
@@ -361,14 +396,54 @@ mod tests {
                     status: WorkerStatus::Done,
                     ticket: Some(blocker.as_str().to_owned()),
                     branch: Some("adam/eng-101-foundation".to_owned()),
+                    error: None,
                 }],
                 calls: Vec::new(),
                 fail_next_save: false,
+                reset_fails: false,
+            }
+        }
+
+        fn failed_attempt(retries: i64) -> Self {
+            let ticket = TicketId::parse("ENG-101").expect("Ticket");
+            let worker = WorkerId::parse("worker-01").expect("Worker");
+            let mut state = DispatchGroupState::new(
+                TicketId::parse("ENG-100").expect("Parent Ticket"),
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+                "owner/repo",
+                DispatchGroupOptions::new(""),
+            );
+            let mut issue = SubIssueState::new(
+                "Build the foundation",
+                WireStatus::new("dispatched"),
+                Vec::new(),
+            );
+            issue.worker = Some(worker.clone());
+            issue.dispatched_at = Some(WireTimestamp::new("2026-08-04T12:01:00Z"));
+            issue.retries = retries;
+            state.sub_issues.insert(ticket.clone(), issue);
+            Self {
+                group: DispatchGroup::from_state(state).expect("valid failed group"),
+                revision: 0,
+                workers: vec![WorkerObservation {
+                    worker,
+                    status: WorkerStatus::Failed,
+                    ticket: Some(ticket.as_str().to_owned()),
+                    branch: None,
+                    error: Some("build failed".to_owned()),
+                }],
+                calls: Vec::new(),
+                fail_next_save: false,
+                reset_fails: false,
             }
         }
 
         fn fail_next_save(&mut self) {
             self.fail_next_save = true;
+        }
+
+        fn fail_reset(&mut self) {
+            self.reset_fails = true;
         }
     }
 
@@ -418,6 +493,11 @@ mod tests {
 
         fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError> {
             self.calls.push(format!("reset:{worker}"));
+            if self.reset_fails {
+                return Err(OrchestrationError::Execution(
+                    "Worker Reset failed".to_owned(),
+                ));
+            }
             Ok(())
         }
 
@@ -429,6 +509,94 @@ mod tests {
         fn now(&mut self) -> Result<WireTimestamp, OrchestrationError> {
             Ok(WireTimestamp::new("2026-08-04T12:02:00Z"))
         }
+    }
+
+    #[test]
+    fn first_failed_run_resets_before_persisting_one_retry() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::failed_attempt(0);
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("retry first failure");
+
+        assert_eq!(
+            execution.calls,
+            vec![
+                "workers".to_owned(),
+                "reset:worker-01".to_owned(),
+                "save:r0:ENG-101:pending".to_owned(),
+                "claim:ENG-101".to_owned(),
+            ]
+        );
+        let issue = execution
+            .group
+            .state()
+            .sub_issues
+            .get(&TicketId::parse("ENG-101").expect("Ticket"))
+            .expect("retried Ticket");
+        assert_eq!(issue.retries, 1);
+        assert!(matches!(
+            events.as_slice(),
+            [OrchestrationEvent::Retrying { attempt: 2, .. }]
+        ));
+    }
+
+    #[test]
+    fn reset_failure_leaves_the_first_failed_run_dispatched() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::failed_attempt(0);
+        execution.fail_reset();
+        let mut events = Vec::new();
+
+        let error = run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect_err("Reset failure must stop retry");
+
+        assert!(matches!(error, OrchestrationError::Execution(_)));
+        assert_eq!(
+            execution.calls,
+            vec!["workers".to_owned(), "reset:worker-01".to_owned()]
+        );
+        assert_eq!(
+            execution
+                .group
+                .state()
+                .sub_issues
+                .get(&TicketId::parse("ENG-101").expect("Ticket"))
+                .expect("failed Ticket")
+                .status
+                .as_str(),
+            "dispatched"
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn second_failed_run_is_persisted_terminal_without_another_reset() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::failed_attempt(1);
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("record exhausted retry");
+
+        assert_eq!(
+            execution.calls,
+            vec!["workers".to_owned(), "save:r0:ENG-101:failed".to_owned(),]
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [OrchestrationEvent::Failed { detail: Some(detail), .. }] if detail == "build failed"
+        ));
     }
 
     #[test]
