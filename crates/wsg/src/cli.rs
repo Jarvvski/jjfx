@@ -1,9 +1,11 @@
 use std::io::Read;
+use std::str::FromStr;
 
 use anyhow::{Result, bail};
+use jiff::Timestamp;
 use wsg_core::{
-    CleanDecision, MigrationCapabilities, PoolCapacity, Repository, WorkerActions, WorkerId,
-    WorkerStatus, WorkspaceAddOutcome,
+    CleanDecision, PoolCapacity, Repository, WorkerActions, WorkerId, WorkerStatus,
+    WorkspaceAddOutcome,
 };
 
 pub const HELP: &str = r#"wsg - jj workspace manager
@@ -386,8 +388,9 @@ fn pool_list_command(repository: &Repository) -> Result<()> {
             worker.alias()
         };
         let ticket = worker.ticket().unwrap_or("-");
+        let elapsed = elapsed_display(worker.started_at(), worker.completed_at());
         println!(
-            "{short:<10} {name:<12} {:<10} {ticket:<14} -",
+            "{short:<10} {name:<12} {:<10} {ticket:<14} {elapsed}",
             worker.status().as_str()
         );
     }
@@ -430,6 +433,21 @@ fn reset_worker_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn elapsed_display(started: Option<&str>, completed: Option<&str>) -> String {
+    let Some(started) = started.and_then(|value| Timestamp::from_str(value).ok()) else {
+        return "-".to_owned();
+    };
+    let completed = completed
+        .and_then(|value| Timestamp::from_str(value).ok())
+        .unwrap_or_else(Timestamp::now);
+    let duration = completed.duration_since(started);
+    let seconds = duration.as_secs_f64().trunc() as i64;
+    if seconds < 0 {
+        return "-".to_owned();
+    }
+    format!("{}m {}s", seconds / 60, seconds % 60)
+}
+
 fn destroy_pool_command(repository: &Repository) -> Result<()> {
     if repository.worker_pool().snapshot().is_missing() {
         eprintln!("No pool to destroy");
@@ -441,17 +459,6 @@ fn destroy_pool_command(repository: &Repository) -> Result<()> {
 }
 
 fn default_command() -> Result<()> {
-    let repository =
-        Repository::open(".").map_err(|error| anyhow::anyhow!("Not in a jj repo: {error}"))?;
-    match repository.migration_capabilities() {
-        MigrationCapabilities::ReadOnlyWorkerPool => println!(
-            "Workspace Dispatch read-only Worker Pool snapshots available for {}",
-            repository.root().display()
-        ),
-        MigrationCapabilities::NotImplemented => println!(
-            "Workspace Dispatch migration capabilities are not implemented for {}",
-            repository.root().display()
-        ),
-    }
-    Ok(())
+    let repository = Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))?;
+    pool_list_command(&repository)
 }

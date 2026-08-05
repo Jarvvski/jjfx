@@ -3201,6 +3201,7 @@ name = "wsg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "jiff",
  "tempfile",
  "wsg-core",
 ]

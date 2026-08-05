@@ -6,6 +6,7 @@ license = "GPL-3.0-or-later"
 
 [dependencies]
 anyhow = "1"
+jiff = "0.2"
 wsg-core = { path = "../wsg-core" }
 
 [dev-dependencies]

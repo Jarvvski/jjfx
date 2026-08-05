@@ -281,10 +281,7 @@ fn no_arguments_report_read_only_pool_capabilities_inside_a_repository() {
         .output()
         .expect("wsg should run");
 
-    assert!(output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stdout)
-            .contains("read-only Worker Pool snapshots available")
-    );
-    assert!(output.stderr.is_empty());
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No pool"));
 }
