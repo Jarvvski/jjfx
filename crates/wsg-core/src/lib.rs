@@ -9,6 +9,7 @@ use thiserror::Error;
 mod direct_dispatch;
 mod dispatch_group;
 mod dispatch_prompt;
+mod orchestration;
 mod pool;
 mod run_log;
 mod runtime;
@@ -29,6 +30,9 @@ pub use dispatch_group::{
 pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
     DispatchPromptError,
+};
+pub use orchestration::{
+    OrchestrationEvent, OrchestrationRequest, OrchestrationRunner, OrchestrationSummary,
 };
 pub use pool::{
     CapacityShortage, PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot,
@@ -130,6 +134,11 @@ impl Repository {
     /// Opens the deep Direct Dispatch coordinator for this repository.
     pub fn direct_dispatch(&self) -> DirectDispatch {
         DirectDispatch::new(self.clone())
+    }
+
+    /// Opens persistent Dispatch Group orchestration for this repository.
+    pub fn orchestration_runner(&self) -> OrchestrationRunner {
+        OrchestrationRunner::new(self.clone())
     }
 
     /// Creates an Ad Hoc Workspace at the compatible sibling path.
