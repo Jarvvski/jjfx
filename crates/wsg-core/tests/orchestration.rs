@@ -141,6 +141,72 @@ fn competing_parent_runner_returns_already_running_without_waiting() {
 }
 
 #[test]
+fn restart_does_not_duplicate_a_persisted_assignment_with_a_live_worker() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let ticket = TicketId::parse("ENG-101").expect("Sub-issue");
+    let worker = WorkerId::parse("worker-02").expect("Worker");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-07-27T10:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    let mut issue = SubIssueState::new("First child", WireStatus::new("dispatched"), Vec::new());
+    issue.worker = Some(worker.clone());
+    issue.dispatched_at = Some(WireTimestamp::new("2026-07-27T10:01:00Z"));
+    group.sub_issues.insert(ticket.clone(), issue);
+    repository
+        .state_store()
+        .dispatch_group(parent.clone())
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save dispatched group");
+    let mut pool = PoolState::new(
+        1,
+        "owner/repo",
+        vec![worker.clone()],
+        WireTimestamp::new("2026-07-27T10:00:00Z"),
+    );
+    repository
+        .state_store()
+        .pool()
+        .commit(Expected::Missing, StateChange::Replace(pool.clone()))
+        .expect("save pool");
+    let mut worker_state = wsg_core::WorkerState::new(WireStatus::new("busy"));
+    worker_state.ticket = Some(ticket.as_str().to_owned());
+    worker_state.pid = Some(std::process::id() as i64);
+    repository
+        .state_store()
+        .worker(worker.clone())
+        .commit(Expected::Missing, StateChange::Replace(worker_state))
+        .expect("save busy Worker");
+    pool.workers = vec![worker];
+
+    let mut events = Vec::new();
+    let result = repository
+        .orchestration_runner()
+        .advance_once(
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
+            |event| events.push(event),
+        )
+        .expect("resume live assignment");
+    assert!(result.is_none());
+    assert!(events.is_empty());
+    let loaded = match repository
+        .state_store()
+        .dispatch_group(parent)
+        .load()
+        .expect("reload group")
+    {
+        wsg_core::Loaded::Present(value) => value.value,
+        wsg_core::Loaded::Missing => panic!("group disappeared"),
+    };
+    assert_eq!(loaded.sub_issues[&ticket].status.as_str(), "dispatched");
+}
+
+#[test]
 fn detached_entrypoint_returns_terminal_summary_for_persisted_group() {
     let directory = TempDir::new().expect("temporary repository");
     fs::create_dir(directory.path().join(".jj")).expect("repository marker");
