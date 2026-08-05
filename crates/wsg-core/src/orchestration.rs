@@ -406,6 +406,9 @@ fn dispatch_request(
     if let Some(model) = model {
         request = request.with_model(model);
     }
+    if let Some(context) = group.dependency_context(ticket)? {
+        request = request.with_dependency_context(context);
+    }
     Ok(request)
 }
 
@@ -594,6 +597,7 @@ mod tests {
         reset_fails: bool,
         available_workers: VecDeque<WorkerId>,
         failed_launches: BTreeSet<TicketId>,
+        launched_requests: Vec<DirectDispatchRequest>,
     }
 
     impl FakeExecution {
@@ -638,6 +642,7 @@ mod tests {
                 reset_fails: false,
                 available_workers: VecDeque::new(),
                 failed_launches: BTreeSet::new(),
+                launched_requests: Vec::new(),
             }
         }
 
@@ -674,6 +679,7 @@ mod tests {
                 reset_fails: false,
                 available_workers: VecDeque::new(),
                 failed_launches: BTreeSet::new(),
+                launched_requests: Vec::new(),
             }
         }
 
@@ -707,6 +713,42 @@ mod tests {
                 reset_fails: false,
                 available_workers,
                 failed_launches: BTreeSet::new(),
+                launched_requests: Vec::new(),
+            }
+        }
+
+        fn stacked_pending() -> Self {
+            let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+            let dependent = TicketId::parse("ENG-102").expect("dependent Ticket");
+            let mut state = DispatchGroupState::new(
+                TicketId::parse("ENG-100").expect("Parent Ticket"),
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+                "owner/repo",
+                DispatchGroupOptions::new(""),
+            );
+            let mut delivered =
+                SubIssueState::new("Build the foundation", WireStatus::new("done"), Vec::new());
+            delivered.branch = Some("adam/eng-101-foundation".to_owned());
+            delivered.completed_at = Some(WireTimestamp::new("2026-08-04T12:01:00Z"));
+            state.sub_issues.insert(blocker.clone(), delivered);
+            state.sub_issues.insert(
+                dependent,
+                SubIssueState::new(
+                    "Use the foundation",
+                    WireStatus::new("pending"),
+                    vec![blocker],
+                ),
+            );
+            Self {
+                group: DispatchGroup::from_state(state).expect("valid stacked group"),
+                revision: 0,
+                workers: Vec::new(),
+                calls: Vec::new(),
+                fail_next_save: false,
+                reset_fails: false,
+                available_workers: VecDeque::from([WorkerId::parse("worker-01").expect("Worker")]),
+                failed_launches: BTreeSet::new(),
+                launched_requests: Vec::new(),
             }
         }
 
@@ -808,6 +850,7 @@ mod tests {
         ) -> Result<(), LaunchFailure> {
             let ticket = request.ticket().id();
             self.calls.push(format!("launch:{}:{ticket}", claim.worker));
+            self.launched_requests.push(request.clone());
             if self.failed_launches.contains(ticket) {
                 return Err(LaunchFailure {
                     detail: "launch failed".to_owned(),
@@ -820,6 +863,35 @@ mod tests {
         fn now(&mut self) -> Result<WireTimestamp, OrchestrationError> {
             Ok(WireTimestamp::new("2026-08-04T12:02:00Z"))
         }
+    }
+
+    #[test]
+    fn stacked_dependency_context_reaches_background_direct_dispatch() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        )
+        .with_model("opus");
+        let mut execution = FakeExecution::stacked_pending();
+
+        run_with_execution(&request, &mut execution, &mut |_| {})
+            .expect("dispatch stacked dependent");
+
+        let launched = execution
+            .launched_requests
+            .first()
+            .expect("one launched request");
+        let dependency = launched
+            .dependency_context()
+            .expect("stacked dependency context");
+        assert_eq!(launched.mode(), RunMode::Background);
+        assert_eq!(launched.model(), Some("opus"));
+        assert_eq!(
+            dependency.base_revisions(),
+            &["adam/eng-101-foundation".to_owned()]
+        );
+        assert_eq!(dependency.pull_request_base(), "adam/eng-101-foundation");
+        assert!(dependency.description().contains("ENG-101"));
     }
 
     #[test]
