@@ -272,6 +272,65 @@ fn pool_commands_create_resize_list_remove_reset_and_destroy() {
 }
 
 #[test]
+fn shell_contract_covers_missing_arguments_and_missing_pool_destroy() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+
+    let path = run(binary, directory.path(), &["path"]);
+    assert!(!path.status.success());
+    assert!(String::from_utf8_lossy(&path.stderr).contains("Usage: wsg path <name>"));
+    assert!(path.stdout.is_empty());
+
+    let pool = run(binary, directory.path(), &["pool", "resize"]);
+    assert!(!pool.status.success());
+    assert!(String::from_utf8_lossy(&pool.stderr).contains("Usage: wsg pool resize <N>"));
+    assert!(pool.stdout.is_empty());
+
+    let destroy = run(binary, directory.path(), &["pool", "destroy"]);
+    assert!(destroy.status.success());
+    assert_eq!(
+        String::from_utf8_lossy(&destroy.stderr),
+        "No pool to destroy\n"
+    );
+    assert!(destroy.stdout.is_empty());
+}
+
+#[test]
+fn status_aliases_share_one_semantic_rendering_path() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let create = run(binary, directory.path(), &["pool", "1"]);
+    assert!(create.status.success());
+
+    let canonical = run(binary, directory.path(), &["pool", "list"]);
+    assert!(canonical.status.success());
+    for args in [
+        &["pool"][..],
+        &["pool", "ls"][..],
+        &["pool", "status"][..],
+        &["status"][..],
+    ] {
+        let output = run(binary, directory.path(), args);
+        assert!(output.status.success());
+        assert_eq!(output.stdout, canonical.stdout);
+        assert_eq!(output.stderr, canonical.stderr);
+    }
+}
+
+#[test]
+fn malformed_pool_state_is_a_nonzero_stderr_failure() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    std::fs::write(directory.path().join(".jj/pool.json"), b"not json\n")
+        .expect("malformed pool should be written");
+
+    let output = run(binary, directory.path(), &["status"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
 fn status_displays_cosmetic_worker_aliases_without_changing_worker_input() {
     let binary = env!("CARGO_BIN_EXE_wsg");
     let directory = local_repository();
