@@ -67,22 +67,35 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     ));
 
     let mut events = Vec::new();
-    repository
+    let summary = repository
         .orchestration_runner()
-        .advance_once(
+        .run(
             &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
+            &wsg_core::OrchestrationOptions::new()
+                .with_poll_interval(std::time::Duration::ZERO)
+                .with_max_cycles(1),
             |event| events.push(event),
         )
         .expect("resume group");
 
-    assert_eq!(
-        events,
-        vec![OrchestrationEvent::BranchRevalidated {
-            ticket,
-            previous: "adam/eng-101-removed".to_owned(),
-            current: "adam/eng-101-foundation".to_owned(),
-        }]
-    );
+    assert_eq!(events.len(), 3);
+    assert!(matches!(
+        &events[0],
+        OrchestrationEvent::Started { parent: actual, resumed: true } if actual == &parent
+    ));
+    assert!(matches!(
+        &events[1],
+        OrchestrationEvent::BranchRevalidated {
+            ticket: actual,
+            previous,
+            current,
+        } if actual.as_str() == "ENG-101"
+            && previous == "adam/eng-101-removed"
+            && current == "adam/eng-101-foundation"
+    ));
+    assert!(matches!(&events[2], OrchestrationEvent::Terminal(_)));
+    assert_eq!(summary.parent(), &parent);
+    assert_eq!(summary.counts().done(), 1);
     let loaded = match store.load().expect("load repaired group") {
         wsg_core::Loaded::Present(value) => value.value,
         wsg_core::Loaded::Missing => panic!("group disappeared"),

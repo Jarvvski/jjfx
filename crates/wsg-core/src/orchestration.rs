@@ -7,6 +7,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
+use std::time::Duration;
 
 use thiserror::Error;
 
@@ -25,6 +26,51 @@ pub struct OrchestrationRequest {
     parent: TicketId,
     agent_runtime: AgentRuntime,
     model: Option<String>,
+}
+
+/// Polling and retry limits for one foreground or detached orchestration run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrchestrationOptions {
+    poll_interval: Duration,
+    max_cycles: Option<usize>,
+}
+
+impl Default for OrchestrationOptions {
+    fn default() -> Self {
+        Self {
+            poll_interval: Duration::from_secs(5),
+            max_cycles: None,
+        }
+    }
+}
+
+impl OrchestrationOptions {
+    /// Creates production polling options.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the testable polling interval. Production runs cap this at five seconds.
+    pub fn with_poll_interval(mut self, interval: Duration) -> Self {
+        self.poll_interval = interval;
+        self
+    }
+
+    /// Bounds the number of advance cycles, including the first cycle.
+    pub fn with_max_cycles(mut self, cycles: usize) -> Self {
+        self.max_cycles = Some(cycles);
+        self
+    }
+
+    /// Returns the configured polling interval.
+    pub const fn poll_interval(&self) -> Duration {
+        self.poll_interval
+    }
+
+    /// Returns the optional cycle bound.
+    pub const fn max_cycles(&self) -> Option<usize> {
+        self.max_cycles
+    }
 }
 
 impl OrchestrationRequest {
@@ -201,6 +247,14 @@ pub enum OrchestrationError {
     /// A production or test execution adapter failed.
     #[error("orchestration execution failed: {0}")]
     Execution(String),
+    /// The configured polling cycle bound was reached before terminal state.
+    #[error("Dispatch Group {parent} did not reach terminal state within {cycles} cycles")]
+    PollingExhausted {
+        /// Parent Ticket being watched.
+        parent: TicketId,
+        /// Number of completed advance cycles.
+        cycles: usize,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -650,9 +704,50 @@ impl OrchestrationRunner {
         &self,
         request: &OrchestrationRequest,
         mut observer: impl FnMut(OrchestrationEvent),
-    ) -> Result<(), OrchestrationError> {
+    ) -> Result<Option<OrchestrationSummary>, OrchestrationError> {
         let mut execution = LiveExecution::new(self.repository.clone());
-        run_with_execution(request, &mut execution, &mut observer).map(|_| ())
+        run_with_execution(request, &mut execution, &mut observer)?;
+        let loaded = execution.load_group(request.parent())?;
+        if loaded.group.is_terminal() {
+            let summary = OrchestrationSummary {
+                parent: request.parent().clone(),
+                counts: loaded.group.status_counts(),
+                direct_worker: None,
+            };
+            observer(OrchestrationEvent::Terminal(summary.clone()));
+            Ok(Some(summary))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Watches one persisted group until it reaches a terminal state.
+    pub fn run(
+        &self,
+        request: &OrchestrationRequest,
+        options: &OrchestrationOptions,
+        mut observer: impl FnMut(OrchestrationEvent),
+    ) -> Result<OrchestrationSummary, OrchestrationError> {
+        let mut execution = LiveExecution::new(self.repository.clone());
+        execution.load_group(request.parent())?;
+        observer(OrchestrationEvent::Started {
+            parent: request.parent().clone(),
+            resumed: true,
+        });
+        let mut cycles = 0;
+        loop {
+            if options.max_cycles.is_some_and(|limit| cycles >= limit) {
+                return Err(OrchestrationError::PollingExhausted {
+                    parent: request.parent().clone(),
+                    cycles,
+                });
+            }
+            cycles += 1;
+            if let Some(summary) = self.advance_once(request, &mut observer)? {
+                return Ok(summary);
+            }
+            std::thread::sleep(options.poll_interval.min(Duration::from_secs(5)));
+        }
     }
 }
 
