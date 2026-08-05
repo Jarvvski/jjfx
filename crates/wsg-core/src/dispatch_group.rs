@@ -150,6 +150,13 @@ pub enum DispatchGroupEvent {
         /// Caller-provided dispatch timestamp.
         at: WireTimestamp,
     },
+    /// Returns a persisted assignment to pending after launch compensation.
+    DispatchAborted {
+        /// Ticket whose Run never started.
+        ticket: TicketId,
+        /// Worker whose Reservation was released.
+        worker: WorkerId,
+    },
     /// Records a successful Run outcome.
     Completed {
         /// Ticket whose Run completed.
@@ -191,6 +198,8 @@ pub enum DispatchGroupEvent {
 pub enum DispatchGroupTransition {
     /// A Ticket was recorded as dispatched.
     Dispatched,
+    /// A pre-launch assignment was returned to pending.
+    DispatchAborted,
     /// A Ticket was recorded as completed.
     Completed,
     /// A first failure needs a successful Worker Reset before retry.
@@ -284,6 +293,15 @@ impl DispatchGroup {
                 issue.dispatched_at = Some(at);
                 issue.completed_at = None;
                 Ok(DispatchGroupTransition::Dispatched)
+            }
+            DispatchGroupEvent::DispatchAborted { ticket, worker } => {
+                let issue = self.issue_mut(&ticket)?;
+                ensure_assigned(issue, &ticket, &worker)?;
+                issue.status = WireStatus::new("pending");
+                issue.worker = None;
+                issue.dispatched_at = None;
+                issue.completed_at = None;
+                Ok(DispatchGroupTransition::DispatchAborted)
             }
             DispatchGroupEvent::Completed {
                 ticket,

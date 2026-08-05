@@ -4,18 +4,19 @@
 //! This module owns orchestration order while keeping Worker Pool, Direct
 //! Dispatch, compatible persistence, and terminal formatting behind one seam.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use thiserror::Error;
 
+use crate::pool::current_timestamp;
 use crate::{
-    AgentRuntime, DispatchGroupError, DispatchGroupStatusCounts, Repository, TicketId, WorkerId,
+    AgentRuntime, CommitOutcome, DirectDispatchError, DirectDispatchRequest, DispatchGroup,
+    DispatchGroupError, DispatchGroupEvent, DispatchGroupState, DispatchGroupStatusCounts,
+    Expected, Loaded, Repository, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus,
+    Ticket, TicketId, TicketStatus, TicketTitle, WireTimestamp, WorkerActions, WorkerId,
+    WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
-
-#[cfg(test)]
-use crate::{DispatchGroup, DispatchGroupEvent, SubIssueStatus, WireTimestamp, WorkerStatus};
-#[cfg(test)]
-use std::collections::BTreeMap;
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -160,6 +161,12 @@ pub enum OrchestrationError {
     /// Compatible Dispatch Group state violated a domain invariant.
     #[error(transparent)]
     DispatchGroup(#[from] DispatchGroupError),
+    /// No compatible Dispatch Group exists for a one-tick advance.
+    #[error("Dispatch Group {parent} does not exist")]
+    MissingGroup {
+        /// Requested Parent Ticket.
+        parent: TicketId,
+    },
     /// A dispatched Sub-issue has no persisted Worker assignment.
     #[error("dispatched Ticket {ticket} has no Worker assignment")]
     UnassignedWorker {
@@ -195,7 +202,6 @@ pub enum OrchestrationError {
     Execution(String),
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct WorkerObservation {
     worker: WorkerId,
@@ -205,15 +211,19 @@ struct WorkerObservation {
     error: Option<String>,
 }
 
-#[cfg(test)]
 struct LoadedOrchestration<R> {
     group: DispatchGroup,
     revision: R,
 }
 
-#[cfg(test)]
+struct LaunchFailure {
+    detail: String,
+    compensated: bool,
+}
+
 trait OrchestrationExecution {
     type Revision;
+    type Claim;
 
     fn load_group(
         &mut self,
@@ -226,11 +236,20 @@ trait OrchestrationExecution {
         group: &DispatchGroup,
     ) -> Result<Self::Revision, OrchestrationError>;
     fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError>;
-    fn claim_ready(&mut self, ticket: &TicketId) -> Result<(), OrchestrationError>;
+    fn claim(
+        &mut self,
+        request: &DirectDispatchRequest,
+    ) -> Result<Option<Self::Claim>, OrchestrationError>;
+    fn claimed_worker(claim: &Self::Claim) -> &WorkerId;
+    fn release(&mut self, claim: Self::Claim) -> Result<(), OrchestrationError>;
+    fn launch(
+        &mut self,
+        claim: Self::Claim,
+        request: &DirectDispatchRequest,
+    ) -> Result<(), LaunchFailure>;
     fn now(&mut self) -> Result<WireTimestamp, OrchestrationError>;
 }
 
-#[cfg(test)]
 fn run_with_execution<E: OrchestrationExecution>(
     request: &OrchestrationRequest,
     execution: &mut E,
@@ -325,9 +344,203 @@ fn run_with_execution<E: OrchestrationExecution>(
     }
 
     for ticket in group.ready() {
-        execution.claim_ready(&ticket)?;
+        let dispatch = dispatch_request(&group, &ticket, request.model())?;
+        let Some(claim) = execution.claim(&dispatch)? else {
+            observer(OrchestrationEvent::WaitingForCapacity { ticket });
+            continue;
+        };
+        let worker = E::claimed_worker(&claim).clone();
+        group.apply(DispatchGroupEvent::Dispatched {
+            ticket: ticket.clone(),
+            worker: worker.clone(),
+            at: execution.now()?,
+        })?;
+        revision = match execution.save_group(&revision, &group) {
+            Ok(revision) => revision,
+            Err(primary) => {
+                if let Err(cleanup) = execution.release(claim) {
+                    return Err(OrchestrationError::Execution(format!(
+                        "{primary}; additionally failed to release Reservation: {cleanup}"
+                    )));
+                }
+                return Err(primary);
+            }
+        };
+        match execution.launch(claim, &dispatch) {
+            Ok(()) => observer(OrchestrationEvent::Dispatched { ticket, worker }),
+            Err(failure) if failure.compensated => {
+                group.apply(DispatchGroupEvent::DispatchAborted {
+                    ticket: ticket.clone(),
+                    worker: worker.clone(),
+                })?;
+                revision = execution.save_group(&revision, &group)?;
+                observer(OrchestrationEvent::LaunchFailed {
+                    ticket,
+                    worker,
+                    detail: failure.detail,
+                });
+            }
+            Err(failure) => return Err(OrchestrationError::Execution(failure.detail)),
+        }
     }
     Ok(revision)
+}
+
+fn dispatch_request(
+    group: &DispatchGroup,
+    ticket: &TicketId,
+    model: Option<&str>,
+) -> Result<DirectDispatchRequest, OrchestrationError> {
+    let issue =
+        group.state().sub_issues.get(ticket).ok_or_else(|| {
+            OrchestrationError::Execution(format!("unknown ready Ticket {ticket}"))
+        })?;
+    let title = TicketTitle::parse(&issue.title)
+        .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+    let status = TicketStatus::parse("Todo")
+        .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+    let mut request = DirectDispatchRequest::new(
+        Ticket::new(ticket.clone(), title, status),
+        RunMode::Background,
+    );
+    if let Some(model) = model {
+        request = request.with_model(model);
+    }
+    Ok(request)
+}
+
+struct LiveExecution {
+    repository: Repository,
+}
+
+impl LiveExecution {
+    fn new(repository: Repository) -> Self {
+        Self { repository }
+    }
+}
+
+impl OrchestrationExecution for LiveExecution {
+    type Revision = StateRevision<DispatchGroupState>;
+    type Claim = Reservation;
+
+    fn load_group(
+        &mut self,
+        parent: &TicketId,
+    ) -> Result<LoadedOrchestration<Self::Revision>, OrchestrationError> {
+        let repository = self.repository.state_store().dispatch_group(parent.clone());
+        let versioned = match repository
+            .load()
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?
+        {
+            Loaded::Present(versioned) => versioned,
+            Loaded::Missing => {
+                return Err(OrchestrationError::MissingGroup {
+                    parent: parent.clone(),
+                });
+            }
+        };
+        let (state, revision) = versioned.into_parts();
+        Ok(LoadedOrchestration {
+            group: DispatchGroup::from_state(state)?,
+            revision,
+        })
+    }
+
+    fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError> {
+        Ok(self
+            .repository
+            .worker_pool()
+            .reconcile_runs()
+            .workers()
+            .iter()
+            .map(|worker| WorkerObservation {
+                worker: worker.worker_id().clone(),
+                status: worker.status(),
+                ticket: worker.ticket().map(str::to_owned),
+                branch: worker.branch_name().map(str::to_owned),
+                error: worker.error().map(str::to_owned),
+            })
+            .collect())
+    }
+
+    fn save_group(
+        &mut self,
+        expected: &Self::Revision,
+        group: &DispatchGroup,
+    ) -> Result<Self::Revision, OrchestrationError> {
+        let parent = group.state().parent.clone();
+        let outcome = self
+            .repository
+            .state_store()
+            .dispatch_group(parent.clone())
+            .commit(
+                Expected::Match(expected.clone()),
+                StateChange::Replace(group.state().clone()),
+            )
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        match outcome {
+            CommitOutcome::Applied(Loaded::Present(versioned)) => Ok(versioned.revision().clone()),
+            CommitOutcome::Conflict(_) => Err(OrchestrationError::ConcurrentChange { parent }),
+            CommitOutcome::Applied(Loaded::Missing) => Err(OrchestrationError::Execution(
+                "Dispatch Group replacement unexpectedly removed state".to_owned(),
+            )),
+        }
+    }
+
+    fn reset_worker(&mut self, worker: &WorkerId) -> Result<(), OrchestrationError> {
+        let restoration = WorkerActions::new(self.repository.clone())
+            .reset(worker)
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?
+            .into_restoration();
+        if let WorkspaceRestoration::Pending(handle) = restoration {
+            handle
+                .wait()
+                .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        }
+        Ok(())
+    }
+
+    fn claim(
+        &mut self,
+        request: &DirectDispatchRequest,
+    ) -> Result<Option<Self::Claim>, OrchestrationError> {
+        match self.repository.direct_dispatch().reserve(request) {
+            Ok(claim) => Ok(Some(claim)),
+            Err(DirectDispatchError::WorkerPool(
+                WorkerPoolError::NoIdleWorkers { .. } | WorkerPoolError::CapacityShortage(_),
+            )) => Ok(None),
+            Err(error) => Err(OrchestrationError::Execution(error.to_string())),
+        }
+    }
+
+    fn claimed_worker(claim: &Self::Claim) -> &WorkerId {
+        claim.worker_id()
+    }
+
+    fn release(&mut self, claim: Self::Claim) -> Result<(), OrchestrationError> {
+        claim
+            .release()
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))
+    }
+
+    fn launch(
+        &mut self,
+        claim: Self::Claim,
+        request: &DirectDispatchRequest,
+    ) -> Result<(), LaunchFailure> {
+        self.repository
+            .direct_dispatch()
+            .dispatch_reserved(claim, request)
+            .map(|_| ())
+            .map_err(|error| LaunchFailure {
+                compensated: !matches!(error, DirectDispatchError::ReservationRelease { .. }),
+                detail: error.to_string(),
+            })
+    }
+
+    fn now(&mut self) -> Result<WireTimestamp, OrchestrationError> {
+        current_timestamp().map_err(|error| OrchestrationError::Execution(error.to_string()))
+    }
 }
 
 /// The deep application interface for persistent orchestration.
@@ -345,12 +558,32 @@ impl OrchestrationRunner {
     pub fn repository_root(&self) -> &Path {
         self.repository.root()
     }
+
+    /// Reconciles one persisted group and dispatches every currently ready Ticket that fits.
+    ///
+    /// State transitions are committed before events are delivered. Capacity shortage is
+    /// reported as an event and leaves the Ticket pending for a later advance.
+    pub fn advance_once(
+        &self,
+        request: &OrchestrationRequest,
+        mut observer: impl FnMut(OrchestrationEvent),
+    ) -> Result<(), OrchestrationError> {
+        let mut execution = LiveExecution::new(self.repository.clone());
+        run_with_execution(request, &mut execution, &mut observer).map(|_| ())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{BTreeSet, VecDeque};
+
     use super::*;
     use crate::{DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus};
+
+    struct FakeClaim {
+        worker: WorkerId,
+        ticket: TicketId,
+    }
 
     struct FakeExecution {
         group: DispatchGroup,
@@ -359,6 +592,8 @@ mod tests {
         calls: Vec<String>,
         fail_next_save: bool,
         reset_fails: bool,
+        available_workers: VecDeque<WorkerId>,
+        failed_launches: BTreeSet<TicketId>,
     }
 
     impl FakeExecution {
@@ -401,6 +636,8 @@ mod tests {
                 calls: Vec::new(),
                 fail_next_save: false,
                 reset_fails: false,
+                available_workers: VecDeque::new(),
+                failed_launches: BTreeSet::new(),
             }
         }
 
@@ -435,6 +672,41 @@ mod tests {
                 calls: Vec::new(),
                 fail_next_save: false,
                 reset_fails: false,
+                available_workers: VecDeque::new(),
+                failed_launches: BTreeSet::new(),
+            }
+        }
+
+        fn independent_pending(tickets: &[&str], workers: &[&str]) -> Self {
+            let mut state = DispatchGroupState::new(
+                TicketId::parse("ENG-100").expect("Parent Ticket"),
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+                "owner/repo",
+                DispatchGroupOptions::new(""),
+            );
+            for ticket in tickets {
+                state.sub_issues.insert(
+                    TicketId::parse(*ticket).expect("Ticket"),
+                    SubIssueState::new(
+                        format!("Implement {ticket}"),
+                        WireStatus::new("pending"),
+                        Vec::new(),
+                    ),
+                );
+            }
+            let available_workers = workers
+                .iter()
+                .map(|worker| WorkerId::parse(*worker).expect("Worker"))
+                .collect();
+            Self {
+                group: DispatchGroup::from_state(state).expect("valid pending group"),
+                revision: 0,
+                workers: Vec::new(),
+                calls: Vec::new(),
+                fail_next_save: false,
+                reset_fails: false,
+                available_workers,
+                failed_launches: BTreeSet::new(),
             }
         }
 
@@ -445,10 +717,16 @@ mod tests {
         fn fail_reset(&mut self) {
             self.reset_fails = true;
         }
+
+        fn fail_launch(&mut self, ticket: &str) {
+            self.failed_launches
+                .insert(TicketId::parse(ticket).expect("failed launch Ticket"));
+        }
     }
 
     impl OrchestrationExecution for FakeExecution {
         type Revision = u64;
+        type Claim = FakeClaim;
 
         fn load_group(
             &mut self,
@@ -501,14 +779,150 @@ mod tests {
             Ok(())
         }
 
-        fn claim_ready(&mut self, ticket: &TicketId) -> Result<(), OrchestrationError> {
+        fn claim(
+            &mut self,
+            request: &DirectDispatchRequest,
+        ) -> Result<Option<Self::Claim>, OrchestrationError> {
+            let ticket = request.ticket().id().clone();
             self.calls.push(format!("claim:{ticket}"));
+            Ok(self
+                .available_workers
+                .pop_front()
+                .map(|worker| FakeClaim { worker, ticket }))
+        }
+
+        fn claimed_worker(claim: &Self::Claim) -> &WorkerId {
+            &claim.worker
+        }
+
+        fn release(&mut self, claim: Self::Claim) -> Result<(), OrchestrationError> {
+            self.calls
+                .push(format!("release:{}:{}", claim.worker, claim.ticket));
+            Ok(())
+        }
+
+        fn launch(
+            &mut self,
+            claim: Self::Claim,
+            request: &DirectDispatchRequest,
+        ) -> Result<(), LaunchFailure> {
+            let ticket = request.ticket().id();
+            self.calls.push(format!("launch:{}:{ticket}", claim.worker));
+            if self.failed_launches.contains(ticket) {
+                return Err(LaunchFailure {
+                    detail: "launch failed".to_owned(),
+                    compensated: true,
+                });
+            }
             Ok(())
         }
 
         fn now(&mut self) -> Result<WireTimestamp, OrchestrationError> {
             Ok(WireTimestamp::new("2026-08-04T12:02:00Z"))
         }
+    }
+
+    #[test]
+    fn ready_tickets_launch_in_stable_order_until_capacity_runs_out() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::independent_pending(
+            &["ENG-103", "ENG-101", "ENG-102"],
+            &["worker-01", "worker-02"],
+        );
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("dispatch available wave");
+
+        assert_eq!(
+            execution.calls,
+            vec![
+                "workers".to_owned(),
+                "claim:ENG-101".to_owned(),
+                "save:r0:ENG-101:dispatched".to_owned(),
+                "launch:worker-01:ENG-101".to_owned(),
+                "claim:ENG-102".to_owned(),
+                "save:r1:ENG-101:dispatched".to_owned(),
+                "launch:worker-02:ENG-102".to_owned(),
+                "claim:ENG-103".to_owned(),
+            ]
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                OrchestrationEvent::Dispatched { ticket: first, .. },
+                OrchestrationEvent::Dispatched { ticket: second, .. },
+                OrchestrationEvent::WaitingForCapacity { ticket: waiting }
+            ] if first.as_str() == "ENG-101"
+                && second.as_str() == "ENG-102"
+                && waiting.as_str() == "ENG-103"
+        ));
+    }
+
+    #[test]
+    fn compensated_launch_failure_returns_the_ticket_to_pending_without_a_retry() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::independent_pending(&["ENG-101"], &["worker-01"]);
+        execution.fail_launch("ENG-101");
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("compensate failed launch");
+
+        assert_eq!(
+            execution.calls,
+            vec![
+                "workers".to_owned(),
+                "claim:ENG-101".to_owned(),
+                "save:r0:ENG-101:dispatched".to_owned(),
+                "launch:worker-01:ENG-101".to_owned(),
+                "save:r1:ENG-101:pending".to_owned(),
+            ]
+        );
+        let issue = execution
+            .group
+            .state()
+            .sub_issues
+            .get(&TicketId::parse("ENG-101").expect("Ticket"))
+            .expect("compensated Ticket");
+        assert_eq!(issue.status.as_str(), "pending");
+        assert_eq!(issue.retries, 0);
+        assert!(matches!(
+            events.as_slice(),
+            [OrchestrationEvent::LaunchFailed { .. }]
+        ));
+    }
+
+    #[test]
+    fn reservation_is_released_when_assignment_persistence_conflicts() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::independent_pending(&["ENG-101"], &["worker-01"]);
+        execution.fail_next_save();
+        let mut events = Vec::new();
+
+        let error = run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect_err("stale assignment must stop");
+
+        assert!(matches!(error, OrchestrationError::ConcurrentChange { .. }));
+        assert_eq!(
+            execution.calls,
+            vec![
+                "workers".to_owned(),
+                "claim:ENG-101".to_owned(),
+                "save:r0:ENG-101:dispatched".to_owned(),
+                "release:worker-01:ENG-101".to_owned(),
+            ]
+        );
+        assert!(events.is_empty());
     }
 
     #[test]
@@ -541,7 +955,10 @@ mod tests {
         assert_eq!(issue.retries, 1);
         assert!(matches!(
             events.as_slice(),
-            [OrchestrationEvent::Retrying { attempt: 2, .. }]
+            [
+                OrchestrationEvent::Retrying { attempt: 2, .. },
+                OrchestrationEvent::WaitingForCapacity { .. }
+            ]
         ));
     }
 

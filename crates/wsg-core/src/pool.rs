@@ -1218,7 +1218,7 @@ fn apply_run_result(state: &mut WorkerState, result: &RunResult) -> Result<(), W
     Ok(())
 }
 
-fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {
+pub(crate) fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {
     let timestamp = Timestamp::now()
         .round(
             TimestampRound::new()
