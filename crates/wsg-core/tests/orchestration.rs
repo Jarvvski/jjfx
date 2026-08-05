@@ -1,11 +1,13 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::process::Command;
+
+use rustix::fs::{FlockOperation, flock};
 
 use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
-    OrchestrationEvent, OrchestrationRequest, Repository, StateChange, SubIssueState, TicketId,
-    WireStatus, WireTimestamp,
+    OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, PoolState, Repository,
+    StateChange, SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
 };
 
 #[test]
@@ -106,4 +108,127 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
             .as_deref(),
         Some("adam/eng-101-foundation")
     );
+}
+
+#[test]
+fn competing_parent_runner_returns_already_running_without_waiting() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let lock_path = directory.path().join(".jj/pool/orchestrate-eng-100.lock");
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock directory");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .expect("lock file");
+    flock(&lock_file, FlockOperation::LockExclusive).expect("hold runner lock");
+
+    let error = repository
+        .orchestration_runner()
+        .advance_once(
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
+            |_| {},
+        )
+        .expect_err("second runner must be rejected");
+    assert!(matches!(
+        error,
+        wsg_core::OrchestrationError::AlreadyRunning { parent: actual } if actual == parent
+    ));
+}
+
+#[test]
+fn detached_entrypoint_returns_terminal_summary_for_persisted_group() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-08-04T12:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    group.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Sub-issue"),
+        SubIssueState::new("Foundation", WireStatus::new("done"), Vec::new()),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent.clone())
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save group");
+
+    let summary = repository
+        .orchestration_runner()
+        .run_detached(
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
+            &OrchestrationOptions::new()
+                .with_poll_interval(std::time::Duration::ZERO)
+                .with_max_cycles(1),
+            |_| {},
+        )
+        .expect("detached entrypoint");
+    assert_eq!(summary.parent(), &parent);
+    assert_eq!(summary.counts().done(), 1);
+}
+
+#[test]
+fn bounded_polling_reports_capacity_wait_without_busy_looping() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let ticket = TicketId::parse("ENG-101").expect("Sub-issue");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-08-04T12:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    group.sub_issues.insert(
+        ticket,
+        SubIssueState::new("Foundation", WireStatus::new("pending"), Vec::new()),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent.clone())
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save group");
+    repository
+        .state_store()
+        .pool()
+        .commit(
+            Expected::Missing,
+            StateChange::Replace(PoolState::new(
+                0,
+                "owner/repo",
+                Vec::<WorkerId>::new(),
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+            )),
+        )
+        .expect("save empty pool");
+
+    let mut events = Vec::new();
+    let error = repository
+        .orchestration_runner()
+        .run(
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
+            &OrchestrationOptions::new()
+                .with_poll_interval(std::time::Duration::ZERO)
+                .with_max_cycles(1),
+            |event| events.push(event),
+        )
+        .expect_err("one bounded cycle cannot complete pending work");
+    assert!(matches!(
+        error,
+        wsg_core::OrchestrationError::PollingExhausted { parent: actual, cycles: 1 } if actual == parent
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        OrchestrationEvent::WaitingForCapacity { ticket } if ticket.as_str() == "ENG-101"
+    )));
 }

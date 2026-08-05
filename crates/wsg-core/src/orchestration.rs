@@ -5,9 +5,12 @@
 //! Dispatch, compatible persistence, and terminal formatting behind one seam.
 
 use std::collections::BTreeMap;
+use std::fs::{self, File, OpenOptions};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
+
+use rustix::fs::{FlockOperation, flock};
 
 use thiserror::Error;
 
@@ -247,6 +250,12 @@ pub enum OrchestrationError {
     /// A production or test execution adapter failed.
     #[error("orchestration execution failed: {0}")]
     Execution(String),
+    /// Another runner already owns this Parent Ticket.
+    #[error("Dispatch Group {parent} is already running")]
+    AlreadyRunning {
+        /// Parent Ticket whose runner lock is held.
+        parent: TicketId,
+    },
     /// The configured polling cycle bound was reached before terminal state.
     #[error("Dispatch Group {parent} did not reach terminal state within {cycles} cycles")]
     PollingExhausted {
@@ -705,8 +714,17 @@ impl OrchestrationRunner {
         request: &OrchestrationRequest,
         mut observer: impl FnMut(OrchestrationEvent),
     ) -> Result<Option<OrchestrationSummary>, OrchestrationError> {
+        let _lock = self.acquire_lock(request.parent())?;
+        self.advance_once_unlocked(request, &mut observer)
+    }
+
+    fn advance_once_unlocked(
+        &self,
+        request: &OrchestrationRequest,
+        observer: &mut impl FnMut(OrchestrationEvent),
+    ) -> Result<Option<OrchestrationSummary>, OrchestrationError> {
         let mut execution = LiveExecution::new(self.repository.clone());
-        run_with_execution(request, &mut execution, &mut observer)?;
+        run_with_execution(request, &mut execution, observer)?;
         let loaded = execution.load_group(request.parent())?;
         if loaded.group.is_terminal() {
             let summary = OrchestrationSummary {
@@ -721,6 +739,29 @@ impl OrchestrationRunner {
         }
     }
 
+    fn acquire_lock(&self, parent: &TicketId) -> Result<File, OrchestrationError> {
+        let directory = self.repository.root().join(".jj/pool");
+        fs::create_dir_all(&directory)
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        let path = directory.join(format!("orchestrate-{}.lock", parent.as_str().to_ascii_lowercase()));
+        let file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => Ok(file),
+            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
+                Err(OrchestrationError::AlreadyRunning {
+                    parent: parent.clone(),
+                })
+            }
+            Err(error) => Err(OrchestrationError::Execution(error.to_string())),
+        }
+    }
+
     /// Watches one persisted group until it reaches a terminal state.
     pub fn run(
         &self,
@@ -728,6 +769,7 @@ impl OrchestrationRunner {
         options: &OrchestrationOptions,
         mut observer: impl FnMut(OrchestrationEvent),
     ) -> Result<OrchestrationSummary, OrchestrationError> {
+        let _lock = self.acquire_lock(request.parent())?;
         let mut execution = LiveExecution::new(self.repository.clone());
         execution.load_group(request.parent())?;
         observer(OrchestrationEvent::Started {
@@ -743,11 +785,21 @@ impl OrchestrationRunner {
                 });
             }
             cycles += 1;
-            if let Some(summary) = self.advance_once(request, &mut observer)? {
+            if let Some(summary) = self.advance_once_unlocked(request, &mut observer)? {
                 return Ok(summary);
             }
             std::thread::sleep(options.poll_interval.min(Duration::from_secs(5)));
         }
+    }
+
+    /// Detached-process-compatible entrypoint with the same durable semantics as foreground watch.
+    pub fn run_detached(
+        &self,
+        request: &OrchestrationRequest,
+        options: &OrchestrationOptions,
+        observer: impl FnMut(OrchestrationEvent),
+    ) -> Result<OrchestrationSummary, OrchestrationError> {
+        self.run(request, options, observer)
     }
 }
 
