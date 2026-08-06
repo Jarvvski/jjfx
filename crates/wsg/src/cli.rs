@@ -1117,6 +1117,24 @@ mod tests {
     }
 
     #[test]
+    fn parser_preserves_ready_ticket_bulk_label() {
+        let command = parse(&args(&["dispatch", "--all", "--label", "needs-review"]))
+            .expect("bulk dispatch arguments should parse");
+        assert_eq!(
+            command,
+            Command::Dispatch(DispatchArgs {
+                tickets: Vec::new(),
+                all: true,
+                mode: RunMode::Background,
+                model: None,
+                budget: None,
+                label: "needs-review".to_owned(),
+                no_orchestrate: false,
+            })
+        );
+    }
+
+    #[test]
     fn parser_accepts_action_aliases() {
         assert_eq!(
             parse(&args(&["d", "AMBA-42", "--no-orchestrate"])).unwrap(),
