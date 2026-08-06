@@ -1,6 +1,6 @@
 # Add Ticket Dispatch workflows to jjfx
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

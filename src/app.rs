@@ -44,6 +44,10 @@ enum PoolMode {
         buffer: String,
         selected: Option<String>,
     },
+    TicketInput {
+        buffer: String,
+        selected: Option<String>,
+    },
 }
 
 /// What the key handler is currently collecting: normal navigation, a new
@@ -180,6 +184,8 @@ pub struct App {
     /// Operation generation used to reject stale mutation results.
     next_operation: OperationId,
     active_operation: Option<OperationId>,
+    /// Latest ordered Direct Dispatch outcomes for the Pool view.
+    dispatch_result: Option<crate::workspace_dispatch::DispatchResult>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
@@ -250,6 +256,7 @@ impl App {
             dispatch,
             next_operation: 0,
             active_operation: None,
+            dispatch_result: None,
             forge_progress: HashMap::new(),
             fetching: false,
             workspace_config: config.workspace,
@@ -338,6 +345,31 @@ impl App {
                 if self.active_operation == Some(operation) {
                     self.set_status("Worker Pool destroyed".to_string());
                     self.mode = Mode::Normal;
+                }
+            }
+            WorkspaceDispatchEvent::Dispatched { operation, result } => {
+                if self.active_operation == Some(operation) {
+                    let count = result.outcomes().len();
+                    let partial = result.is_partial();
+                    self.dispatch_result = Some(result);
+                    self.active_operation = None;
+                    self.set_status(if partial {
+                        format!("Dispatched {count} Ticket(s) with partial capacity")
+                    } else {
+                        format!("Dispatched {count} Ticket(s)")
+                    });
+                }
+            }
+            WorkspaceDispatchEvent::DispatchCapacity {
+                operation,
+                shortage,
+            } => {
+                if self.active_operation == Some(operation) {
+                    self.set_status(format!(
+                        "Dispatch needs {} idle Worker(s); only {} available",
+                        shortage.requested(),
+                        shortage.available()
+                    ));
                 }
             }
             WorkspaceDispatchEvent::Failed { operation, message } => {
@@ -683,6 +715,13 @@ impl App {
                     let selected = self.pool_worker_after(selected.as_deref(), -1);
                     self.mode = Mode::Pool(PoolMode::View { selected });
                 }
+                KeyCode::Char('d') => {
+                    let selected = selected.or_else(|| self.pool_worker_after(None, 0));
+                    self.mode = Mode::Pool(PoolMode::TicketInput {
+                        buffer: String::new(),
+                        selected,
+                    });
+                }
                 KeyCode::Char('r') => {
                     let capacity = self.pool_capacity().unwrap_or(0);
                     self.mode = Mode::Pool(PoolMode::Capacity {
@@ -725,6 +764,39 @@ impl App {
                 },
                 _ => self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected }),
             },
+            Mode::Pool(PoolMode::TicketInput {
+                mut buffer,
+                selected,
+            }) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Pool(PoolMode::View { selected }),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
+                }
+                KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => {
+                    buffer.push(c);
+                    self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
+                }
+                KeyCode::Enter => {
+                    let ticket = buffer.trim().to_owned();
+                    if ticket.is_empty() {
+                        self.set_status("Ticket ID cannot be empty".to_string());
+                        self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
+                    } else if selected
+                        .as_deref()
+                        .is_none_or(|worker| !self.worker_is_idle(worker))
+                    {
+                        self.set_status("Select an idle Worker before Dispatch".to_string());
+                        self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
+                    } else {
+                        self.mode = Mode::Pool(PoolMode::View {
+                            selected: selected.clone(),
+                        });
+                        self.dispatch_tickets(vec![ticket], selected);
+                    }
+                }
+                _ => self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected }),
+            },
             other => self.mode = other,
         }
     }
@@ -760,6 +832,16 @@ impl App {
         }
     }
 
+    fn dispatch_tickets(&mut self, tickets: Vec<String>, worker: Option<String>) {
+        let operation = self.begin_dispatch();
+        self.pin_status(format!("dispatching {} Ticket(s)...", tickets.len()));
+        self.dispatch.submit(WorkspaceDispatchCommand::Dispatch {
+            operation,
+            tickets,
+            worker,
+        });
+    }
+
     fn resize_pool(&mut self, capacity: usize) {
         let operation = self.begin_dispatch();
         self.pin_status(format!("resizing Worker Pool to {capacity}..."));
@@ -781,6 +863,18 @@ impl App {
             .as_ref()?
             .pool()
             .and_then(|pool| usize::try_from(pool.size()).ok())
+    }
+
+    fn worker_is_idle(&self, worker_id: &str) -> bool {
+        self.worker_pool
+            .as_ref()
+            .and_then(|snapshot| {
+                snapshot
+                    .workers()
+                    .iter()
+                    .find(|worker| worker.worker_id().as_str() == worker_id)
+            })
+            .is_some_and(|worker| worker.status() == WorkerStatus::Idle)
     }
 
     fn pool_worker_after(&self, selected: Option<&str>, delta: isize) -> Option<String> {
@@ -1367,7 +1461,8 @@ impl App {
             }
             let selected = match &self.mode {
                 Mode::Pool(PoolMode::View { selected })
-                | Mode::Pool(PoolMode::Capacity { selected, .. }) => selected.as_deref(),
+                | Mode::Pool(PoolMode::Capacity { selected, .. })
+                | Mode::Pool(PoolMode::TicketInput { selected, .. }) => selected.as_deref(),
                 _ => None,
             };
             for worker in snapshot.workers() {
@@ -1389,6 +1484,27 @@ impl App {
                     format!(" ! {}", diagnostic.message()),
                     Style::default().fg(Color::Yellow),
                 )));
+            }
+            if let Some(result) = &self.dispatch_result {
+                lines.push(dim_line(" Dispatch outcomes:"));
+                for outcome in result.outcomes() {
+                    let line = if outcome.succeeded() {
+                        format!(
+                            "  ✓ {} -> {} (PID {})",
+                            outcome.ticket(),
+                            outcome.worker().unwrap_or("?"),
+                            outcome.pid().unwrap_or_default()
+                        )
+                    } else {
+                        format!(
+                            "  ✗ {} [{}] {}",
+                            outcome.ticket(),
+                            outcome.phase().unwrap_or("unknown"),
+                            outcome.detail().unwrap_or("Dispatch failed")
+                        )
+                    };
+                    lines.push(Line::from(line));
+                }
             }
         } else {
             lines.push(dim_line(" loading Worker Pool..."));
@@ -1698,11 +1814,15 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
                 format!(" Pool capacity: {buffer}_  (enter apply, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::TicketInput { buffer, .. }) => Paragraph::new(Span::styled(
+                format!(" Ticket ID: {buffer}_  (enter dispatch, esc cancel) "),
                 Style::default().fg(Color::Cyan),
             )),
             Mode::ConfirmPoolShrink(capacity, _) => Paragraph::new(Span::styled(
