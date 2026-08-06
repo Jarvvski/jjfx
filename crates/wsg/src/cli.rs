@@ -1161,6 +1161,18 @@ mod tests {
     }
 
     #[test]
+    fn send_parser_preserves_prompt_and_foreground_mode() {
+        assert_eq!(
+            parse(&args(&["s", "worker-1", "follow up", "--fg"])).unwrap(),
+            Command::Send {
+                worker: "worker-1".to_owned(),
+                prompt: "follow up".to_owned(),
+                mode: RunMode::Foreground,
+            }
+        );
+    }
+
+    #[test]
     fn foreground_and_background_prompt_rendering_preserves_ordered_inputs() {
         assert_eq!(truncate_prompt("é".repeat(80).as_str()).chars().count(), 60);
         assert_eq!(truncate_prompt("first second"), "first second");
