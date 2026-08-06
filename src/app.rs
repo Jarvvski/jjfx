@@ -55,6 +55,11 @@ enum PoolMode {
     ReadyPreview {
         selected: Option<String>,
     },
+    ConfirmDispatchCapacity {
+        tickets: Vec<String>,
+        worker: Option<String>,
+        shortage: crate::workspace_dispatch::DispatchCapacityShortage,
+    },
 }
 
 /// What the key handler is currently collecting: normal navigation, a new
@@ -372,9 +377,16 @@ impl App {
             }
             WorkspaceDispatchEvent::DispatchCapacity {
                 operation,
+                tickets,
+                worker,
                 shortage,
             } => {
                 if self.active_operation == Some(operation) {
+                    self.mode = Mode::Pool(PoolMode::ConfirmDispatchCapacity {
+                        tickets,
+                        worker,
+                        shortage,
+                    });
                     self.set_status(format!(
                         "Dispatch needs {} idle Worker(s); only {} available",
                         shortage.requested(),
@@ -855,6 +867,11 @@ impl App {
                 }
                 _ => self.mode = Mode::Pool(PoolMode::ReadyPreview { selected }),
             },
+            Mode::Pool(PoolMode::ConfirmDispatchCapacity {
+                tickets,
+                worker,
+                shortage,
+            }) => self.on_key_confirm_dispatch_capacity(key, tickets, worker, shortage),
             other => self.mode = other,
         }
     }
@@ -867,6 +884,52 @@ impl App {
                 operation,
                 label: "ready-for-agent".to_owned(),
             });
+    }
+
+    fn on_key_confirm_dispatch_capacity(
+        &mut self,
+        key: KeyEvent,
+        tickets: Vec<String>,
+        worker: Option<String>,
+        shortage: crate::workspace_dispatch::DispatchCapacityShortage,
+    ) {
+        let Some(operation) = self.active_operation else {
+            self.mode = Mode::Pool(PoolMode::View { selected: worker });
+            return;
+        };
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.pin_status(format!("growing Pool by {} Worker(s)...", shortage.gap()));
+                self.dispatch
+                    .submit(WorkspaceDispatchCommand::DispatchWithApprovedGrowth {
+                        operation,
+                        tickets,
+                        worker,
+                        additional: shortage.gap(),
+                    });
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') => {
+                self.pin_status("dispatching available Tickets...".to_string());
+                self.dispatch
+                    .submit(WorkspaceDispatchCommand::DispatchUseAvailable {
+                        operation,
+                        tickets,
+                        worker,
+                    });
+            }
+            KeyCode::Esc => {
+                self.active_operation = None;
+                self.mode = Mode::Pool(PoolMode::View { selected: worker });
+                self.set_status("Dispatch cancelled".to_string());
+            }
+            _ => {
+                self.mode = Mode::Pool(PoolMode::ConfirmDispatchCapacity {
+                    tickets,
+                    worker,
+                    shortage,
+                });
+            }
+        }
     }
 
     fn on_key_confirm_pool_shrink(&mut self, key: KeyEvent) {
@@ -1532,7 +1595,10 @@ impl App {
                 | Mode::Pool(PoolMode::Capacity { selected, .. })
                 | Mode::Pool(PoolMode::TicketInput { selected, .. })
                 | Mode::Pool(PoolMode::DispatchPreview { selected, .. })
-                | Mode::Pool(PoolMode::ReadyPreview { selected }) => selected.as_deref(),
+                | Mode::Pool(PoolMode::ReadyPreview { selected })
+                | Mode::Pool(PoolMode::ConfirmDispatchCapacity {
+                    worker: selected, ..
+                }) => selected.as_deref(),
                 _ => None,
             };
             for worker in snapshot.workers() {
@@ -1592,8 +1658,9 @@ impl App {
                 for outcome in result.outcomes() {
                     let line = if outcome.succeeded() {
                         format!(
-                            "  ✓ {} -> {} (PID {})",
+                            "  ✓ {}  {} -> {} (PID {})",
                             outcome.ticket(),
+                            outcome.title(),
                             outcome.worker().unwrap_or("?"),
                             outcome.pid().unwrap_or_default()
                         )
@@ -1938,6 +2005,15 @@ impl App {
                 " Ready Tickets: enter launch, esc cancel ",
                 Style::default().fg(Color::Cyan),
             )),
+            Mode::Pool(PoolMode::ConfirmDispatchCapacity { shortage, .. }) => {
+                Paragraph::new(Span::styled(
+                    format!(
+                        " Pool short by {} Worker(s): grow? (y/n, esc cancel) ",
+                        shortage.gap()
+                    ),
+                    Style::default().fg(Color::Yellow),
+                ))
+            }
             Mode::ConfirmPoolShrink(capacity, _) => Paragraph::new(Span::styled(
                 format!(" shrink Worker Pool to {capacity}? (y/n) "),
                 Style::default().fg(Color::Red),
@@ -3247,6 +3323,32 @@ mod tests {
             app.ready_tickets.as_ref().unwrap().tickets()[1].id(),
             "ENG-43"
         );
+    }
+
+    #[test]
+    fn capacity_shortage_requires_a_typed_growth_decision() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::View { selected: None });
+        app.active_operation = Some(7);
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::DispatchCapacity {
+                operation: 7,
+                tickets: vec!["ENG-42".to_owned(), "ENG-43".to_owned()],
+                worker: None,
+                shortage: crate::workspace_dispatch::DispatchCapacityShortage::new(2, 1),
+            },
+        ));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::ConfirmDispatchCapacity { ref tickets, shortage, .. })
+                if tickets == &["ENG-42".to_owned(), "ENG-43".to_owned()]
+                    && shortage.gap() == 1
+        ));
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert_eq!(app.active_operation, None);
+        assert_eq!(app.status.as_deref(), Some("Dispatch cancelled"));
     }
 
     #[test]

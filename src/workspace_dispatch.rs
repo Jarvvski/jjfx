@@ -34,6 +34,19 @@ pub enum WorkspaceDispatchCommand {
         tickets: Vec<String>,
         worker: Option<String>,
     },
+    /// Retry a Dispatch after approving the exact capacity gap.
+    DispatchWithApprovedGrowth {
+        operation: OperationId,
+        tickets: Vec<String>,
+        worker: Option<String>,
+        additional: usize,
+    },
+    /// Dispatch only the currently available subset after declining growth.
+    DispatchUseAvailable {
+        operation: OperationId,
+        tickets: Vec<String>,
+        worker: Option<String>,
+    },
     /// Discover provider-ready Tickets for the configured dispatch label.
     DiscoverReady {
         operation: OperationId,
@@ -145,6 +158,14 @@ pub struct DispatchCapacityShortage {
 }
 
 impl DispatchCapacityShortage {
+    /// Creates a shortage from counts observed under the Pool lock.
+    pub const fn new(requested: usize, available: usize) -> Self {
+        Self {
+            requested,
+            available,
+        }
+    }
+
     /// Returns the number of requested Tickets.
     pub const fn requested(self) -> usize {
         self.requested
@@ -275,6 +296,8 @@ pub enum WorkspaceDispatchEvent {
     /// Dispatch found too little idle capacity for the complete batch.
     DispatchCapacity {
         operation: OperationId,
+        tickets: Vec<String>,
+        worker: Option<String>,
         shortage: DispatchCapacityShortage,
     },
     /// Ready Ticket discovery completed with ordered preview data.
@@ -299,6 +322,19 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     fn destroy(&self) -> Result<(), String>;
     /// Dispatch Ticket IDs through the shared Direct Dispatch coordinator.
     fn dispatch(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
+    /// Dispatch after approving the exact capacity gap under the Pool lock.
+    fn dispatch_with_approved_growth(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+        additional: usize,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
+    /// Dispatch only the available subset under the Pool lock.
+    fn dispatch_use_available(
         &self,
         tickets: &[String],
         worker: Option<&str>,
@@ -384,6 +420,54 @@ impl WorkspaceDispatchController {
                 Err(WorkspaceDispatchError::CapacityShortage(shortage)) => {
                     emit(WorkspaceDispatchEvent::DispatchCapacity {
                         operation,
+                        tickets,
+                        worker,
+                        shortage,
+                    })
+                }
+                Err(WorkspaceDispatchError::Failed(message)) => {
+                    emit(WorkspaceDispatchEvent::Failed { operation, message })
+                }
+            },
+            WorkspaceDispatchCommand::DispatchWithApprovedGrowth {
+                operation,
+                tickets,
+                worker,
+                additional,
+            } => {
+                match adapter.dispatch_with_approved_growth(&tickets, worker.as_deref(), additional)
+                {
+                    Ok(result) => emit(WorkspaceDispatchEvent::Dispatched {
+                        operation,
+                        result: result.into_result(),
+                    }),
+                    Err(WorkspaceDispatchError::CapacityShortage(shortage)) => {
+                        emit(WorkspaceDispatchEvent::DispatchCapacity {
+                            operation,
+                            tickets,
+                            worker,
+                            shortage,
+                        })
+                    }
+                    Err(WorkspaceDispatchError::Failed(message)) => {
+                        emit(WorkspaceDispatchEvent::Failed { operation, message })
+                    }
+                }
+            }
+            WorkspaceDispatchCommand::DispatchUseAvailable {
+                operation,
+                tickets,
+                worker,
+            } => match adapter.dispatch_use_available(&tickets, worker.as_deref()) {
+                Ok(result) => emit(WorkspaceDispatchEvent::Dispatched {
+                    operation,
+                    result: result.into_result(),
+                }),
+                Err(WorkspaceDispatchError::CapacityShortage(shortage)) => {
+                    emit(WorkspaceDispatchEvent::DispatchCapacity {
+                        operation,
+                        tickets,
+                        worker,
                         shortage,
                     })
                 }
@@ -407,6 +491,12 @@ pub struct RealWorkspaceDispatch {
     repository_root: PathBuf,
 }
 
+enum DispatchStrategy {
+    Complete,
+    ApprovedGrowth(usize),
+    Available,
+}
+
 impl RealWorkspaceDispatch {
     /// Creates an adapter rooted at a discovered jj workspace.
     pub fn new(repository_root: impl Into<PathBuf>) -> Self {
@@ -417,6 +507,80 @@ impl RealWorkspaceDispatch {
 
     fn repository(&self) -> Result<wsg_core::Repository, String> {
         wsg_core::Repository::open(&self.repository_root).map_err(|error| error.to_string())
+    }
+
+    fn dispatch_with_strategy(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+        strategy: DispatchStrategy,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
+        let repository = self.repository().map_err(WorkspaceDispatchError::Failed)?;
+        let requests = tickets
+            .iter()
+            .map(|ticket| {
+                let id = TicketId::parse(ticket.clone())
+                    .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?;
+                let request = DirectDispatchRequest::for_ticket_id(id, RunMode::Background)
+                    .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?;
+                Ok(match worker {
+                    Some(worker) => request.to_worker(
+                        WorkerId::parse(worker.to_owned())
+                            .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?,
+                    ),
+                    None => request,
+                })
+            })
+            .collect::<Result<Vec<_>, WorkspaceDispatchError>>()?;
+        let dispatcher = repository.direct_dispatch();
+        let result = match strategy {
+            DispatchStrategy::Complete => dispatcher.dispatch(&requests),
+            DispatchStrategy::ApprovedGrowth(additional) => {
+                dispatcher.dispatch_with_approved_growth(&requests, additional)
+            }
+            DispatchStrategy::Available => dispatcher.dispatch_use_available(&requests),
+        }
+        .map_err(|error| match error {
+            DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(shortage)) => {
+                WorkspaceDispatchError::CapacityShortage(DispatchCapacityShortage {
+                    requested: shortage.requested(),
+                    available: shortage.available(),
+                })
+            }
+            other => WorkspaceDispatchError::Failed(other.to_string()),
+        })?;
+        let outcomes = result
+            .outcomes()
+            .iter()
+            .map(|outcome| match outcome {
+                DirectDispatchOutcome::Succeeded(success) => match success.execution() {
+                    DirectDispatchExecution::Background { pid } => DispatchOutcome::success(
+                        success.ticket().id().to_string(),
+                        success.ticket().title().as_str().to_owned(),
+                        success.worker().to_string(),
+                        *pid,
+                    ),
+                    DirectDispatchExecution::Foreground(_) => DispatchOutcome::failure(
+                        success.ticket().id().to_string(),
+                        success.ticket().title().as_str().to_owned(),
+                        Some(success.worker().to_string()),
+                        DirectDispatchFailurePhase::Launch,
+                        "foreground Dispatch is not supported by the jjfx controller".to_owned(),
+                    ),
+                },
+                DirectDispatchOutcome::Failed(failure) => DispatchOutcome::failure(
+                    failure.ticket().id().to_string(),
+                    failure.ticket().title().as_str().to_owned(),
+                    failure.worker().map(ToString::to_string),
+                    failure.phase(),
+                    failure.detail().to_owned(),
+                ),
+            })
+            .collect();
+        Ok(DispatchAdapterResult::new(DispatchResult {
+            outcomes,
+            partial: result.is_partial(),
+        }))
     }
 }
 
@@ -468,21 +632,18 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         let ready = discovery
             .ready_tickets(&filter)
             .map_err(|error| error.to_string())?;
-        Ok(ReadyTicketResult {
-            tickets: ready
+        Ok(ReadyTicketResult::new(
+            ready
                 .tickets()
                 .iter()
-                .map(|ticket| ReadyTicket {
-                    id: ticket.id().to_string(),
-                    title: ticket.title().as_str().to_owned(),
-                })
+                .map(|ticket| ReadyTicket::new(ticket.id().to_string(), ticket.title().as_str()))
                 .collect(),
-            diagnostics: ready
+            ready
                 .diagnostics()
                 .iter()
                 .map(|diagnostic| format!("{}: {}", diagnostic.subject(), diagnostic.reason()))
                 .collect(),
-        })
+        ))
     }
 
     fn dispatch(
@@ -490,68 +651,28 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         tickets: &[String],
         worker: Option<&str>,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
-        let repository = self.repository().map_err(WorkspaceDispatchError::Failed)?;
-        let requests = tickets
-            .iter()
-            .map(|ticket| {
-                let id = TicketId::parse(ticket.clone())
-                    .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?;
-                let request = DirectDispatchRequest::for_ticket_id(id, RunMode::Background)
-                    .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?;
-                Ok(match worker {
-                    Some(worker) => request.to_worker(
-                        WorkerId::parse(worker.to_owned())
-                            .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?,
-                    ),
-                    None => request,
-                })
-            })
-            .collect::<Result<Vec<_>, WorkspaceDispatchError>>()?;
-        let result =
-            repository
-                .direct_dispatch()
-                .dispatch(&requests)
-                .map_err(|error| match error {
-                    DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(
-                        shortage,
-                    )) => WorkspaceDispatchError::CapacityShortage(DispatchCapacityShortage {
-                        requested: shortage.requested(),
-                        available: shortage.available(),
-                    }),
-                    other => WorkspaceDispatchError::Failed(other.to_string()),
-                })?;
-        let outcomes = result
-            .outcomes()
-            .iter()
-            .map(|outcome| match outcome {
-                DirectDispatchOutcome::Succeeded(success) => match success.execution() {
-                    DirectDispatchExecution::Background { pid } => DispatchOutcome::success(
-                        success.ticket().id().to_string(),
-                        success.ticket().title().as_str().to_owned(),
-                        success.worker().to_string(),
-                        *pid,
-                    ),
-                    DirectDispatchExecution::Foreground(_) => DispatchOutcome::failure(
-                        success.ticket().id().to_string(),
-                        success.ticket().title().as_str().to_owned(),
-                        Some(success.worker().to_string()),
-                        DirectDispatchFailurePhase::Launch,
-                        "foreground Dispatch is not supported by the jjfx controller".to_owned(),
-                    ),
-                },
-                DirectDispatchOutcome::Failed(failure) => DispatchOutcome::failure(
-                    failure.ticket().id().to_string(),
-                    failure.ticket().title().as_str().to_owned(),
-                    failure.worker().map(ToString::to_string),
-                    failure.phase(),
-                    failure.detail().to_owned(),
-                ),
-            })
-            .collect();
-        Ok(DispatchAdapterResult::new(DispatchResult {
-            outcomes,
-            partial: result.is_partial(),
-        }))
+        self.dispatch_with_strategy(tickets, worker, DispatchStrategy::Complete)
+    }
+
+    fn dispatch_with_approved_growth(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+        additional: usize,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
+        self.dispatch_with_strategy(
+            tickets,
+            worker,
+            DispatchStrategy::ApprovedGrowth(additional),
+        )
+    }
+
+    fn dispatch_use_available(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
+        self.dispatch_with_strategy(tickets, worker, DispatchStrategy::Available)
     }
 }
 
@@ -577,6 +698,23 @@ impl RecordingAdapter {
             .lock()
             .expect("recording adapter lock")
             .clone()
+    }
+
+    fn result(tickets: &[String], worker: Option<&str>) -> DispatchAdapterResult {
+        DispatchAdapterResult::new(DispatchResult {
+            outcomes: tickets
+                .iter()
+                .map(|ticket| DispatchOutcome {
+                    ticket: ticket.clone(),
+                    title: ticket.clone(),
+                    worker: worker.map(str::to_owned),
+                    pid: Some(42),
+                    phase: None,
+                    detail: None,
+                })
+                .collect(),
+            partial: false,
+        })
     }
 }
 
@@ -624,20 +762,39 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
                 worker: worker.map(str::to_owned),
             },
         );
-        Ok(DispatchAdapterResult::new(DispatchResult {
-            outcomes: tickets
-                .iter()
-                .map(|ticket| DispatchOutcome {
-                    ticket: ticket.clone(),
-                    title: ticket.clone(),
-                    worker: worker.map(str::to_owned),
-                    pid: Some(42),
-                    phase: None,
-                    detail: None,
-                })
-                .collect(),
-            partial: false,
-        }))
+        Ok(Self::result(tickets, worker))
+    }
+
+    fn dispatch_with_approved_growth(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+        additional: usize,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::DispatchWithApprovedGrowth {
+                operation: 0,
+                tickets: tickets.to_vec(),
+                worker: worker.map(str::to_owned),
+                additional,
+            },
+        );
+        Ok(Self::result(tickets, worker))
+    }
+
+    fn dispatch_use_available(
+        &self,
+        tickets: &[String],
+        worker: Option<&str>,
+    ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::DispatchUseAvailable {
+                operation: 0,
+                tickets: tickets.to_vec(),
+                worker: worker.map(str::to_owned),
+            },
+        );
+        Ok(Self::result(tickets, worker))
     }
 
     fn discover_ready(&self, _label: &str) -> Result<ReadyTicketResult, String> {
@@ -703,6 +860,53 @@ mod tests {
                 tickets,
                 worker: Some(worker),
             } if tickets == &["ENG-42".to_owned()] && worker == "worker-01"
+        )));
+    }
+
+    #[test]
+    fn controller_preserves_approved_capacity_and_available_dispatch_commands() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+        let tickets = vec!["ENG-42".to_owned(), "ENG-43".to_owned()];
+
+        controller.submit(WorkspaceDispatchCommand::DispatchWithApprovedGrowth {
+            operation: 12,
+            tickets: tickets.clone(),
+            worker: None,
+            additional: 1,
+        });
+        assert!(matches!(
+            events_rx.recv().expect("growth event"),
+            WorkspaceDispatchEvent::Dispatched { operation: 12, result }
+                if result.outcomes().len() == 2
+        ));
+        controller.submit(WorkspaceDispatchCommand::DispatchUseAvailable {
+            operation: 13,
+            tickets: tickets.clone(),
+            worker: None,
+        });
+        assert!(matches!(
+            events_rx.recv().expect("available event"),
+            WorkspaceDispatchEvent::Dispatched { operation: 13, .. }
+        ));
+        let commands = adapter.commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::DispatchWithApprovedGrowth {
+                additional: 1,
+                tickets: command_tickets,
+                ..
+            } if command_tickets == &tickets
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::DispatchUseAvailable {
+                tickets: command_tickets,
+                ..
+            } if command_tickets == &tickets
         )));
     }
 
