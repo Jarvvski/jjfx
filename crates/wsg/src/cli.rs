@@ -1098,10 +1098,49 @@ fn render_orchestration_event(event: &OrchestrationEvent) {
 }
 
 const ZSH_COMPLETION: &str = r#"#compdef wsg
+
+__wsg_workers() {
+  local -a workers
+  workers=("${(@f)$(wsg __complete workers 2>/dev/null)}")
+  _describe 'worker' workers
+}
+__wsg_non_busy_workers() {
+  local -a workers
+  workers=("${(@f)$(wsg __complete non-busy-workers 2>/dev/null)}")
+  _describe 'worker' workers
+}
+__wsg_workspaces() {
+  local -a workspaces
+  workspaces=("${(@f)$(wsg __complete workspaces 2>/dev/null)}")
+  _describe 'workspace' workspaces
+}
+
 _wsg() {
   local -a commands
-  commands=(add rm list clean root where path refresh pool dispatch send review mount reset status logs completion rebase open-pr help)
-  _describe 'command' commands
+  commands=(
+    'add:Create workspace' 'rm:Remove workspace' 'list:List workspaces'
+    'clean:Remove workspaces' 'root:Print repository root'
+    'where:Show repository paths' 'path:Print workspace path'
+    'refresh:Rebuild workspace cache' 'pool:Manage Worker Pool'
+    'dispatch:Dispatch Tickets' 'send:Send a Follow-up'
+    'review:Address review comments' 'mount:Open Worker in kitty'
+    'reset:Reset Worker' 'status:Show Pool status' 'logs:Follow Worker log'
+    'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
+    'completion:Print shell completion' 'help:Show help'
+  )
+  _arguments -C '1:command:->command' '*::arg:->args'
+  case $state in
+    command) _describe 'command' commands ;;
+    args)
+      case $words[1] in
+        rm|remove|path) _arguments '1:workspace:__wsg_workspaces' ;;
+        send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' '2:prompt:' ;;
+        review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' ;;
+        mount|m|reset|logs|log|rebase|rb|open-pr|pr) _arguments '1:worker:__wsg_workers' ;;
+        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
+      esac
+      ;;
+  esac
 }
 compdef _wsg wsg
 "#;
@@ -1158,6 +1197,18 @@ mod tests {
     fn parser_rejects_unknown_dispatch_options_and_budgeted_orchestration() {
         assert!(parse(&args(&["dispatch", "AMBA-42", "--wat"])).is_err());
         assert!(parse(&args(&["dispatch", "AMBA-42", "--budget", "12"])).is_err());
+    }
+
+    #[test]
+    fn completion_parser_defaults_to_zsh_and_keeps_hidden_commands_private() {
+        assert_eq!(
+            parse(&args(&["completion"])).unwrap(),
+            Command::Completion {
+                shell: "zsh".to_owned(),
+            }
+        );
+        assert!(HELP.contains("completion [zsh]"));
+        assert!(!HELP.contains("__complete"));
     }
 
     #[test]
