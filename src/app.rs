@@ -48,6 +48,13 @@ enum PoolMode {
         buffer: String,
         selected: Option<String>,
     },
+    DispatchPreview {
+        tickets: Vec<String>,
+        selected: Option<String>,
+    },
+    ReadyPreview {
+        selected: Option<String>,
+    },
 }
 
 /// What the key handler is currently collecting: normal navigation, a new
@@ -186,6 +193,8 @@ pub struct App {
     active_operation: Option<OperationId>,
     /// Latest ordered Direct Dispatch outcomes for the Pool view.
     dispatch_result: Option<crate::workspace_dispatch::DispatchResult>,
+    /// Latest Ready Ticket discovery result awaiting preview or launch.
+    ready_tickets: Option<crate::workspace_dispatch::ReadyTicketResult>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
@@ -257,6 +266,7 @@ impl App {
             next_operation: 0,
             active_operation: None,
             dispatch_result: None,
+            ready_tickets: None,
             forge_progress: HashMap::new(),
             fetching: false,
             workspace_config: config.workspace,
@@ -370,6 +380,15 @@ impl App {
                         shortage.requested(),
                         shortage.available()
                     ));
+                }
+            }
+            WorkspaceDispatchEvent::ReadyTickets { operation, result } => {
+                if self.active_operation == Some(operation) {
+                    let count = result.tickets().len();
+                    self.ready_tickets = Some(result);
+                    self.active_operation = None;
+                    self.mode = Mode::Pool(PoolMode::ReadyPreview { selected: None });
+                    self.set_status(format!("Found {count} Ready Ticket(s)"));
                 }
             }
             WorkspaceDispatchEvent::Failed { operation, message } => {
@@ -722,6 +741,7 @@ impl App {
                         selected,
                     });
                 }
+                KeyCode::Char('a') => self.discover_ready_tickets(),
                 KeyCode::Char('r') => {
                     let capacity = self.pool_capacity().unwrap_or(0);
                     self.mode = Mode::Pool(PoolMode::Capacity {
@@ -773,32 +793,80 @@ impl App {
                     buffer.pop();
                     self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
                 }
-                KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => {
+                KeyCode::Char(c)
+                    if c.is_ascii_alphanumeric()
+                        || c == '-'
+                        || c == '_'
+                        || c.is_ascii_whitespace() =>
+                {
                     buffer.push(c);
                     self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
                 }
                 KeyCode::Enter => {
-                    let ticket = buffer.trim().to_owned();
-                    if ticket.is_empty() {
+                    let tickets = buffer
+                        .split_whitespace()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>();
+                    if tickets.is_empty() {
                         self.set_status("Ticket ID cannot be empty".to_string());
                         self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
-                    } else if selected
-                        .as_deref()
-                        .is_none_or(|worker| !self.worker_is_idle(worker))
+                    } else if tickets.len() == 1
+                        && selected
+                            .as_deref()
+                            .is_none_or(|worker| !self.worker_is_idle(worker))
                     {
                         self.set_status("Select an idle Worker before Dispatch".to_string());
                         self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
                     } else {
-                        self.mode = Mode::Pool(PoolMode::View {
-                            selected: selected.clone(),
-                        });
-                        self.dispatch_tickets(vec![ticket], selected);
+                        self.mode = Mode::Pool(PoolMode::DispatchPreview { tickets, selected });
                     }
                 }
                 _ => self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected }),
             },
+            Mode::Pool(PoolMode::DispatchPreview { tickets, selected }) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Pool(PoolMode::View { selected }),
+                KeyCode::Enter => {
+                    let worker = (tickets.len() == 1).then(|| selected.clone()).flatten();
+                    self.mode = Mode::Pool(PoolMode::View { selected });
+                    self.dispatch_tickets(tickets, worker);
+                }
+                _ => self.mode = Mode::Pool(PoolMode::DispatchPreview { tickets, selected }),
+            },
+            Mode::Pool(PoolMode::ReadyPreview { selected }) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Pool(PoolMode::View { selected }),
+                KeyCode::Enter => {
+                    let tickets = self
+                        .ready_tickets
+                        .as_ref()
+                        .map(|ready| {
+                            ready
+                                .tickets()
+                                .iter()
+                                .map(|ticket| ticket.id().to_owned())
+                                .collect::<Vec<String>>()
+                        })
+                        .unwrap_or_default();
+                    self.mode = Mode::Pool(PoolMode::View { selected });
+                    if tickets.is_empty() {
+                        self.set_status("No Ready Tickets to Dispatch".to_string());
+                    } else {
+                        self.dispatch_tickets(tickets, None);
+                    }
+                }
+                _ => self.mode = Mode::Pool(PoolMode::ReadyPreview { selected }),
+            },
             other => self.mode = other,
         }
+    }
+
+    fn discover_ready_tickets(&mut self) {
+        let operation = self.begin_dispatch();
+        self.pin_status("discovering Ready Tickets...".to_string());
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::DiscoverReady {
+                operation,
+                label: "ready-for-agent".to_owned(),
+            });
     }
 
     fn on_key_confirm_pool_shrink(&mut self, key: KeyEvent) {
@@ -1462,7 +1530,9 @@ impl App {
             let selected = match &self.mode {
                 Mode::Pool(PoolMode::View { selected })
                 | Mode::Pool(PoolMode::Capacity { selected, .. })
-                | Mode::Pool(PoolMode::TicketInput { selected, .. }) => selected.as_deref(),
+                | Mode::Pool(PoolMode::TicketInput { selected, .. })
+                | Mode::Pool(PoolMode::DispatchPreview { selected, .. })
+                | Mode::Pool(PoolMode::ReadyPreview { selected }) => selected.as_deref(),
                 _ => None,
             };
             for worker in snapshot.workers() {
@@ -1484,6 +1554,38 @@ impl App {
                     format!(" ! {}", diagnostic.message()),
                     Style::default().fg(Color::Yellow),
                 )));
+            }
+            match &self.mode {
+                Mode::Pool(PoolMode::DispatchPreview { tickets, selected }) => {
+                    lines.push(dim_line(" Dispatch preview:"));
+                    for ticket in tickets {
+                        let target = if tickets.len() == 1 {
+                            selected.as_deref().unwrap_or("no Worker")
+                        } else {
+                            "first idle Worker"
+                        };
+                        lines.push(Line::from(format!("  ? {ticket} -> {target}")));
+                    }
+                }
+                Mode::Pool(PoolMode::ReadyPreview { .. }) => {
+                    if let Some(ready) = &self.ready_tickets {
+                        lines.push(dim_line(" Ready Ticket preview:"));
+                        for ticket in ready.tickets() {
+                            lines.push(Line::from(format!(
+                                "  ? {}  {}",
+                                ticket.id(),
+                                ticket.title()
+                            )));
+                        }
+                        for diagnostic in ready.diagnostics() {
+                            lines.push(Line::from(Span::styled(
+                                format!(" ! {diagnostic}"),
+                                Style::default().fg(Color::Yellow),
+                            )));
+                        }
+                    }
+                }
+                _ => {}
             }
             if let Some(result) = &self.dispatch_result {
                 lines.push(dim_line(" Dispatch outcomes:"));
@@ -1814,7 +1916,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -1822,7 +1924,18 @@ impl App {
                 Style::default().fg(Color::Cyan),
             )),
             Mode::Pool(PoolMode::TicketInput { buffer, .. }) => Paragraph::new(Span::styled(
-                format!(" Ticket ID: {buffer}_  (enter dispatch, esc cancel) "),
+                format!(" Ticket IDs: {buffer}_  (enter preview, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::DispatchPreview { tickets, .. }) => Paragraph::new(Span::styled(
+                format!(
+                    " Dispatch {} Ticket(s)? (enter launch, esc cancel) ",
+                    tickets.len()
+                ),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::ReadyPreview { .. }) => Paragraph::new(Span::styled(
+                " Ready Tickets: enter launch, esc cancel ",
                 Style::default().fg(Color::Cyan),
             )),
             Mode::ConfirmPoolShrink(capacity, _) => Paragraph::new(Span::styled(
@@ -3068,6 +3181,72 @@ mod tests {
             .unwrap();
         assert_eq!(app.work_state(def), WorkState::Unknown);
         assert_eq!(app.behind(def), 0);
+    }
+
+    #[test]
+    fn ticket_input_preserves_order_until_dispatch_preview() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let mut app = app_with(&["default", "worker-01"]);
+        app.worker_pool = Some(snapshot);
+        app.handle(press(KeyCode::Char('p')));
+        app.handle(press(KeyCode::Char('d')));
+        for character in "ENG-42 ENG-43".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::DispatchPreview { ref tickets, .. })
+                if tickets == &["ENG-42".to_owned(), "ENG-43".to_owned()]
+        ));
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert_eq!(app.active_operation, None);
+    }
+
+    #[test]
+    fn ready_ticket_event_opens_an_ordered_preview() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::View { selected: None });
+        app.active_operation = Some(4);
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::ReadyTickets {
+                operation: 4,
+                result: crate::workspace_dispatch::ReadyTicketResult::new(
+                    vec![
+                        crate::workspace_dispatch::ReadyTicket::new("ENG-42", "First"),
+                        crate::workspace_dispatch::ReadyTicket::new("ENG-43", "Second"),
+                    ],
+                    vec!["ENG-44: invalid status".to_owned()],
+                ),
+            },
+        ));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::ReadyPreview { .. })
+        ));
+        assert_eq!(app.active_operation, None);
+        assert_eq!(
+            app.ready_tickets.as_ref().unwrap().tickets()[1].id(),
+            "ENG-43"
+        );
     }
 
     #[test]

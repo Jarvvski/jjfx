@@ -7,9 +7,10 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use wsg_core::{
-    DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
-    DirectDispatchOutcome, DirectDispatchRequest, PoolCapacity, RunMode, TicketId, WorkerId,
-    WorkerPoolError, WorkerPoolSnapshot,
+    AgentRuntime, AgentRuntimeQuery, DirectDispatchError, DirectDispatchExecution,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, PoolCapacity,
+    ReadyTicketFilter, RunMode, TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError,
+    WorkerPoolSnapshot,
 };
 
 /// A user-visible operation identity used to ignore stale results.
@@ -32,6 +33,11 @@ pub enum WorkspaceDispatchCommand {
         operation: OperationId,
         tickets: Vec<String>,
         worker: Option<String>,
+    },
+    /// Discover provider-ready Tickets for the configured dispatch label.
+    DiscoverReady {
+        operation: OperationId,
+        label: String,
     },
 }
 
@@ -162,6 +168,58 @@ pub enum WorkspaceDispatchError {
     Failed(String),
 }
 
+/// A discovered Ticket reduced to immutable preview data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyTicket {
+    id: String,
+    title: String,
+}
+
+impl ReadyTicket {
+    /// Creates immutable preview data for one discovered Ticket.
+    pub fn new(id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            title: title.into(),
+        }
+    }
+
+    /// Returns the stable Ticket identifier.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+    /// Returns the human-facing Ticket title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+}
+
+/// Ready Ticket discovery results, including safely excluded entries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadyTicketResult {
+    tickets: Vec<ReadyTicket>,
+    diagnostics: Vec<String>,
+}
+
+impl ReadyTicketResult {
+    /// Creates an ordered discovery result and its validation diagnostics.
+    pub fn new(tickets: Vec<ReadyTicket>, diagnostics: Vec<String>) -> Self {
+        Self {
+            tickets,
+            diagnostics,
+        }
+    }
+
+    /// Returns Tickets in provider order.
+    pub fn tickets(&self) -> &[ReadyTicket] {
+        &self.tickets
+    }
+    /// Returns diagnostics for entries excluded by validation.
+    pub fn diagnostics(&self) -> &[String] {
+        &self.diagnostics
+    }
+}
+
 /// Result of a successful adapter Dispatch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchAdapterResult {
@@ -219,6 +277,11 @@ pub enum WorkspaceDispatchEvent {
         operation: OperationId,
         shortage: DispatchCapacityShortage,
     },
+    /// Ready Ticket discovery completed with ordered preview data.
+    ReadyTickets {
+        operation: OperationId,
+        result: ReadyTicketResult,
+    },
     /// A command or its post-mutation refresh failed.
     Failed {
         operation: OperationId,
@@ -240,6 +303,8 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
         tickets: &[String],
         worker: Option<&str>,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
+    /// Discover Tickets ready for Dispatch through the configured Agent Runtime.
+    fn discover_ready(&self, label: &str) -> Result<ReadyTicketResult, String>;
 }
 
 /// A deep asynchronous controller for Workspace Dispatch operations.
@@ -326,6 +391,12 @@ impl WorkspaceDispatchController {
                     emit(WorkspaceDispatchEvent::Failed { operation, message })
                 }
             },
+            WorkspaceDispatchCommand::DiscoverReady { operation, label } => {
+                match adapter.discover_ready(&label) {
+                    Ok(result) => emit(WorkspaceDispatchEvent::ReadyTickets { operation, result }),
+                    Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+                }
+            }
         });
     }
 }
@@ -381,6 +452,37 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .worker_pool()
             .destroy()
             .map_err(|error| error.to_string())
+    }
+
+    fn discover_ready(&self, label: &str) -> Result<ReadyTicketResult, String> {
+        let repository = self.repository()?;
+        let runtime = repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .and_then(|pool| pool.agent_runtime())
+            .unwrap_or(AgentRuntime::Claude);
+        let status = TicketStatus::parse("Todo").map_err(|error| error.to_string())?;
+        let filter = ReadyTicketFilter::new(label, status).map_err(|error| error.to_string())?;
+        let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(runtime, repository.root()));
+        let ready = discovery
+            .ready_tickets(&filter)
+            .map_err(|error| error.to_string())?;
+        Ok(ReadyTicketResult {
+            tickets: ready
+                .tickets()
+                .iter()
+                .map(|ticket| ReadyTicket {
+                    id: ticket.id().to_string(),
+                    title: ticket.title().as_str().to_owned(),
+                })
+                .collect(),
+            diagnostics: ready
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| format!("{}: {}", diagnostic.subject(), diagnostic.reason()))
+                .collect(),
+        })
     }
 
     fn dispatch(
@@ -537,6 +639,22 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             partial: false,
         }))
     }
+
+    fn discover_ready(&self, _label: &str) -> Result<ReadyTicketResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::DiscoverReady {
+                operation: 0,
+                label: _label.to_owned(),
+            },
+        );
+        Ok(ReadyTicketResult {
+            tickets: vec![ReadyTicket {
+                id: "ENG-42".to_owned(),
+                title: "Example ready Ticket".to_owned(),
+            }],
+            diagnostics: Vec::new(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -585,6 +703,32 @@ mod tests {
                 tickets,
                 worker: Some(worker),
             } if tickets == &["ENG-42".to_owned()] && worker == "worker-01"
+        )));
+    }
+
+    #[test]
+    fn controller_discovers_ready_tickets_in_provider_order() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::DiscoverReady {
+            operation: 11,
+            label: "ready-for-agent".to_owned(),
+        });
+
+        assert!(matches!(
+            events_rx.recv().expect("discovery event"),
+            WorkspaceDispatchEvent::ReadyTickets { operation: 11, result }
+                if result.tickets()[0].id() == "ENG-42"
+                    && result.tickets()[0].title() == "Example ready Ticket"
+        ));
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::DiscoverReady { operation: 0, label }
+                if label == "ready-for-agent"
         )));
     }
 
