@@ -15,7 +15,12 @@ Epics A through C must provide the shared Repository, Worker Pool, Run, Worker a
 
 1. **14-restore-wsg-workspace-and-pool-cli** restores script-facing Workspace, Worker Pool, status, and version commands.
 2. **15-restore-wsg-dispatch-and-session-cli** restores Dispatch, Follow-up, review, logs, completion, and orchestration commands.
-3. **16-integrate-dispatch-into-jjfx** adds interactive Worker Pool and Dispatch workflows to the existing TUI.
+3. **16-integrate-dispatch-into-jjfx** tracks the interactive Worker Pool and Dispatch integration, delivered in child tickets 19 through 23.
+   - **19-enable-writable-worker-pool-in-jjfx** establishes the command/event controller and writable Pool management.
+   - **20-add-jjfx-ticket-dispatch** adds selected-Worker, bulk, and Ready Ticket Dispatch.
+   - **21-show-dispatch-progress-and-logs** adds Dispatch Group progress and structured logs.
+   - **22-add-jjfx-worker-session-actions** adds Send, Review, Session outcomes, and Worker actions.
+   - **23-share-and-harden-jjfx-tui** shares startup and completes hardening and end-to-end coverage.
 4. **17-prove-parity-and-release-from-jjfx** runs mixed-implementation conformance, packages both binaries, and performs the replacement release.
 5. **18-deprecate-the-go-repository** publishes the final transition after owner validation.
 

@@ -1,6 +1,6 @@
 # Integrate Worker Pool and Dispatch into jjfx
 
-Status: ready-for-agent
+Status: tracking
 
 ## Parent
 
@@ -50,6 +50,25 @@ Use existing App tests and fake shared-library adapters. Cover state refresh whi
 - [ ] Existing Attention, Agent, Work, Forge, and Workspace flows remain intact.
 - [ ] `wsg` with no arguments enters the same TUI when appropriate.
 - [ ] `mise run check` is green.
+
+## Child tickets
+
+The implementation is split into five vertical tickets so each can be completed
+with red-green TDD, focused review, and the repository verification gate:
+
+1. `issues/19-enable-writable-worker-pool-in-jjfx.md` - writable Pool presentation,
+   the Workspace Dispatch command/event controller, and Pool management.
+2. `issues/20-add-jjfx-ticket-dispatch.md` - selected-Worker, bulk, and Ready Ticket
+   Direct Dispatch with capacity confirmation.
+3. `issues/21-show-dispatch-progress-and-logs.md` - Dispatch Group progress, waves,
+   and structured log detail.
+4. `issues/22-add-jjfx-worker-session-actions.md` - Send, Review, Session outcomes,
+   Reset, Rebase, Open PR, aliases, and dismiss behavior.
+5. `issues/23-share-and-harden-jjfx-tui.md` - shared jjfx/wsg startup, help,
+   narrow layouts, PTY coverage, and end-to-end hardening.
+
+Issue 19 is the current implementation slice. Each later ticket is blocked by
+its predecessor and must preserve the command/event seam introduced there.
 
 ## Out of Scope
 
