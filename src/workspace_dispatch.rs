@@ -74,7 +74,8 @@ pub struct DispatchOutcome {
 }
 
 impl DispatchOutcome {
-    fn success(ticket: String, title: String, worker: String, pid: u32) -> Self {
+    /// Creates a successful background-launch outcome.
+    pub fn success(ticket: String, title: String, worker: String, pid: u32) -> Self {
         Self {
             ticket,
             title,
@@ -85,7 +86,8 @@ impl DispatchOutcome {
         }
     }
 
-    fn failure(
+    /// Creates a failed pre-launch outcome.
+    pub fn failure(
         ticket: String,
         title: String,
         worker: Option<String>,
@@ -140,6 +142,12 @@ pub struct DispatchResult {
 }
 
 impl DispatchResult {
+    /// Creates ordered presentation outcomes from one Dispatch attempt.
+    #[cfg(test)]
+    pub fn new(outcomes: Vec<DispatchOutcome>, partial: bool) -> Self {
+        Self { outcomes, partial }
+    }
+
     /// Returns outcomes in the same order as the requested Tickets.
     pub fn outcomes(&self) -> &[DispatchOutcome] {
         &self.outcomes
@@ -159,6 +167,7 @@ pub struct DispatchCapacityShortage {
 
 impl DispatchCapacityShortage {
     /// Creates a shortage from counts observed under the Pool lock.
+    #[cfg(test)]
     pub const fn new(requested: usize, available: usize) -> Self {
         Self {
             requested,

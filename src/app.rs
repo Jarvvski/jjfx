@@ -109,6 +109,8 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Tidy this workspace", "t"),
     ("Tidy (abandon junk empties)", "T"),
     ("Worker Pool management", "p"),
+    ("Selected / bulk Ticket Dispatch", "d"),
+    ("Ready Ticket discovery", "a"),
     ("Fold / expand idle group", "c"),
     ("Toggle this help", "?"),
     ("Quit", "q / esc"),
@@ -368,6 +370,7 @@ impl App {
                     let partial = result.is_partial();
                     self.dispatch_result = Some(result);
                     self.active_operation = None;
+                    self.refresh_worker_pool();
                     self.set_status(if partial {
                         format!("Dispatched {count} Ticket(s) with partial capacity")
                     } else {
@@ -3349,6 +3352,74 @@ mod tests {
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
         assert_eq!(app.active_operation, None);
         assert_eq!(app.status.as_deref(), Some("Dispatch cancelled"));
+    }
+
+    #[test]
+    fn dispatch_input_remains_responsive_while_background_operation_is_active() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::TicketInput {
+            buffer: String::new(),
+            selected: None,
+        });
+        app.active_operation = Some(8);
+        app.handle(press(KeyCode::Char('E')));
+        app.handle(press(KeyCode::Char('N')));
+        app.handle(press(KeyCode::Char('G')));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG"
+        ));
+        assert_eq!(app.active_operation, Some(8));
+    }
+
+    #[test]
+    fn ordered_dispatch_outcomes_render_with_ticket_titles() {
+        let mut app = app_with(&["default"]);
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        app.worker_pool = Some(
+            wsg_core::Repository::open(temp.path())
+                .unwrap()
+                .read_worker_pool_snapshot(),
+        );
+        app.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
+            vec![
+                crate::workspace_dispatch::DispatchOutcome::success(
+                    "ENG-42".to_owned(),
+                    "First Ticket".to_owned(),
+                    "worker-01".to_owned(),
+                    42,
+                ),
+                crate::workspace_dispatch::DispatchOutcome::failure(
+                    "ENG-43".to_owned(),
+                    "Second Ticket".to_owned(),
+                    None,
+                    wsg_core::DirectDispatchFailurePhase::Capacity,
+                    "no idle Worker".to_owned(),
+                ),
+            ],
+            true,
+        ));
+        app.mode = Mode::Pool(PoolMode::View { selected: None });
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("ENG-42  First Ticket"), "{text}");
+        assert!(text.contains("ENG-43 [Capacity]"), "{text}");
+        assert!(text.find("ENG-42").unwrap() < text.find("ENG-43").unwrap());
     }
 
     #[test]

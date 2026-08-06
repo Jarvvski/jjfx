@@ -6,6 +6,11 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-06 - Added selected-Worker, bulk, and Ready Ticket Dispatch to jjfx
+  0.31.0. Ticket previews, typed capacity confirmation, ordered outcomes, and
+  background execution keep the TUI responsive while reusing shared wsg-core
+  rules.
+
 - 2026-08-06 - Added writable Worker Pool management to jjfx 0.30.0 through
   an asynchronous Workspace Dispatch controller. Pool capacity changes,
   confirmed shrink and destruction, Worker diagnostics, and stable Worker

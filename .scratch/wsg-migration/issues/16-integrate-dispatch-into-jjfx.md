@@ -74,8 +74,12 @@ its predecessor and must preserve the command/event seam introduced there.
 
 2026-08-06 - Issue 19 is resolved. It introduced the Workspace Dispatch
 command/event seam, writable Pool management, stable Worker presentation data,
-and the version 0.30.0 jjfx integration. Issues 20 through 23 remain the
-successive implementation frontier.
+and the version 0.30.0 jjfx integration.
+
+2026-08-06 - Issue 20 is resolved. jjfx 0.31.0 now supports selected-Worker,
+bulk, and Ready Ticket Dispatch with previews, typed capacity decisions,
+ordered outcomes, and responsive background execution. Issue 21 is now the
+successive implementation frontier for Dispatch Group progress and logs.
 
 ## Out of Scope
 
