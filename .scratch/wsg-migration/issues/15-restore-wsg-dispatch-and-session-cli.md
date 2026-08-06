@@ -1,6 +1,6 @@
 # Restore wsg Dispatch and Agent Session CLI compatibility
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -41,12 +41,12 @@ Test binary behavior with fake Agent Runtime executables, temporary Repositories
 
 ## Acceptance Criteria
 
-- [ ] Every command and option in the compatibility inventory has a Rust path.
-- [ ] Dispatch resize prompts report the actual locked capacity gap.
-- [ ] Follow-up visibly reports resumed or fresh Session behavior.
-- [ ] Completion reconciles dead busy Workers.
-- [ ] Parent Ticket orchestration can run detached and resume.
-- [ ] `mise run check` is green.
+- [x] Every command and option in the compatibility inventory has a Rust path.
+- [x] Dispatch resize prompts report the actual locked capacity gap.
+- [x] Follow-up visibly reports resumed or fresh Session behavior.
+- [x] Completion reconciles dead busy Workers.
+- [x] Parent Ticket orchestration can run detached and resume.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -59,3 +59,15 @@ Test binary behavior with fake Agent Runtime executables, temporary Repositories
 
 - issues/13-port-orchestration-runner.md
 - issues/14-restore-wsg-workspace-and-pool-cli.md
+
+## Comments
+
+2026-08-06 - Implemented the approved Rust compatibility surface in focused
+TDD slices. The wsg binary now supports strict Dispatch parsing and budget
+controls, Ready Ticket bulk discovery, exact locked capacity prompts, ordered
+foreground/background outcomes, detached orchestration preparation and resume,
+Follow-up Session reporting, Review, Logs, Mount, Rebase, Open PR, Reset,
+zsh completion, live reconciled Worker candidates, and safe no-argument help.
+
+Verification: `mise run check` passed. The wsg package version is 0.9.0 and the
+existing jjfx package remains 0.29.0.

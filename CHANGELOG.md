@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-06 - Restored the wsg Dispatch, orchestration, Follow-up, Worker
+  action, completion, and safe default command surfaces over shared typed Rust
+  interfaces. The compatibility binary is now wsg 0.9.0.
+
 - 2026-08-05 - Restored the compatible Workspace and Worker Pool command surface
   in the Rust `wsg` binary, including independent versioning (`wsg` 0.8.1 and
   `jjfx` 0.29.0) without changing the installed Go binary. An isolated
