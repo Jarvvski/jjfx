@@ -1161,6 +1161,30 @@ mod tests {
     }
 
     #[test]
+    fn worker_action_aliases_cover_review_logs_mount_rebase_and_open_pr() {
+        assert!(matches!(
+            parse(&args(&["rev", "worker-1"])),
+            Ok(Command::Review { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["log", "worker-1"])),
+            Ok(Command::Logs { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["m", "worker-1"])),
+            Ok(Command::Mount { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["rb", "worker-1"])),
+            Ok(Command::Rebase { .. })
+        ));
+        assert!(matches!(
+            parse(&args(&["pr", "worker-1"])),
+            Ok(Command::OpenPullRequest { .. })
+        ));
+    }
+
+    #[test]
     fn send_parser_preserves_prompt_and_foreground_mode() {
         assert_eq!(
             parse(&args(&["s", "worker-1", "follow up", "--fg"])).unwrap(),
