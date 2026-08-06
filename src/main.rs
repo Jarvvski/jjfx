@@ -26,6 +26,7 @@ mod ui_state;
 mod viewport;
 mod watch;
 mod work;
+mod workspace_dispatch;
 mod workspace_list;
 
 use std::io::Write;
@@ -111,12 +112,6 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     let (work_tx, work_rx) = mpsc::unbounded_channel::<()>();
     spawn_work_poller(repo_root.clone(), tx.clone(), work_rx);
 
-    // Worker Pool reader: observe existing wsg state without enabling any Rust
-    // mutation. It shares the repository-change nudge but owns its own snapshot
-    // cadence and deduplication.
-    let (worker_tx, worker_rx) = mpsc::unbounded_channel::<()>();
-    spawn_worker_pool_poller(repo_root.clone(), tx.clone(), worker_rx);
-
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx.clone());
 
@@ -141,6 +136,9 @@ async fn run_tui(repo_root: std::path::PathBuf) -> anyhow::Result<()> {
     // A persisted-on world pane needs its first graph load kicked off here (the
     // load is otherwise only triggered by the toggle keys).
     app.refresh_graph_if_visible();
+
+    let (worker_tx, worker_rx) = mpsc::unbounded_channel::<()>();
+    spawn_worker_pool_poller(app.workspace_dispatch_controller(), worker_rx);
 
     let mut terminal = tui::init()?;
     let result = event_loop(&mut terminal, &mut rx, &mut app, work_tx, worker_tx).await;
@@ -249,32 +247,19 @@ fn spawn_work_poller(
 /// Send [`Msg::Tick`] every 150ms (jj-wsx's animation frame rate) to advance
 /// the working-glyph bounce. The app decides per tick whether a redraw is
 /// warranted, so an idle screen costs nothing beyond the channel send.
-/// Read the compatibility Worker Pool periodically and after repository
-/// changes, sending only snapshots that differ from the last read. All file
-/// access stays outside the App event loop and the reader itself is read-only.
+/// Ask the Workspace Dispatch controller to reconcile the compatible Worker
+/// Pool periodically and after repository changes. The controller owns all
+/// blocking Repository access and emits typed events back through `Msg`.
 fn spawn_worker_pool_poller(
-    repo_root: std::path::PathBuf,
-    tx: UnboundedSender<Msg>,
+    controller: crate::workspace_dispatch::WorkspaceDispatchController,
     mut refresh_rx: mpsc::UnboundedReceiver<()>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
-        let mut previous = None;
         loop {
-            let root = repo_root.clone();
-            let snapshot = tokio::task::spawn_blocking(move || {
-                wsg_core::Repository::open(&root)
-                    .map(|repository| repository.read_worker_pool_snapshot())
-            })
-            .await;
-            if let Ok(Ok(snapshot)) = snapshot
-                && previous.as_ref() != Some(&snapshot)
-            {
-                if tx.send(Msg::WorkerPoolSnapshot(snapshot.clone())).is_err() {
-                    break;
-                }
-                previous = Some(snapshot);
-            }
+            controller.submit(
+                crate::workspace_dispatch::WorkspaceDispatchCommand::Refresh { operation: 0 },
+            );
             tokio::select! {
                 _ = interval.tick() => {}
                 got = refresh_rx.recv() => {

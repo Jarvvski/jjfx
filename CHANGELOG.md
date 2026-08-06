@@ -6,6 +6,11 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-06 - Added writable Worker Pool management to jjfx 0.30.0 through
+  an asynchronous Workspace Dispatch controller. Pool capacity changes,
+  confirmed shrink and destruction, Worker diagnostics, and stable Worker
+  metadata now work without replacing the existing Attention lifecycle.
+
 - 2026-08-06 - Restored the wsg Dispatch, orchestration, Follow-up, Worker
   action, completion, and safe default command surfaces over shared typed Rust
   interfaces. The compatibility binary is now wsg 0.9.0.

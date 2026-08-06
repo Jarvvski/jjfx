@@ -14,12 +14,24 @@ use ratatui::widgets::{List, ListItem, ListState};
 
 use crate::attention::Attention;
 use crate::store::{DEFAULT_WORKSPACE, Workspace};
+use wsg_core::WorkerSnapshot;
 
 /// One rendered list line: a group header (non-selectable) or a workspace row.
 #[derive(Debug, PartialEq)]
 pub enum Row<'a> {
     Header(Attention, usize),
     Ws(&'a Workspace, Attention),
+}
+
+/// A workspace row enriched once with its immutable Worker presentation data.
+#[derive(Debug, PartialEq)]
+pub enum PresentationRow<'a, 'b> {
+    Header(Attention, usize),
+    Ws {
+        workspace: &'a Workspace,
+        attention: Attention,
+        worker: Option<&'b WorkerSnapshot>,
+    },
 }
 
 /// The stateful workspace list: which workspace is selected (by name), whether
@@ -85,6 +97,27 @@ impl WorkspaceList {
             idx = end;
         }
         rows
+    }
+
+    /// The display rows with Worker metadata joined before rendering.
+    pub fn presentation_rows<'a, 'b>(
+        &self,
+        classified: &[(Attention, &'a Workspace)],
+        workers: &'b [WorkerSnapshot],
+    ) -> Vec<PresentationRow<'a, 'b>> {
+        self.rows(classified)
+            .into_iter()
+            .map(|row| match row {
+                Row::Header(attention, count) => PresentationRow::Header(attention, count),
+                Row::Ws(workspace, attention) => PresentationRow::Ws {
+                    worker: workers
+                        .iter()
+                        .find(|worker| worker.workspace() == workspace.name),
+                    workspace,
+                    attention,
+                },
+            })
+            .collect()
     }
 
     /// The selectable workspace names in display order (excludes headers and any

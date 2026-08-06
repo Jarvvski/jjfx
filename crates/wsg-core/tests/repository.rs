@@ -4,10 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use tempfile::TempDir;
-use wsg_core::{
-    CleanDecision, Loaded, MigrationCapabilities, Repository, RepositoryError, WorkerId,
-    WorkspaceAddOutcome,
-};
+use wsg_core::{CleanDecision, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome};
 
 fn local_repository() -> (TempDir, Repository) {
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -115,7 +112,7 @@ fn reports_missing_repository_with_typed_context() {
 }
 
 #[test]
-fn opens_nested_repository_and_reports_foundation_status() {
+fn opens_nested_repository() {
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
     let nested = temporary_directory.path().join("workspace/src");
     std::fs::create_dir_all(&nested).expect("nested directory should be created");
@@ -130,10 +127,6 @@ fn opens_nested_repository_and_reports_foundation_status() {
             .path()
             .canonicalize()
             .expect("path should resolve")
-    );
-    assert_eq!(
-        repository.migration_capabilities(),
-        MigrationCapabilities::ReadOnlyWorkerPool
     );
 }
 

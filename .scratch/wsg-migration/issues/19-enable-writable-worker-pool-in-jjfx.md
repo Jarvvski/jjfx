@@ -1,6 +1,6 @@
 # Enable writable Worker Pool management in jjfx
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -44,16 +44,16 @@ operation correlation, and responsive background execution.
 
 ## Acceptance Criteria
 
-- [ ] The command/event controller is the only App seam for Pool operations.
-- [ ] Blocking Pool reads and mutations never run in the App event loop.
-- [ ] App retains the last valid snapshot when refresh fails and shows the error.
-- [ ] jjfx manages existing and Rust-created Pools with exact capacity changes.
-- [ ] Shrink and destruction require explicit confirmation.
-- [ ] Worker metadata is presentation data, not a second mutable Pool model.
-- [ ] No read-only capability or READ-ONLY UI marker remains.
-- [ ] Existing lifecycle, selection, help, and rendering behavior remains intact.
-- [ ] jjfx is version 0.30.0 and the changelog records the user-visible change.
-- [ ] `mise run check` is green.
+- [x] The command/event controller is the only App seam for Pool operations.
+- [x] Blocking Pool reads and mutations never run in the App event loop.
+- [x] App retains the last valid snapshot when refresh fails and shows the error.
+- [x] jjfx manages existing and Rust-created Pools with exact capacity changes.
+- [x] Shrink and destruction require explicit confirmation.
+- [x] Worker metadata is presentation data, not a second mutable Pool model.
+- [x] No read-only capability or READ-ONLY UI marker remains.
+- [x] Existing lifecycle, selection, help, and rendering behavior remains intact.
+- [x] jjfx is version 0.30.0 and the changelog records the user-visible change.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -69,6 +69,26 @@ operation correlation, and responsive background execution.
 - issues/11-port-direct-dispatch.md
 - issues/13-port-orchestration-runner.md
 
+## Answer
+
+Implemented the first writable jjfx integration slice. `src/workspace_dispatch.rs`
+now provides one deep command/event controller with a real `wsg-core` adapter and
+an in-memory recording adapter for App tests. Refresh, exact resize, and destroy
+operations run on blocking threads, and successful mutations emit a fresh
+immutable snapshot.
+
+The existing read-only poller now submits controller refresh commands. App retains
+the last good snapshot when a refresh or mutation reports an error, uses operation
+IDs to reject stale events, and keeps Worker Status separate from the existing
+Attention, Agent, Work, Forge, and Workspace presentation axes.
+
+Pool management is available from `p`, with exact capacity editing through `r`,
+confirmed shrink and destruction, stable Worker ID selection, diagnostics, and
+narrow-safe rendering. jjfx is version 0.30.0 and the changelog records the
+user-visible change.
+
 ## Comments
 
 2026-08-06 - Split from issue 16 as the first vertical implementation slice.
+2026-08-06 - Completed after `mise run check`, focused TDD coverage, primary LSP
+diagnostics, and session-wide diagnostics review.

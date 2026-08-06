@@ -73,15 +73,6 @@ pub use workspace::{
     WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceSnapshot, Workspaces,
 };
 
-/// The migration capabilities currently exposed by a discovered repository.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MigrationCapabilities {
-    /// The shared Workspace Dispatch implementation can expose read-only pool state.
-    ReadOnlyWorkerPool,
-    /// The shared Workspace Dispatch implementation is not available yet.
-    NotImplemented,
-}
-
 /// A Jujutsu repository discovered from a starting path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
@@ -187,11 +178,6 @@ impl Repository {
         base_revisions: &[String],
     ) -> Result<workspace::PreparedWorkerWorkspace, WorkerWorkspaceError> {
         workspace::prepare_for_dispatch(self, worker_id, base_revisions)
-    }
-
-    /// Reports which migration capabilities are available for this foundation.
-    pub fn migration_capabilities(&self) -> MigrationCapabilities {
-        MigrationCapabilities::ReadOnlyWorkerPool
     }
 }
 

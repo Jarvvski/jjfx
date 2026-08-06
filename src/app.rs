@@ -28,8 +28,23 @@ use crate::store::{self, Store, Workspace};
 use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
-use crate::workspace_list::{Row, WorkspaceList};
+use crate::workspace_dispatch::{
+    OperationId, RealWorkspaceDispatch, WorkspaceDispatchCommand, WorkspaceDispatchController,
+    WorkspaceDispatchEvent,
+};
+use crate::workspace_list::{PresentationRow, WorkspaceList};
 use wsg_core::{WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus};
+
+/// The focused Worker Pool management interaction.
+enum PoolMode {
+    View {
+        selected: Option<String>,
+    },
+    Capacity {
+        buffer: String,
+        selected: Option<String>,
+    },
+}
 
 /// What the key handler is currently collecting: normal navigation, a new
 /// workspace name, or a delete confirmation.
@@ -39,6 +54,12 @@ enum Mode {
     ConfirmDelete(String),
     /// Confirming the destructive `tidy` sweep (abandon junk empties).
     ConfirmTidy,
+    /// Focused Pool capacity and Worker management.
+    Pool(PoolMode),
+    /// Confirming a Pool shrink after exact capacity entry.
+    ConfirmPoolShrink(usize, Option<String>),
+    /// Confirming complete Pool destruction.
+    ConfirmPoolDestroy,
     /// The `?` help overlay is open (a pure UI mode - no state is mutated).
     Help,
     /// The full-screen diff-detail view for one workspace (ADR 0008).
@@ -71,6 +92,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Lift all onto trunk", "R"),
     ("Tidy this workspace", "t"),
     ("Tidy (abandon junk empties)", "T"),
+    ("Worker Pool management", "p"),
     ("Fold / expand idle group", "c"),
     ("Toggle this help", "?"),
     ("Quit", "q / esc"),
@@ -94,8 +116,8 @@ pub enum Msg {
     AgentEvent(agent::Event),
     /// A freshly computed work-lifecycle snapshot, keyed by workspace name.
     WorkSnapshot(HashMap<String, Work>),
-    /// A complete immutable read-only Worker Pool snapshot.
-    WorkerPoolSnapshot(WorkerPoolSnapshot),
+    /// A Workspace Dispatch controller event.
+    WorkspaceDispatch(WorkspaceDispatchEvent),
     /// A forge pipeline transition (ticket 08).
     Forge(forge::Update),
     /// The background `jj git fetch` finished; `Err` carries jj's error text.
@@ -151,8 +173,13 @@ pub struct App {
     /// Latest work-lifecycle snapshot per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, Work>,
-    /// Latest read-only Worker Pool snapshot, if the repository exposes one.
+    /// Latest immutable Worker Pool presentation snapshot.
     worker_pool: Option<WorkerPoolSnapshot>,
+    /// The deep Workspace Dispatch seam for Pool commands and events.
+    dispatch: WorkspaceDispatchController,
+    /// Operation generation used to reject stale mutation results.
+    next_operation: OperationId,
+    active_operation: Option<OperationId>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
@@ -208,11 +235,21 @@ impl App {
         tx: UnboundedSender<Msg>,
     ) -> Self {
         let forge = forge::Forge::new(store.repo_root().to_path_buf(), config.forge);
+        let dispatch_tx = tx.clone();
+        let dispatch = WorkspaceDispatchController::new(
+            RealWorkspaceDispatch::new(store.repo_root()),
+            move |event| {
+                let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
+            },
+        );
         let mut app = App {
             store,
             agents,
             work: HashMap::new(),
             worker_pool: None,
+            dispatch,
+            next_operation: 0,
+            active_operation: None,
             forge_progress: HashMap::new(),
             fetching: false,
             workspace_config: config.workspace,
@@ -242,7 +279,7 @@ impl App {
             Msg::Reload => self.reload(),
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
             Msg::WorkSnapshot(work) => self.work = work,
-            Msg::WorkerPoolSnapshot(snapshot) => self.worker_pool = Some(snapshot),
+            Msg::WorkspaceDispatch(event) => self.on_workspace_dispatch(event),
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
             Msg::WorkspaceConfigured { workspace, result } => {
@@ -259,6 +296,72 @@ impl App {
                 self.animate();
             }
         }
+    }
+
+    fn on_worker_pool_snapshot(&mut self, operation: OperationId, snapshot: WorkerPoolSnapshot) {
+        if operation == 0 {
+            if self.active_operation.is_some() {
+                return;
+            }
+        } else if self.active_operation != Some(operation) {
+            return;
+        }
+        if self.worker_pool.as_ref() == Some(&snapshot) {
+            if operation != 0 {
+                self.active_operation = None;
+            }
+            return;
+        }
+        self.worker_pool = Some(snapshot);
+        if operation != 0 {
+            self.active_operation = None;
+        }
+    }
+
+    fn on_workspace_dispatch(&mut self, event: WorkspaceDispatchEvent) {
+        match event {
+            WorkspaceDispatchEvent::Snapshot {
+                operation,
+                snapshot,
+            } => self.on_worker_pool_snapshot(operation, snapshot),
+            WorkspaceDispatchEvent::Resized { operation, result } => {
+                if self.active_operation == Some(operation) {
+                    self.set_status(format!(
+                        "Pool resized to {} ({} added, {} removed)",
+                        result.capacity(),
+                        result.added_workers().len(),
+                        result.removed_workers().len()
+                    ));
+                }
+            }
+            WorkspaceDispatchEvent::Destroyed { operation } => {
+                if self.active_operation == Some(operation) {
+                    self.set_status("Worker Pool destroyed".to_string());
+                    self.mode = Mode::Normal;
+                }
+            }
+            WorkspaceDispatchEvent::Failed { operation, message } => {
+                if self.active_operation == Some(operation) {
+                    self.active_operation = None;
+                    self.set_status(format!("Worker Pool: {message}"));
+                }
+            }
+        }
+    }
+
+    pub(crate) fn workspace_dispatch_controller(&self) -> WorkspaceDispatchController {
+        self.dispatch.clone()
+    }
+
+    pub(crate) fn refresh_worker_pool(&self) {
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::Refresh { operation: 0 });
+    }
+
+    fn begin_dispatch(&mut self) -> OperationId {
+        self.next_operation = self.next_operation.wrapping_add(1).max(1);
+        self.active_operation = Some(self.next_operation);
+        self.next_operation
     }
 
     /// Advance the working-glyph animation one frame. Returns whether anything
@@ -396,6 +499,9 @@ impl App {
             Mode::NewWorkspace(_) => self.on_key_new_workspace(key),
             Mode::ConfirmDelete(_) => self.on_key_confirm_delete(key),
             Mode::ConfirmTidy => self.on_key_confirm_tidy(key),
+            Mode::Pool(_) => self.on_key_pool(key),
+            Mode::ConfirmPoolShrink(_, _) => self.on_key_confirm_pool_shrink(key),
+            Mode::ConfirmPoolDestroy => self.on_key_confirm_pool_destroy(key),
             Mode::Help => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
             Mode::Graph(_) => self.on_key_graph(key),
@@ -438,6 +544,7 @@ impl App {
             KeyCode::Char('f') => self.forge_selected(),
             KeyCode::Char('F') => self.forge_all(),
             KeyCode::Char('g') => self.forge_default(),
+            KeyCode::Char('p') => self.open_pool(),
             KeyCode::Char('c') => {
                 self.list.toggle_idle();
                 self.ensure_selection();
@@ -556,6 +663,140 @@ impl App {
         if matches!(self.mode, Mode::Graph(_) | Mode::Detail(_)) || self.world.is_some() {
             self.spawn_graph_load();
         }
+    }
+
+    fn open_pool(&mut self) {
+        self.mode = Mode::Pool(PoolMode::View { selected: None });
+        self.refresh_worker_pool();
+    }
+
+    fn on_key_pool(&mut self, key: KeyEvent) {
+        let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        match mode {
+            Mode::Pool(PoolMode::View { selected }) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {}
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let selected = self.pool_worker_after(selected.as_deref(), 1);
+                    self.mode = Mode::Pool(PoolMode::View { selected });
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let selected = self.pool_worker_after(selected.as_deref(), -1);
+                    self.mode = Mode::Pool(PoolMode::View { selected });
+                }
+                KeyCode::Char('r') => {
+                    let capacity = self.pool_capacity().unwrap_or(0);
+                    self.mode = Mode::Pool(PoolMode::Capacity {
+                        buffer: capacity.to_string(),
+                        selected,
+                    });
+                }
+                KeyCode::Char('D') => self.mode = Mode::ConfirmPoolDestroy,
+                _ => self.mode = Mode::Pool(PoolMode::View { selected }),
+            },
+            Mode::Pool(PoolMode::Capacity {
+                mut buffer,
+                selected,
+            }) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Pool(PoolMode::View { selected }),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected });
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    buffer.push(c);
+                    self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected });
+                }
+                KeyCode::Enter => match buffer.parse::<usize>() {
+                    Ok(capacity)
+                        if self
+                            .pool_capacity()
+                            .is_some_and(|current| capacity < current) =>
+                    {
+                        self.mode = Mode::ConfirmPoolShrink(capacity, selected);
+                    }
+                    Ok(capacity) => {
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        self.resize_pool(capacity);
+                    }
+                    Err(_) => {
+                        self.set_status("Pool capacity must be a number".to_string());
+                        self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected });
+                    }
+                },
+                _ => self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected }),
+            },
+            other => self.mode = other,
+        }
+    }
+
+    fn on_key_confirm_pool_shrink(&mut self, key: KeyEvent) {
+        let Mode::ConfirmPoolShrink(capacity, selected) = &self.mode else {
+            return;
+        };
+        let capacity = *capacity;
+        let selected = selected.clone();
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Pool(PoolMode::View { selected });
+                self.resize_pool(capacity);
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Pool(PoolMode::View { selected });
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_confirm_pool_destroy(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Normal;
+                self.destroy_pool();
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Pool(PoolMode::View { selected: None });
+            }
+            _ => {}
+        }
+    }
+
+    fn resize_pool(&mut self, capacity: usize) {
+        let operation = self.begin_dispatch();
+        self.pin_status(format!("resizing Worker Pool to {capacity}..."));
+        self.dispatch.submit(WorkspaceDispatchCommand::Resize {
+            operation,
+            capacity,
+        });
+    }
+
+    fn destroy_pool(&mut self) {
+        let operation = self.begin_dispatch();
+        self.pin_status("destroying Worker Pool...".to_string());
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::Destroy { operation });
+    }
+
+    fn pool_capacity(&self) -> Option<usize> {
+        self.worker_pool
+            .as_ref()?
+            .pool()
+            .and_then(|pool| usize::try_from(pool.size()).ok())
+    }
+
+    fn pool_worker_after(&self, selected: Option<&str>, delta: isize) -> Option<String> {
+        let workers = self.worker_pool.as_ref()?.workers();
+        if workers.is_empty() {
+            return None;
+        }
+        let current = selected
+            .and_then(|id| {
+                workers
+                    .iter()
+                    .position(|worker| worker.worker_id().as_str() == id)
+            })
+            .unwrap_or(0) as isize;
+        let index = (current + delta).clamp(0, workers.len() as isize - 1) as usize;
+        Some(workers[index].worker_id().to_string())
     }
 
     fn on_key_new_workspace(&mut self, key: KeyEvent) {
@@ -993,6 +1234,10 @@ impl App {
             self.render_graph_world(frame);
             return;
         }
+        if matches!(self.mode, Mode::Pool(_)) {
+            self.render_pool(frame);
+            return;
+        }
 
         let [header, body, footer] = Layout::vertical([
             Constraint::Length(2),
@@ -1004,11 +1249,11 @@ impl App {
 
         let title = match &self.worker_pool {
             Some(snapshot) if snapshot.diagnostics().is_empty() => format!(
-                "jjfx - {} workspace(s)  [wsg pool READ-ONLY]",
+                "jjfx - {} workspace(s)  [wsg pool]",
                 self.store.workspaces().len()
             ),
             Some(snapshot) => format!(
-                "jjfx - {} workspace(s)  [wsg pool READ-ONLY, {} issue(s)]",
+                "jjfx - {} workspace(s)  [wsg pool, {} issue(s)]",
                 self.store.workspaces().len(),
                 snapshot.diagnostics().len()
             ),
@@ -1041,19 +1286,27 @@ impl App {
         // Build list items from the grouped rows, tracking which item index the
         // selected workspace lands on so the highlight follows it.
         let classified = self.classified();
-        let rows = self.list.rows(&classified);
+        let workers = self
+            .worker_pool
+            .as_ref()
+            .map_or(&[][..], WorkerPoolSnapshot::workers);
+        let rows = self.list.presentation_rows(&classified, workers);
         let mut cursor = None;
         let items: Vec<ListItem> = rows
             .iter()
             .enumerate()
             .map(|(i, row)| match row {
-                Row::Header(att, count) => self.header_item(*att, *count),
-                Row::Ws(w, att) => {
-                    let is_selected = self.list.selected() == Some(w.name.as_str());
+                PresentationRow::Header(att, count) => self.header_item(*att, *count),
+                PresentationRow::Ws {
+                    workspace,
+                    attention,
+                    worker,
+                } => {
+                    let is_selected = self.list.selected() == Some(workspace.name.as_str());
                     if is_selected {
                         cursor = Some(i);
                     }
-                    self.workspace_item(w, *att, is_selected)
+                    self.workspace_item(workspace, *attention, is_selected, *worker)
                 }
             })
             .collect();
@@ -1084,6 +1337,67 @@ impl App {
         if matches!(self.mode, Mode::Help) {
             self.render_help(frame);
         }
+    }
+
+    fn render_pool(&mut self, frame: &mut Frame) {
+        let [header, body, footer] = Layout::vertical([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .horizontal_margin(2)
+        .areas(frame.area());
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                "Worker Pool  [p management]",
+                Style::default().add_modifier(Modifier::BOLD),
+            )),
+            header,
+        );
+
+        let mut lines = Vec::new();
+        if let Some(snapshot) = &self.worker_pool {
+            let capacity = snapshot
+                .pool()
+                .and_then(|pool| usize::try_from(pool.size()).ok())
+                .map_or_else(|| "missing".to_string(), |capacity| capacity.to_string());
+            lines.push(Line::from(format!(" capacity: {capacity}")));
+            if snapshot.workers().is_empty() {
+                lines.push(dim_line(" (no Workers)"));
+            }
+            let selected = match &self.mode {
+                Mode::Pool(PoolMode::View { selected })
+                | Mode::Pool(PoolMode::Capacity { selected, .. }) => selected.as_deref(),
+                _ => None,
+            };
+            for worker in snapshot.workers() {
+                let marker = if selected == Some(worker.worker_id().as_str()) {
+                    "▸"
+                } else {
+                    "·"
+                };
+                lines.push(Line::from(format!(
+                    " {marker} {}  {:<7} {}  {}",
+                    worker.worker_id(),
+                    worker.status().as_str(),
+                    worker.alias(),
+                    worker.workspace()
+                )));
+            }
+            for diagnostic in snapshot.diagnostics() {
+                lines.push(Line::from(Span::styled(
+                    format!(" ! {}", diagnostic.message()),
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+        } else {
+            lines.push(dim_line(" loading Worker Pool..."));
+        }
+        frame.render_widget(
+            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" pool ")),
+            body,
+        );
+        frame.render_widget(self.footer(), footer);
     }
 
     /// The `?` overlay: a centered, bordered box listing every binding
@@ -1283,7 +1597,13 @@ impl App {
 
     /// A workspace row: Attention badge, then the two lifecycle axes, then name
     /// and path.
-    fn workspace_item(&self, w: &Workspace, att: Attention, selected: bool) -> ListItem<'static> {
+    fn workspace_item(
+        &self,
+        w: &Workspace,
+        att: Attention,
+        selected: bool,
+        worker: Option<&WorkerSnapshot>,
+    ) -> ListItem<'static> {
         let agent = self.agent_of(w);
         let work = self.work_state(w);
         let behind = self.behind(w);
@@ -1345,13 +1665,14 @@ impl App {
             format!("{:pad$}{path}", ""),
             Style::default().fg(Color::DarkGray),
         ));
-        let lines = match self.worker_for(w) {
+        let lines = match worker {
             Some(worker) => vec![Line::from(spans), worker_line(worker, self.tick)],
             None => vec![Line::from(spans)],
         };
         ListItem::new(lines)
     }
 
+    #[cfg(test)]
     fn worker_for(&self, workspace: &Workspace) -> Option<&WorkerSnapshot> {
         self.worker_pool
             .as_ref()?
@@ -1376,6 +1697,22 @@ impl App {
                 " tidy: abandon all junk empty changes? (y/n) ".to_string(),
                 Style::default().fg(Color::Red),
             )),
+            Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
+                " Pool: j/k select  r resize  D destroy  esc back ",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
+                format!(" Pool capacity: {buffer}_  (enter apply, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::ConfirmPoolShrink(capacity, _) => Paragraph::new(Span::styled(
+                format!(" shrink Worker Pool to {capacity}? (y/n) "),
+                Style::default().fg(Color::Red),
+            )),
+            Mode::ConfirmPoolDestroy => Paragraph::new(Span::styled(
+                " destroy Worker Pool and all Worker Workspaces? (y/n) ",
+                Style::default().fg(Color::Red),
+            )),
             Mode::Normal => match (&self.pending_workspace, &self.status) {
                 (Some(workspace), _) => Paragraph::new(Span::styled(
                     format!(" configuring '{}'... ", workspace.name),
@@ -1387,7 +1724,7 @@ impl App {
                 )),
                 (None, None) => Paragraph::new(Span::styled(
                     if self.worker_pool.is_some() {
-                        " wsg pool READ-ONLY  ·  j/k move  ? help  q quit "
+                        " wsg pool  ·  p manage  j/k move  ? help  q quit "
                     } else if self.world.is_some() {
                         " j/k move  J/K scroll world  ? help  q quit "
                     } else {
@@ -1436,7 +1773,6 @@ fn worker_line(worker: &WorkerSnapshot, _tick: u64) -> Line<'static> {
             ),
             Style::default().fg(Color::Cyan),
         ),
-        Span::styled("  READ-ONLY", Style::default().fg(Color::DarkGray)),
     ])
 }
 
@@ -2039,6 +2375,7 @@ fn work_color(state: WorkState) -> Color {
 mod tests {
     use super::*;
     use crate::store::Workspace;
+    use crate::workspace_dispatch::RecordingAdapter;
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -2614,7 +2951,92 @@ mod tests {
     }
 
     #[test]
-    fn worker_pool_snapshot_joins_by_workspace_and_renders_read_only_metadata() {
+    fn pool_capacity_input_survives_refresh_and_cancel_submits_no_resize() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let adapter = RecordingAdapter::new(snapshot.clone());
+        let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
+        let mut app = app_with(&["default", "worker-01"]);
+        app.dispatch = controller;
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot: snapshot.clone(),
+        }));
+        app.handle(press(KeyCode::Char('p')));
+        app.handle(press(KeyCode::Char('r')));
+        app.handle(press(KeyCode::Backspace));
+        app.handle(press(KeyCode::Char('2')));
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot,
+        }));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::Capacity { ref buffer, .. }) if buffer == "2"
+        ));
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert!(
+            !adapter
+                .commands()
+                .iter()
+                .any(|command| matches!(command, WorkspaceDispatchCommand::Resize { .. }))
+        );
+        app.active_operation = Some(3);
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Failed {
+            operation: 3,
+            message: "refresh failed".to_string(),
+        }));
+        assert!(app.worker_pool.is_some());
+        assert_eq!(app.status.as_deref(), Some("Worker Pool: refresh failed"));
+    }
+
+    #[test]
+    fn pool_mode_renders_on_a_narrow_terminal() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('p')));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 4)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Worker Pool"), "{text}");
+    }
+
+    #[test]
+    fn stale_workspace_dispatch_events_do_not_replace_newer_operations() {
+        let mut app = app_with(&["default"]);
+        app.active_operation = Some(9);
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Failed {
+            operation: 8,
+            message: "old failure".to_string(),
+        }));
+        assert_eq!(app.active_operation, Some(9));
+        assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn worker_pool_snapshot_joins_by_workspace_and_renders_worker_metadata() {
         let temp = tempfile::tempdir().unwrap();
         let pool = temp.path().join(".jj/pool");
         std::fs::create_dir_all(&pool).unwrap();
@@ -2633,7 +3055,10 @@ mod tests {
             .read_worker_pool_snapshot();
 
         let mut app = app_with(&["default", "worker-01"]);
-        app.handle(Msg::WorkerPoolSnapshot(snapshot));
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot,
+        }));
 
         let worker = app
             .worker_for(app.store.workspace("worker-01").unwrap())
@@ -2653,7 +3078,7 @@ mod tests {
             .collect();
         assert!(text.contains("alpha"), "{text}");
         assert!(text.contains("ENG-101"), "{text}");
-        assert!(text.contains("READ-ONLY"), "{text}");
+        assert!(text.contains("wsg pool"), "{text}");
     }
 
     #[test]

@@ -70,6 +70,13 @@ with red-green TDD, focused review, and the repository verification gate:
 Issue 19 is the current implementation slice. Each later ticket is blocked by
 its predecessor and must preserve the command/event seam introduced there.
 
+## Comments
+
+2026-08-06 - Issue 19 is resolved. It introduced the Workspace Dispatch
+command/event seam, writable Pool management, stable Worker presentation data,
+and the version 0.30.0 jjfx integration. Issues 20 through 23 remain the
+successive implementation frontier.
+
 ## Out of Scope
 
 - Porting Bubble Tea widgets or keybindings exactly
