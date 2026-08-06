@@ -768,12 +768,29 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
             Ok(request)
         })
         .collect::<Result<Vec<_>>>()?;
-    let result = if args.no_orchestrate || requests.len() != 1 {
-        dispatch_with_capacity_prompt(repository, &requests)?
-    } else {
+    if !args.no_orchestrate && requests.len() == 1 {
+        if args.mode == RunMode::Foreground {
+            return orchestrate_command(repository, &args.tickets[0], args.model.as_deref());
+        }
+        let executable = std::env::current_exe()?;
+        let mut command = std::process::Command::new(executable);
+        command.arg("__orchestrate").arg(&args.tickets[0]);
+        if let Some(model) = args.model.as_deref() {
+            command.args(["--model", model]);
+        }
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()?;
         eprintln!("Orchestrating {} in background", args.tickets[0]);
-        dispatch_with_capacity_prompt(repository, &requests)?
-    };
+        eprintln!(
+            "  Re-run 'wsg dispatch {}' to check progress",
+            args.tickets[0]
+        );
+        return Ok(());
+    }
+    let result = dispatch_with_capacity_prompt(repository, &requests)?;
     render_dispatch_result(&result, requests.len(), false);
     Ok(())
 }
@@ -1008,12 +1025,35 @@ fn orchestrate_command(repository: &Repository, parent: &str, model: Option<&str
     let id = TicketId::parse(parent.to_owned())?;
     let request = wsg_core::OrchestrationRequest::new(id.clone(), configured_runtime(repository));
     let request = model.map_or(request.clone(), |value| request.with_model(value));
+    let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
+        .ticket()
+        .clone();
+    let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
+    let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(
+        request.agent_runtime(),
+        repository.root(),
+    ));
+    let runner = repository.orchestration_runner();
+    let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;
+    render_orchestration_event(&OrchestrationEvent::Started {
+        parent: id.clone(),
+        resumed: preparation.resumed(),
+    });
+    if let wsg_core::OrchestrationStart::Direct(success) = preparation.into_start() {
+        if let DirectDispatchExecution::Background { pid } = success.execution() {
+            eprintln!(
+                "  {} (PID {}) -> {}",
+                success.worker(),
+                pid,
+                success.ticket().id()
+            );
+        }
+        return Ok(());
+    }
     let options = wsg_core::OrchestrationOptions::new();
-    let summary = repository
-        .orchestration_runner()
-        .run(&request, &options, |event| {
-            render_orchestration_event(&event);
-        })?;
+    let summary = runner.run(&request, &options, |event| {
+        render_orchestration_event(&event);
+    })?;
     render_orchestration_event(&OrchestrationEvent::Terminal(summary));
     Ok(())
 }

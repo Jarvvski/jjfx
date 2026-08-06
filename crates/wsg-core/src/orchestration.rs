@@ -191,6 +191,36 @@ pub enum OrchestrationStart {
     Direct(Box<DirectDispatchSuccess>),
 }
 
+/// The result of preparing a Parent Ticket for foreground or detached watching.
+#[derive(Debug)]
+pub struct OrchestrationPreparation {
+    start: OrchestrationStart,
+    resumed: bool,
+    maximum_wave: usize,
+}
+
+impl OrchestrationPreparation {
+    /// Returns whether a persisted Dispatch Group was resumed.
+    pub const fn resumed(&self) -> bool {
+        self.resumed
+    }
+
+    /// Returns the largest dependency wave that must fit in the Worker Pool.
+    pub const fn maximum_wave(&self) -> usize {
+        self.maximum_wave
+    }
+
+    /// Returns the prepared group or direct Parent fallback.
+    pub const fn start(&self) -> &OrchestrationStart {
+        &self.start
+    }
+
+    /// Consumes the preparation and returns its start outcome.
+    pub fn into_start(self) -> OrchestrationStart {
+        self.start
+    }
+}
+
 /// Terminal information returned without choosing terminal formatting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationSummary {
@@ -807,6 +837,59 @@ impl OrchestrationRunner {
                 parent: parent.id().clone(),
             }),
         }
+    }
+
+    /// Prepares a Parent Ticket by resuming existing state or discovering and
+    /// persisting a new Dispatch Group. Persistence and Repository identity
+    /// policy stay behind this deep interface.
+    pub fn prepare<Q: TicketQuery>(
+        &self,
+        request: &OrchestrationRequest,
+        parent: &ParentTicket,
+        discovery: &TicketDiscovery<Q>,
+    ) -> Result<OrchestrationPreparation, OrchestrationError> {
+        let group_repository = self
+            .repository
+            .state_store()
+            .dispatch_group(parent.id().clone());
+        match group_repository
+            .load()
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?
+        {
+            Loaded::Present(versioned) => {
+                let group = DispatchGroup::from_state(versioned.value)?;
+                return Ok(OrchestrationPreparation {
+                    maximum_wave: group.maximum_wave_size(),
+                    start: OrchestrationStart::Group,
+                    resumed: true,
+                });
+            }
+            Loaded::Missing => {}
+        }
+        let pool = self.repository.worker_pool().snapshot();
+        let pool = pool
+            .pool()
+            .ok_or_else(|| OrchestrationError::Execution("Worker Pool is missing".to_owned()))?;
+        let identity = RepositoryIdentity::parse(pool.gh_repo())
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        let start = self.discover(request, parent, discovery, &identity, pool.gh_repo())?;
+        let maximum_wave = match &start {
+            OrchestrationStart::Group => match group_repository
+                .load()
+                .map_err(|error| OrchestrationError::Execution(error.to_string()))?
+            {
+                Loaded::Present(versioned) => {
+                    DispatchGroup::from_state(versioned.value)?.maximum_wave_size()
+                }
+                Loaded::Missing => 0,
+            },
+            OrchestrationStart::Direct(_) => 0,
+        };
+        Ok(OrchestrationPreparation {
+            start,
+            resumed: false,
+            maximum_wave,
+        })
     }
 
     /// Reconciles one persisted group and dispatches every currently ready Ticket that fits.
