@@ -360,6 +360,40 @@ fn status_displays_cosmetic_worker_aliases_without_changing_worker_input() {
 }
 
 #[test]
+fn dispatch_and_completion_shell_contracts_are_typed_and_separated() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+
+    let missing = run(
+        binary,
+        directory.path(),
+        &["dispatch", "AMBA-42", "--model"],
+    );
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("missing value for --model"));
+
+    let completion = run(binary, directory.path(), &["completion", "zsh"]);
+    assert!(completion.status.success());
+    let script = String::from_utf8_lossy(&completion.stdout);
+    assert!(script.contains("__complete non-busy-workers"));
+    assert!(!script.contains("__orchestrate"));
+    assert!(completion.stderr.is_empty());
+
+    let unsupported = run(binary, directory.path(), &["completion", "bash"]);
+    assert!(!unsupported.status.success());
+    assert!(String::from_utf8_lossy(&unsupported.stderr).contains("Unsupported shell"));
+}
+
+#[test]
+fn hidden_completion_is_read_only_outside_a_repository() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let output = run(binary, directory.path(), &["__complete", "workers"]);
+    assert!(output.status.success());
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
 fn no_arguments_report_read_only_pool_capabilities_inside_a_repository() {
     let binary = env!("CARGO_BIN_EXE_wsg");
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
