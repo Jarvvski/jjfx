@@ -1,6 +1,6 @@
 # Restore wsg Dispatch and Agent Session CLI compatibility
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 
