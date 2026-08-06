@@ -1121,6 +1121,12 @@ mod tests {
     }
 
     #[test]
+    fn foreground_and_background_prompt_rendering_preserves_ordered_inputs() {
+        assert_eq!(truncate_prompt("é".repeat(80).as_str()).chars().count(), 60);
+        assert_eq!(truncate_prompt("first second"), "first second");
+    }
+
+    #[test]
     fn capacity_prompt_uses_the_locked_shortage_gap() {
         let shortage = CapacityShortage::new(5, 2);
         assert_eq!(
