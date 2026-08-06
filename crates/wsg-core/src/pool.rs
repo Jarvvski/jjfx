@@ -51,7 +51,8 @@ pub struct CapacityShortage {
 }
 
 impl CapacityShortage {
-    fn new(requested: usize, available: usize) -> Self {
+    /// Creates a shortage from the locked requested and available counts.
+    pub const fn new(requested: usize, available: usize) -> Self {
         Self {
             requested,
             available,

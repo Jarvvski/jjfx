@@ -797,13 +797,17 @@ fn dispatch_with_capacity_prompt(
     }
 }
 
-fn confirm_growth(shortage: CapacityShortage) -> bool {
-    eprint!(
+fn growth_question(shortage: CapacityShortage) -> String {
+    format!(
         "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Resize pool to {}? [Y/n] ",
         shortage.available(),
         shortage.requested(),
         shortage.available() + shortage.gap()
-    );
+    )
+}
+
+fn confirm_growth(shortage: CapacityShortage) -> bool {
+    eprint!("{}", growth_question(shortage));
     let mut input = String::new();
     if std::io::stdin().read_to_string(&mut input).is_err() {
         return false;
@@ -1114,6 +1118,15 @@ mod tests {
     fn parser_rejects_unknown_dispatch_options_and_budgeted_orchestration() {
         assert!(parse(&args(&["dispatch", "AMBA-42", "--wat"])).is_err());
         assert!(parse(&args(&["dispatch", "AMBA-42", "--budget", "12"])).is_err());
+    }
+
+    #[test]
+    fn capacity_prompt_uses_the_locked_shortage_gap() {
+        let shortage = CapacityShortage::new(5, 2);
+        assert_eq!(
+            growth_question(shortage),
+            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Resize pool to 5? [Y/n] "
+        );
     }
 
     #[test]
