@@ -1285,6 +1285,8 @@ impl WorkerReference {
 pub struct PoolSnapshot {
     size: i64,
     gh_repo: String,
+    foreground: Option<bool>,
+    agent_runtime: Option<AgentRuntime>,
     workers: Vec<WorkerReference>,
 }
 impl PoolSnapshot {
@@ -1297,6 +1299,14 @@ impl PoolSnapshot {
     }
     pub fn gh_repo(&self) -> &str {
         &self.gh_repo
+    }
+    /// Returns the configured foreground default, when explicitly persisted.
+    pub fn foreground(&self) -> Option<bool> {
+        self.foreground
+    }
+    /// Returns the configured Agent Runtime, when explicitly persisted.
+    pub fn agent_runtime(&self) -> Option<AgentRuntime> {
+        self.agent_runtime
     }
     pub fn workers(&self) -> &[WorkerReference] {
         &self.workers
@@ -1510,6 +1520,8 @@ impl Repository {
         let snapshot = PoolSnapshot {
             size: pool.size,
             gh_repo: pool.gh_repo.clone(),
+            foreground: pool.foreground,
+            agent_runtime: AgentRuntime::from_configured(pool.agent.as_ref()).ok(),
             workers: references,
         };
         let mut workers = Vec::new();

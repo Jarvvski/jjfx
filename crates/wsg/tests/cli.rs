@@ -371,7 +371,7 @@ fn no_arguments_report_read_only_pool_capabilities_inside_a_repository() {
         .output()
         .expect("wsg should run");
 
-    assert!(!output.status.success());
-    assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("No pool"));
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("wsg dispatch"));
+    assert!(output.stderr.is_empty());
 }

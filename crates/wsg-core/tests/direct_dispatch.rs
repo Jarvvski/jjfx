@@ -26,6 +26,18 @@ const HELPER_COMPATIBILITY: &str = "WSG_DIRECT_DISPATCH_COMPATIBILITY";
 const HELPER_RELEASE: &str = "WSG_DIRECT_DISPATCH_RELEASE";
 
 #[test]
+fn request_for_ticket_id_constructs_a_valid_direct_request() {
+    let id = TicketId::parse("AMBA-42").expect("Ticket ID");
+    let request = DirectDispatchRequest::for_ticket_id(id, RunMode::Foreground)
+        .expect("Ticket ID creates a valid request");
+
+    assert_eq!(request.ticket().id().as_str(), "AMBA-42");
+    assert_eq!(request.ticket().title().as_str(), "AMBA-42");
+    assert_eq!(request.ticket().status().as_str(), "Todo");
+    assert_eq!(request.mode(), RunMode::Foreground);
+}
+
+#[test]
 fn failed_runtime_launch_releases_the_direct_dispatch_reservation() {
     let (temporary_directory, repository) = local_repository();
     configure_jj_identity(&repository);

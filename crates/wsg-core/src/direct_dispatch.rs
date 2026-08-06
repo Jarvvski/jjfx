@@ -8,8 +8,8 @@ use thiserror::Error;
 use crate::{
     AgentRuntimeInvocation, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
     DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
-    RunMode, RunSupervisor, RunSupervisorError, Ticket, WorkerId, WorkerPoolError,
-    WorkerWorkspaceError,
+    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketId, TicketStatus, TicketTitle,
+    WorkerId, WorkerPoolError, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -82,6 +82,15 @@ impl DirectDispatchRequest {
             mode,
             dependency_context: None,
         }
+    }
+
+    /// Creates a request from a stable Ticket ID when only the compatibility
+    /// command input is available. The provider can still supply richer Ticket
+    /// metadata in the Agent Runtime prompt.
+    pub fn for_ticket_id(id: TicketId, mode: RunMode) -> Result<Self, crate::TicketValueError> {
+        let title = TicketTitle::parse(id.as_str())?;
+        let status = TicketStatus::parse("Todo")?;
+        Ok(Self::new(Ticket::new(id, title, status), mode))
     }
 
     /// Selects one exact Worker and disables first-idle fallback.

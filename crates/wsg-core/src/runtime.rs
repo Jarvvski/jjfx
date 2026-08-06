@@ -944,7 +944,8 @@ impl AgentRuntime {
         }
     }
 
-    pub(crate) fn from_configured(value: Option<&WireAgent>) -> Result<Self, String> {
+    /// Selects the configured runtime, defaulting legacy pools to Claude.
+    pub fn from_configured(value: Option<&WireAgent>) -> Result<Self, String> {
         let configured = value.map_or("", WireAgent::as_str).trim();
         if configured.is_empty() {
             return Ok(Self::Claude);
