@@ -6,6 +6,11 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-10 - Added Dispatch Group progress, non-blocking Parent Ticket
+  orchestration, and focused provider-neutral Worker logs to jjfx 0.32.0.
+  Dependency waves, retries, usage, terminal outcomes, and unavailable logs
+  remain visible without blocking Pool input.
+
 - 2026-08-06 - Added selected-Worker, bulk, and Ready Ticket Dispatch to jjfx
   0.31.0. Ticket previews, typed capacity confirmation, ordered outcomes, and
   background execution keep the TUI responsive while reusing shared wsg-core

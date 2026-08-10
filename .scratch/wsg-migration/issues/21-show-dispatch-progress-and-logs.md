@@ -1,6 +1,6 @@
 # Show Dispatch progress and structured logs in jjfx
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -27,11 +27,11 @@ a focused detail view without blocking the event loop.
 
 ## Acceptance Criteria
 
-- [ ] Dispatch Group progress and dependency waves are visible.
-- [ ] Orchestration events do not block input rendering.
-- [ ] Structured Claude and Codex activity renders through shared values.
-- [ ] Terminal and malformed log outcomes remain understandable.
-- [ ] `mise run check` is green.
+- [x] Dispatch Group progress and dependency waves are visible.
+- [x] Orchestration events do not block input rendering.
+- [x] Structured Claude and Codex activity renders through shared values.
+- [x] Terminal and malformed log outcomes remain understandable.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -42,3 +42,23 @@ a focused detail view without blocking the event loop.
 ## Blocked by
 
 - issues/20-add-jjfx-ticket-dispatch.md
+
+## Answer
+
+Implemented Dispatch Group progress and focused Worker logs through the
+Workspace Dispatch controller seam. Pool mode now has a separate `o` Parent
+Ticket orchestration flow while preserving selected-Worker Direct Dispatch on
+`d`. Immutable presentation values expose dependency waves, blockers, ready
+Tickets, Worker assignments, retries, status counts, and terminal group state.
+
+The controller streams start, progress, direct-dispatch, terminal, and failure
+events without blocking the Ratatui event loop. Focused Worker detail mode
+uses a cancellable, generation-correlated watcher over the shared `RunLog`
+interface and renders provider-neutral Claude and Codex activity, usage,
+terminal results, malformed records, and unavailable-log errors. Stale updates,
+removed Workers, terminal groups, concurrent refreshes, and narrow layouts are
+covered by tests without adding persistence schemas or mutable domain state to
+`App`.
+
+jjfx is version 0.32.0 with the user-visible change recorded in
+`CHANGELOG.md`. `mise run check` passes across jjfx, wsg, and wsg-core.
