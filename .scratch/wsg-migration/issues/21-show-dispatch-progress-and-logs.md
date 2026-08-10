@@ -1,6 +1,6 @@
 # Show Dispatch progress and structured logs in jjfx
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

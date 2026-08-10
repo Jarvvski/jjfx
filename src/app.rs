@@ -202,6 +202,8 @@ pub struct App {
     dispatch_result: Option<crate::workspace_dispatch::DispatchResult>,
     /// Latest Ready Ticket discovery result awaiting preview or launch.
     ready_tickets: Option<crate::workspace_dispatch::ReadyTicketResult>,
+    /// Latest immutable Dispatch Group presentation projection.
+    group_progress: Option<crate::workspace_dispatch::DispatchGroupProgress>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
@@ -274,6 +276,7 @@ impl App {
             active_operation: None,
             dispatch_result: None,
             ready_tickets: None,
+            group_progress: None,
             forge_progress: HashMap::new(),
             fetching: false,
             workspace_config: config.workspace,
@@ -404,6 +407,17 @@ impl App {
                     self.active_operation = None;
                     self.mode = Mode::Pool(PoolMode::ReadyPreview { selected: None });
                     self.set_status(format!("Found {count} Ready Ticket(s)"));
+                }
+            }
+            WorkspaceDispatchEvent::GroupProgress {
+                operation,
+                progress,
+            } => {
+                if operation == 0 || self.active_operation == Some(operation) {
+                    self.group_progress = Some(progress);
+                    if operation != 0 {
+                        self.active_operation = None;
+                    }
                 }
             }
             WorkspaceDispatchEvent::Failed { operation, message } => {
@@ -1623,6 +1637,51 @@ impl App {
                     format!(" ! {}", diagnostic.message()),
                     Style::default().fg(Color::Yellow),
                 )));
+            }
+            if let Some(progress) = &self.group_progress {
+                let counts = progress.counts();
+                let terminal = if progress.is_terminal() {
+                    " terminal"
+                } else {
+                    ""
+                };
+                lines.push(dim_line(&format!(
+                    " Dispatch Group {}  waves: {}  done: {}  failed: {}  skipped: {}{}",
+                    progress.parent(),
+                    progress.maximum_wave(),
+                    counts.done(),
+                    counts.failed(),
+                    counts.skipped(),
+                    terminal
+                )));
+                if !progress.ready().is_empty() {
+                    lines.push(Line::from(format!(
+                        "  ready: {}",
+                        progress.ready().join(", ")
+                    )));
+                }
+                for issue in progress.issues() {
+                    let blockers = if issue.blockers().is_empty() {
+                        String::new()
+                    } else {
+                        format!("  blocked by {}", issue.blockers().join(", "))
+                    };
+                    let retry = if issue.retries() > 0 {
+                        format!("  retry {}", issue.retries())
+                    } else {
+                        String::new()
+                    };
+                    lines.push(Line::from(format!(
+                        "  wave {}  {:<10} {}  {} -> {}{}{}",
+                        issue.wave(),
+                        issue.status().as_str(),
+                        issue.ticket(),
+                        issue.title(),
+                        issue.worker().unwrap_or("unassigned"),
+                        retry,
+                        blockers
+                    )));
+                }
             }
             match &self.mode {
                 Mode::Pool(PoolMode::DispatchPreview { tickets, selected }) => {
@@ -3420,6 +3479,77 @@ mod tests {
         assert!(text.contains("ENG-42  First Ticket"), "{text}");
         assert!(text.contains("ENG-43 [Capacity]"), "{text}");
         assert!(text.find("ENG-42").unwrap() < text.find("ENG-43").unwrap());
+    }
+
+    #[test]
+    fn dispatch_group_progress_renders_ready_wave_and_terminal_counts() {
+        use std::collections::BTreeMap;
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+
+        let parent = wsg_core::TicketId::parse("ENG-100").unwrap();
+        let blocker = wsg_core::TicketId::parse("ENG-101").unwrap();
+        let dependent = wsg_core::TicketId::parse("ENG-102").unwrap();
+        let mut sub_issues = BTreeMap::new();
+        sub_issues.insert(
+            blocker,
+            wsg_core::SubIssueState::new(
+                "Foundation",
+                wsg_core::WireStatus::new("done"),
+                Vec::new(),
+            ),
+        );
+        sub_issues.insert(
+            dependent,
+            wsg_core::SubIssueState::new(
+                "Dependent work",
+                wsg_core::WireStatus::new("pending"),
+                vec![wsg_core::TicketId::parse("ENG-101").unwrap()],
+            ),
+        );
+        let mut state = wsg_core::DispatchGroupState::new(
+            parent,
+            wsg_core::WireTimestamp::new("2026-08-10T10:00:00Z"),
+            "Jarvvski/jjfx",
+            wsg_core::DispatchGroupOptions::new(""),
+        );
+        state.sub_issues = sub_issues;
+
+        let mut app = app_with(&["default"]);
+        app.worker_pool = Some(
+            wsg_core::Repository::open(temp.path())
+                .unwrap()
+                .read_worker_pool_snapshot(),
+        );
+        let progress = crate::workspace_dispatch::DispatchGroupProgress::from_state(state).unwrap();
+        app.mode = Mode::Pool(PoolMode::View { selected: None });
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::GroupProgress {
+                operation: 0,
+                progress,
+            },
+        ));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Dispatch Group ENG-100"), "{text}");
+        assert!(text.contains("ready: ENG-102"), "{text}");
+        assert!(text.contains("wave 2"), "{text}");
+        assert!(text.contains("done: 1"), "{text}");
     }
 
     #[test]
