@@ -3787,6 +3787,75 @@ mod tests {
     }
 
     #[test]
+    fn stale_worker_log_events_do_not_replace_the_current_detail() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::LogDetail {
+            worker: "worker-01".to_owned(),
+        });
+        app.worker_log_operation = Some(7);
+        let first = crate::workspace_dispatch::WorkerLogSnapshot::new(
+            "worker-01",
+            wsg_core::AgentRuntime::Claude,
+            Some(RunActivity::new(RunActivityKind::Message {
+                text: "current".to_owned(),
+            })),
+            None,
+        );
+        app.worker_log = Some(first.clone());
+        let stale = crate::workspace_dispatch::WorkerLogSnapshot::new(
+            "worker-01",
+            wsg_core::AgentRuntime::Codex,
+            Some(RunActivity::new(RunActivityKind::Message {
+                text: "stale".to_owned(),
+            })),
+            None,
+        );
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerLogUpdated {
+                operation: 6,
+                snapshot: Box::new(stale),
+            },
+        ));
+        assert_eq!(app.worker_log.as_ref(), Some(&first));
+        assert_eq!(app.worker_log_operation, Some(7));
+
+        let terminal = crate::workspace_dispatch::WorkerLogSnapshot::new(
+            "worker-01",
+            wsg_core::AgentRuntime::Claude,
+            None,
+            Some(RunResult::succeeded()),
+        );
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerLogUpdated {
+                operation: 7,
+                snapshot: Box::new(terminal),
+            },
+        ));
+        assert_eq!(app.worker_log_operation, None);
+        assert_eq!(
+            app.worker_log
+                .as_ref()
+                .unwrap()
+                .result()
+                .unwrap()
+                .conclusion(),
+            &RunConclusion::Succeeded
+        );
+    }
+
+    #[test]
+    fn unavailable_worker_log_remains_understandable_on_a_narrow_terminal() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::LogDetail {
+            worker: "worker-01".to_owned(),
+        });
+        app.worker_log_error = Some("log file unavailable: missing Worker log".to_owned());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+    }
+
+    #[test]
     fn ordered_dispatch_outcomes_render_with_ticket_titles() {
         let mut app = app_with(&["default"]);
         let temp = tempfile::tempdir().unwrap();
