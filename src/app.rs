@@ -33,7 +33,10 @@ use crate::workspace_dispatch::{
     WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{PresentationRow, WorkspaceList};
-use wsg_core::{WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus};
+use wsg_core::{
+    RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage, WorkerPoolSnapshot,
+    WorkerSnapshot, WorkerStatus,
+};
 
 /// The focused Worker Pool management interaction.
 enum PoolMode {
@@ -54,6 +57,12 @@ enum PoolMode {
     },
     ReadyPreview {
         selected: Option<String>,
+    },
+    ParentInput {
+        buffer: String,
+    },
+    LogDetail {
+        worker: String,
     },
     ConfirmDispatchCapacity {
         tickets: Vec<String>,
@@ -110,6 +119,7 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Tidy (abandon junk empties)", "T"),
     ("Worker Pool management", "p"),
     ("Selected / bulk Ticket Dispatch", "d"),
+    ("Parent Dispatch Group orchestration", "o"),
     ("Ready Ticket discovery", "a"),
     ("Fold / expand idle group", "c"),
     ("Toggle this help", "?"),
@@ -198,6 +208,14 @@ pub struct App {
     /// Operation generation used to reject stale mutation results.
     next_operation: OperationId,
     active_operation: Option<OperationId>,
+    /// Independent operation identity for durable Parent orchestration.
+    orchestration_operation: Option<OperationId>,
+    /// Independent operation identity for the selected Worker log watcher.
+    worker_log_operation: Option<OperationId>,
+    /// Latest immutable provider-neutral Worker log snapshot.
+    worker_log: Option<crate::workspace_dispatch::WorkerLogSnapshot>,
+    /// Latest Worker log failure retained for the focused detail view.
+    worker_log_error: Option<String>,
     /// Latest ordered Direct Dispatch outcomes for the Pool view.
     dispatch_result: Option<crate::workspace_dispatch::DispatchResult>,
     /// Latest Ready Ticket discovery result awaiting preview or launch.
@@ -274,6 +292,10 @@ impl App {
             dispatch,
             next_operation: 0,
             active_operation: None,
+            orchestration_operation: None,
+            worker_log_operation: None,
+            worker_log: None,
+            worker_log_error: None,
             dispatch_result: None,
             ready_tickets: None,
             group_progress: None,
@@ -413,17 +435,95 @@ impl App {
                 operation,
                 progress,
             } => {
-                if operation == 0 || self.active_operation == Some(operation) {
+                if operation == 0
+                    || self.active_operation == Some(operation)
+                    || self.orchestration_operation == Some(operation)
+                {
                     self.group_progress = Some(progress);
-                    if operation != 0 {
-                        self.active_operation = None;
+                }
+            }
+            WorkspaceDispatchEvent::OrchestrationStarted {
+                operation,
+                parent,
+                resumed,
+            } => {
+                if self.orchestration_operation == Some(operation) {
+                    self.set_status(format!(
+                        "{} Dispatch Group {parent}",
+                        if resumed { "Resuming" } else { "Starting" }
+                    ));
+                }
+            }
+            WorkspaceDispatchEvent::OrchestrationProgress {
+                operation,
+                progress,
+                notice,
+            } => {
+                if self.orchestration_operation == Some(operation) {
+                    self.group_progress = Some(progress);
+                    if let Some(notice) = notice {
+                        self.set_status(notice);
                     }
+                }
+            }
+            WorkspaceDispatchEvent::OrchestrationDirect {
+                operation,
+                parent,
+                worker,
+                pid,
+            } => {
+                if self.orchestration_operation == Some(operation) {
+                    self.orchestration_operation = None;
+                    self.set_status(format!(
+                        "Dispatched Parent {parent} to {worker} (PID {pid})"
+                    ));
+                }
+            }
+            WorkspaceDispatchEvent::OrchestrationTerminal {
+                operation,
+                parent,
+                counts,
+            } => {
+                if self.orchestration_operation == Some(operation) {
+                    self.orchestration_operation = None;
+                    self.set_status(format!(
+                        "Dispatch Group {parent} complete: {} done, {} failed, {} skipped",
+                        counts.done(),
+                        counts.failed(),
+                        counts.skipped()
+                    ));
+                }
+            }
+            WorkspaceDispatchEvent::WorkerLogUpdated {
+                operation,
+                snapshot,
+            } => {
+                if self.worker_log_operation == Some(operation) {
+                    let terminal = snapshot.result().is_some();
+                    self.worker_log = Some(*snapshot);
+                    self.worker_log_error = None;
+                    if terminal {
+                        self.worker_log_operation = None;
+                    }
+                }
+            }
+            WorkspaceDispatchEvent::WorkerLogFailed {
+                operation,
+                worker: _,
+                message,
+            } => {
+                if self.worker_log_operation == Some(operation) {
+                    self.worker_log_operation = None;
+                    self.worker_log_error = Some(message);
                 }
             }
             WorkspaceDispatchEvent::Failed { operation, message } => {
                 if self.active_operation == Some(operation) {
                     self.active_operation = None;
                     self.set_status(format!("Worker Pool: {message}"));
+                } else if self.orchestration_operation == Some(operation) {
+                    self.orchestration_operation = None;
+                    self.set_status(format!("Dispatch Group: {message}"));
                 }
             }
         }
@@ -442,6 +542,36 @@ impl App {
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
         self.active_operation = Some(self.next_operation);
         self.next_operation
+    }
+
+    fn orchestrate_parent(&mut self, parent: String) {
+        self.next_operation = self.next_operation.wrapping_add(1).max(1);
+        let operation = self.next_operation;
+        self.orchestration_operation = Some(operation);
+        self.pin_status(format!("starting Dispatch Group {parent}..."));
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::Orchestrate { operation, parent });
+    }
+
+    fn start_worker_log(&mut self, worker: String) {
+        self.next_operation = self.next_operation.wrapping_add(1).max(1);
+        let operation = self.next_operation;
+        self.worker_log_operation = Some(operation);
+        self.worker_log = None;
+        self.worker_log_error = None;
+        self.mode = Mode::Pool(PoolMode::LogDetail {
+            worker: worker.clone(),
+        });
+        self.pin_status(format!("reading Worker {worker} log..."));
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::WatchWorkerLog { operation, worker });
+    }
+
+    fn stop_worker_log(&mut self) {
+        if let Some(operation) = self.worker_log_operation.take() {
+            self.dispatch
+                .submit(WorkspaceDispatchCommand::StopWorkerLog { operation });
+        }
     }
 
     /// Advance the working-glyph animation one frame. Returns whether anything
@@ -771,6 +901,20 @@ impl App {
                     });
                 }
                 KeyCode::Char('a') => self.discover_ready_tickets(),
+                KeyCode::Char('o') => {
+                    self.mode = Mode::Pool(PoolMode::ParentInput {
+                        buffer: String::new(),
+                    });
+                }
+                KeyCode::Char('l') => {
+                    let worker = selected.clone().or_else(|| self.pool_worker_after(None, 0));
+                    if let Some(worker) = worker {
+                        self.start_worker_log(worker);
+                    } else {
+                        self.set_status("Select a Worker before opening its log".to_string());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                    }
+                }
                 KeyCode::Char('r') => {
                     let capacity = self.pool_capacity().unwrap_or(0);
                     self.mode = Mode::Pool(PoolMode::Capacity {
@@ -883,6 +1027,35 @@ impl App {
                     }
                 }
                 _ => self.mode = Mode::Pool(PoolMode::ReadyPreview { selected }),
+            },
+            Mode::Pool(PoolMode::ParentInput { mut buffer }) => match key.code {
+                KeyCode::Esc => self.mode = Mode::Pool(PoolMode::View { selected: None }),
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    self.mode = Mode::Pool(PoolMode::ParentInput { buffer });
+                }
+                KeyCode::Char(c) if c.is_ascii_alphanumeric() || c == '-' || c == '_' => {
+                    buffer.push(c);
+                    self.mode = Mode::Pool(PoolMode::ParentInput { buffer });
+                }
+                KeyCode::Enter if !buffer.trim().is_empty() => {
+                    self.mode = Mode::Pool(PoolMode::View { selected: None });
+                    self.orchestrate_parent(buffer);
+                }
+                KeyCode::Enter => {
+                    self.set_status("Parent Ticket ID cannot be empty".to_string());
+                    self.mode = Mode::Pool(PoolMode::ParentInput { buffer });
+                }
+                _ => self.mode = Mode::Pool(PoolMode::ParentInput { buffer }),
+            },
+            Mode::Pool(PoolMode::LogDetail { worker }) => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.stop_worker_log();
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker),
+                    });
+                }
+                _ => self.mode = Mode::Pool(PoolMode::LogDetail { worker }),
             },
             Mode::Pool(PoolMode::ConfirmDispatchCapacity {
                 tickets,
@@ -1616,6 +1789,8 @@ impl App {
                 | Mode::Pool(PoolMode::ConfirmDispatchCapacity {
                     worker: selected, ..
                 }) => selected.as_deref(),
+                Mode::Pool(PoolMode::ParentInput { .. }) => None,
+                Mode::Pool(PoolMode::LogDetail { worker }) => Some(worker.as_str()),
                 _ => None,
             };
             for worker in snapshot.workers() {
@@ -1735,6 +1910,36 @@ impl App {
                         )
                     };
                     lines.push(Line::from(line));
+                }
+            }
+            if let Mode::Pool(PoolMode::LogDetail { worker }) = &self.mode {
+                lines.push(dim_line(&format!(" Worker log: {worker}")));
+                if let Some(error) = &self.worker_log_error {
+                    lines.push(Line::from(Span::styled(
+                        format!(" ! {error}"),
+                        Style::default().fg(Color::Yellow),
+                    )));
+                } else if let Some(snapshot) = &self.worker_log {
+                    lines.push(Line::from(format!(
+                        " runtime: {}  worker: {}",
+                        snapshot.runtime().as_str(),
+                        snapshot.worker()
+                    )));
+                    match snapshot.activity() {
+                        Some(activity) => lines.push(Line::from(format!(
+                            " activity: {}",
+                            worker_activity_line(activity)
+                        ))),
+                        None => lines.push(dim_line(" no recognized activity yet")),
+                    }
+                    if let Some(result) = snapshot.result() {
+                        lines.push(Line::from(format!(
+                            " result: {}",
+                            worker_result_line(result)
+                        )));
+                    }
+                } else {
+                    lines.push(dim_line(" loading latest activity..."));
                 }
             }
         } else {
@@ -2045,7 +2250,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  o orchestrate  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -2065,6 +2270,14 @@ impl App {
             )),
             Mode::Pool(PoolMode::ReadyPreview { .. }) => Paragraph::new(Span::styled(
                 " Ready Tickets: enter launch, esc cancel ",
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::ParentInput { buffer }) => Paragraph::new(Span::styled(
+                format!(" Parent Ticket: {buffer}_  (enter start/resume, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::LogDetail { worker }) => Paragraph::new(Span::styled(
+                format!(" Worker log {worker}: esc close "),
                 Style::default().fg(Color::Cyan),
             )),
             Mode::Pool(PoolMode::ConfirmDispatchCapacity { shortage, .. }) => {
@@ -2117,6 +2330,49 @@ impl App {
 
 fn display_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+fn worker_activity_line(activity: &RunActivity) -> String {
+    let detail = match activity.kind() {
+        RunActivityKind::SessionStarted => "session started".to_owned(),
+        RunActivityKind::Message { text } => text.clone(),
+        RunActivityKind::Reasoning { text } => format!("reasoning: {text}"),
+        RunActivityKind::Warning { message } => format!("warning: {message}"),
+        RunActivityKind::FileChanges { paths } => format!("files: {}", paths.join(", ")),
+        RunActivityKind::Plan { completed, total } => format!("plan: {completed}/{total}"),
+        RunActivityKind::Tool {
+            name,
+            detail,
+            status,
+        } => format!(
+            "tool {name} {status:?}{}",
+            detail
+                .as_deref()
+                .map_or(String::new(), |value| format!(" {value}"))
+        ),
+        RunActivityKind::Collaboration(event) => format!("collaboration: {:?}", event),
+    };
+    match activity.usage() {
+        Some(usage) => format!("{detail} [{}]", worker_usage_line(usage)),
+        None => detail,
+    }
+}
+
+fn worker_usage_line(usage: &RunUsage) -> String {
+    format!(
+        "input {} cached {} output {} reasoning {}",
+        usage.input_tokens(),
+        usage.cached_input_tokens(),
+        usage.output_tokens(),
+        usage.reasoning_output_tokens()
+    )
+}
+
+fn worker_result_line(result: &RunResult) -> String {
+    match result.conclusion() {
+        RunConclusion::Succeeded => "succeeded".to_owned(),
+        RunConclusion::Failed { message } => format!("failed: {message}"),
+    }
 }
 
 fn worker_line(worker: &WorkerSnapshot, _tick: u64) -> Line<'static> {
@@ -3430,6 +3686,104 @@ mod tests {
             Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG"
         ));
         assert_eq!(app.active_operation, Some(8));
+    }
+
+    #[test]
+    fn parent_orchestration_uses_o_without_changing_direct_dispatch_d() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let adapter = RecordingAdapter::new(snapshot);
+        let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
+        let mut app = app_with(&["default"]);
+        app.dispatch = controller;
+        app.mode = Mode::Pool(PoolMode::View { selected: None });
+
+        app.handle(press(KeyCode::Char('o')));
+        for character in "ENG-100".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::ParentInput { ref buffer }) if buffer == "ENG-100"
+        ));
+        app.handle(press(KeyCode::Enter));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        for _ in 0..100 {
+            if adapter.commands().iter().any(|command| {
+                matches!(
+                    command,
+                    WorkspaceDispatchCommand::Orchestrate { parent, .. }
+                        if parent == "ENG-100"
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(adapter.commands().iter().any(|command| {
+            matches!(
+                command,
+                WorkspaceDispatchCommand::Orchestrate { parent, .. }
+                    if parent == "ENG-100"
+            )
+        }));
+        assert!(app.orchestration_operation.is_some());
+    }
+
+    #[test]
+    fn worker_log_detail_renders_provider_neutral_codex_activity_and_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut app = app_with(&["default"]);
+        app.worker_pool = Some(
+            wsg_core::Repository::open(temp.path())
+                .unwrap()
+                .read_worker_pool_snapshot(),
+        );
+        app.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
+            "worker-01",
+            wsg_core::AgentRuntime::Codex,
+            Some(RunActivity::new(RunActivityKind::FileChanges {
+                paths: vec![
+                    "src/app.rs".to_owned(),
+                    "src/workspace_dispatch.rs".to_owned(),
+                ],
+            })),
+            Some(RunResult::failed("provider stopped")),
+        ));
+        app.mode = Mode::Pool(PoolMode::LogDetail {
+            worker: "worker-01".to_owned(),
+        });
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("runtime: codex"), "{text}");
+        assert!(
+            text.contains("files: src/app.rs, src/workspace_dispatch.rs"),
+            "{text}"
+        );
+        assert!(text.contains("result: failed: provider stopped"), "{text}");
     }
 
     #[test]

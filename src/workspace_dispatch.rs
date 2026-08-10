@@ -5,18 +5,64 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DispatchGroup,
-    DispatchGroupState, DispatchGroupStatusCounts, PoolCapacity, ReadyTicketFilter, RunMode,
-    SubIssueStatus, TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError,
-    WorkerPoolSnapshot,
+    DispatchGroupState, DispatchGroupStatusCounts, PoolCapacity, ReadyTicketFilter, RunActivity,
+    RunMode, RunResult, SubIssueStatus, TicketDiscovery, TicketId, TicketStatus, WorkerId,
+    WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 /// A user-visible operation identity used to ignore stale results.
 pub type OperationId = u64;
+
+/// Immutable latest activity from one Worker's provider-neutral Run log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerLogSnapshot {
+    worker: String,
+    runtime: AgentRuntime,
+    activity: Option<RunActivity>,
+    result: Option<RunResult>,
+}
+
+impl WorkerLogSnapshot {
+    pub(crate) fn new(
+        worker: impl Into<String>,
+        runtime: AgentRuntime,
+        activity: Option<RunActivity>,
+        result: Option<RunResult>,
+    ) -> Self {
+        Self {
+            worker: worker.into(),
+            runtime,
+            activity,
+            result,
+        }
+    }
+
+    /// Returns the Worker whose log was read.
+    pub fn worker(&self) -> &str {
+        &self.worker
+    }
+
+    /// Returns the provider selected for the Run log.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
+    }
+
+    /// Returns the latest normalized activity, if the log contains one.
+    pub const fn activity(&self) -> Option<&RunActivity> {
+        self.activity.as_ref()
+    }
+
+    /// Returns the terminal normalized result, if the Worker has one.
+    pub const fn result(&self) -> Option<&RunResult> {
+        self.result.as_ref()
+    }
+}
 
 /// Commands accepted by the Workspace Dispatch controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,6 +100,18 @@ pub enum WorkspaceDispatchCommand {
         operation: OperationId,
         label: String,
     },
+    /// Start or resume one Parent Ticket's dependency-aware orchestration.
+    Orchestrate {
+        operation: OperationId,
+        parent: String,
+    },
+    /// Start one cancellable latest-activity Worker log watcher.
+    WatchWorkerLog {
+        operation: OperationId,
+        worker: String,
+    },
+    /// Stop the Worker log watcher identified by its operation.
+    StopWorkerLog { operation: OperationId },
 }
 
 /// The result of a Pool membership mutation, reduced to presentation data.
@@ -385,6 +443,35 @@ fn dependency_wave(
     wave
 }
 
+fn orchestration_notice(event: &wsg_core::OrchestrationEvent) -> Option<String> {
+    match event {
+        wsg_core::OrchestrationEvent::Started { .. }
+        | wsg_core::OrchestrationEvent::Terminal(_) => None,
+        wsg_core::OrchestrationEvent::Completed { ticket, worker, .. } => {
+            Some(format!("{ticket} completed on {worker}"))
+        }
+        wsg_core::OrchestrationEvent::Retrying {
+            ticket, attempt, ..
+        } => Some(format!("retrying {ticket} (attempt {attempt})")),
+        wsg_core::OrchestrationEvent::Dispatched { ticket, worker } => {
+            Some(format!("{ticket} dispatched to {worker}"))
+        }
+        wsg_core::OrchestrationEvent::WaitingForCapacity { ticket } => {
+            Some(format!("waiting for Worker capacity: {ticket}"))
+        }
+        wsg_core::OrchestrationEvent::LaunchFailed { ticket, detail, .. } => {
+            Some(format!("launch failed {ticket}: {detail}"))
+        }
+        wsg_core::OrchestrationEvent::BranchRevalidated {
+            ticket, current, ..
+        } => Some(format!("repaired {ticket} -> {current}")),
+        wsg_core::OrchestrationEvent::Failed { ticket, detail, .. } => Some(format!(
+            "{ticket} failed: {}",
+            detail.as_deref().unwrap_or("unknown error")
+        )),
+    }
+}
+
 /// Ready Ticket discovery results, including safely excluded entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyTicketResult {
@@ -443,6 +530,29 @@ impl PoolMutationResult {
     }
 }
 
+/// Immutable updates emitted by an orchestration adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceDispatchOrchestrationEvent {
+    /// Preparation completed and the group is ready to run.
+    Started { parent: String, resumed: bool },
+    /// A durable group transition was folded into presentation data.
+    Progress {
+        progress: DispatchGroupProgress,
+        notice: Option<String>,
+    },
+    /// A Parent without Sub-issues launched through Direct Dispatch.
+    Direct {
+        parent: String,
+        worker: String,
+        pid: u32,
+    },
+    /// The group reached a terminal state.
+    Terminal {
+        parent: String,
+        counts: DispatchGroupStatusCounts,
+    },
+}
+
 /// Events emitted after a command completes outside the App event loop.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceDispatchEvent {
@@ -482,6 +592,42 @@ pub enum WorkspaceDispatchEvent {
         operation: OperationId,
         progress: DispatchGroupProgress,
     },
+    /// Orchestration preparation or execution started.
+    OrchestrationStarted {
+        operation: OperationId,
+        parent: String,
+        resumed: bool,
+    },
+    /// A durable orchestration update was projected for the Pool view.
+    OrchestrationProgress {
+        operation: OperationId,
+        progress: DispatchGroupProgress,
+        notice: Option<String>,
+    },
+    /// A Parent without children launched directly.
+    OrchestrationDirect {
+        operation: OperationId,
+        parent: String,
+        worker: String,
+        pid: u32,
+    },
+    /// Orchestration reached a terminal group state.
+    OrchestrationTerminal {
+        operation: OperationId,
+        parent: String,
+        counts: DispatchGroupStatusCounts,
+    },
+    /// A changed provider-neutral Worker log snapshot.
+    WorkerLogUpdated {
+        operation: OperationId,
+        snapshot: Box<WorkerLogSnapshot>,
+    },
+    /// A Worker log could not be read.
+    WorkerLogFailed {
+        operation: OperationId,
+        worker: String,
+        message: String,
+    },
     /// A command or its post-mutation refresh failed.
     Failed {
         operation: OperationId,
@@ -518,6 +664,50 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
     /// Discover Tickets ready for Dispatch through the configured Agent Runtime.
     fn discover_ready(&self, label: &str) -> Result<ReadyTicketResult, String>;
+    /// Prepare and run one Parent orchestration, emitting durable progress updates.
+    fn orchestrate(
+        &self,
+        parent: &str,
+        emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
+    ) -> Result<(), String>;
+    /// Reads one latest Worker log snapshot without choosing a rendering.
+    fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
+}
+
+struct WatcherRegistry {
+    active: Mutex<BTreeMap<OperationId, Arc<AtomicBool>>>,
+}
+
+impl WatcherRegistry {
+    fn new() -> Self {
+        Self {
+            active: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    fn stop(&self, operation: OperationId) {
+        if let Some(cancel) = self
+            .active
+            .lock()
+            .expect("Worker log watcher registry lock")
+            .remove(&operation)
+        {
+            cancel.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl Drop for WatcherRegistry {
+    fn drop(&mut self) {
+        for cancel in self
+            .active
+            .get_mut()
+            .expect("Worker log watcher registry lock")
+            .values()
+        {
+            cancel.store(true, Ordering::Release);
+        }
+    }
 }
 
 /// A deep asynchronous controller for Workspace Dispatch operations.
@@ -525,6 +715,7 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
 pub struct WorkspaceDispatchController {
     adapter: Arc<dyn WorkspaceDispatchAdapter>,
     emit: Arc<dyn Fn(WorkspaceDispatchEvent) + Send + Sync>,
+    watchers: Arc<WatcherRegistry>,
 }
 
 impl WorkspaceDispatchController {
@@ -537,6 +728,7 @@ impl WorkspaceDispatchController {
         Self {
             adapter: Arc::new(adapter),
             emit: Arc::new(emit),
+            watchers: Arc::new(WatcherRegistry::new()),
         }
     }
 
@@ -544,6 +736,7 @@ impl WorkspaceDispatchController {
     pub fn submit(&self, command: WorkspaceDispatchCommand) {
         let adapter = Arc::clone(&self.adapter);
         let emit = Arc::clone(&self.emit);
+        let watchers = Arc::clone(&self.watchers);
         std::thread::spawn(move || match command {
             WorkspaceDispatchCommand::Refresh { operation } => match adapter.refresh() {
                 Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
@@ -657,6 +850,105 @@ impl WorkspaceDispatchController {
                     Ok(result) => emit(WorkspaceDispatchEvent::ReadyTickets { operation, result }),
                     Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
                 }
+            }
+            WorkspaceDispatchCommand::Orchestrate { operation, parent } => {
+                let mut forward = |event| match event {
+                    WorkspaceDispatchOrchestrationEvent::Started { parent, resumed } => {
+                        emit(WorkspaceDispatchEvent::OrchestrationStarted {
+                            operation,
+                            parent,
+                            resumed,
+                        });
+                    }
+                    WorkspaceDispatchOrchestrationEvent::Progress { progress, notice } => {
+                        emit(WorkspaceDispatchEvent::OrchestrationProgress {
+                            operation,
+                            progress,
+                            notice,
+                        });
+                    }
+                    WorkspaceDispatchOrchestrationEvent::Direct {
+                        parent,
+                        worker,
+                        pid,
+                    } => {
+                        emit(WorkspaceDispatchEvent::OrchestrationDirect {
+                            operation,
+                            parent,
+                            worker,
+                            pid,
+                        });
+                    }
+                    WorkspaceDispatchOrchestrationEvent::Terminal { parent, counts } => {
+                        emit(WorkspaceDispatchEvent::OrchestrationTerminal {
+                            operation,
+                            parent,
+                            counts,
+                        });
+                    }
+                };
+                if let Err(message) = adapter.orchestrate(&parent, &mut forward) {
+                    emit(WorkspaceDispatchEvent::Failed { operation, message });
+                }
+            }
+            WorkspaceDispatchCommand::WatchWorkerLog { operation, worker } => {
+                let cancel = Arc::new(AtomicBool::new(false));
+                if let Some(previous) = watchers
+                    .active
+                    .lock()
+                    .expect("watcher registry lock")
+                    .insert(operation, Arc::clone(&cancel))
+                {
+                    previous.store(true, Ordering::Release);
+                }
+                let watchers = Arc::clone(&watchers);
+                std::thread::spawn(move || {
+                    let mut previous = None;
+                    loop {
+                        if cancel.load(Ordering::Acquire) {
+                            break;
+                        }
+                        match adapter.worker_log(&worker) {
+                            Ok(snapshot) => {
+                                let terminal = snapshot.result().is_some();
+                                if previous.as_ref() != Some(&snapshot) {
+                                    emit(WorkspaceDispatchEvent::WorkerLogUpdated {
+                                        operation,
+                                        snapshot: Box::new(snapshot.clone()),
+                                    });
+                                    previous = Some(snapshot);
+                                }
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            Err(message) => {
+                                emit(WorkspaceDispatchEvent::WorkerLogFailed {
+                                    operation,
+                                    worker: worker.clone(),
+                                    message,
+                                });
+                                break;
+                            }
+                        }
+                        for _ in 0..20 {
+                            if cancel.load(Ordering::Acquire) {
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                    let mut active = watchers.active.lock().expect("watcher registry lock");
+                    if active
+                        .get(&operation)
+                        .is_some_and(|current| Arc::ptr_eq(current, &cancel))
+                    {
+                        active.remove(&operation);
+                    }
+                });
+            }
+            WorkspaceDispatchCommand::StopWorkerLog { operation } => {
+                watchers.stop(operation);
             }
         });
     }
@@ -823,6 +1115,84 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         ))
     }
 
+    fn orchestrate(
+        &self,
+        parent: &str,
+        emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
+    ) -> Result<(), String> {
+        let repository = self.repository()?;
+        let id = TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?;
+        let runtime = repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .and_then(|pool| pool.agent_runtime())
+            .unwrap_or(AgentRuntime::Claude);
+        let request = wsg_core::OrchestrationRequest::new(id.clone(), runtime);
+        let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)
+            .map_err(|error| error.to_string())?
+            .ticket()
+            .clone();
+        let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
+        let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(runtime, repository.root()));
+        let runner = repository.orchestration_runner();
+        let preparation = runner
+            .prepare(&request, &parent_ticket, &discovery)
+            .map_err(|error| error.to_string())?;
+        emit(WorkspaceDispatchOrchestrationEvent::Started {
+            parent: id.to_string(),
+            resumed: preparation.resumed(),
+        });
+        match preparation.into_start() {
+            wsg_core::OrchestrationStart::Direct(success) => {
+                let wsg_core::DirectDispatchExecution::Background { pid } = success.execution()
+                else {
+                    return Err("foreground Parent Dispatch is not supported by jjfx".to_owned());
+                };
+                emit(WorkspaceDispatchOrchestrationEvent::Direct {
+                    parent: id.to_string(),
+                    worker: success.worker().to_string(),
+                    pid: *pid,
+                });
+                return Ok(());
+            }
+            wsg_core::OrchestrationStart::Group => {}
+        }
+
+        let mut projection_error = None;
+        let options = wsg_core::OrchestrationOptions::new();
+        runner
+            .run(&request, &options, |event| {
+                if matches!(event, wsg_core::OrchestrationEvent::Started { .. }) {
+                    return;
+                }
+                let notice = orchestration_notice(&event);
+                let progress = match repository.state_store().dispatch_group(id.clone()).load() {
+                    Ok(wsg_core::Loaded::Present(versioned)) => {
+                        DispatchGroupProgress::from_state(versioned.value)
+                    }
+                    Ok(wsg_core::Loaded::Missing) => Err(format!(
+                        "Dispatch Group {id} disappeared during orchestration"
+                    )),
+                    Err(error) => Err(error.to_string()),
+                };
+                match progress {
+                    Ok(progress) => {
+                        emit(WorkspaceDispatchOrchestrationEvent::Progress { progress, notice })
+                    }
+                    Err(error) => projection_error = Some(error),
+                }
+                if let wsg_core::OrchestrationEvent::Terminal(summary) = event {
+                    emit(WorkspaceDispatchOrchestrationEvent::Terminal {
+                        parent: summary.parent().to_string(),
+                        counts: summary.counts(),
+                    });
+                }
+            })
+            .map_err(|error| error.to_string())?;
+        projection_error.map_or(Ok(()), Err)
+    }
+
     fn dispatch(
         &self,
         tickets: &[String],
@@ -851,6 +1221,33 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
         self.dispatch_with_strategy(tickets, worker, DispatchStrategy::Available)
     }
+
+    fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let snapshot = repository.worker_pool().snapshot();
+        let state = snapshot
+            .worker(worker)
+            .ok_or_else(|| format!("Worker {worker} was not found"))?;
+        let runtime = state.agent_runtime().unwrap_or(AgentRuntime::Claude);
+        let logs = wsg_core::WorkerActions::new(repository)
+            .logs(&worker_id)
+            .map_err(|error| error.to_string())?;
+        let log = logs.open();
+        let activity = log.current_activity().map_err(|error| error.to_string())?;
+        let result = match state.status() {
+            WorkerStatus::Done | WorkerStatus::Failed => {
+                log.final_result().map_err(|error| error.to_string())?
+            }
+            WorkerStatus::Idle | WorkerStatus::Busy => None,
+        };
+        Ok(WorkerLogSnapshot::new(
+            worker.to_owned(),
+            runtime,
+            activity,
+            result,
+        ))
+    }
 }
 
 /// Test adapter that records commands while returning a supplied snapshot.
@@ -859,6 +1256,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
 pub(crate) struct RecordingAdapter {
     commands: Arc<std::sync::Mutex<Vec<WorkspaceDispatchCommand>>>,
     snapshot: WorkerPoolSnapshot,
+    log_snapshot: WorkerLogSnapshot,
 }
 
 #[cfg(test)]
@@ -867,7 +1265,13 @@ impl RecordingAdapter {
         Self {
             commands: Arc::new(std::sync::Mutex::new(Vec::new())),
             snapshot,
+            log_snapshot: WorkerLogSnapshot::new("worker-01", AgentRuntime::Claude, None, None),
         }
+    }
+
+    pub(crate) fn with_log_snapshot(mut self, snapshot: WorkerLogSnapshot) -> Self {
+        self.log_snapshot = snapshot;
+        self
     }
 
     pub(crate) fn commands(&self) -> Vec<WorkspaceDispatchCommand> {
@@ -988,6 +1392,50 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             }],
             diagnostics: Vec::new(),
         })
+    }
+
+    fn orchestrate(
+        &self,
+        parent: &str,
+        emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
+    ) -> Result<(), String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Orchestrate {
+                operation: 0,
+                parent: parent.to_owned(),
+            },
+        );
+        let mut state = wsg_core::DispatchGroupState::new(
+            wsg_core::TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?,
+            wsg_core::WireTimestamp::new("2026-08-10T10:00:00Z"),
+            "Jarvvski/jjfx",
+            wsg_core::DispatchGroupOptions::new(""),
+        );
+        state.sub_issues = std::collections::BTreeMap::new();
+        let progress = DispatchGroupProgress::from_state(state)?;
+        emit(WorkspaceDispatchOrchestrationEvent::Started {
+            parent: parent.to_owned(),
+            resumed: true,
+        });
+        emit(WorkspaceDispatchOrchestrationEvent::Progress {
+            progress,
+            notice: Some("orchestration test update".to_owned()),
+        });
+        emit(WorkspaceDispatchOrchestrationEvent::Terminal {
+            parent: parent.to_owned(),
+            counts: DispatchGroupStatusCounts::default(),
+        });
+        Ok(())
+    }
+
+    fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::WatchWorkerLog {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(self.log_snapshot.clone())
     }
 }
 
@@ -1111,6 +1559,86 @@ mod tests {
             WorkspaceDispatchCommand::DiscoverReady { operation: 0, label }
                 if label == "ready-for-agent"
         )));
+    }
+
+    #[test]
+    fn controller_streams_ordered_orchestration_updates_without_waiting_for_app() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::Orchestrate {
+            operation: 22,
+            parent: "ENG-100".to_owned(),
+        });
+
+        assert!(matches!(
+            events_rx.recv().expect("started event"),
+            WorkspaceDispatchEvent::OrchestrationStarted {
+                operation: 22,
+                parent,
+                resumed: true,
+            } if parent == "ENG-100"
+        ));
+        assert!(matches!(
+            events_rx.recv().expect("progress event"),
+            WorkspaceDispatchEvent::OrchestrationProgress {
+                operation: 22,
+                progress,
+                notice: Some(notice),
+            } if progress.parent() == "ENG-100" && notice == "orchestration test update"
+        ));
+        assert!(matches!(
+            events_rx.recv().expect("terminal event"),
+            WorkspaceDispatchEvent::OrchestrationTerminal {
+                operation: 22,
+                parent,
+                counts,
+            } if parent == "ENG-100" && counts == DispatchGroupStatusCounts::default()
+        ));
+    }
+
+    #[test]
+    fn worker_log_watch_deduplicates_activity_and_stops_on_request() {
+        let activity = RunActivity::new(wsg_core::RunActivityKind::Message {
+            text: "hello from Claude".to_owned(),
+        });
+        let adapter = RecordingAdapter::new(empty_snapshot()).with_log_snapshot(
+            WorkerLogSnapshot::new("worker-01", AgentRuntime::Claude, Some(activity), None),
+        );
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::WatchWorkerLog {
+            operation: 31,
+            worker: "worker-01".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("first log update"),
+            WorkspaceDispatchEvent::WorkerLogUpdated { operation: 31, snapshot }
+                if snapshot.worker() == "worker-01"
+                    && snapshot.activity().is_some_and(|activity| matches!(
+                        activity.kind(),
+                        wsg_core::RunActivityKind::Message { text } if text == "hello from Claude"
+                    ))
+        ));
+        assert!(
+            events_rx
+                .recv_timeout(std::time::Duration::from_millis(250))
+                .is_err()
+        );
+        controller.submit(WorkspaceDispatchCommand::StopWorkerLog { operation: 31 });
+        assert!(adapter.commands().iter().any(|command| {
+            matches!(
+                command,
+                WorkspaceDispatchCommand::WatchWorkerLog { worker, .. }
+                    if worker == "worker-01"
+            )
+        }));
     }
 
     #[test]
