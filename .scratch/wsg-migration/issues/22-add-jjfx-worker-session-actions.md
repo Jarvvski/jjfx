@@ -1,6 +1,6 @@
 # Add Worker Session actions to jjfx
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -26,12 +26,12 @@ actions through the Workspace Dispatch controller.
 
 ## Acceptance Criteria
 
-- [ ] Send and Review work from the selected Worker.
-- [ ] Session resume and fresh fallback reasons are visible.
-- [ ] Reset retains and reports its asynchronous restoration outcome.
-- [ ] Destructive actions use safe confirmation.
-- [ ] Alias and dismiss semantics are explicit and tested.
-- [ ] `mise run check` is green.
+- [x] Send and Review work from the selected Worker.
+- [x] Session resume and fresh fallback reasons are visible.
+- [x] Reset retains and reports its asynchronous restoration outcome.
+- [x] Destructive actions use safe confirmation.
+- [x] Alias and dismiss semantics are explicit and tested.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 

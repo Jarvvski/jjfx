@@ -6,8 +6,8 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntime, AgentSessionResolution, Expected, FollowUpExecution, Loaded, PoolCapacity,
-    Repository, RunMode, RunReset, StateChange, WireAgent, WireStatus, WireTimestamp,
+    AgentRuntime, AgentSessionResolution, DismissOutcome, Expected, FollowUpExecution, Loaded,
+    PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent, WireStatus, WireTimestamp,
     WorkerActions, WorkerId, WorkspaceRestoration,
 };
 
@@ -35,6 +35,68 @@ fn send_rejects_a_busy_worker_through_the_actions_facade() {
 
     assert!(result.is_err());
     drop(temporary_directory);
+}
+
+#[test]
+fn dismiss_removes_an_idle_worker_and_reduces_pool_capacity() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+
+    let outcome = WorkerActions::new(repository.clone())
+        .dismiss(&worker)
+        .expect("idle Worker should be removable");
+
+    assert_eq!(outcome, DismissOutcome::Removed { capacity: 0 });
+    let snapshot = repository.worker_pool().snapshot();
+    assert!(snapshot.worker(worker.as_str()).is_none());
+    assert_eq!(snapshot.pool().expect("Pool state").size(), 0);
+}
+
+#[test]
+fn dismiss_clears_terminal_worker_without_restoring_or_removing_workspace() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let workspace = worker_workspace_path(&repository, &worker);
+    let log = repository.root().join("dismiss-terminal.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let outcome = WorkerActions::new(repository.clone())
+        .dismiss(&worker)
+        .expect("terminal Worker should be clearable");
+
+    assert_eq!(outcome, DismissOutcome::Reset);
+    assert!(workspace.is_dir());
+    let snapshot = repository.worker_pool().snapshot();
+    let worker_state = snapshot
+        .worker(worker.as_str())
+        .expect("Worker remains in Pool");
+    assert_eq!(worker_state.status(), wsg_core::WorkerStatus::Idle);
+}
+
+#[test]
+fn dismiss_rejects_a_busy_worker_without_changing_its_lifecycle() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    repository
+        .worker_pool()
+        .reserve_named(worker.clone(), "ENG-302")
+        .expect("Run reservation");
+
+    let error = WorkerActions::new(repository.clone())
+        .dismiss(&worker)
+        .expect_err("busy Worker must require Reset instead");
+
+    assert!(error.to_string().contains("not idle"));
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .expect("Worker remains")
+            .status(),
+        wsg_core::WorkerStatus::Busy
+    );
 }
 
 #[test]

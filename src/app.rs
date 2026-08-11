@@ -4216,6 +4216,14 @@ mod tests {
         assert!(
             matches!(app.mode, Mode::Pool(PoolMode::AliasInput { ref worker, .. }) if worker == "worker-01")
         );
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert!(
+            !adapter
+                .commands()
+                .iter()
+                .any(|command| matches!(command, WorkspaceDispatchCommand::SetAlias { .. }))
+        );
         app.handle(press(KeyCode::Char('e')));
         for _ in 0..5 {
             app.handle(press(KeyCode::Backspace));
@@ -4282,6 +4290,16 @@ mod tests {
             command,
             WorkspaceDispatchCommand::OpenPullRequest { worker, .. } if worker == "worker-01"
         )));
+        let operation = app.active_operation.expect("Pull Request operation");
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Failed {
+            operation,
+            message: "browser unavailable".to_owned(),
+        }));
+        assert_eq!(app.active_operation, None);
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Worker Pool: browser unavailable")
+        );
     }
 
     #[test]
