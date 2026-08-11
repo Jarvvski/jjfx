@@ -89,6 +89,8 @@ enum Mode {
     ConfirmPoolShrink(usize, Option<String>),
     /// Confirming complete Pool destruction.
     ConfirmPoolDestroy,
+    /// Confirming Reset for one Worker.
+    ConfirmPoolReset(String),
     /// The `?` help overlay is open (a pure UI mode - no state is mutated).
     Help,
     /// The full-screen diff-detail view for one workspace (ADR 0008).
@@ -212,6 +214,8 @@ pub struct App {
     /// Operation generation used to reject stale mutation results.
     next_operation: OperationId,
     active_operation: Option<OperationId>,
+    /// A Reset keeps its operation active until Workspace restoration completes.
+    worker_reset_operation: Option<OperationId>,
     /// Independent operation identity for durable Parent orchestration.
     orchestration_operation: Option<OperationId>,
     /// Independent operation identity for the selected Worker log watcher.
@@ -298,6 +302,7 @@ impl App {
             dispatch,
             next_operation: 0,
             active_operation: None,
+            worker_reset_operation: None,
             orchestration_operation: None,
             worker_log_operation: None,
             worker_log: None,
@@ -369,7 +374,7 @@ impl App {
             return;
         }
         self.worker_pool = Some(snapshot);
-        if operation != 0 {
+        if operation != 0 && self.worker_reset_operation != Some(operation) {
             self.active_operation = None;
         }
     }
@@ -518,6 +523,38 @@ impl App {
                     ));
                 }
             }
+            WorkspaceDispatchEvent::WorkerResetCompleted { operation, outcome } => {
+                if self.active_operation == Some(operation) {
+                    self.set_status(format!(
+                        "Reset {} ({:?}) to idle",
+                        outcome.worker(),
+                        outcome.run()
+                    ));
+                    self.refresh_worker_pool();
+                }
+            }
+            WorkspaceDispatchEvent::WorkspaceRestorationCompleted {
+                operation,
+                worker,
+                result,
+            } => {
+                if self.worker_reset_operation == Some(operation) {
+                    self.worker_reset_operation = None;
+                    self.active_operation = None;
+                    self.set_status(match result {
+                        crate::workspace_dispatch::WorkspaceRestorationResult::Skipped => {
+                            format!("Reset {worker}: Workspace restoration skipped")
+                        }
+                        crate::workspace_dispatch::WorkspaceRestorationResult::Restored => {
+                            format!("Reset {worker}: Workspace restored")
+                        }
+                        crate::workspace_dispatch::WorkspaceRestorationResult::Failed(error) => {
+                            format!("Reset {worker}: Workspace restoration failed: {error}")
+                        }
+                    });
+                    self.refresh_worker_pool();
+                }
+            }
             WorkspaceDispatchEvent::WorkerLogUpdated {
                 operation,
                 snapshot,
@@ -544,6 +581,7 @@ impl App {
             WorkspaceDispatchEvent::Failed { operation, message } => {
                 if self.active_operation == Some(operation) {
                     self.active_operation = None;
+                    self.worker_reset_operation = None;
                     self.set_status(format!("Worker Pool: {message}"));
                 } else if self.orchestration_operation == Some(operation) {
                     self.orchestration_operation = None;
@@ -736,6 +774,7 @@ impl App {
             Mode::Pool(_) => self.on_key_pool(key),
             Mode::ConfirmPoolShrink(_, _) => self.on_key_confirm_pool_shrink(key),
             Mode::ConfirmPoolDestroy => self.on_key_confirm_pool_destroy(key),
+            Mode::ConfirmPoolReset(_) => self.on_key_confirm_pool_reset(key),
             Mode::Help => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
             Mode::Graph(_) => self.on_key_graph(key),
@@ -983,6 +1022,15 @@ impl App {
                         buffer: capacity.to_string(),
                         selected,
                     });
+                }
+                KeyCode::Char('K') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before Reset".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    self.mode = Mode::ConfirmPoolReset(worker);
                 }
                 KeyCode::Char('D') => self.mode = Mode::ConfirmPoolDestroy,
                 _ => self.mode = Mode::Pool(PoolMode::View { selected }),
@@ -1247,6 +1295,31 @@ impl App {
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Pool(PoolMode::View { selected });
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_confirm_pool_reset(&mut self, key: KeyEvent) {
+        let Mode::ConfirmPoolReset(worker) = &self.mode else {
+            return;
+        };
+        let worker = worker.clone();
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: Some(worker.clone()),
+                });
+                let operation = self.begin_dispatch();
+                self.worker_reset_operation = Some(operation);
+                self.pin_status(format!("resetting Worker {worker}..."));
+                self.dispatch
+                    .submit(WorkspaceDispatchCommand::Reset { operation, worker });
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: Some(worker),
+                });
             }
             _ => {}
         }
@@ -2430,6 +2503,10 @@ impl App {
             )),
             Mode::ConfirmPoolDestroy => Paragraph::new(Span::styled(
                 " destroy Worker Pool and all Worker Workspaces? (y/n) ",
+                Style::default().fg(Color::Red),
+            )),
+            Mode::ConfirmPoolReset(worker) => Paragraph::new(Span::styled(
+                format!(" reset Worker {worker} and restore its Workspace? (y/n) "),
                 Style::default().fg(Color::Red),
             )),
             Mode::Normal => match (&self.pending_workspace, &self.status) {
@@ -3935,6 +4012,58 @@ mod tests {
         assert!(
             text.contains("fresh session (log has no session id yet)"),
             "{text}"
+        );
+    }
+
+    #[test]
+    fn pool_reset_requires_confirmation_and_keeps_restoration_observable() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+        app.handle(press(KeyCode::Char('K')));
+        assert!(matches!(
+            app.mode,
+            Mode::ConfirmPoolReset(ref worker) if worker == "worker-01"
+        ));
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+        app.active_operation = Some(8);
+        app.worker_reset_operation = Some(8);
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerResetCompleted {
+                operation: 8,
+                outcome: crate::workspace_dispatch::WorkerResetOutcome::new(
+                    "worker-01",
+                    wsg_core::RunReset::Abandoned {
+                        terminated_pid: Some(77),
+                    },
+                ),
+            },
+        ));
+        assert_eq!(app.active_operation, Some(8));
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("Abandoned"))
+        );
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkspaceRestorationCompleted {
+                operation: 8,
+                worker: "worker-01".to_owned(),
+                result: crate::workspace_dispatch::WorkspaceRestorationResult::Restored,
+            },
+        ));
+        assert_eq!(app.active_operation, None);
+        assert_eq!(app.worker_reset_operation, None);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("Workspace restored"))
         );
     }
 

@@ -137,6 +137,62 @@ impl WorkerSessionOutcome {
     }
 }
 
+/// Immutable presentation of a Worker Run Reset.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerResetOutcome {
+    worker: String,
+    run: wsg_core::RunReset,
+}
+
+impl WorkerResetOutcome {
+    pub(crate) fn new(worker: impl Into<String>, run: wsg_core::RunReset) -> Self {
+        Self {
+            worker: worker.into(),
+            run,
+        }
+    }
+
+    /// Returns the Worker whose Run was Reset.
+    pub fn worker(&self) -> &str {
+        &self.worker
+    }
+
+    /// Returns how Run cleanup changed the Worker lifecycle.
+    pub const fn run(&self) -> wsg_core::RunReset {
+        self.run
+    }
+}
+
+/// The result of asynchronous Worker Workspace restoration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceRestorationResult {
+    /// No Workspace directory existed, so no restoration command was needed.
+    Skipped,
+    /// The Workspace was restored and returned to the trunk revision.
+    Restored,
+    /// Restoration failed after Reset released Worker capacity.
+    Failed(String),
+}
+
+/// Reset result plus the independent Workspace restoration handle.
+pub struct ResetAdapterResult {
+    outcome: WorkerResetOutcome,
+    restoration: wsg_core::WorkspaceRestoration,
+}
+
+impl ResetAdapterResult {
+    fn new(outcome: WorkerResetOutcome, restoration: wsg_core::WorkspaceRestoration) -> Self {
+        Self {
+            outcome,
+            restoration,
+        }
+    }
+
+    fn into_parts(self) -> (WorkerResetOutcome, wsg_core::WorkspaceRestoration) {
+        (self.outcome, self.restoration)
+    }
+}
+
 /// Commands accepted by the Workspace Dispatch controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceDispatchCommand {
@@ -186,6 +242,11 @@ pub enum WorkspaceDispatchCommand {
     },
     /// Start a Pull Request review on one selected Worker.
     Review {
+        operation: OperationId,
+        worker: String,
+    },
+    /// Reset one selected Worker after the caller has obtained confirmation.
+    Reset {
         operation: OperationId,
         worker: String,
     },
@@ -706,6 +767,17 @@ pub enum WorkspaceDispatchEvent {
         operation: OperationId,
         outcome: WorkerSessionOutcome,
     },
+    /// A Worker Run was Reset; Workspace restoration may still be pending.
+    WorkerResetCompleted {
+        operation: OperationId,
+        outcome: WorkerResetOutcome,
+    },
+    /// A Worker Workspace restoration finished separately from Reset.
+    WorkspaceRestorationCompleted {
+        operation: OperationId,
+        worker: String,
+        result: WorkspaceRestorationResult,
+    },
     /// A changed provider-neutral Worker log snapshot.
     WorkerLogUpdated {
         operation: OperationId,
@@ -763,6 +835,8 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String>;
     /// Launch a Pull Request review as a background Follow-up Run.
     fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String>;
+    /// Reset a Worker and return its independent Workspace restoration handle.
+    fn reset(&self, worker: &str) -> Result<ResetAdapterResult, String>;
     /// Reads one latest Worker log snapshot without choosing a rendering.
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
@@ -1002,6 +1076,41 @@ impl WorkspaceDispatchController {
                     Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
                 }
             }
+            WorkspaceDispatchCommand::Reset { operation, worker } => match adapter.reset(&worker) {
+                Ok(result) => {
+                    let (outcome, restoration) = result.into_parts();
+                    emit(WorkspaceDispatchEvent::WorkerResetCompleted { operation, outcome });
+                    match adapter.refresh() {
+                        Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
+                            operation,
+                            snapshot,
+                        }),
+                        Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+                    }
+                    let restoration_emit = Arc::clone(&emit);
+                    std::thread::spawn(move || {
+                        let result = match restoration {
+                            wsg_core::WorkspaceRestoration::SkippedMissingWorkspace => {
+                                WorkspaceRestorationResult::Skipped
+                            }
+                            wsg_core::WorkspaceRestoration::Pending(handle) => {
+                                match handle.wait() {
+                                    Ok(()) => WorkspaceRestorationResult::Restored,
+                                    Err(error) => {
+                                        WorkspaceRestorationResult::Failed(error.to_string())
+                                    }
+                                }
+                            }
+                        };
+                        restoration_emit(WorkspaceDispatchEvent::WorkspaceRestorationCompleted {
+                            operation,
+                            worker,
+                            result,
+                        });
+                    });
+                }
+                Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+            },
             WorkspaceDispatchCommand::WatchWorkerLog { operation, worker } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 if let Some(previous) = watchers
@@ -1380,6 +1489,18 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         self.worker_action(worker, WorkerActionKind::Review, None)
     }
 
+    fn reset(&self, worker: &str) -> Result<ResetAdapterResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let outcome = wsg_core::WorkerActions::new(repository)
+            .reset(&worker_id)
+            .map_err(|error| error.to_string())?;
+        Ok(ResetAdapterResult::new(
+            WorkerResetOutcome::new(worker, outcome.run()),
+            outcome.into_restoration(),
+        ))
+    }
+
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
         let repository = self.repository()?;
         let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
@@ -1623,6 +1744,19 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
         ))
     }
 
+    fn reset(&self, worker: &str) -> Result<ResetAdapterResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Reset {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(ResetAdapterResult::new(
+            WorkerResetOutcome::new(worker, wsg_core::RunReset::AlreadyIdle),
+            wsg_core::WorkspaceRestoration::SkippedMissingWorkspace,
+        ))
+    }
+
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
         self.commands.lock().expect("recording adapter lock").push(
             WorkspaceDispatchCommand::WatchWorkerLog {
@@ -1845,6 +1979,43 @@ mod tests {
         assert!(commands.iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Review { worker, .. } if worker == "worker-01"
+        )));
+    }
+
+    #[test]
+    fn controller_reports_reset_before_independent_restoration_completion() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::Reset {
+            operation: 42,
+            worker: "worker-01".to_owned(),
+        });
+
+        assert!(matches!(
+            events_rx.recv().expect("reset event"),
+            WorkspaceDispatchEvent::WorkerResetCompleted { operation: 42, outcome }
+                if outcome.worker() == "worker-01"
+                    && outcome.run() == wsg_core::RunReset::AlreadyIdle
+        ));
+        assert!(matches!(
+            events_rx.recv().expect("refresh event"),
+            WorkspaceDispatchEvent::Snapshot { operation: 42, .. }
+        ));
+        assert!(matches!(
+            events_rx.recv().expect("restoration event"),
+            WorkspaceDispatchEvent::WorkspaceRestorationCompleted {
+                operation: 42,
+                worker,
+                result: WorkspaceRestorationResult::Skipped,
+            } if worker == "worker-01"
+        ));
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Reset { worker, .. } if worker == "worker-01"
         )));
     }
 

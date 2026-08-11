@@ -6,6 +6,9 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-11 - Added confirmed Worker Reset with independently reported
+  Workspace restoration outcomes in the jjfx Pool view.
+
 - 2026-08-11 - Added non-blocking Worker Send and Review actions to the jjfx
   Pool view. Follow-up outcomes show resumed Agent Sessions or the reason a
   fresh Session was required.
