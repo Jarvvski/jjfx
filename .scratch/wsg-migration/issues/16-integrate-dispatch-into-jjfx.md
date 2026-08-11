@@ -1,6 +1,6 @@
 # Integrate Worker Pool and Dispatch into jjfx
 
-Status: tracking
+Status: resolved
 
 ## Parent
 
@@ -44,12 +44,12 @@ Use existing App tests and fake shared-library adapters. Cover state refresh whi
 
 ## Acceptance Criteria
 
-- [ ] jjfx manages existing and Rust-created Worker Pools.
-- [ ] Direct and orchestrated Dispatch run without blocking input rendering.
-- [ ] Logs, Send, Review, Reset, and aliases work from the TUI.
-- [ ] Existing Attention, Agent, Work, Forge, and Workspace flows remain intact.
-- [ ] `wsg` with no arguments enters the same TUI when appropriate.
-- [ ] `mise run check` is green.
+- [x] jjfx manages existing and Rust-created Worker Pools.
+- [x] Direct and orchestrated Dispatch run without blocking input rendering.
+- [x] Logs, Send, Review, Reset, and aliases work from the TUI.
+- [x] Existing Attention, Agent, Work, Forge, and Workspace flows remain intact.
+- [x] `wsg` with no arguments enters the same TUI when appropriate.
+- [x] `mise run check` is green.
 
 ## Child tickets
 
@@ -67,8 +67,8 @@ with red-green TDD, focused review, and the repository verification gate:
 5. `issues/23-share-and-harden-jjfx-tui.md` - shared jjfx/wsg startup, help,
    narrow layouts, PTY coverage, and end-to-end hardening.
 
-Issue 19 is the current implementation slice. Each later ticket is blocked by
-its predecessor and must preserve the command/event seam introduced there.
+All five child tickets are now resolved. They preserve the command/event seam
+introduced by issue 19 and complete the integrated Worker Pool and Dispatch TUI.
 
 ## Comments
 
@@ -80,6 +80,24 @@ and the version 0.30.0 jjfx integration.
 bulk, and Ready Ticket Dispatch with previews, typed capacity decisions,
 ordered outcomes, and responsive background execution. Issue 21 is now the
 successive implementation frontier for Dispatch Group progress and logs.
+
+2026-08-12 - Issue 23 is resolved. jjfx 0.34.0 and wsg 0.10.0 now share one
+interactive TUI launcher, contextual help, narrow-layout priorities, PTY
+terminal restoration coverage, and active Worker-mode message/render tests.
+The integrated Worker Pool and Dispatch TUI is complete and issue 17 is
+unblocked.
+
+## Answer
+
+All five child tickets are resolved. The integrated jjfx TUI now manages the
+compatible Worker Pool and Dispatch lifecycle through the shared command/event
+seam, while preserving the existing Attention, Agent, Work, Forge, and
+Workspace lifecycles. The final child also made the interactive TUI reusable by
+`wsg`, hardened terminal restoration, and added PTY and active-mode coverage.
+
+`mise run check` passes with jjfx 0.34.0 and wsg 0.10.0. This completes the
+integrated Worker Pool and Dispatch TUI and unblocks parity and release work in
+issue 17.
 
 ## Out of Scope
 

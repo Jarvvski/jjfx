@@ -1,6 +1,6 @@
 # Share and harden the jjfx TUI across jjfx and wsg
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -27,18 +27,35 @@ source of truth and narrow layouts, and add PTY and end-to-end message tests.
 
 ## Acceptance Criteria
 
-- [ ] `jjfx` and appropriate no-argument `wsg` startup enter the same TUI.
-- [ ] Version, hooks, and non-TTY command behavior remain intact.
-- [ ] Terminal restoration works on quit and panic paths.
-- [ ] Narrow layouts preserve primary lifecycle and Worker identity information.
-- [ ] PTY and end-to-end tests pass.
-- [ ] `mise run check` is green.
+- [x] `jjfx` and appropriate no-argument `wsg` startup enter the same TUI.
+- [x] Version, hooks, and non-TTY command behavior remain intact.
+- [x] Terminal restoration works on quit and panic paths.
+- [x] Narrow layouts preserve primary lifecycle and Worker identity information.
+- [x] PTY and end-to-end tests pass.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
 - Final release parity and installation cutover
 - Go repository deprecation
 - Persisted schema redesign
+
+## Answer
+
+Implemented the final jjfx TUI integration slice in four focused commits.
+The root `jjfx` library now owns one deep interactive launcher reused by the
+`jjfx` and interactive no-argument `wsg` adapters. Explicit version, hooks,
+headless, completion, and non-TTY command behavior remain in their existing
+binary-specific paths.
+
+Normal and Worker Pool help use contextual binding tables, Pool help preserves
+its prior interaction state, and narrow Workspace and Pool rows prioritize
+Worker identity, lifecycle status, and active Ticket information. The terminal
+session now restores transactionally on setup failure, normal quit, and panic;
+PTY coverage exercises both binary names and all restoration paths. App message
+and rendering tests cover Pool refreshes while Ticket input is active.
+
+`jjfx` is version 0.34.0, `wsg` is version 0.10.0, and `mise run check` passes.
 
 ## Blocked by
 

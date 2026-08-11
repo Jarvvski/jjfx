@@ -1,7 +1,0 @@
-## Review
-- Correct: `src/lib.rs:run` preserves `--version`, hooks, `--list`, and repository discovery before launching. `crates/wsg/src/cli.rs:1148-1155` routes interactive no-argument `wsg` to `jjfx::launch`, while non-TTY invocation still prints help.
-- Correct: `src/tui.rs:Session` restores raw mode and alternate screen on normal return, error, and panic-hook paths.
-- Finding (medium): Normal-quit PTY coverage is incomplete. `crates/wsg/tests/tui.rs:9-16` and `:67-90` assert alternate-screen entry and successful exit, but never assert the `LeaveAlternateScreen` sequence. The panic test does assert it, but the acceptance requirement is: “Terminal restoration works on quit and panic paths.”
-- Finding (medium): The PTY tests do not establish that both binaries enter the same TUI. Both `interactive_*` tests only check for `\x1b[?1049h`; that proves alternate-screen entry, not shared rendering, key handling, or quit behavior. The requirement is: “`jjfx` and appropriate no-argument `wsg` startup enter the same TUI.”
-- Note (low): `src/app.rs:2385-2415` computes help-popup dimensions from the longest labels without constraining them to the terminal area. The normal help text includes `"Tidy (abandon junk empties)"`, so a narrow terminal can produce a popup wider than the frame. The narrow-layout requirement is: “Narrow layouts preserve primary lifecycle and Worker identity information.” There is no narrow-help test.
-- Scope creep: None observed in the requested files.
