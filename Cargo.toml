@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "jjfx"
-version = "0.33.0"
+version = "0.34.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 

@@ -1151,11 +1151,7 @@ fn default_command() -> Result<()> {
         return Ok(());
     }
     let repository = Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))?;
-    if repository.worker_pool().snapshot().pool().is_none() {
-        print!("{HELP}");
-        return Ok(());
-    }
-    pool_list_command(&repository)
+    jjfx::launch(repository.root().to_path_buf())
 }
 
 #[cfg(test)]
