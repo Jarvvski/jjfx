@@ -97,8 +97,8 @@ enum Mode {
     ConfirmPoolReset(String),
     /// Confirming Dismiss for one Worker.
     ConfirmPoolDismiss(String),
-    /// The `?` help overlay is open (a pure UI mode - no state is mutated).
-    Help,
+    /// The `?` help overlay is open over the prior interaction mode.
+    Help(Box<Mode>),
     /// The full-screen diff-detail view for one workspace (ADR 0008).
     Detail(Detail),
     /// The full-screen "world" commit graph: the repo DAG laid out like
@@ -107,10 +107,9 @@ enum Mode {
     Graph(Viewport),
 }
 
-/// Every keybinding, shown in the `?` help overlay. Kept adjacent to
-/// `on_key_normal` (the real dispatch) so the list cannot silently drift from
-/// the keys the app actually handles.
-const BINDINGS: &[(&str, &str)] = &[
+/// Normal-mode keybindings shown by the `?` help overlay. Keep this adjacent
+/// to the corresponding dispatch so the normal interaction contract is local.
+const NORMAL_BINDINGS: &[(&str, &str)] = &[
     ("Move down", "j / ↓"),
     ("Move up", "k / ↑"),
     ("Open workspace", "enter"),
@@ -130,12 +129,31 @@ const BINDINGS: &[(&str, &str)] = &[
     ("Tidy this workspace", "t"),
     ("Tidy (abandon junk empties)", "T"),
     ("Worker Pool management", "p"),
-    ("Selected / bulk Ticket Dispatch", "d"),
-    ("Parent Dispatch Group orchestration", "o"),
-    ("Ready Ticket discovery", "a"),
     ("Fold / expand idle group", "c"),
     ("Toggle this help", "?"),
     ("Quit", "q / esc"),
+];
+
+/// Worker Pool keybindings shown by the `?` help overlay. Pool actions are
+/// deliberately separate from normal mode because several keys have different
+/// meanings there (notably `d` and `o`).
+const POOL_BINDINGS: &[(&str, &str)] = &[
+    ("Move between Workers", "j / k / ↑ / ↓"),
+    ("Ticket Dispatch", "d"),
+    ("Send to Worker", "s"),
+    ("Review Worker", "v"),
+    ("Rebase Worker", "g"),
+    ("Open Pull Request", "P"),
+    ("Edit Worker alias", "e"),
+    ("Dismiss Worker", "x"),
+    ("Worker log", "l"),
+    ("Ready Ticket discovery", "a"),
+    ("Dispatch Group orchestration", "o"),
+    ("Resize Pool", "r"),
+    ("Reset Worker", "K"),
+    ("Destroy Pool", "D"),
+    ("Toggle this help", "?"),
+    ("Back", "q / esc"),
 ];
 
 /// The identity of the single workspace whose on-create command is running.
@@ -659,7 +677,7 @@ impl App {
     /// other tick instead of repainting an idle screen ~7 times a second.
     pub fn animate(&mut self) -> bool {
         self.tick = self.tick.wrapping_add(1);
-        matches!(self.mode, Mode::Normal | Mode::Help)
+        matches!(self.mode, Mode::Normal | Mode::Help(_))
             && (self
                 .store
                 .workspaces()
@@ -783,6 +801,11 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
+        if key.code == KeyCode::Char('?') && !matches!(self.mode, Mode::Help(_)) {
+            let previous = std::mem::replace(&mut self.mode, Mode::Normal);
+            self.mode = Mode::Help(Box::new(previous));
+            return;
+        }
         match &self.mode {
             Mode::Normal => self.on_key_normal(key),
             Mode::NewWorkspace(_) => self.on_key_new_workspace(key),
@@ -793,7 +816,7 @@ impl App {
             Mode::ConfirmPoolDestroy => self.on_key_confirm_pool_destroy(key),
             Mode::ConfirmPoolReset(_) => self.on_key_confirm_pool_reset(key),
             Mode::ConfirmPoolDismiss(_) => self.on_key_confirm_pool_dismiss(key),
-            Mode::Help => self.on_key_help(key),
+            Mode::Help(_) => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
             Mode::Graph(_) => self.on_key_graph(key),
         }
@@ -840,7 +863,6 @@ impl App {
                 self.list.toggle_idle();
                 self.ensure_selection();
             }
-            KeyCode::Char('?') => self.mode = Mode::Help,
             _ => {}
         }
     }
@@ -849,7 +871,10 @@ impl App {
     /// is swallowed so no navigation leaks through.
     fn on_key_help(&mut self, key: KeyEvent) {
         if matches!(key.code, KeyCode::Char('?') | KeyCode::Esc) {
-            self.mode = Mode::Normal;
+            let Mode::Help(previous) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+                return;
+            };
+            self.mode = *previous;
         }
     }
 
@@ -1984,16 +2009,23 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         self.ensure_selection();
 
-        if matches!(self.mode, Mode::Detail(_)) {
+        let base_mode = match &self.mode {
+            Mode::Help(previous) => previous.as_ref(),
+            mode => mode,
+        };
+        if matches!(base_mode, Mode::Detail(_)) {
             self.render_detail(frame);
             return;
         }
-        if matches!(self.mode, Mode::Graph(_)) {
+        if matches!(base_mode, Mode::Graph(_)) {
             self.render_graph_world(frame);
             return;
         }
-        if matches!(self.mode, Mode::Pool(_)) {
+        if matches!(base_mode, Mode::Pool(_)) {
             self.render_pool(frame);
+            if matches!(self.mode, Mode::Help(_)) {
+                self.render_help(frame, POOL_BINDINGS);
+            }
             return;
         }
 
@@ -2064,7 +2096,13 @@ impl App {
                     if is_selected {
                         cursor = Some(i);
                     }
-                    self.workspace_item(workspace, *attention, is_selected, *worker)
+                    self.workspace_item(
+                        workspace,
+                        *attention,
+                        is_selected,
+                        *worker,
+                        list_area.width,
+                    )
                 }
             })
             .collect();
@@ -2092,8 +2130,36 @@ impl App {
 
         frame.render_widget(self.footer(), footer);
 
-        if matches!(self.mode, Mode::Help) {
-            self.render_help(frame);
+        if matches!(self.mode, Mode::Help(_)) {
+            self.render_help(frame, NORMAL_BINDINGS);
+        }
+    }
+
+    fn pool_mode(&self) -> Option<&PoolMode> {
+        match &self.mode {
+            Mode::Pool(mode) => Some(mode),
+            Mode::Help(previous) => match previous.as_ref() {
+                Mode::Pool(mode) => Some(mode),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn pool_selected(&self) -> Option<&str> {
+        match self.pool_mode()? {
+            PoolMode::View { selected }
+            | PoolMode::Capacity { selected, .. }
+            | PoolMode::TicketInput { selected, .. }
+            | PoolMode::DispatchPreview { selected, .. }
+            | PoolMode::ReadyPreview { selected }
+            | PoolMode::ConfirmDispatchCapacity {
+                worker: selected, ..
+            } => selected.as_deref(),
+            PoolMode::SendInput { worker, .. }
+            | PoolMode::AliasInput { worker, .. }
+            | PoolMode::LogDetail { worker } => Some(worker),
+            PoolMode::ParentInput { .. } => None,
         }
     }
 
@@ -2123,34 +2189,30 @@ impl App {
             if snapshot.workers().is_empty() {
                 lines.push(dim_line(" (no Workers)"));
             }
-            let selected = match &self.mode {
-                Mode::Pool(PoolMode::View { selected })
-                | Mode::Pool(PoolMode::Capacity { selected, .. })
-                | Mode::Pool(PoolMode::TicketInput { selected, .. })
-                | Mode::Pool(PoolMode::DispatchPreview { selected, .. })
-                | Mode::Pool(PoolMode::ReadyPreview { selected })
-                | Mode::Pool(PoolMode::ConfirmDispatchCapacity {
-                    worker: selected, ..
-                }) => selected.as_deref(),
-                Mode::Pool(PoolMode::SendInput { worker, .. })
-                | Mode::Pool(PoolMode::AliasInput { worker, .. }) => Some(worker.as_str()),
-                Mode::Pool(PoolMode::ParentInput { .. }) => None,
-                Mode::Pool(PoolMode::LogDetail { worker }) => Some(worker.as_str()),
-                _ => None,
-            };
+            let selected = self.pool_selected();
             for worker in snapshot.workers() {
                 let marker = if selected == Some(worker.worker_id().as_str()) {
                     "▸"
                 } else {
                     "·"
                 };
-                lines.push(Line::from(format!(
-                    " {marker} {}  {:<7} {}  {}",
-                    worker.worker_id(),
-                    worker.status().as_str(),
-                    worker.alias(),
-                    worker.workspace()
-                )));
+                let line = if body.width < 55 {
+                    format!(
+                        " {marker} {}  {}  ticket:{}",
+                        worker.worker_id(),
+                        worker.status().as_str(),
+                        worker.ticket().unwrap_or("-")
+                    )
+                } else {
+                    format!(
+                        " {marker} {}  {:<7} {}  {}",
+                        worker.worker_id(),
+                        worker.status().as_str(),
+                        worker.alias(),
+                        worker.workspace()
+                    )
+                };
+                lines.push(Line::from(line));
             }
             for diagnostic in snapshot.diagnostics() {
                 lines.push(Line::from(Span::styled(
@@ -2320,19 +2382,19 @@ impl App {
 
     /// The `?` overlay: a centered, bordered box listing every binding
     /// (label-left, key-right) drawn over a dimmed copy of the list behind it.
-    fn render_help(&self, frame: &mut Frame) {
-        let label_w = BINDINGS
+    fn render_help(&self, frame: &mut Frame, bindings: &[(&str, &str)]) {
+        let label_w = bindings
             .iter()
             .map(|(label, _)| label.chars().count())
             .max()
             .unwrap_or(0);
-        let key_w = BINDINGS
+        let key_w = bindings
             .iter()
             .map(|(_, key)| key.chars().count())
             .max()
             .unwrap_or(0);
 
-        let lines: Vec<Line> = BINDINGS
+        let lines: Vec<Line> = bindings
             .iter()
             .map(|(label, key)| {
                 Line::from(vec![
@@ -2348,7 +2410,7 @@ impl App {
 
         // Inner content is " label   key " plus the two borders.
         let width = (label_w + key_w + 5) as u16 + 2;
-        let height = BINDINGS.len() as u16 + 2;
+        let height = bindings.len() as u16 + 2;
         let area = centered_rect(frame.area(), width, height);
 
         // Dim everything already drawn so the popup reads as the foreground,
@@ -2521,6 +2583,7 @@ impl App {
         att: Attention,
         selected: bool,
         worker: Option<&WorkerSnapshot>,
+        width: u16,
     ) -> ListItem<'static> {
         let agent = self.agent_of(w);
         let work = self.work_state(w);
@@ -2584,7 +2647,7 @@ impl App {
             Style::default().fg(Color::DarkGray),
         ));
         let lines = match worker {
-            Some(worker) => vec![Line::from(spans), worker_line(worker, self.tick)],
+            Some(worker) => vec![Line::from(spans), worker_line(worker, width)],
             None => vec![Line::from(spans)],
         };
         ListItem::new(lines)
@@ -2700,7 +2763,7 @@ impl App {
                 )),
             },
             // Help draws its own overlay; the footer stays on the slim hint.
-            Mode::Help => Paragraph::new(Span::styled(
+            Mode::Help(_) => Paragraph::new(Span::styled(
                 " j/k move  ? help  q quit ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
@@ -2757,17 +2820,23 @@ fn worker_result_line(result: &RunResult) -> String {
     }
 }
 
-fn worker_line(worker: &WorkerSnapshot, _tick: u64) -> Line<'static> {
+fn worker_line(worker: &WorkerSnapshot, width: u16) -> Line<'static> {
     let status = if worker.status() == WorkerStatus::Busy && worker.has_dead_process() {
         "stale"
     } else {
         worker.status().as_str()
     };
+    let ticket = worker.ticket().unwrap_or("-");
+    if width < 55 {
+        return Line::from(Span::styled(
+            format!("  {}  {status}  ticket:{ticket}", worker.worker_id()),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
     let runtime = worker
         .agent_runtime()
         .map(|runtime| runtime.as_str())
         .unwrap_or("runtime?");
-    let ticket = worker.ticket().unwrap_or("-");
     let activity = worker
         .last_activity_at()
         .or_else(|| worker.started_at())
@@ -3656,6 +3725,35 @@ mod tests {
     }
 
     #[test]
+    fn pool_help_preserves_selected_worker_and_documents_pool_actions() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        app.handle(press(KeyCode::Char('?')));
+        assert!(matches!(app.mode, Mode::Help(_)));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Send to Worker"), "{text}");
+        assert!(text.contains("Reset Worker"), "{text}");
+
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::View { ref selected }) if selected.as_deref() == Some("worker-01")
+        ));
+    }
+
+    #[test]
     fn help_toggles_without_touching_state() {
         let mut app = app_with(&["default", "feat"]);
         // Move selection off the top so we can prove Help leaves it untouched.
@@ -3663,10 +3761,10 @@ mod tests {
         let before = app.list.selected().map(str::to_string);
 
         app.handle(press(KeyCode::Char('?')));
-        assert!(matches!(app.mode, Mode::Help));
+        assert!(matches!(app.mode, Mode::Help(_)));
         // Navigation is swallowed while the overlay is open, and no status leaks.
         app.handle(press(KeyCode::Down));
-        assert!(matches!(app.mode, Mode::Help));
+        assert!(matches!(app.mode, Mode::Help(_)));
         assert_eq!(app.list.selected().map(str::to_string), before);
         assert!(app.status.is_none());
 
@@ -3685,7 +3783,7 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let mut app = app_with(&["default", "feat"]);
-        app.mode = Mode::Help;
+        app.mode = Mode::Help(Box::new(Mode::Normal));
         let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
 
@@ -3708,20 +3806,25 @@ mod tests {
 
         // A terminal smaller than the popup must clamp, not panic.
         let mut app = app_with(&["default"]);
-        app.mode = Mode::Help;
+        app.mode = Mode::Help(Box::new(Mode::Normal));
         let mut term = Terminal::new(TestBackend::new(6, 3)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
     }
 
     #[test]
     fn bindings_cover_the_essential_keys() {
-        let keys: Vec<&str> = BINDINGS.iter().map(|(_, k)| *k).collect();
-        assert!(keys.contains(&"j / ↓"));
-        assert!(keys.contains(&"?"));
-        assert!(keys.contains(&"q / esc"));
+        let normal_keys: Vec<&str> = NORMAL_BINDINGS.iter().map(|(_, k)| *k).collect();
+        let pool_keys: Vec<&str> = POOL_BINDINGS.iter().map(|(_, k)| *k).collect();
+        assert!(normal_keys.contains(&"j / ↓"));
+        assert!(pool_keys.contains(&"s"));
+        assert!(pool_keys.contains(&"K"));
+        assert!(normal_keys.contains(&"?"));
+        assert!(pool_keys.contains(&"?"));
+        assert!(normal_keys.contains(&"q / esc"));
         assert!(
-            BINDINGS
+            NORMAL_BINDINGS
                 .iter()
+                .chain(POOL_BINDINGS)
                 .all(|(label, key)| !label.is_empty() && !key.is_empty())
         );
     }
@@ -4724,6 +4827,63 @@ mod tests {
         }));
         assert_eq!(app.active_operation, Some(9));
         assert_eq!(app.status, None);
+    }
+
+    #[test]
+    fn normal_help_excludes_pool_only_actions() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('?')));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("Delete workspace"), "{text}");
+        assert!(!text.contains("Send to Worker"), "{text}");
+    }
+
+    #[test]
+    fn narrow_workspace_rows_keep_worker_identity_status_and_ticket() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let mut app = app_with(&["default", "worker-01"]);
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot,
+        }));
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("worker-01"), "{text}");
+        assert!(text.contains("busy"), "{text}");
+        assert!(text.contains("ENG-101"), "{text}");
     }
 
     #[test]
