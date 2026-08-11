@@ -4848,6 +4848,66 @@ mod tests {
     }
 
     #[test]
+    fn active_pool_editor_folds_refresh_and_renders_worker_lifecycle() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
+        )
+        .unwrap();
+        let worker_state = pool.join("worker-01.json");
+        std::fs::write(
+            &worker_state,
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let repository = wsg_core::Repository::open(temp.path()).unwrap();
+        let idle = repository.read_worker_pool_snapshot();
+        let mut app = app_with(&["default", "worker-01"]);
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot: idle,
+        }));
+        app.handle(press(KeyCode::Char('p')));
+        app.handle(press(KeyCode::Char('d')));
+        for character in "ENG-101".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+
+        std::fs::write(
+            &worker_state,
+            br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":"eng-101","exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let busy = repository.read_worker_pool_snapshot();
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot: busy,
+        }));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG-101"
+        ));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("worker-01"), "{text}");
+        assert!(text.contains("busy"), "{text}");
+        assert!(text.contains("ENG-101"), "{text}");
+        assert!(text.contains("Ticket IDs: ENG-101"), "{text}");
+    }
+
+    #[test]
     fn narrow_workspace_rows_keep_worker_identity_status_and_ticket() {
         let temp = tempfile::tempdir().unwrap();
         let pool = temp.path().join(".jj/pool");
