@@ -9,11 +9,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use wsg_core::{
-    AgentRuntime, AgentRuntimeQuery, DirectDispatchError, DirectDispatchExecution,
-    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DispatchGroup,
-    DispatchGroupState, DispatchGroupStatusCounts, PoolCapacity, ReadyTicketFilter, RunActivity,
-    RunMode, RunResult, SubIssueStatus, TicketDiscovery, TicketId, TicketStatus, WorkerId,
-    WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
+    AgentRuntime, AgentRuntimeQuery, AgentSessionResolution, DirectDispatchError,
+    DirectDispatchExecution, DirectDispatchFailurePhase, DirectDispatchOutcome,
+    DirectDispatchRequest, DispatchGroup, DispatchGroupState, DispatchGroupStatusCounts,
+    PoolCapacity, ReadyTicketFilter, RunActivity, RunMode, RunResult, SubIssueStatus,
+    TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError, WorkerPoolSnapshot,
+    WorkerStatus,
 };
 
 /// A user-visible operation identity used to ignore stale results.
@@ -64,6 +65,78 @@ impl WorkerLogSnapshot {
     }
 }
 
+/// The Worker action that launched a Follow-up Run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerActionKind {
+    /// Send a user-provided prompt to the Worker.
+    Send,
+    /// Ask the Worker to address Pull Request review feedback.
+    Review,
+}
+
+impl WorkerActionKind {
+    /// Returns the human-facing action name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Send => "Send",
+            Self::Review => "Review",
+        }
+    }
+}
+
+/// Immutable presentation of a launched Worker Follow-up Run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerSessionOutcome {
+    worker: String,
+    action: WorkerActionKind,
+    runtime: AgentRuntime,
+    session: AgentSessionResolution,
+    pid: u32,
+}
+
+impl WorkerSessionOutcome {
+    pub(crate) fn new(
+        worker: impl Into<String>,
+        action: WorkerActionKind,
+        runtime: AgentRuntime,
+        session: AgentSessionResolution,
+        pid: u32,
+    ) -> Self {
+        Self {
+            worker: worker.into(),
+            action,
+            runtime,
+            session,
+            pid,
+        }
+    }
+
+    /// Returns the Worker that owns the new Run.
+    pub fn worker(&self) -> &str {
+        &self.worker
+    }
+
+    /// Returns the action that launched the new Run.
+    pub const fn action(&self) -> WorkerActionKind {
+        self.action
+    }
+
+    /// Returns the Agent Runtime selected for the Run.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
+    }
+
+    /// Returns whether the prior Agent Session resumed or why a fresh one began.
+    pub fn session(&self) -> &AgentSessionResolution {
+        &self.session
+    }
+
+    /// Returns the Agent Runtime process identifier.
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
 /// Commands accepted by the Workspace Dispatch controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceDispatchCommand {
@@ -104,6 +177,17 @@ pub enum WorkspaceDispatchCommand {
     Orchestrate {
         operation: OperationId,
         parent: String,
+    },
+    /// Send a prompt to one selected Worker.
+    Send {
+        operation: OperationId,
+        worker: String,
+        prompt: String,
+    },
+    /// Start a Pull Request review on one selected Worker.
+    Review {
+        operation: OperationId,
+        worker: String,
     },
     /// Start one cancellable latest-activity Worker log watcher.
     WatchWorkerLog {
@@ -617,6 +701,11 @@ pub enum WorkspaceDispatchEvent {
         parent: String,
         counts: DispatchGroupStatusCounts,
     },
+    /// A Worker Follow-up Run was launched and its Session outcome resolved.
+    WorkerActionCompleted {
+        operation: OperationId,
+        outcome: WorkerSessionOutcome,
+    },
     /// A changed provider-neutral Worker log snapshot.
     WorkerLogUpdated {
         operation: OperationId,
@@ -670,6 +759,10 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
         parent: &str,
         emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
     ) -> Result<(), String>;
+    /// Launch a user prompt as a background Follow-up Run.
+    fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String>;
+    /// Launch a Pull Request review as a background Follow-up Run.
+    fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String>;
     /// Reads one latest Worker log snapshot without choosing a rendering.
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
@@ -891,6 +984,24 @@ impl WorkspaceDispatchController {
                     emit(WorkspaceDispatchEvent::Failed { operation, message });
                 }
             }
+            WorkspaceDispatchCommand::Send {
+                operation,
+                worker,
+                prompt,
+            } => match adapter.send(&worker, &prompt) {
+                Ok(outcome) => {
+                    emit(WorkspaceDispatchEvent::WorkerActionCompleted { operation, outcome })
+                }
+                Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+            },
+            WorkspaceDispatchCommand::Review { operation, worker } => {
+                match adapter.review(&worker) {
+                    Ok(outcome) => {
+                        emit(WorkspaceDispatchEvent::WorkerActionCompleted { operation, outcome })
+                    }
+                    Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+                }
+            }
             WorkspaceDispatchCommand::WatchWorkerLog { operation, worker } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 if let Some(previous) = watchers
@@ -1050,6 +1161,45 @@ impl RealWorkspaceDispatch {
             outcomes,
             partial: result.is_partial(),
         }))
+    }
+
+    fn worker_action(
+        &self,
+        worker: &str,
+        action: WorkerActionKind,
+        prompt: Option<&str>,
+    ) -> Result<WorkerSessionOutcome, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let actions = wsg_core::WorkerActions::new(repository);
+        let outcome = match action {
+            WorkerActionKind::Send => actions
+                .send(
+                    &worker_id,
+                    prompt.ok_or_else(|| "Send prompt cannot be missing".to_owned())?,
+                    RunMode::Background,
+                )
+                .map_err(|error| error.to_string())?,
+            WorkerActionKind::Review => actions
+                .review(&worker_id, RunMode::Background)
+                .map_err(|error| error.to_string())?,
+        };
+        let runtime = outcome.runtime();
+        let session = outcome.session().clone();
+        let wsg_core::FollowUpExecution::Background(run) = outcome.into_execution() else {
+            return Err("foreground Worker actions are not supported by jjfx".to_owned());
+        };
+        let pid = run.pid();
+        std::thread::spawn(move || {
+            let _ = run.wait();
+        });
+        Ok(WorkerSessionOutcome::new(
+            worker.to_owned(),
+            action,
+            runtime,
+            session,
+            pid,
+        ))
     }
 }
 
@@ -1220,6 +1370,14 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         worker: Option<&str>,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
         self.dispatch_with_strategy(tickets, worker, DispatchStrategy::Available)
+    }
+
+    fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String> {
+        self.worker_action(worker, WorkerActionKind::Send, Some(prompt))
+    }
+
+    fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String> {
+        self.worker_action(worker, WorkerActionKind::Review, None)
     }
 
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
@@ -1428,6 +1586,43 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
         Ok(())
     }
 
+    fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Send {
+                operation: 0,
+                worker: worker.to_owned(),
+                prompt: prompt.to_owned(),
+            },
+        );
+        Ok(WorkerSessionOutcome::new(
+            worker,
+            WorkerActionKind::Send,
+            AgentRuntime::Claude,
+            AgentSessionResolution::Fresh {
+                reason: wsg_core::FreshSessionReason::NoPriorLog,
+            },
+            42,
+        ))
+    }
+
+    fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Review {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(WorkerSessionOutcome::new(
+            worker,
+            WorkerActionKind::Review,
+            AgentRuntime::Claude,
+            AgentSessionResolution::Resumed {
+                session_id: "session-42".to_owned(),
+            },
+            43,
+        ))
+    }
+
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
         self.commands.lock().expect("recording adapter lock").push(
             WorkspaceDispatchCommand::WatchWorkerLog {
@@ -1598,6 +1793,59 @@ mod tests {
                 counts,
             } if parent == "ENG-100" && counts == DispatchGroupStatusCounts::default()
         ));
+    }
+
+    #[test]
+    fn controller_launches_follow_up_actions_with_session_outcomes() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::Send {
+            operation: 40,
+            worker: "worker-01".to_owned(),
+            prompt: "continue the work".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("send event"),
+            WorkspaceDispatchEvent::WorkerActionCompleted { operation: 40, outcome }
+                if outcome.worker() == "worker-01"
+                    && outcome.action() == WorkerActionKind::Send
+                    && matches!(
+                        outcome.session(),
+                        AgentSessionResolution::Fresh {
+                            reason: wsg_core::FreshSessionReason::NoPriorLog
+                        }
+                    )
+        ));
+
+        controller.submit(WorkspaceDispatchCommand::Review {
+            operation: 41,
+            worker: "worker-01".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("review event"),
+            WorkspaceDispatchEvent::WorkerActionCompleted { operation: 41, outcome }
+                if outcome.worker() == "worker-01"
+                    && outcome.action() == WorkerActionKind::Review
+                    && matches!(
+                        outcome.session(),
+                        AgentSessionResolution::Resumed { session_id }
+                            if session_id == "session-42"
+                    )
+        ));
+        let commands = adapter.commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Send { worker, prompt, .. }
+                if worker == "worker-01" && prompt == "continue the work"
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Review { worker, .. } if worker == "worker-01"
+        )));
     }
 
     #[test]

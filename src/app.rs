@@ -29,13 +29,13 @@ use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::workspace_dispatch::{
-    OperationId, RealWorkspaceDispatch, WorkspaceDispatchCommand, WorkspaceDispatchController,
-    WorkspaceDispatchEvent,
+    OperationId, RealWorkspaceDispatch, WorkerSessionOutcome, WorkspaceDispatchCommand,
+    WorkspaceDispatchController, WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{PresentationRow, WorkspaceList};
 use wsg_core::{
-    RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage, WorkerPoolSnapshot,
-    WorkerSnapshot, WorkerStatus,
+    AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
+    WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
 };
 
 /// The focused Worker Pool management interaction.
@@ -50,6 +50,10 @@ enum PoolMode {
     TicketInput {
         buffer: String,
         selected: Option<String>,
+    },
+    SendInput {
+        worker: String,
+        buffer: String,
     },
     DispatchPreview {
         tickets: Vec<String>,
@@ -214,6 +218,8 @@ pub struct App {
     worker_log_operation: Option<OperationId>,
     /// Latest immutable provider-neutral Worker log snapshot.
     worker_log: Option<crate::workspace_dispatch::WorkerLogSnapshot>,
+    /// The latest selected-Worker Follow-up Session outcome.
+    worker_session: Option<WorkerSessionOutcome>,
     /// Latest Worker log failure retained for the focused detail view.
     worker_log_error: Option<String>,
     /// Latest ordered Direct Dispatch outcomes for the Pool view.
@@ -295,6 +301,7 @@ impl App {
             orchestration_operation: None,
             worker_log_operation: None,
             worker_log: None,
+            worker_session: None,
             worker_log_error: None,
             dispatch_result: None,
             ready_tickets: None,
@@ -491,6 +498,23 @@ impl App {
                         counts.done(),
                         counts.failed(),
                         counts.skipped()
+                    ));
+                }
+            }
+            WorkspaceDispatchEvent::WorkerActionCompleted { operation, outcome } => {
+                if self.active_operation == Some(operation) {
+                    let worker = outcome.worker().to_owned();
+                    let action = outcome.action();
+                    self.worker_session = Some(outcome);
+                    self.active_operation = None;
+                    self.refresh_worker_pool();
+                    self.set_status(format!(
+                        "{} {} (PID {})",
+                        action.as_str(),
+                        worker,
+                        self.worker_session
+                            .as_ref()
+                            .map_or(0, WorkerSessionOutcome::pid)
                     ));
                 }
             }
@@ -900,6 +924,44 @@ impl App {
                         selected,
                     });
                 }
+                KeyCode::Char('s') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before Send".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    if !self.worker_is_available_for_action(&worker) {
+                        self.set_status("Worker is busy; Send is unavailable".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View {
+                            selected: Some(worker),
+                        });
+                    } else {
+                        self.mode = Mode::Pool(PoolMode::SendInput {
+                            worker,
+                            buffer: String::new(),
+                        });
+                    }
+                }
+                KeyCode::Char('v') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before Review".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    if !self.worker_is_available_for_action(&worker) {
+                        self.set_status("Worker is busy; Review is unavailable".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View {
+                            selected: Some(worker),
+                        });
+                    } else {
+                        self.mode = Mode::Pool(PoolMode::View {
+                            selected: Some(worker.clone()),
+                        });
+                        self.review_worker(worker);
+                    }
+                }
                 KeyCode::Char('a') => self.discover_ready_tickets(),
                 KeyCode::Char('o') => {
                     self.mode = Mode::Pool(PoolMode::ParentInput {
@@ -956,6 +1018,32 @@ impl App {
                     }
                 },
                 _ => self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected }),
+            },
+            Mode::Pool(PoolMode::SendInput { worker, mut buffer }) => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker),
+                    })
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer });
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    buffer.push(c);
+                    self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer });
+                }
+                KeyCode::Enter if !buffer.trim().is_empty() => {
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker.clone()),
+                    });
+                    self.send_to_worker(worker, buffer);
+                }
+                KeyCode::Enter => {
+                    self.set_status("Send prompt cannot be empty".to_owned());
+                    self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer });
+                }
+                _ => self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer }),
             },
             Mode::Pool(PoolMode::TicketInput {
                 mut buffer,
@@ -1064,6 +1152,30 @@ impl App {
             }) => self.on_key_confirm_dispatch_capacity(key, tickets, worker, shortage),
             other => self.mode = other,
         }
+    }
+
+    fn worker_is_available_for_action(&self, worker: &str) -> bool {
+        self.worker_pool
+            .as_ref()
+            .and_then(|snapshot| snapshot.worker(worker))
+            .is_some_and(|worker| worker.status() != WorkerStatus::Busy)
+    }
+
+    fn send_to_worker(&mut self, worker: String, prompt: String) {
+        let operation = self.begin_dispatch();
+        self.pin_status(format!("sending to {worker}..."));
+        self.dispatch.submit(WorkspaceDispatchCommand::Send {
+            operation,
+            worker,
+            prompt,
+        });
+    }
+
+    fn review_worker(&mut self, worker: String) {
+        let operation = self.begin_dispatch();
+        self.pin_status(format!("starting review for {worker}..."));
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::Review { operation, worker });
     }
 
     fn discover_ready_tickets(&mut self) {
@@ -1789,6 +1901,7 @@ impl App {
                 | Mode::Pool(PoolMode::ConfirmDispatchCapacity {
                     worker: selected, ..
                 }) => selected.as_deref(),
+                Mode::Pool(PoolMode::SendInput { worker, .. }) => Some(worker.as_str()),
                 Mode::Pool(PoolMode::ParentInput { .. }) => None,
                 Mode::Pool(PoolMode::LogDetail { worker }) => Some(worker.as_str()),
                 _ => None,
@@ -1889,6 +2002,24 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+            if let Some(session) = &self.worker_session {
+                let session_text = match session.session() {
+                    AgentSessionResolution::Resumed { session_id } => {
+                        format!("resumed session {session_id}")
+                    }
+                    AgentSessionResolution::Fresh { reason } => {
+                        format!("fresh session ({reason})")
+                    }
+                };
+                lines.push(dim_line(&format!(
+                    " {} {}  runtime: {}  PID {}",
+                    session.action().as_str(),
+                    session.worker(),
+                    session.runtime().as_str(),
+                    session.pid()
+                )));
+                lines.push(Line::from(format!("  {session_text}")));
             }
             if let Some(result) = &self.dispatch_result {
                 lines.push(dim_line(" Dispatch outcomes:"));
@@ -2250,7 +2381,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  o orchestrate  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  s send  v review  o orchestrate  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -2259,6 +2390,10 @@ impl App {
             )),
             Mode::Pool(PoolMode::TicketInput { buffer, .. }) => Paragraph::new(Span::styled(
                 format!(" Ticket IDs: {buffer}_  (enter preview, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::SendInput { worker, buffer }) => Paragraph::new(Span::styled(
+                format!(" Send to {worker}: {buffer}_  (enter send, esc cancel) "),
                 Style::default().fg(Color::Cyan),
             )),
             Mode::Pool(PoolMode::DispatchPreview { tickets, .. }) => Paragraph::new(Span::styled(
@@ -3686,6 +3821,121 @@ mod tests {
             Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG"
         ));
         assert_eq!(app.active_operation, Some(8));
+    }
+
+    #[test]
+    fn pool_send_editor_submits_a_prompt_without_blocking_input() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"},"agent":"claude"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let adapter = RecordingAdapter::new(snapshot.clone());
+        let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
+        let mut app = app_with(&["default", "worker-01"]);
+        app.worker_pool = Some(snapshot);
+        app.dispatch = controller;
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        app.handle(press(KeyCode::Char('s')));
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::SendInput { ref worker, ref buffer })
+                if worker == "worker-01" && buffer.is_empty()
+        ));
+        for character in "continue the work".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+
+        for _ in 0..100 {
+            if adapter.commands().iter().any(|command| {
+                matches!(
+                    command,
+                    WorkspaceDispatchCommand::Send { worker, prompt, .. }
+                        if worker == "worker-01" && prompt == "continue the work"
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(adapter.commands().iter().any(|command| {
+            matches!(
+                command,
+                WorkspaceDispatchCommand::Send { worker, prompt, .. }
+                    if worker == "worker-01" && prompt == "continue the work"
+            )
+        }));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert!(app.active_operation.is_some());
+    }
+
+    #[test]
+    fn worker_action_event_keeps_session_outcome_visible() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let mut app = app_with(&["default"]);
+        app.worker_pool = Some(
+            wsg_core::Repository::open(temp.path())
+                .unwrap()
+                .read_worker_pool_snapshot(),
+        );
+        app.mode = Mode::Pool(PoolMode::View { selected: None });
+        app.active_operation = Some(12);
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerActionCompleted {
+                operation: 12,
+                outcome: WorkerSessionOutcome::new(
+                    "worker-01",
+                    crate::workspace_dispatch::WorkerActionKind::Send,
+                    wsg_core::AgentRuntime::Claude,
+                    AgentSessionResolution::Fresh {
+                        reason: wsg_core::FreshSessionReason::MissingIdentity,
+                    },
+                    77,
+                ),
+            },
+        ));
+
+        assert!(app.active_operation.is_none());
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("Send worker-01"))
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(
+            text.contains("fresh session (log has no session id yet)"),
+            "{text}"
+        );
     }
 
     #[test]

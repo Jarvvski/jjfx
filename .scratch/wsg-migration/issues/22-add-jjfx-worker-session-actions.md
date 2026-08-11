@@ -1,6 +1,6 @@
 # Add Worker Session actions to jjfx
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

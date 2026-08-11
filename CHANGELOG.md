@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-11 - Added non-blocking Worker Send and Review actions to the jjfx
+  Pool view. Follow-up outcomes show resumed Agent Sessions or the reason a
+  fresh Session was required.
+
 - 2026-08-10 - Added Dispatch Group progress, non-blocking Parent Ticket
   orchestration, and focused provider-neutral Worker logs to jjfx 0.32.0.
   Dependency waves, retries, usage, terminal outcomes, and unavailable logs
