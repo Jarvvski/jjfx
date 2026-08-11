@@ -64,9 +64,9 @@ pub use ticket::{
     TicketValueError,
 };
 pub use worker_actions::{
-    FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome, RebaseOutcome,
-    ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration,
-    WorkspaceRestorationError, WorkspaceRestorationHandle,
+    DismissOutcome, FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome,
+    RebaseOutcome, ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs,
+    WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, CleanDecision, WorkerWorkspace, WorkerWorkspaceError,

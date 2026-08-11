@@ -193,6 +193,58 @@ impl ResetAdapterResult {
     }
 }
 
+/// How a Dismiss operation changed Worker capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkerDismissDisposition {
+    /// The idle Worker was removed from the Pool.
+    Removed { capacity: usize },
+    /// The terminal Worker was cleared in place.
+    Reset,
+}
+
+/// A typed result from a non-Run Worker action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkerCommandResult {
+    /// A Worker bookmark was rebased and pushed.
+    Rebased { worker: String, branch: String },
+    /// A Worker's Pull Request was opened.
+    PullRequestOpened { worker: String, branch: String },
+    /// A Worker's cosmetic alias was set or cleared.
+    AliasChanged {
+        worker: String,
+        alias: Option<String>,
+    },
+    /// A Worker was dismissed using the compatibility disposition.
+    Dismissed {
+        worker: String,
+        disposition: WorkerDismissDisposition,
+    },
+}
+
+impl WorkerCommandResult {
+    /// Returns a concise human-facing result.
+    pub fn notice(&self) -> String {
+        match self {
+            Self::Rebased { worker, branch } => format!("Rebased {worker} onto {branch}"),
+            Self::PullRequestOpened { worker, branch } => {
+                format!("Opened Pull Request for {worker} ({branch})")
+            }
+            Self::AliasChanged { worker, alias } => match alias {
+                Some(alias) => format!("Named {worker} -> {alias}"),
+                None => format!("Cleared alias for {worker}"),
+            },
+            Self::Dismissed {
+                worker,
+                disposition: WorkerDismissDisposition::Removed { capacity },
+            } => format!("Dismissed {worker} (Pool capacity: {capacity})"),
+            Self::Dismissed {
+                worker,
+                disposition: WorkerDismissDisposition::Reset,
+            } => format!("Reset {worker} to idle without restoring its Workspace"),
+        }
+    }
+}
+
 /// Commands accepted by the Workspace Dispatch controller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum WorkspaceDispatchCommand {
@@ -247,6 +299,27 @@ pub enum WorkspaceDispatchCommand {
     },
     /// Reset one selected Worker after the caller has obtained confirmation.
     Reset {
+        operation: OperationId,
+        worker: String,
+    },
+    /// Rebase and push one Worker's bookmark.
+    Rebase {
+        operation: OperationId,
+        worker: String,
+    },
+    /// Open one Worker's Pull Request.
+    OpenPullRequest {
+        operation: OperationId,
+        worker: String,
+    },
+    /// Set or clear one Worker's cosmetic alias.
+    SetAlias {
+        operation: OperationId,
+        worker: String,
+        alias: String,
+    },
+    /// Dismiss one Worker after the caller has obtained confirmation.
+    Dismiss {
         operation: OperationId,
         worker: String,
     },
@@ -778,6 +851,11 @@ pub enum WorkspaceDispatchEvent {
         worker: String,
         result: WorkspaceRestorationResult,
     },
+    /// A non-Run Worker action completed with a typed result.
+    WorkerCommandCompleted {
+        operation: OperationId,
+        result: WorkerCommandResult,
+    },
     /// A changed provider-neutral Worker log snapshot.
     WorkerLogUpdated {
         operation: OperationId,
@@ -837,6 +915,14 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String>;
     /// Reset a Worker and return its independent Workspace restoration handle.
     fn reset(&self, worker: &str) -> Result<ResetAdapterResult, String>;
+    /// Rebase and push one Worker's bookmark.
+    fn rebase(&self, worker: &str) -> Result<WorkerCommandResult, String>;
+    /// Open one Worker's Pull Request.
+    fn open_pull_request(&self, worker: &str) -> Result<WorkerCommandResult, String>;
+    /// Set or clear one Worker's cosmetic alias.
+    fn set_alias(&self, worker: &str, alias: &str) -> Result<WorkerCommandResult, String>;
+    /// Dismiss one Worker using the compatibility disposition.
+    fn dismiss(&self, worker: &str) -> Result<WorkerCommandResult, String>;
     /// Reads one latest Worker log snapshot without choosing a rendering.
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
@@ -1111,6 +1197,40 @@ impl WorkspaceDispatchController {
                 }
                 Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
             },
+            WorkspaceDispatchCommand::Rebase { operation, worker } => {
+                match adapter.rebase(&worker) {
+                    Ok(result) => {
+                        emit(WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result })
+                    }
+                    Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+                }
+            }
+            WorkspaceDispatchCommand::OpenPullRequest { operation, worker } => {
+                match adapter.open_pull_request(&worker) {
+                    Ok(result) => {
+                        emit(WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result })
+                    }
+                    Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+                }
+            }
+            WorkspaceDispatchCommand::SetAlias {
+                operation,
+                worker,
+                alias,
+            } => match adapter.set_alias(&worker, &alias) {
+                Ok(result) => {
+                    emit(WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result })
+                }
+                Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+            },
+            WorkspaceDispatchCommand::Dismiss { operation, worker } => {
+                match adapter.dismiss(&worker) {
+                    Ok(result) => {
+                        emit(WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result })
+                    }
+                    Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+                }
+            }
             WorkspaceDispatchCommand::WatchWorkerLog { operation, worker } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 if let Some(previous) = watchers
@@ -1501,6 +1621,65 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         ))
     }
 
+    fn rebase(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let outcome = wsg_core::WorkerActions::new(repository)
+            .rebase(&worker_id)
+            .map_err(|error| error.to_string())?;
+        Ok(WorkerCommandResult::Rebased {
+            worker: worker.to_owned(),
+            branch: outcome.branch().to_owned(),
+        })
+    }
+
+    fn open_pull_request(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let outcome = wsg_core::WorkerActions::new(repository)
+            .open_pull_request(&worker_id)
+            .map_err(|error| error.to_string())?;
+        Ok(WorkerCommandResult::PullRequestOpened {
+            worker: worker.to_owned(),
+            branch: outcome.branch().to_owned(),
+        })
+    }
+
+    fn set_alias(&self, worker: &str, alias: &str) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let alias = match alias.trim() {
+            "" => None,
+            value => Some(value.to_owned()),
+        };
+        repository
+            .worker_pool()
+            .set_alias(worker_id, alias.clone().unwrap_or_default())
+            .map_err(|error| error.to_string())?;
+        Ok(WorkerCommandResult::AliasChanged {
+            worker: worker.to_owned(),
+            alias,
+        })
+    }
+
+    fn dismiss(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let outcome = wsg_core::WorkerActions::new(repository)
+            .dismiss(&worker_id)
+            .map_err(|error| error.to_string())?;
+        let disposition = match outcome {
+            wsg_core::DismissOutcome::Removed { capacity } => {
+                WorkerDismissDisposition::Removed { capacity }
+            }
+            wsg_core::DismissOutcome::Reset => WorkerDismissDisposition::Reset,
+        };
+        Ok(WorkerCommandResult::Dismissed {
+            worker: worker.to_owned(),
+            disposition,
+        })
+    }
+
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
         let repository = self.repository()?;
         let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
@@ -1757,6 +1936,59 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
         ))
     }
 
+    fn rebase(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Rebase {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(WorkerCommandResult::Rebased {
+            worker: worker.to_owned(),
+            branch: "main".to_owned(),
+        })
+    }
+
+    fn open_pull_request(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::OpenPullRequest {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(WorkerCommandResult::PullRequestOpened {
+            worker: worker.to_owned(),
+            branch: "main".to_owned(),
+        })
+    }
+
+    fn set_alias(&self, worker: &str, alias: &str) -> Result<WorkerCommandResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::SetAlias {
+                operation: 0,
+                worker: worker.to_owned(),
+                alias: alias.to_owned(),
+            },
+        );
+        Ok(WorkerCommandResult::AliasChanged {
+            worker: worker.to_owned(),
+            alias: (!alias.trim().is_empty()).then(|| alias.trim().to_owned()),
+        })
+    }
+
+    fn dismiss(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Dismiss {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(WorkerCommandResult::Dismissed {
+            worker: worker.to_owned(),
+            disposition: WorkerDismissDisposition::Reset,
+        })
+    }
+
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {
         self.commands.lock().expect("recording adapter lock").push(
             WorkspaceDispatchCommand::WatchWorkerLog {
@@ -1979,6 +2211,82 @@ mod tests {
         assert!(commands.iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Review { worker, .. } if worker == "worker-01"
+        )));
+    }
+
+    #[test]
+    fn controller_completes_rebase_pull_request_alias_and_dismiss_actions() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::Rebase {
+            operation: 50,
+            worker: "worker-01".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("rebase event"),
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation: 50,
+                result: WorkerCommandResult::Rebased { worker, branch },
+            } if worker == "worker-01" && branch == "main"
+        ));
+
+        controller.submit(WorkspaceDispatchCommand::OpenPullRequest {
+            operation: 51,
+            worker: "worker-01".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("pull request event"),
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation: 51,
+                result: WorkerCommandResult::PullRequestOpened { worker, branch },
+            } if worker == "worker-01" && branch == "main"
+        ));
+
+        controller.submit(WorkspaceDispatchCommand::SetAlias {
+            operation: 52,
+            worker: "worker-01".to_owned(),
+            alias: "  primary  ".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("alias event"),
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation: 52,
+                result: WorkerCommandResult::AliasChanged { worker, alias },
+            } if worker == "worker-01" && alias.as_deref() == Some("primary")
+        ));
+
+        controller.submit(WorkspaceDispatchCommand::Dismiss {
+            operation: 53,
+            worker: "worker-01".to_owned(),
+        });
+        assert!(matches!(
+            events_rx.recv().expect("dismiss event"),
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation: 53,
+                result: WorkerCommandResult::Dismissed { worker, disposition },
+            } if worker == "worker-01" && disposition == WorkerDismissDisposition::Reset
+        ));
+        let commands = adapter.commands();
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Rebase { worker, .. } if worker == "worker-01"
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::OpenPullRequest { worker, .. } if worker == "worker-01"
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::SetAlias { worker, alias, .. }
+                if worker == "worker-01" && alias == "  primary  "
+        )));
+        assert!(commands.iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01"
         )));
     }
 

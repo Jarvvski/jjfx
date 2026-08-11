@@ -6,6 +6,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-11 - Added Worker Rebase, Pull Request, alias, and confirmed Dismiss
+  actions to the jjfx Pool view while preserving stable Worker identities and
+  Go-compatible terminal lifecycle behavior.
+
 - 2026-08-11 - Added confirmed Worker Reset with independently reported
   Workspace restoration outcomes in the jjfx Pool view.
 

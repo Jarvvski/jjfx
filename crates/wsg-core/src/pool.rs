@@ -397,6 +397,33 @@ impl WorkerPool {
         Ok(Some(RunTarget::new(&state, revision)))
     }
 
+    /// Clears a terminal Worker Run without restoring its Workspace.
+    ///
+    /// This is the compatibility Dismiss path: completed or failed Worker
+    /// state is released for reuse while the user keeps the Workspace contents
+    /// available for inspection. Active Runs remain protected.
+    pub fn clear_terminal(&self, worker: &WorkerId) -> Result<(), WorkerPoolError> {
+        let snapshot = self.snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerPoolError::WorkerNotInPool {
+                    worker: worker.clone(),
+                })?;
+        if state.status() == WorkerStatus::Busy {
+            return Err(WorkerPoolError::WorkerNotIdle {
+                worker: worker.clone(),
+            });
+        }
+        let Some(target) = self.run_target(worker)? else {
+            return Ok(());
+        };
+        match self.clear_run(worker, target)? {
+            RunClearing::Cleared | RunClearing::AlreadyIdle => Ok(()),
+            RunClearing::Superseded => Err(WorkerPoolError::Conflict),
+        }
+    }
+
     /// Returns a Worker to idle once its Run is no longer executing.
     ///
     /// A natural finalization of the same Run only changes completion fields,

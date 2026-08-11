@@ -29,8 +29,8 @@ use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::workspace_dispatch::{
-    OperationId, RealWorkspaceDispatch, WorkerSessionOutcome, WorkspaceDispatchCommand,
-    WorkspaceDispatchController, WorkspaceDispatchEvent,
+    OperationId, RealWorkspaceDispatch, WorkerCommandResult, WorkerSessionOutcome,
+    WorkspaceDispatchCommand, WorkspaceDispatchController, WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{PresentationRow, WorkspaceList};
 use wsg_core::{
@@ -52,6 +52,10 @@ enum PoolMode {
         selected: Option<String>,
     },
     SendInput {
+        worker: String,
+        buffer: String,
+    },
+    AliasInput {
         worker: String,
         buffer: String,
     },
@@ -91,6 +95,8 @@ enum Mode {
     ConfirmPoolDestroy,
     /// Confirming Reset for one Worker.
     ConfirmPoolReset(String),
+    /// Confirming Dismiss for one Worker.
+    ConfirmPoolDismiss(String),
     /// The `?` help overlay is open (a pure UI mode - no state is mutated).
     Help,
     /// The full-screen diff-detail view for one workspace (ADR 0008).
@@ -224,6 +230,8 @@ pub struct App {
     worker_log: Option<crate::workspace_dispatch::WorkerLogSnapshot>,
     /// The latest selected-Worker Follow-up Session outcome.
     worker_session: Option<WorkerSessionOutcome>,
+    /// The latest typed non-Run Worker action result.
+    worker_command_result: Option<WorkerCommandResult>,
     /// Latest Worker log failure retained for the focused detail view.
     worker_log_error: Option<String>,
     /// Latest ordered Direct Dispatch outcomes for the Pool view.
@@ -307,6 +315,7 @@ impl App {
             worker_log_operation: None,
             worker_log: None,
             worker_session: None,
+            worker_command_result: None,
             worker_log_error: None,
             dispatch_result: None,
             ready_tickets: None,
@@ -531,6 +540,14 @@ impl App {
                         outcome.run()
                     ));
                     self.refresh_worker_pool();
+                }
+            }
+            WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result } => {
+                if self.active_operation == Some(operation) {
+                    self.worker_command_result = Some(result.clone());
+                    self.active_operation = None;
+                    self.refresh_worker_pool();
+                    self.set_status(result.notice());
                 }
             }
             WorkspaceDispatchEvent::WorkspaceRestorationCompleted {
@@ -775,6 +792,7 @@ impl App {
             Mode::ConfirmPoolShrink(_, _) => self.on_key_confirm_pool_shrink(key),
             Mode::ConfirmPoolDestroy => self.on_key_confirm_pool_destroy(key),
             Mode::ConfirmPoolReset(_) => self.on_key_confirm_pool_reset(key),
+            Mode::ConfirmPoolDismiss(_) => self.on_key_confirm_pool_dismiss(key),
             Mode::Help => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
             Mode::Graph(_) => self.on_key_graph(key),
@@ -1001,6 +1019,64 @@ impl App {
                         self.review_worker(worker);
                     }
                 }
+                KeyCode::Char('e') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before editing its alias".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    let alias = self
+                        .worker_pool
+                        .as_ref()
+                        .and_then(|snapshot| snapshot.worker(&worker))
+                        .map_or_else(String::new, |worker| worker.alias().to_owned());
+                    self.mode = Mode::Pool(PoolMode::AliasInput {
+                        worker,
+                        buffer: alias,
+                    });
+                }
+                KeyCode::Char('x') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before Dismiss".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    self.mode = Mode::ConfirmPoolDismiss(worker);
+                }
+                KeyCode::Char('g') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before Rebase".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker.clone()),
+                    });
+                    self.start_worker_command(WorkspaceDispatchCommand::Rebase {
+                        operation: 0,
+                        worker,
+                    });
+                }
+                KeyCode::Char('P') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status(
+                            "Select a Worker before opening its Pull Request".to_owned(),
+                        );
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker.clone()),
+                    });
+                    self.start_worker_command(WorkspaceDispatchCommand::OpenPullRequest {
+                        operation: 0,
+                        worker,
+                    });
+                }
                 KeyCode::Char('a') => self.discover_ready_tickets(),
                 KeyCode::Char('o') => {
                     self.mode = Mode::Pool(PoolMode::ParentInput {
@@ -1066,6 +1142,28 @@ impl App {
                     }
                 },
                 _ => self.mode = Mode::Pool(PoolMode::Capacity { buffer, selected }),
+            },
+            Mode::Pool(PoolMode::AliasInput { worker, mut buffer }) => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker),
+                    });
+                }
+                KeyCode::Backspace => {
+                    buffer.pop();
+                    self.mode = Mode::Pool(PoolMode::AliasInput { worker, buffer });
+                }
+                KeyCode::Char(c) if !c.is_control() => {
+                    buffer.push(c);
+                    self.mode = Mode::Pool(PoolMode::AliasInput { worker, buffer });
+                }
+                KeyCode::Enter => {
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker.clone()),
+                    });
+                    self.set_worker_alias(worker, buffer);
+                }
+                _ => self.mode = Mode::Pool(PoolMode::AliasInput { worker, buffer }),
             },
             Mode::Pool(PoolMode::SendInput { worker, mut buffer }) => match key.code {
                 KeyCode::Esc => {
@@ -1226,6 +1324,42 @@ impl App {
             .submit(WorkspaceDispatchCommand::Review { operation, worker });
     }
 
+    fn start_worker_command(&mut self, command: WorkspaceDispatchCommand) {
+        let operation = self.begin_dispatch();
+        let command = match command {
+            WorkspaceDispatchCommand::Rebase { worker, .. } => {
+                self.pin_status("rebasing Worker...".to_owned());
+                WorkspaceDispatchCommand::Rebase { operation, worker }
+            }
+            WorkspaceDispatchCommand::OpenPullRequest { worker, .. } => {
+                self.pin_status("opening Worker Pull Request...".to_owned());
+                WorkspaceDispatchCommand::OpenPullRequest { operation, worker }
+            }
+            WorkspaceDispatchCommand::SetAlias { worker, alias, .. } => {
+                self.pin_status("saving Worker alias...".to_owned());
+                WorkspaceDispatchCommand::SetAlias {
+                    operation,
+                    worker,
+                    alias,
+                }
+            }
+            WorkspaceDispatchCommand::Dismiss { worker, .. } => {
+                self.pin_status("dismissing Worker...".to_owned());
+                WorkspaceDispatchCommand::Dismiss { operation, worker }
+            }
+            _ => return,
+        };
+        self.dispatch.submit(command);
+    }
+
+    fn set_worker_alias(&mut self, worker: String, alias: String) {
+        self.start_worker_command(WorkspaceDispatchCommand::SetAlias {
+            operation: 0,
+            worker,
+            alias,
+        });
+    }
+
     fn discover_ready_tickets(&mut self) {
         let operation = self.begin_dispatch();
         self.pin_status("discovering Ready Tickets...".to_string());
@@ -1315,6 +1449,30 @@ impl App {
                 self.pin_status(format!("resetting Worker {worker}..."));
                 self.dispatch
                     .submit(WorkspaceDispatchCommand::Reset { operation, worker });
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: Some(worker),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    fn on_key_confirm_pool_dismiss(&mut self, key: KeyEvent) {
+        let Mode::ConfirmPoolDismiss(worker) = &self.mode else {
+            return;
+        };
+        let worker = worker.clone();
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: Some(worker.clone()),
+                });
+                self.start_worker_command(WorkspaceDispatchCommand::Dismiss {
+                    operation: 0,
+                    worker,
+                });
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Pool(PoolMode::View {
@@ -1974,7 +2132,8 @@ impl App {
                 | Mode::Pool(PoolMode::ConfirmDispatchCapacity {
                     worker: selected, ..
                 }) => selected.as_deref(),
-                Mode::Pool(PoolMode::SendInput { worker, .. }) => Some(worker.as_str()),
+                Mode::Pool(PoolMode::SendInput { worker, .. })
+                | Mode::Pool(PoolMode::AliasInput { worker, .. }) => Some(worker.as_str()),
                 Mode::Pool(PoolMode::ParentInput { .. }) => None,
                 Mode::Pool(PoolMode::LogDetail { worker }) => Some(worker.as_str()),
                 _ => None,
@@ -2093,6 +2252,9 @@ impl App {
                     session.pid()
                 )));
                 lines.push(Line::from(format!("  {session_text}")));
+            }
+            if let Some(result) = &self.worker_command_result {
+                lines.push(dim_line(&format!(" Worker action: {}", result.notice())));
             }
             if let Some(result) = &self.dispatch_result {
                 lines.push(dim_line(" Dispatch outcomes:"));
@@ -2454,7 +2616,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  s send  v review  o orchestrate  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  s send  v review  g rebase  P PR  e alias  x dismiss  o orchestrate  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -2467,6 +2629,10 @@ impl App {
             )),
             Mode::Pool(PoolMode::SendInput { worker, buffer }) => Paragraph::new(Span::styled(
                 format!(" Send to {worker}: {buffer}_  (enter send, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::AliasInput { worker, buffer }) => Paragraph::new(Span::styled(
+                format!(" Alias for {worker}: {buffer}_  (enter save, esc cancel) "),
                 Style::default().fg(Color::Cyan),
             )),
             Mode::Pool(PoolMode::DispatchPreview { tickets, .. }) => Paragraph::new(Span::styled(
@@ -2507,6 +2673,10 @@ impl App {
             )),
             Mode::ConfirmPoolReset(worker) => Paragraph::new(Span::styled(
                 format!(" reset Worker {worker} and restore its Workspace? (y/n) "),
+                Style::default().fg(Color::Red),
+            )),
+            Mode::ConfirmPoolDismiss(worker) => Paragraph::new(Span::styled(
+                format!(" dismiss Worker {worker}? (y/n) "),
                 Style::default().fg(Color::Red),
             )),
             Mode::Normal => match (&self.pending_workspace, &self.status) {
@@ -4013,6 +4183,105 @@ mod tests {
             text.contains("fresh session (log has no session id yet)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn pool_worker_actions_use_keys_confirmation_and_visible_results() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"},"agent":"claude"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let adapter = RecordingAdapter::new(snapshot.clone());
+        let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
+        let mut app = app_with(&["default", "worker-01"]);
+        app.worker_pool = Some(snapshot);
+        app.dispatch = controller;
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        app.handle(press(KeyCode::Char('e')));
+        assert!(
+            matches!(app.mode, Mode::Pool(PoolMode::AliasInput { ref worker, .. }) if worker == "worker-01")
+        );
+        app.handle(press(KeyCode::Char('e')));
+        for _ in 0..5 {
+            app.handle(press(KeyCode::Backspace));
+        }
+        for character in "primary".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation: app.active_operation.unwrap(),
+                result: WorkerCommandResult::AliasChanged {
+                    worker: "worker-01".to_owned(),
+                    alias: Some("primary".to_owned()),
+                },
+            },
+        ));
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("primary"))
+        );
+
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+        app.handle(press(KeyCode::Char('x')));
+        assert!(matches!(app.mode, Mode::ConfirmPoolDismiss(ref worker) if worker == "worker-01"));
+        app.handle(press(KeyCode::Char('n')));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        app.handle(press(KeyCode::Char('x')));
+        app.handle(press(KeyCode::Char('y')));
+        for _ in 0..100 {
+            if adapter.commands().iter().any(|command| {
+                matches!(command, WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01")
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01"
+        )));
+
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+        app.handle(press(KeyCode::Char('g')));
+        app.handle(press(KeyCode::Char('P')));
+        for _ in 0..100 {
+            if adapter.commands().iter().any(|command| {
+                matches!(command, WorkspaceDispatchCommand::OpenPullRequest { worker, .. } if worker == "worker-01")
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Rebase { worker, .. } if worker == "worker-01"
+        )));
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::OpenPullRequest { worker, .. } if worker == "worker-01"
+        )));
     }
 
     #[test]

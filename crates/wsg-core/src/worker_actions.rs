@@ -12,7 +12,7 @@ use thiserror::Error;
 use crate::{
     AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError, AgentSessionResolution,
     BackgroundRun, CompletedRun, Loaded, Repository, RunLog, RunSupervisor, RunSupervisorError,
-    WorkerId, WorkerPoolError, resolve_agent_session,
+    WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -85,6 +85,15 @@ impl ResetOutcome {
     pub fn into_restoration(self) -> WorkspaceRestoration {
         self.restoration
     }
+}
+
+/// The compatibility outcome of dismissing one Worker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DismissOutcome {
+    /// An idle Worker was removed from the Pool.
+    Removed { capacity: usize },
+    /// A terminal Worker was cleared in place and kept its Workspace.
+    Reset,
 }
 
 /// Workspace restoration scheduled after a Reset releases capacity.
@@ -373,6 +382,39 @@ impl WorkerActions {
             WorkspaceRestoration::SkippedMissingWorkspace
         };
         Ok(ResetOutcome { run, restoration })
+    }
+
+    /// Dismisses an idle Worker from the Pool or clears a terminal Worker in place.
+    ///
+    /// Busy Workers are rejected. Terminal Workers are deliberately cleared
+    /// without Workspace restoration so their failed or completed contents can
+    /// still be inspected, matching the compatibility TUI behavior.
+    pub fn dismiss(&self, worker: &WorkerId) -> Result<DismissOutcome, WorkerActionError> {
+        let pool = self.repository.worker_pool();
+        let snapshot = pool.reconcile_runs();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        match state.status() {
+            WorkerStatus::Busy => Err(WorkerActionError::WorkerPool(
+                WorkerPoolError::WorkerNotIdle {
+                    worker: worker.clone(),
+                },
+            )),
+            WorkerStatus::Idle => {
+                let resize = pool.remove(worker.clone())?;
+                Ok(DismissOutcome::Removed {
+                    capacity: resize.capacity().as_usize(),
+                })
+            }
+            WorkerStatus::Done | WorkerStatus::Failed => {
+                pool.clear_terminal(worker)?;
+                Ok(DismissOutcome::Reset)
+            }
+        }
     }
 
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
