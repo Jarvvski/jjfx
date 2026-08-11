@@ -1,0 +1,127 @@
+{
+  "runId": "5eaf6115",
+  "agent": "reviewer",
+  "task": "[Read from: /Users/jarvis/Code/personal/jjfx/AGENTS.md, /Users/jarvis/Code/personal/jjfx/CLAUDE.md, /Users/jarvis/Code/personal/jjfx/CONTEXT.md, /Users/jarvis/Code/personal/jjfx/src/lib.rs, /Users/jarvis/Code/personal/jjfx/src/main.rs, /Users/jarvis/Code/personal/jjfx/src/tui.rs, /Users/jarvis/Code/personal/jjfx/src/app.rs, /Users/jarvis/Code/personal/jjfx/crates/wsg/src/cli.rs, /Users/jarvis/Code/personal/jjfx/crates/wsg/tests/tui.rs, /Users/jarvis/Code/personal/jjfx/Cargo.toml, /Users/jarvis/Code/personal/jjfx/crates/wsg/Cargo.toml]\n\nStandards review, read-only. Review the jjfx changes from revision loyolw through @ using jj diff --from loyolw --to @ and jj log -r 'loyolw..@'. Read AGENTS.md, CLAUDE.md, CONTEXT.md, and the TDD/codebase-design rules. Report under 400 words: documented-standard violations per file/hunk, plus judgment-call Fowler smells (mysterious name, duplication, feature envy, data clumps, primitive obsession, repeated switches, shotgun surgery, divergent change, speculative generality, message chains, middle man, refused bequest). Never use Git and do not modify files.",
+  "exitCode": 0,
+  "usage": {
+    "input": 15,
+    "output": 4496,
+    "cacheRead": 116175,
+    "cacheWrite": 44447,
+    "cost": 0.018833449999999998,
+    "turns": 5
+  },
+  "model": "openai/gpt-5.6-luna:high",
+  "attemptedModels": [
+    "openai/gpt-5.6-luna:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "openai/gpt-5.6-luna:high",
+      "success": false,
+      "exitCode": -2,
+      "usage": {
+        "input": 6,
+        "output": 629,
+        "cacheRead": 6184,
+        "cacheWrite": 35340,
+        "cost": 0.00971468,
+        "turns": 2
+      }
+    }
+  ],
+  "durationMs": 116355,
+  "toolCount": 22,
+  "acceptance": {
+    "status": "attested",
+    "explicit": true,
+    "effectiveAcceptance": {
+      "level": "attested",
+      "explicit": true,
+      "inferredReason": [
+        "read-only/reviewer-style agent"
+      ],
+      "criteria": [
+        {
+          "id": "criterion-1",
+          "must": "Return concrete findings with file paths and severity when applicable",
+          "evidence": [
+            "review-findings",
+            "residual-risks"
+          ],
+          "severity": "required"
+        }
+      ],
+      "evidence": [
+        "review-findings",
+        "residual-risks"
+      ],
+      "verify": [],
+      "stopRules": []
+    },
+    "inferredReason": [
+      "read-only/reviewer-style agent"
+    ],
+    "criteria": [
+      {
+        "id": "criterion-1",
+        "must": "Return concrete findings with file paths and severity when applicable",
+        "evidence": [
+          "review-findings",
+          "residual-risks"
+        ],
+        "severity": "required"
+      }
+    ],
+    "runtimeChecks": [],
+    "verifyRuns": [],
+    "childReport": {
+      "criteriaSatisfied": [
+        {
+          "id": "criterion-1",
+          "status": "satisfied",
+          "evidence": "Concrete file-and-line findings and severity are listed above; no blocker was confirmed."
+        }
+      ],
+      "changedFiles": [
+        "src/lib.rs",
+        "src/tui.rs",
+        "src/app.rs",
+        "crates/wsg/src/cli.rs",
+        "crates/wsg/tests/tui.rs"
+      ],
+      "testsAddedOrUpdated": [
+        "crates/wsg/tests/tui.rs"
+      ],
+      "commandsRun": [
+        {
+          "command": "jj diff --from loyolw --to @",
+          "result": "not-run",
+          "summary": "Shell/jj execution was unavailable in this review runtime."
+        },
+        {
+          "command": "jj log -r 'loyolw..@'",
+          "result": "not-run",
+          "summary": "Shell/jj execution was unavailable in this review runtime."
+        }
+      ],
+      "validationOutput": [
+        "Inspected the current changed-scope files and reviewed the four supplied focused changes."
+      ],
+      "residualRisks": [
+        "Duplicated RunActivityKind formatting may drift.",
+        "Global panic hook can restore an inactive terminal session."
+      ],
+      "noStagedFiles": true,
+      "diffSummary": "Shared launcher, contextual Worker UI rendering, terminal restoration hardening, and PTY coverage.",
+      "reviewFindings": [
+        "note: src/app.rs:2779-2800 duplicates crates/wsg/src/cli.rs:924-947 activity rendering.",
+        "note: src/app.rs:989-1318 contains repeated Pool worker-selection and mode-transition logic.",
+        "no blockers found"
+      ],
+      "manualNotes": "Root AGENTS.md was unavailable at the requested path."
+    }
+  },
+  "transcriptPath": "/Users/jarvis/Code/personal/jjfx/.pi-subagents/artifacts/5eaf6115_reviewer_0_transcript.jsonl",
+  "timestamp": 1786467703079
+}

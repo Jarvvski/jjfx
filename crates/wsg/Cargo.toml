@@ -11,6 +11,7 @@ jjfx = { path = "../.." }
 wsg-core = { path = "../wsg-core" }
 
 [dev-dependencies]
+jjfx = { path = "../..", features = ["test-support"] }
 portable-pty = "0.9"
 tempfile = "3"
 wsg-core = { path = "../wsg-core" }

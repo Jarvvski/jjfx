@@ -1,0 +1,8 @@
+## Review
+- **Correct:** `src/lib.rs` centralizes shared TUI startup for `jjfx` and `wsg`; `crates/wsg/src/cli.rs` remains a thin CLI adapter. `src/tui.rs` restores both raw mode and alternate screen even when the first cleanup operation fails.
+- **Correct:** `crates/wsg/tests/tui.rs` covers interactive entry for both binaries and panic-time terminal restoration through a PTY. Test-only `expect`/`unwrap` usage complies with the documented Rust rules.
+- **Note:** **Duplication / divergent change risk**, `src/app.rs:2779-2800` and `crates/wsg/src/cli.rs:924-947` - `render_activity` independently matches every `RunActivityKind` variant with effectively duplicated formatting logic. A new activity variant can compile while only one renderer is updated. Centralize provider-neutral activity formatting or share a renderer.
+- **Note:** **Duplication / repeated switches**, `src/app.rs:989-1318` - Pool key handling repeatedly performs selected-worker fallback, busy checks, and `Mode::Pool(View { ... })` reconstruction. This is readable now but creates divergent behavior risk as Worker actions grow.
+- **Residual risk:** `src/tui.rs:76-83` installs a process-global panic hook once. A later panic outside an active TUI session still invokes `restore()`, potentially emitting terminal control sequences to a normal terminal.
+- **No blocker found.** No confirmed documented-standard violation in the reviewed change scope.
+- The requested root `AGENTS.md` was absent (`ENOENT`), so that file could not be evaluated.

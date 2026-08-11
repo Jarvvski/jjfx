@@ -37,6 +37,16 @@ use wsg_core as _;
 use crate::app::{App, AppConfig, Msg};
 use crate::store::Store;
 
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support {
+    /// Enter the terminal and panic, for an external PTY restoration test.
+    pub fn panic_after_tui_init() -> ! {
+        let _session = crate::tui::Session::enter().expect("test PTY should enter");
+        panic!("intentional terminal restoration test panic");
+    }
+}
+
 /// Run the jjfx binary's argument router.
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // `--version`/`-V` prints "jjfx <version>" and exits before any repo or
@@ -146,12 +156,16 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     let (worker_tx, worker_rx) = mpsc::unbounded_channel::<()>();
     spawn_worker_pool_poller(app.workspace_dispatch_controller(), worker_rx);
 
-    let mut terminal = tui::init()?;
-    let result = event_loop(&mut terminal, &mut rx, &mut app, work_tx, worker_tx).await;
-
-    // Always restore, then surface any loop error.
-    tui::restore()?;
-    terminal.show_cursor().ok();
+    let mut session = tui::Session::enter()?;
+    let result = event_loop(
+        session.terminal_mut(),
+        &mut rx,
+        &mut app,
+        work_tx,
+        worker_tx,
+    )
+    .await;
+    let restore_result = session.restore();
 
     // Persist the UI toggles. Best-effort: a failed write of a nicety must not
     // turn a clean quit into an error.
@@ -159,7 +173,11 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         world_pane: app.world_pane(),
     })
     .ok();
-    result
+
+    match result {
+        Ok(()) => restore_result.map_err(Into::into),
+        Err(error) => Err(error),
+    }
 }
 
 async fn event_loop(

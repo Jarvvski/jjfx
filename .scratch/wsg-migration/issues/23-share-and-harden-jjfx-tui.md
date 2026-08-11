@@ -1,6 +1,6 @@
 # Share and harden the jjfx TUI across jjfx and wsg
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 
