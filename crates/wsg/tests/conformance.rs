@@ -3,12 +3,13 @@
 mod support;
 
 use std::env;
+use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use support::{BinarySpec, ConformanceBinaries};
 
@@ -303,6 +304,85 @@ fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
 
 #[test]
 #[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn dispatch_group_progress_created_and_resumed_across_implementations() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    run_dispatch_group_scenario(&binaries.go, &binaries.rust, "map");
+    run_dispatch_group_scenario(&binaries.rust, &binaries.go, "array");
+}
+
+fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, graph_shape: &str) {
+    let directory = support::local_repository();
+    let runtime_directory = directory.path().join("fake-runtime");
+    fs::create_dir(&runtime_directory).expect("fake runtime directory should be created");
+    write_executable(
+        &runtime_directory.join("claude"),
+        "#!/bin/sh\ncase \"$*\" in *'--output-format json'*) if [ \"$WSG_GROUP_RUNTIME_SHAPE\" = \"map\" ]; then printf '%s\\n' '{\"sub_issues\":{\"ENG-101\":{\"title\":\"First\",\"status\":\"Todo\",\"blocked_by\":[],\"cross_repo\":false},\"ENG-102\":{\"title\":\"Second\",\"status\":\"Todo\",\"blocked_by\":[\"ENG-101\"],\"cross_repo\":false}}}'; else printf '%s\\n' '{\"sub_issues\":[{\"id\":\"ENG-101\",\"title\":\"First\",\"status\":\"Todo\",\"blocked_by\":[],\"cross_repo\":false},{\"id\":\"ENG-102\",\"title\":\"Second\",\"status\":\"Todo\",\"blocked_by\":[\"ENG-101\"],\"cross_repo\":false}]}'; fi; exit 0;; esac\nif [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Usage: claude --forward-subagent-text'; exit 0; fi\nprintf '%s\\n' \"$$\" > \"$WSG_GROUP_RUNTIME_PID_FILE\"\nif [ \"$WSG_GROUP_RUNTIME_MODE\" = \"hold\" ]; then while :; do sleep 0.05; done; fi\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n",
+    );
+    let pid_file = directory.path().join("group-runtime.pid");
+    let current_path = env::var_os("PATH").expect("PATH should be configured");
+    let mut paths = vec![runtime_directory];
+    paths.extend(env::split_paths(&current_path));
+    let path = env::join_paths(paths).expect("fake runtime PATH should be valid");
+    let group_path = directory.path().join(".jj/pool/dispatch-eng-100.json");
+    let hold_environment = [
+        ("PATH", path.as_os_str()),
+        ("WSG_GROUP_RUNTIME_MODE", OsStr::new("hold")),
+        ("WSG_GROUP_RUNTIME_SHAPE", OsStr::new(graph_shape)),
+        ("WSG_GROUP_RUNTIME_PID_FILE", pid_file.as_os_str()),
+    ];
+
+    let create = creator.run_with_environment(directory.path(), &["pool", "2"], &hold_environment);
+    assert_success("Dispatch Group Pool create", &create);
+    let mut first_run = Some(
+        Command::new(creator.path())
+            .args(["__orchestrate", "ENG-100"])
+            .current_dir(directory.path())
+            .envs(hold_environment.iter().copied())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("initial orchestration should spawn"),
+    );
+    wait_for_child_file(&group_path, &mut first_run);
+    let (worker, leader) = support::wait_for_busy_worker(directory.path());
+    support::wait_for_file(&pid_file);
+    let process_guard = support::ProcessTreeGuard::new(leader);
+    let mut first_run = first_run
+        .take()
+        .expect("initial orchestration child should remain running");
+    first_run.kill().expect("initial orchestration should stop");
+    drop(process_guard);
+    let _ = first_run
+        .wait_with_output()
+        .expect("initial orchestration should finish");
+    support::mark_worker_done(directory.path(), &worker, "ENG-101");
+
+    let restart_environment = [
+        ("PATH", path.as_os_str()),
+        ("WSG_GROUP_RUNTIME_MODE", OsStr::new("complete")),
+        ("WSG_GROUP_RUNTIME_SHAPE", OsStr::new(graph_shape)),
+        ("WSG_GROUP_RUNTIME_PID_FILE", pid_file.as_os_str()),
+    ];
+    let restart = Command::new(reconciler.path())
+        .args(["__orchestrate", "ENG-100"])
+        .current_dir(directory.path())
+        .envs(restart_environment.iter().copied())
+        .output()
+        .expect("resumed orchestration should run");
+    let restart_output = support::CommandOutcome::from(restart);
+    assert_success("resumed orchestration", &restart_output);
+    let (done, failed, skipped, total) = support::dispatch_group_counts(directory.path());
+    assert_eq!((failed, skipped), (0, 0));
+    assert_eq!(done, total);
+    assert_eq!(total, 2);
+    let status = reconciler.run(directory.path(), &["status"]);
+    assert_success("resumed Pool status", &status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("idle"));
+}
+
+#[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
 fn runtime_process_groups_are_reconciled_across_implementations() {
     let binaries =
         ConformanceBinaries::from_environment().expect("oracle paths should be configured");
@@ -367,6 +447,36 @@ fn run_runtime_scenario(creator: &BinarySpec, reconciler: &BinarySpec) {
 #[ignore = "helper invoked by mixed conformance tests"]
 fn conformance_lock_helper() {
     support::run_lock_helper();
+}
+
+fn wait_for_child_file(path: &Path, child: &mut Option<Child>) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        if let Some(status) = child
+            .as_mut()
+            .expect("orchestration child")
+            .try_wait()
+            .expect("orchestration status should be readable")
+        {
+            let output = child
+                .take()
+                .expect("orchestration child")
+                .wait_with_output()
+                .expect("orchestration output should be readable");
+            panic!(
+                "orchestration exited {status} before {}: stdout={} stderr={}",
+                path.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn assert_success(label: &str, output: &support::CommandOutcome) {

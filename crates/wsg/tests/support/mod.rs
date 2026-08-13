@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
 use tempfile::TempDir;
-use wsg_core::{Expected, Loaded, Repository, StateChange, WireStatus};
+use wsg_core::{DispatchGroup, Expected, Loaded, Repository, StateChange, TicketId, WireStatus};
 
 const LOCK_HOLDER_MODE: &str = "WSG_CONFORMANCE_LOCK_HOLDER_MODE";
 const LOCK_HOLDER_PATH: &str = "WSG_CONFORMANCE_LOCK_HOLDER_PATH";
@@ -152,6 +152,54 @@ fn wait_for_child(mut child: Child) {
     }
 }
 
+pub(crate) fn wait_for_busy_worker(root: &Path) -> (String, u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let repository = Repository::open(root).expect("repository should open");
+        if let Loaded::Present(pool) = repository
+            .state_store()
+            .pool()
+            .load()
+            .expect("Pool should load")
+        {
+            for worker in &pool.value.workers {
+                let Loaded::Present(state) = repository
+                    .state_store()
+                    .worker(worker.clone())
+                    .load()
+                    .expect("Worker should load")
+                else {
+                    continue;
+                };
+                if state.value.status.as_str() == "busy"
+                    && let Some(pid) = state.value.pid.and_then(|pid| u32::try_from(pid).ok())
+                {
+                    return (worker.to_string(), pid);
+                }
+            }
+        }
+        assert!(Instant::now() < deadline, "no busy Worker appeared");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+pub(crate) fn dispatch_group_counts(root: &Path) -> (usize, usize, usize, usize) {
+    let repository = Repository::open(root).expect("repository should open");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket should parse");
+    let Loaded::Present(state) = repository
+        .state_store()
+        .dispatch_group(parent)
+        .load()
+        .expect("Dispatch Group should load")
+    else {
+        panic!("Dispatch Group should exist");
+    };
+    let total = state.value.sub_issues.len();
+    let group = DispatchGroup::from_state(state.value).expect("Dispatch Group should validate");
+    let counts = group.status_counts();
+    (counts.done(), counts.failed(), counts.skipped(), total)
+}
+
 pub(crate) fn first_worker(root: &Path) -> String {
     let repository = Repository::open(root).expect("repository should open");
     let Loaded::Present(pool) = repository
@@ -167,6 +215,27 @@ pub(crate) fn first_worker(root: &Path) -> String {
         .first()
         .expect("Pool should have one Worker")
         .to_string()
+}
+
+pub(crate) fn mark_worker_done(root: &Path, worker: &str, ticket: &str) {
+    let repository = Repository::open(root).expect("repository should open");
+    let worker = wsg_core::WorkerId::parse(worker).expect("Worker ID should be valid");
+    let state = repository.state_store().worker(worker);
+    let Loaded::Present(versioned) = state.load().expect("Worker should load") else {
+        panic!("Worker should exist");
+    };
+    let (mut worker_state, revision) = versioned.into_parts();
+    worker_state.status = WireStatus::new("done");
+    worker_state.ticket = Some(ticket.to_owned());
+    worker_state.pid = None;
+    worker_state.exit_code = Some(0);
+    worker_state.completed_at = Some(wsg_core::WireTimestamp::new("2026-08-13T00:00:00Z"));
+    state
+        .commit(
+            Expected::Match(revision),
+            StateChange::Replace(worker_state),
+        )
+        .expect("done Worker fixture should commit");
 }
 
 pub(crate) fn recorded_worker_pid(root: &Path, worker: &str) -> u32 {
