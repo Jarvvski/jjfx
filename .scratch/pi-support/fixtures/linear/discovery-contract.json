@@ -1,0 +1,21 @@
+{
+  "kind":"pi-linear-discovery-contract",
+  "capability":"linear-read-only-discovery",
+  "requiredTools":["list_issues","get_issue"],
+  "requiredConfiguration":[
+    "Explicit Pi MCP adapter plus a named Linear server, or a dedicated helper.",
+    "Read-only credentials supplied through the configured transport, never embedded in prompts or command arguments.",
+    "A static allowlist and bounded request timeout.",
+    "A response schema that validates issue id, identifier, title, labels, status, and repository metadata before dispatch."
+  ],
+  "safeInvocation":"Use Pi JSON mode only when the configured capability is the selected adapter. Disable sessions, project resources, unneeded extensions, and write-capable tools.",
+  "failureRules":{
+    "notConfigured":"unsupported capability; surface actionable configuration error",
+    "toolNotRegistered":"unsupported capability; do not return an empty result",
+    "authentication":"surface auth failure; retry only when transport marks it transient",
+    "timeoutOrServerUnavailable":"transient query failure after bounded retry policy",
+    "malformedResponse":"permanent adapter-contract failure with sanitized diagnostic",
+    "otherRuntime":"never fall back to Claude or Codex"
+  },
+  "outOfScope":"Live Linear credentials and production helper implementation are not part of this spike."
+}

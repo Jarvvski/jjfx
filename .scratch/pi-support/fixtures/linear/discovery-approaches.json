@@ -1,0 +1,26 @@
+{
+  "kind": "linear-discovery-transport-comparison",
+  "approaches": [
+    {
+      "name":"Pi-native MCP",
+      "status":"unsupported",
+      "evidence":"Pi core has no built-in MCP contract or Linear-specific tool. The installed CLI only exposes provider/model/tool controls; the mcp tool appeared only after loading the optional adapter.",
+      "decision":"Do not infer MCP availability from Pi installation. Return an explicit unsupported-capability error."
+    },
+    {
+      "name":"Pi MCP adapter through model tool calls",
+      "status":"conditionally-supported",
+      "evidence":"The installed pi-mcp-adapter 2.11.0 registered an mcp proxy and configured direct tools. With an isolated fixture MCP server, search returned linear_list_issues and linear_get_issue, and a direct linear_list_issues call returned bounded JSON.",
+      "limits":"This is an optional extension/configuration, not a stable Pi core API. Proxy search is discovery-oriented and model-mediated; direct tool names and schemas must be preflighted. No configured server produced no matching Linear tools.",
+      "decision":"Accept only as an explicitly configured capability with a static direct-tool allowlist and schema validation. Never auto-install, auto-adopt host configs, or silently use another runtime."
+    },
+    {
+      "name":"Dedicated read-only helper",
+      "status":"preferred-host-seam",
+      "evidence":"A helper can speak the configured Linear API or MCP server directly and return schema-bound JSON without spending a Pi model turn or trusting model-generated discovery text.",
+      "limits":"No helper is part of this spike or the current repository. It must be supplied and configured separately.",
+      "decision":"Keep Pi worker execution and Linear discovery separate. Use this seam when implementation ticket 03 supplies a helper capability; otherwise report discovery unsupported."
+    }
+  ],
+  "nonNegotiable":"The Pi adapter must not fall back to Claude or Codex discovery commands."
+}

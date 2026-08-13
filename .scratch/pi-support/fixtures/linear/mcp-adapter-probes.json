@@ -1,0 +1,23 @@
+{
+  "kind": "observed-pi-mcp-adapter-probes",
+  "adapterVersion":"2.11.0",
+  "isolation":"temporary Pi agent directory and fixture MCP server; no Linear credentials",
+  "noConfiguredServer": {
+    "tool":"mcp",
+    "args":{"search":"Linear"},
+    "result":{"isError":false,"text":"No tools matching \\\"Linear\\\"","matches":[]},
+    "contract":"Absence is not a successful discovery result; the host must preflight and convert it to unsupported capability."
+  },
+  "configuredReadOnlyServer": {
+    "server":"linear",
+    "configuredDirectTools":["list_issues","get_issue"],
+    "searchResult":{"matches":["linear_list_issues","linear_get_issue"]},
+    "directCall":{"tool":"linear_list_issues","args":{"label":"ready-for-agent"},"isError":false,"details":{"server":"linear","tool":"list_issues"},"resultShape":{"issues":[{"id":"<id>","identifier":"<identifier>","title":"<title>"}]}},
+    "contract":"Use exact preflighted direct names and validate the returned JSON before converting to provider-neutral tickets."
+  },
+  "missingConfiguredServer": {
+    "configuredDirectTool":"linear_list_issues",
+    "observed":"The direct tool was not registered and Pi returned Tool linear_list_issues not found.",
+    "contract":"Missing or unavailable configured access is an explicit unsupported-capability error, not an empty ticket list."
+  }
+}
