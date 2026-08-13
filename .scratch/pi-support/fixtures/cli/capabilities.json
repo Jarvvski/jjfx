@@ -1,0 +1,77 @@
+{
+  "kind": "observed-cli-contract",
+  "testedPackage": "@earendil-works/pi-coding-agent",
+  "testedVersion": "0.84.1",
+  "testedExecutable": "/Users/<user>/.local/share/mise/installs/node/26.4.0/lib/node_modules/@earendil-works/pi-coding-agent/dist/cli.js",
+  "testedExecutableSha256": "840d1e8e689ed9e4937bcb00b9a810e02a8567d9afb10a47097f11ca93ea1521",
+  "isolation": {
+    "workingDirectory": "/tmp/<spike>/project",
+    "piConfigDirectory": "/tmp/<spike>/pi-agent",
+    "sessionDirectory": "/tmp/<spike>/sessions",
+    "offline": true,
+    "telemetry": false,
+    "discoveredResourcesDisabled": true,
+    "credentialsPassed": false
+  },
+  "observations": [
+    {
+      "mode": "version",
+      "command": ["pi", "--version"],
+      "documented": true,
+      "exitStatus": 0,
+      "stdout": "0.84.1",
+      "stderr": ""
+    },
+    {
+      "mode": "help",
+      "command": ["pi", "--help"],
+      "documented": true,
+      "exitStatus": 0,
+      "stdoutContains": ["--mode <mode>", "--print, -p", "--session <path|id>", "--fork <path|id>", "--extension, -e", "--no-extensions, -ne", "--tools, -t <tools>", "--approve, -a", "--no-approve, -na"],
+      "stderr": ""
+    },
+    {
+      "mode": "interactive",
+      "command": ["pi", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"],
+      "documented": true,
+      "transport": "pty",
+      "exitAction": "Ctrl-D",
+      "exitStatus": 0,
+      "observed": "Started the TUI, displayed v0.84.1 and a no-model warning, then exited cleanly on Ctrl-D."
+    },
+    {
+      "mode": "print",
+      "command": ["pi", "--print", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve", "contract probe"],
+      "documented": true,
+      "exitStatus": 1,
+      "stdout": "",
+      "stderrContains": ["No API key found for the selected model.", "Use /login to log into a provider via OAuth or API key."]
+    },
+    {
+      "mode": "json",
+      "command": ["pi", "--mode", "json", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve", "contract probe"],
+      "documented": true,
+      "exitStatus": 1,
+      "stdoutRecords": [
+        {"type": "session", "version": 3, "id": "<uuid>", "timestamp": "<iso8601>", "cwd": "/tmp/<spike>/project"}
+      ],
+      "stderrContains": ["No API key found for the selected model."]
+    },
+    {
+      "mode": "rpc",
+      "command": ["pi", "--mode", "rpc", "--no-session", "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-themes", "--no-context-files", "--no-approve"],
+      "documented": true,
+      "input": {"type": "get_state"},
+      "exitStatus": 0,
+      "responseContains": ["type", "response", "command", "get_state", "success", "data", "sessionId"],
+      "observed": "RPC remains usable without a model and exits after stdin EOF."
+    },
+    {
+      "mode": "invalid-option",
+      "command": ["pi", "--not-a-real-flag"],
+      "documented": false,
+      "exitStatus": 1,
+      "stderrContains": ["Unknown option: --not-a-real-flag"]
+    }
+  ]
+}
