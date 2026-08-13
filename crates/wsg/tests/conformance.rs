@@ -282,6 +282,101 @@ fn pool_growth_and_destruction_round_trip_between_each_binary() {
 }
 
 #[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn cli_contract_inventory_applies_to_both_binary_adapters() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    for binary in [&binaries.go, &binaries.rust] {
+        let directory = support::local_repository();
+        let root = directory
+            .path()
+            .canonicalize()
+            .expect("Repository root should resolve");
+
+        let version = binary.run(directory.path(), &["version"]);
+        assert_success("version", &version);
+        assert!(String::from_utf8_lossy(&version.stdout).starts_with("wsg "));
+        assert!(version.stderr.is_empty());
+
+        let version_alias = binary.run(directory.path(), &["--version"]);
+        assert_success("version alias", &version_alias);
+        assert_eq!(version.stdout, version_alias.stdout);
+        assert!(version_alias.stderr.is_empty());
+
+        let root_output = binary.run(directory.path(), &["root"]);
+        assert_success("root", &root_output);
+        assert_eq!(
+            root_output.stdout,
+            format!("{}\n", root.display()).as_bytes()
+        );
+        assert!(root_output.stderr.is_empty());
+
+        let where_output = binary.run(directory.path(), &["where"]);
+        let info_output = binary.run(directory.path(), &["info"]);
+        assert_success("where", &where_output);
+        assert_success("info", &info_output);
+        assert_eq!(where_output.stdout, info_output.stdout);
+        assert_eq!(where_output.stderr, info_output.stderr);
+
+        let add = binary.run(directory.path(), &["a", "contract-feature"]);
+        assert_success("add alias", &add);
+        assert!(!add.stdout.is_empty());
+        assert!(add.stderr.is_empty());
+        let list = binary.run(directory.path(), &["ls"]);
+        assert_success("list alias", &list);
+        assert!(String::from_utf8_lossy(&list.stdout).contains("contract-feature"));
+        let remove = binary.run(directory.path(), &["remove", "--force", "contract-feature"]);
+        assert_success("remove", &remove);
+        assert!(remove.stdout.is_empty());
+        assert!(!remove.stderr.is_empty());
+
+        let refresh = binary.run(directory.path(), &["sync"]);
+        assert_success("refresh alias", &refresh);
+        assert!(refresh.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&refresh.stderr).contains("Cache refreshed"));
+
+        let create = binary.run(directory.path(), &["pool", "1"]);
+        assert_success("pool create", &create);
+        let canonical = binary.run(directory.path(), &["pool", "list"]);
+        assert_success("pool list", &canonical);
+        for alias in [
+            &["pool"][..],
+            &["pool", "ls"][..],
+            &["pool", "status"][..],
+            &["status"][..],
+        ] {
+            let output = binary.run(directory.path(), alias);
+            assert_success("pool status alias", &output);
+            assert_eq!(output.stdout, canonical.stdout);
+            assert_eq!(output.stderr, canonical.stderr);
+        }
+        let destroy = binary.run(directory.path(), &["pool", "destroy"]);
+        assert_success("pool destroy", &destroy);
+        assert!(destroy.stdout.is_empty());
+
+        let completion = binary.run(directory.path(), &["completion", "zsh"]);
+        assert_success("completion", &completion);
+        assert!(!completion.stdout.is_empty());
+        assert!(completion.stderr.is_empty());
+
+        let unsupported = binary.run(directory.path(), &["completion", "bash"]);
+        assert!(!unsupported.status.success());
+        assert!(unsupported.stdout.is_empty());
+        assert!(!unsupported.stderr.is_empty());
+
+        let unknown = binary.run(directory.path(), &["not-a-command"]);
+        assert!(!unknown.status.success());
+        assert!(unknown.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&unknown.stderr).contains("Unknown command"));
+
+        let missing = binary.run(directory.path(), &["path"]);
+        assert!(!missing.status.success());
+        assert!(missing.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&missing.stderr).contains("Usage: wsg path"));
+    }
+}
+
+#[test]
 fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let go = directory.path().join("go-wsg");
