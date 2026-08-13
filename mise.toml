@@ -11,8 +11,8 @@ zig = "0.16.0"
 "cargo:cargo-zigbuild" = "0.23.0"
 
 [tasks.run]
-description = "Run the jjfx app"
-run = "cargo run -p jjfx"
+description = "Run the jjfx TUI"
+run = "cargo run -p jjfx -- tui"
 
 [tasks.build]
 description = "Build every workspace package"

@@ -2,13 +2,14 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 #[test]
 fn interactive_wsg_without_arguments_enters_the_shared_tui() {
-    let output = run_interactive(env!("CARGO_BIN_EXE_wsg"), "wsg");
+    let output = run_interactive(env!("CARGO_BIN_EXE_wsg"), "wsg", &[]);
     assert!(
         output.contains("\u{1b}[?1049h") && output.contains("\u{1b}[?1049l"),
         "interactive wsg should enter and leave the alternate screen: {output}"
@@ -56,15 +57,26 @@ fn panic_helper() {
 }
 
 #[test]
+fn jjfx_without_arguments_prints_cli_help() {
+    let output = Command::new(jjfx_binary())
+        .output()
+        .expect("jjfx should run without arguments");
+    assert!(
+        output.status.success(),
+        "jjfx help should succeed: {output:?}"
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("Usage: jjfx [OPTIONS]"),
+        "unexpected help: {stdout}"
+    );
+    assert!(!stdout.contains("\u{1b}[?1049h"));
+}
+
+#[test]
 fn interactive_jjfx_enters_the_same_tui() {
-    let binary = std::env::var_os("CARGO_BIN_EXE_jjfx")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/debug/jjfx")
-                .to_path_buf()
-        });
-    let output = run_interactive(&binary, "jjfx");
+    let binary = jjfx_binary();
+    let output = run_interactive(&binary, "jjfx", &["tui"]);
     assert!(
         output.contains("\u{1b}[?1049h") && output.contains("\u{1b}[?1049l"),
         "interactive jjfx should enter and leave the alternate screen: {output}"
@@ -75,7 +87,17 @@ fn interactive_jjfx_enters_the_same_tui() {
     );
 }
 
-fn run_interactive(binary: impl AsRef<Path>, name: &str) -> String {
+fn jjfx_binary() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_jjfx")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../target/debug/jjfx")
+                .to_path_buf()
+        })
+}
+
+fn run_interactive(binary: impl AsRef<Path>, name: &str, args: &[&str]) -> String {
     let repository = tempfile::tempdir().expect("temporary repository should be created");
     std::fs::create_dir(repository.path().join(".jj"))
         .expect("repository marker should be created");
@@ -89,6 +111,7 @@ fn run_interactive(binary: impl AsRef<Path>, name: &str) -> String {
         })
         .expect("PTY should open");
     let mut command = CommandBuilder::new(binary.as_ref());
+    command.args(args);
     command.cwd(repository.path());
     command.env("HOME", repository.path());
     command.env("XDG_CONFIG_HOME", repository.path().join("config"));

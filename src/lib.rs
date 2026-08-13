@@ -4,6 +4,7 @@ mod agent;
 mod app;
 mod attention;
 mod cache;
+mod cli;
 mod cmd;
 mod config;
 mod diff;
@@ -63,6 +64,21 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return hooks::run_cli(args.get(1).map(String::as_str));
     }
 
+    // The TUI is explicit. Bare `jjfx` is the non-interactive CLI and prints
+    // help, so scripts and shell completion never unexpectedly claim the
+    // terminal.
+    if args.is_empty() {
+        return cli::run(vec!["help".to_owned()], launch);
+    }
+    if args.first().map(String::as_str) == Some("tui") {
+        if args.len() != 1 {
+            anyhow::bail!("Usage: jjfx tui");
+        }
+        let cwd = std::env::current_dir().context("reading current directory")?;
+        let repo_root = repo::discover(&cwd)?;
+        return launch(repo_root);
+    }
+
     let cwd = std::env::current_dir().context("reading current directory")?;
     let repo_root = repo::discover(&cwd)?;
 
@@ -82,7 +98,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    launch(repo_root)
+    cli::run(args, launch)
 }
 
 /// Launch the shared interactive jjfx TUI for a discovered repository.

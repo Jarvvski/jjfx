@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "jjfx"
-version = "0.34.0"
+version = "0.35.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -13,6 +13,7 @@ test-support = []
 
 [dependencies]
 anyhow = "1"
+jiff = "0.2"
 wsg-core = { path = "crates/wsg-core" }
 ratatui = "0.29"
 notify = "8"

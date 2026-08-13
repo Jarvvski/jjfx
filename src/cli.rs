@@ -1,8 +1,11 @@
 use std::io::{IsTerminal, Read};
+use std::path::PathBuf;
 use std::str::FromStr;
 
 use anyhow::{Result, bail};
 use jiff::Timestamp;
+const PROGRAM: &str = env!("CARGO_PKG_NAME");
+
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, CapacityShortage, CleanDecision, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest, DispatchBudget,
@@ -11,43 +14,60 @@ use wsg_core::{
     WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
 };
 
-pub const HELP: &str = r#"wsg - jj workspace manager
-
-Usage: wsg [OPTIONS]
-
-Usage:
-  wsg add <name> [-r <rev>]     Create workspace and print path (stdout)
-  wsg rm [--force] <name>       Remove workspace
-  wsg list                      List workspaces
-  wsg clean                     Remove all non-default workspaces
-  wsg root                      Print repo root
-  wsg where                     Show repo and workspace paths
-  wsg path <name>               Print workspace path
-  wsg refresh                   Rebuild workspace cache
-
-Pool:
-  wsg pool <N>                  Set pool size (creates pool if needed, safe shrink)
-  wsg pool list                 Show pool status
-  wsg pool rm <worker>          Remove a worker from the pool (must not be busy)
-  wsg pool reset <worker>       Reset a worker to idle
-  wsg pool destroy              Tear down all workers and remove pool
-
-Dispatch and sessions:
-  wsg dispatch <TICKET>...     Dispatch Tickets (d)
-  wsg send <worker> <prompt>   Send a Follow-up (s)
-  wsg review <worker>          Address PR review comments (rev)
-  wsg logs <worker>            Follow a Worker log (log)
-  wsg mount <worker>           Mount a Worker in kitty (m)
-  wsg rebase <worker>          Rebase and push a Worker (rb)
-  wsg open-pr <worker>         Open a Worker's Pull Request (pr)
-
-Completion:
-  wsg completion [zsh]         Print zsh completion
-
-Observability:
-  wsg status                    Alias for pool list
-  wsg version                   Print the wsg version
-"#;
+pub const HELP: &str = concat!(
+    env!("CARGO_PKG_NAME"),
+    " - jj workspace manager\n\nUsage: ",
+    env!("CARGO_PKG_NAME"),
+    " [OPTIONS]\n\nUsage:\n  ",
+    env!("CARGO_PKG_NAME"),
+    " add <name> [-r <rev>]     Create workspace and print path (stdout)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " rm [--force] <name>       Remove workspace\n  ",
+    env!("CARGO_PKG_NAME"),
+    " list                      List workspaces\n  ",
+    env!("CARGO_PKG_NAME"),
+    " clean                     Remove all non-default workspaces\n  ",
+    env!("CARGO_PKG_NAME"),
+    " root                      Print repo root\n  ",
+    env!("CARGO_PKG_NAME"),
+    " where                     Show repo and workspace paths\n  ",
+    env!("CARGO_PKG_NAME"),
+    " path <name>               Print workspace path\n  ",
+    env!("CARGO_PKG_NAME"),
+    " refresh                   Rebuild workspace cache\n\nPool:\n  ",
+    env!("CARGO_PKG_NAME"),
+    " pool <N>                  Set pool size (creates pool if needed, safe shrink)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " pool list                 Show pool status\n  ",
+    env!("CARGO_PKG_NAME"),
+    " pool rm <worker>          Remove a worker from the pool (must not be busy)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " pool reset <worker>       Reset a worker to idle\n  ",
+    env!("CARGO_PKG_NAME"),
+    " pool destroy              Tear down all workers and remove pool\n\nDispatch and sessions:\n  ",
+    env!("CARGO_PKG_NAME"),
+    " dispatch <TICKET>...     Dispatch Tickets (d)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " send <worker> <prompt>   Send a Follow-up (s)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " review <worker>          Address PR review comments (rev)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " logs <worker>            Follow a Worker log (log)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " mount <worker>           Mount a Worker in kitty (m)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " rebase <worker>          Rebase and push a Worker (rb)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " open-pr <worker>         Open a Worker's Pull Request (pr)\n\nCompletion:\n  ",
+    env!("CARGO_PKG_NAME"),
+    " completion [zsh]         Print zsh completion\n\nObservability:\n  ",
+    env!("CARGO_PKG_NAME"),
+    " status                    Alias for pool list\n  ",
+    env!("CARGO_PKG_NAME"),
+    " version                   Print the ",
+    env!("CARGO_PKG_NAME"),
+    " version\n",
+);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -140,30 +160,51 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "clean" => Ok(Command::Clean),
         "root" => Ok(Command::Root),
         "where" | "info" => Ok(Command::Where),
-        "path" => {
-            parse_single("Usage: wsg path <name>", &args[1..]).map(|name| Command::Path { name })
-        }
+        "path" => parse_single(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " path <name>"),
+            &args[1..],
+        )
+        .map(|name| Command::Path { name }),
         "refresh" | "sync" => Ok(Command::Refresh),
-        "status" => ensure_no_extra("wsg status", &args[1..]).map(|_| Command::Status),
-        "reset" => parse_single_exact("Usage: wsg reset <worker>", &args[1..])
-            .map(|worker| Command::Pool(PoolCommand::Reset { worker })),
+        "status" => ensure_no_extra(concat!(env!("CARGO_PKG_NAME"), " status"), &args[1..])
+            .map(|_| Command::Status),
+        "reset" => parse_single_exact(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " reset <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::Pool(PoolCommand::Reset { worker })),
         "dispatch" | "d" => parse_dispatch(&args[1..]),
         "send" | "s" => parse_send(&args[1..]),
         "review" | "rev" => parse_review(&args[1..]),
-        "logs" | "log" => parse_worker_command("Usage: wsg logs <worker>", &args[1..])
-            .map(|worker| Command::Logs { worker }),
-        "mount" | "m" => parse_worker_command("Usage: wsg mount <worker>", &args[1..])
-            .map(|worker| Command::Mount { worker }),
-        "rebase" | "rb" => parse_worker_command("Usage: wsg rebase <worker>", &args[1..])
-            .map(|worker| Command::Rebase { worker }),
-        "open-pr" | "pr" => parse_worker_command("Usage: wsg open-pr <worker>", &args[1..])
-            .map(|worker| Command::OpenPullRequest { worker }),
+        "logs" | "log" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " logs <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::Logs { worker }),
+        "mount" | "m" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " mount <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::Mount { worker }),
+        "rebase" | "rb" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " rebase <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::Rebase { worker }),
+        "open-pr" | "pr" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " open-pr <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::OpenPullRequest { worker }),
         "completion" => parse_completion(&args[1..]),
-        "__complete" => parse_worker_command("Usage: wsg __complete <mode>", &args[1..])
-            .map(|mode| Command::InternalComplete { mode }),
+        "__complete" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " __complete <mode>"),
+            &args[1..],
+        )
+        .map(|mode| Command::InternalComplete { mode }),
         "__orchestrate" => parse_orchestrate(&args[1..]),
         "pool" => parse_pool(&args[1..]),
-        unknown => bail!("Unknown command: {unknown}. Run 'wsg help' for usage."),
+        unknown => bail!("Unknown command: {unknown}. Run '{PROGRAM} help' for usage."),
     }
 }
 
@@ -174,9 +215,13 @@ fn parse_add(args: &[String]) -> Result<Command> {
     while index < args.len() {
         match args[index].as_str() {
             "-r" | "--revision" => {
-                let value = args
-                    .get(index + 1)
-                    .ok_or_else(|| anyhow::anyhow!("Usage: wsg add <name> [-r <rev>]"))?;
+                let value = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!(concat!(
+                        "Usage: ",
+                        env!("CARGO_PKG_NAME"),
+                        " add <name> [-r <rev>]"
+                    ))
+                })?;
                 revision = Some(value.clone());
                 index += 2;
             }
@@ -192,7 +237,13 @@ fn parse_add(args: &[String]) -> Result<Command> {
             }
         }
     }
-    let name = name.ok_or_else(|| anyhow::anyhow!("Usage: wsg add <name> [-r <rev>]"))?;
+    let name = name.ok_or_else(|| {
+        anyhow::anyhow!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " add <name> [-r <rev>]"
+        ))
+    })?;
     Ok(Command::Add { name, revision })
 }
 
@@ -207,7 +258,11 @@ fn parse_remove(args: &[String]) -> Result<Command> {
         }
     }
     if names.is_empty() {
-        bail!("Usage: wsg rm [--force] <name> [name...]");
+        bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " rm [--force] <name> [name...]"
+        ));
     }
     Ok(Command::Remove { force, names })
 }
@@ -220,10 +275,16 @@ fn parse_pool(args: &[String]) -> Result<Command> {
         "list" | "ls" | "status" => Ok(PoolCommand::List.into()),
         "destroy" => Ok(PoolCommand::Destroy.into()),
         "help" => Ok(PoolCommand::Help.into()),
-        "rm" | "remove" => parse_single("Usage: wsg pool rm <worker>", &args[1..])
-            .map(|worker| PoolCommand::Remove { worker }.into()),
-        "reset" => parse_single("Usage: wsg pool reset <worker>", &args[1..])
-            .map(|worker| PoolCommand::Reset { worker }.into()),
+        "rm" | "remove" => parse_single(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " pool rm <worker>"),
+            &args[1..],
+        )
+        .map(|worker| PoolCommand::Remove { worker }.into()),
+        "reset" => parse_single(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " pool reset <worker>"),
+            &args[1..],
+        )
+        .map(|worker| PoolCommand::Reset { worker }.into()),
         "create" | "c" | "resize" | "r" => parse_pool_size(&args[1..]),
         value if value.parse::<i64>().is_ok() => parse_pool_size(args),
         unknown => bail!("Unknown pool command: {unknown}"),
@@ -246,7 +307,13 @@ fn parse_pool_size(args: &[String]) -> Result<Command> {
             _ => index += 1,
         }
     }
-    let size = size.ok_or_else(|| anyhow::anyhow!("Usage: wsg pool resize <N>"))?;
+    let size = size.ok_or_else(|| {
+        anyhow::anyhow!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " pool resize <N>"
+        ))
+    })?;
     Ok(PoolCommand::Resize { size }.into())
 }
 
@@ -334,7 +401,11 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         bail!("--all cannot be combined with explicit Tickets");
     }
     if tickets.is_empty() && !all {
-        bail!("Usage: wsg dispatch <TICKET>... [--fg|--bg] [--model MODEL]");
+        bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " dispatch <TICKET>... [--fg|--bg] [--model MODEL]"
+        ));
     }
     if budget.is_some() && tickets.len() == 1 && !no_orchestrate {
         bail!("--budget for one Ticket requires --no-orchestrate");
@@ -361,7 +432,11 @@ fn parse_send(args: &[String]) -> Result<Command> {
         }
     }
     if values.len() != 2 {
-        bail!("Usage: wsg send <worker> <prompt> [--fg|--bg]");
+        bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " send <worker> <prompt> [--fg|--bg]"
+        ));
     }
     Ok(Command::Send {
         worker: values.remove(0),
@@ -378,18 +453,32 @@ fn parse_review(args: &[String]) -> Result<Command> {
             "--fg" | "--bg" => parse_mode(argument, &mut mode)?,
             value if value.starts_with('-') => bail!("unknown option for review: {value}"),
             value if worker.is_none() => worker = Some(value.to_owned()),
-            _ => bail!("Usage: wsg review <worker> [--fg|--bg]"),
+            _ => bail!(concat!(
+                "Usage: ",
+                env!("CARGO_PKG_NAME"),
+                " review <worker> [--fg|--bg]"
+            )),
         }
     }
     Ok(Command::Review {
-        worker: worker.ok_or_else(|| anyhow::anyhow!("Usage: wsg review <worker> [--fg|--bg]"))?,
+        worker: worker.ok_or_else(|| {
+            anyhow::anyhow!(concat!(
+                "Usage: ",
+                env!("CARGO_PKG_NAME"),
+                " review <worker> [--fg|--bg]"
+            ))
+        })?,
         mode: mode.unwrap_or(RunMode::Background),
     })
 }
 
 fn parse_completion(args: &[String]) -> Result<Command> {
     if args.len() > 1 {
-        bail!("Usage: wsg completion [zsh]");
+        bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " completion [zsh]"
+        ));
     }
     Ok(Command::Completion {
         shell: args.first().cloned().unwrap_or_else(|| "zsh".to_owned()),
@@ -398,7 +487,11 @@ fn parse_completion(args: &[String]) -> Result<Command> {
 
 fn parse_orchestrate(args: &[String]) -> Result<Command> {
     let Some(parent) = args.first() else {
-        bail!("Usage: wsg __orchestrate <PARENT-TICKET> [--model MODEL]");
+        bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " __orchestrate <PARENT-TICKET> [--model MODEL]"
+        ));
     };
     let mut model = None;
     let mut index = 1;
@@ -425,11 +518,11 @@ impl From<PoolCommand> for Command {
     }
 }
 
-pub fn run(args: Vec<String>) -> Result<()> {
+pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
-        Command::Version => println!("wsg {}", env!("CARGO_PKG_VERSION")),
-        Command::Default => default_command()?,
+        Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
+        Command::Default => default_command(launch)?,
         Command::Root => root_command(&repository()?)?,
         Command::Where => where_command(&repository()?)?,
         Command::Path { name } => path_command(&repository()?, &name)?,
@@ -608,7 +701,7 @@ fn pool_list_command(repository: &Repository) -> Result<()> {
     let snapshot = repository.worker_pool().reconcile_runs();
     let pool = snapshot
         .pool()
-        .ok_or_else(|| anyhow::anyhow!("No pool. Run: wsg pool create --size N"))?;
+        .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
     for diagnostic in snapshot.diagnostics() {
         eprintln!("{}", diagnostic.message());
     }
@@ -785,7 +878,7 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
             .spawn()?;
         eprintln!("Orchestrating {} in background", args.tickets[0]);
         eprintln!(
-            "  Re-run 'wsg dispatch {}' to check progress",
+            "  Re-run '{PROGRAM} dispatch {}' to check progress",
             args.tickets[0]
         );
         return Ok(());
@@ -861,7 +954,7 @@ fn render_dispatch_result(result: &wsg_core::DirectDispatchResult, requested: us
     if result.is_partial() {
         let dispatched = result.outcomes().len();
         if dispatched == 0 && !all {
-            eprintln!("No idle workers. Run: wsg pool list");
+            eprintln!("No idle workers. Run: {PROGRAM} pool list");
         } else {
             eprintln!("No more idle workers. Dispatched {dispatched}/{requested} ticket(s).");
         }
@@ -976,7 +1069,7 @@ fn completion_command(shell: &str) -> Result<()> {
     if shell != "zsh" {
         bail!("Unsupported shell: {shell} (supported: zsh)");
     }
-    print!("{ZSH_COMPLETION}");
+    print!("{}", ZSH_COMPLETION.replace("wsg", PROGRAM));
     Ok(())
 }
 
@@ -1145,13 +1238,13 @@ _wsg() {
 compdef _wsg wsg
 "#;
 
-fn default_command() -> Result<()> {
+fn default_command(launch: fn(PathBuf) -> Result<()>) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         print!("{HELP}");
         return Ok(());
     }
     let repository = Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))?;
-    jjfx::launch(repository.root().to_path_buf())
+    launch(repository.root().to_path_buf())
 }
 
 #[cfg(test)]

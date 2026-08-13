@@ -6,6 +6,12 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-13 - Consolidated the user-facing command surface into the `jjfx`
+  binary. Bare `jjfx` prints CLI help, `jjfx tui` opens the interactive TUI,
+  and existing workspace, Pool, dispatch, and Worker actions are available as
+  `jjfx` subcommands. The internal `wsg` target remains for migration
+  conformance.
+
 - 2026-08-12 - `wsg` no-argument interactive startup now enters the shared
   jjfx TUI, while non-TTY command behavior and independent version output remain
   unchanged in jjfx 0.34.0 and wsg 0.10.0.

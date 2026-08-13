@@ -1720,9 +1720,10 @@ dependencies = [
 
 [[package]]
 name = "jjfx"
-version = "0.34.0"
+version = "0.35.0"
 dependencies = [
  "anyhow",
+ "jiff",
  "jj-lib",
  "notify",
  "pollster",
