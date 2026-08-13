@@ -1,0 +1,2 @@
+{"observedEvent":"session_start","event":{"type":"session_start","reason":"startup"}}
+{"observedEvent":"session_shutdown","event":{"type":"session_shutdown","reason":"quit"}}

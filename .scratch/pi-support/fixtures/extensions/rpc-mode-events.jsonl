@@ -1,0 +1,5 @@
+{"observedEvent":"session_start","event":{"type":"session_start","reason":"startup"}}
+{"observedEvent":"input","event":{"type":"input","text":"<prompt>","source":"rpc"}}
+{"observedEvent":"agent_start","event":{"type":"agent_start"}}
+{"observedEvent":"agent_settled","event":{"type":"agent_settled"}}
+{"observedEvent":"session_shutdown","event":{"type":"session_shutdown","reason":"quit"}}

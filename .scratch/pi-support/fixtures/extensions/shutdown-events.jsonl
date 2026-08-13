@@ -1,0 +1,4 @@
+{"scenario":"interactive-ctrl-d","order":["session_start","session_shutdown"],"shutdownReason":"quit","exitStatus":0}
+{"scenario":"json-success","order":["session_start","agent_start","turn_start","agent_end","agent_settled","session_shutdown"],"shutdownReason":"quit","exitStatus":0}
+{"scenario":"json-provider-failure","order":["session_start","agent_start","turn_start","agent_end","agent_settled","session_shutdown"],"shutdownReason":"quit","exitStatus":0}
+{"scenario":"rpc-stdin-eof-during-tool","order":["session_start","agent_start","turn_start","session_shutdown","agent_settled"],"shutdownReason":"quit","exitStatus":0,"note":"EOF can terminate the RPC process before the in-flight agent settles; clients must keep stdin open until agent_settled when they need complete results."}

@@ -1,0 +1,11 @@
+{"observedEvent":"session_start","event":{"type":"session_start","reason":"startup"}}
+{"observedEvent":"input","event":{"type":"input","text":"<prompt>","source":"interactive"}}
+{"observedEvent":"agent_start","event":{"type":"agent_start"}}
+{"observedEvent":"turn_start","event":{"type":"turn_start","turnIndex":0,"timestamp":"<unix-ms>"}}
+{"observedEvent":"message_start","event":{"type":"message_start","message":{"role":"assistant","stopReason":"toolUse"}}}
+{"observedEvent":"tool_execution_start","event":{"type":"tool_execution_start","toolCallId":"<tool-call>","toolName":"read","args":{"path":"sentinel.txt"}}}
+{"observedEvent":"tool_execution_end","event":{"type":"tool_execution_end","toolCallId":"<tool-call>","toolName":"read","isError":false}}
+{"observedEvent":"turn_end","event":{"type":"turn_end","turnIndex":0,"toolResults":[{"isError":false}]}}
+{"observedEvent":"agent_end","event":{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}]}}
+{"observedEvent":"agent_settled","event":{"type":"agent_settled"}}
+{"observedEvent":"session_shutdown","event":{"type":"session_shutdown","reason":"quit"}}

@@ -1,0 +1,10 @@
+{
+  "kind": "derived-lifecycle-mapping",
+  "states": {
+    "working": {"observedEvents": ["agent_start", "turn_start", "tool_execution_start", "message_update"], "jjfxState": "Working"},
+    "waiting": {"observedEvents": ["session_start", "agent_settled"], "jjfxState": "Waiting", "note": "session_start is waiting before the first prompt; agent_settled is the strongest idle signal after retries, compaction, and queued work settle"},
+    "ended": {"observedEvents": ["session_shutdown", "process_exit"], "jjfxState": "Ended"},
+    "attentionRequired": {"observedEvents": [], "jjfxState": "Unsupported", "note": "No native permission-dialog or attention event was observed; do not infer it from tool failure or provider error"}
+  },
+  "identity": {"session": "extension context exposes session manager identity; event envelope itself does not add a provider-specific id", "cwd": "extension context cwd is available but not included in the observed event payloads"}
+}
