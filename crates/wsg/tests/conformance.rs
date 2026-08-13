@@ -2,6 +2,7 @@
 
 mod support;
 
+use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -298,6 +299,68 @@ fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
     assert_eq!(binaries.go.path(), go);
     assert_eq!(binaries.go_test.path(), go_test);
     assert_ne!(binaries.go.path(), binaries.go_test.path());
+}
+
+#[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn runtime_process_groups_are_reconciled_across_implementations() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    run_runtime_scenario(&binaries.go, &binaries.rust);
+    run_runtime_scenario(&binaries.rust, &binaries.go);
+}
+
+fn run_runtime_scenario(creator: &BinarySpec, reconciler: &BinarySpec) {
+    let directory = support::local_repository();
+    let runtime_directory = directory.path().join("fake-runtime");
+    fs::create_dir(&runtime_directory).expect("fake runtime directory should be created");
+    let runtime = runtime_directory.join("claude");
+    write_executable(
+        &runtime,
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then printf '%s\\n' 'Usage: claude --forward-subagent-text'; exit 0; fi\nprintf '%s\\n' \"$$\" > \"$WSG_RUNTIME_LEADER_PID_FILE\"\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$WSG_RUNTIME_DESCENDANT_PID_FILE\"\nwhile :; do sleep 0.05; done\n",
+    );
+    let leader_pid = directory.path().join("leader.pid");
+    let descendant_pid = directory.path().join("descendant.pid");
+    let current_path = env::var_os("PATH").expect("PATH should be configured");
+    let mut paths = vec![runtime_directory];
+    paths.extend(env::split_paths(&current_path));
+    let path = env::join_paths(paths).expect("fake runtime PATH should be valid");
+    let environment = [
+        ("PATH", path.as_os_str()),
+        ("WSG_RUNTIME_LEADER_PID_FILE", leader_pid.as_os_str()),
+        (
+            "WSG_RUNTIME_DESCENDANT_PID_FILE",
+            descendant_pid.as_os_str(),
+        ),
+    ];
+
+    let create = creator.run_with_environment(directory.path(), &["pool", "1"], &environment);
+    assert_success("runtime Pool create", &create);
+    let dispatch = creator.run_with_environment(
+        directory.path(),
+        &["dispatch", "ENG-CONFORMANCE", "--no-orchestrate", "--bg"],
+        &environment,
+    );
+    assert_success("runtime dispatch", &dispatch);
+    support::wait_for_file(&leader_pid);
+    support::wait_for_file(&descendant_pid);
+
+    let worker = support::first_worker(directory.path());
+    let recorded_pid = support::recorded_worker_pid(directory.path(), &worker);
+    let _process_guard = support::ProcessTreeGuard::new(recorded_pid);
+    let descendant = fs::read_to_string(&descendant_pid)
+        .expect("descendant PID should be readable")
+        .trim()
+        .parse::<u32>()
+        .expect("descendant PID should be numeric");
+
+    let reset = reconciler.run(directory.path(), &["pool", "reset", &worker]);
+    assert_success("cross-implementation runtime reset", &reset);
+    support::wait_for_process_exit(recorded_pid);
+    support::wait_for_process_exit(descendant);
+    let status = reconciler.run(directory.path(), &["status"]);
+    assert_success("cross-implementation runtime status", &status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("idle"));
 }
 
 #[test]

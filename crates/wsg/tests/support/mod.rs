@@ -1,4 +1,5 @@
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -6,6 +7,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::fs::{FlockOperation, flock};
+use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
 use tempfile::TempDir;
 use wsg_core::{Expected, Loaded, Repository, StateChange, WireStatus};
 
@@ -44,6 +46,17 @@ pub(crate) fn local_repository() -> TempDir {
         remote.status.success(),
         "jj remote add failed: {}",
         String::from_utf8_lossy(&remote.stderr)
+    );
+
+    let bookmark = Command::new("jj")
+        .args(["bookmark", "create", "main"])
+        .current_dir(directory.path())
+        .output()
+        .expect("jj bookmark create should run");
+    assert!(
+        bookmark.status.success(),
+        "jj bookmark create failed: {}",
+        String::from_utf8_lossy(&bookmark.stderr)
     );
     directory
 }
@@ -111,6 +124,10 @@ pub(crate) fn run_lock_helper() {
     wait_for(&release);
 }
 
+pub(crate) fn wait_for_file(path: &Path) {
+    wait_for(path);
+}
+
 fn wait_for(path: &Path) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !path.exists() {
@@ -133,6 +150,74 @@ fn wait_for_child(mut child: Child) {
         assert!(Instant::now() < deadline, "lock helper timed out");
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+pub(crate) fn first_worker(root: &Path) -> String {
+    let repository = Repository::open(root).expect("repository should open");
+    let Loaded::Present(pool) = repository
+        .state_store()
+        .pool()
+        .load()
+        .expect("Pool should load")
+    else {
+        panic!("Pool should exist");
+    };
+    pool.value
+        .workers
+        .first()
+        .expect("Pool should have one Worker")
+        .to_string()
+}
+
+pub(crate) fn recorded_worker_pid(root: &Path, worker: &str) -> u32 {
+    let repository = Repository::open(root).expect("repository should open");
+    let worker = wsg_core::WorkerId::parse(worker).expect("Worker ID should be valid");
+    let Loaded::Present(state) = repository
+        .state_store()
+        .worker(worker)
+        .load()
+        .expect("Worker should load")
+    else {
+        panic!("Worker should exist");
+    };
+    state
+        .value
+        .pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .expect("Worker should record a process PID")
+}
+
+pub(crate) struct ProcessTreeGuard {
+    leader: Option<Pid>,
+}
+
+impl ProcessTreeGuard {
+    pub(crate) fn new(pid: u32) -> Self {
+        Self {
+            leader: pid_from_u32(pid),
+        }
+    }
+}
+
+impl Drop for ProcessTreeGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.leader.take() {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+    }
+}
+
+pub(crate) fn wait_for_process_exit(pid: u32) {
+    let pid = pid_from_u32(pid).expect("process PID should be positive");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while test_kill_process(pid).is_ok() {
+        assert!(Instant::now() < deadline, "process {pid:?} did not exit");
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn pid_from_u32(pid: u32) -> Option<Pid> {
+    Pid::from_raw(i32::try_from(pid).expect("process PID should fit in i32"))
 }
 
 pub(crate) fn mark_worker_busy(root: &Path) -> String {
@@ -178,22 +263,28 @@ impl BinarySpec {
     }
 
     pub(crate) fn run(&self, directory: &Path, args: &[&str]) -> CommandOutcome {
-        let output = Command::new(&self.executable)
+        self.run_with_environment(directory, args, &[])
+    }
+
+    pub(crate) fn run_with_environment(
+        &self,
+        directory: &Path,
+        args: &[&str],
+        environment: &[(&str, &OsStr)],
+    ) -> CommandOutcome {
+        let mut command = Command::new(&self.executable);
+        command
             .args(args)
             .current_dir(directory)
-            .output()
-            .unwrap_or_else(|error| {
-                panic!(
-                    "{} binary {} should run: {error}",
-                    self.label,
-                    self.executable.display()
-                )
-            });
-        CommandOutcome {
-            status: output.status,
-            stdout: output.stdout,
-            stderr: output.stderr,
-        }
+            .envs(environment.iter().copied());
+        let output = command.output().unwrap_or_else(|error| {
+            panic!(
+                "{} binary {} should run: {error}",
+                self.label,
+                self.executable.display()
+            )
+        });
+        output.into()
     }
 }
 

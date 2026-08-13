@@ -13,7 +13,7 @@ wsg-core = { path = "../wsg-core" }
 [dev-dependencies]
 jjfx = { path = "../..", features = ["test-support"] }
 portable-pty = "0.9"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 tempfile = "3"
 wsg-core = { path = "../wsg-core" }
 
