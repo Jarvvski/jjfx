@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
@@ -345,6 +346,29 @@ pub(crate) fn mark_worker_busy(root: &Path) -> String {
     worker.to_string()
 }
 
+pub(crate) fn wait_with_output(mut child: Child, label: &str) -> CommandOutcome {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if child
+            .try_wait()
+            .unwrap_or_else(|error| panic!("{label} status failed: {error}"))
+            .is_some()
+        {
+            break;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("{label} exceeded the 30 second conformance timeout");
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    child
+        .wait_with_output()
+        .unwrap_or_else(|error| panic!("{label} output failed: {error}"))
+        .into()
+}
+
 impl BinarySpec {
     pub(crate) fn new(label: &'static str, executable: PathBuf) -> Self {
         Self { label, executable }
@@ -358,6 +382,37 @@ impl BinarySpec {
         self.run_with_environment(directory, args, &[])
     }
 
+    pub(crate) fn run_with_input_and_environment(
+        &self,
+        directory: &Path,
+        args: &[&str],
+        input: &[u8],
+        environment: &[(&str, &OsStr)],
+    ) -> CommandOutcome {
+        let mut command = Command::new(&self.executable);
+        command
+            .args(args)
+            .current_dir(directory)
+            .envs(environment.iter().copied())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().unwrap_or_else(|error| {
+            panic!(
+                "{} binary {} should run: {error}",
+                self.label,
+                self.executable.display()
+            )
+        });
+        child
+            .stdin
+            .take()
+            .expect("input-enabled conformance process should have stdin")
+            .write_all(input)
+            .unwrap_or_else(|error| panic!("{label} input failed: {error}", label = self.label));
+        wait_with_output(child, self.label)
+    }
+
     pub(crate) fn run_with_environment(
         &self,
         directory: &Path,
@@ -368,15 +423,18 @@ impl BinarySpec {
         command
             .args(args)
             .current_dir(directory)
-            .envs(environment.iter().copied());
-        let output = command.output().unwrap_or_else(|error| {
+            .envs(environment.iter().copied())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command.spawn().unwrap_or_else(|error| {
             panic!(
                 "{} binary {} should run: {error}",
                 self.label,
                 self.executable.display()
             )
         });
-        output.into()
+        wait_with_output(child, self.label)
     }
 }
 

@@ -105,14 +105,19 @@ fn workspaces_created_by_each_binary_are_visible_and_removable_by_the_other() {
 fn mixed_pool_mutations_wait_for_the_shared_lock_and_keep_state_valid() {
     let binaries =
         ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    run_mixed_pool_mutation_scenario(&binaries.go, &binaries.rust);
+    run_mixed_pool_mutation_scenario(&binaries.rust, &binaries.go);
+}
+
+fn run_mixed_pool_mutation_scenario(first: &BinarySpec, second: &BinarySpec) {
     let directory = support::local_repository();
 
-    let go_create = binaries.go.run(directory.path(), &["pool", "1"]);
+    let go_create = first.run(directory.path(), &["pool", "1"]);
     assert_success("Go pool create", &go_create);
     let busy_worker = support::mark_worker_busy(directory.path());
 
     let barrier = support::LockBarrier::acquire(directory.path());
-    let mut blocked = Command::new(binaries.rust.path())
+    let mut blocked = Command::new(second.path())
         .args(["pool", "resize", "2"])
         .current_dir(directory.path())
         .stdout(Stdio::piped())
@@ -129,51 +134,37 @@ fn mixed_pool_mutations_wait_for_the_shared_lock_and_keep_state_valid() {
     );
 
     barrier.release();
-    let blocked_output = support::CommandOutcome::from(
-        blocked
-            .wait_with_output()
-            .expect("Rust resize should finish after lock release"),
-    );
+    let blocked_output = support::wait_with_output(blocked, "Rust blocked resize");
     assert_success("Rust blocked resize", &blocked_output);
 
-    let go_resize = Command::new(binaries.go.path())
+    let go_resize = Command::new(first.path())
         .args(["pool", "resize", "3"])
         .current_dir(directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("Go resize should spawn");
-    let rust_resize = Command::new(binaries.rust.path())
+    let rust_resize = Command::new(second.path())
         .args(["pool", "resize", "4"])
         .current_dir(directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("Rust resize should spawn");
-    let go_output = support::CommandOutcome::from(
-        go_resize
-            .wait_with_output()
-            .expect("Go concurrent resize should finish"),
-    );
-    let rust_output = support::CommandOutcome::from(
-        rust_resize
-            .wait_with_output()
-            .expect("Rust concurrent resize should finish"),
-    );
+    let go_output = support::wait_with_output(go_resize, "Go concurrent resize");
+    let rust_output = support::wait_with_output(rust_resize, "Rust concurrent resize");
     assert_success_or_conflict("Go concurrent resize", &go_output);
     assert_success_or_conflict("Rust concurrent resize", &rust_output);
     if !go_output.status.success() {
-        let retry = binaries.go.run(directory.path(), &["pool", "resize", "3"]);
+        let retry = first.run(directory.path(), &["pool", "resize", "3"]);
         assert_success("Go retry resize", &retry);
     }
     if !rust_output.status.success() {
-        let retry = binaries
-            .rust
-            .run(directory.path(), &["pool", "resize", "4"]);
+        let retry = second.run(directory.path(), &["pool", "resize", "4"]);
         assert_success("Rust retry resize", &retry);
     }
 
-    let final_status = binaries.rust.run(directory.path(), &["status"]);
+    let final_status = second.run(directory.path(), &["status"]);
     assert_success("Rust final status", &final_status);
     let status = String::from_utf8_lossy(&final_status.stdout);
     let pool_line = status
@@ -198,43 +189,34 @@ fn mixed_pool_mutations_wait_for_the_shared_lock_and_keep_state_valid() {
     assert_eq!(worker_names.len(), total);
     assert!((3..=4).contains(&total));
 
-    let go_reset = Command::new(binaries.go.path())
+    let go_reset = Command::new(first.path())
         .args(["pool", "reset", &busy_worker])
         .current_dir(directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("Go reset should spawn");
-    let rust_reset = Command::new(binaries.rust.path())
+    let rust_reset = Command::new(second.path())
         .args(["pool", "reset", &busy_worker])
         .current_dir(directory.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("Rust reset should spawn");
-    let go_reset =
-        support::CommandOutcome::from(go_reset.wait_with_output().expect("Go reset should finish"));
-    let rust_reset = support::CommandOutcome::from(
-        rust_reset
-            .wait_with_output()
-            .expect("Rust reset should finish"),
-    );
+    let go_reset = support::wait_with_output(go_reset, "Go concurrent reset");
+    let rust_reset = support::wait_with_output(rust_reset, "Rust concurrent reset");
     assert_success_or_conflict("Go concurrent reset", &go_reset);
     assert_success_or_conflict("Rust concurrent reset", &rust_reset);
     if !go_reset.status.success() {
-        let retry = binaries
-            .go
-            .run(directory.path(), &["pool", "reset", &busy_worker]);
+        let retry = first.run(directory.path(), &["pool", "reset", &busy_worker]);
         assert_success("Go reset retry", &retry);
     }
     if !rust_reset.status.success() {
-        let retry = binaries
-            .rust
-            .run(directory.path(), &["pool", "reset", &busy_worker]);
+        let retry = second.run(directory.path(), &["pool", "reset", &busy_worker]);
         assert_success("Rust reset retry", &retry);
     }
 
-    let reset_status = binaries.rust.run(directory.path(), &["status"]);
+    let reset_status = second.run(directory.path(), &["status"]);
     assert_success("Rust status after reset", &reset_status);
     assert!(String::from_utf8_lossy(&reset_status.stdout).contains("idle"));
 }
@@ -244,41 +226,44 @@ fn mixed_pool_mutations_wait_for_the_shared_lock_and_keep_state_valid() {
 fn pool_growth_and_destruction_round_trip_between_each_binary() {
     let binaries =
         ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    run_pool_lifecycle_scenario(&binaries.go, &binaries.rust);
+    run_pool_lifecycle_scenario(&binaries.rust, &binaries.go);
+}
+
+fn run_pool_lifecycle_scenario(first: &BinarySpec, second: &BinarySpec) {
     let directory = support::local_repository();
 
-    let go_create = binaries.go.run(directory.path(), &["pool", "create", "1"]);
-    assert_success("Go pool create", &go_create);
+    let create = first.run(directory.path(), &["pool", "create", "1"]);
+    assert_success("first Pool create", &create);
 
-    let rust_list = binaries.rust.run(directory.path(), &["pool", "list"]);
-    assert_success("Rust pool list", &rust_list);
-    assert!(String::from_utf8_lossy(&rust_list.stdout).contains("Pool: 1 idle"));
+    let list = second.run(directory.path(), &["pool", "list"]);
+    assert_success("second Pool list", &list);
+    assert!(String::from_utf8_lossy(&list.stdout).contains("Pool: 1 idle"));
 
-    let rust_resize = binaries
-        .rust
-        .run(directory.path(), &["pool", "resize", "2"]);
-    assert_success("Rust pool resize", &rust_resize);
+    let resize = second.run(directory.path(), &["pool", "resize", "2"]);
+    assert_success("second Pool resize", &resize);
 
-    let go_status = binaries.go.run(directory.path(), &["status"]);
-    assert_success("Go pool status", &go_status);
-    assert!(String::from_utf8_lossy(&go_status.stdout).contains("Pool: 2 idle"));
+    let status = first.run(directory.path(), &["status"]);
+    assert_success("first Pool status", &status);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("Pool: 2 idle"));
 
-    let rust_destroy = binaries.rust.run(directory.path(), &["pool", "destroy"]);
-    assert_success("Rust pool destroy", &rust_destroy);
+    let destroy = second.run(directory.path(), &["pool", "destroy"]);
+    assert_success("second Pool destroy", &destroy);
 
-    let go_missing = binaries.go.run(directory.path(), &["pool", "list"]);
-    assert!(!go_missing.status.success());
-    assert!(go_missing.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&go_missing.stderr).contains("No pool"));
+    let missing = first.run(directory.path(), &["pool", "list"]);
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No pool"));
 
-    let go_recreate = binaries.go.run(directory.path(), &["pool", "1"]);
-    assert_success("Go pool recreate", &go_recreate);
-    let rust_destroy = binaries.rust.run(directory.path(), &["pool", "destroy"]);
-    assert_success("Rust second pool destroy", &rust_destroy);
+    let recreate = first.run(directory.path(), &["pool", "1"]);
+    assert_success("first Pool recreate", &recreate);
+    let destroy = second.run(directory.path(), &["pool", "destroy"]);
+    assert_success("second Pool second destroy", &destroy);
 
-    let rust_missing = binaries.rust.run(directory.path(), &["status"]);
-    assert!(!rust_missing.status.success());
-    assert!(rust_missing.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&rust_missing.stderr).contains("No pool"));
+    let missing = first.run(directory.path(), &["status"]);
+    assert!(!missing.status.success());
+    assert!(missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("No pool"));
 }
 
 #[test]
@@ -381,11 +366,11 @@ fn cli_contract_inventory_applies_to_both_binary_adapters() {
 fn interrupted_pool_and_worker_replacements_leave_cross_implementation_state_valid() {
     let binaries =
         ConformanceBinaries::from_environment().expect("oracle paths should be configured");
-    run_interrupted_state_scenario(&binaries.go, &binaries.rust);
-    run_interrupted_state_scenario(&binaries.rust, &binaries.go);
+    run_interrupted_state_scenario(&binaries.go, &binaries.rust, &binaries.go_test);
+    run_interrupted_state_scenario(&binaries.rust, &binaries.go, &binaries.go_test);
 }
 
-fn run_interrupted_state_scenario(creator: &BinarySpec, reader: &BinarySpec) {
+fn run_interrupted_state_scenario(creator: &BinarySpec, reader: &BinarySpec, go_test: &BinarySpec) {
     let directory = support::local_repository();
     let create = creator.run(directory.path(), &["pool", "1"]);
     assert_success("interrupted Pool create", &create);
@@ -407,6 +392,23 @@ fn run_interrupted_state_scenario(creator: &BinarySpec, reader: &BinarySpec) {
         .join(format!("{worker}.json"));
     support::add_unknown_field(&worker_path, "future_worker");
     support::mark_worker_busy(directory.path());
+    let helper_result = directory.path().join("go-helper-result.json");
+    let helper_environment = [
+        ("WSG_STATE_HELPER_MODE", OsStr::new("rewrite")),
+        ("WSG_STATE_HELPER_KIND", OsStr::new("worker")),
+        ("WSG_STATE_HELPER_STATE", worker_path.as_os_str()),
+        ("WSG_STATE_HELPER_RESULT", helper_result.as_os_str()),
+    ];
+    let helper = go_test.run_with_environment(
+        directory.path(),
+        &["-test.run", "^TestStateLockSubprocessHelper$"],
+        &helper_environment,
+    );
+    assert_success("Go state rewrite helper", &helper);
+    assert!(helper_result.exists());
+    let helper_document =
+        fs::read_to_string(&worker_path).expect("Go helper should rewrite Worker");
+    assert!(helper_document.contains("future_worker"));
     let worker_temp = directory
         .path()
         .join(".jj/pool")
@@ -417,6 +419,39 @@ fn run_interrupted_state_scenario(creator: &BinarySpec, reader: &BinarySpec) {
     assert_success("Worker rewrite after interruption", &reset);
     let worker_document = fs::read_to_string(&worker_path).expect("Worker should remain readable");
     assert!(worker_document.contains("future_worker"));
+}
+
+#[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn go_and_rust_share_the_non_cosmetic_cli_contract() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    let go_directory = support::local_repository();
+    let rust_directory = support::local_repository();
+
+    let go_refresh = binaries.go.run(go_directory.path(), &["refresh"]);
+    let rust_refresh = binaries.rust.run(rust_directory.path(), &["refresh"]);
+    assert_success("Go refresh", &go_refresh);
+    assert_success("Rust refresh", &rust_refresh);
+    assert_eq!(go_refresh.stdout, rust_refresh.stdout);
+    assert_eq!(go_refresh.stderr, rust_refresh.stderr);
+
+    let go_help = binaries.go.run(go_directory.path(), &["help"]);
+    let rust_help = binaries.rust.run(rust_directory.path(), &["help"]);
+    assert_success("Go help", &go_help);
+    assert_success("Rust help", &rust_help);
+    for command in ["wsg add", "wsg pool", "wsg dispatch"] {
+        assert!(String::from_utf8_lossy(&go_help.stdout).contains(command));
+        assert!(String::from_utf8_lossy(&rust_help.stdout).contains(command));
+    }
+
+    let go_unknown = binaries.go.run(go_directory.path(), &["not-a-command"]);
+    let rust_unknown = binaries.rust.run(rust_directory.path(), &["not-a-command"]);
+    assert_eq!(go_unknown.status.success(), rust_unknown.status.success());
+    assert!(go_unknown.stdout.is_empty());
+    assert!(rust_unknown.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&go_unknown.stderr).contains("Unknown command"));
+    assert!(String::from_utf8_lossy(&rust_unknown.stderr).contains("Unknown command"));
 }
 
 #[test]
@@ -500,9 +535,7 @@ fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, gr
         .expect("initial orchestration child should remain running");
     first_run.kill().expect("initial orchestration should stop");
     drop(process_guard);
-    let _ = first_run
-        .wait_with_output()
-        .expect("initial orchestration should finish");
+    let _ = support::wait_with_output(first_run, "initial orchestration");
     support::mark_worker_done(directory.path(), &worker, "ENG-101");
 
     let restart_environment = [
@@ -524,7 +557,10 @@ fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, gr
     assert_eq!(done, total);
     assert_eq!(total, 2);
     let persisted_group = fs::read_to_string(&group_path).expect("Dispatch Group should remain");
-    assert!(persisted_group.contains("future_group"));
+    assert!(
+        persisted_group.contains("future_group"),
+        "Dispatch Group extension field was lost for graph shape {graph_shape}"
+    );
     let status = reconciler.run(directory.path(), &["status"]);
     assert_success("resumed Pool status", &status);
     assert!(String::from_utf8_lossy(&status.stdout).contains("idle"));
@@ -575,6 +611,25 @@ fn run_runtime_scenario(creator: &BinarySpec, reconciler: &BinarySpec) {
     support::wait_for_file(&descendant_pid);
 
     let worker = support::first_worker(directory.path());
+    let competing = reconciler.run_with_input_and_environment(
+        directory.path(),
+        &["dispatch", "ENG-COMPETING", "--no-orchestrate", "--bg"],
+        b"n\n",
+        &environment,
+    );
+    let competing_message = String::from_utf8_lossy(&competing.stderr);
+    assert!(
+        competing_message.contains("No idle workers")
+            || competing_message.contains("No more idle workers"),
+        "unexpected contention message: {competing_message}"
+    );
+    let pool = reconciler.run(directory.path(), &["pool", "list"]);
+    assert_success("Reservation pool status", &pool);
+    assert!(
+        String::from_utf8_lossy(&pool.stdout).contains("(1 total)"),
+        "Reservation changed Pool state: {}",
+        String::from_utf8_lossy(&pool.stdout)
+    );
     let recorded_pid = support::recorded_worker_pid(directory.path(), &worker);
     let _process_guard = support::ProcessTreeGuard::new(recorded_pid);
     let descendant = fs::read_to_string(&descendant_pid)
@@ -642,7 +697,11 @@ fn assert_success_or_conflict(label: &str, output: &support::CommandOutcome) {
         return;
     }
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("conflicted with another process"),
+        {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            stderr.contains("conflicted with another process")
+                || stderr.contains("persisted state changed")
+        },
         "{label} failed unexpectedly with {}: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
