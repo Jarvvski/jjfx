@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
+use serde_json::Value;
 use tempfile::TempDir;
 use wsg_core::{DispatchGroup, Expected, Loaded, Repository, StateChange, TicketId, WireStatus};
 
@@ -152,33 +153,55 @@ fn wait_for_child(mut child: Child) {
     }
 }
 
-pub(crate) fn wait_for_busy_worker(root: &Path) -> (String, u32) {
+pub(crate) fn add_unknown_field(path: &Path, field: &str) {
+    let mut document: Value = serde_json::from_slice(&fs::read(path).expect("state should read"))
+        .expect("state should be valid JSON");
+    document
+        .as_object_mut()
+        .expect("state should be a JSON object")
+        .insert(field.to_owned(), Value::Bool(true));
+    let mut bytes = serde_json::to_vec_pretty(&document).expect("state should serialize");
+    bytes.push(b'\n');
+    fs::write(path, bytes).expect("state should be rewritten");
+}
+
+pub(crate) fn interrupted_artifact(path: &Path) -> Child {
+    let child = Command::new("sh")
+        .args(["-c", "printf '%s' '{' > \"$1\"; sleep 30", "writer"])
+        .arg(path)
+        .spawn()
+        .expect("interrupted writer should spawn");
+    wait_for_file(path);
+    child
+}
+
+pub(crate) fn stop_child(mut child: Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+pub(crate) fn wait_for_assigned_group_worker(root: &Path) -> String {
     let deadline = Instant::now() + Duration::from_secs(10);
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket should parse");
     loop {
         let repository = Repository::open(root).expect("repository should open");
-        if let Loaded::Present(pool) = repository
+        if let Loaded::Present(group) = repository
             .state_store()
-            .pool()
+            .dispatch_group(parent.clone())
             .load()
-            .expect("Pool should load")
+            .expect("Dispatch Group should load")
+            && let Some(worker) = group
+                .value
+                .sub_issues
+                .values()
+                .find_map(|issue| issue.worker.clone())
         {
-            for worker in &pool.value.workers {
-                let Loaded::Present(state) = repository
-                    .state_store()
-                    .worker(worker.clone())
-                    .load()
-                    .expect("Worker should load")
-                else {
-                    continue;
-                };
-                if state.value.status.as_str() == "busy"
-                    && let Some(pid) = state.value.pid.and_then(|pid| u32::try_from(pid).ok())
-                {
-                    return (worker.to_string(), pid);
-                }
-            }
+            return worker.to_string();
         }
-        assert!(Instant::now() < deadline, "no busy Worker appeared");
+        assert!(
+            Instant::now() < deadline,
+            "no Dispatch Group assignment appeared"
+        );
         thread::sleep(Duration::from_millis(20));
     }
 }

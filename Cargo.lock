@@ -3311,6 +3311,7 @@ dependencies = [
  "jjfx",
  "portable-pty",
  "rustix 1.1.4",
+ "serde_json",
  "tempfile",
  "wsg-core",
 ]

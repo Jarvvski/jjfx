@@ -377,6 +377,49 @@ fn cli_contract_inventory_applies_to_both_binary_adapters() {
 }
 
 #[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn interrupted_pool_and_worker_replacements_leave_cross_implementation_state_valid() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    run_interrupted_state_scenario(&binaries.go, &binaries.rust);
+    run_interrupted_state_scenario(&binaries.rust, &binaries.go);
+}
+
+fn run_interrupted_state_scenario(creator: &BinarySpec, reader: &BinarySpec) {
+    let directory = support::local_repository();
+    let create = creator.run(directory.path(), &["pool", "1"]);
+    assert_success("interrupted Pool create", &create);
+
+    let pool_path = directory.path().join(".jj/pool.json");
+    support::add_unknown_field(&pool_path, "future_pool");
+    let pool_temp = directory.path().join(".jj/pool.json.tmp-interrupted");
+    let pool_writer = support::interrupted_artifact(&pool_temp);
+    support::stop_child(pool_writer);
+    let resize = reader.run(directory.path(), &["pool", "resize", "2"]);
+    assert_success("Pool rewrite after interruption", &resize);
+    let pool_document = fs::read_to_string(&pool_path).expect("Pool should remain readable");
+    assert!(pool_document.contains("future_pool"));
+
+    let worker = support::first_worker(directory.path());
+    let worker_path = directory
+        .path()
+        .join(".jj/pool")
+        .join(format!("{worker}.json"));
+    support::add_unknown_field(&worker_path, "future_worker");
+    support::mark_worker_busy(directory.path());
+    let worker_temp = directory
+        .path()
+        .join(".jj/pool")
+        .join(format!("{worker}.json.tmp-interrupted"));
+    let worker_writer = support::interrupted_artifact(&worker_temp);
+    support::stop_child(worker_writer);
+    let reset = reader.run(directory.path(), &["pool", "reset", &worker]);
+    assert_success("Worker rewrite after interruption", &reset);
+    let worker_document = fs::read_to_string(&worker_path).expect("Worker should remain readable");
+    assert!(worker_document.contains("future_worker"));
+}
+
+#[test]
 fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let go = directory.path().join("go-wsg");
@@ -440,8 +483,17 @@ fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, gr
             .expect("initial orchestration should spawn"),
     );
     wait_for_child_file(&group_path, &mut first_run);
-    let (worker, leader) = support::wait_for_busy_worker(directory.path());
+    support::add_unknown_field(&group_path, "future_group");
+    let interrupted_group = directory.path().join(".jj/pool/dispatch-eng-100.json.tmp");
+    let interrupted_writer = support::interrupted_artifact(&interrupted_group);
+    support::stop_child(interrupted_writer);
+    let worker = support::wait_for_assigned_group_worker(directory.path());
     support::wait_for_file(&pid_file);
+    let leader = fs::read_to_string(&pid_file)
+        .expect("runtime PID should be readable")
+        .trim()
+        .parse::<u32>()
+        .expect("runtime PID should be numeric");
     let process_guard = support::ProcessTreeGuard::new(leader);
     let mut first_run = first_run
         .take()
@@ -471,6 +523,8 @@ fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, gr
     assert_eq!((failed, skipped), (0, 0));
     assert_eq!(done, total);
     assert_eq!(total, 2);
+    let persisted_group = fs::read_to_string(&group_path).expect("Dispatch Group should remain");
+    assert!(persisted_group.contains("future_group"));
     let status = reconciler.run(directory.path(), &["status"]);
     assert_success("resumed Pool status", &status);
     assert!(String::from_utf8_lossy(&status.stdout).contains("idle"));

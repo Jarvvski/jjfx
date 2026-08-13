@@ -14,6 +14,7 @@ wsg-core = { path = "../wsg-core" }
 jjfx = { path = "../..", features = ["test-support"] }
 portable-pty = "0.9"
 rustix = { version = "1", features = ["fs", "process"] }
+serde_json = "1"
 tempfile = "3"
 wsg-core = { path = "../wsg-core" }
 

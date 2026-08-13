@@ -28,7 +28,7 @@ run = "cargo test --workspace"
 
 [tasks.conformance]
 description = "Run Go/Rust wsg conformance with explicit Go oracle binaries"
-run = "test -x \"${WSG_GO_BINARY:-}\" && test -x \"${WSG_GO_TEST_BINARY:-}\" && cargo test -p wsg --test conformance -- --include-ignored"
+run = "test -x \"${WSG_GO_BINARY:-}\" && test -x \"${WSG_GO_TEST_BINARY:-}\" && cargo test -p wsg --test conformance -- --include-ignored --test-threads=1"
 
 [tasks.fmt]
 description = "Format all code"
