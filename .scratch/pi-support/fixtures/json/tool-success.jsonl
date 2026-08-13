@@ -1,0 +1,4 @@
+{"type":"tool_execution_start","toolCallId":"<tool-call>","toolName":"read","args":{"path":"sentinel.txt"}}
+{"type":"tool_execution_end","toolCallId":"<tool-call>","toolName":"read","result":{"content":[{"type":"text","text":"sentinel-read-only"}]},"isError":false}
+{"type":"message_start","message":{"role":"toolResult","toolCallId":"<tool-call>","toolName":"read","content":[{"type":"text","text":"sentinel-read-only"}],"isError":false}}
+{"type":"message_end","message":{"role":"toolResult","toolCallId":"<tool-call>","toolName":"read","content":[{"type":"text","text":"sentinel-read-only"}],"isError":false}}

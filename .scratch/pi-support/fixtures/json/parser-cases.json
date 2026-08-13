@@ -1,0 +1,11 @@
+{
+  "kind": "synthetic-parser-cases",
+  "cases": [
+    {"name":"malformed-json-line","raw":"{\\\"type\\\":\\\"message_end\\\"","expected":"ignore-or-classify-as-malformed; never panic"},
+    {"name":"unknown-top-level-event","raw":"{\\\"type\\\":\\\"future_event\\\",\\\"value\\\":1}","expected":"ignore while preserving stream progress"},
+    {"name":"blank-line","raw":"","expected":"ignore"},
+    {"name":"missing-optional-fields","raw":"{\\\"type\\\":\\\"agent_end\\\",\\\"messages\\\":[]}","expected":"accept with documented defaults"},
+    {"name":"unknown-message-content-block","raw":"{\\\"type\\\":\\\"message_end\\\",\\\"message\\\":{\\\"role\\\":\\\"assistant\\\",\\\"content\\\":[{\\\"type\\\":\\\"future_block\\\"}]}}","expected":"ignore unknown block or return typed unsupported-record error; never invent activity"},
+    {"name":"wrong-typed-known-field","raw":"{\\\"type\\\":\\\"session\\\",\\\"version\\\":\\\"three\\\"}","expected":"typed malformed-record outcome"}
+  ]
+}
