@@ -21,8 +21,10 @@ Epics A through C must provide the shared Repository, Worker Pool, Run, Worker a
    - **21-show-dispatch-progress-and-logs** adds Dispatch Group progress and structured logs.
    - **22-add-jjfx-worker-session-actions** adds Send, Review, Session outcomes, and Worker actions.
    - **23-share-and-harden-jjfx-tui** shares startup and completes hardening and end-to-end coverage.
-4. **17-prove-parity-and-release-from-jjfx** runs mixed-implementation conformance, packages both binaries, and performs the replacement release.
-5. **18-deprecate-the-go-repository** publishes the final transition after owner validation.
+4. **17-prove-go-rust-conformance** runs automated mixed-implementation conformance before release.
+5. **24-package-jjfx-and-wsg-release** packages both binaries and stages them without cutover.
+6. **25-run-manual-acceptance-and-record-cutover-evidence** performs owner validation against released artifacts.
+7. **18-deprecate-the-go-repository** publishes the final transition after owner validation.
 
 CLI work and jjfx integration can proceed in parallel once their shared library dependencies are complete. Cutover cannot begin until both interfaces pass end-to-end verification.
 

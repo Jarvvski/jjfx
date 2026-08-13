@@ -36,7 +36,10 @@ After owner review of the parity evidence and replacement release, make jjfx the
 
 ## Testing Decisions
 
-The automated gate is ticket 17's conformance suite. This ticket adds manual installation and existing-state smoke checks using the released artifacts. Verify both binary names, version output, Workspace listing, Worker Pool status, one Direct Dispatch, one Follow-up, and one Reset before announcing deprecation.
+The automated gate is ticket 17's conformance suite, followed by ticket 24's
+candidate artifact and ticket 25's owner-approved manual matrix. Verify both
+binary names, version output, Workspace listing, Worker Pool status, one Direct
+Dispatch, one Follow-up, and one Reset before announcing deprecation.
 
 ## Acceptance Criteria
 
@@ -56,4 +59,4 @@ The automated gate is ticket 17's conformance suite. This ticket adds manual ins
 
 ## Blocked by
 
-- issues/17-prove-parity-and-release-from-jjfx.md
+- issues/25-run-manual-acceptance-and-record-cutover-evidence.md
