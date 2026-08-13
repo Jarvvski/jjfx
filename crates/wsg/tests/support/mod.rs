@@ -1,7 +1,18 @@
+use std::env;
+use std::fs::{self, OpenOptions};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use rustix::fs::{FlockOperation, flock};
 use tempfile::TempDir;
+use wsg_core::{Expected, Loaded, Repository, StateChange, WireStatus};
+
+const LOCK_HOLDER_MODE: &str = "WSG_CONFORMANCE_LOCK_HOLDER_MODE";
+const LOCK_HOLDER_PATH: &str = "WSG_CONFORMANCE_LOCK_HOLDER_PATH";
+const LOCK_HOLDER_READY: &str = "WSG_CONFORMANCE_LOCK_HOLDER_READY";
+const LOCK_HOLDER_RELEASE: &str = "WSG_CONFORMANCE_LOCK_HOLDER_RELEASE";
 
 use anyhow::{Result, bail};
 
@@ -35,6 +46,126 @@ pub(crate) fn local_repository() -> TempDir {
         String::from_utf8_lossy(&remote.stderr)
     );
     directory
+}
+
+pub(crate) struct LockBarrier {
+    child: Option<Child>,
+    release: PathBuf,
+}
+
+impl LockBarrier {
+    pub(crate) fn acquire(root: &Path) -> Self {
+        let lock = root.join(".jj/pool/.dispatch.lock");
+        let ready = root.join("conformance-lock-ready");
+        let release = root.join("conformance-lock-release");
+        let child = Command::new(env::current_exe().expect("test executable"))
+            .args(["--exact", "conformance_lock_helper", "--ignored"])
+            .env(LOCK_HOLDER_MODE, "hold")
+            .env(LOCK_HOLDER_PATH, &lock)
+            .env(LOCK_HOLDER_READY, &ready)
+            .env(LOCK_HOLDER_RELEASE, &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("lock helper should spawn");
+        wait_for(&ready);
+        Self {
+            child: Some(child),
+            release,
+        }
+    }
+
+    pub(crate) fn release(mut self) {
+        fs::write(&self.release, b"release").expect("lock release marker should be written");
+        wait_for_child(self.child.take().expect("lock helper child"));
+    }
+}
+
+impl Drop for LockBarrier {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+pub(crate) fn run_lock_helper() {
+    if env::var(LOCK_HOLDER_MODE).as_deref() != Ok("hold") {
+        return;
+    }
+    let lock = PathBuf::from(env::var_os(LOCK_HOLDER_PATH).expect("lock path"));
+    let ready = PathBuf::from(env::var_os(LOCK_HOLDER_READY).expect("ready path"));
+    let release = PathBuf::from(env::var_os(LOCK_HOLDER_RELEASE).expect("release path"));
+    fs::create_dir_all(lock.parent().expect("lock parent")).expect("lock directory");
+    let file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock)
+        .expect("lock file");
+    flock(&file, FlockOperation::LockExclusive).expect("exclusive lock");
+    fs::write(ready, b"ready").expect("ready marker");
+    wait_for(&release);
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_child(mut child: Child) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(status) = child.try_wait().expect("lock helper status") {
+            assert!(status.success(), "lock helper failed: {status}");
+            return;
+        }
+        assert!(Instant::now() < deadline, "lock helper timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+pub(crate) fn mark_worker_busy(root: &Path) -> String {
+    let repository = Repository::open(root).expect("repository should open");
+    let Loaded::Present(pool) = repository
+        .state_store()
+        .pool()
+        .load()
+        .expect("Pool should load")
+    else {
+        panic!("Pool should exist");
+    };
+    let worker = pool
+        .value
+        .workers
+        .first()
+        .cloned()
+        .expect("Pool should have one Worker");
+    let state = repository.state_store().worker(worker.clone());
+    let Loaded::Present(versioned) = state.load().expect("Worker should load") else {
+        panic!("Worker should exist");
+    };
+    let (mut worker_state, revision) = versioned.into_parts();
+    worker_state.status = WireStatus::new("busy");
+    worker_state.ticket = Some("ENG-CONFORMANCE".to_owned());
+    worker_state.pid = Some(999_999_999);
+    state
+        .commit(
+            Expected::Match(revision),
+            StateChange::Replace(worker_state),
+        )
+        .expect("busy Worker fixture should commit");
+    worker.to_string()
 }
 
 impl BinarySpec {
@@ -71,6 +202,16 @@ pub(crate) struct CommandOutcome {
     pub(crate) status: ExitStatus,
     pub(crate) stdout: Vec<u8>,
     pub(crate) stderr: Vec<u8>,
+}
+
+impl From<std::process::Output> for CommandOutcome {
+    fn from(output: std::process::Output) -> Self {
+        Self {
+            status: output.status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        }
+    }
 }
 
 #[derive(Debug)]

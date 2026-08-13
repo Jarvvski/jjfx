@@ -5,6 +5,9 @@ mod support;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::Duration;
 
 use support::{BinarySpec, ConformanceBinaries};
 
@@ -97,6 +100,145 @@ fn workspaces_created_by_each_binary_are_visible_and_removable_by_the_other() {
 
 #[test]
 #[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn mixed_pool_mutations_wait_for_the_shared_lock_and_keep_state_valid() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    let directory = support::local_repository();
+
+    let go_create = binaries.go.run(directory.path(), &["pool", "1"]);
+    assert_success("Go pool create", &go_create);
+    let busy_worker = support::mark_worker_busy(directory.path());
+
+    let barrier = support::LockBarrier::acquire(directory.path());
+    let mut blocked = Command::new(binaries.rust.path())
+        .args(["pool", "resize", "2"])
+        .current_dir(directory.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Rust resize should spawn");
+    thread::sleep(Duration::from_millis(150));
+    assert!(
+        blocked
+            .try_wait()
+            .expect("Rust resize status should be readable")
+            .is_none(),
+        "Rust resize bypassed the shared Pool lock"
+    );
+
+    barrier.release();
+    let blocked_output = support::CommandOutcome::from(
+        blocked
+            .wait_with_output()
+            .expect("Rust resize should finish after lock release"),
+    );
+    assert_success("Rust blocked resize", &blocked_output);
+
+    let go_resize = Command::new(binaries.go.path())
+        .args(["pool", "resize", "3"])
+        .current_dir(directory.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Go resize should spawn");
+    let rust_resize = Command::new(binaries.rust.path())
+        .args(["pool", "resize", "4"])
+        .current_dir(directory.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Rust resize should spawn");
+    let go_output = support::CommandOutcome::from(
+        go_resize
+            .wait_with_output()
+            .expect("Go concurrent resize should finish"),
+    );
+    let rust_output = support::CommandOutcome::from(
+        rust_resize
+            .wait_with_output()
+            .expect("Rust concurrent resize should finish"),
+    );
+    assert_success_or_conflict("Go concurrent resize", &go_output);
+    assert_success_or_conflict("Rust concurrent resize", &rust_output);
+    if !go_output.status.success() {
+        let retry = binaries.go.run(directory.path(), &["pool", "resize", "3"]);
+        assert_success("Go retry resize", &retry);
+    }
+    if !rust_output.status.success() {
+        let retry = binaries
+            .rust
+            .run(directory.path(), &["pool", "resize", "4"]);
+        assert_success("Rust retry resize", &retry);
+    }
+
+    let final_status = binaries.rust.run(directory.path(), &["status"]);
+    assert_success("Rust final status", &final_status);
+    let status = String::from_utf8_lossy(&final_status.stdout);
+    let pool_line = status
+        .lines()
+        .find(|line| line.starts_with("Pool:"))
+        .expect("final status should include pool totals");
+    assert!(pool_line.contains("total)"));
+    let worker_names = status
+        .lines()
+        .skip(2)
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| line.split_whitespace().next())
+        .collect::<std::collections::BTreeSet<_>>();
+    let total = pool_line
+        .split_whitespace()
+        .find_map(|value| {
+            value
+                .strip_prefix('(')
+                .and_then(|value| value.parse::<usize>().ok())
+        })
+        .expect("pool total should be numeric");
+    assert_eq!(worker_names.len(), total);
+    assert!((3..=4).contains(&total));
+
+    let go_reset = Command::new(binaries.go.path())
+        .args(["pool", "reset", &busy_worker])
+        .current_dir(directory.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Go reset should spawn");
+    let rust_reset = Command::new(binaries.rust.path())
+        .args(["pool", "reset", &busy_worker])
+        .current_dir(directory.path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Rust reset should spawn");
+    let go_reset =
+        support::CommandOutcome::from(go_reset.wait_with_output().expect("Go reset should finish"));
+    let rust_reset = support::CommandOutcome::from(
+        rust_reset
+            .wait_with_output()
+            .expect("Rust reset should finish"),
+    );
+    assert_success_or_conflict("Go concurrent reset", &go_reset);
+    assert_success_or_conflict("Rust concurrent reset", &rust_reset);
+    if !go_reset.status.success() {
+        let retry = binaries
+            .go
+            .run(directory.path(), &["pool", "reset", &busy_worker]);
+        assert_success("Go reset retry", &retry);
+    }
+    if !rust_reset.status.success() {
+        let retry = binaries
+            .rust
+            .run(directory.path(), &["pool", "reset", &busy_worker]);
+        assert_success("Rust reset retry", &retry);
+    }
+
+    let reset_status = binaries.rust.run(directory.path(), &["status"]);
+    assert_success("Rust status after reset", &reset_status);
+    assert!(String::from_utf8_lossy(&reset_status.stdout).contains("idle"));
+}
+
+#[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
 fn pool_growth_and_destruction_round_trip_between_each_binary() {
     let binaries =
         ConformanceBinaries::from_environment().expect("oracle paths should be configured");
@@ -158,10 +300,28 @@ fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
     assert_ne!(binaries.go.path(), binaries.go_test.path());
 }
 
+#[test]
+#[ignore = "helper invoked by mixed conformance tests"]
+fn conformance_lock_helper() {
+    support::run_lock_helper();
+}
+
 fn assert_success(label: &str, output: &support::CommandOutcome) {
     assert!(
         output.status.success(),
         "{label} failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_success_or_conflict(label: &str, output: &support::CommandOutcome) {
+    if output.status.success() {
+        return;
+    }
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("conflicted with another process"),
+        "{label} failed unexpectedly with {}: {}",
         output.status,
         String::from_utf8_lossy(&output.stderr)
     );

@@ -3310,6 +3310,7 @@ dependencies = [
  "jiff",
  "jjfx",
  "portable-pty",
+ "rustix 1.1.4",
  "tempfile",
  "wsg-core",
 ]
