@@ -32,15 +32,63 @@ pub enum AgentRuntime {
     Claude,
     /// OpenAI's Codex runtime.
     Codex,
+    /// The Pi coding-agent runtime.
+    Pi,
+}
+
+/// A provider-aware model selection supplied to an Agent Runtime.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentModel {
+    provider: Option<String>,
+    model: String,
+}
+
+impl AgentModel {
+    /// Creates a model selection without a provider override.
+    pub fn new(model: impl Into<String>) -> Self {
+        Self {
+            provider: None,
+            model: model.into(),
+        }
+    }
+
+    /// Adds the provider required by runtimes such as Pi.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
+        self
+    }
+
+    /// Returns the optional provider identifier.
+    pub fn provider(&self) -> Option<&str> {
+        self.provider.as_deref()
+    }
+
+    /// Returns the model identifier.
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+}
+
+impl From<&str> for AgentModel {
+    fn from(model: &str) -> Self {
+        Self::new(model)
+    }
+}
+
+impl From<String> for AgentModel {
+    fn from(model: String) -> Self {
+        Self::new(model)
+    }
 }
 
 /// Typed inputs for one Agent Runtime invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRuntimeInvocation {
     prompt: String,
-    model: Option<String>,
+    model: Option<AgentModel>,
     max_budget_usd: Option<u32>,
     session_id: Option<String>,
+    session_directory: Option<PathBuf>,
     name: Option<String>,
     system_prompt: Option<String>,
 }
@@ -53,13 +101,14 @@ impl AgentRuntimeInvocation {
             model: None,
             max_budget_usd: None,
             session_id: None,
+            session_directory: None,
             name: None,
             system_prompt: None,
         }
     }
 
-    /// Adds a model override to the invocation.
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+    /// Adds a model selection to the invocation.
+    pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         self.model = Some(model.into());
         self
     }
@@ -75,7 +124,14 @@ impl AgentRuntimeInvocation {
         self
     }
 
-    /// Adds a display name for a fresh Claude invocation.
+    /// Selects the private session directory used by runtimes that persist
+    /// session state outside the Worker Run log.
+    pub fn with_session_directory(mut self, directory: impl Into<PathBuf>) -> Self {
+        self.session_directory = Some(directory.into());
+        self
+    }
+
+    /// Adds a display name for a fresh Agent Runtime invocation.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
         self
@@ -164,7 +220,13 @@ impl RunSupervisor {
                 source,
             })?;
         let log = Arc::new(Mutex::new(log));
-        let mut command = request.runtime.command(&request.invocation, capabilities);
+        let mut command = request
+            .runtime
+            .command(&request.invocation, capabilities)
+            .map_err(|source| RunSupervisorError::Command {
+                runtime: request.runtime,
+                source,
+            })?;
         command
             .current_dir(&request.workspace)
             .stdin(Stdio::inherit())
@@ -393,7 +455,13 @@ impl RunSupervisor {
                 path: request.log_path.clone(),
                 source,
             })?;
-        let mut command = request.runtime.command(&request.invocation, capabilities);
+        let mut command = request
+            .runtime
+            .command(&request.invocation, capabilities)
+            .map_err(|source| RunSupervisorError::Command {
+                runtime: request.runtime,
+                source,
+            })?;
         command
             .current_dir(&request.workspace)
             .stdin(Stdio::null())
@@ -550,6 +618,15 @@ pub enum RunSupervisorError {
     /// The Agent Runtime capability probe could not start.
     #[error(transparent)]
     Probe(#[from] AgentRuntimeProbeError),
+    /// The selected runtime rejected its typed invocation before spawning.
+    #[error("cannot build {runtime} Run command: {source}")]
+    Command {
+        /// Runtime whose command could not be built.
+        runtime: AgentRuntime,
+        /// Command validation failure.
+        #[source]
+        source: AgentRuntimeCommandError,
+    },
     /// The shared Run log could not be created or truncated.
     #[error("cannot create foreground Run log {path}: {source}")]
     Log {
@@ -703,7 +780,7 @@ fn reserved_request(reservation: &Reservation, invocation: AgentRuntimeInvocatio
     let repository = reservation.repository();
     RunRequest::new(
         reservation.agent_runtime(),
-        invocation,
+        invocation.with_session_directory(repository.root().join(".jj/pool").join("pi-sessions")),
         crate::workspace::worker_path(repository.root(), &worker_id),
         repository
             .root()
@@ -940,6 +1017,7 @@ impl AgentRuntime {
         match value.as_str() {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
+            "pi" => Some(Self::Pi),
             _ => None,
         }
     }
@@ -953,6 +1031,7 @@ impl AgentRuntime {
         match configured.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
             _ => Err(configured.to_owned()),
         }
     }
@@ -962,6 +1041,7 @@ impl AgentRuntime {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
         }
     }
 
@@ -973,81 +1053,12 @@ impl AgentRuntime {
         self,
         invocation: &AgentRuntimeInvocation,
         capabilities: AgentRuntimeCapabilities,
-    ) -> Command {
-        let (system_prompt, prompt) = invocation.session_prompts();
-        let mut command = Command::new(self.as_str());
-        if self == Self::Claude {
-            command.arg("-p");
-            if let Some(model) = invocation
-                .model
-                .as_deref()
-                .filter(|model| !model.is_empty())
-            {
-                command.args(["--model", model]);
-            }
-            if let Some(max_budget_usd) = invocation.max_budget_usd {
-                command.args(["--max-budget-usd", &max_budget_usd.to_string()]);
-            }
-            if let Some(session_id) = invocation
-                .session_id
-                .as_deref()
-                .filter(|session_id| !session_id.is_empty())
-            {
-                command.args(["--resume", session_id, "--fork-session"]);
-            }
-            command.args(["--output-format", "stream-json", "--verbose"]);
-            if capabilities.forward_subagent_text() {
-                command.arg("--forward-subagent-text");
-            }
-            command.args(["--settings", r#"{"permissions":{"defaultMode":"auto"}}"#]);
-            if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
-                command.args(["--name", name]);
-            }
-            if invocation
-                .session_id
-                .as_deref()
-                .filter(|session_id| !session_id.is_empty())
-                .is_none()
-                && let Some(system_prompt) = system_prompt.as_deref()
-            {
-                command.args(["--append-system-prompt", system_prompt]);
-            }
-            command.arg(&prompt);
-        } else {
-            command.args([
-                "--sandbox",
-                "workspace-write",
-                "--ask-for-approval",
-                "never",
-            ]);
-            if let Some(model) = invocation
-                .model
-                .as_deref()
-                .filter(|model| !model.is_empty())
-            {
-                command.args(["--model", model]);
-            }
-            if capabilities.multi_agent() {
-                command.args(["--enable", "multi_agent"]);
-            }
-            command.arg("exec");
-            if let Some(session_id) = invocation
-                .session_id
-                .as_deref()
-                .filter(|session_id| !session_id.is_empty())
-            {
-                command.args(["resume", "--json", "--skip-git-repo-check", session_id]);
-                command.arg(&prompt);
-            } else {
-                command.args(["--json", "--skip-git-repo-check"]);
-                let prompt = match system_prompt.as_deref() {
-                    Some(system_prompt) => format!("{system_prompt}\n\n{prompt}"),
-                    None => prompt,
-                };
-                command.arg(prompt);
-            }
+    ) -> Result<Command, AgentRuntimeCommandError> {
+        match self {
+            Self::Claude => Ok(claude_command(invocation, capabilities)),
+            Self::Codex => Ok(codex_command(invocation, capabilities)),
+            Self::Pi => pi_command(invocation),
         }
-        command
     }
 
     /// Probes this runtime in `workspace`, requiring its executable to start.
@@ -1055,9 +1066,13 @@ impl AgentRuntime {
         self,
         workspace: impl AsRef<Path>,
     ) -> Result<AgentRuntimeCapabilities, AgentRuntimeProbeError> {
+        if self == Self::Pi {
+            return probe_pi(workspace.as_ref());
+        }
         let (arguments, capability) = match self {
             Self::Claude => (["--help"].as_slice(), Capability::ForwardSubagentText),
             Self::Codex => (["features", "list"].as_slice(), Capability::MultiAgent),
+            Self::Pi => unreachable!("Pi probes through probe_pi"),
         };
         let output = Command::new(self.as_str())
             .args(arguments)
@@ -1086,6 +1101,240 @@ impl AgentRuntime {
         };
         Ok(AgentRuntimeCapabilities::from(capability, supported))
     }
+}
+
+const PI_WORKER_TOOLS: &str = "read,bash,edit,write,grep,find,ls";
+const PI_REQUIRED_FLAGS: &[&str] = &[
+    "--mode",
+    "--provider",
+    "--model",
+    "--session",
+    "--session-dir",
+    "--system-prompt",
+    "--name",
+    "--tools",
+    "--no-extensions",
+    "--no-skills",
+    "--no-prompt-templates",
+    "--no-themes",
+    "--no-context-files",
+    "--no-approve",
+];
+
+fn claude_command(
+    invocation: &AgentRuntimeInvocation,
+    capabilities: AgentRuntimeCapabilities,
+) -> Command {
+    let (system_prompt, prompt) = invocation.session_prompts();
+    let mut command = Command::new(AgentRuntime::Claude.as_str());
+    command.arg("-p");
+    if let Some(model) = invocation
+        .model
+        .as_ref()
+        .map(AgentModel::model)
+        .filter(|model| !model.is_empty())
+    {
+        command.args(["--model", model]);
+    }
+    if let Some(max_budget_usd) = invocation.max_budget_usd {
+        command.args(["--max-budget-usd", &max_budget_usd.to_string()]);
+    }
+    if let Some(session_id) = invocation
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    {
+        command.args(["--resume", session_id, "--fork-session"]);
+    }
+    command.args(["--output-format", "stream-json", "--verbose"]);
+    if capabilities.forward_subagent_text() {
+        command.arg("--forward-subagent-text");
+    }
+    command.args(["--settings", r#"{"permissions":{"defaultMode":"auto"}}"#]);
+    if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
+        command.args(["--name", name]);
+    }
+    if invocation
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+        .is_none()
+        && let Some(system_prompt) = system_prompt.as_deref()
+    {
+        command.args(["--append-system-prompt", system_prompt]);
+    }
+    command.arg(&prompt);
+    command
+}
+
+fn codex_command(
+    invocation: &AgentRuntimeInvocation,
+    capabilities: AgentRuntimeCapabilities,
+) -> Command {
+    let (system_prompt, prompt) = invocation.session_prompts();
+    let mut command = Command::new(AgentRuntime::Codex.as_str());
+    command.args([
+        "--sandbox",
+        "workspace-write",
+        "--ask-for-approval",
+        "never",
+    ]);
+    if let Some(model) = invocation
+        .model
+        .as_ref()
+        .map(AgentModel::model)
+        .filter(|model| !model.is_empty())
+    {
+        command.args(["--model", model]);
+    }
+    if capabilities.multi_agent() {
+        command.args(["--enable", "multi_agent"]);
+    }
+    command.arg("exec");
+    if let Some(session_id) = invocation
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    {
+        command.args(["resume", "--json", "--skip-git-repo-check", session_id]);
+        command.arg(&prompt);
+    } else {
+        command.args(["--json", "--skip-git-repo-check"]);
+        let prompt = match system_prompt.as_deref() {
+            Some(system_prompt) => format!("{system_prompt}\n\n{prompt}"),
+            None => prompt,
+        };
+        command.arg(prompt);
+    }
+    command
+}
+
+fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRuntimeCommandError> {
+    if invocation.max_budget_usd.is_some() {
+        return Err(AgentRuntimeCommandError::UnsupportedBudget {
+            runtime: AgentRuntime::Pi,
+        });
+    }
+    let model = invocation
+        .model
+        .as_ref()
+        .filter(|model| !model.model().trim().is_empty())
+        .ok_or(AgentRuntimeCommandError::MissingModel {
+            runtime: AgentRuntime::Pi,
+        })?;
+    let provider = model
+        .provider()
+        .filter(|provider| !provider.trim().is_empty())
+        .ok_or(AgentRuntimeCommandError::MissingProvider {
+            runtime: AgentRuntime::Pi,
+        })?;
+    let session_directory = invocation
+        .session_directory
+        .as_deref()
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .ok_or(AgentRuntimeCommandError::MissingSessionDirectory)?;
+    let (system_prompt, prompt) = invocation.session_prompts();
+    let mut command = Command::new(AgentRuntime::Pi.as_str());
+    command.args([
+        "--mode",
+        "json",
+        "--provider",
+        provider,
+        "--model",
+        model.model(),
+        "--session-dir",
+    ]);
+    command.arg(session_directory);
+    command.args([
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--no-approve",
+        "--tools",
+        PI_WORKER_TOOLS,
+    ]);
+    if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
+        command.args(["--name", name]);
+    }
+    if let Some(session_id) = invocation
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    {
+        command.args(["--session", session_id]);
+    } else if let Some(system_prompt) = system_prompt.as_deref() {
+        command.args(["--system-prompt", system_prompt]);
+    }
+    command.arg(&prompt);
+    Ok(command)
+}
+
+fn probe_pi(workspace: &Path) -> Result<AgentRuntimeCapabilities, AgentRuntimeProbeError> {
+    let version = run_pi_probe(["--version"].as_slice(), workspace, "version")?;
+    let version_text = String::from_utf8_lossy(&version.stdout).trim().to_owned();
+    let mut segments = version_text.split('.');
+    let valid_version = segments.next() == Some("0")
+        && segments.next() == Some("84")
+        && segments
+            .next()
+            .is_some_and(|patch| patch.parse::<u64>().is_ok());
+    if !valid_version {
+        return Err(AgentRuntimeProbeError::MalformedCapabilities {
+            runtime: AgentRuntime::Pi,
+            detail: format!("unsupported version output {version_text:?}"),
+        });
+    }
+    let help = run_pi_probe(["--help"].as_slice(), workspace, "help")?;
+    let help_text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&help.stdout),
+        String::from_utf8_lossy(&help.stderr)
+    );
+    if let Some(flag) = PI_REQUIRED_FLAGS
+        .iter()
+        .find(|flag| !help_text.contains(**flag))
+    {
+        return Err(AgentRuntimeProbeError::Unsupported {
+            runtime: AgentRuntime::Pi,
+            capability: (*flag).to_owned(),
+        });
+    }
+    Ok(AgentRuntimeCapabilities::default())
+}
+
+fn run_pi_probe(
+    arguments: &[&str],
+    workspace: &Path,
+    operation: &'static str,
+) -> Result<std::process::Output, AgentRuntimeProbeError> {
+    let output = Command::new(AgentRuntime::Pi.as_str())
+        .args(arguments)
+        .current_dir(workspace)
+        .output()
+        .map_err(|source| {
+            if source.kind() == io::ErrorKind::NotFound {
+                AgentRuntimeProbeError::ExecutableNotFound {
+                    runtime: AgentRuntime::Pi,
+                }
+            } else {
+                AgentRuntimeProbeError::Spawn {
+                    runtime: AgentRuntime::Pi,
+                    source,
+                }
+            }
+        })?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(AgentRuntimeProbeError::Failed {
+        runtime: AgentRuntime::Pi,
+        operation,
+        status: output.status.code(),
+        detail,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1134,6 +1383,23 @@ impl AgentRuntimeCapabilities {
     }
 }
 
+/// Errors that prevent a typed Agent Runtime command from being built.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum AgentRuntimeCommandError {
+    /// Pi requires a model selection.
+    #[error("{runtime} command requires a model")]
+    MissingModel { runtime: AgentRuntime },
+    /// Pi requires the provider portion of its model selection.
+    #[error("{runtime} command requires a model provider")]
+    MissingProvider { runtime: AgentRuntime },
+    /// Pi runs must be isolated from the user's global session directory.
+    #[error("Pi command requires an explicit session directory")]
+    MissingSessionDirectory,
+    /// Pi has no native aggregate budget command flag.
+    #[error("{runtime} does not support an aggregate budget override")]
+    UnsupportedBudget { runtime: AgentRuntime },
+}
+
 /// Errors that prevent an Agent Runtime capability probe from starting.
 #[derive(Debug, Error)]
 pub enum AgentRuntimeProbeError {
@@ -1146,5 +1412,33 @@ pub enum AgentRuntimeProbeError {
         runtime: AgentRuntime,
         #[source]
         source: io::Error,
+    },
+    /// The selected runtime rejected a required capability probe.
+    #[error("{runtime} {operation} capability probe failed{}{}", status.map_or(String::new(), |status| format!(" with status {status}")), if detail.is_empty() { String::new() } else { format!(": {detail}") })]
+    Failed {
+        /// Runtime being probed.
+        runtime: AgentRuntime,
+        /// Probe operation that failed.
+        operation: &'static str,
+        /// Process status when one was available.
+        status: Option<i32>,
+        /// Sanitized process diagnostic.
+        detail: String,
+    },
+    /// The runtime returned malformed capability information.
+    #[error("{runtime} capability probe returned malformed data: {detail}")]
+    MalformedCapabilities {
+        /// Runtime being probed.
+        runtime: AgentRuntime,
+        /// Decoding detail.
+        detail: String,
+    },
+    /// A required runtime capability is absent.
+    #[error("{runtime} does not support required capability {capability}")]
+    Unsupported {
+        /// Runtime being probed.
+        runtime: AgentRuntime,
+        /// Missing flag or capability name.
+        capability: String,
     },
 }

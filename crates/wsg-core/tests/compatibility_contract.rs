@@ -33,6 +33,7 @@ fn worker_fixtures_match_go_wsg_nullability_and_runtime_fields() {
         ("worker-busy-claude.json", "busy", "claude"),
         ("worker-done-codex.json", "done", "codex"),
         ("worker-failed-codex.json", "failed", "codex"),
+        ("worker-done-pi.json", "done", "pi"),
     ] {
         let worker = json_fixture(name);
         assert_eq!(worker["status"], status);

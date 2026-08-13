@@ -8,7 +8,7 @@ use wsg_core::{
     AgentRuntime, AgentSessionResolution, CollaborationEvent, CollaborationParticipant,
     FreshSessionReason, RunActivity, RunActivityKind, RunActivityStatus, RunConclusion, RunCost,
     RunLog, RunLogError, RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunUsage,
-    resolve_agent_session,
+    resolve_agent_session, resolve_agent_session_for_runtime,
 };
 
 #[test]
@@ -55,6 +55,111 @@ fn codex_session_identity_resumes_the_prior_agent_session() {
         resolution,
         AgentSessionResolution::Resumed {
             session_id: "codex-thread-123".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn pi_session_identity_uses_only_a_valid_pi_session_header() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("pi.log");
+    fs::write(&path, include_str!("fixtures/pi/session-start.jsonl"))
+        .expect("Pi Run log should be written");
+
+    assert_eq!(
+        resolve_agent_session_for_runtime(AgentRuntime::Pi, Some(path.as_path())),
+        AgentSessionResolution::Resumed {
+            session_id: "<session-success>".to_owned(),
+        }
+    );
+}
+
+#[test]
+fn pi_session_resolution_classifies_missing_malformed_and_unsupported_identity() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let missing_path = directory.path().join("missing.log");
+    fs::write(
+        &missing_path,
+        r#"{"type":"session","version":3,"id":"","timestamp":"now","cwd":"/tmp"}"#,
+    )
+    .expect("Pi Run log should be written");
+    assert_eq!(
+        resolve_agent_session_for_runtime(AgentRuntime::Pi, Some(missing_path.as_path())),
+        AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::MissingIdentity,
+        }
+    );
+
+    let incomplete_path = directory.path().join("incomplete.log");
+    fs::write(
+        &incomplete_path,
+        r#"{"type":"session","version":3,"id":"pi-session","timestamp":"now","cwd":""}"#,
+    )
+    .expect("Pi Run log should be written");
+    assert!(matches!(
+        resolve_agent_session_for_runtime(AgentRuntime::Pi, Some(incomplete_path.as_path())),
+        AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::MalformedLog { .. },
+        }
+    ));
+
+    let malformed_path = directory.path().join("malformed.log");
+    fs::write(
+        &malformed_path,
+        r#"{"type":"session","version":"three","id":"pi-session","cwd":"/tmp"}"#,
+    )
+    .expect("Pi Run log should be written");
+    match resolve_agent_session_for_runtime(AgentRuntime::Pi, Some(malformed_path.as_path())) {
+        AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::MalformedLog { path, detail },
+        } => {
+            assert_eq!(path, malformed_path);
+            assert!(detail.contains("expected u64"));
+        }
+        other => panic!("expected malformed Pi session header, got {other:?}"),
+    }
+
+    let truncated_path = directory.path().join("truncated.log");
+    fs::write(
+        &truncated_path,
+        r#"{"type":"session","version":3,"id":"pi-session""#,
+    )
+    .expect("Pi Run log should be written");
+    assert!(matches!(
+        resolve_agent_session_for_runtime(AgentRuntime::Pi, Some(truncated_path.as_path())),
+        AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::MalformedLog { .. },
+        }
+    ));
+
+    let unsupported_path = directory.path().join("unsupported.log");
+    fs::write(
+        &unsupported_path,
+        r#"{"type":"session","version":4,"id":"pi-session","timestamp":"now","cwd":"/tmp"}"#,
+    )
+    .expect("Pi Run log should be written");
+    assert_eq!(
+        resolve_agent_session_for_runtime(AgentRuntime::Pi, Some(unsupported_path.as_path())),
+        AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::UnsupportedSessionVersion {
+                path: unsupported_path,
+                version: 4,
+            },
+        }
+    );
+}
+
+#[test]
+fn runtime_aware_session_resolution_does_not_cross_runtime_identities() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("pi.log");
+    fs::write(&path, include_str!("fixtures/pi/session-start.jsonl"))
+        .expect("Pi Run log should be written");
+
+    assert_eq!(
+        resolve_agent_session_for_runtime(AgentRuntime::Claude, Some(path.as_path())),
+        AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::MissingIdentity,
         }
     );
 }
@@ -958,6 +1063,174 @@ fn codex_parser_ignores_unknown_events_but_rejects_malformed_json() {
             ..
         }
     ));
+}
+
+#[test]
+fn pi_assistant_and_tool_events_normalize_through_the_public_log_interface() {
+    let mut parser = RunLogParser::new(AgentRuntime::Pi);
+    let mut events = Vec::new();
+    for fixture in [
+        include_str!("fixtures/pi/session-start.jsonl"),
+        include_str!("fixtures/pi/assistant-success.jsonl"),
+    ] {
+        for line in fixture.lines() {
+            events.extend(
+                parser
+                    .parse_line(line)
+                    .expect("sanitized Pi event should parse"),
+            );
+        }
+    }
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunLogEvent::Activity(activity)
+            if matches!(activity.kind(), RunActivityKind::SessionStarted)
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunLogEvent::Activity(activity)
+            if matches!(activity.kind(), RunActivityKind::Reasoning { text } if text == "<thinking>")
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        RunLogEvent::Activity(activity)
+            if matches!(activity.kind(), RunActivityKind::Message { text } if text == "I will inspect the sentinel.")
+    )));
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            RunLogEvent::Result(result) => Some(result),
+            RunLogEvent::Activity(_) => None,
+        })
+        .expect("Pi assistant completion should be a result");
+    assert_eq!(result.conclusion(), &RunConclusion::Succeeded);
+    assert_eq!(
+        result.usage(),
+        Some(
+            &RunUsage::new(31, 13)
+                .with_cached_input_tokens(2)
+                .with_cache_write_input_tokens(3)
+        )
+    );
+    assert_eq!(result.cost(), Some(RunCost::from_micro_usd(3_300)));
+}
+
+#[test]
+fn pi_tool_execution_normalizes_success_and_failure_statuses() {
+    let mut parser = RunLogParser::new(AgentRuntime::Pi);
+    let success = include_str!("fixtures/pi/tool-success.jsonl")
+        .lines()
+        .flat_map(|line| parser.parse_line(line).expect("Pi tool event should parse"))
+        .collect::<Vec<_>>();
+    assert!(success.iter().any(|event| matches!(
+        event,
+        RunLogEvent::Activity(activity)
+            if matches!(activity.kind(), RunActivityKind::Tool { name, status: RunActivityStatus::Completed, .. } if name == "read")
+    )));
+
+    let mut parser = RunLogParser::new(AgentRuntime::Pi);
+    let failure = include_str!("fixtures/pi/tool-failure.jsonl")
+        .lines()
+        .flat_map(|line| {
+            parser
+                .parse_line(line)
+                .expect("Pi failed tool event should parse")
+        })
+        .collect::<Vec<_>>();
+    assert!(failure.iter().any(|event| matches!(
+        event,
+        RunLogEvent::Activity(activity)
+            if matches!(activity.kind(), RunActivityKind::Tool { name, status: RunActivityStatus::Failed { message: Some(message) }, .. } if name == "read" && message == "<missing-file-error>")
+    )));
+}
+
+#[test]
+fn pi_provider_failure_preserves_failure_and_usage_details() {
+    let mut parser = RunLogParser::new(AgentRuntime::Pi);
+    let events = include_str!("fixtures/pi/run-failure.jsonl")
+        .lines()
+        .flat_map(|line| {
+            parser
+                .parse_line(line)
+                .expect("Pi failure event should parse")
+        })
+        .collect::<Vec<_>>();
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            RunLogEvent::Result(result) => Some(result),
+            RunLogEvent::Activity(_) => None,
+        })
+        .expect("Pi failure should be terminal");
+    assert_eq!(
+        result.conclusion(),
+        &RunConclusion::Failed {
+            message: "synthetic provider failure for contract characterization".to_owned(),
+        }
+    );
+    assert_eq!(result.cost(), Some(RunCost::from_micro_usd(3_300)));
+}
+
+#[test]
+fn pi_unknown_records_are_ignored_but_malformed_records_are_typed() {
+    let mut parser = RunLogParser::new(AgentRuntime::Pi);
+    assert!(
+        parser
+            .parse_line(r#"{"type":"future_event","value":1}"#)
+            .expect("unknown Pi event should be ignored")
+            .is_empty()
+    );
+    let error = parser
+        .parse_line("not-json")
+        .expect_err("malformed Pi event should be classified");
+    assert!(matches!(
+        error,
+        RunLogParseError::InvalidEvent {
+            runtime: AgentRuntime::Pi,
+            ..
+        }
+    ));
+    let error = parser
+        .parse_line(
+            r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"cost":{"total":-1}}}}"#,
+        )
+        .expect_err("negative Pi cost should be classified");
+    assert!(matches!(
+        error,
+        RunLogParseError::InvalidCost {
+            runtime: AgentRuntime::Pi,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn pi_run_log_uses_bounded_activity_and_full_log_result_paths() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("pi.log");
+    let contents = format!(
+        "{}\n{}\n{}",
+        include_str!("fixtures/pi/session-start.jsonl").trim_end(),
+        include_str!("fixtures/pi/assistant-success.jsonl").trim_end(),
+        "{malformed Pi line}",
+    );
+    fs::write(&path, contents).expect("Pi Run log should be written");
+
+    let log = RunLog::new(&path, AgentRuntime::Pi);
+    let activity = log
+        .current_activity()
+        .expect("Pi activity should be readable")
+        .expect("Pi activity should be present");
+    assert!(matches!(
+        activity.kind(),
+        RunActivityKind::Message { text } if text == "The sentinel was read successfully."
+    ));
+    let result = log
+        .final_result()
+        .expect("Pi result should be readable")
+        .expect("Pi result should be present");
+    assert_eq!(result.conclusion(), &RunConclusion::Succeeded);
 }
 
 #[test]

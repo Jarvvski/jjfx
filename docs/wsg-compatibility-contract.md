@@ -73,11 +73,13 @@ required `model` string.
 
 Worker Status values currently written by Go are `idle`, `busy`, `done`, and
 `failed`. Sub-issue Status values are `pending`, `dispatched`, `done`, `failed`,
-and `skipped`. Agent Runtime values are `claude` and `codex`.
+and `skipped`. Agent Runtime values currently written by Go are `claude` and
+`codex`; Rust additionally writes the canonical `pi` value when a pool is
+configured for the Pi runtime.
 
-Rust persistence keeps these values as open strings so an additive Go value
-does not make the document unreadable. Lifecycle modules interpret the known
-values separately.
+Rust persistence keeps these values as open strings so an additive runtime
+value does not make the document unreadable. Lifecycle modules interpret the
+known values separately.
 
 ## Lock protocol
 

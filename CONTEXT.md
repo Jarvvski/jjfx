@@ -103,8 +103,8 @@ One execution attempt by an Agent Runtime in a Worker Workspace. A Run is
 shorter-lived than an Agent Session, which may continue across Runs.
 
 **Agent Runtime**:
-The external Claude Code or Codex program that executes a Run. The runtime is
-not the Agent Session or the Worker that hosts it.
+The external Claude Code, Codex, or Pi program that executes a Run. The runtime
+is not the Agent Session or the Worker that hosts it.
 
 **Ticket**:
 A Linear work item selected for implementation. A Ticket can receive a

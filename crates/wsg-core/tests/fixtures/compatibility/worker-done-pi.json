@@ -1,0 +1,12 @@
+{
+  "agent": "pi",
+  "branch_name": "adam/eng-103-done",
+  "completed_at": "2026-07-27T10:20:00Z",
+  "error": null,
+  "exit_code": 0,
+  "log_file": "/repo/.jj/pool/worker-04.log",
+  "pid": 4244,
+  "started_at": "2026-07-27T10:12:00Z",
+  "status": "done",
+  "ticket": "ENG-103"
+}

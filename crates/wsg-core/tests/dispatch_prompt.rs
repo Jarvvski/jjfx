@@ -16,7 +16,9 @@ fn fresh_and_resumed_agent_sessions_receive_the_same_delegation_contract() {
             AgentRuntimeInvocation::new("continue the Ticket").with_session_id("session-42");
 
         for invocation in [fresh, resumed] {
-            let command = runtime.command(&invocation, AgentRuntimeCapabilities::default());
+            let command = runtime
+                .command(&invocation, AgentRuntimeCapabilities::default())
+                .expect("runtime command should build");
             let prompt = command
                 .get_args()
                 .map(OsStr::to_string_lossy)
@@ -39,7 +41,9 @@ fn provider_managed_model_and_budget_add_no_command_overrides() {
     let invocation = DispatchPromptBuilder::new()
         .initial(context)
         .expect("provider-managed Dispatch prompt");
-    let command = AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::default());
+    let command = AgentRuntime::Codex
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("Codex command should build");
     let args = command
         .get_args()
         .map(OsStr::to_string_lossy)
@@ -73,7 +77,9 @@ fn initial_dispatch_prompt_pins_delivery_obligations_and_supported_overrides() {
     let invocation = DispatchPromptBuilder::new()
         .initial(context)
         .expect("initial Dispatch prompt");
-    let command = AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::default());
+    let command = AgentRuntime::Claude
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("Claude command should build");
     let args = command
         .get_args()
         .map(OsStr::to_string_lossy)

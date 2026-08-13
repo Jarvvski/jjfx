@@ -275,7 +275,7 @@ pub enum WorkerPoolError {
         worker: WorkerId,
         source: StateError,
     },
-    #[error("invalid configured Agent Runtime {value:?} (expected claude or codex)")]
+    #[error("invalid configured Agent Runtime {value:?} (expected claude, codex, or pi)")]
     InvalidAgentRuntime { value: String },
     #[error("cannot discover GitHub repository: {0}")]
     RepositoryDiscovery(String),

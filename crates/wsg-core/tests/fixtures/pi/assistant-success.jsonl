@@ -1,0 +1,8 @@
+{"type":"message_start","message":{"role":"assistant","content":[{"type":"thinking","thinking":"<thinking>"},{"type":"text","text":"I will inspect the sentinel."},{"type":"toolCall","id":"<tool-call>","name":"read","arguments":{"path":"sentinel.txt"}}],"provider":"spike","model":"spike-model","usage":{"input":17,"output":0,"cacheRead":2,"cacheWrite":3,"totalTokens":22,"cost":{"total":0.0033}},"stopReason":"toolUse"}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_start","contentIndex":0}}
+{"type":"message_update","assistantMessageEvent":{"type":"thinking_delta","contentIndex":0,"delta":"<thinking>"}}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":1,"delta":"I will inspect the sentinel."}}
+{"type":"message_update","assistantMessageEvent":{"type":"toolcall_end","contentIndex":2,"toolCall":{"type":"toolCall","id":"<tool-call>","name":"read","arguments":{"path":"sentinel.txt"}}}}
+{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"The sentinel was read successfully."}],"provider":"spike","model":"spike-model","usage":{"input":31,"output":13,"cacheRead":2,"cacheWrite":3,"totalTokens":49,"cost":{"total":0.0033}},"stopReason":"stop"}}
+{"type":"agent_end","messages":[{"role":"assistant","stopReason":"stop"}],"willRetry":false}
+{"type":"agent_settled"}

@@ -44,6 +44,20 @@ pub enum FreshSessionReason {
     },
     /// The prior Run log does not contain a provider Session identity.
     MissingIdentity,
+    /// The prior Run log contained a malformed runtime Session header.
+    MalformedLog {
+        /// Path containing the malformed header.
+        path: PathBuf,
+        /// Header decoding detail.
+        detail: String,
+    },
+    /// The prior Run log uses a runtime Session format this version cannot resume.
+    UnsupportedSessionVersion {
+        /// Path containing the unsupported Session header.
+        path: PathBuf,
+        /// Runtime Session format version.
+        version: u64,
+    },
 }
 
 impl fmt::Display for FreshSessionReason {
@@ -58,6 +72,18 @@ impl fmt::Display for FreshSessionReason {
                 )
             }
             Self::MissingIdentity => formatter.write_str("log has no session id yet"),
+            Self::MalformedLog { path, detail } => {
+                write!(
+                    formatter,
+                    "log has malformed session header ({}: {detail})",
+                    path.display()
+                )
+            }
+            Self::UnsupportedSessionVersion { path, version } => write!(
+                formatter,
+                "log has unsupported session version {version} ({})",
+                path.display()
+            ),
         }
     }
 }
@@ -99,6 +125,114 @@ pub fn resolve_agent_session(prior_log: Option<&Path>) -> AgentSessionResolution
     AgentSessionResolution::Fresh {
         reason: FreshSessionReason::MissingIdentity,
     }
+}
+
+/// Resolves a prior Agent Session using the selected runtime's identity format.
+pub fn resolve_agent_session_for_runtime(
+    runtime: AgentRuntime,
+    prior_log: Option<&Path>,
+) -> AgentSessionResolution {
+    if runtime != AgentRuntime::Pi {
+        return resolve_agent_session(prior_log);
+    }
+    let Some(path) = prior_log.filter(|path| !path.as_os_str().is_empty()) else {
+        return AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::NoPriorLog,
+        };
+    };
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) => return unreadable_agent_session_log(path, source),
+    };
+    let mut reader = BufReader::new(file);
+    let mut record = Vec::new();
+
+    loop {
+        record.clear();
+        match reader.read_until(b'\n', &mut record) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(source) => return unreadable_agent_session_log(path, source),
+        }
+        let value = match serde_json::from_slice::<Value>(&record) {
+            Ok(value) => value,
+            Err(source) if looks_like_pi_session_record(&record) => {
+                return AgentSessionResolution::Fresh {
+                    reason: FreshSessionReason::MalformedLog {
+                        path: path.to_path_buf(),
+                        detail: source.to_string(),
+                    },
+                };
+            }
+            Err(_) => continue,
+        };
+        if value.get("type").and_then(Value::as_str) != Some("session") {
+            continue;
+        }
+        let header = match serde_json::from_value::<PiSessionHeader>(value) {
+            Ok(header) => header,
+            Err(source) => {
+                return AgentSessionResolution::Fresh {
+                    reason: FreshSessionReason::MalformedLog {
+                        path: path.to_path_buf(),
+                        detail: source.to_string(),
+                    },
+                };
+            }
+        };
+        if header.version != 3 {
+            return AgentSessionResolution::Fresh {
+                reason: FreshSessionReason::UnsupportedSessionVersion {
+                    path: path.to_path_buf(),
+                    version: header.version,
+                },
+            };
+        }
+        if header.cwd.is_empty() || header.timestamp.is_empty() {
+            return AgentSessionResolution::Fresh {
+                reason: FreshSessionReason::MalformedLog {
+                    path: path.to_path_buf(),
+                    detail: "Pi session header is missing cwd or timestamp".to_owned(),
+                },
+            };
+        }
+        return if header.id.is_empty() {
+            AgentSessionResolution::Fresh {
+                reason: FreshSessionReason::MissingIdentity,
+            }
+        } else {
+            AgentSessionResolution::Resumed {
+                session_id: header.id,
+            }
+        };
+    }
+
+    AgentSessionResolution::Fresh {
+        reason: FreshSessionReason::MissingIdentity,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct PiSessionHeader {
+    version: u64,
+    id: String,
+    cwd: String,
+    timestamp: String,
+}
+
+fn looks_like_pi_session_record(record: &[u8]) -> bool {
+    let Ok(text) = str::from_utf8(record) else {
+        return false;
+    };
+    let text = text.trim_start();
+    let Some(type_start) = text.find("\"type\"") else {
+        return false;
+    };
+    let value = text[type_start + "\"type\"".len()..].trim_start();
+    let Some(value) = value.strip_prefix(':') else {
+        return false;
+    };
+    value.trim_start().starts_with("\"session\"")
 }
 
 fn unreadable_agent_session_log(path: &Path, source: std::io::Error) -> AgentSessionResolution {
@@ -321,6 +455,7 @@ pub enum RunLogEvent {
 pub struct RunLogParser {
     runtime: AgentRuntime,
     claude_tools: HashMap<String, ClaudeToolCall>,
+    pi_tools: HashMap<String, PiToolCall>,
 }
 
 impl RunLogParser {
@@ -329,6 +464,7 @@ impl RunLogParser {
         Self {
             runtime,
             claude_tools: HashMap::new(),
+            pi_tools: HashMap::new(),
         }
     }
 
@@ -337,6 +473,7 @@ impl RunLogParser {
         match self.runtime {
             AgentRuntime::Claude => parse_claude_line(line, &mut self.claude_tools),
             AgentRuntime::Codex => parse_codex_line(line),
+            AgentRuntime::Pi => parse_pi_line(line, &mut self.pi_tools),
         }
     }
 }
@@ -443,6 +580,410 @@ impl ClaudeUsage {
 struct ClaudeToolCall {
     name: String,
     detail: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PiEvent {
+    #[serde(rename = "type")]
+    event_type: String,
+    version: Option<u64>,
+    #[serde(default)]
+    message: Option<PiMessage>,
+    #[serde(rename = "assistantMessageEvent")]
+    assistant_message_event: Option<Value>,
+    #[serde(rename = "toolCallId", default)]
+    tool_call_id: String,
+    #[serde(rename = "toolName", default)]
+    tool_name: String,
+    args: Option<Value>,
+    result: Option<Value>,
+    #[serde(rename = "isError", default)]
+    is_error: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct PiMessage {
+    #[serde(default)]
+    role: String,
+    #[serde(default)]
+    content: Vec<Value>,
+    usage: Option<PiUsage>,
+    #[serde(rename = "stopReason", default)]
+    stop_reason: String,
+    #[serde(rename = "errorMessage", default)]
+    error_message: String,
+    #[serde(rename = "toolCallId", default)]
+    tool_call_id: String,
+    #[serde(rename = "isError", default)]
+    is_error: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PiUsage {
+    #[serde(default)]
+    input: u64,
+    #[serde(default)]
+    output: u64,
+    #[serde(rename = "cacheRead", default)]
+    cache_read: u64,
+    #[serde(rename = "cacheWrite", default)]
+    cache_write: u64,
+    cost: Option<PiCost>,
+}
+
+impl PiUsage {
+    fn normalized(&self) -> RunUsage {
+        RunUsage::new(self.input, self.output)
+            .with_cached_input_tokens(self.cache_read)
+            .with_cache_write_input_tokens(self.cache_write)
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PiCost {
+    total: Option<Value>,
+}
+
+#[derive(Debug)]
+struct PiToolCall {
+    name: String,
+    detail: Option<String>,
+}
+
+fn parse_pi_line(
+    line: &str,
+    tools: &mut HashMap<String, PiToolCall>,
+) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+    let event: PiEvent =
+        serde_json::from_str(line).map_err(|source| RunLogParseError::InvalidEvent {
+            runtime: AgentRuntime::Pi,
+            source,
+        })?;
+    let _version = event.version;
+    match event.event_type.as_str() {
+        "session" => Ok(vec![RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::SessionStarted,
+        ))]),
+        "message_start" | "message_end" => Ok(event
+            .message
+            .map(|message| parse_pi_message(message, tools))
+            .transpose()?
+            .unwrap_or_default()),
+        "message_update" => Ok(parse_pi_message_update(
+            event.assistant_message_event.as_ref(),
+            tools,
+        )),
+        "tool_execution_start" => Ok(parse_pi_tool_start(
+            &event.tool_call_id,
+            &event.tool_name,
+            event.args.as_ref(),
+            tools,
+        )),
+        "tool_execution_end" => Ok(parse_pi_tool_end(event, tools)),
+        "turn_end" => Ok(event
+            .message
+            .filter(|message| message.usage.is_some() || !message.error_message.is_empty())
+            .map(|message| parse_pi_message(message, tools))
+            .transpose()?
+            .unwrap_or_default()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_pi_message(
+    message: PiMessage,
+    tools: &mut HashMap<String, PiToolCall>,
+) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+    let usage = message.usage.as_ref().map(PiUsage::normalized);
+    let mut events = Vec::new();
+    for content in &message.content {
+        let Some(kind) = parse_pi_content(content, &message.role, tools) else {
+            continue;
+        };
+        let activity = RunActivity::new(kind);
+        events.push(RunLogEvent::Activity(match &usage {
+            Some(usage) => activity.with_usage(usage.clone()),
+            None => activity,
+        }));
+    }
+    if message.role == "toolResult"
+        && !message.tool_call_id.is_empty()
+        && let Some(tool) = tools.remove(&message.tool_call_id)
+    {
+        let detail = pi_content_text(&message.content);
+        let failure_detail = detail.clone();
+        events.push(RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: tool.name,
+                detail: detail.or(tool.detail),
+                status: pi_tool_status(message.is_error, failure_detail),
+            },
+        )));
+    }
+    if message.role == "assistant" && matches!(message.stop_reason.as_str(), "stop" | "error") {
+        events.push(RunLogEvent::Result(pi_result(&message)?));
+    }
+    Ok(events)
+}
+
+fn parse_pi_content(
+    content: &Value,
+    role: &str,
+    tools: &mut HashMap<String, PiToolCall>,
+) -> Option<RunActivityKind> {
+    let content_type = content.get("type")?.as_str()?;
+    match (role, content_type) {
+        ("assistant", "text") => content
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| RunActivityKind::Message {
+                text: text.to_owned(),
+            }),
+        ("assistant", "thinking") => content
+            .get("thinking")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| RunActivityKind::Reasoning {
+                text: text.to_owned(),
+            }),
+        ("assistant", "toolCall") => {
+            let id = content
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let name = content
+                .get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())?;
+            let detail = summarize_pi_value(content.get("arguments"));
+            if !id.is_empty() {
+                tools.insert(
+                    id.to_owned(),
+                    PiToolCall {
+                        name: name.to_owned(),
+                        detail: detail.clone(),
+                    },
+                );
+            }
+            Some(RunActivityKind::Tool {
+                name: name.to_owned(),
+                detail,
+                status: RunActivityStatus::InProgress,
+            })
+        }
+        _ => None,
+    }
+}
+
+fn parse_pi_message_update(
+    update: Option<&Value>,
+    tools: &mut HashMap<String, PiToolCall>,
+) -> Vec<RunLogEvent> {
+    let Some(update) = update.and_then(Value::as_object) else {
+        return Vec::new();
+    };
+    match update.get("type").and_then(Value::as_str) {
+        Some("thinking_delta") => update
+            .get("delta")
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.is_empty())
+            .map(|text| {
+                vec![RunLogEvent::Activity(RunActivity::new(
+                    RunActivityKind::Reasoning {
+                        text: text.to_owned(),
+                    },
+                ))]
+            })
+            .unwrap_or_default(),
+        Some("text_delta") => update
+            .get("delta")
+            .and_then(Value::as_str)
+            .filter(|delta| !delta.is_empty())
+            .map(|text| {
+                vec![RunLogEvent::Activity(RunActivity::new(
+                    RunActivityKind::Message {
+                        text: text.to_owned(),
+                    },
+                ))]
+            })
+            .unwrap_or_default(),
+        Some("toolcall_end") => update
+            .get("toolCall")
+            .and_then(|tool| parse_pi_tool_call(tool, tools))
+            .map(|kind| vec![RunLogEvent::Activity(RunActivity::new(kind))])
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+fn parse_pi_tool_call(
+    tool: &Value,
+    tools: &mut HashMap<String, PiToolCall>,
+) -> Option<RunActivityKind> {
+    let id = tool.get("id").and_then(Value::as_str).unwrap_or_default();
+    let name = tool
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    let detail = summarize_pi_value(tool.get("arguments"));
+    if !id.is_empty() {
+        tools.insert(
+            id.to_owned(),
+            PiToolCall {
+                name: name.to_owned(),
+                detail: detail.clone(),
+            },
+        );
+    }
+    Some(RunActivityKind::Tool {
+        name: name.to_owned(),
+        detail,
+        status: RunActivityStatus::InProgress,
+    })
+}
+
+fn parse_pi_tool_start(
+    id: &str,
+    name: &str,
+    args: Option<&Value>,
+    tools: &mut HashMap<String, PiToolCall>,
+) -> Vec<RunLogEvent> {
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let detail = summarize_pi_value(args);
+    if !id.is_empty() {
+        tools.insert(
+            id.to_owned(),
+            PiToolCall {
+                name: name.to_owned(),
+                detail: detail.clone(),
+            },
+        );
+    }
+    vec![RunLogEvent::Activity(RunActivity::new(
+        RunActivityKind::Tool {
+            name: name.to_owned(),
+            detail,
+            status: RunActivityStatus::InProgress,
+        },
+    ))]
+}
+
+fn parse_pi_tool_end(event: PiEvent, tools: &mut HashMap<String, PiToolCall>) -> Vec<RunLogEvent> {
+    let tool = tools.remove(&event.tool_call_id);
+    let name = tool
+        .as_ref()
+        .map_or(event.tool_name.as_str(), |tool| tool.name.as_str());
+    if name.is_empty() {
+        return Vec::new();
+    }
+    let detail = summarize_pi_result(event.result.as_ref())
+        .or_else(|| tool.as_ref().and_then(|tool| tool.detail.clone()));
+    vec![RunLogEvent::Activity(RunActivity::new(
+        RunActivityKind::Tool {
+            name: name.to_owned(),
+            detail: detail.clone(),
+            status: pi_tool_status(
+                event.is_error,
+                detail.or_else(|| summarize_pi_result(event.result.as_ref())),
+            ),
+        },
+    ))]
+}
+
+fn pi_tool_status(is_error: bool, detail: Option<String>) -> RunActivityStatus {
+    if is_error {
+        RunActivityStatus::Failed { message: detail }
+    } else {
+        RunActivityStatus::Completed
+    }
+}
+
+fn pi_result(message: &PiMessage) -> Result<RunResult, RunLogParseError> {
+    let mut result = if message.stop_reason == "error" {
+        RunResult::failed(if message.error_message.is_empty() {
+            "Pi provider failure"
+        } else {
+            &message.error_message
+        })
+    } else {
+        RunResult::succeeded()
+    };
+    if let Some(usage) = message.usage.as_ref() {
+        result = result.with_usage(usage.normalized());
+        if let Some(cost) = parse_pi_cost(usage.cost.as_ref())? {
+            result = result.with_cost(cost);
+        }
+    }
+    Ok(result)
+}
+
+fn parse_pi_cost(cost: Option<&PiCost>) -> Result<Option<RunCost>, RunLogParseError> {
+    let Some(cost) = cost else {
+        return Ok(None);
+    };
+    let Some(value) = cost.total.as_ref() else {
+        return Ok(None);
+    };
+    let number = value
+        .as_f64()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+        .ok_or_else(|| RunLogParseError::InvalidCost {
+            runtime: AgentRuntime::Pi,
+            value: value.to_string(),
+        })?;
+    let micro_usd = (number * 1_000_000.0).round();
+    if micro_usd > u64::MAX as f64 {
+        return Err(RunLogParseError::InvalidCost {
+            runtime: AgentRuntime::Pi,
+            value: value.to_string(),
+        });
+    }
+    Ok(Some(RunCost::from_micro_usd(micro_usd as u64)))
+}
+
+fn summarize_pi_result(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(content) = value.get("content").and_then(Value::as_array) {
+        return pi_content_text(content).or_else(|| summarize_pi_value(Some(value)));
+    }
+    summarize_pi_value(Some(value))
+}
+
+fn summarize_pi_value(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    if let Some(text) = value.as_str() {
+        return (!text.is_empty()).then_some(text.to_owned());
+    }
+    if let Some(object) = value.as_object() {
+        for key in [
+            "command",
+            "path",
+            "file_path",
+            "description",
+            "pattern",
+            "query",
+        ] {
+            if let Some(text) = object.get(key).and_then(Value::as_str) {
+                return (!text.is_empty()).then_some(text.to_owned());
+            }
+        }
+    }
+    (!value.is_null())
+        .then(|| serde_json::to_string(value).ok())
+        .flatten()
+}
+
+fn pi_content_text(content: &[Value]) -> Option<String> {
+    content.iter().find_map(|value| {
+        value
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(ToOwned::to_owned)
+    })
 }
 
 #[derive(Debug, Deserialize)]

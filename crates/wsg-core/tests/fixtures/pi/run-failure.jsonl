@@ -1,0 +1,5 @@
+{"type":"message_start","message":{"role":"assistant","content":[],"provider":"spike","model":"spike-model","usage":{"input":17,"output":0,"cacheRead":2,"cacheWrite":3,"totalTokens":22,"cost":{"total":0.0033}},"stopReason":"error","errorMessage":"synthetic provider failure for contract characterization"}}
+{"type":"message_end","message":{"role":"assistant","content":[],"provider":"spike","model":"spike-model","stopReason":"error","errorMessage":"synthetic provider failure for contract characterization"}}
+{"type":"turn_end","message":{"role":"assistant","stopReason":"error"},"toolResults":[]}
+{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","errorMessage":"synthetic provider failure for contract characterization"}],"willRetry":false}
+{"type":"agent_settled"}

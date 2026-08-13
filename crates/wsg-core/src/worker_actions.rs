@@ -556,7 +556,7 @@ impl SystemCommands {
             AgentSessionResolution::Resumed { session_id } => Some(session_id.as_str()),
             AgentSessionResolution::Fresh { .. } => None,
         };
-        let command = interactive_agent_command(runtime, session_id);
+        let command = interactive_agent_command(runtime, session_id)?;
         let cwd = format!("--cwd={}", workspace.display());
         let title = worker.as_str();
         let tab_id = self.run(
@@ -817,9 +817,12 @@ fn kitty_address() -> Result<String, WorkerActionError> {
     })
 }
 
-fn interactive_agent_command(runtime: AgentRuntime, session_id: Option<&str>) -> String {
+fn interactive_agent_command(
+    runtime: AgentRuntime,
+    session_id: Option<&str>,
+) -> Result<String, WorkerActionError> {
     let resumed = session_id.map(shell_quote);
-    match (runtime, resumed) {
+    let command = match (runtime, resumed) {
         (AgentRuntime::Claude, Some(session)) => {
             format!("claude --resume {session}; exec zsh")
         }
@@ -830,7 +833,11 @@ fn interactive_agent_command(runtime: AgentRuntime, session_id: Option<&str>) ->
         (AgentRuntime::Codex, None) => {
             "codex --sandbox workspace-write --ask-for-approval on-request; exec zsh".to_owned()
         }
-    }
+        (AgentRuntime::Pi, _) => {
+            return Err(WorkerActionError::UnsupportedMount { runtime });
+        }
+    };
+    Ok(command)
 }
 
 fn shell_quote(value: &str) -> String {
@@ -927,6 +934,9 @@ pub enum WorkerActionError {
     /// kitty could not be located for Mount.
     #[error("kitty is unavailable: {detail}")]
     KittyUnavailable { detail: String },
+    /// The selected runtime has no verified interactive mount form yet.
+    #[error("interactive mount is unsupported for {runtime}")]
+    UnsupportedMount { runtime: AgentRuntime },
     /// The Repository has no compatible GitHub slug.
     #[error("cannot detect GitHub repository")]
     RepositoryUnavailable,

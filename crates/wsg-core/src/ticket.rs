@@ -52,6 +52,9 @@ impl AgentRuntimeQuery {
                     prompt,
                 ]);
             }
+            AgentRuntime::Pi => {
+                command.arg(prompt);
+            }
         }
         command
     }
@@ -59,6 +62,11 @@ impl AgentRuntimeQuery {
 
 impl TicketQuery for AgentRuntimeQuery {
     fn query(&self, prompt: &str) -> Result<String, TicketQueryError> {
+        if self.runtime == AgentRuntime::Pi {
+            return Err(TicketQueryError::permanent(
+                "pi ticket discovery is unsupported until its read-only adapter is configured",
+            ));
+        }
         let output = self.command(prompt).output().map_err(|source| {
             TicketQueryError::permanent(format!("cannot start {} query: {source}", self.runtime))
         })?;
@@ -91,6 +99,7 @@ fn normalize_query_output(runtime: AgentRuntime, output: &str) -> Option<String>
                 .map_or_else(|| output.to_owned(), |wrapper| wrapper.result)
         }
         AgentRuntime::Codex => codex_query_text(output).unwrap_or_else(|| output.to_owned()),
+        AgentRuntime::Pi => output.to_owned(),
     };
     extract_json_object(&output).map(str::to_owned)
 }

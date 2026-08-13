@@ -1,0 +1,3 @@
+{"type":"tool_execution_start","toolCallId":"<tool-call-failure>","toolName":"read","args":{"path":"missing-sentinel.txt"}}
+{"type":"tool_execution_end","toolCallId":"<tool-call-failure>","toolName":"read","result":{"content":[{"type":"text","text":"<missing-file-error>"}],"details":{}},"isError":true}
+{"type":"message_end","message":{"role":"toolResult","toolCallId":"<tool-call-failure>","toolName":"read","content":[{"type":"text","text":"<missing-file-error>"}],"details":{},"isError":true}}

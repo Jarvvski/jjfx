@@ -13,9 +13,9 @@ use rustix::process::{
 use serde_json::Value;
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    Expected, PoolCapacity, Repository, RunRequest, RunReset, RunSupervisor, RunSupervisorError,
-    StateChange, WireStatus, WorkerId, WorkerStatus,
+    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation,
+    AgentRuntimeProbeError, Expected, PoolCapacity, Repository, RunRequest, RunReset,
+    RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerId, WorkerStatus,
 };
 
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
@@ -39,13 +39,141 @@ const HELPER_LAUNCH: &str = "WSG_AGENT_RUNTIME_HELPER_LAUNCH";
 const HELPER_DESCENDANT: &str = "WSG_AGENT_RUNTIME_HELPER_DESCENDANT";
 
 #[test]
+fn pi_runtime_has_a_canonical_configured_and_persisted_identity() {
+    let configured = AgentRuntime::from_configured(Some(&WireAgent::new(" PI ")))
+        .expect("Pi should be a supported configured runtime");
+
+    assert_eq!(configured, AgentRuntime::Pi);
+    assert_eq!(configured.as_str(), "pi");
+}
+
+#[test]
+fn legacy_missing_and_blank_runtime_configuration_still_defaults_to_claude() {
+    assert_eq!(
+        AgentRuntime::from_configured(None).expect("missing runtime should default"),
+        AgentRuntime::Claude
+    );
+    assert_eq!(
+        AgentRuntime::from_configured(Some(&WireAgent::new("  ")))
+            .expect("blank runtime should default"),
+        AgentRuntime::Claude
+    );
+}
+
+#[test]
+fn pi_model_selection_keeps_provider_and_model_typed() {
+    let model = AgentModel::new("spike-model").with_provider("spike");
+    assert_eq!(model.provider(), Some("spike"));
+    assert_eq!(model.model(), "spike-model");
+
+    let invocation = AgentRuntimeInvocation::new("inspect the workspace")
+        .with_model(model)
+        .with_session_directory("/tmp/pi-sessions");
+    let command = AgentRuntime::Pi
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("valid Pi model selection should build a command");
+    let args = command_args(&command);
+    assert!(args.windows(2).any(|pair| pair == ["--provider", "spike"]));
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--model", "spike-model"])
+    );
+}
+
+#[test]
+fn pi_requires_a_provider_and_model_before_launch() {
+    let missing_provider =
+        AgentRuntimeInvocation::new("work").with_model(AgentModel::new("spike-model"));
+    let error = AgentRuntime::Pi
+        .command(&missing_provider, AgentRuntimeCapabilities::default())
+        .expect_err("Pi must reject a model without a provider");
+    assert!(error.to_string().contains("provider"));
+
+    let missing_model =
+        AgentRuntimeInvocation::new("work").with_model(AgentModel::new(" ").with_provider("spike"));
+    let error = AgentRuntime::Pi
+        .command(&missing_model, AgentRuntimeCapabilities::default())
+        .expect_err("Pi must reject a blank model");
+    assert!(error.to_string().contains("model"));
+}
+
+#[test]
+fn fresh_pi_command_uses_explicit_json_model_and_trusted_workspace_policy() {
+    let prompt = "inspect; echo $(touch /tmp/not-a-command)";
+    let system_prompt = "follow the task rules";
+    let invocation = AgentRuntimeInvocation::new(prompt)
+        .with_model(AgentModel::new("spike-model").with_provider("spike"))
+        .with_name("worker session")
+        .with_system_prompt(system_prompt)
+        .with_session_directory("/tmp/pi sessions");
+    let command = AgentRuntime::Pi
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("valid Pi invocation should build");
+    let args = command_args(&command);
+
+    assert_eq!(command.get_program(), "pi");
+    assert_eq!(
+        &args[..16],
+        [
+            "--mode",
+            "json",
+            "--provider",
+            "spike",
+            "--model",
+            "spike-model",
+            "--session-dir",
+            "/tmp/pi sessions",
+            "--no-extensions",
+            "--no-skills",
+            "--no-prompt-templates",
+            "--no-themes",
+            "--no-context-files",
+            "--no-approve",
+            "--tools",
+            "read,bash,edit,write,grep,find,ls",
+        ]
+    );
+    assert_eq!(args[16], "--name");
+    assert_eq!(args[17], "worker session");
+    assert_eq!(args[18], "--system-prompt");
+    assert!(args[19].starts_with("follow the task rules\n\nDelegated work is read-only."));
+    assert_eq!(args[20], prompt);
+    assert!(!args.iter().any(|arg| arg == "sh" || arg == "-c"));
+}
+
+#[test]
+fn resumed_pi_command_selects_the_existing_session_without_repeating_system_prompt() {
+    let invocation = AgentRuntimeInvocation::new("continue; echo '$HOME'")
+        .with_model(AgentModel::new("spike-model").with_provider("spike"))
+        .with_session_id("session id with 'quotes'")
+        .with_system_prompt("must not be repeated")
+        .with_session_directory("/tmp/pi sessions");
+    let command = AgentRuntime::Pi
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("valid resumed Pi invocation should build");
+    let args = command_args(&command);
+
+    assert!(
+        args.windows(2)
+            .any(|pair| pair == ["--session", "session id with 'quotes'"])
+    );
+    assert!(!args.iter().any(|arg| arg == "--system-prompt"));
+    assert!(
+        args.last()
+            .expect("prompt argument")
+            .ends_with("\n\ncontinue; echo '$HOME'")
+    );
+}
+
+#[test]
 fn fresh_claude_command_preserves_headless_stream_invocation() {
     let invocation = AgentRuntimeInvocation::new("implement the thing")
         .with_model("opus")
         .with_name("pool:worker-abc:AMBA-42")
         .with_system_prompt("dispatch rules");
-    let command =
-        AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::new(false, true));
+    let command = AgentRuntime::Claude
+        .command(&invocation, AgentRuntimeCapabilities::new(false, true))
+        .expect("Claude command should build");
 
     assert_eq!(command.get_program(), "claude");
     let args = command_args(&command);
@@ -76,7 +204,9 @@ fn resumed_claude_command_does_not_repeat_system_prompt() {
         .with_model("opus")
         .with_session_id("sess-abc-123")
         .with_system_prompt("must not be repeated");
-    let command = AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::default());
+    let command = AgentRuntime::Claude
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("Claude command should build");
 
     let args = command_args(&command);
     assert_eq!(
@@ -105,8 +235,9 @@ fn fresh_codex_command_preserves_workspace_dispatch_invocation() {
     let invocation = AgentRuntimeInvocation::new("implement it")
         .with_model("gpt-test")
         .with_system_prompt("system rules");
-    let command =
-        AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::new(true, false));
+    let command = AgentRuntime::Codex
+        .command(&invocation, AgentRuntimeCapabilities::new(true, false))
+        .expect("Codex command should build");
 
     assert_eq!(command.get_program(), "codex");
     let args = command_args(&command);
@@ -136,8 +267,9 @@ fn resumed_codex_command_does_not_repeat_system_prompt() {
         .with_model("gpt-test")
         .with_session_id("thread-123")
         .with_system_prompt("must not be repeated");
-    let command =
-        AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::new(true, false));
+    let command = AgentRuntime::Codex
+        .command(&invocation, AgentRuntimeCapabilities::new(true, false))
+        .expect("Codex command should build");
 
     let args = command_args(&command);
     assert_eq!(
@@ -165,14 +297,18 @@ fn resumed_codex_command_does_not_repeat_system_prompt() {
 
 #[test]
 fn command_omits_capability_flags_when_not_supported_by_that_runtime() {
-    let claude = AgentRuntime::Claude.command(
-        &AgentRuntimeInvocation::new("work"),
-        AgentRuntimeCapabilities::new(true, false),
-    );
-    let codex = AgentRuntime::Codex.command(
-        &AgentRuntimeInvocation::new("work"),
-        AgentRuntimeCapabilities::new(false, true),
-    );
+    let claude = AgentRuntime::Claude
+        .command(
+            &AgentRuntimeInvocation::new("work"),
+            AgentRuntimeCapabilities::new(true, false),
+        )
+        .expect("Claude command should build");
+    let codex = AgentRuntime::Codex
+        .command(
+            &AgentRuntimeInvocation::new("work"),
+            AgentRuntimeCapabilities::new(false, true),
+        )
+        .expect("Codex command should build");
 
     assert!(
         !command_args(&claude)
@@ -186,6 +322,111 @@ fn command_omits_capability_flags_when_not_supported_by_that_runtime() {
             .any(|arg| arg == "--forward-subagent-text")
     );
     assert!(!command_args(&codex).iter().any(|arg| arg == "multi_agent"));
+}
+
+#[test]
+fn pi_probe_accepts_the_observed_version_and_required_flags() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    write_executable(
+        &temporary_directory.path().join("pi"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '%s\n' '0.84.1'; exit 0; fi
+printf '%s\n' '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'
+"#,
+    );
+    let result = temporary_directory.path().join("result");
+    let output = helper_command(temporary_directory.path(), &result, "pi")
+        .output()
+        .expect("Pi probe helper should run");
+
+    assert!(
+        output.status.success(),
+        "Pi probe helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("probe helper result"),
+        "ok"
+    );
+}
+
+#[test]
+fn pi_probe_reports_failed_version_checks() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    write_executable(
+        &temporary_directory.path().join("pi"),
+        "#!/bin/sh
+printf '%s\\n' 'provider unavailable' >&2
+exit 7
+",
+    );
+    let result = temporary_directory.path().join("result");
+    let output = helper_command(temporary_directory.path(), &result, "pi-failed")
+        .output()
+        .expect("Pi probe helper should run");
+
+    assert!(
+        output.status.success(),
+        "Pi probe helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = fs::read_to_string(result).expect("probe helper result");
+    assert!(error.contains("pi version capability probe failed"));
+    assert!(error.contains("status 7"));
+}
+
+#[test]
+fn pi_probe_rejects_malformed_version_output() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    write_executable(
+        &temporary_directory.path().join("pi"),
+        "#!/bin/sh
+printf '%s\\n' 'not-a-version'
+",
+    );
+    let result = temporary_directory.path().join("result");
+    let output = helper_command(temporary_directory.path(), &result, "pi-malformed")
+        .output()
+        .expect("Pi probe helper should run");
+
+    assert!(output.status.success());
+    let error = fs::read_to_string(result).expect("probe helper result");
+    assert!(error.contains("pi capability probe returned malformed data"));
+}
+
+#[test]
+fn pi_probe_rejects_a_missing_required_flag() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    write_executable(
+        &temporary_directory.path().join("pi"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then printf '%s\n' '0.84.1'; exit 0; fi
+printf '%s\n' '--mode --provider --model'
+"#,
+    );
+    let result = temporary_directory.path().join("result");
+    let output = helper_command(temporary_directory.path(), &result, "pi-unsupported")
+        .output()
+        .expect("Pi probe helper should run");
+
+    assert!(output.status.success());
+    let error = fs::read_to_string(result).expect("probe helper result");
+    assert!(error.contains("pi does not support required capability"));
+}
+
+#[test]
+fn missing_pi_executable_identifies_pi_in_probe_error() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let result = temporary_directory.path().join("result");
+    let output = helper_command(temporary_directory.path(), &result, "pi-missing")
+        .output()
+        .expect("probe helper should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(result).expect("probe helper result"),
+        "pi executable not found in PATH"
+    );
 }
 
 #[test]
@@ -1283,6 +1524,108 @@ fn reserved_background_run_finalizes_worker_after_wait() {
 }
 
 #[test]
+fn reserved_background_pi_run_uses_shared_pid_and_finalization_supervision() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = "pi".into();
+    fs::write(
+        &pool_path,
+        serde_json::to_vec(&pool).expect("pool JSON serialization"),
+    )
+    .expect("configured Pi pool state");
+    let bin_directory = temporary_directory.path().join("bin");
+    let result = temporary_directory.path().join("result");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("pi"),
+        concat!(
+            "#!/bin/sh\n",
+            "if [ \"$1\" = \"--version\" ]; then printf '%s\\n' '0.84.1'; exit 0; fi\n",
+            "if [ \"$1\" = \"--help\" ]; then printf '%s\\n' '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\n",
+            "printf '%s\\n' '{\"type\":\"session\",\"version\":3,\"id\":\"pi-worker-session\",\"cwd\":\"/tmp\"}'\n",
+            "printf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Pi completed the reserved Run.\"}],\"stopReason\":\"stop\",\"usage\":{\"input\":3,\"output\":2,\"cacheRead\":0,\"cacheWrite\":0,\"cost\":{\"total\":0.001}}}}'\n",
+            "exit 0\n",
+        ),
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args([
+            "--exact",
+            "reserved_background_run_finalize_helper",
+            "--ignored",
+        ])
+        .env("PATH", path)
+        .env(HELPER_RUNTIME, "pi")
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = helper
+        .output()
+        .expect("Pi reserved finalization helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("reserved finalization result"),
+        "exit=Some(0); conclusion=Succeeded; cost=Some(1000); source=Provider"
+    );
+
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(worker_id.as_str())
+        .expect("finalized Worker");
+    assert_eq!(worker.status(), WorkerStatus::Done);
+    assert_eq!(worker.exit_code(), Some(0));
+    assert!(worker.pid().is_some());
+    assert!(worker.completed_at().is_some());
+}
+
+#[test]
 fn reserved_background_run_finalizes_failed_worker_after_wait() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
@@ -1647,8 +1990,14 @@ fn reserved_background_run_finalize_helper() {
         .reserve_named(worker_id, "ENG-214")
         .expect("Worker reservation");
     let result = env::var_os(HELPER_RESULT).expect("result path");
+    let invocation = match env::var(HELPER_RUNTIME).as_deref() {
+        Ok("pi") => AgentRuntimeInvocation::new("reserved test")
+            .with_model(AgentModel::new("test-model").with_provider("test-provider")),
+        Ok("claude") | Err(_) => AgentRuntimeInvocation::new("reserved test"),
+        Ok(other) => panic!("unknown Agent Runtime {other}"),
+    };
     let background = RunSupervisor::new()
-        .run_reserved_background(reservation, AgentRuntimeInvocation::new("reserved test"))
+        .run_reserved_background(reservation, invocation)
         .expect("reserved background Run should start");
     let outcome = background.wait().expect("background Run should complete");
     fs::write(
@@ -2300,6 +2649,18 @@ fn agent_runtime_probe_helper() {
                 capabilities.forward_subagent_text(),
                 capabilities.multi_agent()
             )
+        }
+        "pi" => {
+            AgentRuntime::Pi
+                .probe(&workspace)
+                .expect("Pi probe should start");
+            "ok".to_owned()
+        }
+        "pi-failed" | "pi-malformed" | "pi-unsupported" | "pi-missing" => {
+            let error = AgentRuntime::Pi
+                .probe(&workspace)
+                .expect_err("Pi probe should reject the fake capability result");
+            error.to_string()
         }
         _ => panic!("unknown helper mode {mode}"),
     };

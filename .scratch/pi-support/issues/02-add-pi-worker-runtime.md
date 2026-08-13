@@ -1,6 +1,6 @@
 # Add the Pi worker runtime core
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -79,7 +79,8 @@ Follow-up actions, mount, CLI selection, versioning, or release documentation.
 - Runtime-aware session resolution is additive: existing provider-neutral
   resolution remains available while Pi callers select the runtime explicitly.
   A Pi session resumes only when its v3 session header identity is proven;
-  malformed and unsupported records produce explicit fresh-session reasons.
+  malformed and unsupported records produce explicit fresh-session
+  reasons.
 - Pi command construction requires an explicit provider and model selection.
   Pi's trusted Worker mode suppresses inherited resources and uses the fixed
   coding-tool allowlist selected from issue 01. Pi's own tool policy is not a

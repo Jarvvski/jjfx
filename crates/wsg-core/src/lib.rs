@@ -44,12 +44,12 @@ pub use run_log::{
     AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,
     RunActivity, RunActivityKind, RunActivityStatus, RunConclusion, RunCost, RunLog, RunLogError,
     RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunResultFallback, RunResultSource,
-    RunUsage, resolve_agent_session,
+    RunUsage, resolve_agent_session, resolve_agent_session_for_runtime,
 };
 pub use runtime::{
-    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    BackgroundRun, CompletedRun, RunOutcome, RunRequest, RunReset, RunSupervisor,
-    RunSupervisorError,
+    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
+    AgentRuntimeInvocation, AgentRuntimeProbeError, BackgroundRun, CompletedRun, RunOutcome,
+    RunRequest, RunReset, RunSupervisor, RunSupervisorError,
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,

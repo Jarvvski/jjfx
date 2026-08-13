@@ -1450,6 +1450,32 @@ fn reservation_normalizes_configured_codex_runtime_before_persisting_it() {
 }
 
 #[test]
+fn reservation_accepts_and_persists_configured_pi_runtime() {
+    let (temp, repository) = repository_with_pool();
+    let pool_path = temp.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = " PI ".into();
+    fs::write(
+        &pool_path,
+        serde_json::to_vec(&pool).expect("pool JSON serialization"),
+    )
+    .expect("configured pool state");
+
+    let reservation = repository
+        .worker_pool()
+        .reserve("ENG-213")
+        .expect("configured Pi runtime should be accepted");
+
+    assert_eq!(reservation.agent_runtime(), AgentRuntime::Pi);
+    let worker_json: Value = serde_json::from_slice(
+        &fs::read(temp.path().join(".jj/pool/worker-01.json")).expect("persisted Worker"),
+    )
+    .expect("Worker JSON");
+    assert_eq!(worker_json["agent"], "pi");
+}
+
+#[test]
 fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
     let (temp, repository) = repository_with_pool();
     let pool_path = temp.path().join(".jj/pool.json");
