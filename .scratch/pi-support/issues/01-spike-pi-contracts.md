@@ -1,6 +1,6 @@
 # Spike: establish Pi runtime and lifecycle contracts
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
