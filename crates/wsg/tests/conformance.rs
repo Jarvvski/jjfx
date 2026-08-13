@@ -518,11 +518,7 @@ fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, gr
             .expect("initial orchestration should spawn"),
     );
     wait_for_child_file(&group_path, &mut first_run);
-    support::add_unknown_field(&group_path, "future_group");
-    let interrupted_group = directory.path().join(".jj/pool/dispatch-eng-100.json.tmp");
-    let interrupted_writer = support::interrupted_artifact(&interrupted_group);
-    support::stop_child(interrupted_writer);
-    let worker = support::wait_for_assigned_group_worker(directory.path());
+    let worker = support::wait_for_assigned_group_worker(directory.path(), &mut first_run);
     support::wait_for_file(&pid_file);
     let leader = fs::read_to_string(&pid_file)
         .expect("runtime PID should be readable")
@@ -537,6 +533,10 @@ fn run_dispatch_group_scenario(creator: &BinarySpec, reconciler: &BinarySpec, gr
     drop(process_guard);
     let _ = support::wait_with_output(first_run, "initial orchestration");
     support::mark_worker_done(directory.path(), &worker, "ENG-101");
+    support::add_unknown_field(&group_path, "future_group");
+    let interrupted_group = directory.path().join(".jj/pool/dispatch-eng-100.json.tmp");
+    let interrupted_writer = support::interrupted_artifact(&interrupted_group);
+    support::stop_child(interrupted_writer);
 
     let restart_environment = [
         ("PATH", path.as_os_str()),

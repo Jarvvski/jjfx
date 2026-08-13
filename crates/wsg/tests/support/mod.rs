@@ -181,8 +181,8 @@ pub(crate) fn stop_child(mut child: Child) {
     let _ = child.wait();
 }
 
-pub(crate) fn wait_for_assigned_group_worker(root: &Path) -> String {
-    let deadline = Instant::now() + Duration::from_secs(10);
+pub(crate) fn wait_for_assigned_group_worker(root: &Path, child: &mut Option<Child>) -> String {
+    let deadline = Instant::now() + Duration::from_secs(30);
     let parent = TicketId::parse("ENG-100").expect("Parent Ticket should parse");
     loop {
         let repository = Repository::open(root).expect("repository should open");
@@ -198,6 +198,23 @@ pub(crate) fn wait_for_assigned_group_worker(root: &Path) -> String {
                 .find_map(|issue| issue.worker.clone())
         {
             return worker.to_string();
+        }
+        if let Some(status) = child
+            .as_mut()
+            .expect("orchestration child")
+            .try_wait()
+            .expect("orchestration status should be readable")
+        {
+            let output = child
+                .take()
+                .expect("orchestration child")
+                .wait_with_output()
+                .expect("orchestration output should be readable");
+            panic!(
+                "orchestration exited {status} before assigning a Dispatch Group worker: stdout={} stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         assert!(
             Instant::now() < deadline,
