@@ -1,12 +1,40 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 
+use tempfile::TempDir;
+
 use anyhow::{Result, bail};
 
 #[derive(Debug, Clone)]
 pub(crate) struct BinarySpec {
     label: &'static str,
     executable: PathBuf,
+}
+
+pub(crate) fn local_repository() -> TempDir {
+    let directory = tempfile::tempdir().expect("temporary directory should be created");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(directory.path())
+        .output()
+        .expect("jj should run");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let remote = Command::new("jj")
+        .args(["git", "remote", "add", "origin", "owner/repo"])
+        .current_dir(directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        remote.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&remote.stderr)
+    );
+    directory
 }
 
 impl BinarySpec {

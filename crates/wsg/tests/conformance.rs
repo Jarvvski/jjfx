@@ -56,6 +56,88 @@ fn configured_conformance_adapters_are_runnable() {
 }
 
 #[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn workspaces_created_by_each_binary_are_visible_and_removable_by_the_other() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    let directory = support::local_repository();
+
+    let go_add = binaries.go.run(directory.path(), &["add", "go-feature"]);
+    assert_success("Go add", &go_add);
+
+    let rust_list = binaries.rust.run(directory.path(), &["list"]);
+    assert_success("Rust list", &rust_list);
+    assert!(String::from_utf8_lossy(&rust_list.stdout).contains("go-feature"));
+
+    let rust_remove = binaries
+        .rust
+        .run(directory.path(), &["remove", "--force", "go-feature"]);
+    assert_success("Rust remove", &rust_remove);
+
+    let rust_add = binaries
+        .rust
+        .run(directory.path(), &["add", "rust-feature"]);
+    assert_success("Rust add", &rust_add);
+
+    let go_list = binaries.go.run(directory.path(), &["ls"]);
+    assert_success("Go list", &go_list);
+    assert!(String::from_utf8_lossy(&go_list.stdout).contains("rust-feature"));
+
+    let go_remove = binaries
+        .go
+        .run(directory.path(), &["rm", "--force", "rust-feature"]);
+    assert_success("Go remove", &go_remove);
+
+    let final_list = binaries.rust.run(directory.path(), &["list"]);
+    assert_success("Rust final list", &final_list);
+    let final_output = String::from_utf8_lossy(&final_list.stdout);
+    assert!(!final_output.contains("go-feature"));
+    assert!(!final_output.contains("rust-feature"));
+}
+
+#[test]
+#[ignore = "requires WSG_GO_BINARY and WSG_GO_TEST_BINARY"]
+fn pool_growth_and_destruction_round_trip_between_each_binary() {
+    let binaries =
+        ConformanceBinaries::from_environment().expect("oracle paths should be configured");
+    let directory = support::local_repository();
+
+    let go_create = binaries.go.run(directory.path(), &["pool", "create", "1"]);
+    assert_success("Go pool create", &go_create);
+
+    let rust_list = binaries.rust.run(directory.path(), &["pool", "list"]);
+    assert_success("Rust pool list", &rust_list);
+    assert!(String::from_utf8_lossy(&rust_list.stdout).contains("Pool: 1 idle"));
+
+    let rust_resize = binaries
+        .rust
+        .run(directory.path(), &["pool", "resize", "2"]);
+    assert_success("Rust pool resize", &rust_resize);
+
+    let go_status = binaries.go.run(directory.path(), &["status"]);
+    assert_success("Go pool status", &go_status);
+    assert!(String::from_utf8_lossy(&go_status.stdout).contains("Pool: 2 idle"));
+
+    let rust_destroy = binaries.rust.run(directory.path(), &["pool", "destroy"]);
+    assert_success("Rust pool destroy", &rust_destroy);
+
+    let go_missing = binaries.go.run(directory.path(), &["pool", "list"]);
+    assert!(!go_missing.status.success());
+    assert!(go_missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&go_missing.stderr).contains("No pool"));
+
+    let go_recreate = binaries.go.run(directory.path(), &["pool", "1"]);
+    assert_success("Go pool recreate", &go_recreate);
+    let rust_destroy = binaries.rust.run(directory.path(), &["pool", "destroy"]);
+    assert_success("Rust second pool destroy", &rust_destroy);
+
+    let rust_missing = binaries.rust.run(directory.path(), &["status"]);
+    assert!(!rust_missing.status.success());
+    assert!(rust_missing.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&rust_missing.stderr).contains("No pool"));
+}
+
+#[test]
 fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let go = directory.path().join("go-wsg");
@@ -74,6 +156,15 @@ fn conformance_configuration_keeps_the_two_go_adapters_distinct() {
     assert_eq!(binaries.go.path(), go);
     assert_eq!(binaries.go_test.path(), go_test);
     assert_ne!(binaries.go.path(), binaries.go_test.path());
+}
+
+fn assert_success(label: &str, output: &support::CommandOutcome) {
+    assert!(
+        output.status.success(),
+        "{label} failed with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn write_executable(path: &Path, body: &str) {
