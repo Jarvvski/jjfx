@@ -64,6 +64,11 @@ impl WorkspaceList {
         self.idle_collapsed = !self.idle_collapsed;
     }
 
+    /// Restore the idle-group fold state from persisted UI preferences.
+    pub fn set_idle_collapsed(&mut self, collapsed: bool) {
+        self.idle_collapsed = collapsed;
+    }
+
     /// The display rows for the classified workspaces: `default` pinned first,
     /// then a header per non-empty group and its workspace rows (unless the idle
     /// group is collapsed).

@@ -293,7 +293,8 @@ pub struct App {
     /// older message cannot clear a newer one.
     status_gen: u64,
     /// The attention-grouped, idle-collapsible workspace list: owns grouping,
-    /// the idle fold, and the name-tracked selection + render cursor. `App`
+    /// the idle fold, and the name-tracked selection + render cursor. The fold
+    /// state persists across launches through [`crate::ui_state::UiState`]. `App`
     /// supplies the [`Attention`] per workspace via [`App::classified`].
     list: WorkspaceList,
     /// The working-glyph animation frame counter, advanced by [`App::animate`]
@@ -928,6 +929,17 @@ impl App {
     /// Whether the inline world-graph pane is on - persisted as UI state at exit.
     pub fn world_pane(&self) -> bool {
         self.world.is_some()
+    }
+
+    /// Restore the idle-group fold state from persisted UI preferences.
+    pub fn set_idle_collapsed(&mut self, collapsed: bool) {
+        self.list.set_idle_collapsed(collapsed);
+        self.ensure_selection();
+    }
+
+    /// Whether the idle workspace group is folded - persisted as UI state at exit.
+    pub fn idle_collapsed(&self) -> bool {
+        self.list.idle_collapsed()
     }
 
     /// `W`: open the full-screen world graph and kick off an async jj-lib read.
@@ -5589,6 +5601,17 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal), "no mode change");
         app.handle(press(KeyCode::Char('w')));
         assert!(!app.world_pane(), "w again turns it off");
+    }
+
+    #[test]
+    fn idle_group_fold_state_can_be_restored_from_ui_preferences() {
+        let mut app = app_with(&["default", "idle"]);
+        assert!(!app.idle_collapsed());
+
+        app.set_idle_collapsed(true);
+
+        assert!(app.idle_collapsed());
+        assert_eq!(app.selectable_names(), vec!["default"]);
     }
 
     #[tokio::test]

@@ -6,6 +6,9 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-13 - Persisted the TUI's idle workspace fold state alongside the
+  world-graph pane across launches.
+
 - 2026-08-13 - Consolidated the user-facing command surface into the `jjfx`
   binary. Bare `jjfx` prints CLI help, `jjfx tui` opens the interactive TUI,
   and existing workspace, Pool, dispatch, and Worker actions are available as

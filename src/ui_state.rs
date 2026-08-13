@@ -1,5 +1,5 @@
 //! jjfx's persisted UI state: small presentation toggles that survive a
-//! relaunch (currently just whether the home view's world-graph pane is open).
+//! relaunch, such as the home view's world-graph pane and idle-group fold.
 //! Lives in the XDG *state* dir beside the event log - jjfx-owned runtime data,
 //! deliberately separate from the user-edited `config.toml`, which jjfx never
 //! writes back.
@@ -17,6 +17,8 @@ use serde::{Deserialize, Serialize};
 pub struct UiState {
     /// Whether the home view shows the world-graph pane under the list.
     pub world_pane: bool,
+    /// Whether the home view folds the idle workspace group.
+    pub idle_collapsed: bool,
 }
 
 /// `${XDG_STATE_HOME:-~/.local/state}/jjfx/ui.toml` - the same convention as
@@ -76,10 +78,36 @@ mod tests {
     fn round_trips_the_world_pane_toggle() {
         let dir = scratch("rt");
         let file = dir.join("ui.toml");
-        save_to(&file, &UiState { world_pane: true }).unwrap();
-        assert_eq!(load_from(&file), UiState { world_pane: true });
-        save_to(&file, &UiState { world_pane: false }).unwrap();
-        assert_eq!(load_from(&file), UiState { world_pane: false });
+        save_to(
+            &file,
+            &UiState {
+                world_pane: true,
+                idle_collapsed: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_from(&file),
+            UiState {
+                world_pane: true,
+                idle_collapsed: true,
+            }
+        );
+        save_to(
+            &file,
+            &UiState {
+                world_pane: false,
+                idle_collapsed: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            load_from(&file),
+            UiState {
+                world_pane: false,
+                idle_collapsed: false,
+            }
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -105,5 +133,6 @@ mod tests {
         // A state file written by a newer jjfx must still load.
         let state: UiState = toml::from_str("world_pane = true\nfuture_toggle = 3\n").unwrap();
         assert!(state.world_pane);
+        assert!(!state.idle_collapsed);
     }
 }

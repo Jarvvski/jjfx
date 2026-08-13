@@ -167,6 +167,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     );
     // A persisted-on world pane needs its first graph load kicked off here (the
     // load is otherwise only triggered by the toggle keys).
+    app.set_idle_collapsed(ui.idle_collapsed);
     app.refresh_graph_if_visible();
 
     let (worker_tx, worker_rx) = mpsc::unbounded_channel::<()>();
@@ -187,6 +188,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     // turn a clean quit into an error.
     ui_state::save(&ui_state::UiState {
         world_pane: app.world_pane(),
+        idle_collapsed: app.idle_collapsed(),
     })
     .ok();
 
