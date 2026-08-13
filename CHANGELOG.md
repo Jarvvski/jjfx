@@ -64,6 +64,10 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Fixed
 
+- 2026-08-13 - Home workspace rows no longer add placeholder-only Worker
+  metadata lines for idle, unassigned Workers. Optional runtime, ticket, and
+  activity fields are omitted when unavailable.
+
 - 2026-07-27 - Worker Pool snapshots now read the actual Go wsg state layout
   (v0.28.2), including `.jj/pool/<worker>.json`, aliases, Agent Runtime,
   completion metadata, and partial diagnostics. Shared Pool, Worker, and

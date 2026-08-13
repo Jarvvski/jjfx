@@ -2658,8 +2658,8 @@ impl App {
             format!("{:pad$}{path}", ""),
             Style::default().fg(Color::DarkGray),
         ));
-        let lines = match worker {
-            Some(worker) => vec![Line::from(spans), worker_line(worker, width)],
+        let lines = match worker.and_then(|worker| worker_detail_line(worker, width)) {
+            Some(detail) => vec![Line::from(spans), detail],
             None => vec![Line::from(spans)],
         };
         ListItem::new(lines)
@@ -2832,38 +2832,50 @@ fn worker_result_line(result: &RunResult) -> String {
     }
 }
 
-fn worker_line(worker: &WorkerSnapshot, width: u16) -> Line<'static> {
+fn worker_detail_line(worker: &WorkerSnapshot, width: u16) -> Option<Line<'static>> {
     let status = if worker.status() == WorkerStatus::Busy && worker.has_dead_process() {
         "stale"
     } else {
         worker.status().as_str()
     };
-    let ticket = worker.ticket().unwrap_or("-");
-    if width < 55 {
-        return Line::from(Span::styled(
-            format!("  {}  {status}  ticket:{ticket}", worker.worker_id()),
-            Style::default().fg(Color::Cyan),
-        ));
+    let ticket = worker.ticket();
+
+    // An idle, unassigned Worker contributes no information beyond the main
+    // workspace row. Keep it there rather than adding a placeholder-only line.
+    if worker.status() == WorkerStatus::Idle && ticket.is_none() {
+        return None;
     }
-    let runtime = worker
-        .agent_runtime()
-        .map(|runtime| runtime.as_str())
-        .unwrap_or("runtime?");
-    let activity = worker
+
+    if width < 55 {
+        let mut fields = vec![worker.worker_id().to_string(), status.to_owned()];
+        if let Some(ticket) = ticket {
+            fields.push(format!("ticket:{ticket}"));
+        }
+        return Some(Line::from(Span::styled(
+            format!("  {}", fields.join("  ")),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
+    let mut fields = vec![worker.alias().to_owned(), status.to_owned()];
+    if let Some(runtime) = worker.agent_runtime() {
+        fields.push(runtime.as_str().to_owned());
+    }
+    if let Some(ticket) = ticket {
+        fields.push(format!("ticket:{ticket}"));
+    }
+    if let Some(activity) = worker
         .last_activity_at()
         .or_else(|| worker.started_at())
         .map(elapsed_label)
-        .unwrap_or_else(|| "-".to_string());
-    Line::from(vec![
+    {
+        fields.push(activity);
+    }
+
+    Some(Line::from(vec![
         Span::styled("  wsg ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!(
-                "{}  {status:<6} {runtime:<6} ticket:{ticket:<8} {activity}",
-                worker.alias()
-            ),
-            Style::default().fg(Color::Cyan),
-        ),
-    ])
+        Span::styled(fields.join("  "), Style::default().fg(Color::Cyan)),
+    ]))
 }
 
 fn elapsed_label(timestamp: &str) -> String {
@@ -4857,6 +4869,49 @@ mod tests {
             .collect();
         assert!(text.contains("Delete workspace"), "{text}");
         assert!(!text.contains("Send to Worker"), "{text}");
+    }
+
+    #[test]
+    fn idle_unassigned_worker_workspace_stays_on_one_line_without_placeholders() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":null,"ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let mut app = app_with(&["default", "worker-01"]);
+        app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
+            operation: 0,
+            snapshot,
+        }));
+
+        let workspace = app.store.workspace("worker-01").unwrap();
+        let worker = app.worker_for(workspace).unwrap();
+        let item = app.workspace_item(workspace, Attention::Idle, false, Some(worker), 120);
+        assert_eq!(item.height(), 1);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(!text.contains("runtime?"), "{text}");
+        assert!(!text.contains("ticket:-"), "{text}");
     }
 
     #[test]
