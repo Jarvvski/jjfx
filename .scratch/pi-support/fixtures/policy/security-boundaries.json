@@ -1,0 +1,18 @@
+{
+  "kind": "pi-host-security-contract",
+  "safeDefault": {
+    "tools":"--tools read,grep,find,ls",
+    "trust":"--no-approve",
+    "resources":["--no-extensions","--no-skills","--no-prompt-templates","--no-themes","--no-context-files"],
+    "network":"PI_OFFLINE=1",
+    "credentials":"not passed"
+  },
+  "requiredHostControls": [
+    "Constrain cwd and filesystem access outside Pi.",
+    "Select a static tool allowlist before each run.",
+    "Treat project-local resources as untrusted unless explicitly approved.",
+    "Pass only an explicitly selected provider/model and never inherit credentials accidentally.",
+    "Enforce aggregate token/cost/time budgets from streamed usage and lifecycle events.",
+    "Implement approval and attention UI outside Pi because Pi exposes no native approval event in the tested modes."
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "kind": "observed-prompt-and-model-controls",
+  "modelSelection": {
+    "providerFlag":"spike",
+    "modelFlag":"spike-model",
+    "observedState":{"provider":"spike","model":"spike-model","api":"spike-api","reasoning":true,"maxTokens":1000}
+  },
+  "systemPrompt": {
+    "base":"base-spike-system",
+    "append":"append-spike-system",
+    "observed":"base-spike-system\\n\\nappend-spike-system\\nCurrent working directory: <isolated-project>"
+  },
+  "sessionNaming": {
+    "flag":"--name spike-session-name",
+    "observedRpcState":"sessionName=spike-session-name"
+  },
+  "thinking": {
+    "supportedLevels":["off","minimal","low","medium","high","xhigh","max"],
+    "defaultObserved":"medium"
+  }
+}

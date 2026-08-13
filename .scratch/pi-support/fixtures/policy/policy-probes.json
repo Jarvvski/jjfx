@@ -1,0 +1,37 @@
+{
+  "kind": "observed-policy-probes",
+  "model": {
+    "command": ["pi", "--mode", "rpc", "--provider", "spike", "--model", "spike-model", "--name", "spike-session-name"],
+    "getState": {"modelId":"spike-model","provider":"spike","api":"spike-api","sessionName":"spike-session-name","thinkingLevel":"medium"},
+    "contract": "The selected provider/model and session display name are observable through RPC get_state."
+  },
+  "toolAllowlist": [
+    {"command":"--tools read,grep,find,ls","requestedTool":"read","result":"success","writeTargetChanged":false},
+    {"command":"--tools read,grep,find,ls","requestedTool":"write","result":"tool error: Tool write not found","writeTargetChanged":false},
+    {"command":"--tools write","requestedTool":"write","result":"success","writeTargetChanged":true}
+  ],
+  "trust": [
+    {"command":"--no-approve","projectExtension":"ignored","markerWritten":false},
+    {"command":"--approve","projectExtension":"loaded","markerWritten":true}
+  ],
+  "systemPrompt": {
+    "command":["--system-prompt","base-spike-system","--append-system-prompt","append-spike-system"],
+    "observed":"base-spike-system\\n\\nappend-spike-system\\nCurrent working directory: <isolated-project>",
+    "contract":"Explicit system prompt replaces the default prompt; appended text is separated by blank lines; Pi still appends its cwd context."
+  },
+  "filesystem": {
+    "command":"--tools write",
+    "observed":"A relative ../outside-sentinel.txt write succeeded from the isolated project.",
+    "contract":"Pi does not sandbox filesystem paths. The caller must provide a constrained cwd, tool allowlist, and any OS-level sandboxing."
+  },
+  "approval": {
+    "observed":"--approve and --no-approve control project-local resource trust only. No native per-tool approval event or prompt was observed in JSON/RPC runs.",
+    "contract":"A host integration must implement any human approval policy outside Pi or expose only pre-approved tools."
+  },
+  "budget": {
+    "observed":"Usage and cost are emitted on assistant messages, turns, and session records, but the CLI has no total token/cost budget flag.",
+    "unsupportedArgument":"--max-budget 1",
+    "error":"Error: Unknown option: --max-budget",
+    "contract":"A host integration must enforce budget limits from usage events and terminate/abort explicitly."
+  }
+}
