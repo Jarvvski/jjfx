@@ -40,4 +40,9 @@ run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.check]
 description = "fmt + lint + build + test (the pre-land gate)"
-depends = ["fmt", "lint", "build", "test"]
+run = [
+  { task = "fmt" },
+  { task = "lint" },
+  { task = "build" },
+  { task = "test" },
+]
