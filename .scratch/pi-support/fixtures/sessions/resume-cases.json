@@ -1,0 +1,23 @@
+{
+  "kind": "observed-session-contract",
+  "sessionHeader": {
+    "type": "session",
+    "version": 3,
+    "identityField": "id",
+    "workingDirectoryField": "cwd",
+    "parentRelationshipField": "parentSession"
+  },
+  "cases": [
+    {"name":"fresh-explicit-session-dir","result":"creates one v3 JSONL file and emits a session header"},
+    {"name":"resume-by-full-path","result":"reuses the same id, timestamp, cwd, and file; appends new entries"},
+    {"name":"resume-by-partial-id","result":"observed success with a unique id prefix; same session id and file were reused"},
+    {"name":"fork-by-full-path","result":"creates a new id and file with parentSession pointing at the source file"},
+    {"name":"resume-from-different-cwd","result":"uses the stored session cwd; resumed tool execution resolved relative to the stored cwd"},
+    {"name":"missing-explicit-path","result":"creates a fresh session at the requested path"},
+    {"name":"missing-id-in-session-dir","result":"fails before agent start with exit status 1 and no session"},
+    {"name":"malformed-interior-line","result":"ignored and session remains resumable; adapter must tolerate malformed lines"},
+    {"name":"unknown-session-version","result":"accepted as forward-compatible and preserved in the emitted header"},
+    {"name":"syntactically-invalid-header","result":"not yet tested; future adapter must classify as malformed rather than infer identity from filename"}
+  ],
+  "sanitization": "UUIDs, entry ids, timestamps, paths, and private text are replaced with placeholders while equality and parent relationships are preserved."
+}

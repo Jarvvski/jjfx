@@ -1,0 +1,4 @@
+{"type":"session","version":3,"id":"<session-success>","timestamp":"<iso8601>","cwd":"/tmp/<spike>/project"}
+{"type":"message","id":"<entry-final>","parentId":"<entry-tool-result>","timestamp":"<iso8601>","message":{"role":"assistant","content":[{"type":"text","text":"The sentinel was read successfully."}],"stopReason":"stop"}}
+{"type":"message","id":"<entry-resume-user>","parentId":"<entry-final>","timestamp":"<iso8601>","message":{"role":"user","content":[{"type":"text","text":"Continue the contract probe."}]}}
+{"type":"message","id":"<entry-resume-assistant>","parentId":"<entry-resume-user>","timestamp":"<iso8601>","message":{"role":"assistant","content":[{"type":"text","text":"The sentinel was read successfully."}],"stopReason":"stop"}}
