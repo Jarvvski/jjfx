@@ -131,4 +131,4 @@ implementation slices.
 ## Blocked by
 
 - issues/01-spike-pi-contracts.md
-- issues/02-add-pi-worker-runtime.md
+- issues/03-complete-pi-worker-actions-and-release.md

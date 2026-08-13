@@ -23,14 +23,14 @@ remaining differences reviewable.
 ## Solution
 
 Run a non-destructive acceptance matrix against the released jjfx artifact and
-the owner's installed Pi, Claude, and Codex tools after issues 02-04 are
+the owner's installed Pi, Claude, and Codex tools after issues 02-05 are
 resolved. Use isolated or explicitly approved tickets, workspaces, temporary
 configuration where possible, and a controlled repository state. Record
 sanitized evidence under `.scratch/pi-support/`, including tool versions,
 configuration sources, observed results, cleanup, known limitations, and
 explicit owner approval.
 
-The matrix must cover both Pi's interactive lifecycle and worker runtime:
+The matrix must cover both Pi's interactive lifecycle and Worker runtime:
 
 - installation/status and configuration discovery;
 - interactive launch, working/waiting/ended lifecycle, session switching, and
@@ -130,5 +130,6 @@ cleanup, and status for every matrix row.
 ## Blocked by
 
 - issues/02-add-pi-worker-runtime.md
-- issues/03-add-pi-ticket-discovery-and-dispatch.md
-- issues/04-add-pi-interactive-lifecycle.md
+- issues/03-complete-pi-worker-actions-and-release.md
+- issues/04-add-pi-ticket-discovery-and-dispatch.md
+- issues/05-add-pi-interactive-lifecycle.md

@@ -1,6 +1,6 @@
-# Add Pi worker runtime, logs, sessions, and mount
+# Add the Pi worker runtime core
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 
@@ -10,8 +10,9 @@ pi-support effort (standalone; no PRD)
 
 The shared worker library treats Agent Runtime as a closed Claude/Codex enum.
 Runtime parsing, persisted pool identity, command construction, capability
-probes, log parsing, session resolution, follow-ups, and interactive mount all
-need a Pi adapter before a Pi worker can safely execute or continue work.
+probes, structured log parsing, and session resolution need a Pi adapter before
+a Pi Worker can safely execute or continue work. Follow-up actions and
+interactive mount are tracked in the dependent continuation ticket.
 
 Pi's invocation and session contracts differ from both existing providers. A
 Pi process may emit JSON events rather than Claude stream-json or Codex JSONL,
@@ -22,18 +23,21 @@ policy.
 
 ## Solution
 
-Add Pi as a first-class worker runtime behind the existing provider-neutral
+Add Pi as a first-class Worker runtime behind the existing provider-neutral
 interfaces. Use the contract and capability decisions from issue 01 to keep
 Pi-specific command construction, probing, JSON DTOs, session identity, and
-interactive mount details inside the shared library. Reuse the existing Run
-Supervisor, Worker state transitions, follow-up reservation flow, and
-provider-neutral activity/result values wherever the Pi contract permits it.
+runtime-aware session resolution inside the shared library. Reuse the existing
+Run Supervisor, Worker state transitions, and provider-neutral activity/result
+values wherever the Pi contract permits it. Keep the runtime module deep: its
+small public interface owns provider policy while private Pi adapters own CLI
+and JSON details.
 
 Legacy pools with missing or blank runtime configuration continue to default to
-Claude. Existing Claude and Codex wire values, commands, logs, sessions, and
-mount behavior remain unchanged. Pi capabilities that issue 01 marks
-unsupported must be represented by typed errors or absent optional values, not
-by a silent fallback to another runtime.
+Claude. Existing Claude and Codex wire values, commands, logs, and sessions
+remain unchanged. Pi capabilities that issue 01 marks unsupported must be
+represented by typed errors or absent optional values, not by a silent fallback
+to another runtime. This ticket does not add Pi discovery, interactive identity,
+Follow-up actions, mount, CLI selection, versioning, or release documentation.
 
 ## Commits
 
@@ -56,15 +60,9 @@ by a silent fallback to another runtime.
 6. Connect Pi to provider-neutral foreground/background supervision and verify
    that log creation, PID persistence, finalization, process cleanup, and
    stale-run protection remain shared behavior.
-7. Connect Pi to Follow-up session resolution and interactive Worker mount,
-   including fresh and resumed command forms, shell quoting, workspace policy,
-   and executable validation.
-8. Add focused unit and integration coverage using sanitized Pi fixtures and
-   fake executables for invocation, probing, stream parsing, result handling,
-   session continuation, mount, spawn failure, malformed output, and cleanup.
-9. Update the runtime compatibility documentation and user-facing configuration
-   guidance, bump the version according to the repository policy, and add a
-   dated changelog entry for the new worker runtime.
+7. Add focused unit and integration coverage using sanitized Pi fixtures and
+   fake executables for runtime identity, probing, command construction, stream
+   parsing, session resolution, spawn failure, malformed output, and cleanup.
 
 ## Decision Document
 
@@ -78,9 +76,16 @@ by a silent fallback to another runtime.
 - Pi JSON records and session entries remain private implementation details.
   CLI, TUI, orchestration, and Worker actions consume existing normalized
   values.
-- A Pi follow-up resumes only when the configured Pi session identity is
-  proven. Otherwise it starts a fresh Pi session and exposes the explicit
-  fallback reason already used by the shared Worker action API.
+- Runtime-aware session resolution is additive: existing provider-neutral
+  resolution remains available while Pi callers select the runtime explicitly.
+  A Pi session resumes only when its v3 session header identity is proven;
+  malformed and unsupported records produce explicit fresh-session reasons.
+- Pi command construction requires an explicit provider and model selection.
+  Pi's trusted Worker mode suppresses inherited resources and uses the fixed
+  coding-tool allowlist selected from issue 01. Pi's own tool policy is not a
+  filesystem sandbox, so the limitation is visible to callers.
+- Pi has no native aggregate budget or per-tool approval contract. A requested
+  unsupported budget or approval override fails before process launch.
 - Pi's permission, trust, and tool policy must be selected from issue 01's
   evidence. Claude or Codex flags must not be copied by analogy.
 
@@ -89,44 +94,43 @@ by a silent fallback to another runtime.
 Use fake Pi executables for deterministic argument, environment, exit-status,
 stdout/stderr, and process-tree tests. Use sanitized fixture files for every
 supported Pi JSON event and session entry, including unknown and malformed
-records. Exercise public runtime, Run Supervisor, RunLog, session-resolution,
-and WorkerActions seams rather than coupling tests to provider DTO structure.
-Run `mise run check` after the implementation and do not run an unrestricted
-TestContainers test command.
+records. Exercise public runtime, Run Supervisor, RunLog, and session-resolution seams
+rather than coupling tests to provider DTO structure. WorkerActions coverage
+belongs to the dependent continuation ticket. Run `mise run check` after the
+implementation and do not run an unrestricted TestContainers test command.
 
 ## Acceptance Criteria
 
 - [ ] Claude and Codex runtime parsing, persistence, invocation, logs, session
-      continuation, mount, and existing tests remain unchanged and green.
+      continuation, and existing tests remain unchanged and green.
 - [ ] Pi is accepted as a canonical configured and persisted runtime while
       missing or blank legacy configuration still selects Claude.
-- [ ] Pi executable and capability failures identify the runtime and the
-      missing capability without mutating Worker state.
+- [ ] Pi executable and capability failures identify the runtime and missing
+      capability without mutating Worker state.
 - [ ] Fresh and resumed Pi commands match the issue 01 contract, preserve the
-      workspace and safe tool policy, and never route prompt text through a
-      shell.
+      trusted Worker policy, require provider/model selection, and never route
+      prompt text through a shell.
 - [ ] Pi JSON streams normalize into provider-neutral activity, result, usage,
       cost, failure, and session values without leaking Pi DTOs to callers.
 - [ ] Current activity uses bounded log reading and terminal results use the
       shared full-log finalization path, with partial and unknown records
       handled according to the selected contract.
-- [ ] Pi Follow-up reports resumed versus fresh behavior and never resumes a
-      Pi session through Claude or Codex.
-- [ ] Pi Worker mount supports verified fresh and resumed interactive forms or
-      returns a typed unsupported outcome; it never opens an arbitrary shell
-      command in place of a failed Pi command.
+- [ ] Runtime-aware Pi session resolution distinguishes valid identity,
+      missing identity, unreadable logs, malformed records, and unsupported
+      session versions without cross-provider fallback.
 - [ ] Background cleanup, PID persistence, Reset, liveness reconciliation,
       and stale finalization remain provider-neutral and covered.
-- [ ] Compatibility documentation, version, changelog, and `mise run check`
-      are complete.
+- [ ] Focused tests and `mise run check` are complete.
 
 ## Out of Scope
 
 - Pi-based Linear ticket discovery or provider-specific Dispatch queries.
+- Follow-up/send behavior and interactive Worker mount.
 - Direct Dispatch, Dispatch Group orchestration, CLI selection surfaces, and
-  jjfx worker TUI presentation beyond the shared library seams needed to carry
+  jjfx Worker TUI presentation beyond the shared library seams needed to carry
   the new runtime.
 - Pi interactive lifecycle hooks and `AgentKind` display behavior.
+- Version bumps, changelog entries, and user-facing release guidance.
 - Live Pi credentials, live Linear access, or manual acceptance of the real
   installation.
 - Changing Claude or Codex command policy to make it resemble Pi.

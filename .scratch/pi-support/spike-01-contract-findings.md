@@ -151,7 +151,7 @@ Three approaches were compared:
 2. **Configured `pi-mcp-adapter`**: conditionally supported. In an isolated fixture, the adapter discovered `linear_list_issues` and `linear_get_issue` and a direct `linear_list_issues` call returned bounded JSON. It registered no Linear tools when no server was configured. Proxy search is model-mediated, so discovery must use preflighted direct tool names and schemas, not free-form model search.
 3. **Dedicated read-only helper**: preferred host seam. A helper can speak the configured Linear API or MCP transport directly and return schema-bound JSON without spending a Pi model turn or trusting model-generated discovery text. No such helper is part of this spike.
 
-For issue 03, Linear discovery is a separate capability from Pi worker execution. A user's normal Pi setup may already supply the optional adapter and a Linear connector, but this spike deliberately did not inspect or use that global configuration or its credentials. Use a configured read-only helper when supplied. A configured Pi MCP adapter may satisfy the capability only when the host has preflighted the named Linear server, exact direct tools, schemas, timeout, and credentials. Otherwise return an explicit unsupported-capability error. Missing configuration, an unregistered direct tool, unavailable server, authentication failure, timeout, or malformed response must never become an empty ticket list. The adapter must never fall back to Claude or Codex commands.
+For issue 04, Linear discovery is a separate capability from Pi worker execution. A user's normal Pi setup may already supply the optional adapter and a Linear connector, but this spike deliberately did not inspect or use that global configuration or its credentials. Use a configured read-only helper when supplied. A configured Pi MCP adapter may satisfy the capability only when the host has preflighted the named Linear server, exact direct tools, schemas, timeout, and credentials. Otherwise return an explicit unsupported-capability error. Missing configuration, an unregistered direct tool, unavailable server, authentication failure, timeout, or malformed response must never become an empty ticket list. The adapter must never fall back to Claude or Codex commands.
 
 Required discovery properties:
 
@@ -184,7 +184,7 @@ Required discovery properties:
 | Optional MCP direct tools | Conditional | Preflight exact names and schemas; fail visibly when unavailable. |
 | Claude/Codex discovery fallback | Rejected | Never substitute another runtime silently. |
 
-## Rejected assumptions for issues 02-04
+## Rejected assumptions for issues 02-05
 
 - Do not scrape interactive terminal output for worker activity or results.
 - Do not expect one JSON record per prompt or assume the final record contains all usage and tool data.
