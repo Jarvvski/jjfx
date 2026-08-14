@@ -1,6 +1,6 @@
 # Complete Pi Worker actions and release integration
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -77,19 +77,19 @@ TestContainers test command.
 
 ## Acceptance Criteria
 
-- [ ] Pi Follow-up reports resumed versus fresh behavior using runtime-aware
+- [x] Pi Follow-up reports resumed versus fresh behavior using runtime-aware
       session resolution and never resumes through Claude or Codex.
-- [ ] A missing, unreadable, malformed, identity-free, or incompatible Pi log
+- [x] A missing, unreadable, malformed, identity-free, or incompatible Pi log
       returns an explicit fresh-session reason without mutating Worker state.
-- [ ] Pi interactive mount uses verified fresh and resumed forms or returns a
+- [x] Pi interactive mount uses verified fresh and resumed forms or returns a
       typed unsupported result. It never masks a failed Pi launch with a shell.
-- [ ] Prompt, session, workspace, and tool-policy values are preserved without
+- [x] Prompt, session, workspace, and tool-policy values are preserved without
       unsafe shell interpolation.
-- [ ] Background cleanup, PID persistence, Reset, liveness reconciliation, and
+- [x] Background cleanup, PID persistence, Reset, liveness reconciliation, and
       stale finalization remain provider-neutral and green.
-- [ ] Claude and Codex Follow-up, mount, logs, and cleanup behavior remain
+- [x] Claude and Codex Follow-up, mount, logs, and cleanup behavior remain
       unchanged.
-- [ ] Runtime compatibility, setup guidance, version, changelog, and
+- [x] Runtime compatibility, setup guidance, version, changelog, and
       `mise run check` are complete.
 
 ## Out of Scope
@@ -105,3 +105,12 @@ TestContainers test command.
 
 - issues/01-spike-pi-contracts.md
 - issues/02-add-pi-worker-runtime.md
+
+## Comments
+
+- 2026-08-14: Resolved with provider-aware `WorkerActions` profiles,
+  runtime-aware Pi Follow-up, verified fresh and resumed Mount commands, and
+  shared process cleanup coverage. Session resolution and failed preflight are
+  non-mutating; a successfully launched fresh Follow-up uses the normal Worker
+  lifecycle. Pi CLI/TUI profile selection remains in issue 04. `mise run check`
+  passed for jjfx 0.36.0 and wsg 0.11.0.
