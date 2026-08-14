@@ -304,6 +304,241 @@ fn mount_opens_a_resumable_provider_session_and_reports_the_tab() {
 }
 
 #[test]
+fn mount_opens_a_resumed_pi_session_with_the_trusted_worker_policy() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("pi-mount.log");
+    let session_id = "session 'pi'; echo unsafe";
+    fs::write(
+        &log,
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":{session_id:?},\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":{:?}}}\n",
+            worker_workspace_path(&repository, &worker).to_string_lossy()
+        ),
+    )
+    .expect("Pi Worker log");
+    set_terminal_worker_for_runtime(&repository, &worker, &log, AgentRuntime::Pi);
+
+    let bin = temporary_directory.path().join("pi-mount-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    let pi_capture = temporary_directory.path().join("unused-pi-run");
+    write_fake_pi(&bin.join("pi"), &pi_capture);
+    write_executable(
+        &bin.join("kitten"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "case \"$*\" in\n",
+            "  *--type=tab*) echo 52 ;;\n",
+            "  *--location=vsplit*) echo 53 ;;\n",
+            "  *--location=hsplit*) echo 54 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("pi-mount-commands");
+    let result = temporary_directory.path().join("pi-mount-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+    let provider = "test provider";
+    let unsafe_path = temporary_directory.path().join("must-not-exist");
+    let model = format!("model 'quoted'; $(touch {})", unsafe_path.display());
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env(HELPER_PROVIDER, provider)
+        .env(HELPER_MODEL, &model)
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("Pi Mount action helper should run");
+
+    assert!(
+        output.status.success(),
+        "Pi Mount helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&result).expect("Pi Mount result"),
+        format!("pi\nresumed:{session_id}\n52\n")
+    );
+    let commands = fs::read_to_string(&capture).expect("Pi mount command capture");
+    assert!(commands.contains("exec 'pi'"));
+    assert!(commands.contains("'--provider' 'test provider'"));
+    assert!(commands.contains(&format!(
+        "'--model' 'model '\\''quoted'\\''; $(touch {})'",
+        unsafe_path.display()
+    )));
+    assert!(commands.contains("'--session' 'session '\\''pi'\\''; echo unsafe'"));
+    assert!(commands.contains("'--session-dir'"));
+    assert!(commands.contains(".jj/pool/pi-sessions"));
+    assert!(commands.contains("'--no-extensions' '--no-skills' '--no-prompt-templates' '--no-themes' '--no-context-files' '--no-approve'"));
+    assert!(commands.contains("'--tools' 'read,bash,edit,write,grep,find,ls'"));
+    let agent_launch = commands
+        .lines()
+        .find(|line| line.contains("--type=tab"))
+        .expect("agent tab launch");
+    assert!(!agent_launch.contains("exec zsh"));
+    assert!(
+        !pi_capture.exists(),
+        "interactive Pi is launched only by kitty"
+    );
+    assert!(!unsafe_path.exists());
+}
+
+#[test]
+fn mount_opens_a_fresh_pi_session_without_a_resume_argument() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+    let bin = temporary_directory.path().join("fresh-pi-mount-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    let pi_capture = temporary_directory.path().join("unused-fresh-pi-run");
+    write_fake_pi(&bin.join("pi"), &pi_capture);
+    write_executable(
+        &bin.join("kitten"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "case \"$*\" in *--type=tab*) echo 62 ;; esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("fresh-pi-mount-commands");
+    let result = temporary_directory.path().join("fresh-pi-mount-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env(HELPER_PROVIDER, "test-provider")
+        .env(HELPER_MODEL, "test-model")
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("fresh Pi Mount action helper should run");
+
+    assert!(
+        output.status.success(),
+        "fresh Pi Mount helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&result).expect("fresh Pi Mount result"),
+        "pi\nfresh:no prior session log\n62\n"
+    );
+    let commands = fs::read_to_string(&capture).expect("fresh Pi mount command capture");
+    let agent_launch = commands
+        .lines()
+        .find(|line| line.contains("--type=tab"))
+        .expect("agent tab launch");
+    assert!(agent_launch.contains("exec 'pi'"));
+    assert!(!agent_launch.contains("'--session'"));
+}
+
+#[test]
+fn mount_rejects_pi_without_a_model_before_opening_kitty() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+    let bin = temporary_directory.path().join("invalid-pi-mount-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    let pi_capture = temporary_directory.path().join("unused-invalid-pi-run");
+    write_fake_pi(&bin.join("pi"), &pi_capture);
+    let kitten_capture = temporary_directory.path().join("unexpected-kitten-launch");
+    write_executable(
+        &bin.join("kitten"),
+        &format!("#!/bin/sh\ntouch {}\n", kitten_capture.display()),
+    );
+    let result = temporary_directory.path().join("invalid-pi-mount-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "failed_mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("failed Pi Mount helper should run");
+
+    assert!(output.status.success());
+    assert!(
+        fs::read_to_string(result)
+            .expect("failed Pi Mount result")
+            .contains("pi command requires a model")
+    );
+    assert!(
+        !kitten_capture.exists(),
+        "kitty must not launch without a Pi model"
+    );
+}
+
+#[test]
+fn mount_reports_pi_probe_failure_before_opening_kitty() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+    let bin = temporary_directory.path().join("failed-pi-probe-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("pi"),
+        "#!/bin/sh\necho 'unsupported Pi build' >&2\nexit 2\n",
+    );
+    let kitten_capture = temporary_directory
+        .path()
+        .join("unexpected-probe-kitten-launch");
+    write_executable(
+        &bin.join("kitten"),
+        &format!("#!/bin/sh\ntouch {}\n", kitten_capture.display()),
+    );
+    let result = temporary_directory.path().join("failed-pi-probe-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "failed_mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("failed Pi probe helper should run");
+
+    assert!(output.status.success());
+    assert!(
+        fs::read_to_string(result)
+            .expect("failed Pi probe result")
+            .contains("pi version capability probe failed with status 2")
+    );
+    assert!(
+        !kitten_capture.exists(),
+        "kitty must not launch after probe failure"
+    );
+}
+
+#[test]
 fn mount_rejects_a_missing_worker_workspace() {
     let (_temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
@@ -735,13 +970,31 @@ fn failed_send_launch_restores_the_prior_terminal_worker() {
 
 #[test]
 #[ignore]
+fn failed_mount_action_helper() {
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let error = WorkerActions::new(repository)
+        .mount(&worker)
+        .expect_err("Pi Mount without a model should fail");
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        error.to_string(),
+    )
+    .expect("failed Mount result");
+}
+
+#[test]
+#[ignore]
 fn mount_action_helper() {
     let repository =
         Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
     let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
-    let outcome = WorkerActions::new(repository)
-        .mount(&worker)
-        .expect("Mount should succeed");
+    let mut actions = WorkerActions::new(repository);
+    if let (Ok(provider), Ok(model)) = (env::var(HELPER_PROVIDER), env::var(HELPER_MODEL)) {
+        actions = actions.with_model(AgentModel::new(model).with_provider(provider));
+    }
+    let outcome = actions.mount(&worker).expect("Mount should succeed");
     let session = match outcome.session() {
         AgentSessionResolution::Resumed { session_id } => format!("resumed:{session_id}"),
         AgentSessionResolution::Fresh { reason } => format!("fresh:{reason}"),

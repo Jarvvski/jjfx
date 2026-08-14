@@ -1215,24 +1215,8 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
             runtime: AgentRuntime::Pi,
         });
     }
-    let model = invocation
-        .model
-        .as_ref()
-        .filter(|model| !model.model().trim().is_empty())
-        .ok_or(AgentRuntimeCommandError::MissingModel {
-            runtime: AgentRuntime::Pi,
-        })?;
-    let provider = model
-        .provider()
-        .filter(|provider| !provider.trim().is_empty())
-        .ok_or(AgentRuntimeCommandError::MissingProvider {
-            runtime: AgentRuntime::Pi,
-        })?;
-    let session_directory = invocation
-        .session_directory
-        .as_deref()
-        .filter(|directory| !directory.as_os_str().is_empty())
-        .ok_or(AgentRuntimeCommandError::MissingSessionDirectory)?;
+    let (provider, model) = pi_provider_and_model(invocation.model.as_ref())?;
+    let session_directory = required_pi_session_directory(invocation.session_directory.as_deref())?;
     let (system_prompt, prompt) = invocation.session_prompts();
     let mut command = Command::new(AgentRuntime::Pi.as_str());
     command.args([
@@ -1241,20 +1225,11 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
         "--provider",
         provider,
         "--model",
-        model.model(),
+        model,
         "--session-dir",
     ]);
     command.arg(session_directory);
-    command.args([
-        "--no-extensions",
-        "--no-skills",
-        "--no-prompt-templates",
-        "--no-themes",
-        "--no-context-files",
-        "--no-approve",
-        "--tools",
-        PI_WORKER_TOOLS,
-    ]);
+    add_pi_worker_policy(&mut command);
     if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
         command.args(["--name", name]);
     }
@@ -1269,6 +1244,61 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
     }
     command.arg(&prompt);
     Ok(command)
+}
+
+pub(crate) fn pi_interactive_command(
+    model: Option<&AgentModel>,
+    session_directory: &Path,
+    session_id: Option<&str>,
+) -> Result<Command, AgentRuntimeCommandError> {
+    let (provider, model) = pi_provider_and_model(model)?;
+    let session_directory = required_pi_session_directory(Some(session_directory))?;
+    let mut command = Command::new(AgentRuntime::Pi.as_str());
+    command.args(["--provider", provider, "--model", model, "--session-dir"]);
+    command.arg(session_directory);
+    add_pi_worker_policy(&mut command);
+    if let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) {
+        command.args(["--session", session_id]);
+    }
+    Ok(command)
+}
+
+fn pi_provider_and_model(
+    model: Option<&AgentModel>,
+) -> Result<(&str, &str), AgentRuntimeCommandError> {
+    let model = model
+        .filter(|model| !model.model().trim().is_empty())
+        .ok_or(AgentRuntimeCommandError::MissingModel {
+            runtime: AgentRuntime::Pi,
+        })?;
+    let provider = model
+        .provider()
+        .filter(|provider| !provider.trim().is_empty())
+        .ok_or(AgentRuntimeCommandError::MissingProvider {
+            runtime: AgentRuntime::Pi,
+        })?;
+    Ok((provider, model.model()))
+}
+
+fn required_pi_session_directory(
+    session_directory: Option<&Path>,
+) -> Result<&Path, AgentRuntimeCommandError> {
+    session_directory
+        .filter(|directory| !directory.as_os_str().is_empty())
+        .ok_or(AgentRuntimeCommandError::MissingSessionDirectory)
+}
+
+fn add_pi_worker_policy(command: &mut Command) {
+    command.args([
+        "--no-extensions",
+        "--no-skills",
+        "--no-prompt-templates",
+        "--no-themes",
+        "--no-context-files",
+        "--no-approve",
+        "--tools",
+        PI_WORKER_TOOLS,
+    ]);
 }
 
 fn probe_pi(workspace: &Path) -> Result<AgentRuntimeCapabilities, AgentRuntimeProbeError> {

@@ -9,10 +9,11 @@ use std::thread::{self, JoinHandle};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::runtime::pi_interactive_command;
 use crate::{
-    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    AgentSessionResolution, BackgroundRun, CompletedRun, Loaded, Repository, RunLog, RunSupervisor,
-    RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session,
+    AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
+    AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun, CompletedRun, Loaded,
+    Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus,
     resolve_agent_session_for_runtime,
 };
 
@@ -342,11 +343,9 @@ impl WorkerActions {
                 worker: worker.clone(),
             });
         }
-        let session = resolve_agent_session(state.log_file().map(Path::new));
-        let runtime = match (state.agent_runtime(), &session) {
-            (Some(runtime), _) => runtime,
-            (None, AgentSessionResolution::Resumed { .. }) => AgentRuntime::Claude,
-            (None, AgentSessionResolution::Fresh { .. }) => {
+        let runtime = match state.agent_runtime() {
+            Some(runtime) => runtime,
+            None => {
                 let configured = match self.repository.state_store().pool().load()? {
                     Loaded::Present(versioned) => versioned.value.agent,
                     Loaded::Missing => None,
@@ -355,8 +354,17 @@ impl WorkerActions {
                     .map_err(|value| WorkerPoolError::InvalidAgentRuntime { value })?
             }
         };
+        let session = resolve_agent_session_for_runtime(runtime, state.log_file().map(Path::new));
         runtime.probe(&workspace)?;
-        let tab_id = self.commands.mount(worker, &workspace, runtime, &session)?;
+        let session_directory = self.repository.root().join(".jj/pool/pi-sessions");
+        let tab_id = self.commands.mount(
+            worker,
+            &workspace,
+            runtime,
+            self.model.as_ref(),
+            &session_directory,
+            &session,
+        )?;
         Ok(MountOutcome {
             runtime,
             session,
@@ -565,6 +573,8 @@ impl SystemCommands {
         worker: &WorkerId,
         workspace: &Path,
         runtime: AgentRuntime,
+        model: Option<&AgentModel>,
+        session_directory: &Path,
         session: &AgentSessionResolution,
     ) -> Result<String, WorkerActionError> {
         let address = kitty_address()?;
@@ -572,7 +582,7 @@ impl SystemCommands {
             AgentSessionResolution::Resumed { session_id } => Some(session_id.as_str()),
             AgentSessionResolution::Fresh { .. } => None,
         };
-        let command = interactive_agent_command(runtime, session_id)?;
+        let command = interactive_agent_command(runtime, model, session_directory, session_id)?;
         let cwd = format!("--cwd={}", workspace.display());
         let title = worker.as_str();
         let tab_id = self.run(
@@ -835,25 +845,40 @@ fn kitty_address() -> Result<String, WorkerActionError> {
 
 fn interactive_agent_command(
     runtime: AgentRuntime,
+    model: Option<&AgentModel>,
+    session_directory: &Path,
     session_id: Option<&str>,
 ) -> Result<String, WorkerActionError> {
-    let resumed = session_id.map(shell_quote);
-    let command = match (runtime, resumed) {
+    let command = match (runtime, session_id) {
         (AgentRuntime::Claude, Some(session)) => {
-            format!("claude --resume {session}; exec zsh")
+            format!("claude --resume {}; exec zsh", shell_quote(session))
         }
         (AgentRuntime::Claude, None) => "claude; exec zsh".to_owned(),
         (AgentRuntime::Codex, Some(session)) => format!(
-            "codex --sandbox workspace-write --ask-for-approval on-request resume {session}; exec zsh"
+            "codex --sandbox workspace-write --ask-for-approval on-request resume {}; exec zsh",
+            shell_quote(session)
         ),
         (AgentRuntime::Codex, None) => {
             "codex --sandbox workspace-write --ask-for-approval on-request; exec zsh".to_owned()
         }
-        (AgentRuntime::Pi, _) => {
-            return Err(WorkerActionError::UnsupportedMount { runtime });
+        (AgentRuntime::Pi, session) => {
+            return Ok(render_shell_command(&pi_interactive_command(
+                model,
+                session_directory,
+                session,
+            )?));
         }
     };
     Ok(command)
+}
+
+fn render_shell_command(command: &Command) -> String {
+    let arguments = std::iter::once(command.get_program())
+        .chain(command.get_args())
+        .map(|value| shell_quote(&value.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    format!("exec {arguments}")
 }
 
 fn shell_quote(value: &str) -> String {
@@ -950,9 +975,9 @@ pub enum WorkerActionError {
     /// kitty could not be located for Mount.
     #[error("kitty is unavailable: {detail}")]
     KittyUnavailable { detail: String },
-    /// The selected runtime has no verified interactive mount form yet.
-    #[error("interactive mount is unsupported for {runtime}")]
-    UnsupportedMount { runtime: AgentRuntime },
+    /// The selected runtime's interactive command could not be built.
+    #[error(transparent)]
+    RuntimeCommand(#[from] AgentRuntimeCommandError),
     /// The Repository has no compatible GitHub slug.
     #[error("cannot detect GitHub repository")]
     RepositoryUnavailable,
