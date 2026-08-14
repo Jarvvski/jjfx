@@ -63,8 +63,7 @@ pub use ticket::{
     TicketDiscovery,
     TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryErrorKind,
     TicketQueryRequest, TicketStatus,
-    TicketTitle,
-    TicketValueError,
+    TicketTitle, TicketValueError, PI_DISCOVERY_HELPER_ENV,
 };
 pub use worker_actions::{
     DismissOutcome, FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome,

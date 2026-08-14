@@ -13,6 +13,9 @@ use thiserror::Error;
 
 use crate::{AgentRuntime, TicketId};
 
+/// Environment variable naming the dedicated Pi Linear discovery helper.
+pub const PI_DISCOVERY_HELPER_ENV: &str = "JJFX_PI_LINEAR_HELPER";
+
 const DEFAULT_PI_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 const PI_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
@@ -203,7 +206,7 @@ impl AgentRuntimeQuery {
     fn pi_query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         let helper = self.pi_helper.as_ref().ok_or_else(|| {
             TicketQueryError::setup(
-                "pi ticket discovery requires the JJFX_PI_LINEAR_HELPER configuration",
+                format!("pi ticket discovery requires the {PI_DISCOVERY_HELPER_ENV} configuration"),
             )
         })?;
         let input = request.pi_helper_input()?;

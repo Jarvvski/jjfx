@@ -9,9 +9,11 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, CapacityShortage, CleanDecision, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest, DispatchBudget,
-    FollowUpExecution, OrchestrationEvent, PoolCapacity, ReadyTicketFilter, Repository,
-    RunActivity, RunActivityKind, RunMode, TicketDiscovery, TicketId, TicketStatus, WorkerActions,
-    WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    FollowUpExecution, OrchestrationEvent, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter,
+    Repository,
+    RunActivity, RunActivityKind, RunMode, TicketDiscovery, TicketId, TicketStatus,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    PI_DISCOVERY_HELPER_ENV,
 };
 
 pub const HELP: &str = concat!(
@@ -812,12 +814,25 @@ fn configured_runtime(repository: &Repository) -> AgentRuntime {
         .unwrap_or(AgentRuntime::Claude)
 }
 
+fn configured_ticket_query(repository: &Repository, runtime: AgentRuntime) -> AgentRuntimeQuery {
+    let query = AgentRuntimeQuery::new(runtime, repository.root());
+    if runtime != AgentRuntime::Pi {
+        return query;
+    }
+    match std::env::var_os(PI_DISCOVERY_HELPER_ENV)
+        .filter(|executable| !executable.is_empty())
+    {
+        Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
+        None => query,
+    }
+}
+
 fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> {
     if args.all {
         let runtime = configured_runtime(repository);
         let status = TicketStatus::parse("Todo")?;
         let filter = ReadyTicketFilter::new(&args.label, status)?;
-        let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(runtime, repository.root()));
+        let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
         eprintln!("Fetching tickets with label '{}'...", args.label);
         let ready = discovery.ready_tickets(&filter)?;
         for diagnostic in ready.diagnostics() {
@@ -1122,9 +1137,9 @@ fn orchestrate_command(repository: &Repository, parent: &str, model: Option<&str
         .ticket()
         .clone();
     let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
-    let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository,
         request.agent_runtime(),
-        repository.root(),
     ));
     let runner = repository.orchestration_runner();
     let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;

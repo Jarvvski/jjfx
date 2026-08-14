@@ -12,9 +12,10 @@ use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, AgentSessionResolution, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchFailurePhase, DirectDispatchOutcome,
     DirectDispatchRequest, DispatchGroup, DispatchGroupState, DispatchGroupStatusCounts,
-    PoolCapacity, ReadyTicketFilter, RunActivity, RunMode, RunResult, SubIssueStatus,
+    PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, RunActivity, RunMode, RunResult,
+    SubIssueStatus,
     TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError, WorkerPoolSnapshot,
-    WorkerStatus,
+    WorkerStatus, PI_DISCOVERY_HELPER_ENV,
 };
 
 /// A user-visible operation identity used to ignore stale results.
@@ -1300,6 +1301,22 @@ pub struct RealWorkspaceDispatch {
     repository_root: PathBuf,
 }
 
+fn configured_ticket_query(
+    repository: &wsg_core::Repository,
+    runtime: AgentRuntime,
+) -> AgentRuntimeQuery {
+    let query = AgentRuntimeQuery::new(runtime, repository.root());
+    if runtime != AgentRuntime::Pi {
+        return query;
+    }
+    match std::env::var_os(PI_DISCOVERY_HELPER_ENV)
+        .filter(|executable| !executable.is_empty())
+    {
+        Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
+        None => query,
+    }
+}
+
 enum DispatchStrategy {
     Complete,
     ApprovedGrowth(usize),
@@ -1476,7 +1493,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .unwrap_or(AgentRuntime::Claude);
         let status = TicketStatus::parse("Todo").map_err(|error| error.to_string())?;
         let filter = ReadyTicketFilter::new(label, status).map_err(|error| error.to_string())?;
-        let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(runtime, repository.root()));
+        let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
         let ready = discovery
             .ready_tickets(&filter)
             .map_err(|error| error.to_string())?;
@@ -1513,7 +1530,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .ticket()
             .clone();
         let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
-        let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(runtime, repository.root()));
+        let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
         let runner = repository.orchestration_runner();
         let preparation = runner
             .prepare(&request, &parent_ticket, &discovery)
@@ -2003,8 +2020,14 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use tempfile::TempDir;
+
+    const PI_HELPER_REPOSITORY: &str = "JJFX_TEST_PI_HELPER_REPOSITORY";
+    const PI_HELPER_RESULT: &str = "JJFX_TEST_PI_HELPER_RESULT";
 
     fn empty_snapshot() -> WorkerPoolSnapshot {
         let directory = TempDir::new().expect("temporary repository");
@@ -2017,6 +2040,105 @@ mod tests {
         wsg_core::Repository::open(directory.path())
             .expect("repository should open")
             .read_worker_pool_snapshot()
+    }
+
+    fn pi_repository() -> (TempDir, wsg_core::Repository) {
+        let directory = TempDir::new().expect("temporary repository");
+        let output = Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(directory.path())
+            .output()
+            .expect("jj should be installed");
+        assert!(output.status.success());
+        let repository = wsg_core::Repository::open(directory.path()).expect("repository opens");
+        repository
+            .worker_pool()
+            .resize_to(PoolCapacity::new(1).expect("Pool capacity"))
+            .expect("Worker Pool grows");
+        let state_repository = repository.state_store().pool();
+        let loaded = match state_repository.load().expect("Pool state") {
+            wsg_core::Loaded::Present(versioned) => versioned,
+            wsg_core::Loaded::Missing => panic!("Pool state should exist"),
+        };
+        let (mut state, revision) = loaded.into_parts();
+        state.agent = Some(wsg_core::WireAgent::new(AgentRuntime::Pi.as_str()));
+        let outcome = state_repository
+            .commit(
+                wsg_core::Expected::Match(revision),
+                wsg_core::StateChange::Replace(state),
+            )
+            .expect("configured Pool runtime");
+        assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+        (directory, repository)
+    }
+
+    fn write_executable(path: &std::path::Path, body: &str) {
+        fs::write(path, body).expect("write helper executable");
+        let mut permissions = fs::metadata(path).expect("helper metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("helper permissions");
+    }
+
+    #[test]
+    fn real_workspace_dispatch_uses_pi_helper_configuration_before_pool_mutation() {
+        let (directory, repository) = pi_repository();
+        let helper = directory.path().join("pi-linear-helper");
+        let request = directory.path().join("pi-linear-request.json");
+        let result = directory.path().join("pi-linear-result");
+        write_executable(
+            &helper,
+            &format!(
+                "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[]}}}}'\n",
+                request.display(),
+            ),
+        );
+
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .args(["real_workspace_dispatch_pi_helper", "--ignored"])
+            .env(PI_HELPER_REPOSITORY, repository.root())
+            .env(PI_HELPER_RESULT, &result)
+            .env("JJFX_PI_LINEAR_HELPER", &helper)
+            .output()
+            .expect("TUI adapter helper should run");
+
+        assert!(
+            output.status.success(),
+            "TUI adapter helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(result).expect("adapter result"), "0");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                &fs::read_to_string(request).expect("captured helper request")
+            )
+            .expect("valid helper request"),
+            serde_json::json!({
+                "version": 1,
+                "operation": "ready_tickets",
+                "label": "ready-for-agent",
+                "status": "Todo",
+            }),
+        );
+        let snapshot = repository.worker_pool().snapshot();
+        assert!(snapshot.workers().iter().all(|worker| {
+            worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
+        }));
+    }
+
+    #[test]
+    #[ignore]
+    fn real_workspace_dispatch_pi_helper() {
+        let adapter = RealWorkspaceDispatch::new(
+            env::var_os(PI_HELPER_REPOSITORY).expect("helper repository"),
+        );
+        let ready = adapter
+            .discover_ready("ready-for-agent")
+            .expect("Pi TUI discovery");
+        fs::write(
+            env::var_os(PI_HELPER_RESULT).expect("helper result"),
+            ready.tickets().len().to_string(),
+        )
+        .expect("write helper result");
     }
 
     #[test]

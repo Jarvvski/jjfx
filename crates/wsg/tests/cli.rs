@@ -1,6 +1,13 @@
+use std::fs;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
+
+use wsg_core::{
+    AgentRuntime, CommitOutcome, Expected, Loaded, PoolCapacity, Repository, StateChange,
+    WireAgent, WorkerStatus,
+};
 
 fn local_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -35,6 +42,31 @@ fn run(binary: &str, directory: &Path, args: &[&str]) -> std::process::Output {
         .expect("wsg should run")
 }
 
+fn set_pool_runtime(repository: &Repository, runtime: AgentRuntime) {
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("Pool capacity"))
+        .expect("Worker Pool should grow");
+    let state_repository = repository.state_store().pool();
+    let loaded = match state_repository.load().expect("Pool state") {
+        Loaded::Present(versioned) => versioned,
+        Loaded::Missing => panic!("Pool state should exist"),
+    };
+    let (mut state, revision) = loaded.into_parts();
+    state.agent = Some(WireAgent::new(runtime.as_str()));
+    let outcome = state_repository
+        .commit(Expected::Match(revision), StateChange::Replace(state))
+        .expect("configured Pool runtime");
+    assert!(matches!(outcome, CommitOutcome::Applied(_)));
+}
+
+fn write_executable(path: &Path, body: &str) {
+    fs::write(path, body).expect("write helper executable");
+    let mut permissions = fs::metadata(path).expect("helper metadata").permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).expect("helper permissions");
+}
+
 fn run_with_input(
     binary: &str,
     directory: &Path,
@@ -56,6 +88,78 @@ fn run_with_input(
         .write_all(input)
         .expect("input should be written");
     child.wait_with_output().expect("wsg should finish")
+}
+
+#[test]
+fn pi_dispatch_all_reports_missing_helper_without_reserving_a_worker() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let repository = Repository::open(directory.path()).expect("repository should open");
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+
+    let output = Command::new(binary)
+        .args(["dispatch", "--all"])
+        .current_dir(directory.path())
+        .env("JJFX_PI_LINEAR_HELPER", "")
+        .output()
+        .expect("wsg should run");
+
+    assert!(!output.status.success());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(diagnostic.contains("JJFX_PI_LINEAR_HELPER"));
+    assert!(!diagnostic.contains("claude"));
+    assert!(!diagnostic.contains("codex"));
+    let snapshot = repository.worker_pool().snapshot();
+    assert!(snapshot.workers().iter().all(|worker| {
+        worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
+    }));
+}
+
+#[test]
+fn pi_dispatch_all_uses_the_configured_discovery_helper_before_reservation() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let repository = Repository::open(directory.path()).expect("repository should open");
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+    let helper = directory.path().join("pi-linear-helper");
+    let request = directory.path().join("pi-linear-request.json");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[]}}}}'\n",
+            request.display(),
+        ),
+    );
+
+    let output = Command::new(binary)
+        .args(["dispatch", "--all"])
+        .current_dir(directory.path())
+        .env("JJFX_PI_LINEAR_HELPER", &helper)
+        .output()
+        .expect("wsg should run");
+
+    assert!(
+        output.status.success(),
+        "Pi discovery failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("No tickets found"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(request).expect("captured helper request")
+        )
+        .expect("valid helper request"),
+        serde_json::json!({
+            "version": 1,
+            "operation": "ready_tickets",
+            "label": "ready-for-agent",
+            "status": "Todo",
+        }),
+    );
+    let snapshot = repository.worker_pool().snapshot();
+    assert!(snapshot.workers().iter().all(|worker| {
+        worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
+    }));
 }
 
 #[test]
