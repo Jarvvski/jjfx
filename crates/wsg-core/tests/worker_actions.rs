@@ -2,8 +2,13 @@ use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use rustix::process::{
+    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
+};
 use tempfile::TempDir;
 use wsg_core::{
     AgentModel, AgentRuntime, AgentSessionResolution, DismissOutcome, Expected, FollowUpExecution,
@@ -18,6 +23,10 @@ const HELPER_CAPTURE: &str = "WSG_ACTION_CAPTURE";
 const HELPER_MODE: &str = "WSG_ACTION_MODE";
 const HELPER_PROVIDER: &str = "WSG_ACTION_PROVIDER";
 const HELPER_MODEL: &str = "WSG_ACTION_MODEL";
+const HELPER_PROCESS: &str = "WSG_ACTION_PROCESS";
+const HELPER_DESCENDANT: &str = "WSG_ACTION_DESCENDANT";
+const HELPER_DIAGNOSTIC: &str = "WSG_ACTION_DIAGNOSTIC";
+const HELPER_EXIT: &str = "WSG_ACTION_EXIT";
 
 #[test]
 fn send_rejects_a_busy_worker_through_the_actions_facade() {
@@ -553,6 +562,98 @@ fn mount_rejects_a_missing_worker_workspace() {
 }
 
 #[test]
+fn reset_terminates_a_background_pi_follow_up_and_its_descendant() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+    let bin = temporary_directory.path().join("stubborn-pi-bin");
+    fs::create_dir(&bin).expect("fake runtime directory");
+    write_executable(
+        &bin.join("pi"),
+        concat!(
+            "#!/bin/bash\n",
+            "if [ \"$1\" = \"--version\" ]; then echo 0.84.1; exit 0; fi\n",
+            "if [ \"$1\" = \"--help\" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\n",
+            "( trap '' TERM; while :; do sleep 0.05; done ) &\n",
+            "printf '%s\\n' \"$!\" > \"$WSG_ACTION_DESCENDANT\"\n",
+            "trap '' TERM\n",
+            "printf '%s\\n' \"$$\" > \"$WSG_ACTION_PROCESS\"\n",
+            "printf started > \"$WSG_ACTION_DIAGNOSTIC\"\n",
+            "while :; do sleep 0.05; done\n"
+        ),
+    );
+    let result = temporary_directory.path().join("pi-background-pid");
+    let process = temporary_directory.path().join("pi-background-process");
+    let descendant = temporary_directory.path().join("pi-background-descendant");
+    let diagnostic = temporary_directory.path().join("pi-background-diagnostic");
+    let exit = temporary_directory.path().join("pi-background-exit");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut command = Command::new(env::current_exe().expect("test executable"));
+    command
+        .args(["--ignored", "--exact", "background_send_action_helper"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROVIDER, "test-provider")
+        .env(HELPER_MODEL, "test-model")
+        .env(HELPER_PROCESS, &process)
+        .env(HELPER_DESCENDANT, &descendant)
+        .env(HELPER_DIAGNOSTIC, &diagnostic)
+        .env(HELPER_EXIT, &exit)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut helper = BackgroundActionGuard::spawn(&mut command, &result);
+    wait_for_file(&result);
+    wait_for_file(&diagnostic);
+    wait_for_file(&descendant);
+    let leader = read_pid(&result);
+    let descendant_pid = read_pid(&descendant);
+
+    let outcome = WorkerActions::new(repository.clone())
+        .reset(&worker)
+        .expect("Pi Follow-up Reset should succeed");
+    assert_eq!(
+        outcome.run(),
+        RunReset::Abandoned {
+            terminated_pid: Some(leader)
+        }
+    );
+    let WorkspaceRestoration::Pending(restoration) = outcome.into_restoration() else {
+        panic!("existing Worker Workspace should be restored");
+    };
+    restoration
+        .wait()
+        .expect("Worker Workspace restoration should succeed");
+
+    let output = helper.wait_with_output();
+    assert!(
+        output.status.success(),
+        "background Pi helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    wait_for_process_exit(leader);
+    wait_for_process_exit(descendant_pid);
+    assert!(test_kill_process_group(unix_pid(leader)).is_err());
+    let snapshot = repository.worker_pool().snapshot();
+    let state = snapshot.worker(worker.as_str()).expect("reset Worker");
+    assert_eq!(state.status(), wsg_core::WorkerStatus::Idle);
+    assert_eq!(state.pid(), None);
+    assert_eq!(state.agent_runtime(), None);
+    assert!(
+        fs::read_to_string(exit)
+            .expect("waiter outcome")
+            .contains("exit=")
+    );
+}
+
+#[test]
 fn reset_reports_a_missing_workspace_without_hiding_released_capacity() {
     let (_temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
@@ -970,6 +1071,36 @@ fn failed_send_launch_restores_the_prior_terminal_worker() {
 
 #[test]
 #[ignore]
+fn background_send_action_helper() {
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let provider = env::var(HELPER_PROVIDER).expect("provider");
+    let model = env::var(HELPER_MODEL).expect("model");
+    let outcome = WorkerActions::new(repository)
+        .with_model(AgentModel::new(model).with_provider(provider))
+        .send(&worker, "continue the Pi work", RunMode::Background)
+        .expect("background Pi Follow-up should launch");
+    let FollowUpExecution::Background(run) = outcome.into_execution() else {
+        panic!("background action should return a waiter");
+    };
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        run.pid().to_string(),
+    )
+    .expect("background Pi PID");
+    let completed = run
+        .wait()
+        .expect("background Pi Follow-up should be reaped");
+    fs::write(
+        env::var_os(HELPER_EXIT).expect("exit path"),
+        format!("exit={:?}", completed.exit_code()),
+    )
+    .expect("background Pi waiter outcome");
+}
+
+#[test]
+#[ignore]
 fn failed_mount_action_helper() {
     let repository =
         Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
@@ -1167,6 +1298,78 @@ fn set_terminal_worker_for_runtime(
         .commit(Expected::Match(revision), StateChange::Replace(state))
         .expect("terminal Worker state");
     assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+}
+
+struct BackgroundActionGuard {
+    child: Option<Child>,
+    leader_path: PathBuf,
+}
+
+impl BackgroundActionGuard {
+    fn spawn(command: &mut Command, leader_path: &Path) -> Self {
+        Self {
+            child: Some(command.spawn().expect("background action helper")),
+            leader_path: leader_path.to_owned(),
+        }
+    }
+
+    fn wait_with_output(&mut self) -> std::process::Output {
+        self.child
+            .take()
+            .expect("background action helper")
+            .wait_with_output()
+            .expect("background action helper output")
+    }
+}
+
+impl Drop for BackgroundActionGuard {
+    fn drop(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Ok(contents) = fs::read_to_string(&self.leader_path)
+            && let Ok(raw_pid) = contents.trim().parse::<u32>()
+        {
+            let _ = kill_process_group(unix_pid(raw_pid), Signal::KILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+fn unix_pid(pid: u32) -> Pid {
+    i32::try_from(pid)
+        .ok()
+        .and_then(Pid::from_raw)
+        .expect("PID should fit Unix range")
+}
+
+fn read_pid(path: &Path) -> u32 {
+    fs::read_to_string(path)
+        .expect("PID file")
+        .trim()
+        .parse()
+        .expect("numeric PID")
+}
+
+fn wait_for_file(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !path.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {}",
+            path.display()
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn wait_for_process_exit(pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while test_kill_process(unix_pid(pid)).is_ok() {
+        assert!(Instant::now() < deadline, "process {pid} did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn write_fake_pi(path: &Path, capture: &Path) {
