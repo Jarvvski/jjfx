@@ -8,13 +8,14 @@ use wsg_core::{
     AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
     OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, ParentTicket, PoolState,
     Repository, RepositoryIdentity, StateChange, SubIssueState, TicketDiscovery, TicketId,
-    TicketQuery, TicketQueryError, WireStatus, WireTimestamp, WorkerId, WorkerState,
+    TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus, WireTimestamp, WorkerId,
+    WorkerState,
 };
 
 struct StaticQuery(&'static str);
 
 impl TicketQuery for StaticQuery {
-    fn query(&self, _prompt: &str) -> Result<String, TicketQueryError> {
+    fn query(&self, _request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         Ok(self.0.to_owned())
     }
 }

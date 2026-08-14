@@ -7,13 +7,14 @@ use wsg_core::{
     CommitOutcome, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent,
     DispatchGroupOptions, DispatchGroupState, DispatchGroupTransition, Expected, Loaded,
     ParentTicket, Repository, StateChange, SubIssueState, SubIssueStatus, TicketDiscovery,
-    TicketId, TicketQuery, TicketQueryError, WireStatus, WireTimestamp, WorkerId,
+    TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus, WireTimestamp,
+    WorkerId,
 };
 
 struct StubQuery(Mutex<VecDeque<String>>);
 
 impl TicketQuery for StubQuery {
-    fn query(&self, _prompt: &str) -> Result<String, TicketQueryError> {
+    fn query(&self, _request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         self.0
             .lock()
             .expect("query responses")

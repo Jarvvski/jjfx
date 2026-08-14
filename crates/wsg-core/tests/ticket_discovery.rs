@@ -4,12 +4,13 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, ReadyTicketFilter, RepositoryIdentity,
-    Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
+    Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest,
+    TicketStatus, TicketTitle,
 };
 
 const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
@@ -34,13 +35,51 @@ impl StubQuery {
 }
 
 impl TicketQuery for StubQuery {
-    fn query(&self, _prompt: &str) -> Result<String, TicketQueryError> {
+    fn query(&self, _request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         self.responses
             .lock()
             .expect("query responses")
             .pop_front()
             .expect("a configured query response")
     }
+}
+
+struct RecordingQuery {
+    request: Arc<Mutex<Option<TicketQueryRequest>>>,
+}
+
+impl TicketQuery for RecordingQuery {
+    fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
+        self.request
+            .lock()
+            .expect("recorded request")
+            .replace(request.clone());
+        Ok(r#"{"tickets":[]}"#.to_owned())
+    }
+}
+
+#[test]
+fn ready_ticket_discovery_sends_a_typed_request_to_the_query_adapter() {
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+    let recorded = Arc::new(Mutex::new(None));
+    let discovery = TicketDiscovery::new(RecordingQuery {
+        request: Arc::clone(&recorded),
+    });
+
+    discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+
+    assert_eq!(
+        recorded.lock().expect("recorded request").as_ref(),
+        Some(&TicketQueryRequest::ReadyTickets {
+            filter: filter.clone(),
+        })
+    );
 }
 
 #[test]

@@ -60,7 +60,8 @@ pub use state::{
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
     ParentTicket, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket, TicketDiscovery,
-    TicketDiscoveryError, TicketQuery, TicketQueryError, TicketStatus, TicketTitle,
+    TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryRequest, TicketStatus,
+    TicketTitle,
     TicketValueError,
 };
 pub use worker_actions::{

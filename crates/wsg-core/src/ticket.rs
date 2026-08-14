@@ -26,7 +26,8 @@ impl AgentRuntimeQuery {
         }
     }
 
-    fn command(&self, prompt: &str) -> Command {
+    fn command(&self, request: &TicketQueryRequest) -> Command {
+        let prompt = request.prompt();
         let mut command = Command::new(self.runtime.as_str());
         command.current_dir(&self.workspace);
         match self.runtime {
@@ -37,7 +38,7 @@ impl AgentRuntimeQuery {
                     "json",
                     "--no-session-persistence",
                     "--allowedTools=mcp__claude_ai_Linear__list_issues,mcp__claude_ai_Linear__get_issue",
-                    prompt,
+                    &prompt,
                 ]);
             }
             AgentRuntime::Codex => {
@@ -49,7 +50,7 @@ impl AgentRuntimeQuery {
                     "exec",
                     "--ephemeral",
                     "--skip-git-repo-check",
-                    prompt,
+                    &prompt,
                 ]);
             }
             AgentRuntime::Pi => {
@@ -61,13 +62,13 @@ impl AgentRuntimeQuery {
 }
 
 impl TicketQuery for AgentRuntimeQuery {
-    fn query(&self, prompt: &str) -> Result<String, TicketQueryError> {
+    fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         if self.runtime == AgentRuntime::Pi {
             return Err(TicketQueryError::permanent(
                 "pi ticket discovery is unsupported until its read-only adapter is configured",
             ));
         }
-        let output = self.command(prompt).output().map_err(|source| {
+        let output = self.command(request).output().map_err(|source| {
             TicketQueryError::permanent(format!("cannot start {} query: {source}", self.runtime))
         })?;
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
@@ -158,10 +159,46 @@ fn extract_json_object(output: &str) -> Option<&str> {
     None
 }
 
+/// A provider-neutral request for read-only Ticket discovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TicketQueryRequest {
+    /// Finds Tickets matching the configured dispatch filter.
+    ReadyTickets {
+        /// The validated label and workflow status to match.
+        filter: ReadyTicketFilter,
+    },
+    /// Finds a parent Ticket's direct children and their dependencies.
+    DependencyGraph {
+        /// The parent whose direct children should be returned.
+        parent: ParentTicket,
+        /// The repository used to identify cross-repository children.
+        repository: RepositoryIdentity,
+    },
+}
+
+impl TicketQueryRequest {
+    fn prompt(&self) -> String {
+        match self {
+            Self::ReadyTickets { filter } => format!(
+                "Use Linear to find issues with label {:?} in {:?} status. Return only JSON as {{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"{}\",\"labels\":[{:?}]}}]}}.",
+                filter.label,
+                filter.status.as_str(),
+                filter.status.as_str(),
+                filter.label,
+            ),
+            Self::DependencyGraph { parent, repository } => format!(
+                "Fetch the direct children of Linear issue {} and their blockedBy relations. Determine cross_repo relative to {}. Return only JSON as {{\"sub_issues\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"Todo\",\"blocked_by\":[\"AMBA-41\"],\"cross_repo\":false}}]}}.",
+                parent.id(),
+                repository.as_str(),
+            ),
+        }
+    }
+}
+
 /// Executes one short-lived, read-only query against Linear through an Agent Runtime.
 pub trait TicketQuery {
-    /// Returns the provider-neutral text response for `prompt`.
-    fn query(&self, prompt: &str) -> Result<String, TicketQueryError>;
+    /// Returns the provider-neutral text response for a typed request.
+    fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError>;
 }
 
 /// A failure reported by a Ticket query adapter.
@@ -297,14 +334,10 @@ where
         &self,
         filter: &ReadyTicketFilter,
     ) -> Result<ReadyTickets, TicketDiscoveryError> {
-        let prompt = format!(
-            "Use Linear to find issues with label {:?} in {:?} status. Return only JSON as {{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"{}\",\"labels\":[{:?}]}}]}}.",
-            filter.label,
-            filter.status.as_str(),
-            filter.status.as_str(),
-            filter.label,
-        );
-        let payload: RawReadyTickets = self.query_payload(&prompt)?;
+        let request = TicketQueryRequest::ReadyTickets {
+            filter: filter.clone(),
+        };
+        let payload: RawReadyTickets = self.query_payload(&request)?;
         let mut tickets = Vec::with_capacity(payload.tickets.len());
         let mut diagnostics = Vec::new();
         for raw in payload.tickets {
@@ -325,12 +358,11 @@ where
         parent: &ParentTicket,
         repository: &RepositoryIdentity,
     ) -> Result<DependencyGraph, TicketDiscoveryError> {
-        let prompt = format!(
-            "Fetch the direct children of Linear issue {} and their blockedBy relations. Determine cross_repo relative to {}. Return only JSON as {{\"sub_issues\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"Todo\",\"blocked_by\":[\"AMBA-41\"],\"cross_repo\":false}}]}}.",
-            parent.id(),
-            repository.as_str(),
-        );
-        let payload: RawDependencyGraph = self.query_payload(&prompt)?;
+        let request = TicketQueryRequest::DependencyGraph {
+            parent: parent.clone(),
+            repository: repository.clone(),
+        };
+        let payload: RawDependencyGraph = self.query_payload(&request)?;
         let entry_count = payload.sub_issues.len();
         let mut child_counts = BTreeMap::new();
         for raw in &payload.sub_issues {
@@ -455,11 +487,11 @@ where
         })
     }
 
-    fn query_payload<T>(&self, prompt: &str) -> Result<T, TicketDiscoveryError>
+    fn query_payload<T>(&self, request: &TicketQueryRequest) -> Result<T, TicketDiscoveryError>
     where
         T: DeserializeOwned,
     {
-        let first = match self.query_attempt(prompt) {
+        let first = match self.query_attempt(request) {
             Ok(payload) => return Ok(payload),
             Err(error) => error,
         };
@@ -468,18 +500,18 @@ where
                 error: first.to_string(),
             });
         }
-        self.query_attempt(prompt)
+        self.query_attempt(request)
             .map_err(|second| TicketDiscoveryError::RetriesExhausted {
                 first: first.to_string(),
                 second: second.to_string(),
             })
     }
 
-    fn query_attempt<T>(&self, prompt: &str) -> Result<T, QueryAttemptError>
+    fn query_attempt<T>(&self, request: &TicketQueryRequest) -> Result<T, QueryAttemptError>
     where
         T: DeserializeOwned,
     {
-        let output = self.query.query(prompt)?;
+        let output = self.query.query(request)?;
         serde_json::from_str(&output).map_err(QueryAttemptError::MalformedResponse)
     }
 }
