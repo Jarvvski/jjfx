@@ -225,6 +225,7 @@ impl AgentRuntimeQuery {
                 error.kind, error.message
             );
             return Err(match error.kind.as_str() {
+                "transient" => TicketQueryError::transport(message, true),
                 "authentication" => TicketQueryError::authentication(message),
                 "unsupported" | "not_configured" => TicketQueryError::unsupported(message),
                 "permanent" => TicketQueryError::permanent(message),
@@ -779,9 +780,10 @@ where
             Err(error) => error,
         };
         if !first.retryable() {
-            return Err(TicketDiscoveryError::QueryFailed {
-                error: first.to_string(),
-            });
+            let QueryAttemptError::Query(error) = first else {
+                unreachable!("malformed Ticket payloads are always retryable")
+            };
+            return Err(TicketDiscoveryError::QueryFailed { error });
         }
         self.query_attempt(request)
             .map_err(|second| TicketDiscoveryError::RetriesExhausted {
@@ -878,10 +880,10 @@ fn ready_ticket(
 #[derive(Debug, Error)]
 pub enum TicketDiscoveryError {
     /// A permanent query failure surfaced without a retry.
-    #[error("Ticket discovery query failed: {error}")]
+    #[error("Ticket discovery query failed: query failed: {error}")]
     QueryFailed {
-        /// Adapter context for the permanent failure.
-        error: String,
+        /// Typed adapter context for the permanent failure.
+        error: TicketQueryError,
     },
     /// Both bounded query attempts failed.
     #[error(
@@ -901,6 +903,16 @@ pub enum TicketDiscoveryError {
         /// Number of diagnostics produced while validating the graph.
         invalid_entries: usize,
     },
+}
+
+impl TicketDiscoveryError {
+    /// Returns the typed adapter classification for a permanent query failure.
+    pub fn query_kind(&self) -> Option<TicketQueryErrorKind> {
+        match self {
+            Self::QueryFailed { error } => Some(error.kind()),
+            Self::RetriesExhausted { .. } | Self::UnusableGraph { .. } => None,
+        }
+    }
 }
 
 /// A non-empty human-facing Ticket title.

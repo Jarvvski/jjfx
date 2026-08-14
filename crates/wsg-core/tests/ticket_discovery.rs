@@ -85,6 +85,23 @@ fn ready_ticket_discovery_sends_a_typed_request_to_the_query_adapter() {
 }
 
 #[test]
+fn pi_discovery_preserves_typed_setup_failures_for_callers() {
+    let discovery = TicketDiscovery::new(AgentRuntimeQuery::new(AgentRuntime::Pi, "."));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let error = discovery
+        .ready_tickets(&filter)
+        .expect_err("missing Pi helper configuration should fail");
+
+    assert_eq!(error.query_kind(), Some(TicketQueryErrorKind::Setup));
+    assert!(error.to_string().contains("JJFX_PI_LINEAR_HELPER"));
+}
+
+#[test]
 fn pi_discovery_without_a_helper_reports_typed_setup_guidance() {
     let query = AgentRuntimeQuery::new(AgentRuntime::Pi, ".");
     let request = TicketQueryRequest::ReadyTickets {
@@ -128,6 +145,70 @@ fn pi_discovery_times_out_and_reaps_the_helper_process() {
     assert_eq!(error.kind(), TicketQueryErrorKind::Timeout);
     assert!(error.is_retryable());
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn pi_helper_malformed_ticket_payload_uses_the_existing_single_retry() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    let attempts = temporary_directory.path().join("attempts");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nif [ ! -f '{}' ]; then printf '1' > '{}'; printf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":\"invalid\"}}}}'; else printf '2' > '{}'; printf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[]}}}}'; fi\n",
+            attempts.display(),
+            attempts.display(),
+            attempts.display(),
+        ),
+    );
+    let discovery = TicketDiscovery::new(
+        AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+            .with_pi_helper(PiDiscoveryHelper::new(&helper)),
+    );
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("malformed Pi payload should recover");
+
+    assert!(tickets.tickets().is_empty());
+    assert_eq!(fs::read_to_string(attempts).expect("attempt count"), "2");
+}
+
+#[test]
+fn pi_helper_transient_errors_use_the_existing_single_retry() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    let attempts = temporary_directory.path().join("attempts");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\ncat >/dev/null\nif [ ! -f '{}' ]; then printf '1' > '{}'; printf '%s\\n' '{{\"version\":1,\"error\":{{\"kind\":\"transient\",\"message\":\"Linear temporarily unavailable\"}}}}'; else printf '2' > '{}'; printf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Recovered\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}}]}}}}'; fi\n",
+            attempts.display(),
+            attempts.display(),
+            attempts.display(),
+        ),
+    );
+    let discovery = TicketDiscovery::new(
+        AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+            .with_pi_helper(PiDiscoveryHelper::new(&helper)),
+    );
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("transient Pi failure should recover");
+
+    assert_eq!(tickets.tickets()[0].title().as_str(), "Recovered");
+    assert_eq!(fs::read_to_string(attempts).expect("attempt count"), "2");
 }
 
 #[test]
@@ -213,6 +294,75 @@ fn pi_helper_authentication_errors_are_typed_without_leaking_stderr() {
 }
 
 #[test]
+fn pi_dependency_discovery_uses_the_typed_helper_request() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    let request = temporary_directory.path().join("request.json");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"sub_issues\":[{{\"id\":\"AMBA-41\",\"title\":\"Foundation\",\"status\":\"Todo\",\"blocked_by\":[],\"cross_repo\":false,\"future\":true}}]}},\"future\":true}}'\n",
+            request.display(),
+        ),
+    );
+    let discovery = TicketDiscovery::new(
+        AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+            .with_pi_helper(PiDiscoveryHelper::new(&helper)),
+    );
+    let parent = ParentTicket::new(TicketId::parse("AMBA-40").expect("parent Ticket ID"));
+    let repository = RepositoryIdentity::parse("owner/repo").expect("repository identity");
+
+    let graph = discovery
+        .dependency_graph(&parent, &repository)
+        .expect("Pi dependency discovery");
+
+    assert!(
+        graph
+            .sub_issue(&TicketId::parse("AMBA-41").expect("child Ticket ID"))
+            .is_some()
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(request).expect("captured helper request")
+        )
+        .expect("valid request JSON"),
+        serde_json::json!({
+            "version": 1,
+            "operation": "dependency_graph",
+            "parent": "AMBA-40",
+            "repository": "owner/repo",
+        }),
+    );
+}
+
+#[test]
+fn pi_helper_nonzero_exit_is_retryable_without_leaking_stderr() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' 'credential=secret-token' >&2\nexit 17\n",
+    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let error = query
+        .query(&request)
+        .expect_err("non-zero helper exit should fail");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Transport);
+    assert!(error.is_retryable());
+    assert!(!error.to_string().contains("secret-token"));
+}
+
+#[test]
 fn pi_ready_ticket_discovery_uses_the_configured_helper_protocol() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let workspace = temporary_directory.path().join("workspace");
@@ -223,7 +373,7 @@ fn pi_ready_ticket_discovery_uses_the_configured_helper_protocol() {
     write_executable(
         &helper,
         &format!(
-            "#!/bin/sh\npwd > '{}'\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Pi result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}}]}}}}'\n",
+            "#!/bin/sh\npwd > '{}'\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Pi result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"],\"future\":true}}]}},\"future\":true}}'\n",
             working_directory.display(),
             request.display(),
         ),
