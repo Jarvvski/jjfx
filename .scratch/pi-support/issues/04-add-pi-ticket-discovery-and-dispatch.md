@@ -1,6 +1,6 @@
-# Add Pi ticket discovery and Dispatch integration
+# Add Pi read-only ticket discovery
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 
@@ -8,125 +8,105 @@ pi-support effort (standalone; no PRD)
 
 ## Problem Statement
 
-Worker runtime support alone does not make Pi selectable for the complete jjfx
-workflow. Ready-ticket discovery currently builds provider-specific Claude and
-Codex queries, and Direct Dispatch and Dispatch Group orchestration assume
-those query and prompt capabilities. CLI configuration, runtime validation,
-worker status, and the jjfx dispatch TUI also need to expose Pi without
-leaking provider flags into domain decisions.
+Pi Worker execution is available, but Ready Ticket and dependency discovery
+still reject `AgentRuntime::Pi`. Pi core has no native Linear or MCP contract,
+so discovery cannot safely copy Claude or Codex commands, spend a model turn,
+load project resources, or reserve a Worker.
 
-Pi has no built-in MCP. Its default tool set is local file and shell tooling,
-and project-local resources may be subject to trust decisions. A discovery
-implementation must therefore use the safe transport selected by issue 01,
-constrain capabilities explicitly, and fail clearly when Linear access is not
-configured. It must never silently use a different runtime, broaden Pi's
-permissions, or reserve a Worker merely to discover tickets.
+The contract spike selected a dedicated read-only helper as the preferred host
+seam. The helper needs a small typed protocol, bounded execution, explicit
+configuration, provider-neutral output, and actionable failures that do not
+leak credentials or prompts.
 
 ## Solution
 
-Implement the Pi ticket-query adapter and connect it to the existing typed
-TicketDiscovery, DispatchPrompt, Direct Dispatch, Dispatch Group, CLI, and
-worker-TUI seams. Keep provider command flags and output DTOs private to the
-adapter. Reuse existing ticket validation, retry, reservation, orchestration,
-logging, and rendering behavior wherever Pi's capability contract permits it.
+Deepen the existing Ticket query module around a typed `TicketQueryRequest`.
+Claude and Codex adapters privately render their existing prompts, while Pi
+serializes the typed request to a configured helper. `TicketDiscovery` remains
+the authoritative validation and one-retry module for Ready Tickets and
+dependency graphs.
 
-The selected discovery transport must be documented by issue 01. If that
-transport requires a Pi extension, configuration, or external helper, missing
-configuration must produce an actionable setup error and an explicit
-unsupported-capability outcome. No discovery path may load untrusted project
-resources or execute with workspace-write permissions unless the selected
-workflow explicitly requires that policy and the contract documents it.
+Configure the helper executable with `JJFX_PI_LINEAR_HELPER`. Invoke it
+directly, without a shell, from the repository root. Send a versioned JSON
+request on stdin and accept one versioned JSON result or typed error on stdout.
+The helper owns credential lookup; jjfx never places credentials in argv or the
+request. Missing configuration and unsupported capabilities are visible setup
+errors and never fall back to Claude or Codex.
 
 ## Commits
 
-1. Add Pi to the typed query/runtime capability selection used by ticket
-   discovery while preserving the separate query-versus-Worker boundary.
-2. Implement the issue 01-selected Pi discovery command or adapter with an
-   explicit read-only policy, bounded working directory, trust behavior, and
-   Linear access configuration.
-3. Normalize Pi output into the existing constrained JSON payload, including
-   sessionless/ephemeral behavior, JSONL or wrapper records, empty output,
-   malformed output, stderr, exit status, and unknown fields.
-4. Reuse the existing Ready Ticket and dependency-graph validation and retry
-   policy for Pi, adding diagnostics that identify Pi and the missing setup
-   without exposing credentials or raw private prompts.
-5. Extend prompt capability mapping for Pi model, system prompt, delegation,
-   budget, tool, and approval choices. Unsupported options must be rejected or
-   represented explicitly rather than silently ignored.
-6. Connect Pi discovery and prompt construction to Direct Dispatch and
-   Dispatch Group orchestration, preserving reservation ordering, runtime
-   identity, follow-up behavior, and provider-neutral progress/results.
-7. Extend CLI runtime values, configuration, completions/help/error output,
-   dispatch/session/log/action commands, and worker-TUI dispatch/detail views
-   to display and select Pi consistently.
-8. Add deterministic fake-query and fake-runtime tests for safe discovery,
-   validation, retries, prompt capabilities, Direct Dispatch, Dispatch Group
-   progression, CLI surfaces, and worker-TUI outcomes.
-9. Update user-facing setup and capability documentation, bump the version
-   according to repository policy, and add a dated changelog entry.
+1. Replace the free-form `TicketQuery` prompt seam with typed Ready Ticket and
+   dependency-graph requests while preserving Claude and Codex behavior.
+2. Add the Pi helper adapter, versioned JSON protocol, bounded execution, and
+   typed setup, transport, timeout, authentication, unsupported, and malformed
+   protocol outcomes.
+3. Reuse existing output validation and retry behavior for Pi, covering safe
+   success and failure behavior with deterministic fake executables.
+4. Wire helper configuration into shared CLI and jjfx TUI discovery composition
+   so errors occur before Worker reservation or Pool mutation.
+5. Update setup guidance, versions, and changelog, then run the full repository
+   verification gate.
 
 ## Decision Document
 
 - Ticket discovery remains separate from Worker reservation and Run execution.
-- Pi's query transport is selected by the recorded issue 01 contract and is
-  not inferred from Claude's MCP flags or Codex's command flags.
-- Pi query runs are ephemeral or sessionless when the contract supports it;
-  discovery must not pollute a user's interactive session history.
-- Existing ticket graph validation remains authoritative. Pi output is input
-  to the same typed validation, not a new provider-specific graph model.
-- Prompt construction remains provider-neutral at its public boundary. Pi
-  capability mapping owns only the translation and unsupported-option errors.
-- A configured Pi runtime with unavailable ticket discovery is a visible
-  capability error. It must not fall back to Claude/Codex discovery or mutate
-  pool state.
-- Direct Dispatch and Dispatch Group retain the selected Pi runtime through
-  reservation, Run, finalization, follow-up, and TUI/CLI reporting.
+- `TicketQueryRequest` is provider-neutral. Provider prompts, helper DTOs, and
+  command assembly remain private adapter details.
+- Pi discovery uses only the configured dedicated helper. The optional Pi MCP
+  adapter is not a discovery fallback.
+- The helper protocol has two operations: `ready_tickets` with label/status and
+  `dependency_graph` with parent/repository identity.
+- The helper emits one JSON envelope. Wrapper streams, interactive output, and
+  Pi sessions are not part of this helper-only contract.
+- Helper startup and protocol setup failures are permanent. A 30-second timeout
+  and errors explicitly marked transient use the existing single retry.
+- A well-formed result whose Ticket payload is malformed continues through the
+  existing `TicketDiscovery` malformed-response retry.
+- The helper runs in the repository root but is independently responsible for
+  read-only Linear access. No Pi tools, project resources, or write policy are
+  loaded for discovery.
+- Pi Direct Dispatch and Linear mutations require the explicit extension
+  profile tracked by issue 07.
 
 ## Testing Decisions
 
-Use fake executables or injected query adapters to assert argv, environment,
-working directory, read-only policy, output normalization, and failure
-classification without live Linear credentials. Test provider-neutral
-Dispatch and orchestration through public seams. Cover absent, blank, and
-invalid Pi configuration; missing discovery setup; transient and permanent
-failures; malformed JSON; duplicate and unsafe dependency graphs; and
-unsupported model/budget/tool capabilities. Run `mise run check` after all
-implementation slices.
+Test through the public `TicketQuery`/`TicketDiscovery` seam with fake helper
+executables. Assert typed requests, working directory, direct argv execution,
+normalization, retries, timeout, process reaping, and sanitized diagnostics.
+Exercise CLI and TUI outcomes for missing configuration and verify discovery
+fails before Pool state changes. Preserve Claude and Codex behavior through the
+same seam. Use vertical red-green cycles and run `mise run check` before
+resolution.
 
 ## Acceptance Criteria
 
-- [ ] Ready-ticket and dependency discovery can select Pi through the typed
-      query interface without reserving a Worker.
-- [ ] Pi discovery uses the issue 01-selected safe transport and explicit
-      read-only/trust policy; it does not silently load untrusted project
-      resources or broaden permissions.
-- [ ] Pi output is normalized into existing Ticket and dependency values,
-      including wrapper/JSONL output, empty output, malformed records, unknown
-      fields, stderr, and non-zero exits.
-- [ ] Existing validation and one-retry behavior apply to Pi, with actionable
-      diagnostics that do not leak credentials or full private prompts.
-- [ ] Missing Linear/discovery configuration returns an explicit setup or
-      unsupported-capability result and never falls back to Claude or Codex.
-- [ ] Prompt construction maps supported Pi model, system-prompt, delegation,
-      budget, tool, and approval capabilities and reports unsupported choices.
-- [ ] Direct Dispatch and Dispatch Group preserve Pi runtime identity from
-      discovery through reservation, Run completion, follow-up, and result.
-- [ ] CLI and worker-TUI surfaces list Pi accurately and display capability,
-      progress, log, failure, and completion information without provider flag
-      leakage.
-- [ ] Claude and Codex discovery, Dispatch, orchestration, CLI, and TUI tests
-      remain green and behaviorally unchanged.
-- [ ] Documentation, version, changelog, and `mise run check` are complete.
+- [ ] Ready Ticket and dependency discovery select Pi through typed requests
+      without reserving a Worker.
+- [ ] `JJFX_PI_LINEAR_HELPER` identifies the directly executed helper; prompt
+      text and credentials are never passed in argv.
+- [ ] Versioned stdin/stdout JSON covers both operations, success, typed error,
+      unknown fields, empty output, malformed envelopes, and malformed result
+      payloads.
+- [ ] Missing or blank configuration, startup failure, authentication,
+      unsupported capability, timeout, transient transport failure, and
+      permanent failure have actionable sanitized outcomes.
+- [ ] Existing validation and one-retry behavior apply to Pi result payloads
+      without treating unavailable discovery as an empty Ticket list.
+- [ ] Pi discovery never loads project resources, starts a Pi session, broadens
+      tools, falls back to another runtime, or mutates Worker Pool state.
+- [ ] Shared CLI and jjfx TUI discovery surfaces report Pi setup/capability
+      failures consistently.
+- [ ] Claude and Codex discovery behavior remains unchanged and green.
+- [ ] Setup guidance, versions, changelog, and `mise run check` are complete.
 
 ## Out of Scope
 
-- Adding or changing Pi's own MCP, extension, package, trust, or provider
-  implementation outside the selected jjfx integration boundary.
-- Interactive Pi lifecycle hooks, `AgentKind::Pi`, and lifecycle glyphs.
-- Reworking provider-neutral Worker state, Run supervision, or log parsing
-  already delivered by issue 02.
-- Live Linear credentials or owner acceptance of a real Pi installation.
-- Replacing the existing Claude/Codex ticket transports.
+- Pi model/provider selection, Dispatch prompts, Linear write tools, Direct
+  Dispatch, Follow-up, or Worker execution policy, tracked by issue 07.
+- Dispatch Group progression and remaining CLI/TUI runtime surfaces, tracked by
+  issue 08.
+- Pi interactive lifecycle hooks, tracked by issue 05.
+- Live Linear credentials or manual acceptance, tracked by issue 06.
 
 ## Blocked by
 

@@ -133,3 +133,5 @@ cleanup, and status for every matrix row.
 - issues/03-complete-pi-worker-actions-and-release.md
 - issues/04-add-pi-ticket-discovery-and-dispatch.md
 - issues/05-add-pi-interactive-lifecycle.md
+- issues/07-add-pi-direct-dispatch-profile.md
+- issues/08-complete-pi-dispatch-integration.md
