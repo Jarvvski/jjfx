@@ -10,9 +10,10 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::{
-    AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError, AgentSessionResolution,
-    BackgroundRun, CompletedRun, Loaded, Repository, RunLog, RunSupervisor, RunSupervisorError,
-    WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
+    AgentSessionResolution, BackgroundRun, CompletedRun, Loaded, Repository, RunLog, RunSupervisor,
+    RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session,
+    resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -220,6 +221,7 @@ pub struct WorkerActions {
     repository: Repository,
     supervisor: RunSupervisor,
     commands: SystemCommands,
+    model: Option<AgentModel>,
 }
 
 impl WorkerActions {
@@ -229,7 +231,17 @@ impl WorkerActions {
             repository,
             supervisor: RunSupervisor::new(),
             commands: SystemCommands,
+            model: None,
         }
+    }
+
+    /// Supplies the provider-aware model profile used by Worker actions.
+    ///
+    /// Pi requires both provider and model values. Other runtimes retain their
+    /// existing provider-managed defaults when no profile is supplied.
+    pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
+        self.model = Some(model.into());
+        self
     }
 
     /// Starts a new Run carrying a user Follow-up prompt.
@@ -488,13 +500,17 @@ impl WorkerActions {
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
         let (reservation, prior_log) = self.repository.worker_pool().begin_follow_up(worker)?;
-        let session = resolve_agent_session(
+        let runtime = reservation.agent_runtime();
+        let session = resolve_agent_session_for_runtime(
+            runtime,
             prior_log
                 .as_deref()
                 .filter(|path| !path.as_os_str().is_empty()),
         );
-        let runtime = reservation.agent_runtime();
         let mut invocation = AgentRuntimeInvocation::new(prompt);
+        if let Some(model) = self.model.clone() {
+            invocation = invocation.with_model(model);
+        }
         match &session {
             AgentSessionResolution::Resumed { session_id } => {
                 invocation = invocation.with_session_id(session_id);

@@ -6,9 +6,9 @@ use std::process::{Command, Stdio};
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntime, AgentSessionResolution, DismissOutcome, Expected, FollowUpExecution, Loaded,
-    PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent, WireStatus, WireTimestamp,
-    WorkerActions, WorkerId, WorkspaceRestoration,
+    AgentModel, AgentRuntime, AgentSessionResolution, DismissOutcome, Expected, FollowUpExecution,
+    Loaded, PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent, WireStatus,
+    WireTimestamp, WorkerActions, WorkerId, WorkspaceRestoration,
 };
 
 const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
@@ -16,6 +16,8 @@ const HELPER_WORKER: &str = "WSG_ACTION_WORKER";
 const HELPER_RESULT: &str = "WSG_ACTION_RESULT";
 const HELPER_CAPTURE: &str = "WSG_ACTION_CAPTURE";
 const HELPER_MODE: &str = "WSG_ACTION_MODE";
+const HELPER_PROVIDER: &str = "WSG_ACTION_PROVIDER";
+const HELPER_MODEL: &str = "WSG_ACTION_MODEL";
 
 #[test]
 fn send_rejects_a_busy_worker_through_the_actions_facade() {
@@ -491,6 +493,105 @@ fn send_resumes_the_prior_claude_session_and_reports_it() {
 }
 
 #[test]
+fn send_resumes_the_prior_pi_session_with_the_configured_model() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let prior_log = repository.root().join("pi-prior.log");
+    fs::write(
+        &prior_log,
+        format!(
+            "{{\"type\":\"session\",\"version\":3,\"id\":\"session-pi-301\",\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":{:?}}}\n",
+            worker_workspace_path(&repository, &worker).to_string_lossy()
+        ),
+    )
+    .expect("prior Pi Session log");
+    set_terminal_worker_for_runtime(&repository, &worker, &prior_log, AgentRuntime::Pi);
+
+    let bin = temporary_directory.path().join("pi-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    let captured = temporary_directory.path().join("captured-pi-args");
+    write_fake_pi(&bin.join("pi"), &captured);
+    let result = temporary_directory.path().join("pi-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "send_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROVIDER, "test-provider")
+        .env(HELPER_MODEL, "test-model")
+        .stdin(Stdio::null())
+        .output()
+        .expect("Pi Send helper should run");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("Pi Send result"),
+        "runtime=pi; session=resumed:session-pi-301; completed=true"
+    );
+    let args = fs::read_to_string(captured).expect("captured Pi arguments");
+    assert!(args.contains("--provider\ntest-provider\n--model\ntest-model"));
+    assert!(args.contains("--session\nsession-pi-301"));
+    assert!(args.contains("--session-dir"));
+    assert!(args.contains(".jj/pool/pi-sessions"));
+    assert!(args.ends_with("continue the work\n"));
+}
+
+#[test]
+fn send_on_an_idle_pi_worker_starts_fresh_with_the_configured_model() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    set_pool_runtime(&repository, AgentRuntime::Pi);
+    let bin = temporary_directory.path().join("fresh-pi-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    let captured = temporary_directory.path().join("captured-fresh-pi-args");
+    write_fake_pi(&bin.join("pi"), &captured);
+    let result = temporary_directory.path().join("fresh-pi-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "send_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROVIDER, "test-provider")
+        .env(HELPER_MODEL, "test-model")
+        .stdin(Stdio::null())
+        .output()
+        .expect("fresh Pi Send helper should run");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("fresh Pi Send result"),
+        "runtime=pi; session=fresh:no prior session log; completed=true"
+    );
+    let args = fs::read_to_string(captured).expect("captured fresh Pi arguments");
+    assert!(args.contains("--provider\ntest-provider\n--model\ntest-model"));
+    assert!(!args.contains("--session\n"));
+    assert!(args.contains("--system-prompt"));
+    assert!(args.ends_with("continue the work\n"));
+}
+
+#[test]
 fn send_on_an_idle_worker_starts_fresh_and_reports_the_reason() {
     let (temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
@@ -532,6 +633,59 @@ fn send_on_an_idle_worker_starts_fresh_and_reports_the_reason() {
     let args = fs::read_to_string(captured).expect("captured fresh Claude arguments");
     assert!(args.contains("--append-system-prompt"));
     assert!(!args.contains("--resume"));
+}
+
+#[test]
+fn failed_pi_send_validation_restores_the_prior_terminal_worker() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let prior_log = repository.root().join("prior-pi.log");
+    fs::write(
+        &prior_log,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"session-pi-rollback\",\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+    )
+    .expect("prior Pi Session log");
+    set_terminal_worker_for_runtime(&repository, &worker, &prior_log, AgentRuntime::Pi);
+
+    let bin = temporary_directory.path().join("failed-pi-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    let capture = temporary_directory.path().join("unused-pi-capture");
+    write_fake_pi(&bin.join("pi"), &capture);
+    let result = temporary_directory.path().join("failed-pi-send-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "failed_send_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed Pi Send helper should run");
+
+    assert!(output.status.success());
+    assert!(
+        fs::read_to_string(result)
+            .expect("failed Pi Send result")
+            .contains("pi command requires a model")
+    );
+    let snapshot = repository.worker_pool().snapshot();
+    let restored = snapshot.worker(worker.as_str()).expect("restored Worker");
+    assert_eq!(restored.status(), wsg_core::WorkerStatus::Done);
+    assert_eq!(restored.agent_runtime(), Some(AgentRuntime::Pi));
+    assert_eq!(
+        restored.log_file(),
+        Some(prior_log.to_string_lossy().as_ref())
+    );
+    assert!(
+        !capture.exists(),
+        "Pi Run must not start after validation fails"
+    );
 }
 
 #[test]
@@ -673,7 +827,11 @@ fn send_action_helper() {
     let repository =
         Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
     let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
-    let outcome = WorkerActions::new(repository)
+    let mut actions = WorkerActions::new(repository);
+    if let (Ok(provider), Ok(model)) = (env::var(HELPER_PROVIDER), env::var(HELPER_MODEL)) {
+        actions = actions.with_model(AgentModel::new(model).with_provider(provider));
+    }
+    let outcome = actions
         .send(&worker, "continue the work", RunMode::Foreground)
         .expect("Send should launch");
     let session = match outcome.session() {
@@ -714,7 +872,30 @@ fn grow_one_worker(repository: &Repository) -> WorkerId {
         .clone()
 }
 
+fn set_pool_runtime(repository: &Repository, runtime: AgentRuntime) {
+    let state_repository = repository.state_store().pool();
+    let loaded = match state_repository.load().expect("Pool state") {
+        Loaded::Present(versioned) => versioned,
+        Loaded::Missing => panic!("Pool state should exist"),
+    };
+    let (mut state, revision) = loaded.into_parts();
+    state.agent = Some(WireAgent::new(runtime.as_str()));
+    let outcome = state_repository
+        .commit(Expected::Match(revision), StateChange::Replace(state))
+        .expect("configured Pool runtime");
+    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+}
+
 fn set_terminal_worker(repository: &Repository, worker: &WorkerId, prior_log: &Path) {
+    set_terminal_worker_for_runtime(repository, worker, prior_log, AgentRuntime::Claude);
+}
+
+fn set_terminal_worker_for_runtime(
+    repository: &Repository,
+    worker: &WorkerId,
+    prior_log: &Path,
+    runtime: AgentRuntime,
+) {
     let state_repository = repository.state_store().worker(worker.clone());
     let loaded = match state_repository.load().expect("Worker state") {
         Loaded::Present(versioned) => versioned,
@@ -722,7 +903,7 @@ fn set_terminal_worker(repository: &Repository, worker: &WorkerId, prior_log: &P
     };
     let (mut state, revision) = loaded.into_parts();
     state.status = WireStatus::new("done");
-    state.agent = Some(WireAgent::new("claude"));
+    state.agent = Some(WireAgent::new(runtime.as_str()));
     state.ticket = Some("ENG-301".to_owned());
     state.started_at = Some(WireTimestamp::new("2026-07-31T10:00:00Z"));
     state.completed_at = Some(WireTimestamp::new("2026-07-31T10:05:00Z"));
@@ -733,6 +914,16 @@ fn set_terminal_worker(repository: &Repository, worker: &WorkerId, prior_log: &P
         .commit(Expected::Match(revision), StateChange::Replace(state))
         .expect("terminal Worker state");
     assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+}
+
+fn write_fake_pi(path: &Path, capture: &Path) {
+    write_executable(
+        path,
+        &format!(
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.84.1; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '{{\"type\":\"session\",\"version\":3,\"id\":\"session-pi-301\",\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":\"/tmp/project\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"provider\":\"test-provider\",\"model\":\"test-model\",\"stopReason\":\"stop\"}}}}'\n",
+            capture.display()
+        ),
+    );
 }
 
 fn write_executable(path: &Path, contents: &str) {
