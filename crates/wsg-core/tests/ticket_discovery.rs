@@ -5,12 +5,14 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, ReadyTicketFilter, RepositoryIdentity,
-    Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest,
-    TicketStatus, TicketTitle,
+    AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter,
+    RepositoryIdentity, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
+    TicketQueryErrorKind,
+    TicketQueryRequest, TicketStatus, TicketTitle,
 };
 
 const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
@@ -79,6 +81,187 @@ fn ready_ticket_discovery_sends_a_typed_request_to_the_query_adapter() {
         Some(&TicketQueryRequest::ReadyTickets {
             filter: filter.clone(),
         })
+    );
+}
+
+#[test]
+fn pi_discovery_without_a_helper_reports_typed_setup_guidance() {
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, ".");
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let error = query
+        .query(&request)
+        .expect_err("missing Pi helper configuration should fail");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Setup);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("JJFX_PI_LINEAR_HELPER"));
+}
+
+#[test]
+fn pi_discovery_times_out_and_reaps_the_helper_process() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(&helper, "#!/bin/sh\nsleep 5\n");
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path()).with_pi_helper(
+        PiDiscoveryHelper::new(&helper).with_timeout(Duration::from_millis(50)),
+    );
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+    let started = Instant::now();
+
+    let error = query
+        .query(&request)
+        .expect_err("slow Pi helper should time out");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Timeout);
+    assert!(error.is_retryable());
+    assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn pi_helper_malformed_envelopes_are_typed_protocol_errors() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' 'not-json credential=secret-token'\n",
+    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let error = query
+        .query(&request)
+        .expect_err("malformed helper envelope should fail");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Protocol);
+    assert!(!error.is_retryable());
+    assert!(!error.to_string().contains("secret-token"));
+}
+
+#[test]
+fn pi_helper_unsupported_capability_errors_are_typed() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"version\":1,\"error\":{\"kind\":\"unsupported\",\"message\":\"list_issues is unavailable\"}}'\n",
+    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let error = query
+        .query(&request)
+        .expect_err("unsupported helper capability should fail");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Unsupported);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("list_issues is unavailable"));
+}
+
+#[test]
+fn pi_helper_authentication_errors_are_typed_without_leaking_stderr() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' 'credential=secret-token' >&2\nprintf '%s\\n' '{\"version\":1,\"error\":{\"kind\":\"authentication\",\"message\":\"configure Linear credentials\"},\"future\":true}'\n",
+    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let error = query
+        .query(&request)
+        .expect_err("authentication response should fail");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Authentication);
+    assert!(!error.is_retryable());
+    assert!(error.to_string().contains("configure Linear credentials"));
+    assert!(!error.to_string().contains("secret-token"));
+}
+
+#[test]
+fn pi_ready_ticket_discovery_uses_the_configured_helper_protocol() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let workspace = temporary_directory.path().join("workspace");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    let request = temporary_directory.path().join("request.json");
+    let working_directory = temporary_directory.path().join("working-directory");
+    fs::create_dir(&workspace).expect("query workspace");
+    write_executable(
+        &helper,
+        &format!(
+            "#!/bin/sh\npwd > '{}'\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Pi result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}}]}}}}'\n",
+            working_directory.display(),
+            request.display(),
+        ),
+    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, &workspace)
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let discovery = TicketDiscovery::new(query);
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("Pi Ready Ticket discovery");
+
+    assert_eq!(tickets.tickets()[0].title().as_str(), "Pi result");
+    assert_eq!(
+        fs::canonicalize(
+            fs::read_to_string(working_directory)
+                .expect("captured working directory")
+                .trim()
+        )
+        .expect("canonical captured working directory"),
+        fs::canonicalize(&workspace).expect("canonical query workspace"),
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            &fs::read_to_string(request).expect("captured helper request")
+        )
+        .expect("valid request JSON"),
+        serde_json::json!({
+            "version": 1,
+            "operation": "ready_tickets",
+            "label": "ready-for-agent",
+            "status": "Todo",
+        }),
     );
 }
 

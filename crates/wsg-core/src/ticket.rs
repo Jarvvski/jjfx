@@ -1,8 +1,11 @@
 //! Linear Ticket discovery and provider-neutral Dispatch inputs.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
@@ -10,11 +13,141 @@ use thiserror::Error;
 
 use crate::{AgentRuntime, TicketId};
 
+const DEFAULT_PI_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
+const PI_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Configuration for the dedicated read-only Pi discovery helper.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiDiscoveryHelper {
+    executable: PathBuf,
+    timeout: Duration,
+}
+
+impl PiDiscoveryHelper {
+    /// Selects the helper executable with the production timeout.
+    pub fn new(executable: impl Into<PathBuf>) -> Self {
+        Self {
+            executable: executable.into(),
+            timeout: DEFAULT_PI_HELPER_TIMEOUT,
+        }
+    }
+
+    /// Overrides the bounded execution time.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+
+    fn run(&self, workspace: &std::path::Path, input: &str) -> Result<Vec<u8>, TicketQueryError> {
+        let mut child = Command::new(&self.executable)
+            .current_dir(workspace)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|source| {
+                TicketQueryError::setup(format!(
+                    "cannot start pi ticket discovery helper: {source}"
+                ))
+            })?;
+        let stdout = child
+            .stdout
+            .take()
+            .expect("stdout is piped for every Pi discovery helper");
+        let stderr = child
+            .stderr
+            .take()
+            .expect("stderr is piped for every Pi discovery helper");
+        let stdout_reader = thread::spawn(move || read_pipe(stdout));
+        let stderr_reader = thread::spawn(move || read_pipe(stderr));
+        let write_result = child
+            .stdin
+            .take()
+            .expect("stdin is piped for every Pi discovery helper")
+            .write_all(input.as_bytes());
+        if let Err(source) = write_result {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = finish_pipe(stdout_reader, "stdout");
+            let _ = finish_pipe(stderr_reader, "stderr");
+            return Err(TicketQueryError::transport(
+                format!("cannot write pi helper request: {source}"),
+                false,
+            ));
+        }
+
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = finish_pipe(stdout_reader, "stdout");
+                    let _ = finish_pipe(stderr_reader, "stderr");
+                    return Err(TicketQueryError::timeout(
+                        "pi ticket discovery helper exceeded its 30-second execution limit",
+                    ));
+                }
+                Ok(None) => thread::sleep(PI_HELPER_POLL_INTERVAL),
+                Err(source) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = finish_pipe(stdout_reader, "stdout");
+                    let _ = finish_pipe(stderr_reader, "stderr");
+                    return Err(TicketQueryError::transport(
+                        format!("cannot wait for pi helper: {source}"),
+                        true,
+                    ));
+                }
+            }
+        };
+        let stdout = finish_pipe(stdout_reader, "stdout")?;
+        let _stderr = finish_pipe(stderr_reader, "stderr")?;
+        successful_helper_output(status, stdout)
+    }
+}
+
+fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    pipe.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+fn finish_pipe(
+    reader: thread::JoinHandle<io::Result<Vec<u8>>>,
+    name: &'static str,
+) -> Result<Vec<u8>, TicketQueryError> {
+    reader
+        .join()
+        .map_err(|_| {
+            TicketQueryError::transport(format!("pi helper {name} reader panicked"), false)
+        })?
+        .map_err(|source| {
+            TicketQueryError::transport(format!("cannot read pi helper {name}: {source}"), true)
+        })
+}
+
+fn successful_helper_output(
+    status: ExitStatus,
+    stdout: Vec<u8>,
+) -> Result<Vec<u8>, TicketQueryError> {
+    if status.success() {
+        Ok(stdout)
+    } else {
+        Err(TicketQueryError::transport(
+            format!("pi ticket discovery helper exited with {status}"),
+            true,
+        ))
+    }
+}
+
 /// A short-lived Agent Runtime adapter for read-only Linear discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRuntimeQuery {
     runtime: AgentRuntime,
     workspace: PathBuf,
+    pi_helper: Option<PiDiscoveryHelper>,
 }
 
 impl AgentRuntimeQuery {
@@ -23,7 +156,14 @@ impl AgentRuntimeQuery {
         Self {
             runtime,
             workspace: workspace.into(),
+            pi_helper: None,
         }
+    }
+
+    /// Configures the dedicated read-only helper used for Pi discovery.
+    pub fn with_pi_helper(mut self, helper: PiDiscoveryHelper) -> Self {
+        self.pi_helper = Some(helper);
+        self
     }
 
     fn command(&self, request: &TicketQueryRequest) -> Command {
@@ -59,14 +199,62 @@ impl AgentRuntimeQuery {
         }
         command
     }
+
+    fn pi_query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
+        let helper = self.pi_helper.as_ref().ok_or_else(|| {
+            TicketQueryError::setup(
+                "pi ticket discovery requires the JJFX_PI_LINEAR_HELPER configuration",
+            )
+        })?;
+        let input = request.pi_helper_input()?;
+        let output = helper.run(&self.workspace, &input)?;
+        let response = serde_json::from_slice::<PiHelperResponse>(&output).map_err(|error| {
+            TicketQueryError::protocol(format!(
+                "pi ticket discovery helper returned a malformed response envelope: {error}"
+            ))
+        })?;
+        if response.version != PI_HELPER_PROTOCOL_VERSION {
+            return Err(TicketQueryError::protocol(format!(
+                "pi ticket discovery helper returned unsupported protocol version {}",
+                response.version
+            )));
+        }
+        if let Some(error) = response.error {
+            let message = format!(
+                "pi ticket discovery helper reported {}: {}",
+                error.kind, error.message
+            );
+            return Err(match error.kind.as_str() {
+                "authentication" => TicketQueryError::authentication(message),
+                "unsupported" | "not_configured" => TicketQueryError::unsupported(message),
+                "permanent" => TicketQueryError::permanent(message),
+                _ => TicketQueryError::protocol(format!(
+                    "pi ticket discovery helper returned unknown error kind {:?}",
+                    error.kind
+                )),
+            });
+        }
+        response
+            .result
+            .ok_or_else(|| {
+                TicketQueryError::protocol(
+                    "pi ticket discovery helper response contains no result or error",
+                )
+            })
+            .and_then(|result| {
+                serde_json::to_string(&result).map_err(|error| {
+                    TicketQueryError::permanent(format!(
+                        "cannot normalize pi helper result: {error}"
+                    ))
+                })
+            })
+    }
 }
 
 impl TicketQuery for AgentRuntimeQuery {
     fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         if self.runtime == AgentRuntime::Pi {
-            return Err(TicketQueryError::permanent(
-                "pi ticket discovery is unsupported until its read-only adapter is configured",
-            ));
+            return self.pi_query(request);
         }
         let output = self.command(request).output().map_err(|source| {
             TicketQueryError::permanent(format!("cannot start {} query: {source}", self.runtime))
@@ -176,6 +364,21 @@ pub enum TicketQueryRequest {
     },
 }
 
+const PI_HELPER_PROTOCOL_VERSION: u8 = 1;
+
+#[derive(Debug, Deserialize)]
+struct PiHelperResponse {
+    version: u8,
+    result: Option<serde_json::Value>,
+    error: Option<PiHelperError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PiHelperError {
+    kind: String,
+    message: String,
+}
+
 impl TicketQueryRequest {
     fn prompt(&self) -> String {
         match self {
@@ -193,6 +396,26 @@ impl TicketQueryRequest {
             ),
         }
     }
+
+    fn pi_helper_input(&self) -> Result<String, TicketQueryError> {
+        let input = match self {
+            Self::ReadyTickets { filter } => serde_json::json!({
+                "version": PI_HELPER_PROTOCOL_VERSION,
+                "operation": "ready_tickets",
+                "label": filter.label,
+                "status": filter.status.as_str(),
+            }),
+            Self::DependencyGraph { parent, repository } => serde_json::json!({
+                "version": PI_HELPER_PROTOCOL_VERSION,
+                "operation": "dependency_graph",
+                "parent": parent.id().as_str(),
+                "repository": repository.as_str(),
+            }),
+        };
+        serde_json::to_string(&input).map_err(|error| {
+            TicketQueryError::permanent(format!("cannot encode pi helper request: {error}"))
+        })
+    }
 }
 
 /// Executes one short-lived, read-only query against Linear through an Agent Runtime.
@@ -201,10 +424,30 @@ pub trait TicketQuery {
     fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError>;
 }
 
+/// Stable classifications for Ticket query adapter failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TicketQueryErrorKind {
+    /// Required executable or configuration is absent or invalid.
+    Setup,
+    /// The helper could not be started or completed normally.
+    Transport,
+    /// The helper exceeded its bounded execution time.
+    Timeout,
+    /// The configured transport rejected its credentials.
+    Authentication,
+    /// The configured transport does not provide the requested capability.
+    Unsupported,
+    /// The helper violated the versioned request/response contract.
+    Protocol,
+    /// A provider query failed without a more specific classification.
+    Query,
+}
+
 /// A failure reported by a Ticket query adapter.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 #[error("{message}")]
 pub struct TicketQueryError {
+    kind: TicketQueryErrorKind,
     message: String,
     retryable: bool,
 }
@@ -212,18 +455,58 @@ pub struct TicketQueryError {
 impl TicketQueryError {
     /// Creates a failure that may recover on the single bounded retry.
     pub fn transient(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-            retryable: true,
-        }
+        Self::new(TicketQueryErrorKind::Query, message, true)
     }
 
     /// Creates a failure that must surface without repeating the query.
     pub fn permanent(message: impl Into<String>) -> Self {
+        Self::new(TicketQueryErrorKind::Query, message, false)
+    }
+
+    fn setup(message: impl Into<String>) -> Self {
+        Self::new(TicketQueryErrorKind::Setup, message, false)
+    }
+
+    fn transport(message: impl Into<String>, retryable: bool) -> Self {
+        Self::new(TicketQueryErrorKind::Transport, message, retryable)
+    }
+
+    fn timeout(message: impl Into<String>) -> Self {
+        Self::new(TicketQueryErrorKind::Timeout, message, true)
+    }
+
+    fn authentication(message: impl Into<String>) -> Self {
+        Self::new(TicketQueryErrorKind::Authentication, message, false)
+    }
+
+    fn unsupported(message: impl Into<String>) -> Self {
+        Self::new(TicketQueryErrorKind::Unsupported, message, false)
+    }
+
+    fn protocol(message: impl Into<String>) -> Self {
+        Self::new(TicketQueryErrorKind::Protocol, message, false)
+    }
+
+    fn new(
+        kind: TicketQueryErrorKind,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Self {
         Self {
+            kind,
             message: message.into(),
-            retryable: false,
+            retryable,
         }
+    }
+
+    /// Returns the stable failure classification.
+    pub fn kind(&self) -> TicketQueryErrorKind {
+        self.kind
+    }
+
+    /// Reports whether Ticket discovery may repeat this query once.
+    pub fn is_retryable(&self) -> bool {
+        self.retryable
     }
 }
 

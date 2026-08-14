@@ -59,8 +59,10 @@ pub use state::{
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
-    ParentTicket, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket, TicketDiscovery,
-    TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryRequest, TicketStatus,
+    ParentTicket, PiDiscoveryHelper, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket,
+    TicketDiscovery,
+    TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryErrorKind,
+    TicketQueryRequest, TicketStatus,
     TicketTitle,
     TicketValueError,
 };
