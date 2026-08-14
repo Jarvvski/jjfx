@@ -9,11 +9,10 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, CapacityShortage, CleanDecision, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest, DispatchBudget,
-    FollowUpExecution, OrchestrationEvent, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter,
-    Repository,
-    RunActivity, RunActivityKind, RunMode, TicketDiscovery, TicketId, TicketStatus,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
-    PI_DISCOVERY_HELPER_ENV,
+    FollowUpExecution, OrchestrationEvent, PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper,
+    PoolCapacity, ReadyTicketFilter, Repository, RunActivity, RunActivityKind, RunMode,
+    TicketDiscovery, TicketId, TicketStatus, WorkerActions, WorkerId, WorkerPoolError,
+    WorkerStatus, WorkspaceAddOutcome,
 };
 
 pub const HELP: &str = concat!(
@@ -819,9 +818,7 @@ fn configured_ticket_query(repository: &Repository, runtime: AgentRuntime) -> Ag
     if runtime != AgentRuntime::Pi {
         return query;
     }
-    match std::env::var_os(PI_DISCOVERY_HELPER_ENV)
-        .filter(|executable| !executable.is_empty())
-    {
+    match std::env::var_os(PI_DISCOVERY_HELPER_ENV).filter(|executable| !executable.is_empty()) {
         Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
         None => query,
     }
@@ -1137,10 +1134,8 @@ fn orchestrate_command(repository: &Repository, parent: &str, model: Option<&str
         .ticket()
         .clone();
     let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
-    let discovery = TicketDiscovery::new(configured_ticket_query(
-        repository,
-        request.agent_runtime(),
-    ));
+    let discovery =
+        TicketDiscovery::new(configured_ticket_query(repository, request.agent_runtime()));
     let runner = repository.orchestration_runner();
     let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;
     render_orchestration_event(&OrchestrationEvent::Started {

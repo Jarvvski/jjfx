@@ -12,10 +12,9 @@ use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, AgentSessionResolution, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchFailurePhase, DirectDispatchOutcome,
     DirectDispatchRequest, DispatchGroup, DispatchGroupState, DispatchGroupStatusCounts,
-    PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, RunActivity, RunMode, RunResult,
-    SubIssueStatus,
-    TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError, WorkerPoolSnapshot,
-    WorkerStatus, PI_DISCOVERY_HELPER_ENV,
+    PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, RunActivity,
+    RunMode, RunResult, SubIssueStatus, TicketDiscovery, TicketId, TicketStatus, WorkerId,
+    WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 /// A user-visible operation identity used to ignore stale results.
@@ -1309,9 +1308,7 @@ fn configured_ticket_query(
     if runtime != AgentRuntime::Pi {
         return query;
     }
-    match std::env::var_os(PI_DISCOVERY_HELPER_ENV)
-        .filter(|executable| !executable.is_empty())
-    {
+    match std::env::var_os(PI_DISCOVERY_HELPER_ENV).filter(|executable| !executable.is_empty()) {
         Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
         None => query,
     }
@@ -2120,9 +2117,11 @@ mod tests {
             }),
         );
         let snapshot = repository.worker_pool().snapshot();
-        assert!(snapshot.workers().iter().all(|worker| {
-            worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
-        }));
+        assert!(
+            snapshot.workers().iter().all(|worker| {
+                worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
+            })
+        );
     }
 
     #[test]

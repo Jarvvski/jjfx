@@ -1,6 +1,6 @@
 # Add Pi read-only ticket discovery
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -80,24 +80,24 @@ resolution.
 
 ## Acceptance Criteria
 
-- [ ] Ready Ticket and dependency discovery select Pi through typed requests
+- [x] Ready Ticket and dependency discovery select Pi through typed requests
       without reserving a Worker.
-- [ ] `JJFX_PI_LINEAR_HELPER` identifies the directly executed helper; prompt
+- [x] `JJFX_PI_LINEAR_HELPER` identifies the directly executed helper; prompt
       text and credentials are never passed in argv.
-- [ ] Versioned stdin/stdout JSON covers both operations, success, typed error,
+- [x] Versioned stdin/stdout JSON covers both operations, success, typed error,
       unknown fields, empty output, malformed envelopes, and malformed result
       payloads.
-- [ ] Missing or blank configuration, startup failure, authentication,
+- [x] Missing or blank configuration, startup failure, authentication,
       unsupported capability, timeout, transient transport failure, and
       permanent failure have actionable sanitized outcomes.
-- [ ] Existing validation and one-retry behavior apply to Pi result payloads
+- [x] Existing validation and one-retry behavior apply to Pi result payloads
       without treating unavailable discovery as an empty Ticket list.
-- [ ] Pi discovery never loads project resources, starts a Pi session, broadens
+- [x] Pi discovery never loads project resources, starts a Pi session, broadens
       tools, falls back to another runtime, or mutates Worker Pool state.
-- [ ] Shared CLI and jjfx TUI discovery surfaces report Pi setup/capability
+- [x] Shared CLI and jjfx TUI discovery surfaces report Pi setup/capability
       failures consistently.
-- [ ] Claude and Codex discovery behavior remains unchanged and green.
-- [ ] Setup guidance, versions, changelog, and `mise run check` are complete.
+- [x] Claude and Codex discovery behavior remains unchanged and green.
+- [x] Setup guidance, versions, changelog, and `mise run check` are complete.
 
 ## Out of Scope
 
@@ -112,3 +112,11 @@ resolution.
 
 - issues/01-spike-pi-contracts.md
 - issues/03-complete-pi-worker-actions-and-release.md
+
+## Comments
+
+- 2026-08-14: Resolved with typed Ticket query requests, a dedicated
+  `JJFX_PI_LINEAR_HELPER` protocol, bounded helper execution, classified and
+  sanitized failures, and shared CLI/TUI composition. Discovery completes
+  before Worker reservation and preserves existing validation and one-retry
+  behavior. `mise run check` passed for jjfx 0.37.0 and wsg 0.12.0.

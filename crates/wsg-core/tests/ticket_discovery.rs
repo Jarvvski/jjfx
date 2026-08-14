@@ -11,8 +11,7 @@ use tempfile::TempDir;
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter,
     RepositoryIdentity, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
-    TicketQueryErrorKind,
-    TicketQueryRequest, TicketStatus, TicketTitle,
+    TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
 };
 
 const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
@@ -126,9 +125,8 @@ fn pi_discovery_times_out_and_reaps_the_helper_process() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let helper = temporary_directory.path().join("pi-linear-helper");
     write_executable(&helper, "#!/bin/sh\nsleep 5\n");
-    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path()).with_pi_helper(
-        PiDiscoveryHelper::new(&helper).with_timeout(Duration::from_millis(50)),
-    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper).with_timeout(Duration::from_millis(50)));
     let request = TicketQueryRequest::ReadyTickets {
         filter: ReadyTicketFilter::new(
             "ready-for-agent",
@@ -209,6 +207,32 @@ fn pi_helper_transient_errors_use_the_existing_single_retry() {
 
     assert_eq!(tickets.tickets()[0].title().as_str(), "Recovered");
     assert_eq!(fs::read_to_string(attempts).expect("attempt count"), "2");
+}
+
+#[test]
+fn pi_helper_rejects_an_envelope_with_both_result_and_error() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"version\":1,\"result\":{\"tickets\":[]},\"error\":{\"kind\":\"unsupported\",\"message\":\"ambiguous\"}}'\n",
+    );
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let error = query
+        .query(&request)
+        .expect_err("ambiguous helper envelope should fail");
+
+    assert_eq!(error.kind(), TicketQueryErrorKind::Protocol);
+    assert!(!error.is_retryable());
 }
 
 #[test]

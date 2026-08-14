@@ -59,11 +59,10 @@ pub use state::{
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
-    ParentTicket, PiDiscoveryHelper, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket,
-    TicketDiscovery,
-    TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryErrorKind,
-    TicketQueryRequest, TicketStatus,
-    TicketTitle, TicketValueError, PI_DISCOVERY_HELPER_ENV,
+    PI_DISCOVERY_HELPER_ENV, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter, ReadyTickets,
+    RepositoryIdentity, Ticket, TicketDiscovery, TicketDiscoveryError, TicketQuery,
+    TicketQueryError, TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
+    TicketValueError,
 };
 pub use worker_actions::{
     DismissOutcome, FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome,

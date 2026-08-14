@@ -1,10 +1,17 @@
 # Changelog
 
-All notable changes to this project are documented here (newest first). The version of record lives in the project manifest.
+All notable changes to this project are documented here (newest first). The
+version of record lives in the project manifest.
 
 ## [Unreleased]
 
 ### Added
+
+- 2026-08-14 - Added read-only Pi Ticket discovery in jjfx 0.37.0 and wsg
+  0.12.0 through a configured, versioned helper protocol. Ready Ticket and
+  dependency queries now use the existing typed validation and single retry
+  without starting Pi sessions, reserving Workers, exposing credentials, or
+  falling back to Claude or Codex.
 
 - 2026-08-14 - Added Pi 0.84.x Worker Follow-up and interactive Mount support
   in jjfx 0.36.0 and wsg 0.11.0. Pi actions use explicit provider/model

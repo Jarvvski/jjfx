@@ -110,9 +110,12 @@ fn pi_dispatch_all_reports_missing_helper_without_reserving_a_worker() {
     assert!(!diagnostic.contains("claude"));
     assert!(!diagnostic.contains("codex"));
     let snapshot = repository.worker_pool().snapshot();
-    assert!(snapshot.workers().iter().all(|worker| {
-        worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
-    }));
+    assert!(
+        snapshot
+            .workers()
+            .iter()
+            .all(|worker| { worker.status() == WorkerStatus::Idle && worker.ticket().is_none() })
+    );
 }
 
 #[test]
@@ -157,9 +160,12 @@ fn pi_dispatch_all_uses_the_configured_discovery_helper_before_reservation() {
         }),
     );
     let snapshot = repository.worker_pool().snapshot();
-    assert!(snapshot.workers().iter().all(|worker| {
-        worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
-    }));
+    assert!(
+        snapshot
+            .workers()
+            .iter()
+            .all(|worker| { worker.status() == WorkerStatus::Idle && worker.ticket().is_none() })
+    );
 }
 
 #[test]

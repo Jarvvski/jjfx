@@ -89,7 +89,7 @@ impl PiDiscoveryHelper {
                     let _ = finish_pipe(stdout_reader, "stdout");
                     let _ = finish_pipe(stderr_reader, "stderr");
                     return Err(TicketQueryError::timeout(
-                        "pi ticket discovery helper exceeded its 30-second execution limit",
+                        "pi ticket discovery helper exceeded its configured execution limit",
                     ));
                 }
                 Ok(None) => thread::sleep(PI_HELPER_POLL_INTERVAL),
@@ -205,9 +205,9 @@ impl AgentRuntimeQuery {
 
     fn pi_query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
         let helper = self.pi_helper.as_ref().ok_or_else(|| {
-            TicketQueryError::setup(
-                format!("pi ticket discovery requires the {PI_DISCOVERY_HELPER_ENV} configuration"),
-            )
+            TicketQueryError::setup(format!(
+                "pi ticket discovery requires the {PI_DISCOVERY_HELPER_ENV} configuration"
+            ))
         })?;
         let input = request.pi_helper_input()?;
         let output = helper.run(&self.workspace, &input)?;
@@ -221,6 +221,11 @@ impl AgentRuntimeQuery {
                 "pi ticket discovery helper returned unsupported protocol version {}",
                 response.version
             )));
+        }
+        if response.result.is_some() == response.error.is_some() {
+            return Err(TicketQueryError::protocol(
+                "pi ticket discovery helper response must contain exactly one result or error",
+            ));
         }
         if let Some(error) = response.error {
             let message = format!(
@@ -238,20 +243,12 @@ impl AgentRuntimeQuery {
                 )),
             });
         }
-        response
+        let result = response
             .result
-            .ok_or_else(|| {
-                TicketQueryError::protocol(
-                    "pi ticket discovery helper response contains no result or error",
-                )
-            })
-            .and_then(|result| {
-                serde_json::to_string(&result).map_err(|error| {
-                    TicketQueryError::permanent(format!(
-                        "cannot normalize pi helper result: {error}"
-                    ))
-                })
-            })
+            .expect("a validated Pi helper success response contains a result");
+        serde_json::to_string(&result).map_err(|error| {
+            TicketQueryError::permanent(format!("cannot normalize pi helper result: {error}"))
+        })
     }
 }
 
@@ -491,11 +488,7 @@ impl TicketQueryError {
         Self::new(TicketQueryErrorKind::Protocol, message, false)
     }
 
-    fn new(
-        kind: TicketQueryErrorKind,
-        message: impl Into<String>,
-        retryable: bool,
-    ) -> Self {
+    fn new(kind: TicketQueryErrorKind, message: impl Into<String>, retryable: bool) -> Self {
         Self {
             kind,
             message: message.into(),
