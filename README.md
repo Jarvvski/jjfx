@@ -28,6 +28,26 @@ cargo run -p jjfx -- tui       # open the TUI
 cargo run -p jjfx -- pool list # run a CLI command
 ```
 
+## Pi Worker actions
+
+The shared Worker action layer supports Pi 0.84.x for fresh and resumed
+Follow-ups and interactive kitty mounts. The `pi` executable must be on `PATH`,
+and the host must select an authenticated provider and model explicitly through
+`WorkerActions::with_model(AgentModel::new(model).with_provider(provider))`.
+Broad Pi selection in the jjfx CLI and TUI is tracked separately from these
+Worker action contracts.
+
+Pi Worker runs and mounts use the repository-owned `.jj/pool/pi-sessions`
+directory, ignore inherited extensions, skills, prompt templates, themes,
+context files, and project trust, and allow only the built-in
+`read,bash,edit,write,grep,find,ls` tools. This tool policy is not filesystem
+confinement: Pi runs with the host user's permissions, so use an operating-system
+sandbox when the Workspace needs a stronger boundary.
+
+Pi core does not provide aggregate budget limits, per-tool approval dialogs,
+or native Linear ticket discovery. jjfx reports those capabilities as
+unsupported rather than falling back to Claude or Codex.
+
 ## Contributing
 
 Project conventions and agent guidance live in [`CLAUDE.md`](CLAUDE.md); see

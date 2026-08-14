@@ -6,6 +6,12 @@ All notable changes to this project are documented here (newest first). The vers
 
 ### Added
 
+- 2026-08-14 - Added Pi 0.84.x Worker Follow-up and interactive Mount support
+  in jjfx 0.36.0 and wsg 0.11.0. Pi actions use explicit provider/model
+  profiles, repository-owned sessions, and a fixed trusted Worker policy;
+  filesystem sandboxing, aggregate budgets, approval dialogs, ticket
+  discovery, and interactive lifecycle tracking remain separate capabilities.
+
 - 2026-08-13 - Persisted the TUI's idle workspace fold state alongside the
   world-graph pane across launches.
 

@@ -81,6 +81,25 @@ Rust persistence keeps these values as open strings so an additive runtime
 value does not make the document unreadable. Lifecycle modules interpret the
 known values separately.
 
+## Pi Worker actions
+
+Rust supports Pi 0.84.x as an additive Worker runtime. Follow-up and Mount
+resolve a prior Pi Session only from a valid v3 Pi session header and otherwise
+report the existing explicit fresh-session reason. Runtime identity remains the
+canonical `pi` Worker value. Provider and model are typed action inputs and are
+not added to the Go-compatible Pool or Worker documents.
+
+Pi commands use `.jj/pool/pi-sessions`, suppress inherited extensions, skills,
+prompt templates, themes, context files, and project trust, and select the
+fixed `read,bash,edit,write,grep,find,ls` tool allowlist. These controls do not
+sandbox the filesystem. Aggregate budgets, per-tool approval dialogs, and Pi
+ticket discovery are unsupported by this contract and never fall back to a
+different Agent Runtime.
+
+Run supervision remains provider-neutral. Pi uses the same Reservation, PID,
+process-group cleanup, Reset, stale-finalization, and terminal persistence
+rules as Claude and Codex.
+
 ## Lock protocol
 
 Lock files are stable sidecars because atomic replacement changes the state
