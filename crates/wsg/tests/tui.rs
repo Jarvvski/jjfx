@@ -8,6 +8,7 @@ use std::time::Duration;
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 
 #[test]
+#[ignore = "interactive PTY test; run `mise run test-deep`"]
 fn interactive_wsg_without_arguments_enters_the_shared_tui() {
     let output = run_interactive(env!("CARGO_BIN_EXE_wsg"), "wsg", &[]);
     assert!(
@@ -21,6 +22,7 @@ fn interactive_wsg_without_arguments_enters_the_shared_tui() {
 }
 
 #[test]
+#[ignore = "interactive PTY test; run `mise run test-deep`"]
 fn panic_in_the_shared_tui_restores_the_terminal() {
     let pty = native_pty_system()
         .openpty(PtySize {
@@ -74,6 +76,7 @@ fn jjfx_without_arguments_prints_cli_help() {
 }
 
 #[test]
+#[ignore = "interactive PTY test; run `mise run test-deep`"]
 fn interactive_jjfx_enters_the_same_tui() {
     let binary = jjfx_binary();
     let output = run_interactive(&binary, "jjfx", &["tui"]);
