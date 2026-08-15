@@ -4027,6 +4027,9 @@ mod tests {
             name: "UserPromptSubmit".into(),
             cwd: "/wt/feat".into(),
             transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         }));
         let feat = app
             .store
@@ -5437,11 +5440,17 @@ mod tests {
             name: "PermissionRequest".into(),
             cwd: "/wt/blocked".into(),
             transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         }));
         app.handle(Msg::AgentEvent(agent::Event {
             name: "UserPromptSubmit".into(),
             cwd: "/wt/busy".into(),
             transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         }));
         let mut snap = HashMap::new();
         snap.insert(
@@ -5474,6 +5483,9 @@ mod tests {
             name: "PermissionRequest".into(),
             cwd: "/wt/blocked".into(),
             transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         }));
 
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
@@ -5891,6 +5903,9 @@ mod tests {
                 name: name.to_string(),
                 cwd: "/wt/feat".to_string(),
                 transcript_path: None,
+                jjfx_event_version: None,
+                agent_kind: None,
+                session_id: None,
             }));
         }
         assert!(app.animate());
@@ -5905,6 +5920,9 @@ mod tests {
             name: "Stop".to_string(),
             cwd: "/wt/feat".to_string(),
             transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         }));
         assert!(!app.animate());
     }

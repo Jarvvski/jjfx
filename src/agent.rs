@@ -85,6 +85,12 @@ pub struct Event {
     pub cwd: String,
     #[serde(default)]
     pub transcript_path: Option<String>,
+    #[serde(default)]
+    pub jjfx_event_version: Option<u64>,
+    #[serde(default)]
+    pub agent_kind: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 /// Parse one JSONL line into an [`Event`], or `None` for a blank/malformed line
@@ -94,7 +100,17 @@ pub fn parse_line(line: &str) -> Option<Event> {
     if line.is_empty() {
         return None;
     }
-    serde_json::from_str(line).ok()
+    let mut event: Event = serde_json::from_str(line).ok()?;
+    if event.agent_kind.as_deref() == Some("") {
+        event.agent_kind = None;
+    }
+    if event.session_id.as_deref() == Some("") {
+        event.session_id = None;
+    }
+    match event.jjfx_event_version {
+        None | Some(1) => Some(event),
+        Some(_) => None,
+    }
 }
 
 /// The event -> agent-state transition map confirmed in spike 01. Unknown events
@@ -188,6 +204,18 @@ mod tests {
     }
 
     #[test]
+    fn parses_versioned_lifecycle_envelopes() {
+        let line = r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-session","cwd":"/w/a","hook_event_name":"SessionStart"}"#;
+        let ev = parse_line(line).unwrap();
+        assert_eq!(ev.jjfx_event_version, Some(1));
+        assert_eq!(ev.agent_kind.as_deref(), Some("pi"));
+        assert_eq!(ev.session_id.as_deref(), Some("pi-session"));
+
+        let unsupported = r#"{"jjfx_event_version":2,"agent_kind":"pi","session_id":"pi-session","cwd":"/w/a","hook_event_name":"SessionStart"}"#;
+        assert!(parse_line(unsupported).is_none());
+    }
+
+    #[test]
     fn kind_derives_from_the_transcript_location() {
         assert_eq!(
             AgentKind::from_transcript_path("/Users/u/.claude/projects/x/s.jsonl"),
@@ -210,6 +238,9 @@ mod tests {
             name: "SessionStart".to_string(),
             cwd: "/w/a".to_string(),
             transcript_path: Some("/u/.claude/projects/x/s.jsonl".to_string()),
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         });
         assert_eq!(states.agent_for(Path::new("/w/a")).kind, AgentKind::Claude);
 
@@ -218,6 +249,9 @@ mod tests {
             name: "UserPromptSubmit".to_string(),
             cwd: "/w/a".to_string(),
             transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         });
         let agent = states.agent_for(Path::new("/w/a"));
         assert_eq!(agent.state, AgentState::Working);
@@ -228,6 +262,9 @@ mod tests {
             name: "SessionStart".to_string(),
             cwd: "/w/a".to_string(),
             transcript_path: Some("/u/.codex/sessions/r.jsonl".to_string()),
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
         });
         assert_eq!(states.agent_for(Path::new("/w/a")).kind, AgentKind::Codex);
     }
@@ -298,6 +335,9 @@ mod tests {
                 name: name.to_string(),
                 cwd: "/w/a".to_string(),
                 transcript_path: None,
+                jjfx_event_version: None,
+                agent_kind: None,
+                session_id: None,
             });
         }
         assert_eq!(
