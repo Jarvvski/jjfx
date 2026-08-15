@@ -7,6 +7,13 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-08-15 - Added Pi 0.84.x interactive lifecycle tracking in jjfx 0.38.0.
+  A jjfx-owned Pi extension now reports explicit session identity and
+  working, waiting, and graceful shutdown events through the shared JSONL
+  lifecycle log. Hook installation preserves unrelated Pi state, the TUI uses
+  distinct violet Pi styling, and unsupported permission attention is never
+  fabricated.
+
 - 2026-08-14 - Added read-only Pi Ticket discovery in jjfx 0.37.0 and wsg
   0.12.0 through a configured, versioned helper protocol. Ready Ticket and
   dependency queries now use the existing typed validation and single retry

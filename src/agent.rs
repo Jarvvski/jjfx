@@ -32,10 +32,14 @@ pub enum AgentState {
 /// their transcript locations. `Unknown` is the neutral malformed fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentKind {
+    /// The event does not identify a supported agent.
     #[default]
     Unknown,
+    /// Claude Code.
     Claude,
+    /// OpenAI Codex.
     Codex,
+    /// Pi coding agent.
     Pi,
 }
 
@@ -75,7 +79,9 @@ impl AgentKind {
 /// One workspace's live agent: what it is doing, and which CLI it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Agent {
+    /// The agent's current lifecycle state.
     pub state: AgentState,
+    /// The agent implementation associated with the lifecycle state.
     pub kind: AgentKind,
 }
 
@@ -84,15 +90,21 @@ pub struct Agent {
 /// agent and session identity. Unrelated provider fields remain ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Event {
+    /// Provider-neutral lifecycle event name.
     #[serde(rename = "hook_event_name")]
     pub name: String,
+    /// Workspace directory used to join the event to a jjfx row.
     pub cwd: String,
+    /// Legacy Claude or Codex transcript location used for identity inference.
     #[serde(default)]
     pub transcript_path: Option<String>,
+    /// Version of a jjfx-owned lifecycle envelope, if this is one.
     #[serde(default)]
     pub jjfx_event_version: Option<u64>,
+    /// Explicit provider identity carried by a jjfx-owned envelope.
     #[serde(default)]
     pub agent_kind: Option<String>,
+    /// Stable provider session identity carried by a jjfx-owned envelope.
     #[serde(default)]
     pub session_id: Option<String>,
 }
@@ -176,6 +188,9 @@ impl AgentStates {
         let key = canon(Path::new(&ev.cwd));
         let entry = self.states.entry(key).or_default();
         if ev.name == "SessionStart" {
+            // The append-only stream defines session order: each start is the
+            // authoritative switch, then IDs reject delayed events from the
+            // session it replaced.
             entry.session_id.clone_from(&ev.session_id);
         } else {
             match (&entry.session_id, &ev.session_id) {

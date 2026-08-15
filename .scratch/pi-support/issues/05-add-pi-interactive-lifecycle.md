@@ -1,6 +1,6 @@
 # Add Pi interactive lifecycle tracking
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -96,25 +96,25 @@ narrow terminal sizes so missing or partial Pi data cannot panic. Run
 
 ## Acceptance Criteria
 
-- [ ] A real Pi session can be identified as Pi through the issue 01-selected
+- [x] A real Pi session can be identified as Pi through the issue 01-selected
       adapter, with cwd and stable session identity captured where available.
-- [ ] Pi session, active-agent, settled, and shutdown events map to the
+- [x] Pi session, active-agent, settled, and shutdown events map to the
       documented jjfx lifecycle states; unsupported attention states are
       explicitly documented rather than fabricated.
-- [ ] `AgentKind::Pi` never falls back to Claude or Codex when Pi identity is
+- [x] `AgentKind::Pi` never falls back to Claude or Codex when Pi identity is
       missing, ambiguous, malformed, or stale.
-- [ ] `jjfx hooks install` installs or enables the Pi integration idempotently,
+- [x] `jjfx hooks install` installs or enables the Pi integration idempotently,
       and `jjfx hooks status` reports its state accurately.
-- [ ] Installation preserves unrelated Pi settings, resources, sessions,
+- [x] Installation preserves unrelated Pi settings, resources, sessions,
       packages, trust decisions, and existing Claude/Codex hook configuration.
-- [ ] Startup replay and live updates produce equivalent Pi state, tolerate
+- [x] Startup replay and live updates produce equivalent Pi state, tolerate
       malformed/partial records, and join events to workspaces by cwd safely.
-- [ ] The TUI distinguishes Pi in labels and lifecycle glyphs/animation/color,
+- [x] The TUI distinguishes Pi in labels and lifecycle glyphs/animation/color,
       handles narrow terminals, and does not misrepresent absent or ended
       sessions as active.
-- [ ] Claude and Codex hook installation, lifecycle folding, and rendering
+- [x] Claude and Codex hook installation, lifecycle folding, and rendering
       remain behaviorally unchanged.
-- [ ] Setup/lifecycle documentation, version, changelog, and `mise run check`
+- [x] Setup/lifecycle documentation, version, changelog, and `mise run check`
       are complete.
 
 ## Out of Scope
@@ -130,3 +130,13 @@ narrow terminal sizes so missing or partial Pi data cannot panic. Run
 ## Blocked by
 
 - issues/01-spike-pi-contracts.md
+
+## Comments
+
+- 2026-08-15: Resolved with a versioned provider-neutral lifecycle envelope,
+  explicit Pi session identity, a jjfx-owned auto-discovered extension,
+  idempotent install/status support, session-aware replay/live folding, and
+  distinct violet Pi rendering. Pi maps working, waiting, and graceful ended
+  states without fabricating `NeedsAttention`. Deterministic integration tests
+  and an isolated real-Pi smoke test passed, followed by `mise run check` for
+  jjfx 0.38.0.

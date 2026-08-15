@@ -28,6 +28,28 @@ cargo run -p jjfx -- tui       # open the TUI
 cargo run -p jjfx -- pool list # run a CLI command
 ```
 
+## Interactive agent lifecycle setup
+
+Run `jjfx hooks status` to inspect lifecycle integration for Claude Code, Codex,
+and Pi. Install or update every integration with:
+
+```bash
+jjfx hooks install
+```
+
+For Pi, jjfx installs an owned, auto-discovered extension at
+`${PI_CODING_AGENT_DIR:-~/.pi/agent}/extensions/jjfx-lifecycle.ts`. Installation
+is additive and does not modify Pi settings, packages, sessions, project trust,
+or unrelated extensions. A conflicting non-jjfx file at that path is reported
+and never overwritten.
+
+The extension maps Pi session start and settled events to waiting, active agent
+and turn events to working, and graceful session shutdown to ended. Pi does not
+expose a native permission or attention event, so jjfx does not fabricate
+`NeedsAttention` from tool or provider failures. An abruptly terminated Pi
+process may remain waiting until a later lifecycle event because jjfx does not
+infer shutdown by polling or terminal scraping.
+
 ## Pi Worker actions and ticket discovery
 
 The shared Worker action layer supports Pi 0.84.x for fresh and resumed

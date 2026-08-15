@@ -39,4 +39,17 @@ The transitions above are **confirmed**, with refinements
   documented, not yet captured. Re-capture from a live session before issue 04
   hard-codes their field access.
 
-Status: accepted (validated by spike 01)
+## Pi lifecycle extension amendment
+
+Pi does not expose the Claude/Codex hook configuration contract. jjfx therefore
+installs an owned, auto-discovered Pi extension that translates documented Pi
+session and agent events into the same provider-neutral lifecycle names before
+appending them to the shared log. The envelope carries explicit `pi` identity,
+stable session identity, and cwd. Rust still owns the state transition fold.
+
+Pi `agent_start` and `turn_start` mean Working, `agent_settled` means Waiting,
+and graceful `session_shutdown` means Ended. Pi has no native permission or
+attention event, so tool failures and provider errors never imply
+NeedsAttention.
+
+Status: accepted (validated by spike 01; Pi amendment implemented by issue 05)

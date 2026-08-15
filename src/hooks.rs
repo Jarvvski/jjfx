@@ -133,19 +133,28 @@ impl IntegrationPaths {
 /// and already-current resources remain separately observable.
 #[derive(Debug, PartialEq, Eq)]
 pub struct InstallOutcome {
+    /// Agent whose integration was inspected.
     pub agent: &'static str,
+    /// Lifecycle resources created by the installation.
     pub added: Vec<String>,
+    /// Existing jjfx lifecycle resources upgraded by the installation.
     pub updated: Vec<String>,
+    /// Lifecycle resources already matching the installed version.
     pub already: Vec<String>,
 }
 
 /// Installation state for one agent's lifecycle resources.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StatusReport {
+    /// Agent whose integration was inspected.
     pub agent: &'static str,
+    /// Lifecycle resources matching the installed version.
     pub installed: Vec<String>,
+    /// Lifecycle resources that have not been installed.
     pub missing: Vec<String>,
+    /// Older jjfx lifecycle resources that can be upgraded safely.
     pub outdated: Vec<String>,
+    /// Non-jjfx resources at paths owned by the integration.
     pub conflicting: Vec<String>,
 }
 

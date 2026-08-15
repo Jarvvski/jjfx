@@ -19,4 +19,13 @@ and concurrent-write races).
 - Single-line JSON writes are below `PIPE_BUF`, so `O_APPEND` is atomic across
   concurrent agents without locking. Growth is bounded by size-based rotation.
 
-Status: accepted
+## Pi transport amendment
+
+The Pi lifecycle extension uses the same global JSONL path and appends one
+compact, versioned jjfx envelope per event. It opens the path for each append so
+log rotation cannot strand a long-lived Pi process on the renamed file. The
+envelope normalizes Pi event names and includes explicit agent and session
+identity; provider-specific extension payloads do not enter the Rust lifecycle
+model. Installation writes only the jjfx-owned auto-discovered extension file.
+
+Status: accepted (Pi amendment implemented by issue 05)
