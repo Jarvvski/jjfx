@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 use wsg_core::{
-    CommitOutcome, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
+    AgentModel, CommitOutcome, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, Expected, Loaded,
     PoolCapacity, Repository, RunMode, StateChange, Ticket, TicketId, TicketStatus, TicketTitle,
@@ -787,6 +787,19 @@ fn explicit_use_available_dispatch_preserves_ticket_order_and_capacity_failures(
 }
 
 #[test]
+fn direct_dispatch_request_preserves_provider_aware_model_selection() {
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-400", "Preserve Pi model profile"),
+        RunMode::Background,
+    )
+    .with_model(AgentModel::new("gpt-5.4").with_provider("openai"));
+
+    let model = request.model().expect("provider-aware model selection");
+    assert_eq!(model.provider(), Some("openai"));
+    assert_eq!(model.model(), "gpt-5.4");
+}
+
+#[test]
 fn direct_dispatch_contract_carries_inputs_and_preserves_outcome_order() {
     let first = ticket("ENG-401", "Prepare dependency bases");
     let second = ticket("ENG-402", "Launch the worker");
@@ -801,7 +814,7 @@ fn direct_dispatch_contract_carries_inputs_and_preserves_outcome_order() {
         .with_dependency_context(dependency.clone());
 
     assert_eq!(request.ticket(), &first);
-    assert_eq!(request.model(), Some("opus"));
+    assert_eq!(request.model().map(AgentModel::model), Some("opus"));
     assert_eq!(request.budget(), DispatchBudget::MaximumUsd(15));
     assert_eq!(request.mode(), RunMode::Background);
     assert_eq!(request.dependency_context(), Some(&dependency));

@@ -6,10 +6,10 @@ use std::thread;
 use thiserror::Error;
 
 use crate::{
-    AgentRuntimeInvocation, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
-    DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
-    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketId, TicketStatus, TicketTitle,
-    WorkerId, WorkerPoolError, WorkerWorkspaceError,
+    AgentModel, AgentRuntimeInvocation, CompletedRun, DeliveryContract, DispatchBudget,
+    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, Repository,
+    RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketId,
+    TicketStatus, TicketTitle, WorkerId, WorkerPoolError, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -65,7 +65,7 @@ pub enum DirectDispatchTarget {
 pub struct DirectDispatchRequest {
     ticket: Ticket,
     target: DirectDispatchTarget,
-    model: Option<String>,
+    model: Option<AgentModel>,
     budget: DispatchBudget,
     mode: RunMode,
     dependency_context: Option<DispatchDependencyContext>,
@@ -100,9 +100,9 @@ impl DirectDispatchRequest {
     }
 
     /// Supplies a caller-selected model override.
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+    pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         let model = model.into();
-        self.model = (!model.trim().is_empty()).then_some(model);
+        self.model = (!model.model().trim().is_empty()).then_some(model);
         self
     }
 
@@ -129,8 +129,8 @@ impl DirectDispatchRequest {
     }
 
     /// Returns the optional model override.
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+    pub fn model(&self) -> Option<&AgentModel> {
+        self.model.as_ref()
     }
 
     /// Returns provider-managed or caller-bounded spending behavior.
@@ -397,7 +397,7 @@ impl DirectDispatch {
         )
         .with_budget(request.budget());
         if let Some(model) = request.model() {
-            context = context.with_model(model);
+            context = context.with_model(model.clone());
         }
         if let Some(dependency) = request.dependency_context() {
             context = context.with_dependency_context(dependency.clone());

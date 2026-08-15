@@ -3,7 +3,8 @@
 use thiserror::Error;
 
 use crate::{
-    AgentRuntime, AgentRuntimeInvocation, DispatchDependencyContext, RepositoryIdentity, Ticket,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, DispatchDependencyContext,
+    RepositoryIdentity, Ticket,
 };
 
 /// Delivery obligations supplied by a Dispatch caller.
@@ -56,7 +57,7 @@ pub struct DispatchPromptContext {
     repository: RepositoryIdentity,
     ticket: Ticket,
     delivery: DeliveryContract,
-    model: Option<String>,
+    model: Option<AgentModel>,
     budget: DispatchBudget,
     dependency_context: Option<DispatchDependencyContext>,
 }
@@ -81,7 +82,7 @@ impl DispatchPromptContext {
     }
 
     /// Supplies a caller-selected model override.
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+    pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         self.model = Some(model.into());
         self
     }
@@ -143,7 +144,10 @@ impl DispatchPromptBuilder {
         );
         let mut invocation =
             AgentRuntimeInvocation::new(worker_prompt).with_system_prompt(system_prompt);
-        if let Some(model) = context.model.filter(|model| !model.trim().is_empty()) {
+        if let Some(model) = context
+            .model
+            .filter(|model| !model.model().trim().is_empty())
+        {
             invocation = invocation.with_model(model);
         }
         if let DispatchBudget::MaximumUsd(dollars) = context.budget {

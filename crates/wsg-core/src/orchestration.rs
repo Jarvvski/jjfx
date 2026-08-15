@@ -16,13 +16,13 @@ use thiserror::Error;
 
 use crate::pool::current_timestamp;
 use crate::{
-    AgentRuntime, CommitOutcome, DirectDispatchError, DirectDispatchRequest, DirectDispatchSuccess,
-    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent,
-    DispatchGroupOptions, DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded,
-    ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision,
-    SubIssueStatus, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle,
-    WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
-    WorkspaceRestoration,
+    AgentModel, AgentRuntime, CommitOutcome, DirectDispatchError, DirectDispatchRequest,
+    DirectDispatchSuccess, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError,
+    DispatchGroupEvent, DispatchGroupOptions, DispatchGroupState, DispatchGroupStatusCounts,
+    Expected, Loaded, ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode,
+    StateChange, StateRevision, SubIssueStatus, Ticket, TicketDiscovery, TicketId, TicketQuery,
+    TicketStatus, TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError,
+    WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -30,7 +30,7 @@ use crate::{
 pub struct OrchestrationRequest {
     parent: TicketId,
     agent_runtime: AgentRuntime,
-    model: Option<String>,
+    model: Option<AgentModel>,
 }
 
 /// Polling and retry limits for one foreground or detached orchestration run.
@@ -89,9 +89,9 @@ impl OrchestrationRequest {
     }
 
     /// Supplies a caller-selected model override.
-    pub fn with_model(mut self, model: impl Into<String>) -> Self {
+    pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         let model = model.into();
-        self.model = (!model.trim().is_empty()).then_some(model);
+        self.model = (!model.model().trim().is_empty()).then_some(model);
         self
     }
 
@@ -106,8 +106,8 @@ impl OrchestrationRequest {
     }
 
     /// Returns the optional model override persisted with a new group.
-    pub fn model(&self) -> Option<&str> {
-        self.model.as_deref()
+    pub fn model(&self) -> Option<&AgentModel> {
+        self.model.as_ref()
     }
 }
 
@@ -523,7 +523,7 @@ fn run_with_execution<E: OrchestrationExecution>(
 fn dispatch_request(
     group: &DispatchGroup,
     ticket: &TicketId,
-    model: Option<&str>,
+    model: Option<&AgentModel>,
 ) -> Result<DirectDispatchRequest, OrchestrationError> {
     let issue =
         group.state().sub_issues.get(ticket).ok_or_else(|| {
@@ -538,7 +538,7 @@ fn dispatch_request(
         RunMode::Background,
     );
     if let Some(model) = model {
-        request = request.with_model(model);
+        request = request.with_model(model.clone());
     }
     if let Some(context) = group.dependency_context(ticket)? {
         request = request.with_dependency_context(context);
@@ -784,7 +784,7 @@ impl OrchestrationRunner {
             RunMode::Background,
         );
         if let Some(model) = request.model() {
-            placeholder = placeholder.with_model(model);
+            placeholder = placeholder.with_model(model.clone());
         }
         let reservation = match self.repository.direct_dispatch().reserve(&placeholder) {
             Ok(reservation) => reservation,
@@ -814,8 +814,13 @@ impl OrchestrationRunner {
         reservation
             .release()
             .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
-        let mut group_options =
-            DispatchGroupOptions::new(request.model().unwrap_or_default().to_owned());
+        let mut group_options = DispatchGroupOptions::new(
+            request
+                .model()
+                .map(AgentModel::model)
+                .unwrap_or_default()
+                .to_owned(),
+        );
         group_options.agent = Some(WireAgent::new(request.agent_runtime().as_str()));
         let options = DispatchGroupBuildOptions::new(
             current_timestamp()
@@ -1309,7 +1314,7 @@ mod tests {
             .dependency_context()
             .expect("stacked dependency context");
         assert_eq!(launched.mode(), RunMode::Background);
-        assert_eq!(launched.model(), Some("opus"));
+        assert_eq!(launched.model().map(AgentModel::model), Some("opus"));
         assert_eq!(
             dependency.base_revisions(),
             &["adam/eng-101-foundation".to_owned()]

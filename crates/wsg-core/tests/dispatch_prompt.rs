@@ -1,9 +1,9 @@
 use std::ffi::OsStr;
 
 use wsg_core::{
-    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, DeliveryContract,
-    DispatchBudget, DispatchPromptBuilder, DispatchPromptContext, RepositoryIdentity, Ticket,
-    TicketId, TicketStatus, TicketTitle,
+    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
+    AgentRuntimeInvocation, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
+    DispatchPromptContext, RepositoryIdentity, Ticket, TicketId, TicketStatus, TicketTitle,
 };
 
 #[test]
@@ -51,6 +51,22 @@ fn provider_managed_model_and_budget_add_no_command_overrides() {
 
     assert!(!args.iter().any(|argument| argument == "--model"));
     assert!(!args.iter().any(|argument| argument == "--max-budget-usd"));
+}
+
+#[test]
+fn pi_dispatch_prompt_preserves_provider_aware_model_selection() {
+    let invocation = DispatchPromptBuilder::new()
+        .initial(
+            dispatch_context(AgentRuntime::Pi)
+                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
+        )
+        .expect("Pi Dispatch prompt");
+
+    let error = AgentRuntime::Pi
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect_err("the prompt seam should preserve the model before session setup");
+
+    assert_eq!(error, AgentRuntimeCommandError::MissingSessionDirectory);
 }
 
 #[test]

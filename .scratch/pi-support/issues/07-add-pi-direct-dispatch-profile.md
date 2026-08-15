@@ -1,6 +1,6 @@
 # Add the Pi Direct Dispatch profile
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

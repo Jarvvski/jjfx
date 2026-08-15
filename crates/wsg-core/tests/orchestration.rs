@@ -5,7 +5,7 @@ use rustix::fs::{FlockOperation, flock};
 
 use tempfile::TempDir;
 use wsg_core::{
-    AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
+    AgentModel, AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
     OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, ParentTicket, PoolState,
     Repository, RepositoryIdentity, StateChange, SubIssueState, TicketDiscovery, TicketId,
     TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus, WireTimestamp, WorkerId,
@@ -51,13 +51,15 @@ fn orchestration_request_and_repository_expose_the_frontend_neutral_seam() {
     let repository = Repository::open(directory.path()).expect("open repository");
     let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
 
-    let request =
-        OrchestrationRequest::new(parent.clone(), AgentRuntime::Codex).with_model("gpt-5");
+    let request = OrchestrationRequest::new(parent.clone(), AgentRuntime::Pi)
+        .with_model(AgentModel::new("gpt-5.4").with_provider("openai"));
     let runner = repository.orchestration_runner();
 
     assert_eq!(request.parent(), &parent);
-    assert_eq!(request.agent_runtime(), AgentRuntime::Codex);
-    assert_eq!(request.model(), Some("gpt-5"));
+    assert_eq!(request.agent_runtime(), AgentRuntime::Pi);
+    let model = request.model().expect("provider-aware model selection");
+    assert_eq!(model.provider(), Some("openai"));
+    assert_eq!(model.model(), "gpt-5.4");
     assert_eq!(runner.repository_root(), repository.root());
 }
 
