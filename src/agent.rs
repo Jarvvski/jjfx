@@ -147,11 +147,18 @@ fn canon(path: &Path) -> PathBuf {
 /// canonicalized `cwd`. Owns the map, the per-event fold step, and the canon
 /// join, so startup replay ([`replay`](Self::replay)) and live updates
 /// ([`apply`](Self::apply)) reduce through the same rule and canonicalization
-/// happens in exactly one place. At most one agent runs per workspace (CONTEXT),
-/// so last-write-wins by log order is the whole rule.
+/// happens in exactly one place. At most one agent runs per workspace (CONTEXT).
+/// Session identity prevents delayed records from a replaced session from
+/// changing the current agent.
+#[derive(Debug, Default)]
+struct TrackedAgent {
+    agent: Agent,
+    session_id: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct AgentStates {
-    states: HashMap<PathBuf, Agent>,
+    states: HashMap<PathBuf, TrackedAgent>,
 }
 
 impl AgentStates {
@@ -168,10 +175,18 @@ impl AgentStates {
     pub fn apply(&mut self, ev: &Event) {
         let key = canon(Path::new(&ev.cwd));
         let entry = self.states.entry(key).or_default();
-        entry.state = transition(entry.state, &ev.name);
-        // Every real payload carries the kind; keep the last known one so a
-        // field-less line cannot wipe it (and a workspace that switches CLIs
-        // updates on the new agent's first event).
+        if ev.name == "SessionStart" {
+            entry.session_id.clone_from(&ev.session_id);
+        } else {
+            match (&entry.session_id, &ev.session_id) {
+                (Some(active), Some(incoming)) if active != incoming => return,
+                (Some(_), None) if ev.jjfx_event_version.is_some() => return,
+                (None, Some(incoming)) => entry.session_id = Some(incoming.clone()),
+                _ => {}
+            }
+        }
+
+        entry.agent.state = transition(entry.agent.state, &ev.name);
         let kind = match ev.agent_kind.as_deref() {
             Some(name) => AgentKind::from_name(name),
             None => ev
@@ -180,10 +195,9 @@ impl AgentStates {
                 .map(AgentKind::from_transcript_path)
                 .unwrap_or_default(),
         };
-        let starts_versioned_session =
-            ev.name == "SessionStart" && ev.jjfx_event_version.is_some();
+        let starts_versioned_session = ev.name == "SessionStart" && ev.jjfx_event_version.is_some();
         if starts_versioned_session || kind != AgentKind::Unknown {
-            entry.kind = kind;
+            entry.agent.kind = kind;
         }
     }
 
@@ -191,7 +205,10 @@ impl AgentStates {
     /// keys so the two sides of the join compare equal. Default (`Absent`,
     /// `Unknown`) if the log has no events for it.
     pub fn agent_for(&self, path: &Path) -> Agent {
-        self.states.get(&canon(path)).copied().unwrap_or_default()
+        self.states
+            .get(&canon(path))
+            .map(|tracked| tracked.agent)
+            .unwrap_or_default()
     }
 }
 
@@ -304,6 +321,65 @@ mod tests {
             session_id: None,
         });
         assert_eq!(states.agent_for(Path::new("/w/a")).kind, AgentKind::Codex);
+    }
+
+    #[test]
+    fn stale_events_from_a_replaced_session_do_not_change_state() {
+        let lines = [
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-2","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-2","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"Stop"}"#,
+        ];
+
+        let states = AgentStates::replay(lines.into_iter().filter_map(parse_line));
+        let agent = states.agent_for(Path::new("/w/a"));
+        assert_eq!(agent.state, AgentState::Working);
+        assert_eq!(agent.kind, AgentKind::Pi);
+    }
+
+    #[test]
+    fn partial_versioned_event_cannot_mutate_a_known_session() {
+        let lines = [
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","cwd":"/w/a","hook_event_name":"Stop"}"#,
+        ];
+
+        let states = AgentStates::replay(lines.into_iter().filter_map(parse_line));
+        assert_eq!(
+            states.agent_for(Path::new("/w/a")).state,
+            AgentState::Working
+        );
+    }
+
+    #[test]
+    fn pi_replay_and_live_application_are_equivalent() {
+        let lines = [
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"Stop"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionEnd"}"#,
+        ];
+        let events: Vec<_> = lines.into_iter().filter_map(parse_line).collect();
+        let replayed = AgentStates::replay(events.clone());
+        let mut live = AgentStates::default();
+        for event in &events {
+            live.apply(event);
+        }
+
+        assert_eq!(
+            replayed.agent_for(Path::new("/w/a")),
+            live.agent_for(Path::new("/w/a"))
+        );
+        assert_eq!(
+            replayed.agent_for(Path::new("/w/a")),
+            Agent {
+                state: AgentState::Ended,
+                kind: AgentKind::Pi,
+            }
+        );
     }
 
     #[test]
