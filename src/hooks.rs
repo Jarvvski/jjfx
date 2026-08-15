@@ -70,6 +70,13 @@ fn targets() -> Vec<Target> {
 /// Substring that identifies a jjfx-installed hook command, for idempotent
 /// install and status checks.
 const MARKER: &str = "jjfx/events.jsonl";
+#[cfg(test)]
+const PI_EXTENSION_SOURCE: &str = include_str!("../assets/pi/jjfx-lifecycle.ts");
+
+#[cfg(test)]
+fn pi_extension_source() -> &'static str {
+    PI_EXTENSION_SOURCE
+}
 
 /// The dumb append command. It resolves the XDG state dir at hook time (matching
 /// [`events::log_path`]), and writes exactly one line via `printf '%s\n'
@@ -317,6 +324,35 @@ fn join_or_none(items: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pi_extension_emits_the_versioned_lifecycle_contract() {
+        let source = pi_extension_source();
+        for (pi_event, lifecycle_event) in [
+            ("session_start", "SessionStart"),
+            ("agent_start", "UserPromptSubmit"),
+            ("turn_start", "UserPromptSubmit"),
+            ("agent_settled", "Stop"),
+            ("session_shutdown", "SessionEnd"),
+        ] {
+            assert!(source.contains(pi_event), "missing Pi event {pi_event}");
+            assert!(
+                source.contains(lifecycle_event),
+                "missing normalized event {lifecycle_event}"
+            );
+        }
+        for field in [
+            "jjfx_event_version",
+            "hook_event_name",
+            "agent_kind",
+            "session_id",
+            "cwd",
+        ] {
+            assert!(source.contains(field), "missing envelope field {field}");
+        }
+        assert!(source.contains("appendFile"));
+        assert!(!source.contains("PermissionRequest"));
+    }
 
     #[test]
     fn command_targets_the_log_and_writes_one_line() {
