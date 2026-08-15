@@ -1,10 +1,8 @@
-//! `jjfx hooks install` / `jjfx hooks status`: manage the dumb append-only hook
-//! in `~/.claude/settings.json` and `~/.codex/hooks.json` (ADR 0002/0004). Both
-//! agents use the same nested hooks JSON shape and emit the same payload fields,
-//! so one merge serves both files. The hook is a dependency-free shell append -
-//! no jjfx binary at hook time - so the config is written once and never revised
-//! when the lifecycle logic changes. All state-machine logic lives in the Rust
-//! binary (see `agent.rs`).
+//! `jjfx hooks install` / `jjfx hooks status`: manage lifecycle integrations
+//! for Claude Code, Codex, and Pi (ADR 0002/0004). Claude and Codex use dumb
+//! append-only JSON hooks. Pi uses a jjfx-owned auto-discovered extension that
+//! normalizes its lifecycle events into the same log contract. State-machine
+//! logic remains in Rust (see `agent.rs`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -52,16 +50,16 @@ struct Target {
 /// The hooks files jjfx installs into - both agents unconditionally, so changing
 /// `[agent] command` needs no reinstall. The append hook is inert for an agent
 /// that is never run.
-fn targets() -> Vec<Target> {
+fn targets(paths: &IntegrationPaths) -> Vec<Target> {
     vec![
         Target {
             agent: "claude",
-            path: claude_settings_path(),
+            path: paths.claude_settings.clone(),
             events: CLAUDE_EVENTS,
         },
         Target {
             agent: "codex",
-            path: codex_hooks_path(),
+            path: paths.codex_hooks.clone(),
             events: CODEX_EVENTS,
         },
     ]
@@ -70,10 +68,10 @@ fn targets() -> Vec<Target> {
 /// Substring that identifies a jjfx-installed hook command, for idempotent
 /// install and status checks.
 const MARKER: &str = "jjfx/events.jsonl";
-#[cfg(test)]
 const PI_EXTENSION_SOURCE: &str = include_str!("../assets/pi/jjfx-lifecycle.ts");
+const PI_EXTENSION_MARKER: &str = "// jjfx-pi-lifecycle-extension:";
+const PI_EXTENSION_NAME: &str = "lifecycle extension";
 
-#[cfg(test)]
 fn pi_extension_source() -> &'static str {
     PI_EXTENSION_SOURCE
 }
@@ -106,68 +104,182 @@ fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-/// Outcome of an install into one agent's hooks file: how many event hooks were
-/// newly added vs already present (idempotency is observable, not silent).
+fn pi_extension_path() -> PathBuf {
+    std::env::var_os("PI_CODING_AGENT_DIR")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home_dir().join(".pi").join("agent"))
+        .join("extensions")
+        .join("jjfx-lifecycle.ts")
+}
+
+struct IntegrationPaths {
+    claude_settings: PathBuf,
+    codex_hooks: PathBuf,
+    pi_extension: PathBuf,
+}
+
+impl IntegrationPaths {
+    fn from_env() -> Self {
+        Self {
+            claude_settings: claude_settings_path(),
+            codex_hooks: codex_hooks_path(),
+            pi_extension: pi_extension_path(),
+        }
+    }
+}
+
+/// Outcome of installing one agent's lifecycle integration. Added, upgraded,
+/// and already-current resources remain separately observable.
 #[derive(Debug, PartialEq, Eq)]
 pub struct InstallOutcome {
     pub agent: &'static str,
     pub added: Vec<String>,
+    pub updated: Vec<String>,
     pub already: Vec<String>,
 }
 
-/// Whether the jjfx hook is present for each of one agent's events.
+/// Installation state for one agent's lifecycle resources.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StatusReport {
     pub agent: &'static str,
     pub installed: Vec<String>,
     pub missing: Vec<String>,
+    pub outdated: Vec<String>,
+    pub conflicting: Vec<String>,
 }
 
 /// Install (idempotently) the jjfx hook for every lifecycle event of every
 /// agent, preserving all other settings and hooks. Safe to run repeatedly.
 pub fn install() -> anyhow::Result<Vec<InstallOutcome>> {
+    install_with_paths(&IntegrationPaths::from_env())
+}
+
+fn install_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<InstallOutcome>> {
     let command = hook_command();
-    targets()
+    let mut outcomes: Vec<InstallOutcome> = targets(paths)
         .into_iter()
-        .map(|t| {
-            let mut root = read_settings(&t.path)?;
-            let (added, already) = merge_hooks(&mut root, &command, t.events)?;
-            write_settings(&t.path, &root)?;
+        .map(|target| {
+            let mut root = read_settings(&target.path)?;
+            let (added, already) = merge_hooks(&mut root, &command, target.events)?;
+            write_settings(&target.path, &root)?;
             Ok(InstallOutcome {
-                agent: t.agent,
+                agent: target.agent,
                 added,
+                updated: Vec::new(),
                 already,
             })
         })
-        .collect()
+        .collect::<anyhow::Result<_>>()?;
+    outcomes.push(install_pi_extension(&paths.pi_extension)?);
+    Ok(outcomes)
+}
+
+fn install_pi_extension(path: &Path) -> anyhow::Result<InstallOutcome> {
+    let current = match fs::read_to_string(path) {
+        Ok(source) => Some(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+
+    let (added, updated, already) = match current.as_deref() {
+        Some(source) if source == pi_extension_source() => {
+            (Vec::new(), Vec::new(), vec![PI_EXTENSION_NAME.to_owned()])
+        }
+        Some(source) if source.contains(PI_EXTENSION_MARKER) => {
+            write_pi_extension(path)?;
+            (Vec::new(), vec![PI_EXTENSION_NAME.to_owned()], Vec::new())
+        }
+        Some(_) => bail!(
+            "refusing to overwrite non-jjfx Pi extension at {}",
+            path.display()
+        ),
+        None => {
+            write_pi_extension(path)?;
+            (vec![PI_EXTENSION_NAME.to_owned()], Vec::new(), Vec::new())
+        }
+    };
+
+    Ok(InstallOutcome {
+        agent: "pi",
+        added,
+        updated,
+        already,
+    })
+}
+
+fn write_pi_extension(path: &Path) -> anyhow::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| anyhow!("Pi extension path has no parent"))?;
+    fs::create_dir_all(dir)
+        .with_context(|| format!("creating Pi extension directory {}", dir.display()))?;
+    let tmp = dir.join(format!("jjfx-lifecycle.{}.tmp", std::process::id()));
+    fs::write(&tmp, pi_extension_source())
+        .with_context(|| format!("writing temporary Pi extension {}", tmp.display()))?;
+    fs::rename(&tmp, path)
+        .with_context(|| format!("installing Pi extension {}", path.display()))?;
+    Ok(())
 }
 
 /// Report, per agent, which events have the jjfx hook and which do not.
 pub fn status() -> anyhow::Result<Vec<StatusReport>> {
-    targets()
+    status_with_paths(&IntegrationPaths::from_env())
+}
+
+fn status_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<StatusReport>> {
+    let mut reports: Vec<StatusReport> = targets(paths)
         .into_iter()
-        .map(|t| {
-            let root = read_settings(&t.path)?;
+        .map(|target| {
+            let root = read_settings(&target.path)?;
             let hooks = root.get("hooks").and_then(Value::as_object);
             let (mut installed, mut missing) = (Vec::new(), Vec::new());
-            for ev in t.events {
+            for event in target.events {
                 let present = hooks
-                    .and_then(|h| h.get(*ev))
+                    .and_then(|entries| entries.get(*event))
                     .and_then(Value::as_array)
-                    .is_some_and(|arr| array_has_marker(arr));
+                    .is_some_and(|entries| array_has_marker(entries));
                 if present {
-                    installed.push((*ev).to_string());
+                    installed.push((*event).to_owned());
                 } else {
-                    missing.push((*ev).to_string());
+                    missing.push((*event).to_owned());
                 }
             }
             Ok(StatusReport {
-                agent: t.agent,
+                agent: target.agent,
                 installed,
                 missing,
+                outdated: Vec::new(),
+                conflicting: Vec::new(),
             })
         })
-        .collect()
+        .collect::<anyhow::Result<_>>()?;
+    reports.push(pi_extension_status(&paths.pi_extension)?);
+    Ok(reports)
+}
+
+fn pi_extension_status(path: &Path) -> anyhow::Result<StatusReport> {
+    let mut report = StatusReport {
+        agent: "pi",
+        installed: Vec::new(),
+        missing: Vec::new(),
+        outdated: Vec::new(),
+        conflicting: Vec::new(),
+    };
+    match fs::read_to_string(path) {
+        Ok(source) if source == pi_extension_source() => {
+            report.installed.push(PI_EXTENSION_NAME.to_owned());
+        }
+        Ok(source) if source.contains(PI_EXTENSION_MARKER) => {
+            report.outdated.push(PI_EXTENSION_NAME.to_owned());
+        }
+        Ok(_) => report.conflicting.push(PI_EXTENSION_NAME.to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.missing.push(PI_EXTENSION_NAME.to_owned());
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+    Ok(report)
 }
 
 /// Read a hooks file into a JSON value, defaulting to an empty object when the
@@ -256,55 +368,70 @@ pub fn run_cli(sub: Option<&str>) -> anyhow::Result<()> {
     match sub {
         Some("install") => {
             for outcome in install()? {
-                if outcome.added.is_empty() {
+                if !outcome.added.is_empty() {
                     println!(
-                        "{}: jjfx hooks already installed for all {} events.",
-                        outcome.agent,
-                        outcome.already.len()
-                    );
-                } else {
-                    println!(
-                        "{}: installed jjfx hook for: {}",
+                        "{}: installed lifecycle integration for: {}",
                         outcome.agent,
                         outcome.added.join(", ")
                     );
-                    if !outcome.already.is_empty() {
-                        println!(
-                            "{}: already present for: {}",
-                            outcome.agent,
-                            outcome.already.join(", ")
-                        );
-                    }
+                }
+                if !outcome.updated.is_empty() {
+                    println!(
+                        "{}: updated lifecycle integration for: {}",
+                        outcome.agent,
+                        outcome.updated.join(", ")
+                    );
+                }
+                if !outcome.already.is_empty() {
+                    println!(
+                        "{}: already present for: {}",
+                        outcome.agent,
+                        outcome.already.join(", ")
+                    );
                 }
             }
             println!("Events log: {}", events::log_path().display());
         }
         None | Some("status") => {
             let reports = status()?;
-            let mut any_missing = false;
+            let mut needs_install = false;
             for report in &reports {
-                if report.missing.is_empty() {
+                let current = report.missing.is_empty()
+                    && report.outdated.is_empty()
+                    && report.conflicting.is_empty();
+                if current {
                     println!(
-                        "{}: hooks installed for all {} events.",
+                        "{}: lifecycle integration current for all {} resources.",
                         report.agent,
                         report.installed.len()
                     );
-                } else {
-                    any_missing = true;
-                    println!(
-                        "{}: installed: {}",
-                        report.agent,
-                        join_or_none(&report.installed)
-                    );
-                    println!(
-                        "{}: missing:   {}",
-                        report.agent,
-                        join_or_none(&report.missing)
-                    );
+                    continue;
                 }
+
+                needs_install |= !report.missing.is_empty() || !report.outdated.is_empty();
+                println!(
+                    "{}: installed:   {}",
+                    report.agent,
+                    join_or_none(&report.installed)
+                );
+                println!(
+                    "{}: missing:     {}",
+                    report.agent,
+                    join_or_none(&report.missing)
+                );
+                println!(
+                    "{}: outdated:    {}",
+                    report.agent,
+                    join_or_none(&report.outdated)
+                );
+                println!(
+                    "{}: conflicting: {}",
+                    report.agent,
+                    join_or_none(&report.conflicting)
+                );
             }
-            if any_missing {
-                println!("Run `jjfx hooks install` to add the missing hooks.");
+            if needs_install {
+                println!("Run `jjfx hooks install` to add or update lifecycle integrations.");
             }
             println!("Events log: {}", events::log_path().display());
         }
@@ -352,6 +479,71 @@ mod tests {
         }
         assert!(source.contains("appendFile"));
         assert!(!source.contains("PermissionRequest"));
+    }
+
+    #[test]
+    fn pi_extension_install_is_idempotent_and_preserves_other_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let pi_dir = dir.path().join("pi-agent");
+        let paths = IntegrationPaths {
+            claude_settings: dir.path().join("claude/settings.json"),
+            codex_hooks: dir.path().join("codex/hooks.json"),
+            pi_extension: pi_dir.join("extensions/jjfx-lifecycle.ts"),
+        };
+        fs::create_dir_all(pi_dir.join("extensions")).unwrap();
+        fs::write(pi_dir.join("settings.json"), "{\"theme\":\"custom\"}\n").unwrap();
+        fs::write(pi_dir.join("trust.json"), "{\"/project\":\"yes\"}\n").unwrap();
+        fs::write(pi_dir.join("extensions/other.ts"), "export default () => {};\n").unwrap();
+
+        let first = install_with_paths(&paths).unwrap();
+        let pi = first.iter().find(|outcome| outcome.agent == "pi").unwrap();
+        assert_eq!(pi.added, ["lifecycle extension"]);
+        assert!(pi.already.is_empty());
+        assert_eq!(fs::read_to_string(&paths.pi_extension).unwrap(), pi_extension_source());
+        assert_eq!(
+            fs::read_to_string(pi_dir.join("settings.json")).unwrap(),
+            "{\"theme\":\"custom\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(pi_dir.join("trust.json")).unwrap(),
+            "{\"/project\":\"yes\"}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(pi_dir.join("extensions/other.ts")).unwrap(),
+            "export default () => {};\n"
+        );
+
+        let second = install_with_paths(&paths).unwrap();
+        let pi = second.iter().find(|outcome| outcome.agent == "pi").unwrap();
+        assert!(pi.added.is_empty());
+        assert_eq!(pi.already, ["lifecycle extension"]);
+    }
+
+    #[test]
+    fn pi_extension_status_distinguishes_missing_outdated_and_conflicting_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extensions/jjfx-lifecycle.ts");
+
+        let missing = pi_extension_status(&path).unwrap();
+        assert_eq!(missing.missing, [PI_EXTENSION_NAME]);
+
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "// jjfx-pi-lifecycle-extension:v0\n").unwrap();
+        let outdated = pi_extension_status(&path).unwrap();
+        assert_eq!(outdated.outdated, [PI_EXTENSION_NAME]);
+        let updated = install_pi_extension(&path).unwrap();
+        assert_eq!(updated.updated, [PI_EXTENSION_NAME]);
+        assert_eq!(fs::read_to_string(&path).unwrap(), pi_extension_source());
+
+        fs::write(&path, "export default () => {};\n").unwrap();
+        let conflicting = pi_extension_status(&path).unwrap();
+        assert_eq!(conflicting.conflicting, [PI_EXTENSION_NAME]);
+        let error = install_pi_extension(&path).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            "export default () => {};\n"
+        );
     }
 
     #[test]
@@ -424,7 +616,7 @@ mod tests {
 
     #[test]
     fn targets_cover_both_agents_own_files() {
-        let targets = targets();
+        let targets = targets(&IntegrationPaths::from_env());
         let agents: Vec<_> = targets.iter().map(|t| t.agent).collect();
         assert_eq!(agents, ["claude", "codex"]);
         assert!(targets[0].path.ends_with(".claude/settings.json"));
