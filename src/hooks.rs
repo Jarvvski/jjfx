@@ -156,6 +156,14 @@ pub fn install() -> anyhow::Result<Vec<InstallOutcome>> {
 }
 
 fn install_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<InstallOutcome>> {
+    let pi_status = pi_extension_status(&paths.pi_extension)?;
+    if !pi_status.conflicting.is_empty() {
+        bail!(
+            "refusing to overwrite non-jjfx Pi extension at {}",
+            paths.pi_extension.display()
+        );
+    }
+
     let command = hook_command();
     let mut outcomes: Vec<InstallOutcome> = targets(paths)
         .into_iter()
@@ -493,13 +501,20 @@ mod tests {
         fs::create_dir_all(pi_dir.join("extensions")).unwrap();
         fs::write(pi_dir.join("settings.json"), "{\"theme\":\"custom\"}\n").unwrap();
         fs::write(pi_dir.join("trust.json"), "{\"/project\":\"yes\"}\n").unwrap();
-        fs::write(pi_dir.join("extensions/other.ts"), "export default () => {};\n").unwrap();
+        fs::write(
+            pi_dir.join("extensions/other.ts"),
+            "export default () => {};\n",
+        )
+        .unwrap();
 
         let first = install_with_paths(&paths).unwrap();
         let pi = first.iter().find(|outcome| outcome.agent == "pi").unwrap();
         assert_eq!(pi.added, ["lifecycle extension"]);
         assert!(pi.already.is_empty());
-        assert_eq!(fs::read_to_string(&paths.pi_extension).unwrap(), pi_extension_source());
+        assert_eq!(
+            fs::read_to_string(&paths.pi_extension).unwrap(),
+            pi_extension_source()
+        );
         assert_eq!(
             fs::read_to_string(pi_dir.join("settings.json")).unwrap(),
             "{\"theme\":\"custom\"}\n"
@@ -544,6 +559,141 @@ mod tests {
             fs::read_to_string(&path).unwrap(),
             "export default () => {};\n"
         );
+    }
+
+    #[test]
+    fn installed_pi_envelopes_replay_through_the_shared_log_contract() {
+        use crate::agent::{AgentKind, AgentState, AgentStates};
+
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let paths = IntegrationPaths {
+            claude_settings: dir.path().join("claude/settings.json"),
+            codex_hooks: dir.path().join("codex/hooks.json"),
+            pi_extension: dir.path().join("pi-agent/extensions/jjfx-lifecycle.ts"),
+        };
+        install_with_paths(&paths).unwrap();
+
+        let log = dir.path().join("state/jjfx/events.jsonl");
+        fs::create_dir_all(log.parent().unwrap()).unwrap();
+        let lines = [
+            json!({
+                "jjfx_event_version": 1,
+                "hook_event_name": "SessionStart",
+                "agent_kind": "pi",
+                "session_id": "pi-integration",
+                "cwd": workspace,
+            }),
+            json!({
+                "jjfx_event_version": 1,
+                "hook_event_name": "UserPromptSubmit",
+                "agent_kind": "pi",
+                "session_id": "pi-integration",
+                "cwd": workspace,
+            }),
+            json!({
+                "jjfx_event_version": 1,
+                "hook_event_name": "Stop",
+                "agent_kind": "pi",
+                "session_id": "pi-integration",
+                "cwd": workspace,
+            }),
+        ];
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&log, text).unwrap();
+
+        let states = AgentStates::replay(crate::events::read_events(&log));
+        let agent = states.agent_for(&workspace);
+        assert_eq!(agent.kind, AgentKind::Pi);
+        assert_eq!(agent.state, AgentState::Waiting);
+    }
+
+    #[test]
+    fn installed_extension_observes_an_isolated_real_pi_when_available() {
+        use std::process::{Command, Stdio};
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        use crate::agent::{AgentKind, AgentState, AgentStates};
+
+        let Ok(probe) = Command::new("pi").arg("--version").output() else {
+            return;
+        };
+        if !probe.status.success()
+            || !String::from_utf8_lossy(&probe.stdout)
+                .trim()
+                .starts_with("0.84.")
+        {
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let state = dir.path().join("state");
+        let pi_dir = dir.path().join("pi-agent");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let paths = IntegrationPaths {
+            claude_settings: home.join(".claude/settings.json"),
+            codex_hooks: home.join(".codex/hooks.json"),
+            pi_extension: pi_dir.join("extensions/jjfx-lifecycle.ts"),
+        };
+        install_with_paths(&paths).unwrap();
+
+        let mut child = Command::new("pi")
+            .args(["--mode", "rpc", "--no-session", "--offline"])
+            .current_dir(&workspace)
+            .env("HOME", &home)
+            .env("XDG_STATE_HOME", &state)
+            .env("PI_CODING_AGENT_DIR", &pi_dir)
+            .env("PI_OFFLINE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                child.wait().unwrap();
+                panic!("isolated Pi lifecycle smoke test timed out");
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success(), "isolated Pi exited with {status}");
+
+        let log = state.join("jjfx/events.jsonl");
+        let states = AgentStates::replay(crate::events::read_events(&log));
+        let agent = states.agent_for(&workspace);
+        assert_eq!(agent.kind, AgentKind::Pi);
+        assert_eq!(agent.state, AgentState::Ended);
+    }
+
+    #[test]
+    fn conflicting_pi_extension_fails_before_other_integrations_are_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = IntegrationPaths {
+            claude_settings: dir.path().join("claude/settings.json"),
+            codex_hooks: dir.path().join("codex/hooks.json"),
+            pi_extension: dir.path().join("pi-agent/extensions/jjfx-lifecycle.ts"),
+        };
+        fs::create_dir_all(paths.pi_extension.parent().unwrap()).unwrap();
+        fs::write(&paths.pi_extension, "export default () => {};\n").unwrap();
+
+        let error = install_with_paths(&paths).unwrap_err();
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert!(!paths.claude_settings.exists());
+        assert!(!paths.codex_hooks.exists());
     }
 
     #[test]
