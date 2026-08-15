@@ -3355,7 +3355,7 @@ const CODEX_CYAN: Color = Color::Rgb(34, 211, 238);
 fn brand_color(kind: AgentKind) -> Color {
     match kind {
         AgentKind::Codex => CODEX_CYAN,
-        AgentKind::Claude | AgentKind::Unknown => CLAUDE_ORANGE,
+        AgentKind::Claude | AgentKind::Pi | AgentKind::Unknown => CLAUDE_ORANGE,
     }
 }
 
@@ -3365,7 +3365,7 @@ fn brand_color(kind: AgentKind) -> Color {
 fn working_frame(kind: AgentKind, tick: u64) -> char {
     match kind {
         AgentKind::Codex => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
-        AgentKind::Claude | AgentKind::Unknown => {
+        AgentKind::Claude | AgentKind::Pi | AgentKind::Unknown => {
             let len = CLAUDE_FRAMES.len() as u64;
             let cycle = (len - 1) * 2;
             let pos = tick % cycle;
@@ -3396,7 +3396,7 @@ fn agent_glyph(agent: agent::Agent, tick: u64) -> Span<'static> {
 fn paused_glyph(kind: AgentKind) -> char {
     match kind {
         AgentKind::Codex => '\u{f02d9}', // 󰋙 hexagon_outline
-        AgentKind::Claude | AgentKind::Unknown => '✻',
+        AgentKind::Claude | AgentKind::Pi | AgentKind::Unknown => '✻',
     }
 }
 

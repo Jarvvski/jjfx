@@ -1,14 +1,9 @@
 //! The agent lifecycle axis (ADR 0002/0003), event-sourced from agent hooks.
-//! Claude Code and Codex emit the same event names and payload fields, so one
-//! fold serves both (Codex just lacks `SessionEnd`, see `hooks.rs`). Hooks
-//! append raw events to a global JSONL log (ADR 0004); this module parses each
-//! line and folds it into a per-workspace [`AgentState`], keyed by the event's
-//! `cwd` - the clean join to a workspace confirmed by spike 01.
-//!
-//! Only the common fields (`hook_event_name`, `cwd`, and `transcript_path` -
-//! whose location under `~/.claude/` vs `~/.codex/` names the agent) are read;
-//! no event-specific field is touched, so the un-captured field shapes of
-//! `PermissionRequest`/`Notification` (spike 01's open item) never matter here.
+//! Claude Code and Codex append raw hook payloads while provider adapters can
+//! append versioned jjfx envelopes. One fold serves every source through the
+//! common event name and `cwd` join (ADR 0004). Legacy transcript locations
+//! identify Claude and Codex; versioned envelopes carry explicit identity and
+//! session fields without exposing provider-specific payloads to the fold.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -32,16 +27,16 @@ pub enum AgentState {
     Ended,
 }
 
-/// Which CLI a session's events come from, derived per payload from
-/// `transcript_path`: Claude Code transcripts live under `~/.claude/`, codex
-/// rollouts under `~/.codex/`. `Unknown` covers lines without the field (both
-/// agents send it on every event, so this is a malformed-line fallback).
+/// Which CLI a session's events come from. Versioned jjfx envelopes carry an
+/// explicit identity; legacy Claude Code and Codex payloads derive it from
+/// their transcript locations. `Unknown` is the neutral malformed fallback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum AgentKind {
     #[default]
     Unknown,
     Claude,
     Codex,
+    Pi,
 }
 
 impl AgentKind {
@@ -50,11 +45,22 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
+            AgentKind::Pi => "pi",
             AgentKind::Unknown => "agent",
         }
     }
 
-    /// Derive the kind from a payload's `transcript_path`.
+    /// Parse an explicit jjfx lifecycle-envelope identity.
+    fn from_name(name: &str) -> Self {
+        match name {
+            "claude" => AgentKind::Claude,
+            "codex" => AgentKind::Codex,
+            "pi" => AgentKind::Pi,
+            _ => AgentKind::Unknown,
+        }
+    }
+
+    /// Derive the kind from a legacy payload's `transcript_path`.
     fn from_transcript_path(path: &str) -> Self {
         if path.contains("/.claude/") {
             AgentKind::Claude
@@ -73,11 +79,9 @@ pub struct Agent {
     pub kind: AgentKind,
 }
 
-/// One hook event, reduced to the fields the fold needs: the event name, the
-/// `cwd` that joins it to a workspace, and the `transcript_path` whose location
-/// discriminates claude from codex. Extra JSON fields (including `session_id`,
-/// unneeded while a workspace hosts at most one agent) are ignored, so the same
-/// struct parses every event type.
+/// One lifecycle event reduced to the provider-neutral fields the fold needs.
+/// Legacy payloads use `transcript_path`; versioned jjfx envelopes use explicit
+/// agent and session identity. Unrelated provider fields remain ignored.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Event {
     #[serde(rename = "hook_event_name")]
@@ -168,12 +172,17 @@ impl AgentStates {
         // Every real payload carries the kind; keep the last known one so a
         // field-less line cannot wipe it (and a workspace that switches CLIs
         // updates on the new agent's first event).
-        let kind = ev
-            .transcript_path
-            .as_deref()
-            .map(AgentKind::from_transcript_path)
-            .unwrap_or_default();
-        if kind != AgentKind::Unknown {
+        let kind = match ev.agent_kind.as_deref() {
+            Some(name) => AgentKind::from_name(name),
+            None => ev
+                .transcript_path
+                .as_deref()
+                .map(AgentKind::from_transcript_path)
+                .unwrap_or_default(),
+        };
+        let starts_versioned_session =
+            ev.name == "SessionStart" && ev.jjfx_event_version.is_some();
+        if starts_versioned_session || kind != AgentKind::Unknown {
             entry.kind = kind;
         }
     }
@@ -229,6 +238,34 @@ mod tests {
             AgentKind::from_transcript_path("/somewhere/else.jsonl"),
             AgentKind::Unknown
         );
+    }
+
+    #[test]
+    fn explicit_identity_selects_pi_without_transcript_fallback() {
+        let mut states = AgentStates::default();
+        states.apply(
+            &parse_line(
+                r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart","transcript_path":"/u/.claude/session.jsonl"}"#,
+            )
+            .unwrap(),
+        );
+
+        let agent = states.agent_for(Path::new("/w/a"));
+        assert_eq!(agent.kind, AgentKind::Pi);
+        assert_eq!(agent.kind.label(), "pi");
+    }
+
+    #[test]
+    fn new_session_with_missing_identity_resets_to_unknown() {
+        let events = [
+            r#"{"session_id":"claude-1","transcript_path":"/u/.claude/projects/x/s.jsonl","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"session_id":"unknown-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+        ];
+        let states = AgentStates::replay(events.into_iter().filter_map(parse_line));
+
+        let agent = states.agent_for(Path::new("/w/a"));
+        assert_eq!(agent.state, AgentState::Waiting);
+        assert_eq!(agent.kind, AgentKind::Unknown);
     }
 
     #[test]
