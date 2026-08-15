@@ -3306,7 +3306,7 @@ fn attention_color(att: Attention) -> Color {
     }
 }
 
-/// The agent column's label: which agent lives here (claude/codex) while a
+/// The agent column's label: which agent lives here while a
 /// session is live, `-` otherwise. The *state* is carried by the glyph and the
 /// Attention grouping, so the label is free to name the agent instead.
 fn agent_label(agent: agent::Agent) -> &'static str {
@@ -3344,34 +3344,42 @@ const CODEX_FRAMES: [char; 6] = [
     '\u{f0ac8}', // 󰫈 hexagon_slice_6
 ];
 
+/// Pi's working animation pulses from a dim dot to a filled center and back.
+const PI_FRAMES: [char; 6] = ['·', '∙', '•', '●', '•', '∙'];
+
 /// Claude's spinner orange - the colour jj-wsx gave the working animation.
 const CLAUDE_ORANGE: Color = Color::Rgb(255, 149, 0);
 
 /// Codex's cyan.
 const CODEX_CYAN: Color = Color::Rgb(34, 211, 238);
 
-/// Each agent's signature colour, worn while working. Unknown falls back to
-/// claude's - the historical default agent.
+/// Pi's violet identity.
+const PI_VIOLET: Color = Color::Rgb(168, 85, 247);
+
+/// Each known agent's signature colour, worn while working. Unknown identity
+/// stays neutral instead of borrowing another provider's styling.
 fn brand_color(kind: AgentKind) -> Color {
     match kind {
+        AgentKind::Claude => CLAUDE_ORANGE,
         AgentKind::Codex => CODEX_CYAN,
-        AgentKind::Claude | AgentKind::Pi | AgentKind::Unknown => CLAUDE_ORANGE,
+        AgentKind::Pi => PI_VIOLET,
+        AgentKind::Unknown => Color::DarkGray,
     }
 }
 
-/// The working frame for a tick: claude's petals bloom and close (a bounce over
-/// [`CLAUDE_FRAMES`]), codex's hexagon fills up and restarts (a wrap over
-/// [`CODEX_FRAMES`]).
+/// The provider-specific working frame for this animation tick.
 fn working_frame(kind: AgentKind, tick: u64) -> char {
     match kind {
-        AgentKind::Codex => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
-        AgentKind::Claude | AgentKind::Pi | AgentKind::Unknown => {
+        AgentKind::Claude => {
             let len = CLAUDE_FRAMES.len() as u64;
             let cycle = (len - 1) * 2;
             let pos = tick % cycle;
             let idx = if pos < len { pos } else { cycle - pos };
             CLAUDE_FRAMES[idx as usize]
         }
+        AgentKind::Codex => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
+        AgentKind::Pi => PI_FRAMES[(tick % PI_FRAMES.len() as u64) as usize],
+        AgentKind::Unknown => '?',
     }
 }
 
@@ -3389,14 +3397,14 @@ fn agent_glyph(agent: agent::Agent, tick: u64) -> Span<'static> {
     Span::styled(format!("{ch} "), Style::default().fg(color))
 }
 
-/// The static "session present, not working" mark, per agent so a paused codex
-/// cannot be mistaken for a paused claude: claude's `✻`, codex's hexagon
-/// drained to its outline (nerd font `md-hexagon_outline`). The state still
-/// speaks through the colour (yellow waiting, red blocked).
+/// The static "session present, not working" mark. State still speaks through
+/// yellow waiting or red attention colour; unknown identity remains neutral.
 fn paused_glyph(kind: AgentKind) -> char {
     match kind {
+        AgentKind::Claude => '✻',
         AgentKind::Codex => '\u{f02d9}', // 󰋙 hexagon_outline
-        AgentKind::Claude | AgentKind::Pi | AgentKind::Unknown => '✻',
+        AgentKind::Pi => 'π',
+        AgentKind::Unknown => '?',
     }
 }
 
@@ -4046,6 +4054,27 @@ mod tests {
             .find(|w| w.name == "default")
             .unwrap();
         assert_eq!(app.agent_state(def), AgentState::Absent);
+    }
+
+    #[test]
+    fn pi_agent_identity_renders_on_a_narrow_workspace_row() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["feat"]);
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "SessionStart".into(),
+            cwd: "/wt/feat".into(),
+            transcript_path: None,
+            jjfx_event_version: Some(1),
+            agent_kind: Some("pi".into()),
+            session_id: Some("pi-1".into()),
+        }));
+
+        let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("π pi"), "{rendered}");
     }
 
     #[test]
@@ -5832,7 +5861,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_frames_bounce_and_codex_frames_wrap() {
+    fn agent_working_frames_follow_each_visual_identity() {
         // Claude's petals bloom out and close back: 0 1 2 3 4 5 4 3 2 1, then
         // tick 10 starts the next bloom at frame 0 again.
         let seq: String = (0..=10)
@@ -5847,6 +5876,9 @@ mod tests {
             seq,
             "\u{f0ac3}\u{f0ac4}\u{f0ac5}\u{f0ac6}\u{f0ac7}\u{f0ac8}\u{f0ac3}"
         );
+        let seq: String = (0..=6).map(|t| working_frame(AgentKind::Pi, t)).collect();
+        assert_eq!(seq, "·∙•●•∙·");
+        assert_eq!(working_frame(AgentKind::Unknown, 0), '?');
     }
 
     #[test]
@@ -5856,6 +5888,8 @@ mod tests {
         // Each agent pauses under its own mark; colour carries the state.
         assert_eq!(agent_glyph(live(Waiting, Claude), 0).content, "✻ ");
         assert_eq!(agent_glyph(live(Waiting, Codex), 0).content, "\u{f02d9} ");
+        assert_eq!(agent_glyph(live(Waiting, Pi), 0).content, "π ");
+        assert_eq!(agent_glyph(live(Waiting, Unknown), 0).content, "? ");
         assert_eq!(
             agent_glyph(live(NeedsAttention, Codex), 0).content,
             "\u{f02d9} "
@@ -5869,6 +5903,7 @@ mod tests {
         // Each agent works in its own animation and brand colour.
         assert_eq!(agent_glyph(live(Working, Claude), 0).content, "❀ ");
         assert_eq!(agent_glyph(live(Working, Codex), 0).content, "\u{f0ac3} ");
+        assert_eq!(agent_glyph(live(Working, Pi), 0).content, "· ");
         assert_eq!(
             agent_glyph(live(Working, Claude), 0).style.fg,
             Some(CLAUDE_ORANGE)
@@ -5876,6 +5911,11 @@ mod tests {
         assert_eq!(
             agent_glyph(live(Working, Codex), 0).style.fg,
             Some(CODEX_CYAN)
+        );
+        assert_eq!(agent_glyph(live(Working, Pi), 0).style.fg, Some(PI_VIOLET));
+        assert_eq!(
+            agent_glyph(live(Working, Unknown), 0).style.fg,
+            Some(Color::DarkGray)
         );
     }
 
@@ -5885,6 +5925,7 @@ mod tests {
         use AgentState::*;
         assert_eq!(agent_label(live(Working, Claude)), "claude");
         assert_eq!(agent_label(live(Waiting, Codex)), "codex");
+        assert_eq!(agent_label(live(Waiting, Pi)), "pi");
         assert_eq!(agent_label(live(NeedsAttention, Unknown)), "agent");
         // No live session: a dash, whoever was here before.
         assert_eq!(agent_label(live(Absent, Unknown)), "-");
