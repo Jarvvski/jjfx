@@ -24,6 +24,11 @@ const HELPER_RESULT: &str = "WSG_DIRECT_DISPATCH_RESULT";
 const HELPER_CAPTURE: &str = "WSG_DIRECT_DISPATCH_CAPTURE";
 const HELPER_COMPATIBILITY: &str = "WSG_DIRECT_DISPATCH_COMPATIBILITY";
 const HELPER_RELEASE: &str = "WSG_DIRECT_DISPATCH_RELEASE";
+const HELPER_AGENT_DIR: &str = "WSG_DIRECT_DISPATCH_AGENT_DIR";
+const HELPER_RUNTIME_MARKER: &str = "WSG_DIRECT_DISPATCH_RUNTIME_MARKER";
+const HELPER_PROFILE_FIXTURE: &str = "WSG_DIRECT_DISPATCH_PROFILE_FIXTURE";
+const HELPER_PROFILE_BEHAVIOR: &str = "WSG_DIRECT_DISPATCH_PROFILE_BEHAVIOR";
+const HELPER_PROFILE_DESCENDANT: &str = "WSG_DIRECT_DISPATCH_PROFILE_DESCENDANT";
 
 #[test]
 fn request_for_ticket_id_constructs_a_valid_direct_request() {
@@ -35,6 +40,190 @@ fn request_for_ticket_id_constructs_a_valid_direct_request() {
     assert_eq!(request.ticket().title().as_str(), "AMBA-42");
     assert_eq!(request.ticket().status().as_str(), "Todo");
     assert_eq!(request.mode(), RunMode::Foreground);
+}
+
+#[test]
+fn missing_pi_dispatch_profile_fails_before_worker_reservation() {
+    let (temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    configure_pool_runtime(&repository, "pi");
+    let bin = temporary_directory.path().join("isolated-bin");
+    fs::create_dir(&bin).expect("isolated runtime bin");
+    let marker = temporary_directory.path().join("runtime-started");
+    write_executable(
+        &bin.join("pi"),
+        "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.84.1; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\ntouch \"$WSG_DIRECT_DISPATCH_RUNTIME_MARKER\"\nexit 0\n",
+    );
+    let jj = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("jj"))
+        .find(|path| path.is_file())
+        .expect("jj executable on PATH");
+    std::os::unix::fs::symlink(jj, bin.join("jj")).expect("isolated jj executable");
+    let result = temporary_directory.path().join("missing-profile-result");
+    let agent_dir = temporary_directory.path().join("empty-pi-agent");
+    fs::create_dir(&agent_dir).expect("empty Pi agent directory");
+
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "missing_pi_dispatch_profile_helper", "--ignored"])
+        .env("PATH", &bin)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_AGENT_DIR, &agent_dir)
+        .env(HELPER_RUNTIME_MARKER, &marker)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run missing-profile Direct Dispatch helper");
+
+    assert!(
+        output.status.success(),
+        "missing-profile helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(result).expect("missing-profile result");
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(result.contains("pi-mcp-adapter 2.11.0"));
+    assert!(
+        !marker.exists(),
+        "Pi runtime started before profile preflight"
+    );
+}
+
+#[test]
+#[ignore]
+fn missing_pi_dispatch_profile_helper() {
+    let repository = Repository::open(env::var_os(HELPER_REPOSITORY).expect("Repository path"))
+        .expect("open Repository");
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-498", "Require Pi Linear profile"),
+        RunMode::Foreground,
+    )
+    .with_model(AgentModel::new("gpt-5.4").with_provider("openai"));
+    let detail = match repository.direct_dispatch().dispatch(&[request]) {
+        Err(error) => error.to_string(),
+        Ok(result) => match &result.outcomes()[0] {
+            DirectDispatchOutcome::Failed(failure) => failure.detail().to_owned(),
+            DirectDispatchOutcome::Succeeded(_) => "unexpected success".to_owned(),
+        },
+    };
+    let status = repository
+        .worker_pool()
+        .snapshot()
+        .workers()
+        .first()
+        .expect("Worker")
+        .status();
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("missing-profile result"),
+        format!("{}|{detail}", status.as_str()),
+    )
+    .expect("write missing-profile result");
+}
+
+#[test]
+fn unsupported_pi_mcp_adapter_version_fails_before_worker_reservation() {
+    let (result, runtime_started, _) = run_pi_profile_preflight_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.10.0"}"#),
+        None,
+        "fixture",
+    );
+
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(result.contains("requires pi-mcp-adapter 2.11.0"));
+    assert!(result.contains("found pi-mcp-adapter 2.10.0"));
+    assert!(
+        !runtime_started,
+        "Pi runtime started before profile preflight"
+    );
+}
+
+#[test]
+fn missing_pi_linear_tool_fails_before_worker_reservation() {
+    let fixture = r#"{
+        "allTools": [
+            {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"string"}}}}
+        ],
+        "activeTools": ["linear_get_issue","linear_update_issue"]
+    }"#;
+    let (result, runtime_started, _) = run_pi_profile_preflight_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#),
+        Some(fixture),
+        "fixture",
+    );
+
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(
+        result.contains("linear_create_comment"),
+        "unexpected result: {result}"
+    );
+    assert!(
+        !runtime_started,
+        "Pi runtime started before profile preflight"
+    );
+}
+
+#[test]
+fn pi_profile_probe_timeout_reaps_descendants_before_worker_reservation() {
+    let (result, runtime_started, descendant) = run_pi_profile_preflight_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#),
+        None,
+        "hang",
+    );
+
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(
+        result.contains("timed out after 10 seconds"),
+        "unexpected result: {result}"
+    );
+    assert!(
+        !runtime_started,
+        "Pi runtime started before profile preflight"
+    );
+    let descendant = descendant.expect("profile probe descendant PID");
+    assert!(
+        !Command::new("/bin/kill")
+            .args(["-0", &descendant.to_string()])
+            .status()
+            .expect("probe descendant liveness")
+            .success(),
+        "profile probe descendant {descendant} survived timeout"
+    );
+}
+
+#[test]
+fn incompatible_pi_linear_schema_fails_before_worker_reservation() {
+    let fixture = r#"{
+        "allTools": [
+            {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}}}},
+            {"name":"linear_create_comment","parameters":{"type":"object","properties":{"issueId":{"type":"string"},"body":{"type":"string"}}}}
+        ],
+        "activeTools": ["linear_get_issue","linear_update_issue","linear_create_comment"]
+    }"#;
+    let (result, runtime_started, _) = run_pi_profile_preflight_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#),
+        Some(fixture),
+        "fixture",
+    );
+
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(result.contains("linear_update_issue"));
+    assert!(result.contains("assignee"));
+    assert!(
+        !runtime_started,
+        "Pi runtime started before profile preflight"
+    );
 }
 
 #[test]
@@ -877,6 +1066,116 @@ fn configure_jj_identity(repository: &Repository) {
             .expect("configure jj identity");
         assert!(output.status.success());
     }
+}
+
+fn run_pi_profile_preflight_case(
+    manifest: Option<&str>,
+    profile_fixture: Option<&str>,
+    profile_behavior: &str,
+) -> (String, bool, Option<u32>) {
+    let temporary_directory = tempfile::tempdir().expect("temporary directory");
+    let repository_path = temporary_directory.path().join("repository");
+    fs::create_dir(&repository_path).expect("repository directory");
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .arg(&repository_path)
+        .output()
+        .expect("jj init");
+    assert!(output.status.success(), "jj init failed: {output:?}");
+    let repository = Repository::open(&repository_path).expect("open repository");
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    configure_pool_runtime(&repository, "pi");
+
+    let bin = temporary_directory.path().join("isolated-bin");
+    fs::create_dir(&bin).expect("isolated runtime bin");
+    let marker = temporary_directory.path().join("runtime-started");
+    write_executable(
+        &bin.join("pi"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 0.84.1; exit 0; fi
+if [ "$1" = "--help" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi
+if [ "$1" = "--mode" ] && [ "$2" = "rpc" ]; then
+  if [ "$WSG_DIRECT_DISPATCH_PROFILE_BEHAVIOR" = "hang" ]; then
+    (trap '' TERM; while :; do /bin/sleep 0.05; done) &
+    printf '%s\n' "$!" > "$WSG_DIRECT_DISPATCH_PROFILE_DESCENDANT"
+    wait
+  fi
+  /bin/cp "$WSG_DIRECT_DISPATCH_PROFILE_FIXTURE" "$JJFX_PI_PROFILE_PROBE_OUTPUT"
+  exit 0
+fi
+touch "$WSG_DIRECT_DISPATCH_RUNTIME_MARKER"
+exit 0
+"#,
+    );
+    let jj = env::split_paths(&env::var_os("PATH").unwrap_or_default())
+        .map(|path| path.join("jj"))
+        .find(|path| path.is_file())
+        .expect("jj executable on PATH");
+    std::os::unix::fs::symlink(jj, bin.join("jj")).expect("isolated jj executable");
+    let result = temporary_directory.path().join("profile-result");
+    let agent_dir = temporary_directory.path().join("pi-agent");
+    fs::create_dir(&agent_dir).expect("Pi agent directory");
+    if let Some(manifest) = manifest {
+        let package = agent_dir.join("npm/node_modules/pi-mcp-adapter");
+        fs::create_dir_all(&package).expect("Pi MCP adapter package directory");
+        fs::write(package.join("package.json"), manifest).expect("Pi MCP adapter manifest");
+    }
+    let fixture = temporary_directory.path().join("profile-fixture.json");
+    if let Some(profile_fixture) = profile_fixture {
+        fs::write(&fixture, profile_fixture).expect("Pi profile fixture");
+    }
+    let descendant = temporary_directory.path().join("profile-descendant");
+
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "missing_pi_dispatch_profile_helper", "--ignored"])
+        .env("PATH", &bin)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_RUNTIME_MARKER, &marker)
+        .env(HELPER_PROFILE_FIXTURE, &fixture)
+        .env(HELPER_PROFILE_BEHAVIOR, profile_behavior)
+        .env(HELPER_PROFILE_DESCENDANT, &descendant)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run Pi profile Direct Dispatch helper");
+    assert!(
+        output.status.success(),
+        "Pi profile helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    (
+        fs::read_to_string(result).expect("Pi profile result"),
+        marker.exists(),
+        fs::read_to_string(descendant)
+            .ok()
+            .and_then(|value| value.trim().parse().ok()),
+    )
+}
+
+fn configure_pool_runtime(repository: &Repository, runtime: &str) {
+    let pool = repository.state_store().pool();
+    let Loaded::Present(versioned) = pool.load().expect("Pool state") else {
+        panic!("Pool state must exist");
+    };
+    let revision = versioned.revision().clone();
+    let mut state = versioned.value;
+    state.agent = Some(WireAgent::new(runtime));
+    assert!(matches!(
+        pool.commit(Expected::Match(revision), StateChange::Replace(state))
+            .expect("configure Pool runtime"),
+        CommitOutcome::Applied(_)
+    ));
 }
 
 fn add_origin(repository: &Repository) {

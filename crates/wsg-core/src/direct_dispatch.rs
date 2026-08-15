@@ -6,10 +6,11 @@ use std::thread;
 use thiserror::Error;
 
 use crate::{
-    AgentModel, AgentRuntimeInvocation, CompletedRun, DeliveryContract, DispatchBudget,
-    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, Repository,
-    RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketId,
-    TicketStatus, TicketTitle, WorkerId, WorkerPoolError, WorkerWorkspaceError,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError, CompletedRun,
+    DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
+    DispatchPromptError, Repository, RepositoryIdentity, Reservation, RunMode, RunSupervisor,
+    RunSupervisorError, Ticket, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError,
+    WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -169,6 +170,7 @@ impl DirectDispatch {
         &self,
         request: &DirectDispatchRequest,
     ) -> Result<Reservation, DirectDispatchError> {
+        self.preflight(request)?;
         let pool = self.repository.worker_pool();
         match request.target() {
             DirectDispatchTarget::FirstIdle => Ok(pool.reserve(request.ticket().id().as_str())?),
@@ -186,6 +188,7 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
+        self.preflight_all(requests)?;
         let targets = requests
             .iter()
             .map(|request| {
@@ -214,6 +217,7 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
+        self.preflight_all(requests)?;
         let targets = requests
             .iter()
             .map(|request| {
@@ -244,6 +248,7 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
+        self.preflight_all(requests)?;
         let targets = requests
             .iter()
             .map(|request| {
@@ -275,6 +280,15 @@ impl DirectDispatch {
                 requested: request.ticket().id().as_str().to_owned(),
             };
             return Err(release_before_launch(&reservation, mismatch));
+        }
+        if let Err(error) = reservation
+            .agent_runtime()
+            .preflight_dispatch(request.model(), self.repository.root())
+        {
+            return Err(release_before_launch(
+                &reservation,
+                DirectDispatchError::Preflight(error),
+            ));
         }
         let bases = request
             .dependency_context()
@@ -320,6 +334,26 @@ impl DirectDispatch {
             worker,
             execution,
         ))
+    }
+
+    fn preflight_all(&self, requests: &[DirectDispatchRequest]) -> Result<(), DirectDispatchError> {
+        for request in requests {
+            self.preflight(request)?;
+        }
+        Ok(())
+    }
+
+    fn preflight(&self, request: &DirectDispatchRequest) -> Result<(), DirectDispatchError> {
+        let runtime = self
+            .repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .and_then(|pool| pool.agent_runtime())
+            .unwrap_or(AgentRuntime::Claude);
+        runtime
+            .preflight_dispatch(request.model(), self.repository.root())
+            .map_err(DirectDispatchError::Preflight)
     }
 
     fn dispatch_claimed(
@@ -473,6 +507,7 @@ fn failure_phase(error: &DirectDispatchError) -> DirectDispatchFailurePhase {
         DirectDispatchError::Workspace(_) => DirectDispatchFailurePhase::Workspace,
         DirectDispatchError::Identity(_) => DirectDispatchFailurePhase::Identity,
         DirectDispatchError::Prompt(_) => DirectDispatchFailurePhase::Prompt,
+        DirectDispatchError::Preflight(_) => DirectDispatchFailurePhase::Launch,
         DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(_)) => {
             DirectDispatchFailurePhase::Capacity
         }
@@ -520,6 +555,9 @@ pub enum DirectDispatchError {
     /// The Reservation belongs to another Ticket.
     #[error("Reservation belongs to Ticket {reserved}, not requested Ticket {requested}")]
     ReservationTicketMismatch { reserved: String, requested: String },
+    /// Runtime profile validation failed before Worker mutation.
+    #[error(transparent)]
+    Preflight(#[from] AgentRuntimePreflightError),
     /// Typed initial prompt construction failed.
     #[error(transparent)]
     Prompt(#[from] DispatchPromptError),
