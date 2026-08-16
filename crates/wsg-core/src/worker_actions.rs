@@ -13,8 +13,8 @@ use crate::runtime::pi_interactive_command;
 use crate::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, Loaded, Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId,
-    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
+    CompletedRun, Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
+    WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -343,25 +343,22 @@ impl WorkerActions {
                 worker: worker.clone(),
             });
         }
-        let runtime = match state.agent_runtime() {
-            Some(runtime) => runtime,
-            None => {
-                let configured = match self.repository.state_store().pool().load()? {
-                    Loaded::Present(versioned) => versioned.value.agent,
-                    Loaded::Missing => None,
-                };
-                AgentRuntime::from_configured(configured.as_ref())
-                    .map_err(|value| WorkerPoolError::InvalidAgentRuntime { value })?
-            }
-        };
+        let profile = state
+            .profile()
+            .cloned()
+            .or_else(|| snapshot.pool().and_then(|pool| pool.profile().cloned()))
+            .unwrap_or_else(|| crate::AgentRuntimeProfile::new(AgentRuntime::Claude))
+            .with_model_override(self.model.as_ref());
+        let runtime = profile.runtime();
         let session = resolve_agent_session_for_runtime(runtime, state.log_file().map(Path::new));
         runtime.probe(&workspace)?;
+        runtime.preflight_dispatch_input(profile.model())?;
         let session_directory = self.repository.root().join(".jj/pool/pi-sessions");
         let tab_id = self.commands.mount(
             worker,
             &workspace,
             runtime,
-            self.model.as_ref(),
+            profile.model(),
             &session_directory,
             &session,
         )?;
@@ -514,12 +511,19 @@ impl WorkerActions {
                 .ok_or_else(|| WorkerActionError::WorkerNotFound {
                     worker: worker.clone(),
                 })?;
-        let runtime = worker_snapshot
-            .agent_runtime()
-            .or_else(|| snapshot.pool().and_then(|pool| pool.agent_runtime()))
-            .unwrap_or(AgentRuntime::Claude);
-        runtime.preflight_dispatch(self.model.as_ref(), self.repository.root())?;
-        let (reservation, prior_log) = self.repository.worker_pool().begin_follow_up(worker)?;
+        let profile = worker_snapshot
+            .profile()
+            .cloned()
+            .or_else(|| snapshot.pool().and_then(|pool| pool.profile().cloned()))
+            .unwrap_or_else(|| crate::AgentRuntimeProfile::new(AgentRuntime::Claude))
+            .with_model_override(self.model.as_ref());
+        profile
+            .runtime()
+            .preflight_dispatch(profile.model(), self.repository.root())?;
+        let (reservation, prior_log) = self
+            .repository
+            .worker_pool()
+            .begin_follow_up(worker, profile)?;
         let runtime = reservation.agent_runtime();
         let session = resolve_agent_session_for_runtime(
             runtime,
@@ -528,8 +532,8 @@ impl WorkerActions {
                 .filter(|path| !path.as_os_str().is_empty()),
         );
         let mut invocation = AgentRuntimeInvocation::new(prompt).with_ticket_delivery_profile();
-        if let Some(model) = self.model.clone() {
-            invocation = invocation.with_model(model);
+        if let Some(model) = reservation.profile().model() {
+            invocation = invocation.with_model(model.clone());
         }
         match &session {
             AgentSessionResolution::Resumed { session_id } => {

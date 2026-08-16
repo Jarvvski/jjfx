@@ -9,9 +9,9 @@ use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 use thiserror::Error;
 
 use crate::{
-    AgentRuntime, CommitOutcome, Expected, Loaded, PoolState, Repository, RunConclusion, RunResult,
-    StateChange, StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
-    WorkerWorkspaceError,
+    AgentRuntime, AgentRuntimeProfile, CommitOutcome, Expected, Loaded, PoolState, Repository,
+    RunConclusion, RunResult, StateChange, StateError, StateRevision, WireStatus, WireTimestamp,
+    WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -105,7 +105,7 @@ impl PoolResize {
 pub struct Reservation {
     worker_id: WorkerId,
     ticket: String,
-    agent_runtime: AgentRuntime,
+    profile: AgentRuntimeProfile,
     repository: Repository,
     worker_revision: StateRevision<WorkerState>,
     rollback: WorkerState,
@@ -183,7 +183,12 @@ impl Reservation {
 
     /// Returns the Agent Runtime persisted for this Run.
     pub fn agent_runtime(&self) -> AgentRuntime {
-        self.agent_runtime
+        self.profile.runtime()
+    }
+
+    /// Returns the complete runtime and model profile persisted for this Run.
+    pub fn profile(&self) -> &AgentRuntimeProfile {
+        &self.profile
     }
 
     pub(crate) fn repository(&self) -> &Repository {
@@ -277,6 +282,8 @@ pub enum WorkerPoolError {
     },
     #[error("invalid configured Agent Runtime {value:?} (expected claude, codex, or pi)")]
     InvalidAgentRuntime { value: String },
+    #[error(transparent)]
+    InvalidRuntimeProfile(#[from] crate::AgentRuntimePreflightError),
     #[error("cannot discover GitHub repository: {0}")]
     RepositoryDiscovery(String),
     #[error("cannot create a Worker timestamp: {0}")]
@@ -477,6 +484,7 @@ impl WorkerPool {
     pub(crate) fn begin_follow_up(
         &self,
         worker: &WorkerId,
+        profile: AgentRuntimeProfile,
     ) -> Result<(Reservation, Option<PathBuf>), WorkerPoolError> {
         let started_at = current_timestamp()?;
         let log_path = self
@@ -488,9 +496,10 @@ impl WorkerPool {
             worker,
             started_at,
             log_path.to_string_lossy().into_owned(),
+            Some(profile),
         )? {
             crate::state::FollowUpOutcome::Started {
-                agent_runtime,
+                profile,
                 prior_log,
                 revision,
                 rollback,
@@ -498,7 +507,7 @@ impl WorkerPool {
                 Reservation {
                     worker_id: worker.clone(),
                     ticket: rollback.ticket.clone().unwrap_or_default(),
-                    agent_runtime,
+                    profile,
                     repository: self.repository.clone(),
                     worker_revision: revision,
                     rollback: *rollback,
@@ -526,7 +535,16 @@ impl WorkerPool {
 
     /// Reserves the first idle Worker for `ticket` in pool order.
     pub fn reserve(&self, ticket: impl Into<String>) -> Result<Reservation, WorkerPoolError> {
-        self.reserve_inner(None, ticket.into())
+        self.reserve_inner(None, ticket.into(), None)
+    }
+
+    pub(crate) fn reserve_profiled(
+        &self,
+        requested: Option<WorkerId>,
+        ticket: impl Into<String>,
+        profile: AgentRuntimeProfile,
+    ) -> Result<Reservation, WorkerPoolError> {
+        self.reserve_inner(requested, ticket.into(), Some(profile))
     }
 
     /// Atomically reserves one idle Worker per Ticket in input order.
@@ -539,23 +557,24 @@ impl WorkerPool {
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
         let requests = tickets
             .iter()
-            .map(|ticket| (ticket.as_ref().to_owned(), None))
+            .map(|ticket| (ticket.as_ref().to_owned(), None, None))
             .collect::<Vec<_>>();
         self.reserve_targeted(&requests)
     }
 
     pub(crate) fn reserve_targeted(
         &self,
-        requests: &[(String, Option<WorkerId>)],
+        requests: &[(String, Option<WorkerId>, Option<AgentRuntimeProfile>)],
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
         let inputs = requests
             .iter()
-            .map(|(ticket, worker)| {
+            .map(|(ticket, worker, profile)| {
                 Ok(crate::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
                     ticket: ticket.clone(),
                     requested_worker: worker.clone(),
                     started_at: current_timestamp()?,
+                    profile: profile.clone(),
                 })
             })
             .collect::<Result<Vec<_>, WorkerPoolError>>()?;
@@ -570,7 +589,7 @@ impl WorkerPool {
                     .map(|reserved| Reservation {
                         worker_id: reserved.worker,
                         ticket: reserved.ticket,
-                        agent_runtime: reserved.agent_runtime,
+                        profile: reserved.profile,
                         repository: self.repository.clone(),
                         worker_revision: reserved.revision,
                         rollback: reserved.rollback,
@@ -594,16 +613,17 @@ impl WorkerPool {
 
     pub(crate) fn reserve_available_targeted(
         &self,
-        requests: &[(String, Option<WorkerId>)],
+        requests: &[(String, Option<WorkerId>, Option<AgentRuntimeProfile>)],
     ) -> Result<AvailableReservations, WorkerPoolError> {
         let inputs = requests
             .iter()
-            .map(|(ticket, worker)| {
+            .map(|(ticket, worker, profile)| {
                 Ok(crate::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
                     ticket: ticket.clone(),
                     requested_worker: worker.clone(),
                     started_at: current_timestamp()?,
+                    profile: profile.clone(),
                 })
             })
             .collect::<Result<Vec<_>, WorkerPoolError>>()?;
@@ -626,7 +646,7 @@ impl WorkerPool {
                             Reservation {
                                 worker_id: reserved.worker,
                                 ticket: reserved.ticket,
-                                agent_runtime: reserved.agent_runtime,
+                                profile: reserved.profile,
                                 repository: self.repository.clone(),
                                 worker_revision: reserved.revision,
                                 rollback: reserved.rollback,
@@ -666,14 +686,14 @@ impl WorkerPool {
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
         let requests = tickets
             .iter()
-            .map(|ticket| (ticket.as_ref().to_owned(), None))
+            .map(|ticket| (ticket.as_ref().to_owned(), None, None))
             .collect::<Vec<_>>();
         self.grow_and_reserve_targeted(&requests, approved_additional)
     }
 
     pub(crate) fn grow_and_reserve_targeted(
         &self,
-        requests: &[(String, Option<WorkerId>)],
+        requests: &[(String, Option<WorkerId>, Option<AgentRuntimeProfile>)],
         approved_additional: usize,
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
         let shortage = match self.reserve_targeted(requests) {
@@ -720,12 +740,13 @@ impl WorkerPool {
         next.workers.extend(added.iter().cloned());
         let inputs = requests
             .iter()
-            .map(|(ticket, worker)| {
+            .map(|(ticket, worker, profile)| {
                 Ok(crate::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
                     ticket: ticket.clone(),
                     requested_worker: worker.clone(),
                     started_at: current_timestamp()?,
+                    profile: profile.clone(),
                 })
             })
             .collect::<Result<Vec<_>, WorkerPoolError>>()?;
@@ -740,7 +761,7 @@ impl WorkerPool {
                 .map(|reserved| Reservation {
                     worker_id: reserved.worker,
                     ticket: reserved.ticket,
-                    agent_runtime: reserved.agent_runtime,
+                    profile: reserved.profile,
                     repository: self.repository.clone(),
                     worker_revision: reserved.revision,
                     rollback: reserved.rollback,
@@ -771,10 +792,19 @@ impl WorkerPool {
         worker: WorkerId,
         ticket: impl Into<String>,
     ) -> Result<Reservation, WorkerPoolError> {
-        self.reserve_inner(Some(worker), ticket.into())
+        self.reserve_inner(Some(worker), ticket.into(), None)
     }
 
     /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
+    /// Replaces the Repository default profile used by future Reservations.
+    pub fn set_profile(&self, profile: AgentRuntimeProfile) -> Result<(), WorkerPoolError> {
+        profile
+            .runtime()
+            .preflight_dispatch_input(profile.model())?;
+        self.repository.state_store().set_pool_profile(&profile)?;
+        Ok(())
+    }
+
     /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
     pub fn set_alias(
         &self,
@@ -803,6 +833,7 @@ impl WorkerPool {
         &self,
         requested: Option<WorkerId>,
         ticket: String,
+        profile: Option<AgentRuntimeProfile>,
     ) -> Result<Reservation, WorkerPoolError> {
         let started_at = current_timestamp()?;
         let outcome = self.repository.state_store().reserve_worker(
@@ -810,17 +841,18 @@ impl WorkerPool {
             ticket.clone(),
             started_at,
             ticket.to_lowercase(),
+            profile,
         )?;
         match outcome {
             crate::state::ReservationOutcome::Reserved {
                 worker,
-                agent_runtime,
+                profile,
                 revision,
                 rollback,
             } => Ok(Reservation {
                 worker_id: worker,
                 ticket,
-                agent_runtime,
+                profile,
                 repository: self.repository.clone(),
                 worker_revision: revision,
                 rollback: *rollback,
@@ -1219,6 +1251,8 @@ fn remote_slug(remote: &str) -> String {
 fn clear_run_fields(state: &mut WorkerState) {
     state.status = WireStatus::new(WorkerStatus::Idle.as_str());
     state.agent = None;
+    state.provider = None;
+    state.model = None;
     state.ticket = None;
     state.pid = None;
     state.started_at = None;
@@ -1314,7 +1348,7 @@ pub struct PoolSnapshot {
     size: i64,
     gh_repo: String,
     foreground: Option<bool>,
-    agent_runtime: Option<AgentRuntime>,
+    profile: Option<AgentRuntimeProfile>,
     workers: Vec<WorkerReference>,
 }
 impl PoolSnapshot {
@@ -1334,7 +1368,11 @@ impl PoolSnapshot {
     }
     /// Returns the configured Agent Runtime, when explicitly persisted.
     pub fn agent_runtime(&self) -> Option<AgentRuntime> {
-        self.agent_runtime
+        self.profile.as_ref().map(AgentRuntimeProfile::runtime)
+    }
+    /// Returns the configured default runtime and model profile.
+    pub fn profile(&self) -> Option<&AgentRuntimeProfile> {
+        self.profile.as_ref()
     }
     pub fn workers(&self) -> &[WorkerReference] {
         &self.workers
@@ -1349,7 +1387,7 @@ pub struct WorkerSnapshot {
     workspace: String,
     status: WorkerStatus,
     ticket: Option<String>,
-    agent_runtime: Option<AgentRuntime>,
+    profile: Option<AgentRuntimeProfile>,
     started_at: Option<String>,
     completed_at: Option<String>,
     log_file: Option<String>,
@@ -1391,10 +1429,14 @@ impl WorkerSnapshot {
         PersistedField::Missing
     }
     pub fn agent_runtime(&self) -> Option<AgentRuntime> {
-        self.agent_runtime
+        self.profile.as_ref().map(AgentRuntimeProfile::runtime)
+    }
+    /// Returns the current or latest Run's complete runtime profile.
+    pub fn profile(&self) -> Option<&AgentRuntimeProfile> {
+        self.profile.as_ref()
     }
     pub fn agent_runtime_presence(&self) -> PersistedField<AgentRuntime> {
-        self.agent_runtime
+        self.agent_runtime()
             .map_or(PersistedField::Null, PersistedField::Value)
     }
     pub fn started_at(&self) -> Option<&str> {
@@ -1549,7 +1591,12 @@ impl Repository {
             size: pool.size,
             gh_repo: pool.gh_repo.clone(),
             foreground: pool.foreground,
-            agent_runtime: AgentRuntime::from_configured(pool.agent.as_ref()).ok(),
+            profile: AgentRuntimeProfile::from_configured(
+                pool.agent.as_ref(),
+                pool.provider.as_deref(),
+                pool.model.as_deref(),
+            )
+            .ok(),
             workers: references,
         };
         let mut workers = Vec::new();
@@ -1611,12 +1658,11 @@ fn worker_snapshot(
 ) -> Result<WorkerSnapshot, String> {
     let status = WorkerStatus::parse(&state.status)
         .ok_or_else(|| format!("unknown Worker status {:?}", state.status.as_str()))?;
-    let agent_runtime = state
-        .agent
-        .as_ref()
-        .map(AgentRuntime::parse)
-        .transpose_option()
-        .ok_or_else(|| "unknown Agent Runtime".to_owned())?;
+    let profile = AgentRuntimeProfile::from_run_state(
+        state.agent.as_ref(),
+        state.provider.as_deref(),
+        state.model.as_deref(),
+    )?;
     let pid = state
         .pid
         .map(u32::try_from)
@@ -1631,7 +1677,7 @@ fn worker_snapshot(
         alias,
         status,
         ticket: state.ticket,
-        agent_runtime,
+        profile,
         started_at: state.started_at.map(|value| value.as_str().to_owned()),
         completed_at: state.completed_at.map(|value| value.as_str().to_owned()),
         log_file: state.log_file,
@@ -1641,19 +1687,6 @@ fn worker_snapshot(
         process_alive: pid.map(process_is_alive),
         pid,
     })
-}
-
-trait TransposeOption<T> {
-    fn transpose_option(self) -> Option<Option<T>>;
-}
-impl<T> TransposeOption<T> for Option<Option<T>> {
-    fn transpose_option(self) -> Option<Option<T>> {
-        match self {
-            None => Some(None),
-            Some(Some(value)) => Some(Some(value)),
-            Some(None) => None,
-        }
-    }
 }
 
 fn process_is_alive_i64(pid: i64) -> bool {

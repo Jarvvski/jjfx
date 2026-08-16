@@ -1,6 +1,6 @@
 # Complete Pi Dispatch integration
 
-Status: ready-for-agent
+Status: claimed
 
 ## Parent
 

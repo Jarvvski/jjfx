@@ -16,21 +16,20 @@ use thiserror::Error;
 
 use crate::pool::current_timestamp;
 use crate::{
-    AgentModel, AgentRuntime, CommitOutcome, DirectDispatchError, DirectDispatchRequest,
-    DirectDispatchSuccess, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError,
-    DispatchGroupEvent, DispatchGroupOptions, DispatchGroupState, DispatchGroupStatusCounts,
-    Expected, Loaded, ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode,
-    StateChange, StateRevision, SubIssueStatus, Ticket, TicketDiscovery, TicketId, TicketQuery,
-    TicketStatus, TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError,
-    WorkerStatus, WorkspaceRestoration,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
+    DirectDispatchRequest, DirectDispatchSuccess, DispatchGroup, DispatchGroupBuildOptions,
+    DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions, DispatchGroupState,
+    DispatchGroupStatusCounts, Expected, Loaded, ParentTicket, Repository, RepositoryIdentity,
+    Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket, TicketDiscovery,
+    TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp, WorkerActions,
+    WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OrchestrationRequest {
     parent: TicketId,
-    agent_runtime: AgentRuntime,
-    model: Option<AgentModel>,
+    profile: AgentRuntimeProfile,
 }
 
 /// Polling and retry limits for one foreground or detached orchestration run.
@@ -83,15 +82,16 @@ impl OrchestrationRequest {
     pub fn new(parent: TicketId, agent_runtime: AgentRuntime) -> Self {
         Self {
             parent,
-            agent_runtime,
-            model: None,
+            profile: AgentRuntimeProfile::new(agent_runtime),
         }
     }
 
     /// Supplies a caller-selected model override.
     pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         let model = model.into();
-        self.model = (!model.model().trim().is_empty()).then_some(model);
+        if !model.model().trim().is_empty() {
+            self.profile = self.profile.with_model_override(Some(&model));
+        }
         self
     }
 
@@ -102,12 +102,17 @@ impl OrchestrationRequest {
 
     /// Returns the Agent Runtime used for dependency discovery.
     pub const fn agent_runtime(&self) -> AgentRuntime {
-        self.agent_runtime
+        self.profile.runtime()
     }
 
     /// Returns the optional model override persisted with a new group.
-    pub fn model(&self) -> Option<&AgentModel> {
-        self.model.as_ref()
+    pub const fn model(&self) -> Option<&AgentModel> {
+        self.profile.model()
+    }
+
+    /// Returns the complete runtime and model profile for a new group.
+    pub const fn profile(&self) -> &AgentRuntimeProfile {
+        &self.profile
     }
 }
 
@@ -477,8 +482,9 @@ fn run_with_execution<E: OrchestrationExecution>(
         }
     }
 
+    let profile = persisted_group_profile(&group, request)?;
     for ticket in group.ready() {
-        let dispatch = dispatch_request(&group, &ticket, request.model())?;
+        let dispatch = dispatch_request(&group, &ticket, &profile)?;
         let Some(claim) = execution.claim(&dispatch)? else {
             observer(OrchestrationEvent::WaitingForCapacity { ticket });
             continue;
@@ -520,10 +526,30 @@ fn run_with_execution<E: OrchestrationExecution>(
     Ok(revision)
 }
 
+fn persisted_group_profile(
+    group: &DispatchGroup,
+    request: &OrchestrationRequest,
+) -> Result<AgentRuntimeProfile, OrchestrationError> {
+    let options = &group.state().opts;
+    let has_persisted_runtime = options
+        .agent
+        .as_ref()
+        .is_some_and(|runtime| !runtime.as_str().trim().is_empty());
+    if !has_persisted_runtime {
+        return Ok(request.profile().clone());
+    }
+    AgentRuntimeProfile::from_configured(
+        options.agent.as_ref(),
+        options.provider.as_deref(),
+        (!options.model.trim().is_empty()).then_some(options.model.as_str()),
+    )
+    .map_err(|detail| OrchestrationError::Execution(format!("invalid persisted profile: {detail}")))
+}
+
 fn dispatch_request(
     group: &DispatchGroup,
     ticket: &TicketId,
-    model: Option<&AgentModel>,
+    profile: &AgentRuntimeProfile,
 ) -> Result<DirectDispatchRequest, OrchestrationError> {
     let issue =
         group.state().sub_issues.get(ticket).ok_or_else(|| {
@@ -536,10 +562,8 @@ fn dispatch_request(
     let mut request = DirectDispatchRequest::new(
         Ticket::new(ticket.clone(), title, status),
         RunMode::Background,
-    );
-    if let Some(model) = model {
-        request = request.with_model(model.clone());
-    }
+    )
+    .with_profile(profile.clone());
     if let Some(context) = group.dependency_context(ticket)? {
         request = request.with_dependency_context(context);
     }
@@ -779,13 +803,11 @@ impl OrchestrationRunner {
             .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
         let status = TicketStatus::parse("Todo")
             .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
-        let mut placeholder = DirectDispatchRequest::new(
+        let placeholder = DirectDispatchRequest::new(
             Ticket::new(parent.id().clone(), title, status),
             RunMode::Background,
-        );
-        if let Some(model) = request.model() {
-            placeholder = placeholder.with_model(model.clone());
-        }
+        )
+        .with_profile(request.profile().clone());
         let reservation = match self.repository.direct_dispatch().reserve(&placeholder) {
             Ok(reservation) => reservation,
             Err(error) => return Err(OrchestrationError::Execution(error.to_string())),
@@ -822,6 +844,10 @@ impl OrchestrationRunner {
                 .to_owned(),
         );
         group_options.agent = Some(WireAgent::new(request.agent_runtime().as_str()));
+        group_options.provider = request
+            .model()
+            .and_then(AgentModel::provider)
+            .map(str::to_owned);
         let options = DispatchGroupBuildOptions::new(
             current_timestamp()
                 .map_err(|error| OrchestrationError::Execution(error.to_string()))?,

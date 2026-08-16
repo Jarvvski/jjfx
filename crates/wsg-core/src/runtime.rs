@@ -105,6 +105,115 @@ impl From<String> for AgentModel {
     }
 }
 
+/// The complete provider-neutral identity and model policy for one Agent Runtime Run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuntimeProfile {
+    runtime: AgentRuntime,
+    model: Option<AgentModel>,
+}
+
+impl AgentRuntimeProfile {
+    /// Creates a profile using provider-managed model selection.
+    pub const fn new(runtime: AgentRuntime) -> Self {
+        Self {
+            runtime,
+            model: None,
+        }
+    }
+
+    /// Supplies the provider-aware model selection for this profile.
+    pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
+        self.model = Some(model.into());
+        self
+    }
+
+    /// Reconstructs a compatible profile from persisted runtime, provider, and model fields.
+    pub fn from_configured(
+        runtime: Option<&WireAgent>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Self, String> {
+        let runtime = AgentRuntime::from_configured(runtime)?;
+        Ok(Self::from_parts(runtime, provider, model))
+    }
+
+    /// Reconstructs an optional Run profile without applying the legacy Pool default.
+    pub(crate) fn from_run_state(
+        runtime: Option<&WireAgent>,
+        provider: Option<&str>,
+        model: Option<&str>,
+    ) -> Result<Option<Self>, String> {
+        let Some(runtime) = runtime.filter(|runtime| !runtime.as_str().trim().is_empty()) else {
+            return Ok(None);
+        };
+        let runtime = AgentRuntime::from_configured(Some(runtime))?;
+        Ok(Some(Self::from_parts(runtime, provider, model)))
+    }
+
+    fn from_parts(runtime: AgentRuntime, provider: Option<&str>, model: Option<&str>) -> Self {
+        let provider = provider.map(str::trim).filter(|value| !value.is_empty());
+        let model = model.map(str::trim).filter(|value| !value.is_empty());
+        let selection = match (provider, model) {
+            (None, None) => None,
+            (provider, model) => {
+                let mut selection = AgentModel::new(model.unwrap_or_default());
+                if let Some(provider) = provider {
+                    selection = selection.with_provider(provider);
+                }
+                Some(selection)
+            }
+        };
+        Self {
+            runtime,
+            model: selection,
+        }
+    }
+
+    /// Applies a caller model override while retaining a configured provider when omitted.
+    pub fn with_model_override(mut self, model: Option<&AgentModel>) -> Self {
+        let Some(model) = model else {
+            return self;
+        };
+        let provider = model.provider().map(str::to_owned).or_else(|| {
+            self.model
+                .as_ref()
+                .and_then(AgentModel::provider)
+                .map(str::to_owned)
+        });
+        let mut merged = AgentModel::new(model.model());
+        if let Some(provider) = provider {
+            merged = merged.with_provider(provider);
+        }
+        self.model = Some(merged);
+        self
+    }
+
+    /// Returns the selected Agent Runtime.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
+    }
+
+    /// Returns the optional provider-aware model selection.
+    pub const fn model(&self) -> Option<&AgentModel> {
+        self.model.as_ref()
+    }
+
+    pub(crate) fn provider_value(&self) -> Option<String> {
+        self.model
+            .as_ref()
+            .and_then(AgentModel::provider)
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn model_value(&self) -> Option<String> {
+        self.model
+            .as_ref()
+            .map(AgentModel::model)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 enum AgentRuntimeInvocationProfile {
     #[default]

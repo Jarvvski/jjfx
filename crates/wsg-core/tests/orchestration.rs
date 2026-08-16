@@ -382,11 +382,14 @@ fn pi_orchestration_preflights_before_assignment_persistence() {
     pool_state.agent = Some(wsg_core::WireAgent::new("pi"));
     pool.commit(Expected::Match(revision), StateChange::Replace(pool_state))
         .expect("configure Pi Pool");
+    let mut group_options = DispatchGroupOptions::new("gpt-5.4");
+    group_options.agent = Some(wsg_core::WireAgent::new("pi"));
+    group_options.provider = Some("openai".to_owned());
     let mut group = DispatchGroupState::new(
         parent.clone(),
         WireTimestamp::new("2026-08-16T10:00:00Z"),
         "owner/repo",
-        DispatchGroupOptions::new(""),
+        group_options,
     );
     group.sub_issues.insert(
         ticket,
@@ -451,8 +454,7 @@ fn pi_orchestration_preflight_helper() {
     let error = repository
         .orchestration_runner()
         .advance_once(
-            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Pi)
-                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
             |_| {},
         )
         .expect_err("missing Pi profile should fail orchestration");

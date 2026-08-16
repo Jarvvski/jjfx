@@ -49,8 +49,8 @@ pub use run_log::{
 pub use runtime::{
     AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
     AgentRuntimeInvocation, AgentRuntimePreflightError, AgentRuntimePreflightErrorKind,
-    AgentRuntimeProbeError, BackgroundRun, CompletedRun, RunOutcome, RunRequest, RunReset,
-    RunSupervisor, RunSupervisorError,
+    AgentRuntimeProbeError, AgentRuntimeProfile, BackgroundRun, CompletedRun, RunOutcome,
+    RunRequest, RunReset, RunSupervisor, RunSupervisorError,
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,

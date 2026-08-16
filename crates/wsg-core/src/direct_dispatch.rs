@@ -6,11 +6,11 @@ use std::thread;
 use thiserror::Error;
 
 use crate::{
-    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError, CompletedRun,
-    DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
-    DispatchPromptError, Repository, RepositoryIdentity, Reservation, RunMode, RunSupervisor,
-    RunSupervisorError, Ticket, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError,
-    WorkerWorkspaceError,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError,
+    AgentRuntimeProfile, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
+    DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
+    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketId, TicketStatus, TicketTitle,
+    WorkerId, WorkerPoolError, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -66,6 +66,7 @@ pub enum DirectDispatchTarget {
 pub struct DirectDispatchRequest {
     ticket: Ticket,
     target: DirectDispatchTarget,
+    profile: Option<AgentRuntimeProfile>,
     model: Option<AgentModel>,
     budget: DispatchBudget,
     mode: RunMode,
@@ -78,6 +79,7 @@ impl DirectDispatchRequest {
         Self {
             ticket,
             target: DirectDispatchTarget::FirstIdle,
+            profile: None,
             model: None,
             budget: DispatchBudget::ProviderManaged,
             mode,
@@ -97,6 +99,12 @@ impl DirectDispatchRequest {
     /// Selects one exact Worker and disables first-idle fallback.
     pub fn to_worker(mut self, worker: WorkerId) -> Self {
         self.target = DirectDispatchTarget::Worker(worker);
+        self
+    }
+
+    /// Supplies the persisted runtime and model profile that owns this Run.
+    pub fn with_profile(mut self, profile: AgentRuntimeProfile) -> Self {
+        self.profile = Some(profile);
         self
     }
 
@@ -129,9 +137,16 @@ impl DirectDispatchRequest {
         &self.target
     }
 
+    /// Returns the optional persisted runtime profile override.
+    pub fn profile(&self) -> Option<&AgentRuntimeProfile> {
+        self.profile.as_ref()
+    }
+
     /// Returns the optional model override.
     pub fn model(&self) -> Option<&AgentModel> {
-        self.model.as_ref()
+        self.model
+            .as_ref()
+            .or_else(|| self.profile.as_ref().and_then(AgentRuntimeProfile::model))
     }
 
     /// Returns provider-managed or caller-bounded spending behavior.
@@ -170,14 +185,16 @@ impl DirectDispatch {
         &self,
         request: &DirectDispatchRequest,
     ) -> Result<Reservation, DirectDispatchError> {
-        self.preflight(request)?;
-        let pool = self.repository.worker_pool();
-        match request.target() {
-            DirectDispatchTarget::FirstIdle => Ok(pool.reserve(request.ticket().id().as_str())?),
-            DirectDispatchTarget::Worker(worker) => {
-                Ok(pool.reserve_named(worker.clone(), request.ticket().id().as_str())?)
-            }
-        }
+        let profile = self.preflight(request)?;
+        let worker = match request.target() {
+            DirectDispatchTarget::FirstIdle => None,
+            DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
+        };
+        Ok(self.repository.worker_pool().reserve_profiled(
+            worker,
+            request.ticket().id().as_str(),
+            profile,
+        )?)
     }
 
     /// Atomically reserves the complete batch before launching ordered outcomes.
@@ -188,15 +205,20 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
-        self.preflight_all(requests)?;
+        let profiles = self.preflight_all(requests)?;
         let targets = requests
             .iter()
-            .map(|request| {
+            .zip(profiles)
+            .map(|(request, profile)| {
                 let worker = match request.target() {
                     DirectDispatchTarget::FirstIdle => None,
                     DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
                 };
-                (request.ticket().id().as_str().to_owned(), worker)
+                (
+                    request.ticket().id().as_str().to_owned(),
+                    worker,
+                    Some(profile),
+                )
             })
             .collect::<Vec<_>>();
         let reservations = self.repository.worker_pool().reserve_targeted(&targets)?;
@@ -217,15 +239,20 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
-        self.preflight_all(requests)?;
+        let profiles = self.preflight_all(requests)?;
         let targets = requests
             .iter()
-            .map(|request| {
+            .zip(profiles)
+            .map(|(request, profile)| {
                 let worker = match request.target() {
                     DirectDispatchTarget::FirstIdle => None,
                     DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
                 };
-                (request.ticket().id().as_str().to_owned(), worker)
+                (
+                    request.ticket().id().as_str().to_owned(),
+                    worker,
+                    Some(profile),
+                )
             })
             .collect::<Vec<_>>();
         let reservations = self
@@ -248,15 +275,20 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
-        self.preflight_all(requests)?;
+        let profiles = self.preflight_all(requests)?;
         let targets = requests
             .iter()
-            .map(|request| {
+            .zip(profiles)
+            .map(|(request, profile)| {
                 let worker = match request.target() {
                     DirectDispatchTarget::FirstIdle => None,
                     DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
                 };
-                (request.ticket().id().as_str().to_owned(), worker)
+                (
+                    request.ticket().id().as_str().to_owned(),
+                    worker,
+                    Some(profile),
+                )
             })
             .collect::<Vec<_>>();
         let available = self
@@ -280,7 +312,15 @@ impl DirectDispatch {
             };
             return Err(release_before_launch(&reservation, mismatch));
         }
-        if let Err(error) = self.preflight_runtime(reservation.agent_runtime(), request) {
+        let preflight = self
+            .preflight_input(reservation.profile(), request)
+            .and_then(|()| {
+                reservation
+                    .agent_runtime()
+                    .preflight_dispatch_environment(self.repository.root())
+                    .map_err(DirectDispatchError::Preflight)
+            });
+        if let Err(error) = preflight {
             return Err(release_before_launch(&reservation, error));
         }
         self.dispatch_preflighted(reservation, request)
@@ -338,55 +378,75 @@ impl DirectDispatch {
         ))
     }
 
-    fn preflight_all(&self, requests: &[DirectDispatchRequest]) -> Result<(), DirectDispatchError> {
-        if requests.is_empty() {
-            return Ok(());
-        }
-        let runtime = self.configured_runtime();
+    fn preflight_all(
+        &self,
+        requests: &[DirectDispatchRequest],
+    ) -> Result<Vec<AgentRuntimeProfile>, DirectDispatchError> {
+        let configured = self.configured_profile();
+        let mut profiles = Vec::with_capacity(requests.len());
+        let mut runtimes = Vec::new();
         for request in requests {
-            self.preflight_input(runtime, request)?;
+            let profile = request
+                .profile()
+                .cloned()
+                .unwrap_or_else(|| configured.clone())
+                .with_model_override(request.model());
+            self.preflight_input(&profile, request)?;
+            if !runtimes.contains(&profile.runtime()) {
+                runtimes.push(profile.runtime());
+            }
+            profiles.push(profile);
         }
-        runtime
+        for runtime in runtimes {
+            runtime
+                .preflight_dispatch_environment(self.repository.root())
+                .map_err(DirectDispatchError::Preflight)?;
+        }
+        Ok(profiles)
+    }
+
+    fn preflight(
+        &self,
+        request: &DirectDispatchRequest,
+    ) -> Result<AgentRuntimeProfile, DirectDispatchError> {
+        let profile = request
+            .profile()
+            .cloned()
+            .unwrap_or_else(|| self.configured_profile())
+            .with_model_override(request.model());
+        self.preflight_input(&profile, request)?;
+        profile
+            .runtime()
             .preflight_dispatch_environment(self.repository.root())
-            .map_err(DirectDispatchError::Preflight)
+            .map_err(DirectDispatchError::Preflight)?;
+        Ok(profile)
     }
 
-    fn preflight(&self, request: &DirectDispatchRequest) -> Result<(), DirectDispatchError> {
-        self.preflight_runtime(self.configured_runtime(), request)
-    }
-
-    fn configured_runtime(&self) -> AgentRuntime {
+    fn configured_profile(&self) -> AgentRuntimeProfile {
         self.repository
             .worker_pool()
             .snapshot()
             .pool()
-            .and_then(|pool| pool.agent_runtime())
-            .unwrap_or(AgentRuntime::Claude)
-    }
-
-    fn preflight_runtime(
-        &self,
-        runtime: AgentRuntime,
-        request: &DirectDispatchRequest,
-    ) -> Result<(), DirectDispatchError> {
-        self.preflight_input(runtime, request)?;
-        runtime
-            .preflight_dispatch_environment(self.repository.root())
-            .map_err(DirectDispatchError::Preflight)
+            .and_then(|pool| pool.profile().cloned())
+            .unwrap_or_else(|| AgentRuntimeProfile::new(AgentRuntime::Claude))
     }
 
     fn preflight_input(
         &self,
-        runtime: AgentRuntime,
+        profile: &AgentRuntimeProfile,
         request: &DirectDispatchRequest,
     ) -> Result<(), DirectDispatchError> {
         if matches!(request.budget(), DispatchBudget::MaximumUsd(_))
-            && runtime != AgentRuntime::Claude
+            && profile.runtime() != AgentRuntime::Claude
         {
-            return Err(DispatchPromptError::UnsupportedBudget { runtime }.into());
+            return Err(DispatchPromptError::UnsupportedBudget {
+                runtime: profile.runtime(),
+            }
+            .into());
         }
-        runtime
-            .preflight_dispatch_input(request.model())
+        profile
+            .runtime()
+            .preflight_dispatch_input(profile.model())
             .map_err(DirectDispatchError::Preflight)
     }
 
@@ -464,7 +524,7 @@ impl DirectDispatch {
             delivery,
         )
         .with_budget(request.budget());
-        if let Some(model) = request.model() {
+        if let Some(model) = reservation.profile().model() {
             context = context.with_model(model.clone());
         }
         if let Some(dependency) = request.dependency_context() {

@@ -17,7 +17,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::Repository;
+use crate::{AgentRuntimeProfile, Repository};
 
 const POOL_PATH: &str = ".jj/pool.json";
 const POOL_DIRECTORY: &str = ".jj/pool";
@@ -39,6 +39,28 @@ where
         Some(branch) if !branch.is_empty() => serializer.serialize_some(branch),
         Some(_) | None => serializer.serialize_none(),
     }
+}
+
+fn configured_pool_profile(pool: &PoolState) -> Result<AgentRuntimeProfile, String> {
+    AgentRuntimeProfile::from_configured(
+        pool.agent.as_ref(),
+        pool.provider.as_deref(),
+        pool.model.as_deref(),
+    )
+}
+
+fn worker_profile(state: &WorkerState) -> Result<Option<AgentRuntimeProfile>, String> {
+    AgentRuntimeProfile::from_run_state(
+        state.agent.as_ref(),
+        state.provider.as_deref(),
+        state.model.as_deref(),
+    )
+}
+
+fn apply_worker_profile(state: &mut WorkerState, profile: &AgentRuntimeProfile) {
+    state.agent = Some(WireAgent::new(profile.runtime().as_str()));
+    state.provider = profile.provider_value();
+    state.model = profile.model_value();
 }
 
 macro_rules! wire_string {
@@ -184,6 +206,12 @@ pub struct PoolState {
     #[serde(default, skip_serializing_if = "wire_agent_is_absent")]
     /// Optional default Agent Runtime.
     pub agent: Option<WireAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional model provider for the default Agent Runtime profile.
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional model for the default Agent Runtime profile.
+    pub model: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     /// Optional display aliases keyed by Worker.
     pub names: BTreeMap<WorkerId, String>,
@@ -206,6 +234,8 @@ impl PoolState {
             created_at,
             foreground: None,
             agent: None,
+            provider: None,
+            model: None,
             names: BTreeMap::new(),
             extra: BTreeMap::new(),
         }
@@ -219,6 +249,12 @@ pub struct WorkerState {
     pub status: WireStatus,
     /// Agent Runtime selected for the current or latest Run.
     pub agent: Option<WireAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Model provider selected for the current or latest Run.
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Model selected for the current or latest Run.
+    pub model: Option<String>,
     /// Assigned Ticket, if any.
     pub ticket: Option<String>,
     /// Agent Runtime process identifier, if known.
@@ -246,6 +282,8 @@ impl WorkerState {
         Self {
             status,
             agent: None,
+            provider: None,
+            model: None,
             ticket: None,
             pid: None,
             started_at: None,
@@ -309,6 +347,9 @@ pub struct DispatchGroupOptions {
     #[serde(default, skip_serializing_if = "wire_agent_is_absent")]
     /// Optional Agent Runtime override.
     pub agent: Option<WireAgent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional model provider selected for this Dispatch Group.
+    pub provider: Option<String>,
     /// Optional model spelling, represented by an empty string when unset.
     pub model: String,
     #[serde(flatten)]
@@ -320,6 +361,7 @@ impl DispatchGroupOptions {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             agent: None,
+            provider: None,
             model: model.into(),
             extra: BTreeMap::new(),
         }
@@ -469,7 +511,7 @@ pub struct StateStore {
 pub(crate) enum ReservationOutcome {
     Reserved {
         worker: WorkerId,
-        agent_runtime: crate::AgentRuntime,
+        profile: AgentRuntimeProfile,
         revision: StateRevision<WorkerState>,
         rollback: Box<WorkerState>,
     },
@@ -492,12 +534,13 @@ pub(crate) struct ReservationInput {
     pub(crate) requested_worker: Option<WorkerId>,
     pub(crate) started_at: WireTimestamp,
     pub(crate) branch_name: String,
+    pub(crate) profile: Option<AgentRuntimeProfile>,
 }
 
 pub(crate) struct ReservedWorker {
     pub(crate) worker: WorkerId,
     pub(crate) ticket: String,
-    pub(crate) agent_runtime: crate::AgentRuntime,
+    pub(crate) profile: AgentRuntimeProfile,
     pub(crate) revision: StateRevision<WorkerState>,
     pub(crate) rollback: WorkerState,
 }
@@ -531,7 +574,7 @@ pub(crate) enum GrowReservationsOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum FollowUpOutcome {
     Started {
-        agent_runtime: crate::AgentRuntime,
+        profile: AgentRuntimeProfile,
         prior_log: Option<String>,
         revision: StateRevision<WorkerState>,
         rollback: Box<WorkerState>,
@@ -623,6 +666,30 @@ impl StateStore {
             root: self.root.clone(),
             parent,
         }
+    }
+
+    /// Sets or clears cosmetic Worker metadata under the compatible Pool lock.
+    pub(crate) fn set_pool_profile(&self, profile: &AgentRuntimeProfile) -> Result<(), StateError> {
+        let subject = "Worker Pool";
+        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+            if self.root.join(DESTROY_MARKER).exists() {
+                return Err(StateError::new(
+                    "set profile",
+                    subject,
+                    "Pool destruction is in progress",
+                ));
+            }
+            let mut pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+                Loaded::Present(versioned) => versioned.value,
+                Loaded::Missing => {
+                    return Err(StateError::new("set profile", subject, "state is missing"));
+                }
+            };
+            pool.agent = Some(WireAgent::new(profile.runtime().as_str()));
+            pool.provider = profile.provider_value();
+            pool.model = profile.model_value();
+            write_atomic(&self.root.join(POOL_PATH), &pool, subject)
+        })
     }
 
     /// Sets or clears cosmetic Worker metadata under the compatible Pool lock.
@@ -1057,6 +1124,7 @@ impl StateStore {
         worker: &WorkerId,
         started_at: WireTimestamp,
         log_file: String,
+        profile_override: Option<AgentRuntimeProfile>,
     ) -> Result<FollowUpOutcome, StateError> {
         let pool_subject = "Worker Pool";
         with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
@@ -1084,28 +1152,23 @@ impl StateStore {
                 if state.status.as_str() == "busy" {
                     return Ok(FollowUpOutcome::WorkerBusy);
                 }
-                let agent_runtime = match state
-                    .agent
-                    .as_ref()
-                    .filter(|agent| !agent.as_str().trim().is_empty())
-                {
-                    Some(agent) => match crate::AgentRuntime::parse(agent) {
-                        Some(runtime) => runtime,
-                        None => {
-                            return Ok(FollowUpOutcome::InvalidAgentRuntime {
-                                value: agent.as_str().to_owned(),
-                            });
-                        }
-                    },
-                    None => match crate::AgentRuntime::from_configured(pool.agent.as_ref()) {
-                        Ok(runtime) => runtime,
+                let profile = match profile_override {
+                    Some(profile) => profile,
+                    None => match worker_profile(&state) {
+                        Ok(Some(profile)) => profile,
+                        Ok(None) => match configured_pool_profile(&pool) {
+                            Ok(profile) => profile,
+                            Err(value) => {
+                                return Ok(FollowUpOutcome::InvalidAgentRuntime { value });
+                            }
+                        },
                         Err(value) => return Ok(FollowUpOutcome::InvalidAgentRuntime { value }),
                     },
                 };
                 let prior_log = state.log_file.clone();
                 let rollback = state.clone();
                 state.status = WireStatus::new("busy");
-                state.agent = Some(WireAgent::new(agent_runtime.as_str()));
+                apply_worker_profile(&mut state, &profile);
                 state.pid = None;
                 state.started_at = Some(started_at);
                 state.completed_at = None;
@@ -1125,7 +1188,7 @@ impl StateStore {
                         }
                     };
                 Ok(FollowUpOutcome::Started {
-                    agent_runtime,
+                    profile,
                     prior_log,
                     revision,
                     rollback: Box::new(rollback),
@@ -1310,6 +1373,7 @@ impl StateStore {
         ticket: String,
         started_at: WireTimestamp,
         branch_name: String,
+        profile: Option<AgentRuntimeProfile>,
     ) -> Result<ReservationOutcome, StateError> {
         let pool_subject = "Worker Pool";
         with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
@@ -1354,12 +1418,14 @@ impl StateStore {
                         worker: requested.clone(),
                     });
                 }
-                let agent_runtime = match crate::AgentRuntime::from_configured(pool.agent.as_ref())
-                {
-                    Ok(agent_runtime) => agent_runtime,
-                    Err(value) => {
-                        return Ok(ReservationOutcome::InvalidAgentRuntime { value });
-                    }
+                let profile = match profile {
+                    Some(profile) => profile,
+                    None => match configured_pool_profile(&pool) {
+                        Ok(profile) => profile,
+                        Err(value) => {
+                            return Ok(ReservationOutcome::InvalidAgentRuntime { value });
+                        }
+                    },
                 };
 
                 let candidates = requested.into_iter().cloned().chain(
@@ -1402,7 +1468,7 @@ impl StateStore {
                 };
                 let rollback = state.clone();
                 state.status = WireStatus::new("busy");
-                state.agent = Some(WireAgent::new(agent_runtime.as_str()));
+                apply_worker_profile(&mut state, &profile);
                 state.ticket = Some(ticket);
                 state.started_at = Some(started_at);
                 state.log_file = Some(
@@ -1435,7 +1501,7 @@ impl StateStore {
                     };
                 Ok(ReservationOutcome::Reserved {
                     worker,
-                    agent_runtime,
+                    profile,
                     revision,
                     rollback: Box::new(rollback),
                 })
@@ -1450,9 +1516,13 @@ fn reserve_batch_locked(
     inputs: Vec<ReservationInput>,
     allow_partial: bool,
 ) -> Result<ReservationsOutcome, StateError> {
-    let agent_runtime = match crate::AgentRuntime::from_configured(pool.agent.as_ref()) {
-        Ok(agent_runtime) => agent_runtime,
-        Err(value) => return Ok(ReservationsOutcome::InvalidAgentRuntime { value }),
+    let default_profile = if inputs.iter().any(|input| input.profile.is_none()) {
+        match configured_pool_profile(pool) {
+            Ok(profile) => Some(profile),
+            Err(value) => return Ok(ReservationsOutcome::InvalidAgentRuntime { value }),
+        }
+    } else {
+        None
     };
     let mut workers = Vec::with_capacity(pool.workers.len());
     for worker in &pool.workers {
@@ -1519,8 +1589,12 @@ fn reserve_batch_locked(
     for (worker, mut state, input) in assignments {
         let rollback = state.clone();
         let ticket = input.ticket;
+        let profile = input
+            .profile
+            .or_else(|| default_profile.clone())
+            .expect("a default profile exists when a Reservation has no override");
         state.status = WireStatus::new("busy");
-        state.agent = Some(WireAgent::new(agent_runtime.as_str()));
+        apply_worker_profile(&mut state, &profile);
         state.ticket = Some(ticket.clone());
         state.started_at = Some(input.started_at);
         state.log_file = Some(
@@ -1554,7 +1628,7 @@ fn reserve_batch_locked(
         reserved.push(ReservedWorker {
             worker,
             ticket,
-            agent_runtime,
+            profile,
             revision,
             rollback,
         });
