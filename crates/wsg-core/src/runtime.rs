@@ -105,6 +105,13 @@ impl From<String> for AgentModel {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum AgentRuntimeInvocationProfile {
+    #[default]
+    Standard,
+    TicketDelivery,
+}
+
 /// Typed inputs for one Agent Runtime invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentRuntimeInvocation {
@@ -115,7 +122,7 @@ pub struct AgentRuntimeInvocation {
     session_directory: Option<PathBuf>,
     name: Option<String>,
     system_prompt: Option<String>,
-    direct_dispatch_profile: bool,
+    profile: AgentRuntimeInvocationProfile,
 }
 
 impl AgentRuntimeInvocation {
@@ -129,7 +136,7 @@ impl AgentRuntimeInvocation {
             session_directory: None,
             name: None,
             system_prompt: None,
-            direct_dispatch_profile: false,
+            profile: AgentRuntimeInvocationProfile::Standard,
         }
     }
 
@@ -169,13 +176,13 @@ impl AgentRuntimeInvocation {
         self
     }
 
-    pub(crate) fn with_direct_dispatch_profile(mut self) -> Self {
-        self.direct_dispatch_profile = true;
+    pub(crate) fn with_ticket_delivery_profile(mut self) -> Self {
+        self.profile = AgentRuntimeInvocationProfile::TicketDelivery;
         self
     }
 
     fn session_prompts(&self) -> (Option<String>, String) {
-        let prompt = if self.direct_dispatch_profile {
+        let prompt = if self.profile == AgentRuntimeInvocationProfile::TicketDelivery {
             format!("{PI_DIRECT_DISPATCH_GUIDANCE}\n\n{}", self.prompt)
         } else {
             self.prompt.clone()
@@ -1102,17 +1109,37 @@ impl AgentRuntime {
         model: Option<&AgentModel>,
         workspace: &Path,
     ) -> Result<(), AgentRuntimePreflightError> {
+        self.preflight_dispatch_input(model)?;
+        self.preflight_dispatch_environment(workspace)
+    }
+
+    pub(crate) fn preflight_dispatch_input(
+        self,
+        model: Option<&AgentModel>,
+    ) -> Result<(), AgentRuntimePreflightError> {
         if self == Self::Pi {
-            let model = model.filter(|model| !model.model().is_empty()).ok_or(
-                AgentRuntimePreflightError::MissingModel {
-                    runtime: AgentRuntime::Pi,
-                },
-            )?;
-            if model.provider().is_none_or(str::is_empty) {
-                return Err(AgentRuntimePreflightError::MissingModelProvider {
-                    runtime: AgentRuntime::Pi,
-                });
+            let model = model
+                .filter(|model| !model.model().trim().is_empty())
+                .ok_or_else(|| {
+                    AgentRuntimePreflightError::invalid_input("pi command requires a model")
+                })?;
+            if model
+                .provider()
+                .is_none_or(|provider| provider.trim().is_empty())
+            {
+                return Err(AgentRuntimePreflightError::invalid_input(
+                    "pi command requires a model provider",
+                ));
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn preflight_dispatch_environment(
+        self,
+        workspace: &Path,
+    ) -> Result<(), AgentRuntimePreflightError> {
+        if self == Self::Pi {
             PiDispatchProfile::load()?.preflight(workspace)?;
         }
         Ok(())
@@ -1185,7 +1212,7 @@ struct PiProfileTool {
 }
 
 impl PiDispatchProfile {
-    fn package_path() -> Result<PathBuf, AgentRuntimePreflightError> {
+    fn package_path() -> Result<PathBuf, PiDispatchProfileError> {
         let agent_directory = env::var_os("PI_CODING_AGENT_DIR")
             .filter(|directory| !directory.is_empty())
             .map(PathBuf::from)
@@ -1194,50 +1221,49 @@ impl PiDispatchProfile {
                     .filter(|home| !home.is_empty())
                     .map(|home| PathBuf::from(home).join(".pi/agent"))
             })
-            .ok_or(AgentRuntimePreflightError::MissingPiAgentDirectory)?;
+            .ok_or(PiDispatchProfileError::MissingPiAgentDirectory)?;
         Ok(agent_directory
             .join("npm/node_modules")
             .join(PI_MCP_ADAPTER_NAME))
     }
 
-    fn load() -> Result<Self, AgentRuntimePreflightError> {
+    fn load() -> Result<Self, PiDispatchProfileError> {
         let package = Self::package_path()?;
         let manifest_path = package.join("package.json");
         let manifest = fs::read(&manifest_path).map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
-                AgentRuntimePreflightError::MissingPiMcpAdapter {
+                PiDispatchProfileError::MissingPiMcpAdapter {
                     version: PI_MCP_ADAPTER_VERSION,
                 }
             } else {
-                AgentRuntimePreflightError::ReadPiMcpAdapterManifest { source }
+                PiDispatchProfileError::ReadPiMcpAdapterManifest { source }
             }
         })?;
-        let manifest: PiPackageManifest = serde_json::from_slice(&manifest).map_err(|source| {
-            AgentRuntimePreflightError::MalformedPiMcpAdapterManifest { source }
-        })?;
+        let manifest: PiPackageManifest = serde_json::from_slice(&manifest)
+            .map_err(|source| PiDispatchProfileError::MalformedPiMcpAdapterManifest { source })?;
         if manifest.name != PI_MCP_ADAPTER_NAME || manifest.version != PI_MCP_ADAPTER_VERSION {
-            return Err(AgentRuntimePreflightError::UnsupportedPiMcpAdapter {
+            return Err(PiDispatchProfileError::UnsupportedPiMcpAdapter {
                 found_name: manifest.name,
                 found_version: manifest.version,
                 required_version: PI_MCP_ADAPTER_VERSION,
             });
         }
         if !package.join(PI_MCP_ADAPTER_ENTRY).is_file() {
-            return Err(AgentRuntimePreflightError::MissingPiMcpAdapter {
+            return Err(PiDispatchProfileError::MissingPiMcpAdapter {
                 version: PI_MCP_ADAPTER_VERSION,
             });
         }
         Ok(Self { package })
     }
 
-    fn preflight(&self, workspace: &Path) -> Result<(), AgentRuntimePreflightError> {
+    fn preflight(&self, workspace: &Path) -> Result<(), PiDispatchProfileError> {
         let mut probe_extension = tempfile::NamedTempFile::new()
-            .map_err(|source| AgentRuntimePreflightError::PreparePiProfileProbe { source })?;
+            .map_err(|source| PiDispatchProfileError::PreparePiProfileProbe { source })?;
         probe_extension
             .write_all(PI_PROFILE_PROBE_EXTENSION.as_bytes())
-            .map_err(|source| AgentRuntimePreflightError::PreparePiProfileProbe { source })?;
+            .map_err(|source| PiDispatchProfileError::PreparePiProfileProbe { source })?;
         let probe_output = tempfile::NamedTempFile::new()
-            .map_err(|source| AgentRuntimePreflightError::PreparePiProfileProbe { source })?;
+            .map_err(|source| PiDispatchProfileError::PreparePiProfileProbe { source })?;
         let mut command = Command::new(AgentRuntime::Pi.as_str());
         command.args([
             "--mode",
@@ -1266,54 +1292,54 @@ impl PiDispatchProfile {
             .process_group(0);
         let mut child = command
             .spawn()
-            .map_err(|source| AgentRuntimePreflightError::StartPiProfileProbe { source })?;
+            .map_err(|source| PiDispatchProfileError::StartPiProfileProbe { source })?;
         let deadline = Instant::now() + PI_PROFILE_PROBE_TIMEOUT;
         let status = loop {
             if let Some(status) = child
                 .try_wait()
-                .map_err(|source| AgentRuntimePreflightError::WaitForPiProfileProbe { source })?
+                .map_err(|source| PiDispatchProfileError::WaitForPiProfileProbe { source })?
             {
                 break status;
             }
             if Instant::now() >= deadline {
                 terminate_profile_probe(&mut child);
-                return Err(AgentRuntimePreflightError::PiProfileProbeTimeout);
+                return Err(PiDispatchProfileError::PiProfileProbeTimeout);
             }
             thread::sleep(PROCESS_GROUP_POLL);
         };
         if !status.success() {
-            return Err(AgentRuntimePreflightError::PiProfileProbeFailed {
+            return Err(PiDispatchProfileError::PiProfileProbeFailed {
                 status: status.code(),
             });
         }
         let output = fs::read(probe_output.path())
-            .map_err(|source| AgentRuntimePreflightError::ReadPiProfileProbe { source })?;
+            .map_err(|source| PiDispatchProfileError::ReadPiProfileProbe { source })?;
         let probe: PiProfileProbe = serde_json::from_slice(&output)
-            .map_err(|source| AgentRuntimePreflightError::MalformedPiProfileProbe { source })?;
+            .map_err(|source| PiDispatchProfileError::MalformedPiProfileProbe { source })?;
         for required in PI_LINEAR_TOOLS {
             if !probe.all_tools.iter().any(|tool| tool.name == required) {
-                return Err(AgentRuntimePreflightError::MissingPiLinearTool { tool: required });
+                return Err(PiDispatchProfileError::MissingPiLinearTool { tool: required });
             }
             if !probe.active_tools.iter().any(|tool| tool == required) {
-                return Err(AgentRuntimePreflightError::InactivePiLinearTool { tool: required });
+                return Err(PiDispatchProfileError::InactivePiLinearTool { tool: required });
             }
         }
         let get_issue = profile_tool(&probe, "linear_get_issue");
-        require_profile_property(get_issue, "id")?;
+        require_profile_string_property(get_issue, "id")?;
         let update_issue = profile_tool(&probe, "linear_update_issue");
-        require_profile_property(update_issue, "id")?;
-        require_profile_property(update_issue, "assignee")?;
-        if !has_profile_property(update_issue, "status")
-            && !has_profile_property(update_issue, "state")
+        require_profile_string_property(update_issue, "id")?;
+        require_profile_string_property(update_issue, "assignee")?;
+        if !profile_string_property(update_issue, "status")
+            && !profile_string_property(update_issue, "state")
         {
-            return Err(AgentRuntimePreflightError::IncompatiblePiLinearTool {
+            return Err(PiDispatchProfileError::IncompatiblePiLinearTool {
                 tool: "linear_update_issue",
-                requirement: "status or state",
+                requirement: "string status or state",
             });
         }
         let create_comment = profile_tool(&probe, "linear_create_comment");
-        require_profile_property(create_comment, "issueId")?;
-        require_profile_property(create_comment, "body")?;
+        require_profile_string_property(create_comment, "issueId")?;
+        require_profile_string_property(create_comment, "body")?;
         Ok(())
     }
 }
@@ -1326,30 +1352,57 @@ fn profile_tool<'a>(probe: &'a PiProfileProbe, name: &'static str) -> &'a PiProf
         .expect("required Pi profile tool was checked before schema validation")
 }
 
-fn require_profile_property(
+fn require_profile_string_property(
     tool: &PiProfileTool,
     property: &'static str,
-) -> Result<(), AgentRuntimePreflightError> {
-    if has_profile_property(tool, property) {
-        Ok(())
-    } else {
-        Err(AgentRuntimePreflightError::IncompatiblePiLinearTool {
-            tool: match tool.name.as_str() {
-                "linear_get_issue" => "linear_get_issue",
-                "linear_update_issue" => "linear_update_issue",
-                "linear_create_comment" => "linear_create_comment",
-                _ => unreachable!("only required Pi profile tools are validated"),
-            },
-            requirement: property,
-        })
+) -> Result<(), PiDispatchProfileError> {
+    if profile_string_property(tool, property) {
+        return Ok(());
     }
+    Err(PiDispatchProfileError::IncompatiblePiLinearTool {
+        tool: match tool.name.as_str() {
+            "linear_get_issue" => "linear_get_issue",
+            "linear_update_issue" => "linear_update_issue",
+            "linear_create_comment" => "linear_create_comment",
+            _ => unreachable!("only required Pi profile tools are validated"),
+        },
+        requirement: match property {
+            "id" => "string id",
+            "assignee" => "string assignee",
+            "issueId" => "string issueId",
+            "body" => "string body",
+            _ => unreachable!("only required Pi profile properties are validated"),
+        },
+    })
 }
 
-fn has_profile_property(tool: &PiProfileTool, property: &str) -> bool {
+fn profile_string_property(tool: &PiProfileTool, property: &str) -> bool {
+    if tool
+        .parameters
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        != Some("object")
+    {
+        return false;
+    }
     tool.parameters
         .get("properties")
         .and_then(serde_json::Value::as_object)
-        .is_some_and(|properties| properties.contains_key(property))
+        .and_then(|properties| properties.get(property))
+        .is_some_and(schema_accepts_string)
+}
+
+fn schema_accepts_string(schema: &serde_json::Value) -> bool {
+    match schema.get("type") {
+        Some(serde_json::Value::String(value)) if value == "string" => true,
+        Some(serde_json::Value::Array(values)) => values.iter().any(|value| value == "string"),
+        _ => ["anyOf", "oneOf"].iter().any(|keyword| {
+            schema
+                .get(keyword)
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|choices| choices.iter().any(schema_accepts_string))
+        }),
+    }
 }
 
 fn terminate_profile_probe(child: &mut Child) {
@@ -1489,7 +1542,7 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
         "--session-dir",
     ]);
     command.arg(session_directory);
-    if invocation.direct_dispatch_profile {
+    if invocation.profile == AgentRuntimeInvocationProfile::TicketDelivery {
         let package = PiDispatchProfile::package_path().map_err(|error| {
             AgentRuntimeCommandError::InvalidDispatchProfile {
                 detail: error.to_string(),
@@ -1705,15 +1758,88 @@ pub enum AgentRuntimeCommandError {
     InvalidDispatchProfile { detail: String },
 }
 
-/// Errors that prevent the selected runtime profile from satisfying Direct Dispatch.
+/// Provider-neutral categories for runtime profile preflight failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentRuntimePreflightErrorKind {
+    /// Caller-supplied runtime inputs are incomplete or invalid.
+    InvalidInput,
+    /// Required runtime configuration is absent or unsupported.
+    Configuration,
+    /// The runtime profile could not be prepared or executed.
+    RuntimeUnavailable,
+    /// The runtime profile exceeded its fixed deadline.
+    Timeout,
+    /// The runtime returned malformed profile metadata.
+    Protocol,
+    /// The runtime profile lacks a required delivery capability.
+    Capability,
+}
+
+/// A provider-neutral runtime profile preflight failure.
 #[derive(Debug, Error)]
-pub enum AgentRuntimePreflightError {
-    /// The selected runtime requires an explicit model for Direct Dispatch.
-    #[error("{runtime} command requires a model")]
-    MissingModel { runtime: AgentRuntime },
-    /// The selected runtime requires a provider-qualified model for Direct Dispatch.
-    #[error("{runtime} command requires a model provider")]
-    MissingModelProvider { runtime: AgentRuntime },
+#[error("{detail}")]
+pub struct AgentRuntimePreflightError {
+    kind: AgentRuntimePreflightErrorKind,
+    detail: String,
+    #[source]
+    source: Option<Box<dyn std::error::Error + Send + Sync>>,
+}
+
+impl AgentRuntimePreflightError {
+    /// Returns the stable category callers can use without knowing provider details.
+    pub const fn kind(&self) -> AgentRuntimePreflightErrorKind {
+        self.kind
+    }
+
+    fn invalid_input(detail: impl Into<String>) -> Self {
+        Self {
+            kind: AgentRuntimePreflightErrorKind::InvalidInput,
+            detail: detail.into(),
+            source: None,
+        }
+    }
+}
+
+impl From<PiDispatchProfileError> for AgentRuntimePreflightError {
+    fn from(source: PiDispatchProfileError) -> Self {
+        let kind = match &source {
+            PiDispatchProfileError::MissingPiAgentDirectory
+            | PiDispatchProfileError::MissingPiMcpAdapter { .. }
+            | PiDispatchProfileError::UnsupportedPiMcpAdapter { .. } => {
+                AgentRuntimePreflightErrorKind::Configuration
+            }
+            PiDispatchProfileError::ReadPiMcpAdapterManifest { .. }
+            | PiDispatchProfileError::PreparePiProfileProbe { .. }
+            | PiDispatchProfileError::StartPiProfileProbe { .. }
+            | PiDispatchProfileError::WaitForPiProfileProbe { .. }
+            | PiDispatchProfileError::ReadPiProfileProbe { .. } => {
+                AgentRuntimePreflightErrorKind::RuntimeUnavailable
+            }
+            PiDispatchProfileError::PiProfileProbeTimeout => {
+                AgentRuntimePreflightErrorKind::Timeout
+            }
+            PiDispatchProfileError::MalformedPiMcpAdapterManifest { .. }
+            | PiDispatchProfileError::MalformedPiProfileProbe { .. } => {
+                AgentRuntimePreflightErrorKind::Protocol
+            }
+            PiDispatchProfileError::PiProfileProbeFailed { .. }
+            | PiDispatchProfileError::MissingPiLinearTool { .. }
+            | PiDispatchProfileError::InactivePiLinearTool { .. }
+            | PiDispatchProfileError::IncompatiblePiLinearTool { .. } => {
+                AgentRuntimePreflightErrorKind::Capability
+            }
+        };
+        let detail = source.to_string();
+        Self {
+            kind,
+            detail,
+            source: Some(Box::new(source)),
+        }
+    }
+}
+
+#[derive(Debug, Error)]
+enum PiDispatchProfileError {
     /// Pi's configuration root could not be resolved without guessing.
     #[error("Pi Direct Dispatch requires PI_CODING_AGENT_DIR or HOME")]
     MissingPiAgentDirectory,

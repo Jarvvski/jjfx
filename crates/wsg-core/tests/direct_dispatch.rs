@@ -12,11 +12,12 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 use wsg_core::{
-    AgentModel, CommitOutcome, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
-    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
-    DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, Expected, Loaded,
-    PoolCapacity, Repository, RunMode, RunSupervisor, StateChange, Ticket, TicketId, TicketStatus,
-    TicketTitle, WireAgent, WorkerId, WorkerPoolError, WorkerStatus,
+    AgentModel, AgentRuntimePreflightErrorKind, CommitOutcome, DirectDispatchError,
+    DirectDispatchExecution, DirectDispatchFailure, DirectDispatchFailurePhase,
+    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess,
+    DispatchBudget, DispatchDependencyContext, Expected, Loaded, PoolCapacity, Repository, RunMode,
+    RunSupervisor, StateChange, Ticket, TicketId, TicketStatus, TicketTitle, WireAgent, WorkerId,
+    WorkerPoolError, WorkerStatus,
 };
 
 const HELPER_REPOSITORY: &str = "WSG_DIRECT_DISPATCH_REPOSITORY";
@@ -29,6 +30,7 @@ const HELPER_RUNTIME_MARKER: &str = "WSG_DIRECT_DISPATCH_RUNTIME_MARKER";
 const HELPER_PROFILE_FIXTURE: &str = "WSG_DIRECT_DISPATCH_PROFILE_FIXTURE";
 const HELPER_PROFILE_BEHAVIOR: &str = "WSG_DIRECT_DISPATCH_PROFILE_BEHAVIOR";
 const HELPER_PROFILE_DESCENDANT: &str = "WSG_DIRECT_DISPATCH_PROFILE_DESCENDANT";
+const HELPER_PROFILE_COUNT: &str = "WSG_DIRECT_DISPATCH_PROFILE_COUNT";
 const HELPER_MODEL_PROVIDER: &str = "WSG_DIRECT_DISPATCH_MODEL_PROVIDER";
 const HELPER_OPERATION: &str = "WSG_DIRECT_DISPATCH_OPERATION";
 
@@ -128,7 +130,7 @@ fn missing_pi_dispatch_profile_helper() {
                 "unexpected reservation".to_owned()
             }
         }
-    } else if operation == "growth" {
+    } else if operation == "growth" || operation == "batch-success" {
         let second = DirectDispatchRequest::new(
             ticket("ENG-499", "Require Pi Linear profile twice"),
             RunMode::Foreground,
@@ -136,6 +138,7 @@ fn missing_pi_dispatch_profile_helper() {
         .with_model(AgentModel::new("gpt-5.4").with_provider("openai"));
         match dispatch.dispatch_with_approved_growth(&[request, second], 1) {
             Err(error) => error.to_string(),
+            Ok(_) if operation == "batch-success" => "batch success".to_owned(),
             Ok(_) => "unexpected success".to_owned(),
         }
     } else {
@@ -160,9 +163,12 @@ fn missing_pi_dispatch_profile_helper() {
     fs::write(
         env::var_os(HELPER_RESULT).expect("missing-profile result"),
         format!(
-            "{}|{detail}|{}",
+            "{}|{detail}|{}|{}",
             status.as_str(),
-            repository.worker_pool().snapshot().workers().len()
+            repository.worker_pool().snapshot().workers().len(),
+            env::var_os(HELPER_PROFILE_COUNT)
+                .and_then(|path| fs::read_to_string(path).ok())
+                .map_or(0, |probes| probes.lines().count())
         ),
     )
     .expect("write missing-profile result");
@@ -176,7 +182,7 @@ fn missing_pi_profile_fails_before_approved_pool_growth() {
     assert!(result.starts_with("idle|"), "unexpected result: {result}");
     assert!(result.contains("pi-mcp-adapter 2.11.0"));
     assert!(
-        result.ends_with("|1"),
+        result.ends_with("|1|0"),
         "Pool grew before preflight: {result}"
     );
     assert!(
@@ -285,11 +291,33 @@ fn valid_pi_profile_reaches_the_run_supervisor() {
 }
 
 #[test]
+fn pi_batch_preflights_the_workspace_profile_once() {
+    let fixture = r#"{
+        "allTools": [
+            {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"string"}}}},
+            {"name":"linear_create_comment","parameters":{"type":"object","properties":{"issueId":{"type":"string"},"body":{"type":"string"}}}}
+        ],
+        "activeTools": ["linear_get_issue","linear_update_issue","linear_create_comment"]
+    }"#;
+    let (result, runtime_started, _) = run_pi_profile_preflight_request_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#),
+        Some(fixture),
+        "fixture",
+        "openai",
+        "batch-success",
+    );
+
+    assert_eq!(result, "done|batch success|2|1");
+    assert!(runtime_started, "Pi runtimes did not start after preflight");
+}
+
+#[test]
 fn incompatible_pi_linear_schema_fails_before_worker_reservation() {
     let fixture = r#"{
         "allTools": [
             {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
-            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"}}}},
+            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"number"}}}},
             {"name":"linear_create_comment","parameters":{"type":"object","properties":{"issueId":{"type":"string"},"body":{"type":"string"}}}}
         ],
         "activeTools": ["linear_get_issue","linear_update_issue","linear_create_comment"]
@@ -306,6 +334,36 @@ fn incompatible_pi_linear_schema_fails_before_worker_reservation() {
     assert!(
         !runtime_started,
         "Pi runtime started before profile preflight"
+    );
+}
+
+#[test]
+fn pi_preflight_exposes_only_a_provider_neutral_error_category() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    configure_pool_runtime(&repository, "pi");
+    let request =
+        DirectDispatchRequest::new(ticket("ENG-497", "Require a model"), RunMode::Foreground);
+
+    let error = repository
+        .direct_dispatch()
+        .reserve(&request)
+        .expect_err("missing Pi model must fail preflight");
+
+    assert!(matches!(
+        error,
+        DirectDispatchError::Preflight(source)
+            if source.kind() == AgentRuntimePreflightErrorKind::InvalidInput
+    ));
+    assert_eq!(
+        repository.worker_pool().snapshot().workers()[0].status(),
+        WorkerStatus::Idle
     );
 }
 
@@ -1276,6 +1334,7 @@ fn run_pi_profile_preflight_request_case(
 if [ "$1" = "--version" ]; then echo 0.84.1; exit 0; fi
 if [ "$1" = "--help" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi
 if [ "$1" = "--mode" ] && [ "$2" = "rpc" ]; then
+  /usr/bin/printf 'probe\n' >> "$WSG_DIRECT_DISPATCH_PROFILE_COUNT"
   if [ "$WSG_DIRECT_DISPATCH_PROFILE_BEHAVIOR" = "hang" ]; then
     (trap '' TERM; while :; do /bin/sleep 0.05; done) &
     printf '%s\n' "$!" > "$WSG_DIRECT_DISPATCH_PROFILE_DESCENDANT"
@@ -1309,6 +1368,7 @@ exit 0
         fs::write(&fixture, profile_fixture).expect("Pi profile fixture");
     }
     let descendant = temporary_directory.path().join("profile-descendant");
+    let profile_count = temporary_directory.path().join("profile-count");
 
     let output = Command::new(env::current_exe().expect("test executable"))
         .args(["--exact", "missing_pi_dispatch_profile_helper", "--ignored"])
@@ -1320,6 +1380,7 @@ exit 0
         .env(HELPER_PROFILE_FIXTURE, &fixture)
         .env(HELPER_PROFILE_BEHAVIOR, profile_behavior)
         .env(HELPER_PROFILE_DESCENDANT, &descendant)
+        .env(HELPER_PROFILE_COUNT, &profile_count)
         .env(HELPER_MODEL_PROVIDER, model_provider)
         .env(HELPER_OPERATION, operation)
         .stdin(Stdio::null())

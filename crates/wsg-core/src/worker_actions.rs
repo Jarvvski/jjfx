@@ -527,10 +527,7 @@ impl WorkerActions {
                 .as_deref()
                 .filter(|path| !path.as_os_str().is_empty()),
         );
-        let mut invocation = AgentRuntimeInvocation::new(prompt);
-        if runtime == AgentRuntime::Pi {
-            invocation = invocation.with_direct_dispatch_profile();
-        }
+        let mut invocation = AgentRuntimeInvocation::new(prompt).with_ticket_delivery_profile();
         if let Some(model) = self.model.clone() {
             invocation = invocation.with_model(model);
         }

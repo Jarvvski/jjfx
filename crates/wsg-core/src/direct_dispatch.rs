@@ -273,7 +273,6 @@ impl DirectDispatch {
         reservation: Reservation,
         request: &DirectDispatchRequest,
     ) -> Result<DirectDispatchSuccess, DirectDispatchError> {
-        let worker = reservation.worker_id().clone();
         if reservation.ticket() != request.ticket().id().as_str() {
             let mismatch = DirectDispatchError::ReservationTicketMismatch {
                 reserved: reservation.ticket().to_owned(),
@@ -284,6 +283,15 @@ impl DirectDispatch {
         if let Err(error) = self.preflight_runtime(reservation.agent_runtime(), request) {
             return Err(release_before_launch(&reservation, error));
         }
+        self.dispatch_preflighted(reservation, request)
+    }
+
+    fn dispatch_preflighted(
+        &self,
+        reservation: Reservation,
+        request: &DirectDispatchRequest,
+    ) -> Result<DirectDispatchSuccess, DirectDispatchError> {
+        let worker = reservation.worker_id().clone();
         let bases = request
             .dependency_context()
             .map(DispatchDependencyContext::base_revisions)
@@ -331,24 +339,43 @@ impl DirectDispatch {
     }
 
     fn preflight_all(&self, requests: &[DirectDispatchRequest]) -> Result<(), DirectDispatchError> {
-        for request in requests {
-            self.preflight(request)?;
+        if requests.is_empty() {
+            return Ok(());
         }
-        Ok(())
+        let runtime = self.configured_runtime();
+        for request in requests {
+            self.preflight_input(runtime, request)?;
+        }
+        runtime
+            .preflight_dispatch_environment(self.repository.root())
+            .map_err(DirectDispatchError::Preflight)
     }
 
     fn preflight(&self, request: &DirectDispatchRequest) -> Result<(), DirectDispatchError> {
-        let runtime = self
-            .repository
+        self.preflight_runtime(self.configured_runtime(), request)
+    }
+
+    fn configured_runtime(&self) -> AgentRuntime {
+        self.repository
             .worker_pool()
             .snapshot()
             .pool()
             .and_then(|pool| pool.agent_runtime())
-            .unwrap_or(AgentRuntime::Claude);
-        self.preflight_runtime(runtime, request)
+            .unwrap_or(AgentRuntime::Claude)
     }
 
     fn preflight_runtime(
+        &self,
+        runtime: AgentRuntime,
+        request: &DirectDispatchRequest,
+    ) -> Result<(), DirectDispatchError> {
+        self.preflight_input(runtime, request)?;
+        runtime
+            .preflight_dispatch_environment(self.repository.root())
+            .map_err(DirectDispatchError::Preflight)
+    }
+
+    fn preflight_input(
         &self,
         runtime: AgentRuntime,
         request: &DirectDispatchRequest,
@@ -359,7 +386,7 @@ impl DirectDispatch {
             return Err(DispatchPromptError::UnsupportedBudget { runtime }.into());
         }
         runtime
-            .preflight_dispatch(request.model(), self.repository.root())
+            .preflight_dispatch_input(request.model())
             .map_err(DirectDispatchError::Preflight)
     }
 
@@ -389,7 +416,7 @@ impl DirectDispatch {
         }
         for (index, reservation) in claimed {
             let worker = reservation.worker_id().clone();
-            outcomes[index] = match self.dispatch_reserved(reservation, &requests[index]) {
+            outcomes[index] = match self.dispatch_preflighted(reservation, &requests[index]) {
                 Ok(success) => DirectDispatchOutcome::Succeeded(success),
                 Err(error) => DirectDispatchOutcome::Failed(DirectDispatchFailure::new(
                     requests[index].ticket().clone(),

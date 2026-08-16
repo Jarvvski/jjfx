@@ -117,7 +117,7 @@ impl DispatchPromptBuilder {
     ) -> Result<AgentRuntimeInvocation, DispatchPromptError> {
         let ticket_lower = context.ticket.id().as_str().to_ascii_lowercase();
         let mut system_prompt = format!(
-            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- The gh CLI requires: gh -R {} pr create ...\n- Branch naming: {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- To push your work: jj git push --named <branch>=@\n- You have access to Linear MCP tools for fetching Ticket details and updating status.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the PR description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
+            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- The gh CLI requires: gh -R {} pr create ...\n- Branch naming: {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- To push your work: jj git push --named <branch>=@\n- You have access to Linear tools for fetching Ticket details and updating status.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the PR description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
             context.repository.as_str(),
             context.delivery.branch_prefix,
             ticket_lower,
@@ -133,7 +133,7 @@ impl DispatchPromptBuilder {
             ));
         }
         let worker_prompt = format!(
-            "Implement Linear Ticket {}: {}.\n\n1. Fetch the Ticket through Linear MCP and verify its acceptance criteria.\n2. Claim it by moving it to In Progress and assigning {}.\n3. Derive a bookmark beginning {}/{}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe.\n8. Push with jj git push.\n9. Create the Pull Request with: {}\n10. Move {} to Reviewable and add a Linear comment summarizing the implementation, PR URL, and assumptions.",
+            "Implement Linear Ticket {}: {}.\n\n1. Fetch the Ticket through Linear tools and verify its acceptance criteria.\n2. Claim it by moving it to In Progress and assigning {}.\n3. Derive a bookmark beginning {}/{}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe.\n8. Push with jj git push.\n9. Create the Pull Request with: {}\n10. Move {} to Reviewable and add a Linear comment summarizing the implementation, PR URL, and assumptions.",
             context.ticket.id(),
             context.ticket.title().as_str(),
             context.delivery.assignee,
@@ -144,9 +144,7 @@ impl DispatchPromptBuilder {
         );
         let mut invocation =
             AgentRuntimeInvocation::new(worker_prompt).with_system_prompt(system_prompt);
-        if context.runtime == AgentRuntime::Pi {
-            invocation = invocation.with_direct_dispatch_profile();
-        }
+        invocation = invocation.with_ticket_delivery_profile();
         if let Some(model) = context
             .model
             .filter(|model| !model.model().trim().is_empty())
