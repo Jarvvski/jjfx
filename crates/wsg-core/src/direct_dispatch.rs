@@ -351,6 +351,11 @@ impl DirectDispatch {
             .pool()
             .and_then(|pool| pool.agent_runtime())
             .unwrap_or(AgentRuntime::Claude);
+        if matches!(request.budget(), DispatchBudget::MaximumUsd(_))
+            && runtime != AgentRuntime::Claude
+        {
+            return Err(DispatchPromptError::UnsupportedBudget { runtime }.into());
+        }
         runtime
             .preflight_dispatch(request.model(), self.repository.root())
             .map_err(DirectDispatchError::Preflight)

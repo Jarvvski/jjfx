@@ -70,6 +70,46 @@ fn pi_dispatch_prompt_preserves_provider_aware_model_selection() {
 }
 
 #[test]
+fn pi_dispatch_prompt_selects_the_explicit_trusted_linear_profile() {
+    let invocation = DispatchPromptBuilder::new()
+        .initial(
+            dispatch_context(AgentRuntime::Pi)
+                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
+        )
+        .expect("Pi Dispatch prompt")
+        .with_session_directory("/tmp/jjfx-pi-session");
+
+    let command = AgentRuntime::Pi
+        .command(&invocation, AgentRuntimeCapabilities::default())
+        .expect("Pi Direct Dispatch command");
+    let args = command
+        .get_args()
+        .map(OsStr::to_string_lossy)
+        .collect::<Vec<_>>();
+
+    assert!(args.iter().any(|argument| argument == "--no-extensions"));
+    assert!(args.iter().any(|argument| argument == "--extension"));
+    assert!(
+        args.iter()
+            .any(|argument| argument.ends_with("pi-mcp-adapter/index.ts"))
+    );
+    assert!(args.iter().any(|argument| argument == "--no-skills"));
+    assert!(args.iter().any(|argument| argument == "--no-context-files"));
+    assert!(args.iter().any(|argument| argument == "--no-approve"));
+    assert!(
+        args.iter().any(|argument| {
+            argument
+                == "read,bash,edit,write,grep,find,ls,linear_get_issue,linear_update_issue,linear_create_comment"
+        }),
+        "unexpected Pi command arguments: {args:?}"
+    );
+    assert!(
+        args.iter()
+            .any(|argument| argument.contains("Call linear_get_issue directly"))
+    );
+}
+
+#[test]
 fn unsupported_budget_override_is_rejected_before_invocation() {
     let context = dispatch_context(AgentRuntime::Codex)
         .with_budget(DispatchBudget::maximum_usd(12).expect("Dispatch budget"));

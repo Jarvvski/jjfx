@@ -144,6 +144,9 @@ impl DispatchPromptBuilder {
         );
         let mut invocation =
             AgentRuntimeInvocation::new(worker_prompt).with_system_prompt(system_prompt);
+        if context.runtime == AgentRuntime::Pi {
+            invocation = invocation.with_direct_dispatch_profile();
+        }
         if let Some(model) = context
             .model
             .filter(|model| !model.model().trim().is_empty())

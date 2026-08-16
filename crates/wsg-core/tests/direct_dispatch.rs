@@ -15,8 +15,8 @@ use wsg_core::{
     AgentModel, CommitOutcome, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, Expected, Loaded,
-    PoolCapacity, Repository, RunMode, StateChange, Ticket, TicketId, TicketStatus, TicketTitle,
-    WireAgent, WorkerId, WorkerPoolError, WorkerStatus,
+    PoolCapacity, Repository, RunMode, RunSupervisor, StateChange, Ticket, TicketId, TicketStatus,
+    TicketTitle, WireAgent, WorkerId, WorkerPoolError, WorkerStatus,
 };
 
 const HELPER_REPOSITORY: &str = "WSG_DIRECT_DISPATCH_REPOSITORY";
@@ -29,6 +29,8 @@ const HELPER_RUNTIME_MARKER: &str = "WSG_DIRECT_DISPATCH_RUNTIME_MARKER";
 const HELPER_PROFILE_FIXTURE: &str = "WSG_DIRECT_DISPATCH_PROFILE_FIXTURE";
 const HELPER_PROFILE_BEHAVIOR: &str = "WSG_DIRECT_DISPATCH_PROFILE_BEHAVIOR";
 const HELPER_PROFILE_DESCENDANT: &str = "WSG_DIRECT_DISPATCH_PROFILE_DESCENDANT";
+const HELPER_MODEL_PROVIDER: &str = "WSG_DIRECT_DISPATCH_MODEL_PROVIDER";
+const HELPER_OPERATION: &str = "WSG_DIRECT_DISPATCH_OPERATION";
 
 #[test]
 fn request_for_ticket_id_constructs_a_valid_direct_request() {
@@ -104,17 +106,35 @@ fn missing_pi_dispatch_profile_fails_before_worker_reservation() {
 fn missing_pi_dispatch_profile_helper() {
     let repository = Repository::open(env::var_os(HELPER_REPOSITORY).expect("Repository path"))
         .expect("open Repository");
+    let provider = env::var(HELPER_MODEL_PROVIDER).unwrap_or_else(|_| "openai".to_owned());
+    let mut model = AgentModel::new("gpt-5.4");
+    if !provider.is_empty() {
+        model = model.with_provider(provider);
+    }
     let request = DirectDispatchRequest::new(
         ticket("ENG-498", "Require Pi Linear profile"),
         RunMode::Foreground,
     )
-    .with_model(AgentModel::new("gpt-5.4").with_provider("openai"));
-    let detail = match repository.direct_dispatch().dispatch(&[request]) {
-        Err(error) => error.to_string(),
-        Ok(result) => match &result.outcomes()[0] {
-            DirectDispatchOutcome::Failed(failure) => failure.detail().to_owned(),
-            DirectDispatchOutcome::Succeeded(_) => "unexpected success".to_owned(),
-        },
+    .with_model(model);
+    let dispatch = repository.direct_dispatch();
+    let detail = if env::var(HELPER_OPERATION).as_deref() == Ok("reserve") {
+        match dispatch.reserve(&request) {
+            Err(error) => error.to_string(),
+            Ok(reservation) => {
+                RunSupervisor::new()
+                    .reset_run(&repository, reservation.worker_id())
+                    .expect("reset unexpected Reservation");
+                "unexpected reservation".to_owned()
+            }
+        }
+    } else {
+        match dispatch.dispatch(&[request]) {
+            Err(error) => error.to_string(),
+            Ok(result) => match &result.outcomes()[0] {
+                DirectDispatchOutcome::Failed(failure) => failure.detail().to_owned(),
+                DirectDispatchOutcome::Succeeded(_) => "unexpected success".to_owned(),
+            },
+        }
     };
     let status = repository
         .worker_pool()
@@ -223,6 +243,70 @@ fn incompatible_pi_linear_schema_fails_before_worker_reservation() {
     assert!(
         !runtime_started,
         "Pi runtime started before profile preflight"
+    );
+}
+
+#[test]
+fn missing_pi_model_provider_fails_before_worker_reservation() {
+    let fixture = r#"{
+        "allTools": [
+            {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"string"}}}},
+            {"name":"linear_create_comment","parameters":{"type":"object","properties":{"issueId":{"type":"string"},"body":{"type":"string"}}}}
+        ],
+        "activeTools": ["linear_get_issue","linear_update_issue","linear_create_comment"]
+    }"#;
+    let (result, runtime_started, _) = run_pi_profile_preflight_request_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#),
+        Some(fixture),
+        "fixture",
+        "",
+        "reserve",
+    );
+
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(
+        result.contains("requires a model provider"),
+        "unexpected result: {result}"
+    );
+    assert!(
+        !runtime_started,
+        "Pi runtime started before profile preflight"
+    );
+}
+
+#[test]
+fn unsupported_budget_fails_before_worker_reservation() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool");
+    configure_pool_runtime(&repository, "codex");
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-499", "Reject unsupported budget"),
+        RunMode::Foreground,
+    )
+    .with_budget(DispatchBudget::MaximumUsd(1));
+
+    let result = repository.direct_dispatch().reserve(&request);
+
+    let error = match result {
+        Err(error) => error,
+        Ok(reservation) => {
+            RunSupervisor::new()
+                .reset_run(&repository, reservation.worker_id())
+                .expect("reset unexpected Reservation");
+            panic!("unsupported budget reserved a Worker")
+        }
+    };
+    assert!(error.to_string().contains("Dispatch spending override"));
+    assert_eq!(
+        repository.worker_pool().snapshot().workers()[0].status(),
+        WorkerStatus::Idle
     );
 }
 
@@ -693,13 +777,12 @@ fn direct_dispatch_releases_its_reservation_after_prompt_failure() {
             .expect("configure Codex Pool"),
         CommitOutcome::Applied(_)
     ));
-    let request = DirectDispatchRequest::new(
-        ticket("ENG-407", "Fail prompt construction"),
-        RunMode::Foreground,
-    )
-    .with_budget(DispatchBudget::maximum_usd(1).expect("budget"));
+    let ticket = ticket("ENG-407", "Fail prompt construction");
+    let reservable = DirectDispatchRequest::new(ticket.clone(), RunMode::Foreground);
+    let request = DirectDispatchRequest::new(ticket, RunMode::Foreground)
+        .with_budget(DispatchBudget::maximum_usd(1).expect("budget"));
     let dispatch = repository.direct_dispatch();
-    let reservation = dispatch.reserve(&request).expect("reserve Worker");
+    let reservation = dispatch.reserve(&reservable).expect("reserve Worker");
 
     let error = dispatch
         .dispatch_reserved(reservation, &request)
@@ -1073,6 +1156,22 @@ fn run_pi_profile_preflight_case(
     profile_fixture: Option<&str>,
     profile_behavior: &str,
 ) -> (String, bool, Option<u32>) {
+    run_pi_profile_preflight_request_case(
+        manifest,
+        profile_fixture,
+        profile_behavior,
+        "openai",
+        "dispatch",
+    )
+}
+
+fn run_pi_profile_preflight_request_case(
+    manifest: Option<&str>,
+    profile_fixture: Option<&str>,
+    profile_behavior: &str,
+    model_provider: &str,
+    operation: &str,
+) -> (String, bool, Option<u32>) {
     let temporary_directory = tempfile::tempdir().expect("temporary directory");
     let repository_path = temporary_directory.path().join("repository");
     fs::create_dir(&repository_path).expect("repository directory");
@@ -1125,6 +1224,8 @@ exit 0
         let package = agent_dir.join("npm/node_modules/pi-mcp-adapter");
         fs::create_dir_all(&package).expect("Pi MCP adapter package directory");
         fs::write(package.join("package.json"), manifest).expect("Pi MCP adapter manifest");
+        fs::write(package.join("index.ts"), "export default function () {}\n")
+            .expect("Pi MCP adapter entry");
     }
     let fixture = temporary_directory.path().join("profile-fixture.json");
     if let Some(profile_fixture) = profile_fixture {
@@ -1142,6 +1243,8 @@ exit 0
         .env(HELPER_PROFILE_FIXTURE, &fixture)
         .env(HELPER_PROFILE_BEHAVIOR, profile_behavior)
         .env(HELPER_PROFILE_DESCENDANT, &descendant)
+        .env(HELPER_MODEL_PROVIDER, model_provider)
+        .env(HELPER_OPERATION, operation)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

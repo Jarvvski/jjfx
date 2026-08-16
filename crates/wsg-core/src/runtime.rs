@@ -26,6 +26,7 @@ const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
 const PROCESS_GROUP_FORCE_TIMEOUT: Duration = Duration::from_secs(1);
 const PI_MCP_ADAPTER_NAME: &str = "pi-mcp-adapter";
 const PI_MCP_ADAPTER_VERSION: &str = "2.11.0";
+const PI_MCP_ADAPTER_ENTRY: &str = "index.ts";
 const PI_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const PI_PROFILE_PROBE_OUTPUT_ENV: &str = "JJFX_PI_PROFILE_PROBE_OUTPUT";
 const PI_LINEAR_TOOLS: [&str; 3] = [
@@ -33,6 +34,7 @@ const PI_LINEAR_TOOLS: [&str; 3] = [
     "linear_update_issue",
     "linear_create_comment",
 ];
+const PI_DIRECT_DISPATCH_GUIDANCE: &str = "Linear delivery tools are direct Pi tools for this Run. Call linear_get_issue directly to fetch the Ticket, linear_update_issue directly to change status or assignee, and linear_create_comment directly to post delivery notes. Do not look for an MCP wrapper or another tool namespace.";
 const PI_PROFILE_PROBE_EXTENSION: &str = r#"import { writeFileSync } from "node:fs";
 export default function (pi) {
   pi.on("session_start", () => {
@@ -113,6 +115,7 @@ pub struct AgentRuntimeInvocation {
     session_directory: Option<PathBuf>,
     name: Option<String>,
     system_prompt: Option<String>,
+    direct_dispatch_profile: bool,
 }
 
 impl AgentRuntimeInvocation {
@@ -126,6 +129,7 @@ impl AgentRuntimeInvocation {
             session_directory: None,
             name: None,
             system_prompt: None,
+            direct_dispatch_profile: false,
         }
     }
 
@@ -165,13 +169,23 @@ impl AgentRuntimeInvocation {
         self
     }
 
+    pub(crate) fn with_direct_dispatch_profile(mut self) -> Self {
+        self.direct_dispatch_profile = true;
+        self
+    }
+
     fn session_prompts(&self) -> (Option<String>, String) {
+        let prompt = if self.direct_dispatch_profile {
+            format!("{PI_DIRECT_DISPATCH_GUIDANCE}\n\n{}", self.prompt)
+        } else {
+            self.prompt.clone()
+        };
         if self
             .session_id
             .as_deref()
             .is_some_and(|session_id| !session_id.is_empty())
         {
-            return (None, format!("{DELEGATION_RULES}\n\n{}", self.prompt));
+            return (None, format!("{DELEGATION_RULES}\n\n{prompt}"));
         }
         let system_prompt = self
             .system_prompt
@@ -181,7 +195,7 @@ impl AgentRuntimeInvocation {
                 || DELEGATION_RULES.to_owned(),
                 |prompt| format!("{prompt}\n\n{DELEGATION_RULES}"),
             );
-        (Some(system_prompt), self.prompt.clone())
+        (Some(system_prompt), prompt)
     }
 }
 
@@ -1085,10 +1099,20 @@ impl AgentRuntime {
 
     pub(crate) fn preflight_dispatch(
         self,
-        _model: Option<&AgentModel>,
+        model: Option<&AgentModel>,
         workspace: &Path,
     ) -> Result<(), AgentRuntimePreflightError> {
         if self == Self::Pi {
+            let model = model.filter(|model| !model.model().is_empty()).ok_or(
+                AgentRuntimePreflightError::MissingModel {
+                    runtime: AgentRuntime::Pi,
+                },
+            )?;
+            if model.provider().is_none_or(str::is_empty) {
+                return Err(AgentRuntimePreflightError::MissingModelProvider {
+                    runtime: AgentRuntime::Pi,
+                });
+            }
             PiDispatchProfile::load()?.preflight(workspace)?;
         }
         Ok(())
@@ -1161,7 +1185,7 @@ struct PiProfileTool {
 }
 
 impl PiDispatchProfile {
-    fn load() -> Result<Self, AgentRuntimePreflightError> {
+    fn package_path() -> Result<PathBuf, AgentRuntimePreflightError> {
         let agent_directory = env::var_os("PI_CODING_AGENT_DIR")
             .filter(|directory| !directory.is_empty())
             .map(PathBuf::from)
@@ -1171,9 +1195,13 @@ impl PiDispatchProfile {
                     .map(|home| PathBuf::from(home).join(".pi/agent"))
             })
             .ok_or(AgentRuntimePreflightError::MissingPiAgentDirectory)?;
-        let package = agent_directory
+        Ok(agent_directory
             .join("npm/node_modules")
-            .join(PI_MCP_ADAPTER_NAME);
+            .join(PI_MCP_ADAPTER_NAME))
+    }
+
+    fn load() -> Result<Self, AgentRuntimePreflightError> {
+        let package = Self::package_path()?;
         let manifest_path = package.join("package.json");
         let manifest = fs::read(&manifest_path).map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
@@ -1192,6 +1220,11 @@ impl PiDispatchProfile {
                 found_name: manifest.name,
                 found_version: manifest.version,
                 required_version: PI_MCP_ADAPTER_VERSION,
+            });
+        }
+        if !package.join(PI_MCP_ADAPTER_ENTRY).is_file() {
+            return Err(AgentRuntimePreflightError::MissingPiMcpAdapter {
+                version: PI_MCP_ADAPTER_VERSION,
             });
         }
         Ok(Self { package })
@@ -1213,7 +1246,7 @@ impl PiDispatchProfile {
             "--no-extensions",
             "--extension",
         ]);
-        command.arg(&self.package);
+        command.arg(self.package.join(PI_MCP_ADAPTER_ENTRY));
         command.arg("--extension").arg(probe_extension.path());
         command.args([
             "--no-skills",
@@ -1456,7 +1489,16 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
         "--session-dir",
     ]);
     command.arg(session_directory);
-    add_pi_worker_policy(&mut command);
+    if invocation.direct_dispatch_profile {
+        let package = PiDispatchProfile::package_path().map_err(|error| {
+            AgentRuntimeCommandError::InvalidDispatchProfile {
+                detail: error.to_string(),
+            }
+        })?;
+        add_pi_worker_policy(&mut command, Some(&package.join(PI_MCP_ADAPTER_ENTRY)));
+    } else {
+        add_pi_worker_policy(&mut command, None);
+    }
     if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
         command.args(["--name", name]);
     }
@@ -1483,7 +1525,7 @@ pub(crate) fn pi_interactive_command(
     let mut command = Command::new(AgentRuntime::Pi.as_str());
     command.args(["--provider", provider, "--model", model, "--session-dir"]);
     command.arg(session_directory);
-    add_pi_worker_policy(&mut command);
+    add_pi_worker_policy(&mut command, None);
     if let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) {
         command.args(["--session", session_id]);
     }
@@ -1515,16 +1557,19 @@ fn required_pi_session_directory(
         .ok_or(AgentRuntimeCommandError::MissingSessionDirectory)
 }
 
-fn add_pi_worker_policy(command: &mut Command) {
+fn add_pi_worker_policy(command: &mut Command, dispatch_package: Option<&Path>) {
+    command.arg("--no-extensions");
+    if let Some(package) = dispatch_package {
+        command.arg("--extension").arg(package);
+    }
     command.args([
-        "--no-extensions",
         "--no-skills",
         "--no-prompt-templates",
         "--no-themes",
         "--no-context-files",
         "--no-approve",
         "--tools",
-        PI_WORKER_TOOLS,
+        dispatch_package.map_or(PI_WORKER_TOOLS, |_| PI_DISPATCH_TOOLS),
     ]);
 }
 
@@ -1655,11 +1700,20 @@ pub enum AgentRuntimeCommandError {
     /// Pi has no native aggregate budget command flag.
     #[error("{runtime} does not support an aggregate budget override")]
     UnsupportedBudget { runtime: AgentRuntime },
+    /// Pi's explicit Direct Dispatch profile path could not be resolved.
+    #[error("invalid Direct Dispatch runtime profile: {detail}")]
+    InvalidDispatchProfile { detail: String },
 }
 
 /// Errors that prevent the selected runtime profile from satisfying Direct Dispatch.
 #[derive(Debug, Error)]
 pub enum AgentRuntimePreflightError {
+    /// The selected runtime requires an explicit model for Direct Dispatch.
+    #[error("{runtime} command requires a model")]
+    MissingModel { runtime: AgentRuntime },
+    /// The selected runtime requires a provider-qualified model for Direct Dispatch.
+    #[error("{runtime} command requires a model provider")]
+    MissingModelProvider { runtime: AgentRuntime },
     /// Pi's configuration root could not be resolved without guessing.
     #[error("Pi Direct Dispatch requires PI_CODING_AGENT_DIR or HOME")]
     MissingPiAgentDirectory,
