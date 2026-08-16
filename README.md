@@ -50,25 +50,57 @@ expose a native permission or attention event, so jjfx does not fabricate
 process may remain waiting until a later lifecycle event because jjfx does not
 infer shutdown by polling or terminal scraping.
 
-## Pi Worker actions and ticket discovery
+## Pi Worker actions, Direct Dispatch, and ticket discovery
 
-The shared Worker action layer supports Pi 0.84.x for fresh and resumed
-Follow-ups and interactive kitty mounts. The `pi` executable must be on `PATH`,
-and the host must select an authenticated provider and model explicitly through
-`WorkerActions::with_model(AgentModel::new(model).with_provider(provider))`.
-Pi Direct Dispatch profiles and broader runtime selection remain separate from
-these Worker action contracts.
+The shared Worker action layer supports Pi 0.84.x for Direct Dispatch, fresh
+and resumed Follow-ups, and interactive kitty mounts. The `pi` executable must
+be on `PATH`, and callers must select an authenticated provider and model
+explicitly through `AgentModel::new(model).with_provider(provider)`.
+
+Pi Direct Dispatch and Follow-up require the pinned `pi-mcp-adapter` 2.11.0
+package:
+
+```bash
+pi install npm:pi-mcp-adapter@2.11.0
+```
+
+Configure a Linear MCP server named `linear` and expose only the required
+original tools as direct tools. Keep the server transport and credential lookup
+in your MCP configuration rather than command arguments:
+
+```json
+{
+  "mcpServers": {
+    "linear": {
+      "url": "<your Linear MCP endpoint>",
+      "directTools": ["get_issue", "update_issue", "create_comment"]
+    }
+  }
+}
+```
+
+Before any Worker reservation, Pool growth, assignment persistence, or
+Workspace preparation, jjfx starts a bounded isolated Pi RPC probe. The probe
+loads only the pinned adapter and a private inspection extension, then requires
+active `linear_get_issue`, `linear_update_issue`, and
+`linear_create_comment` tools with compatible schemas. Missing provider/model,
+package, tool, or schema support fails with sanitized setup guidance and does
+not fall back to Claude or Codex.
 
 Pi Worker runs and mounts use the repository-owned `.jj/pool/pi-sessions`
-directory, ignore inherited extensions, skills, prompt templates, themes,
-context files, and project trust, and allow only the built-in
-`read,bash,edit,write,grep,find,ls` tools. This tool policy is not filesystem
-confinement: Pi runs with the host user's permissions, so use an operating-system
-sandbox when the Workspace needs a stronger boundary.
+directory. Direct Dispatch and Follow-up ignore inherited extensions, skills,
+prompt templates, themes, context files, and project trust, explicitly load
+only the pinned Linear adapter, disable approval prompts, and allow the fixed
+`read,bash,edit,write,grep,find,ls` tools plus the three Linear tools. Interactive
+Mount retains the fixed built-in coding-tool policy. These policies are not
+filesystem confinement: Pi runs with the host user's permissions, so use an
+operating-system sandbox when the Workspace needs a stronger boundary.
 
-Pi core does not provide aggregate budget limits, per-tool approval dialogs,
-or native Linear ticket discovery. For read-only Ready Ticket and dependency
-discovery, set `JJFX_PI_LINEAR_HELPER` to a dedicated helper executable. jjfx
+Pi core does not provide aggregate budget limits or per-tool approval dialogs,
+so those Direct Dispatch choices are rejected instead of silently weakened. Pi
+also has no native Linear ticket discovery. For read-only Ready Ticket and
+dependency discovery, set `JJFX_PI_LINEAR_HELPER` to a dedicated helper
+executable. jjfx
 runs it directly from the repository root with a 30-second timeout, sends one
 versioned JSON request on stdin, and expects one versioned JSON result or typed
 error on stdout. The helper owns credential lookup and must provide read-only

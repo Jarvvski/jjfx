@@ -7,6 +7,15 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-08-16 - Added the preflighted Pi Direct Dispatch profile in jjfx 0.39.0
+  and wsg 0.13.0. Provider-qualified models now reach Dispatch and
+  orchestration, while a pinned `pi-mcp-adapter` 2.11.0 profile validates the
+  exact direct Linear tools and schemas before Worker, Pool, assignment, or
+  Workspace mutation. Pi Runs and Follow-ups explicitly disable inherited
+  resources and approvals, retain a fixed coding-tool policy, and reject
+  unsupported budgets without weakening the delivery contract or changing
+  Claude and Codex behavior.
+
 - 2026-08-15 - Added Pi 0.84.x interactive lifecycle tracking in jjfx 0.38.0.
   A jjfx-owned Pi extension now reports explicit session identity and
   working, waiting, and graceful shutdown events through the shared JSONL
