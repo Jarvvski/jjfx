@@ -117,7 +117,8 @@ fn missing_pi_dispatch_profile_helper() {
     )
     .with_model(model);
     let dispatch = repository.direct_dispatch();
-    let detail = if env::var(HELPER_OPERATION).as_deref() == Ok("reserve") {
+    let operation = env::var(HELPER_OPERATION).unwrap_or_else(|_| "dispatch".to_owned());
+    let detail = if operation == "reserve" {
         match dispatch.reserve(&request) {
             Err(error) => error.to_string(),
             Ok(reservation) => {
@@ -127,11 +128,24 @@ fn missing_pi_dispatch_profile_helper() {
                 "unexpected reservation".to_owned()
             }
         }
+    } else if operation == "growth" {
+        let second = DirectDispatchRequest::new(
+            ticket("ENG-499", "Require Pi Linear profile twice"),
+            RunMode::Foreground,
+        )
+        .with_model(AgentModel::new("gpt-5.4").with_provider("openai"));
+        match dispatch.dispatch_with_approved_growth(&[request, second], 1) {
+            Err(error) => error.to_string(),
+            Ok(_) => "unexpected success".to_owned(),
+        }
     } else {
         match dispatch.dispatch(&[request]) {
             Err(error) => error.to_string(),
             Ok(result) => match &result.outcomes()[0] {
                 DirectDispatchOutcome::Failed(failure) => failure.detail().to_owned(),
+                DirectDispatchOutcome::Succeeded(_) if operation == "success" => {
+                    "success".to_owned()
+                }
                 DirectDispatchOutcome::Succeeded(_) => "unexpected success".to_owned(),
             },
         }
@@ -145,9 +159,30 @@ fn missing_pi_dispatch_profile_helper() {
         .status();
     fs::write(
         env::var_os(HELPER_RESULT).expect("missing-profile result"),
-        format!("{}|{detail}", status.as_str()),
+        format!(
+            "{}|{detail}|{}",
+            status.as_str(),
+            repository.worker_pool().snapshot().workers().len()
+        ),
     )
     .expect("write missing-profile result");
+}
+
+#[test]
+fn missing_pi_profile_fails_before_approved_pool_growth() {
+    let (result, runtime_started, _) =
+        run_pi_profile_preflight_request_case(None, None, "fixture", "openai", "growth");
+
+    assert!(result.starts_with("idle|"), "unexpected result: {result}");
+    assert!(result.contains("pi-mcp-adapter 2.11.0"));
+    assert!(
+        result.ends_with("|1"),
+        "Pool grew before preflight: {result}"
+    );
+    assert!(
+        !runtime_started,
+        "Pi runtime started before profile preflight"
+    );
 }
 
 #[test]
@@ -218,6 +253,34 @@ fn pi_profile_probe_timeout_reaps_descendants_before_worker_reservation() {
             .expect("probe descendant liveness")
             .success(),
         "profile probe descendant {descendant} survived timeout"
+    );
+}
+
+#[test]
+fn valid_pi_profile_reaches_the_run_supervisor() {
+    let fixture = r#"{
+        "allTools": [
+            {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+            {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"string"}}}},
+            {"name":"linear_create_comment","parameters":{"type":"object","properties":{"issueId":{"type":"string"},"body":{"type":"string"}}}}
+        ],
+        "activeTools": ["linear_get_issue","linear_update_issue","linear_create_comment"]
+    }"#;
+    let (result, runtime_started, _) = run_pi_profile_preflight_request_case(
+        Some(r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#),
+        Some(fixture),
+        "fixture",
+        "openai",
+        "success",
+    );
+
+    assert!(
+        result.starts_with("done|success|"),
+        "unexpected result: {result}"
+    );
+    assert!(
+        runtime_started,
+        "Pi runtime did not start after valid preflight"
     );
 }
 
@@ -783,6 +846,19 @@ fn direct_dispatch_releases_its_reservation_after_prompt_failure() {
         .with_budget(DispatchBudget::maximum_usd(1).expect("budget"));
     let dispatch = repository.direct_dispatch();
     let reservation = dispatch.reserve(&reservable).expect("reserve Worker");
+    let workspace = repository
+        .root()
+        .parent()
+        .expect("Repository parent")
+        .join(format!(
+            "{}-workspaces/{worker}",
+            repository
+                .root()
+                .file_name()
+                .expect("Repository name")
+                .to_string_lossy()
+        ));
+    fs::remove_dir_all(workspace).expect("remove Worker Workspace");
 
     let error = dispatch
         .dispatch_reserved(reservation, &request)
@@ -1208,7 +1284,8 @@ if [ "$1" = "--mode" ] && [ "$2" = "rpc" ]; then
   /bin/cp "$WSG_DIRECT_DISPATCH_PROFILE_FIXTURE" "$JJFX_PI_PROFILE_PROBE_OUTPUT"
   exit 0
 fi
-touch "$WSG_DIRECT_DISPATCH_RUNTIME_MARKER"
+/usr/bin/touch "$WSG_DIRECT_DISPATCH_RUNTIME_MARKER"
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"provider":"openai","model":"gpt-5.4","stopReason":"stop"}}'
 exit 0
 "#,
     );

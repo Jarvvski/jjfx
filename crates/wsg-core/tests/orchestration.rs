@@ -12,6 +12,10 @@ use wsg_core::{
     WorkerState,
 };
 
+const HELPER_REPOSITORY: &str = "WSG_ORCHESTRATION_REPOSITORY";
+const HELPER_RESULT: &str = "WSG_ORCHESTRATION_RESULT";
+const HELPER_RUNTIME_MARKER: &str = "WSG_ORCHESTRATION_RUNTIME_MARKER";
+
 struct StaticQuery(&'static str);
 
 impl TicketQuery for StaticQuery {
@@ -358,6 +362,130 @@ fn restart_does_not_duplicate_a_persisted_assignment_with_a_live_worker() {
         wsg_core::Loaded::Missing => panic!("group disappeared"),
     };
     assert_eq!(loaded.sub_issues[&ticket].status.as_str(), "dispatched");
+}
+
+#[test]
+fn pi_orchestration_preflights_before_assignment_persistence() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-700").expect("Parent Ticket");
+    let ticket = TicketId::parse("ENG-701").expect("Sub-issue");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker(&repository, &worker);
+    let pool = repository.state_store().pool();
+    let wsg_core::Loaded::Present(versioned) = pool.load().expect("load Pool") else {
+        panic!("Pool missing")
+    };
+    let revision = versioned.revision().clone();
+    let mut pool_state = versioned.value;
+    pool_state.agent = Some(wsg_core::WireAgent::new("pi"));
+    pool.commit(Expected::Match(revision), StateChange::Replace(pool_state))
+        .expect("configure Pi Pool");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-08-16T10:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    group.sub_issues.insert(
+        ticket,
+        SubIssueState::new("Preflight Pi", WireStatus::new("pending"), Vec::new()),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent)
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save pending group");
+    let bin = directory.path().join("isolated-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    let runtime_marker = directory.path().join("runtime-started");
+    fs::write(
+        bin.join("pi"),
+        "#!/bin/sh\n/usr/bin/touch \"$WSG_ORCHESTRATION_RUNTIME_MARKER\"\nexit 0\n",
+    )
+    .expect("fake Pi");
+    let mut permissions = fs::metadata(bin.join("pi"))
+        .expect("fake Pi metadata")
+        .permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
+    fs::set_permissions(bin.join("pi"), permissions).expect("fake Pi permissions");
+    let agent_dir = directory.path().join("empty-pi-agent");
+    fs::create_dir(&agent_dir).expect("empty Pi agent directory");
+    let result = directory.path().join("orchestration-result");
+
+    let output = Command::new(std::env::current_exe().expect("test executable"))
+        .args(["--exact", "pi_orchestration_preflight_helper", "--ignored"])
+        .env("PATH", &bin)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_RUNTIME_MARKER, &runtime_marker)
+        .output()
+        .expect("Pi orchestration helper");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(result).expect("orchestration result");
+    assert!(
+        result.starts_with("pending|none|idle|"),
+        "unexpected result: {result}"
+    );
+    assert!(result.contains("pi-mcp-adapter 2.11.0"));
+    assert!(
+        !runtime_marker.exists(),
+        "Pi started before profile preflight"
+    );
+}
+
+#[test]
+#[ignore]
+fn pi_orchestration_preflight_helper() {
+    let repository =
+        Repository::open(std::env::var_os(HELPER_REPOSITORY).expect("orchestration repository"))
+            .expect("open repository");
+    let parent = TicketId::parse("ENG-700").expect("Parent Ticket");
+    let error = repository
+        .orchestration_runner()
+        .advance_once(
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Pi)
+                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
+            |_| {},
+        )
+        .expect_err("missing Pi profile should fail orchestration");
+    let group = match repository
+        .state_store()
+        .dispatch_group(parent)
+        .load()
+        .expect("load group")
+    {
+        wsg_core::Loaded::Present(group) => group.value,
+        wsg_core::Loaded::Missing => panic!("group missing"),
+    };
+    let issue = group.sub_issues.values().next().expect("pending issue");
+    let worker = repository
+        .worker_pool()
+        .snapshot()
+        .workers()
+        .first()
+        .expect("Worker")
+        .clone();
+    fs::write(
+        std::env::var_os(HELPER_RESULT).expect("orchestration result"),
+        format!(
+            "{}|{}|{}|{error}",
+            issue.status.as_str(),
+            issue
+                .worker
+                .as_ref()
+                .map_or("none", wsg_core::WorkerId::as_str),
+            worker.status().as_str()
+        ),
+    )
+    .expect("write orchestration result");
 }
 
 #[test]

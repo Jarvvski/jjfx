@@ -281,14 +281,8 @@ impl DirectDispatch {
             };
             return Err(release_before_launch(&reservation, mismatch));
         }
-        if let Err(error) = reservation
-            .agent_runtime()
-            .preflight_dispatch(request.model(), self.repository.root())
-        {
-            return Err(release_before_launch(
-                &reservation,
-                DirectDispatchError::Preflight(error),
-            ));
+        if let Err(error) = self.preflight_runtime(reservation.agent_runtime(), request) {
+            return Err(release_before_launch(&reservation, error));
         }
         let bases = request
             .dependency_context()
@@ -351,6 +345,14 @@ impl DirectDispatch {
             .pool()
             .and_then(|pool| pool.agent_runtime())
             .unwrap_or(AgentRuntime::Claude);
+        self.preflight_runtime(runtime, request)
+    }
+
+    fn preflight_runtime(
+        &self,
+        runtime: AgentRuntime,
+        request: &DirectDispatchRequest,
+    ) -> Result<(), DirectDispatchError> {
         if matches!(request.budget(), DispatchBudget::MaximumUsd(_))
             && runtime != AgentRuntime::Claude
         {

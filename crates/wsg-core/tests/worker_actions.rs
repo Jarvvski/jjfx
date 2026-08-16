@@ -574,6 +574,7 @@ fn reset_terminates_a_background_pi_follow_up_and_its_descendant() {
             "#!/bin/bash\n",
             "if [ \"$1\" = \"--version\" ]; then echo 0.84.1; exit 0; fi\n",
             "if [ \"$1\" = \"--help\" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\n",
+            "if [ \"$1\" = \"--mode\" ] && [ \"$2\" = \"rpc\" ]; then /bin/cp \"$WSG_WORKER_PROFILE_FIXTURE\" \"$JJFX_PI_PROFILE_PROBE_OUTPUT\"; exit 0; fi\n",
             "( trap '' TERM; while :; do sleep 0.05; done ) &\n",
             "printf '%s\\n' \"$!\" > \"$WSG_ACTION_DESCENDANT\"\n",
             "trap '' TERM\n",
@@ -582,6 +583,7 @@ fn reset_terminates_a_background_pi_follow_up_and_its_descendant() {
             "while :; do sleep 0.05; done\n"
         ),
     );
+    let (agent_dir, profile_fixture) = install_valid_pi_profile(temporary_directory.path());
     let result = temporary_directory.path().join("pi-background-pid");
     let process = temporary_directory.path().join("pi-background-process");
     let descendant = temporary_directory.path().join("pi-background-descendant");
@@ -602,6 +604,8 @@ fn reset_terminates_a_background_pi_follow_up_and_its_descendant() {
         .env(HELPER_RESULT, &result)
         .env(HELPER_PROVIDER, "test-provider")
         .env(HELPER_MODEL, "test-model")
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("WSG_WORKER_PROFILE_FIXTURE", &profile_fixture)
         .env(HELPER_PROCESS, &process)
         .env(HELPER_DESCENDANT, &descendant)
         .env(HELPER_DIAGNOSTIC, &diagnostic)
@@ -847,6 +851,7 @@ fn send_resumes_the_prior_pi_session_with_the_configured_model() {
     fs::create_dir(&bin).expect("fake executable directory");
     let captured = temporary_directory.path().join("captured-pi-args");
     write_fake_pi(&bin.join("pi"), &captured);
+    let (agent_dir, profile_fixture) = install_valid_pi_profile(temporary_directory.path());
     let result = temporary_directory.path().join("pi-result");
     let path = env::join_paths([
         bin.as_os_str(),
@@ -862,6 +867,8 @@ fn send_resumes_the_prior_pi_session_with_the_configured_model() {
         .env(HELPER_RESULT, &result)
         .env(HELPER_PROVIDER, "test-provider")
         .env(HELPER_MODEL, "test-model")
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("WSG_WORKER_PROFILE_FIXTURE", &profile_fixture)
         .stdin(Stdio::null())
         .output()
         .expect("Pi Send helper should run");
@@ -892,6 +899,7 @@ fn send_on_an_idle_pi_worker_starts_fresh_with_the_configured_model() {
     fs::create_dir(&bin).expect("fake executable directory");
     let captured = temporary_directory.path().join("captured-fresh-pi-args");
     write_fake_pi(&bin.join("pi"), &captured);
+    let (agent_dir, profile_fixture) = install_valid_pi_profile(temporary_directory.path());
     let result = temporary_directory.path().join("fresh-pi-result");
     let path = env::join_paths([
         bin.as_os_str(),
@@ -907,6 +915,8 @@ fn send_on_an_idle_pi_worker_starts_fresh_with_the_configured_model() {
         .env(HELPER_RESULT, &result)
         .env(HELPER_PROVIDER, "test-provider")
         .env(HELPER_MODEL, "test-model")
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("WSG_WORKER_PROFILE_FIXTURE", &profile_fixture)
         .stdin(Stdio::null())
         .output()
         .expect("fresh Pi Send helper should run");
@@ -972,7 +982,103 @@ fn send_on_an_idle_worker_starts_fresh_and_reports_the_reason() {
 }
 
 #[test]
-fn failed_pi_send_validation_restores_the_prior_terminal_worker() {
+fn invalid_pi_follow_up_profile_fails_before_beginning_follow_up() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let prior_log = repository.root().join("prior-profile-pi.log");
+    fs::write(
+        &prior_log,
+        "{\"type\":\"session\",\"version\":3,\"id\":\"session-pi-profile\",\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":\"/tmp/project\"}\n",
+    )
+    .expect("prior Pi Session log");
+    set_terminal_worker_for_runtime(&repository, &worker, &prior_log, AgentRuntime::Pi);
+
+    let agent_dir = temporary_directory.path().join("pi-agent");
+    let package = agent_dir.join("npm/node_modules/pi-mcp-adapter");
+    fs::create_dir_all(&package).expect("Pi adapter package");
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#,
+    )
+    .expect("Pi adapter manifest");
+    fs::write(package.join("index.ts"), "export default function () {}\n")
+        .expect("Pi adapter entry");
+    let fixture = temporary_directory.path().join("profile-fixture.json");
+    fs::write(
+        &fixture,
+        r#"{
+            "allTools": [
+                {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+                {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"string"}}}}
+            ],
+            "activeTools": ["linear_get_issue","linear_update_issue"]
+        }"#,
+    )
+    .expect("Pi profile fixture");
+    let bin = temporary_directory.path().join("profile-pi-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    let runtime_marker = temporary_directory.path().join("runtime-started");
+    write_executable(
+        &bin.join("pi"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then echo 0.84.1; exit 0; fi
+if [ "$1" = "--help" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi
+if [ "$1" = "--mode" ] && [ "$2" = "rpc" ]; then /bin/cp "$WSG_WORKER_PROFILE_FIXTURE" "$JJFX_PI_PROFILE_PROBE_OUTPUT"; exit 0; fi
+touch "$WSG_WORKER_RUNTIME_MARKER"
+printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"done"}'
+"#,
+    );
+    let result = temporary_directory
+        .path()
+        .join("failed-profile-send-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "failed_send_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env("PI_CODING_AGENT_DIR", &agent_dir)
+        .env("WSG_WORKER_PROFILE_FIXTURE", &fixture)
+        .env("WSG_WORKER_RUNTIME_MARKER", &runtime_marker)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROVIDER, "test-provider")
+        .env(HELPER_MODEL, "test-model")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed Pi profile Send helper should run");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let error = fs::read_to_string(result).expect("failed Pi profile Send result");
+    assert!(
+        error.contains("linear_create_comment"),
+        "unexpected error: {error}"
+    );
+    let worker = repository
+        .worker_pool()
+        .snapshot()
+        .worker(worker.as_str())
+        .expect("unchanged Worker")
+        .clone();
+    assert_eq!(worker.status(), wsg_core::WorkerStatus::Done);
+    assert_eq!(
+        worker.log_file(),
+        Some(prior_log.to_string_lossy().as_ref())
+    );
+    assert!(!runtime_marker.exists(), "Pi Follow-up runtime started");
+}
+
+#[test]
+fn failed_pi_send_validation_does_not_mutate_the_prior_terminal_worker() {
     let (temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
     let prior_log = repository.root().join("prior-pi.log");
@@ -982,6 +1088,15 @@ fn failed_pi_send_validation_restores_the_prior_terminal_worker() {
     )
     .expect("prior Pi Session log");
     set_terminal_worker_for_runtime(&repository, &worker, &prior_log, AgentRuntime::Pi);
+    let before = match repository
+        .state_store()
+        .worker(worker.clone())
+        .load()
+        .expect("load Pi Worker before Send")
+    {
+        wsg_core::Loaded::Present(worker) => worker.revision().clone(),
+        wsg_core::Loaded::Missing => panic!("Pi Worker missing before Send"),
+    };
 
     let bin = temporary_directory.path().join("failed-pi-bin");
     fs::create_dir(&bin).expect("fake executable directory");
@@ -1010,12 +1125,20 @@ fn failed_pi_send_validation_restores_the_prior_terminal_worker() {
             .expect("failed Pi Send result")
             .contains("pi command requires a model")
     );
-    let snapshot = repository.worker_pool().snapshot();
-    let restored = snapshot.worker(worker.as_str()).expect("restored Worker");
-    assert_eq!(restored.status(), wsg_core::WorkerStatus::Done);
-    assert_eq!(restored.agent_runtime(), Some(AgentRuntime::Pi));
+    let after = match repository
+        .state_store()
+        .worker(worker.clone())
+        .load()
+        .expect("load Pi Worker after rejected Send")
+    {
+        wsg_core::Loaded::Present(worker) => worker,
+        wsg_core::Loaded::Missing => panic!("Pi Worker missing after rejected Send"),
+    };
+    assert_eq!(after.revision(), &before);
+    assert_eq!(after.value.status.as_str(), "done");
+    assert_eq!(after.value.agent, Some(wsg_core::WireAgent::new("pi")));
     assert_eq!(
-        restored.log_file(),
+        after.value.log_file.as_deref(),
         Some(prior_log.to_string_lossy().as_ref())
     );
     assert!(
@@ -1195,9 +1318,13 @@ fn failed_send_action_helper() {
     let repository =
         Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
     let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
-    let error = WorkerActions::new(repository)
+    let mut actions = WorkerActions::new(repository);
+    if let (Ok(provider), Ok(model)) = (env::var(HELPER_PROVIDER), env::var(HELPER_MODEL)) {
+        actions = actions.with_model(AgentModel::new(model).with_provider(provider));
+    }
+    let error = actions
         .send(&worker, "continue", RunMode::Background)
-        .expect_err("missing runtime should fail");
+        .expect_err("invalid runtime profile should fail");
     fs::write(
         env::var_os(HELPER_RESULT).expect("result path"),
         error.to_string(),
@@ -1372,11 +1499,38 @@ fn wait_for_process_exit(pid: u32) {
     }
 }
 
+fn install_valid_pi_profile(root: &Path) -> (PathBuf, PathBuf) {
+    let agent_dir = root.join("valid-pi-agent");
+    let package = agent_dir.join("npm/node_modules/pi-mcp-adapter");
+    fs::create_dir_all(&package).expect("Pi adapter package");
+    fs::write(
+        package.join("package.json"),
+        r#"{"name":"pi-mcp-adapter","version":"2.11.0"}"#,
+    )
+    .expect("Pi adapter manifest");
+    fs::write(package.join("index.ts"), "export default function () {}\n")
+        .expect("Pi adapter entry");
+    let fixture = root.join("valid-pi-profile.json");
+    fs::write(
+        &fixture,
+        r#"{
+            "allTools": [
+                {"name":"linear_get_issue","parameters":{"type":"object","properties":{"id":{"type":"string"}}}},
+                {"name":"linear_update_issue","parameters":{"type":"object","properties":{"id":{"type":"string"},"status":{"type":"string"},"assignee":{"type":"string"}}}},
+                {"name":"linear_create_comment","parameters":{"type":"object","properties":{"issueId":{"type":"string"},"body":{"type":"string"}}}}
+            ],
+            "activeTools": ["linear_get_issue","linear_update_issue","linear_create_comment"]
+        }"#,
+    )
+    .expect("Pi profile fixture");
+    (agent_dir, fixture)
+}
+
 fn write_fake_pi(path: &Path, capture: &Path) {
     write_executable(
         path,
         &format!(
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.84.1; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '{{\"type\":\"session\",\"version\":3,\"id\":\"session-pi-301\",\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":\"/tmp/project\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"provider\":\"test-provider\",\"model\":\"test-model\",\"stopReason\":\"stop\"}}}}'\n",
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 0.84.1; exit 0; fi\nif [ \"$1\" = \"--help\" ]; then echo '--mode --provider --model --session --session-dir --system-prompt --name --tools --no-extensions --no-skills --no-prompt-templates --no-themes --no-context-files --no-approve'; exit 0; fi\nif [ \"$1\" = \"--mode\" ] && [ \"$2\" = \"rpc\" ]; then /bin/cp \"$WSG_WORKER_PROFILE_FIXTURE\" \"$JJFX_PI_PROFILE_PROBE_OUTPUT\"; exit 0; fi\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '{{\"type\":\"session\",\"version\":3,\"id\":\"session-pi-301\",\"timestamp\":\"2026-08-13T10:00:00Z\",\"cwd\":\"/tmp/project\"}}' '{{\"type\":\"message_end\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"done\"}}],\"provider\":\"test-provider\",\"model\":\"test-model\",\"stopReason\":\"stop\"}}}}'\n",
             capture.display()
         ),
     );

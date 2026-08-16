@@ -12,9 +12,9 @@ use thiserror::Error;
 use crate::runtime::pi_interactive_command;
 use crate::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
-    AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun, CompletedRun, Loaded,
-    Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus,
-    resolve_agent_session_for_runtime,
+    AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
+    CompletedRun, Loaded, Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId,
+    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -507,6 +507,18 @@ impl WorkerActions {
         fresh_system_prompt: Option<String>,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let worker_snapshot =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        let runtime = worker_snapshot
+            .agent_runtime()
+            .or_else(|| snapshot.pool().and_then(|pool| pool.agent_runtime()))
+            .unwrap_or(AgentRuntime::Claude);
+        runtime.preflight_dispatch(self.model.as_ref(), self.repository.root())?;
         let (reservation, prior_log) = self.repository.worker_pool().begin_follow_up(worker)?;
         let runtime = reservation.agent_runtime();
         let session = resolve_agent_session_for_runtime(
@@ -516,6 +528,9 @@ impl WorkerActions {
                 .filter(|path| !path.as_os_str().is_empty()),
         );
         let mut invocation = AgentRuntimeInvocation::new(prompt);
+        if runtime == AgentRuntime::Pi {
+            invocation = invocation.with_direct_dispatch_profile();
+        }
         if let Some(model) = self.model.clone() {
             invocation = invocation.with_model(model);
         }
@@ -975,6 +990,9 @@ pub enum WorkerActionError {
     /// kitty could not be located for Mount.
     #[error("kitty is unavailable: {detail}")]
     KittyUnavailable { detail: String },
+    /// The selected runtime's Direct Dispatch profile is not ready.
+    #[error(transparent)]
+    RuntimePreflight(#[from] AgentRuntimePreflightError),
     /// The selected runtime's interactive command could not be built.
     #[error(transparent)]
     RuntimeCommand(#[from] AgentRuntimeCommandError),
