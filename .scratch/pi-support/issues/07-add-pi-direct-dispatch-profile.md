@@ -1,6 +1,6 @@
 # Add the Pi Direct Dispatch profile
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -61,17 +61,17 @@ credentials. Run vertical red-green cycles and `mise run check`.
 
 ## Acceptance Criteria
 
-- [ ] Dispatch callers can supply Pi provider and model through `AgentModel`.
-- [ ] Pi Direct Dispatch preflights an explicit Linear profile with the exact
+- [x] Dispatch callers can supply Pi provider and model through `AgentModel`.
+- [x] Pi Direct Dispatch preflights an explicit Linear profile with the exact
       required read/write tools before reservation or launch.
-- [ ] Supported prompt/tool/trust choices are applied explicitly and unsupported
+- [x] Supported prompt/tool/trust choices are applied explicitly and unsupported
       budget/approval choices return typed errors.
-- [ ] Pi runtime identity remains stable through reservation, Run completion,
+- [x] Pi runtime identity remains stable through reservation, Run completion,
       failure, and Follow-up.
-- [ ] No inherited resources, provider fallback, credential leakage, or silent
+- [x] No inherited resources, provider fallback, credential leakage, or silent
       delivery-contract weakening occurs.
-- [ ] Claude and Codex prompt and Direct Dispatch behavior remains unchanged.
-- [ ] Documentation, versions, changelog, and `mise run check` are complete.
+- [x] Claude and Codex prompt and Direct Dispatch behavior remains unchanged.
+- [x] Documentation, versions, changelog, and `mise run check` are complete.
 
 ## Out of Scope
 
@@ -82,3 +82,13 @@ credentials. Run vertical red-green cycles and `mise run check`.
 ## Blocked by
 
 - issues/04-add-pi-ticket-discovery-and-dispatch.md
+
+## Comments
+
+- 2026-08-16 - Resolved with provider-aware Dispatch and orchestration models,
+  pinned `pi-mcp-adapter` 2.11.0 package and direct-tool schema preflight,
+  explicit Pi runtime policy, pre-mutation Direct Dispatch and Follow-up
+  validation, public-seam fake runtime coverage, setup guidance, and the jjfx
+  0.39.0 and wsg 0.13.0 release updates. `mise run check`, primary LSP
+  diagnostics, `lens_diagnostics mode=all`, and `cargo fmt --check` completed;
+  the lens report contains only pre-existing `CHANGELOG.md` Markdown warnings.
