@@ -2198,6 +2198,9 @@ impl App {
                 .and_then(|pool| usize::try_from(pool.size()).ok())
                 .map_or_else(|| "missing".to_string(), |capacity| capacity.to_string());
             lines.push(Line::from(format!(" capacity: {capacity}")));
+            if let Some(runtime) = snapshot.pool().and_then(|pool| pool.agent_runtime()) {
+                lines.push(Line::from(format!(" profile: {}", runtime.as_str())));
+            }
             if snapshot.workers().is_empty() {
                 lines.push(dim_line(" (no Workers)"));
             }
@@ -2210,17 +2213,23 @@ impl App {
                 };
                 let line = if body.width < 55 {
                     format!(
-                        " {marker} {}  {}  ticket:{}",
+                        " {marker} {}  {}  runtime: {}  ticket:{}",
                         worker.worker_id(),
                         worker.status().as_str(),
+                        worker
+                            .agent_runtime()
+                            .map_or("-", |runtime| runtime.as_str()),
                         worker.ticket().unwrap_or("-")
                     )
                 } else {
                     format!(
-                        " {marker} {}  {:<7} {}  {}",
+                        " {marker} {}  {:<7} {}  runtime: {}  {}",
                         worker.worker_id(),
                         worker.status().as_str(),
                         worker.alias(),
+                        worker
+                            .agent_runtime()
+                            .map_or("-", |runtime| runtime.as_str()),
                         worker.workspace()
                     )
                 };
@@ -2240,8 +2249,9 @@ impl App {
                     ""
                 };
                 lines.push(dim_line(&format!(
-                    " Dispatch Group {}  waves: {}  done: {}  failed: {}  skipped: {}{}",
+                    " Dispatch Group {}  runtime: {}  waves: {}  done: {}  failed: {}  skipped: {}{}",
                     progress.parent(),
+                    progress.runtime().as_str(),
                     progress.maximum_wave(),
                     counts.done(),
                     counts.failed(),
@@ -2331,7 +2341,10 @@ impl App {
                 lines.push(dim_line(&format!(" Worker action: {}", result.notice())));
             }
             if let Some(result) = &self.dispatch_result {
-                lines.push(dim_line(" Dispatch outcomes:"));
+                lines.push(dim_line(&format!(
+                    " Dispatch outcomes (runtime: {}):",
+                    result.runtime().as_str()
+                )));
                 for outcome in result.outcomes() {
                     let line = if outcome.succeeded() {
                         format!(
@@ -4313,7 +4326,7 @@ mod tests {
                 outcome: WorkerSessionOutcome::new(
                     "worker-01",
                     crate::workspace_dispatch::WorkerActionKind::Send,
-                    wsg_core::AgentRuntime::Claude,
+                    wsg_core::AgentRuntime::Pi,
                     AgentSessionResolution::Fresh {
                         reason: wsg_core::FreshSessionReason::MissingIdentity,
                     },
@@ -4338,10 +4351,52 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
+        assert!(text.contains("runtime: pi"), "{text}");
         assert!(
             text.contains("fresh session (log has no session id yet)"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn pi_pool_profile_renders_runtime_capability_without_provider_details() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-08-17T10:00:00Z","agent":"pi","provider":"openai","model":"gpt-5.4"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"busy","agent":"pi","provider":"openai","model":"gpt-5.4","ticket":"ENG-42","pid":42,"started_at":"2026-08-17T10:00:00Z","completed_at":null,"log_file":".jj/pool/worker-01.log","branch_name":"eng-42","exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let mut app = app_with(&["default", "worker-01"]);
+        app.worker_pool = Some(
+            wsg_core::Repository::open(temp.path())
+                .unwrap()
+                .read_worker_pool_snapshot(),
+        );
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("profile: pi"), "{text}");
+        assert!(text.contains("runtime: pi"), "{text}");
+        assert!(!text.contains("openai"), "{text}");
+        assert!(!text.contains("gpt-5.4"), "{text}");
     }
 
     #[test]
@@ -4564,7 +4619,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_log_detail_renders_provider_neutral_codex_activity_and_result() {
+    fn worker_log_detail_renders_provider_neutral_pi_activity_and_result() {
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
             .args(["--config", "signing.behavior=drop", "git", "init"])
@@ -4580,7 +4635,7 @@ mod tests {
         );
         app.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
-            wsg_core::AgentRuntime::Codex,
+            wsg_core::AgentRuntime::Pi,
             Some(RunActivity::new(RunActivityKind::FileChanges {
                 paths: vec![
                     "src/app.rs".to_owned(),
@@ -4603,7 +4658,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("runtime: codex"), "{text}");
+        assert!(text.contains("runtime: pi"), "{text}");
         assert!(
             text.contains("files: src/app.rs, src/workspace_dispatch.rs"),
             "{text}"
@@ -4696,6 +4751,7 @@ mod tests {
                 .read_worker_pool_snapshot(),
         );
         app.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
+            wsg_core::AgentRuntime::Pi,
             vec![
                 crate::workspace_dispatch::DispatchOutcome::success(
                     "ENG-42".to_owned(),
@@ -4724,6 +4780,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
+        assert!(text.contains("Dispatch outcomes (runtime: pi)"), "{text}");
         assert!(text.contains("ENG-42  First Ticket"), "{text}");
         assert!(text.contains("ENG-43 [Capacity]"), "{text}");
         assert!(text.find("ENG-42").unwrap() < text.find("ENG-43").unwrap());
@@ -4761,11 +4818,14 @@ mod tests {
                 vec![wsg_core::TicketId::parse("ENG-101").unwrap()],
             ),
         );
+        let mut group_options = wsg_core::DispatchGroupOptions::new("gpt-5.4");
+        group_options.agent = Some(wsg_core::WireAgent::new("pi"));
+        group_options.provider = Some("openai".to_owned());
         let mut state = wsg_core::DispatchGroupState::new(
             parent,
             wsg_core::WireTimestamp::new("2026-08-10T10:00:00Z"),
             "Jarvvski/jjfx",
-            wsg_core::DispatchGroupOptions::new(""),
+            group_options,
         );
         state.sub_issues = sub_issues;
 
@@ -4794,8 +4854,13 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Dispatch Group ENG-100"), "{text}");
+        assert!(
+            text.contains("Dispatch Group ENG-100  runtime: pi"),
+            "{text}"
+        );
         assert!(text.contains("ready: ENG-102"), "{text}");
+        assert!(!text.contains("openai"), "{text}");
+        assert!(!text.contains("gpt-5.4"), "{text}");
         assert!(text.contains("wave 2"), "{text}");
         assert!(text.contains("done: 1"), "{text}");
     }

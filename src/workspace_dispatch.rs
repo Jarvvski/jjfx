@@ -415,6 +415,7 @@ impl DispatchOutcome {
 /// Ordered presentation outcomes from one Direct Dispatch batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchResult {
+    runtime: AgentRuntime,
     outcomes: Vec<DispatchOutcome>,
     partial: bool,
 }
@@ -422,8 +423,17 @@ pub struct DispatchResult {
 impl DispatchResult {
     /// Creates ordered presentation outcomes from one Dispatch attempt.
     #[cfg(test)]
-    pub fn new(outcomes: Vec<DispatchOutcome>, partial: bool) -> Self {
-        Self { outcomes, partial }
+    pub fn new(runtime: AgentRuntime, outcomes: Vec<DispatchOutcome>, partial: bool) -> Self {
+        Self {
+            runtime,
+            outcomes,
+            partial,
+        }
+    }
+
+    /// Returns the Agent Runtime selected for every outcome in this batch.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
     }
 
     /// Returns outcomes in the same order as the requested Tickets.
@@ -506,6 +516,7 @@ impl ReadyTicket {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DispatchGroupProgress {
     parent: String,
+    runtime: AgentRuntime,
     issues: Vec<DispatchIssueProgress>,
     ready: Vec<String>,
     maximum_wave: usize,
@@ -519,6 +530,10 @@ impl DispatchGroupProgress {
     pub(crate) fn from_state(state: DispatchGroupState) -> Result<Self, String> {
         let group = DispatchGroup::from_state(state).map_err(|error| error.to_string())?;
         let state = group.state();
+        let runtime =
+            AgentRuntime::from_configured(state.opts.agent.as_ref()).map_err(|value| {
+                format!("invalid persisted Agent Runtime {value:?} in Dispatch Group")
+            })?;
         let mut waves = BTreeMap::new();
         let issues = state
             .sub_issues
@@ -541,6 +556,7 @@ impl DispatchGroupProgress {
         let ready = group.ready().iter().map(ToString::to_string).collect();
         Ok(Self {
             parent: state.parent.to_string(),
+            runtime,
             issues,
             ready,
             maximum_wave: group.maximum_wave_size(),
@@ -552,6 +568,11 @@ impl DispatchGroupProgress {
     /// Returns the Parent Ticket identifier.
     pub fn parent(&self) -> &str {
         &self.parent
+    }
+
+    /// Returns the persisted Agent Runtime without provider configuration details.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
     }
 
     /// Returns the stable, provider-order-independent Sub-issue rows.
@@ -1339,13 +1360,21 @@ impl RealWorkspaceDispatch {
         strategy: DispatchStrategy,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
         let repository = self.repository().map_err(WorkspaceDispatchError::Failed)?;
+        let snapshot = repository.worker_pool().snapshot();
+        let profile = snapshot
+            .pool()
+            .and_then(|pool| pool.profile())
+            .cloned()
+            .unwrap_or_else(|| wsg_core::AgentRuntimeProfile::new(AgentRuntime::Claude));
+        let runtime = profile.runtime();
         let requests = tickets
             .iter()
             .map(|ticket| {
                 let id = TicketId::parse(ticket.clone())
                     .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?;
                 let request = DirectDispatchRequest::for_ticket_id(id, RunMode::Background)
-                    .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?;
+                    .map_err(|error| WorkspaceDispatchError::Failed(error.to_string()))?
+                    .with_profile(profile.clone());
                 Ok(match worker {
                     Some(worker) => request.to_worker(
                         WorkerId::parse(worker.to_owned())
@@ -1401,6 +1430,7 @@ impl RealWorkspaceDispatch {
             })
             .collect();
         Ok(DispatchAdapterResult::new(DispatchResult {
+            runtime,
             outcomes,
             partial: result.is_partial(),
         }))
@@ -1515,13 +1545,18 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     ) -> Result<(), String> {
         let repository = self.repository()?;
         let id = TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?;
-        let runtime = repository
-            .worker_pool()
-            .snapshot()
-            .pool()
-            .and_then(|pool| pool.agent_runtime())
-            .unwrap_or(AgentRuntime::Claude);
-        let request = wsg_core::OrchestrationRequest::new(id.clone(), runtime);
+        let pool = repository.worker_pool().snapshot();
+        let profile = pool.pool().and_then(|pool| pool.profile()).cloned();
+        let runtime = profile
+            .as_ref()
+            .map_or(AgentRuntime::Claude, wsg_core::AgentRuntimeProfile::runtime);
+        let mut request = wsg_core::OrchestrationRequest::new(id.clone(), runtime);
+        if let Some(model) = profile
+            .as_ref()
+            .and_then(wsg_core::AgentRuntimeProfile::model)
+        {
+            request = request.with_model(model.clone());
+        }
         let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)
             .map_err(|error| error.to_string())?
             .ticket()
@@ -1753,8 +1788,14 @@ impl RecordingAdapter {
             .clone()
     }
 
-    fn result(tickets: &[String], worker: Option<&str>) -> DispatchAdapterResult {
+    fn result(&self, tickets: &[String], worker: Option<&str>) -> DispatchAdapterResult {
+        let runtime = self
+            .snapshot
+            .pool()
+            .and_then(|pool| pool.agent_runtime())
+            .unwrap_or(AgentRuntime::Claude);
         DispatchAdapterResult::new(DispatchResult {
+            runtime,
             outcomes: tickets
                 .iter()
                 .map(|ticket| DispatchOutcome {
@@ -1815,7 +1856,7 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
                 worker: worker.map(str::to_owned),
             },
         );
-        Ok(Self::result(tickets, worker))
+        Ok(self.result(tickets, worker))
     }
 
     fn dispatch_with_approved_growth(
@@ -1832,7 +1873,7 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
                 additional,
             },
         );
-        Ok(Self::result(tickets, worker))
+        Ok(self.result(tickets, worker))
     }
 
     fn dispatch_use_available(
@@ -1847,7 +1888,7 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
                 worker: worker.map(str::to_owned),
             },
         );
-        Ok(Self::result(tickets, worker))
+        Ok(self.result(tickets, worker))
     }
 
     fn discover_ready(&self, _label: &str) -> Result<ReadyTicketResult, String> {
