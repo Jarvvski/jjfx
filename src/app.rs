@@ -4667,6 +4667,86 @@ mod tests {
     }
 
     #[test]
+    fn tui_runtime_matrix_preserves_session_activity_failure_and_completion_rendering() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+
+        for runtime in [
+            wsg_core::AgentRuntime::Claude,
+            wsg_core::AgentRuntime::Codex,
+            wsg_core::AgentRuntime::Pi,
+        ] {
+            let mut app = app_with(&["default"]);
+            app.worker_pool = Some(snapshot.clone());
+            app.worker_session = Some(WorkerSessionOutcome::new(
+                "worker-01",
+                crate::workspace_dispatch::WorkerActionKind::Send,
+                runtime,
+                AgentSessionResolution::Fresh {
+                    reason: wsg_core::FreshSessionReason::MissingIdentity,
+                },
+                77,
+            ));
+            app.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
+                "worker-01",
+                runtime,
+                Some(RunActivity::new(RunActivityKind::Warning {
+                    message: "capability warning".to_owned(),
+                })),
+                Some(RunResult::failed("provider stopped")),
+            ));
+            app.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
+                runtime,
+                vec![crate::workspace_dispatch::DispatchOutcome::failure(
+                    "ENG-43".to_owned(),
+                    "Runtime matrix".to_owned(),
+                    None,
+                    wsg_core::DirectDispatchFailurePhase::Launch,
+                    format!("{} capability failed", runtime.as_str()),
+                )],
+                false,
+            ));
+            app.mode = Mode::Pool(PoolMode::LogDetail {
+                worker: "worker-01".to_owned(),
+            });
+
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 16)).unwrap();
+            terminal.draw(|frame| app.render(frame)).unwrap();
+            let text: String = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(
+                text.contains(&format!(
+                    "Dispatch outcomes (runtime: {})",
+                    runtime.as_str()
+                )),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format!("{} capability failed", runtime.as_str())),
+                "{text}"
+            );
+            assert!(text.contains("warning: capability warning"), "{text}");
+            assert!(text.contains("result: failed: provider stopped"), "{text}");
+            assert!(!text.contains("openai"), "{text}");
+            assert!(!text.contains("gpt-5.4"), "{text}");
+        }
+    }
+
+    #[test]
     fn stale_worker_log_events_do_not_replace_the_current_detail() {
         let mut app = app_with(&["default"]);
         app.mode = Mode::Pool(PoolMode::LogDetail {

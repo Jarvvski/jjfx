@@ -491,6 +491,120 @@ fn pi_orchestration_preflight_helper() {
 }
 
 #[test]
+fn persisted_runtime_matrix_survives_restart_completion_and_failure_progression() {
+    for runtime in [AgentRuntime::Claude, AgentRuntime::Codex, AgentRuntime::Pi] {
+        for (worker_status, retries) in [("done", 0), ("failed", 1)] {
+            let directory = TempDir::new().expect("temporary repository");
+            fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+            let repository = Repository::open(directory.path()).expect("open repository");
+            let parent = TicketId::parse("ENG-800").expect("Parent Ticket");
+            let ticket = TicketId::parse("ENG-801").expect("Sub-issue");
+            let worker = WorkerId::parse("worker-01").expect("Worker");
+            let mut options = DispatchGroupOptions::new("test-model");
+            options.agent = Some(wsg_core::WireAgent::new(runtime.as_str()));
+            options.provider = Some("test-provider".to_owned());
+            let mut group = DispatchGroupState::new(
+                parent.clone(),
+                WireTimestamp::new("2026-08-17T12:00:00Z"),
+                "owner/repo",
+                options,
+            );
+            let mut issue =
+                SubIssueState::new("Runtime matrix", WireStatus::new("dispatched"), Vec::new());
+            issue.worker = Some(worker.clone());
+            issue.retries = retries;
+            issue.dispatched_at = Some(WireTimestamp::new("2026-08-17T12:01:00Z"));
+            group.sub_issues.insert(ticket.clone(), issue);
+            repository
+                .state_store()
+                .dispatch_group(parent.clone())
+                .commit(Expected::Missing, StateChange::Replace(group))
+                .expect("save Dispatch Group");
+            let mut pool = PoolState::new(
+                1,
+                "owner/repo",
+                vec![worker.clone()],
+                WireTimestamp::new("2026-08-17T12:00:00Z"),
+            );
+            pool.agent = Some(wsg_core::WireAgent::new(runtime.as_str()));
+            pool.provider = Some("test-provider".to_owned());
+            pool.model = Some("test-model".to_owned());
+            repository
+                .state_store()
+                .pool()
+                .commit(Expected::Missing, StateChange::Replace(pool))
+                .expect("save Pool");
+            let mut worker_state = WorkerState::new(WireStatus::new(worker_status));
+            worker_state.agent = Some(wsg_core::WireAgent::new(runtime.as_str()));
+            worker_state.provider = Some("test-provider".to_owned());
+            worker_state.model = Some("test-model".to_owned());
+            worker_state.ticket = Some(ticket.to_string());
+            worker_state.branch_name = Some("runtime-matrix".to_owned());
+            worker_state.error = (worker_status == "failed").then(|| "provider failed".to_owned());
+            repository
+                .state_store()
+                .worker(worker.clone())
+                .commit(Expected::Missing, StateChange::Replace(worker_state))
+                .expect("save Worker Run");
+
+            let request_runtime = if runtime == AgentRuntime::Claude {
+                AgentRuntime::Pi
+            } else {
+                AgentRuntime::Claude
+            };
+            let mut events = Vec::new();
+            let summary = repository
+                .orchestration_runner()
+                .advance_once(
+                    &OrchestrationRequest::new(parent.clone(), request_runtime),
+                    |event| events.push(event),
+                )
+                .expect("resume terminal Run")
+                .expect("terminal summary");
+            assert_eq!(summary.parent(), &parent);
+            assert!(events.iter().any(|event| match (worker_status, event) {
+                ("done", OrchestrationEvent::Completed { ticket: actual, .. }) => {
+                    actual == &ticket
+                }
+                ("failed", OrchestrationEvent::Failed { ticket: actual, .. }) => {
+                    actual == &ticket
+                }
+                _ => false,
+            }));
+            let loaded = match repository
+                .state_store()
+                .dispatch_group(parent)
+                .load()
+                .expect("load terminal group")
+            {
+                wsg_core::Loaded::Present(group) => group.value,
+                wsg_core::Loaded::Missing => panic!("Dispatch Group missing"),
+            };
+            assert_eq!(
+                loaded.opts.agent.as_ref().map(wsg_core::WireAgent::as_str),
+                Some(runtime.as_str())
+            );
+            assert_eq!(loaded.opts.provider.as_deref(), Some("test-provider"));
+            assert_eq!(loaded.opts.model, "test-model");
+            if worker_status == "failed" {
+                let snapshot = repository.worker_pool().snapshot();
+                let profile = snapshot
+                    .worker(worker.as_str())
+                    .expect("failed Worker")
+                    .profile()
+                    .expect("failed Run profile");
+                assert_eq!(profile.runtime(), runtime);
+                assert_eq!(
+                    profile.model().and_then(AgentModel::provider),
+                    Some("test-provider")
+                );
+                assert_eq!(profile.model().map(AgentModel::model), Some("test-model"));
+            }
+        }
+    }
+}
+
+#[test]
 fn detached_entrypoint_returns_terminal_summary_for_persisted_group() {
     let directory = TempDir::new().expect("temporary repository");
     fs::create_dir(directory.path().join(".jj")).expect("repository marker");

@@ -383,6 +383,102 @@ fn pool_profile_configures_pi_atomically_and_renders_the_public_identity() {
 }
 
 #[test]
+fn pool_profile_cli_preserves_claude_codex_and_pi_runtime_matrix() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    assert!(
+        run(binary, directory.path(), &["pool", "1"])
+            .status
+            .success()
+    );
+    let repository = Repository::open(directory.path()).expect("Repository should open");
+
+    struct ProfileCase<'a> {
+        runtime: &'a str,
+        arguments: Vec<&'a str>,
+        provider: Option<&'a str>,
+        model: Option<&'a str>,
+    }
+    let cases = [
+        ProfileCase {
+            runtime: "claude",
+            arguments: vec!["pool", "profile", "claude"],
+            provider: None,
+            model: None,
+        },
+        ProfileCase {
+            runtime: "codex",
+            arguments: vec!["pool", "profile", "codex", "--model", "o3"],
+            provider: None,
+            model: Some("o3"),
+        },
+        ProfileCase {
+            runtime: "pi",
+            arguments: vec![
+                "pool",
+                "profile",
+                "pi",
+                "--provider",
+                "openai",
+                "--model",
+                "gpt-5.4",
+            ],
+            provider: Some("openai"),
+            model: Some("gpt-5.4"),
+        },
+    ];
+    for ProfileCase {
+        runtime,
+        arguments,
+        provider,
+        model,
+    } in cases
+    {
+        let configured = run(binary, directory.path(), &arguments);
+        assert!(
+            configured.status.success(),
+            "{runtime} profile failed: {}",
+            String::from_utf8_lossy(&configured.stderr)
+        );
+        let snapshot = repository.worker_pool().snapshot();
+        let profile = snapshot
+            .pool()
+            .expect("Pool should exist")
+            .profile()
+            .expect("profile should exist");
+        assert_eq!(profile.runtime().as_str(), runtime);
+        assert_eq!(profile.model().and_then(|value| value.provider()), provider);
+        assert_eq!(profile.model().map(|value| value.model()), model);
+        let listed = run(binary, directory.path(), &["status"]);
+        assert!(listed.status.success());
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains(&format!("Profile: {runtime}")),
+            "{}",
+            String::from_utf8_lossy(&listed.stdout)
+        );
+    }
+
+    let before = repository
+        .worker_pool()
+        .snapshot()
+        .pool()
+        .expect("Pool should exist")
+        .profile()
+        .cloned();
+    let invalid = run(binary, directory.path(), &["pool", "profile", "other"]);
+    assert!(!invalid.status.success());
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .expect("Pool should exist")
+            .profile(),
+        before.as_ref()
+    );
+}
+
+#[test]
 fn pool_commands_create_resize_list_remove_reset_and_destroy() {
     let binary = env!("CARGO_BIN_EXE_wsg");
     let directory = local_repository();
