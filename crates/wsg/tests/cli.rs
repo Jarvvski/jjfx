@@ -207,6 +207,8 @@ fn help_documents_workspace_and_pool_command_groups() {
     let help = String::from_utf8_lossy(&output.stdout);
     assert!(help.contains("wsg add <name>"));
     assert!(help.contains("wsg pool <N>"));
+    assert!(help.contains("wsg pool profile <runtime>"));
+    assert!(help.contains("--provider/--model"));
     assert!(help.contains("wsg pool destroy"));
     assert!(help.contains("wsg status"));
     assert!(output.stderr.is_empty());
@@ -308,6 +310,76 @@ fn workspace_commands_are_compatible_and_clean_requires_explicit_confirmation() 
     assert!(remove.status.success());
     assert!(String::from_utf8_lossy(&remove.stderr).contains("Deleted"));
     assert!(!expected.exists());
+}
+
+#[test]
+fn pool_profile_configures_pi_atomically_and_renders_the_public_identity() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let created = run(binary, directory.path(), &["pool", "1"]);
+    assert!(created.status.success());
+
+    let repository = Repository::open(directory.path()).expect("Repository should open");
+    let before = repository
+        .worker_pool()
+        .snapshot()
+        .pool()
+        .expect("Pool should exist")
+        .profile()
+        .cloned();
+    let missing = run(
+        binary,
+        directory.path(),
+        &["pool", "profile", "pi", "--model", "gpt-5.4"],
+    );
+    assert!(!missing.status.success());
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .pool()
+            .expect("Pool should exist")
+            .profile(),
+        before.as_ref(),
+        "invalid Pi setup must not mutate the Pool profile"
+    );
+
+    let configured = run(
+        binary,
+        directory.path(),
+        &[
+            "pool",
+            "profile",
+            "pi",
+            "--provider",
+            "openai",
+            "--model",
+            "gpt-5.4",
+        ],
+    );
+    assert!(
+        configured.status.success(),
+        "profile failed: {}",
+        String::from_utf8_lossy(&configured.stderr)
+    );
+    let profile = repository
+        .worker_pool()
+        .snapshot()
+        .pool()
+        .expect("Pool should exist")
+        .profile()
+        .expect("profile should be configured")
+        .clone();
+    assert_eq!(profile.runtime(), AgentRuntime::Pi);
+    assert_eq!(
+        profile.model().and_then(|model| model.provider()),
+        Some("openai")
+    );
+    assert_eq!(profile.model().map(|model| model.model()), Some("gpt-5.4"));
+
+    let listed = run(binary, directory.path(), &["pool", "list"]);
+    assert!(listed.status.success());
+    assert!(String::from_utf8_lossy(&listed.stdout).contains("Profile: pi (openai/gpt-5.4)"));
 }
 
 #[test]
@@ -486,6 +558,8 @@ fn dispatch_and_completion_shell_contracts_are_typed_and_separated() {
     assert!(completion.status.success());
     let script = String::from_utf8_lossy(&completion.stdout);
     assert!(script.contains("__complete non-busy-workers"));
+    assert!(script.contains("profile"));
+    assert!(script.contains("--provider"));
     assert!(!script.contains("__orchestrate"));
     assert!(completion.stderr.is_empty());
 

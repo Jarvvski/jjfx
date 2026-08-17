@@ -7,12 +7,12 @@ use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
 use wsg_core::{
-    AgentRuntime, AgentRuntimeQuery, CapacityShortage, CleanDecision, DirectDispatchError,
-    DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest, DispatchBudget,
-    FollowUpExecution, OrchestrationEvent, PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper,
-    PoolCapacity, ReadyTicketFilter, Repository, RunActivity, RunActivityKind, RunMode,
-    TicketDiscovery, TicketId, TicketStatus, WorkerActions, WorkerId, WorkerPoolError,
-    WorkerStatus, WorkspaceAddOutcome,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, AgentRuntimeQuery, CapacityShortage,
+    CleanDecision, DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome,
+    DirectDispatchRequest, DispatchBudget, FollowUpExecution, OrchestrationEvent,
+    PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, Repository,
+    RunActivity, RunActivityKind, RunMode, TicketDiscovery, TicketId, TicketStatus, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
 };
 
 pub const HELP: &str = concat!(
@@ -45,9 +45,11 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " pool reset <worker>       Reset a worker to idle\n  ",
     env!("CARGO_PKG_NAME"),
+    " pool profile <runtime>    Set runtime profile (--provider/--model)\n  ",
+    env!("CARGO_PKG_NAME"),
     " pool destroy              Tear down all workers and remove pool\n\nDispatch and sessions:\n  ",
     env!("CARGO_PKG_NAME"),
-    " dispatch <TICKET>...     Dispatch Tickets (d)\n  ",
+    " dispatch <TICKET>...     Dispatch Tickets (d; --provider/--model)\n  ",
     env!("CARGO_PKG_NAME"),
     " send <worker> <prompt>   Send a Follow-up (s)\n  ",
     env!("CARGO_PKG_NAME"),
@@ -122,6 +124,7 @@ pub enum Command {
     },
     InternalOrchestrate {
         parent: String,
+        provider: Option<String>,
         model: Option<String>,
     },
     Pool(PoolCommand),
@@ -132,6 +135,7 @@ pub struct DispatchArgs {
     pub tickets: Vec<String>,
     pub all: bool,
     pub mode: RunMode,
+    pub provider: Option<String>,
     pub model: Option<String>,
     pub budget: Option<u32>,
     pub label: String,
@@ -140,10 +144,21 @@ pub struct DispatchArgs {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PoolCommand {
-    Resize { size: String },
+    Resize {
+        size: String,
+    },
     List,
-    Remove { worker: String },
-    Reset { worker: String },
+    Remove {
+        worker: String,
+    },
+    Reset {
+        worker: String,
+    },
+    Profile {
+        runtime: String,
+        provider: Option<String>,
+        model: Option<String>,
+    },
     Destroy,
     Help,
 }
@@ -286,10 +301,47 @@ fn parse_pool(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|worker| PoolCommand::Reset { worker }.into()),
+        "profile" => parse_pool_profile(&args[1..]),
         "create" | "c" | "resize" | "r" => parse_pool_size(&args[1..]),
         value if value.parse::<i64>().is_ok() => parse_pool_size(args),
         unknown => bail!("Unknown pool command: {unknown}"),
     }
+}
+
+fn parse_pool_profile(args: &[String]) -> Result<Command> {
+    let usage = concat!(
+        "Usage: ",
+        env!("CARGO_PKG_NAME"),
+        " pool profile <claude|codex|pi> [--provider PROVIDER] [--model MODEL]"
+    );
+    let Some(runtime) = args.first().filter(|value| !value.starts_with('-')) else {
+        bail!(usage);
+    };
+    let mut provider = None;
+    let mut model = None;
+    let mut index = 1;
+    while index < args.len() {
+        let option = args[index].as_str();
+        let destination = match option {
+            "--provider" => &mut provider,
+            "--model" => &mut model,
+            _ => bail!("unknown option for pool profile: {option}"),
+        };
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.starts_with('-'))
+            .ok_or_else(|| anyhow::anyhow!("missing value for {option}"))?;
+        if destination.replace(value.clone()).is_some() {
+            bail!("duplicate option for pool profile: {option}");
+        }
+        index += 2;
+    }
+    Ok(PoolCommand::Profile {
+        runtime: runtime.clone(),
+        provider,
+        model,
+    }
+    .into())
 }
 
 fn parse_pool_size(args: &[String]) -> Result<Command> {
@@ -359,6 +411,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     let mut tickets = Vec::new();
     let mut all = false;
     let mut mode = None;
+    let mut provider = None;
     let mut model = None;
     let mut budget = None;
     let mut label = "ready-for-agent".to_owned();
@@ -369,7 +422,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
             "--fg" | "--bg" => parse_mode(&args[index], &mut mode)?,
             "--all" => all = true,
             "--no-orchestrate" => no_orchestrate = true,
-            "--model" | "--label" | "--budget" => {
+            "--provider" | "--model" | "--label" | "--budget" => {
                 let option = args[index].as_str();
                 let value = args
                     .get(index + 1)
@@ -378,6 +431,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
                     bail!("missing value for {option}");
                 }
                 match option {
+                    "--provider" => provider = Some(value.clone()),
                     "--model" => model = Some(value.clone()),
                     "--label" => label = value.clone(),
                     "--budget" => {
@@ -405,7 +459,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         bail!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
-            " dispatch <TICKET>... [--fg|--bg] [--model MODEL]"
+            " dispatch <TICKET>... [--fg|--bg] [--provider PROVIDER] [--model MODEL]"
         ));
     }
     if budget.is_some() && tickets.len() == 1 && !no_orchestrate {
@@ -415,6 +469,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         tickets,
         all,
         mode: mode.unwrap_or(RunMode::Background),
+        provider,
         model,
         budget,
         label,
@@ -491,24 +546,31 @@ fn parse_orchestrate(args: &[String]) -> Result<Command> {
         bail!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
-            " __orchestrate <PARENT-TICKET> [--model MODEL]"
+            " __orchestrate <PARENT-TICKET> [--provider PROVIDER] [--model MODEL]"
         ));
     };
+    let mut provider = None;
     let mut model = None;
     let mut index = 1;
     while index < args.len() {
-        if args[index] != "--model" {
-            bail!("unknown option for __orchestrate: {}", args[index]);
+        let option = args[index].as_str();
+        let destination = match option {
+            "--provider" => &mut provider,
+            "--model" => &mut model,
+            _ => bail!("unknown option for __orchestrate: {option}"),
+        };
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.starts_with('-'))
+            .ok_or_else(|| anyhow::anyhow!("missing value for {option}"))?;
+        if destination.replace(value.clone()).is_some() {
+            bail!("duplicate option for __orchestrate: {option}");
         }
-        model = Some(
-            args.get(index + 1)
-                .ok_or_else(|| anyhow::anyhow!("missing value for --model"))?
-                .clone(),
-        );
         index += 2;
     }
     Ok(Command::InternalOrchestrate {
         parent: parent.clone(),
+        provider,
         model,
     })
 }
@@ -546,9 +608,16 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>) -> Result<()> {
         Command::OpenPullRequest { worker } => open_pr_command(&repository()?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
         Command::InternalComplete { mode } => internal_complete_command(&mode)?,
-        Command::InternalOrchestrate { parent, model } => {
-            orchestrate_command(&repository()?, &parent, model.as_deref())?
-        }
+        Command::InternalOrchestrate {
+            parent,
+            provider,
+            model,
+        } => orchestrate_command(
+            &repository()?,
+            &parent,
+            provider.as_deref(),
+            model.as_deref(),
+        )?,
         Command::Pool(command) => pool_command(&repository()?, command)?,
     }
     Ok(())
@@ -663,11 +732,68 @@ fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
         PoolCommand::List => pool_list_command(repository),
         PoolCommand::Remove { worker } => remove_worker_command(repository, &worker),
         PoolCommand::Reset { worker } => reset_worker_command(repository, &worker),
+        PoolCommand::Profile {
+            runtime,
+            provider,
+            model,
+        } => pool_profile_command(repository, &runtime, provider.as_deref(), model.as_deref()),
         PoolCommand::Destroy => destroy_pool_command(repository),
         PoolCommand::Help => {
             print!("{HELP}");
             Ok(())
         }
+    }
+}
+
+fn pool_profile_command(
+    repository: &Repository,
+    runtime: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
+    let profile = runtime_profile(runtime, provider, model)?;
+    repository.worker_pool().set_profile(profile.clone())?;
+    eprintln!("Pool profile set to {}", render_profile(&profile));
+    Ok(())
+}
+
+fn runtime_profile(
+    runtime: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<AgentRuntimeProfile> {
+    let configured = WireAgent::new(runtime);
+    let runtime = AgentRuntime::from_configured(Some(&configured)).map_err(|value| {
+        anyhow::anyhow!("invalid Agent Runtime {value:?} (expected claude, codex, or pi)")
+    })?;
+    let mut profile = AgentRuntimeProfile::new(runtime);
+    if let Some(selection) = selected_model(provider, model)? {
+        profile = profile.with_model(selection);
+    }
+    Ok(profile)
+}
+
+fn selected_model(provider: Option<&str>, model: Option<&str>) -> Result<Option<AgentModel>> {
+    let Some(model) = model else {
+        if provider.is_some() {
+            bail!("--provider requires --model");
+        }
+        return Ok(None);
+    };
+    let mut selection = AgentModel::new(model);
+    if let Some(provider) = provider {
+        selection = selection.with_provider(provider);
+    }
+    Ok(Some(selection))
+}
+
+fn render_profile(profile: &AgentRuntimeProfile) -> String {
+    match profile.model() {
+        Some(model) => match model.provider() {
+            Some(provider) => format!("{} ({provider}/{})", profile.runtime(), model.model()),
+            None => format!("{} ({})", profile.runtime(), model.model()),
+        },
+        None => profile.runtime().to_string(),
     }
 }
 
@@ -741,6 +867,9 @@ fn pool_list_command(repository: &Repository) -> Result<()> {
         );
     }
     println!();
+    if let Some(profile) = pool.profile() {
+        println!("Profile: {}", render_profile(profile));
+    }
     println!(
         "Pool: {} idle, {} busy, {} done, {} failed ({} total)",
         counts[0],
@@ -825,6 +954,7 @@ fn configured_ticket_query(repository: &Repository, runtime: AgentRuntime) -> Ag
 }
 
 fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> {
+    let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
     if args.all {
         let runtime = configured_runtime(repository);
         let status = TicketStatus::parse("Todo")?;
@@ -844,7 +974,7 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
             .iter()
             .map(|ticket| {
                 let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
-                if let Some(model) = args.model.as_deref() {
+                if let Some(model) = model.clone() {
                     request = request.with_model(model);
                 }
                 if let Some(dollars) = args.budget {
@@ -864,7 +994,7 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
         .map(|ticket| {
             let id = TicketId::parse(ticket.clone())?;
             let mut request = DirectDispatchRequest::for_ticket_id(id, args.mode)?;
-            if let Some(model) = args.model.as_deref() {
+            if let Some(model) = model.clone() {
                 request = request.with_model(model);
             }
             if let Some(dollars) = args.budget {
@@ -875,11 +1005,19 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
         .collect::<Result<Vec<_>>>()?;
     if !args.no_orchestrate && requests.len() == 1 {
         if args.mode == RunMode::Foreground {
-            return orchestrate_command(repository, &args.tickets[0], args.model.as_deref());
+            return orchestrate_command(
+                repository,
+                &args.tickets[0],
+                args.provider.as_deref(),
+                args.model.as_deref(),
+            );
         }
         let executable = std::env::current_exe()?;
         let mut command = std::process::Command::new(executable);
         command.arg("__orchestrate").arg(&args.tickets[0]);
+        if let Some(provider) = args.provider.as_deref() {
+            command.args(["--provider", provider]);
+        }
         if let Some(model) = args.model.as_deref() {
             command.args(["--model", model]);
         }
@@ -979,6 +1117,7 @@ fn send_command(repository: &Repository, value: &str, prompt: &str, mode: RunMod
     let worker = normalize_worker(value)?;
     eprintln!("Sending to {worker}...");
     let outcome = WorkerActions::new(repository.clone()).send(&worker, prompt, mode)?;
+    eprintln!("Agent Runtime: {}", outcome.runtime());
     render_session(outcome.session());
     if let FollowUpExecution::Background(run) = outcome.execution() {
         eprintln!(
@@ -993,6 +1132,7 @@ fn send_command(repository: &Repository, value: &str, prompt: &str, mode: RunMod
 fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result<()> {
     let worker = normalize_worker(value)?;
     let outcome = WorkerActions::new(repository.clone()).review(&worker, mode)?;
+    eprintln!("Agent Runtime: {}", outcome.runtime());
     render_session(outcome.session());
     if let FollowUpExecution::Background(run) = outcome.execution() {
         eprintln!("  {worker} (PID {}) -> review", run.pid());
@@ -1018,6 +1158,7 @@ fn truncate_prompt(prompt: &str) -> String {
 fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let logs = WorkerActions::new(repository.clone()).logs(&worker)?;
+    eprintln!("Following {} log for {worker}", logs.runtime());
     let mut last = None;
     loop {
         if let Some(activity) = logs.open().current_activity()? {
@@ -1059,7 +1200,11 @@ fn mount_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let outcome = WorkerActions::new(repository.clone()).mount(&worker)?;
     render_session(outcome.session());
-    eprintln!("Mounted {worker} in kitty tab {}", outcome.tab_id());
+    eprintln!(
+        "Mounted {worker} with {} in kitty tab {}",
+        outcome.runtime(),
+        outcome.tab_id()
+    );
     Ok(())
 }
 
@@ -1126,10 +1271,16 @@ fn internal_complete_command(mode: &str) -> Result<()> {
     Ok(())
 }
 
-fn orchestrate_command(repository: &Repository, parent: &str, model: Option<&str>) -> Result<()> {
+fn orchestrate_command(
+    repository: &Repository,
+    parent: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<()> {
     let id = TicketId::parse(parent.to_owned())?;
     let request = wsg_core::OrchestrationRequest::new(id.clone(), configured_runtime(repository));
-    let request = model.map_or(request.clone(), |value| request.with_model(value));
+    let request = selected_model(provider, model)?
+        .map_or(request.clone(), |selection| request.with_model(selection));
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();
@@ -1240,7 +1391,8 @@ _wsg() {
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' ;;
         mount|m|reset|logs|log|rebase|rb|open-pr|pr) _arguments '1:worker:__wsg_workers' ;;
-        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
+        pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
+        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
   esac
@@ -1271,6 +1423,8 @@ mod tests {
             "dispatch",
             "AMBA-42",
             "--fg",
+            "--provider",
+            "anthropic",
             "--model",
             "opus",
             "--budget",
@@ -1284,6 +1438,7 @@ mod tests {
                 tickets: vec!["AMBA-42".to_owned()],
                 all: false,
                 mode: RunMode::Foreground,
+                provider: Some("anthropic".to_owned()),
                 model: Some("opus".to_owned()),
                 budget: Some(12),
                 label: "ready-for-agent".to_owned(),
@@ -1371,6 +1526,7 @@ mod tests {
                 tickets: Vec::new(),
                 all: true,
                 mode: RunMode::Background,
+                provider: None,
                 model: None,
                 budget: None,
                 label: "needs-review".to_owned(),
@@ -1387,6 +1543,7 @@ mod tests {
                 tickets: vec!["AMBA-42".to_owned()],
                 all: false,
                 mode: RunMode::Background,
+                provider: None,
                 model: None,
                 budget: None,
                 label: "ready-for-agent".to_owned(),
