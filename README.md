@@ -52,10 +52,29 @@ infer shutdown by polling or terminal scraping.
 
 ## Pi Worker actions, Direct Dispatch, and ticket discovery
 
-The shared Worker action layer supports Pi 0.84.x for Direct Dispatch, fresh
-and resumed Follow-ups, and interactive kitty mounts. The `pi` executable must
-be on `PATH`, and callers must select an authenticated provider and model
-explicitly through `AgentModel::new(model).with_provider(provider)`.
+The shared Worker action layer supports Pi 0.84.x for Direct Dispatch, persistent
+Dispatch Group orchestration, fresh and resumed Follow-ups, and interactive
+kitty mounts. The `pi` executable must be on `PATH`. Configure the repository's
+default Agent Runtime profile before dispatching:
+
+```bash
+jjfx pool profile pi --provider <provider> --model <model>
+jjfx pool list
+jjfx dispatch <TICKET>
+```
+
+The same command accepts `claude` or `codex`; provider and model are optional
+for runtimes that support provider-managed selection. `dispatch --provider`
+and `dispatch --model` override model selection for that invocation and are
+forwarded to detached orchestration. A persisted Dispatch Group profile remains
+authoritative after restart, so an explicitly selected Pi Run never falls back
+to Claude or Codex. Invalid or incomplete Pi setup fails before Pool,
+Reservation, assignment, or Workspace mutation.
+
+The jjfx Pool view displays the selected runtime for Pool capability, Workers,
+Dispatch outcomes, orchestration progress, sessions, activity, failures, and
+terminal results. It deliberately omits provider/model values and Pi adapter
+configuration from presentation output.
 
 Pi Direct Dispatch and Follow-up require the pinned `pi-mcp-adapter` 2.11.0
 package:

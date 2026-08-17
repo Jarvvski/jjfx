@@ -7,6 +7,15 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-08-17 - Completed persistent Pi Dispatch integration in jjfx 0.40.0 and
+  wsg 0.14.0. Repository profiles now carry runtime, provider, and model through
+  Dispatch Group restarts, Reservations, Worker Runs, detached orchestration,
+  Follow-ups, and Mounts without falling back to another runtime. The shared
+  CLI adds atomic `pool profile` configuration plus provider-aware dispatch,
+  help, completions, and runtime output. The jjfx Pool view shows
+  provider-neutral runtime capability, progress, activity, failures, and
+  terminal outcomes while keeping provider and adapter details out of the TUI.
+
 - 2026-08-16 - Added the preflighted Pi Direct Dispatch profile in jjfx 0.39.0
   and wsg 0.13.0. Provider-qualified models now reach Dispatch and
   orchestration, while a pinned `pi-mcp-adapter` 2.11.0 profile validates the

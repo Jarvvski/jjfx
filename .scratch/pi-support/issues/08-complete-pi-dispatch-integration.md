@@ -1,6 +1,6 @@
 # Complete Pi Dispatch integration
 
-Status: claimed
+Status: resolved
 
 ## Parent
 
@@ -52,16 +52,16 @@ red-green cycles and `mise run check`.
 
 ## Acceptance Criteria
 
-- [ ] Dispatch Group discovery, reservation, restart, progression, retry,
+- [x] Dispatch Group discovery, reservation, restart, progression, retry,
       completion, and failure preserve Pi identity.
-- [ ] Shared CLI values, help, completions, errors, logs, sessions, and actions
+- [x] Shared CLI values, help, completions, errors, logs, sessions, and actions
       select and display Pi consistently.
-- [ ] jjfx TUI views show Pi capability, progress, activity, failure, and
+- [x] jjfx TUI views show Pi capability, progress, activity, failure, and
       completion without provider-detail leakage.
-- [ ] Missing configuration never mutates Pool state or falls back to another
+- [x] Missing configuration never mutates Pool state or falls back to another
       runtime.
-- [ ] Claude and Codex orchestration, CLI, and TUI behavior remains unchanged.
-- [ ] Documentation, versions, changelog, and `mise run check` are complete.
+- [x] Claude and Codex orchestration, CLI, and TUI behavior remains unchanged.
+- [x] Documentation, versions, changelog, and `mise run check` are complete.
 
 ## Out of Scope
 
@@ -73,3 +73,12 @@ red-green cycles and `mise run check`.
 
 - issues/04-add-pi-ticket-discovery-and-dispatch.md
 - issues/07-add-pi-direct-dispatch-profile.md
+
+## Comments
+
+- 2026-08-17 - Implemented the complete persisted runtime profile, shared CLI,
+  Workspace Dispatch/TUI projection, and Claude/Codex/Pi regression matrix in
+  five focused local commits. Updated setup and release guidance and bumped
+  jjfx to 0.40.0 and wsg to 0.14.0. Primary LSP diagnostics, `mise run check`,
+  `lens_diagnostics mode=all`, and `cargo fmt --check` all passed, so the Ticket
+  is resolved.
