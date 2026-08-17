@@ -33,7 +33,7 @@ pub struct WorkspaceConfig {
 }
 
 impl Config {
-    /// The command run in a workspace's left pane, wrapped in the user's login
+    /// The command run in a workspace's bottom-left pane, wrapped in the user's login
     /// interactive shell as `$SHELL -l -i -c <command>`. The shell sources
     /// login and interactive files, so configured aliases and the user's PATH
     /// are available. Falls back to `/bin/sh` when `$SHELL` is unset.
@@ -53,7 +53,7 @@ impl Config {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
-    /// The shell command run in a workspace's left pane. Because it runs in the
+    /// The shell command run in a workspace's bottom-left pane. Because it runs in the
     /// user's login interactive shell, this may name an alias such as `cx`.
     pub command: String,
 }

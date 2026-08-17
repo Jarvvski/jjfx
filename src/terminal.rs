@@ -27,13 +27,70 @@ fn tab_title(name: &str) -> String {
     format!("{TAB_PREFIX}{name}")
 }
 
+fn new_shell_tab_args(title: &str, cwd_arg: &str, focus: bool) -> Vec<String> {
+    let mut args = vec![
+        "launch".to_string(),
+        "--type=tab".to_string(),
+        "--tab-title".to_string(),
+        title.to_string(),
+        cwd_arg.to_string(),
+    ];
+    if !focus {
+        args.push("--dont-take-focus".to_string());
+    }
+    args
+}
+
+fn splits_layout_args(window_id: &str) -> Vec<String> {
+    vec![
+        "goto-layout".to_string(),
+        "--match".to_string(),
+        format!("window_id:{window_id}"),
+        "splits".to_string(),
+    ]
+}
+
+fn split_args(
+    anchor_id: &str,
+    location: &str,
+    bias: u8,
+    cwd_arg: &str,
+    focus: bool,
+    command: &[String],
+) -> Vec<String> {
+    let mut args = vec![
+        "launch".to_string(),
+        "--match".to_string(),
+        format!("window_id:{anchor_id}"),
+        "--next-to".to_string(),
+        format!("id:{anchor_id}"),
+        format!("--location={location}"),
+        format!("--bias={bias}"),
+        cwd_arg.to_string(),
+    ];
+    if !focus {
+        args.push("--dont-take-focus".to_string());
+    }
+    args.extend_from_slice(command);
+    args
+}
+
+fn focus_window_args(window_id: &str) -> Vec<String> {
+    vec![
+        "focus-window".to_string(),
+        "--match".to_string(),
+        format!("id:{window_id}"),
+    ]
+}
+
 /// A terminal multiplexer jjfx drives to host workspace tabs.
 pub trait Terminal: Send {
     /// Is a tab for this workspace currently open?
     fn is_open(&self, name: &str) -> bool;
-    /// Open a tab for the workspace rooted at `path`: the agent on the left,
-    /// and a right column split into two stacked shells. `focus` lands on the
-    /// agent pane; otherwise the tab is built without the target taking focus.
+    /// Open a tab for the workspace rooted at `path`: a full-width shell on top
+    /// and an evenly split bottom row with the agent on the left and a shell on
+    /// the right. `focus` lands on the agent pane; otherwise the tab is built
+    /// without the target taking focus.
     fn open(&self, name: &str, path: &Path, focus: bool) -> anyhow::Result<()>;
     /// Focus the workspace's existing tab.
     fn focus(&self, name: &str) -> anyhow::Result<()>;
@@ -53,7 +110,7 @@ pub struct KittyTerminal {
     /// Command (program + args) run to launch the target when its socket isn't
     /// found. Empty never auto-launches.
     launch_command: Vec<String>,
-    /// Command (program + args) run in a tab's left pane - the configured agent,
+    /// Command (program + args) run in a tab's bottom-left pane - the configured agent,
     /// already resolved by [`Config::agent_command`](crate::config::Config::agent_command)
     /// through the login interactive shell. This module just runs what it is
     /// given.
@@ -80,7 +137,7 @@ impl KittyTerminal {
 
     /// Run `kitten @ <args>`, returning stdout on success. Errors carry stderr so
     /// the app can surface a useful message rather than failing silently.
-    fn run(&self, args: &[&str]) -> anyhow::Result<String> {
+    fn run<S: AsRef<str>>(&self, args: &[S]) -> anyhow::Result<String> {
         let to = self.resolved_to()?;
         cmd("kitten")
             .args(kitten_argv(to.as_deref(), args))
@@ -149,7 +206,7 @@ impl KittyTerminal {
 
     /// `launch` a window and return the new window's id (kitty prints it to
     /// stdout), trimmed. The id anchors later splits with `--match id:<id>`.
-    fn launch(&self, args: &[&str]) -> anyhow::Result<String> {
+    fn launch<S: AsRef<str>>(&self, args: &[S]) -> anyhow::Result<String> {
         Ok(self.run(args)?.trim().to_string())
     }
 }
@@ -176,50 +233,34 @@ impl Terminal for KittyTerminal {
         let title = tab_title(name);
         let cwd = path.to_string_lossy();
         let cwd_arg = format!("--cwd={cwd}");
-        // A background open builds the tab without pulling focus (or raising the
-        // target window); a foreground open lands on the agent pane below.
-        let no_focus: &[&str] = if focus { &[] } else { &["--dont-take-focus"] };
 
-        // Left pane: a new tab running the agent. kitty prints its window id,
-        // which anchors the splits so they land against the right column even
-        // when this tab is not the active one.
-        let mut agent = vec!["launch", "--type=tab", "--tab-title", &title, &cwd_arg];
-        agent.extend_from_slice(no_focus);
-        agent.extend(self.agent_command.iter().map(String::as_str));
-        let win_id = self.launch(&agent)?;
-        if win_id.is_empty() {
+        // Start with the full-width top shell, then force the tab into kitty's
+        // splits layout before adding the bottom row.
+        let top_shell_id = self.launch(&new_shell_tab_args(&title, &cwd_arg, focus))?;
+        if top_shell_id.is_empty() {
             return Ok(()); // tab exists but there is no id to anchor splits to
         }
-        let win_match = format!("id:{win_id}");
+        self.run(&splits_layout_args(&top_shell_id))?;
 
-        // Right column, top: a shell beside the agent (a vertical divider).
-        let mut top = vec![
-            "launch",
-            "--match",
-            &win_match,
-            "--location=vsplit",
+        // The new horizontal split receives 65% of the original pane, leaving
+        // the full-width shell at the screenshot's approximate 35% height.
+        let agent_id = self.launch(&split_args(
+            &top_shell_id,
+            "hsplit",
+            65,
             &cwd_arg,
-        ];
-        top.extend_from_slice(no_focus);
-        let right_top_id = self.launch(&top)?;
-
-        // Right column, bottom: a shell below the right-top pane (a horizontal
-        // divider), so the right side is split into two stacked shells.
-        if !right_top_id.is_empty() {
-            let top_match = format!("id:{right_top_id}");
-            let mut bottom = vec![
-                "launch",
-                "--match",
-                &top_match,
-                "--location=hsplit",
-                &cwd_arg,
-            ];
-            bottom.extend_from_slice(no_focus);
-            self.run(&bottom)?;
+            focus,
+            &self.agent_command,
+        ))?;
+        if agent_id.is_empty() {
+            return Ok(()); // agent exists but there is no id to anchor its shell
         }
 
+        // Split the bottom agent pane evenly, placing a shell on its right.
+        self.run(&split_args(&agent_id, "vsplit", 50, &cwd_arg, focus, &[]))?;
+
         // Land on the agent pane (kitty otherwise focuses the last-created one).
-        self.run(&["focus-window", "--match", &win_match])?;
+        self.run(&focus_window_args(&agent_id))?;
         Ok(())
     }
 
@@ -241,14 +282,14 @@ impl Terminal for KittyTerminal {
 /// optional `--to <socket>` to target a specific instance, then the subcommand
 /// args. Split out from [`KittyTerminal::run`] so the routing is unit-testable
 /// without spawning kitty.
-fn kitten_argv(listen_on: Option<&str>, args: &[&str]) -> Vec<String> {
+fn kitten_argv<S: AsRef<str>>(listen_on: Option<&str>, args: &[S]) -> Vec<String> {
     let mut argv = Vec::with_capacity(args.len() + 3);
     argv.push("@".to_string());
     if let Some(socket) = listen_on {
         argv.push("--to".to_string());
         argv.push(socket.to_string());
     }
-    argv.extend(args.iter().map(|s| s.to_string()));
+    argv.extend(args.iter().map(|s| s.as_ref().to_string()));
     argv
 }
 
@@ -353,6 +394,112 @@ mod tests {
                 "--match",
                 "title:^x$"
             ],
+        );
+    }
+
+    #[test]
+    fn workspace_layout_places_the_agent_below_the_top_shell_and_a_shell_to_its_right() {
+        let agent_command = vec!["zsh".to_string(), "-lc".to_string(), "pi".to_string()];
+
+        assert_eq!(
+            new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", true),
+            [
+                "launch",
+                "--type=tab",
+                "--tab-title",
+                "jjfx:feat",
+                "--cwd=/repo-feat",
+            ]
+        );
+        assert_eq!(
+            splits_layout_args("41"),
+            ["goto-layout", "--match", "window_id:41", "splits"]
+        );
+        assert_eq!(
+            split_args("41", "hsplit", 65, "--cwd=/repo-feat", true, &agent_command,),
+            [
+                "launch",
+                "--match",
+                "window_id:41",
+                "--next-to",
+                "id:41",
+                "--location=hsplit",
+                "--bias=65",
+                "--cwd=/repo-feat",
+                "zsh",
+                "-lc",
+                "pi",
+            ]
+        );
+        assert_eq!(
+            split_args("42", "vsplit", 50, "--cwd=/repo-feat", true, &[]),
+            [
+                "launch",
+                "--match",
+                "window_id:42",
+                "--next-to",
+                "id:42",
+                "--location=vsplit",
+                "--bias=50",
+                "--cwd=/repo-feat",
+            ]
+        );
+        assert_eq!(
+            focus_window_args("42"),
+            ["focus-window", "--match", "id:42"]
+        );
+    }
+
+    #[test]
+    fn background_workspace_layout_keeps_focus_during_every_launch() {
+        let agent_command = vec!["pi".to_string()];
+
+        assert_eq!(
+            new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", false),
+            [
+                "launch",
+                "--type=tab",
+                "--tab-title",
+                "jjfx:feat",
+                "--cwd=/repo-feat",
+                "--dont-take-focus",
+            ]
+        );
+        assert_eq!(
+            split_args(
+                "41",
+                "hsplit",
+                65,
+                "--cwd=/repo-feat",
+                false,
+                &agent_command,
+            ),
+            [
+                "launch",
+                "--match",
+                "window_id:41",
+                "--next-to",
+                "id:41",
+                "--location=hsplit",
+                "--bias=65",
+                "--cwd=/repo-feat",
+                "--dont-take-focus",
+                "pi",
+            ]
+        );
+        assert_eq!(
+            split_args("42", "vsplit", 50, "--cwd=/repo-feat", false, &[]),
+            [
+                "launch",
+                "--match",
+                "window_id:42",
+                "--next-to",
+                "id:42",
+                "--location=vsplit",
+                "--bias=50",
+                "--cwd=/repo-feat",
+                "--dont-take-focus",
+            ]
         );
     }
 

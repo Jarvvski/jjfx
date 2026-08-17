@@ -7,6 +7,11 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-08-17 - Redesigned workspace tabs in jjfx 0.41.0 with a full-width shell
+  across the top 35% and an evenly split agent and shell across the bottom 65%.
+  Every pane starts in the workspace directory, and focus finishes on the agent
+  pane. The fixed layout requires kitty 0.36.0 or newer for `launch --bias`.
+
 - 2026-08-17 - Completed persistent Pi Dispatch integration in jjfx 0.40.0 and
   wsg 0.14.0. Repository profiles now carry runtime, provider, and model through
   Dispatch Group restarts, Reservations, Worker Runs, detached orchestration,
