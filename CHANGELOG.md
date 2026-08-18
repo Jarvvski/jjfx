@@ -7,6 +7,11 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-08-18 - New workspace configuration now reports elapsed time and the
+  latest setup output in the footer, while the default setup hook only trusts
+  the project's `mise.toml` and defers heavyweight dependency installation
+  until it is needed (jjfx 0.42.0).
+
 - 2026-08-17 - Redesigned workspace tabs in jjfx 0.41.0 with a full-width shell
   across the top 35% and an evenly split agent and shell across the bottom 65%.
   Every pane starts in the workspace directory, and focus finishes on the agent

@@ -3,7 +3,7 @@
 //! redraws (the engine shape from the PRD).
 
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
@@ -17,7 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentKind, AgentState};
 use crate::attention::{self, Attention};
-use crate::cmd::cmd;
+use crate::cmd::{OutputStream, cmd};
 use crate::config::{ForgeConfig, WorkspaceConfig};
 use crate::diff::{self, FileDiff};
 use crate::diff_view::Detail;
@@ -161,6 +161,7 @@ const POOL_BINDINGS: &[(&str, &str)] = &[
 pub struct PendingWorkspace {
     name: String,
     path: std::path::PathBuf,
+    started_at: Instant,
 }
 
 /// Messages folded into the app from the terminal and background watchers.
@@ -180,6 +181,12 @@ pub enum Msg {
     Forge(forge::Update),
     /// The background `jj git fetch` finished; `Err` carries jj's error text.
     Fetched(Result<(), String>),
+    /// A line of output from the configured command for a new workspace.
+    WorkspaceConfigOutput {
+        workspace: PendingWorkspace,
+        stream: OutputStream,
+        line: String,
+    },
     /// The configured command for a newly-created workspace finished.
     WorkspaceConfigured {
         workspace: PendingWorkspace,
@@ -204,11 +211,27 @@ const STATUS_TTL: Duration = Duration::from_secs(5);
 /// Run the configured new-workspace command directly from `path`. An empty
 /// argv disables the hook; otherwise its first item is the program and the rest
 /// are passed unchanged as arguments, with no shell interpretation.
+#[cfg(test)]
 pub(crate) fn run_on_create(command: &[String], path: &std::path::Path) -> anyhow::Result<()> {
+    run_on_create_with_progress(command, path, |_, _| {})
+}
+
+pub(crate) fn run_on_create_with_progress<F>(
+    command: &[String],
+    path: &std::path::Path,
+    on_line: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(OutputStream, &str),
+{
     let Some((program, args)) = command.split_first() else {
         return Ok(());
     };
-    cmd(program).args(args).current_dir(path).run()?.checked()?;
+    cmd(program)
+        .args(args)
+        .current_dir(path)
+        .run_streaming(on_line)?
+        .checked()?;
     Ok(())
 }
 
@@ -268,6 +291,8 @@ pub struct App {
     workspace_config: WorkspaceConfig,
     /// The single new workspace whose configured command is still running.
     pending_workspace: Option<PendingWorkspace>,
+    /// Latest non-empty line emitted by that workspace's setup command.
+    config_output: Option<(OutputStream, String)>,
     /// The deep Forge module owns execution, progress, and Pull Request rules.
     forge: forge::Forge,
     /// Channel to the app's own message loop, so forge tasks can stream updates
@@ -343,6 +368,7 @@ impl App {
             fetching: false,
             workspace_config: config.workspace,
             pending_workspace: None,
+            config_output: None,
             forge,
             tx,
             terminal,
@@ -371,6 +397,11 @@ impl App {
             Msg::WorkspaceDispatch(event) => self.on_workspace_dispatch(event),
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
+            Msg::WorkspaceConfigOutput {
+                workspace,
+                stream,
+                line,
+            } => self.on_workspace_config_output(workspace, stream, line),
             Msg::WorkspaceConfigured { workspace, result } => {
                 self.on_workspace_configured(workspace, result);
             }
@@ -679,11 +710,12 @@ impl App {
     pub fn animate(&mut self) -> bool {
         self.tick = self.tick.wrapping_add(1);
         matches!(self.mode, Mode::Normal | Mode::Help(_))
-            && (self
-                .store
-                .workspaces()
-                .iter()
-                .any(|w| self.agent_state(w) == AgentState::Working)
+            && (self.pending_workspace.is_some()
+                || self
+                    .store
+                    .workspaces()
+                    .iter()
+                    .any(|w| self.agent_state(w) == AgentState::Working)
                 || self.worker_pool.as_ref().is_some_and(|snapshot| {
                     snapshot
                         .workers()
@@ -1735,18 +1767,32 @@ impl App {
         let workspace = PendingWorkspace {
             name: created.name().to_string(),
             path: created.path().to_path_buf(),
+            started_at: Instant::now(),
         };
         self.pending_workspace = Some(workspace.clone());
+        self.config_output = None;
         self.pin_status(format!("configuring '{}'...", workspace.name));
 
         let command = self.workspace_config.on_create.clone();
         let tx = self.tx.clone();
         let run_path = workspace.path.clone();
+        let progress_workspace = workspace.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || run_on_create(&command, &run_path))
-                .await
-                .map_err(|error| format!("{error:#}"))
-                .and_then(|result| result.map_err(|error| format!("{error:#}")));
+            let progress_tx = tx.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                run_on_create_with_progress(&command, &run_path, move |stream, line| {
+                    if !line.trim().is_empty() {
+                        let _ = progress_tx.send(Msg::WorkspaceConfigOutput {
+                            workspace: progress_workspace.clone(),
+                            stream,
+                            line: line.to_owned(),
+                        });
+                    }
+                })
+            })
+            .await
+            .map_err(|error| format!("{error:#}"))
+            .and_then(|result| result.map_err(|error| format!("{error:#}")));
             let _ = tx.send(Msg::WorkspaceConfigured { workspace, result });
         });
     }
@@ -1756,7 +1802,8 @@ impl App {
             return;
         }
         self.pending_workspace = None;
-        let PendingWorkspace { name, path } = workspace;
+        self.config_output = None;
+        let PendingWorkspace { name, path, .. } = workspace;
 
         if let Err(error) = result {
             self.set_status(format!("created '{name}', on-create failed: {error}"));
@@ -1775,6 +1822,24 @@ impl App {
             return;
         }
         self.open_created_workspace(&name, &path);
+    }
+
+    fn on_workspace_config_output(
+        &mut self,
+        workspace: PendingWorkspace,
+        stream: OutputStream,
+        line: String,
+    ) {
+        if self.pending_workspace.as_ref() != Some(&workspace) {
+            return;
+        }
+        let line = line
+            .chars()
+            .filter(|character| !character.is_control() || *character == '\t')
+            .collect::<String>();
+        if !line.trim().is_empty() {
+            self.config_output = Some((stream, line));
+        }
     }
 
     fn open_created_workspace(&mut self, name: &str, path: &std::path::Path) {
@@ -2768,10 +2833,18 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Normal => match (&self.pending_workspace, &self.status) {
-                (Some(workspace), _) => Paragraph::new(Span::styled(
-                    format!(" configuring '{}'... ", workspace.name),
-                    Style::default().fg(Color::Yellow),
-                )),
+                (Some(workspace), _) => {
+                    let elapsed = workspace.started_at.elapsed().as_secs();
+                    let output = self
+                        .config_output
+                        .as_ref()
+                        .map(|(_, line)| elide_right(line.trim(), 80))
+                        .unwrap_or_else(|| "waiting for setup output".to_owned());
+                    Paragraph::new(Span::styled(
+                        format!(" configuring '{}' ({elapsed}s): {output} ", workspace.name),
+                        Style::default().fg(Color::Yellow),
+                    ))
+                }
                 (None, Some(msg)) => Paragraph::new(Span::styled(
                     format!(" {msg} "),
                     Style::default().fg(Color::Yellow),
@@ -3672,11 +3745,17 @@ mod tests {
         app: &mut App,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
-        let completed = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-            .await
-            .expect("on-create command completes")
-            .expect("completion message arrives");
-        app.handle(completed);
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("on-create command completes")
+                .expect("completion message arrives");
+            let completed = matches!(message, Msg::WorkspaceConfigured { .. });
+            app.handle(message);
+            if completed {
+                break;
+            }
+        }
     }
 
     #[test]
@@ -3922,6 +4001,7 @@ mod tests {
         app.pending_workspace = Some(PendingWorkspace {
             name: "feat".to_string(),
             path: PathBuf::from("/wt/feat"),
+            started_at: Instant::now(),
         });
         app.handle(press(KeyCode::Down));
 
@@ -3976,6 +4056,7 @@ mod tests {
         app.pending_workspace = Some(PendingWorkspace {
             name: "feat".to_string(),
             path: PathBuf::from("/wt/feat"),
+            started_at: Instant::now(),
         });
 
         app.handle(press(KeyCode::Down));
@@ -3997,6 +4078,7 @@ mod tests {
         app.pending_workspace = Some(PendingWorkspace {
             name: "feat".to_string(),
             path: PathBuf::from("/wt/feat"),
+            started_at: Instant::now(),
         });
         app.status = None;
         let mut terminal = Terminal::new(TestBackend::new(80, 8)).unwrap();
@@ -4010,7 +4092,50 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("configuring 'feat'..."), "{text}");
+        assert!(text.contains("configuring 'feat' ("), "{text}");
+        assert!(text.contains("waiting for setup output"), "{text}");
+    }
+
+    #[test]
+    fn configuring_footer_shows_latest_setup_output_and_ignores_stale_output() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        let started_at = Instant::now();
+        let workspace = PendingWorkspace {
+            name: "feat".to_string(),
+            path: PathBuf::from("/wt/feat"),
+            started_at,
+        };
+        app.pending_workspace = Some(workspace.clone());
+        app.handle(Msg::WorkspaceConfigOutput {
+            workspace: workspace.clone(),
+            stream: OutputStream::Stdout,
+            line: "==> compiling backend".to_string(),
+        });
+        app.handle(Msg::WorkspaceConfigOutput {
+            workspace: PendingWorkspace {
+                name: "other".to_string(),
+                path: PathBuf::from("/wt/other"),
+                started_at,
+            },
+            stream: OutputStream::Stderr,
+            line: "stale output".to_string(),
+        });
+
+        let mut terminal = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("configuring 'feat' ("), "{text}");
+        assert!(text.contains("compiling backend"), "{text}");
+        assert!(!text.contains("stale output"), "{text}");
     }
 
     #[test]
@@ -4018,16 +4143,19 @@ mod tests {
         let fake = FakeTerminal::default();
         let mut app = app_with_terminal(&["default", "feat"], Box::new(fake.clone()));
         let path = PathBuf::from("/jjfx-test-path-that-does-not-exist/feat");
+        let started_at = Instant::now();
         app.store.workspace("feat").unwrap();
         app.pending_workspace = Some(PendingWorkspace {
             name: "feat".to_string(),
             path: path.clone(),
+            started_at,
         });
 
         app.handle(Msg::WorkspaceConfigured {
             workspace: PendingWorkspace {
                 name: "feat".to_string(),
                 path,
+                started_at,
             },
             result: Ok(()),
         });

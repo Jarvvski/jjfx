@@ -10,8 +10,11 @@
 //! both output streams. `.output()` closes stdin, so it cannot host that case.
 
 use std::ffi::OsStr;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::thread;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -22,6 +25,13 @@ pub struct Cmd {
     inner: Command,
     /// Human-readable `program arg arg ...`, used in error messages.
     label: String,
+}
+
+/// Which output stream produced a progress line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OutputStream {
+    Stdout,
+    Stderr,
 }
 
 /// Start building a captured run of `program`.
@@ -91,6 +101,73 @@ impl Cmd {
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+
+    /// Run to completion while delivering complete output lines to `on_line`.
+    /// Both streams remain captured in the returned [`Run`].
+    pub(crate) fn run_streaming<F>(mut self, mut on_line: F) -> Result<Run>
+    where
+        F: FnMut(OutputStream, &str),
+    {
+        let mut child = self
+            .inner
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running {}", self.label))?;
+        let stdout = child.stdout.take().context("capturing command stdout")?;
+        let stderr = child.stderr.take().context("capturing command stderr")?;
+        let (tx, rx) = mpsc::channel();
+        let stdout_thread = spawn_output_reader(stdout, OutputStream::Stdout, tx.clone());
+        let stderr_thread = spawn_output_reader(stderr, OutputStream::Stderr, tx);
+
+        let mut stdout_text = String::new();
+        let mut stderr_text = String::new();
+        for (stream, line) in rx {
+            match stream {
+                OutputStream::Stdout => stdout_text.push_str(&line),
+                OutputStream::Stderr => stderr_text.push_str(&line),
+            }
+            on_line(stream, line.trim_end_matches(['\r', '\n']));
+        }
+        stdout_thread
+            .join()
+            .map_err(|_| anyhow!("reading command stdout failed"))??;
+        stderr_thread
+            .join()
+            .map_err(|_| anyhow!("reading command stderr failed"))??;
+        let status = child
+            .wait()
+            .with_context(|| format!("waiting for {}", self.label))?;
+        Ok(Run {
+            label: self.label,
+            ok: status.success(),
+            stdout: stdout_text,
+            stderr: stderr_text,
+        })
+    }
+}
+
+fn spawn_output_reader<R: std::io::Read + Send + 'static>(
+    reader: R,
+    stream: OutputStream,
+    tx: mpsc::Sender<(OutputStream, String)>,
+) -> thread::JoinHandle<Result<()>> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let bytes = reader.read_until(b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&line).into_owned();
+            tx.send((stream, text))
+                .map_err(|_| anyhow!("progress receiver closed"))?;
+        }
+        Ok(())
+    })
 }
 
 /// A finished command's captured result (stdout/stderr are lossy UTF-8).
@@ -154,6 +231,25 @@ mod tests {
         let run = cmd("false").run().expect("false spawns");
         assert!(!run.ok());
         assert!(run.stdout_ok().is_none());
+    }
+
+    #[test]
+    fn streaming_captures_both_streams_and_reports_each_line() {
+        let mut lines = Vec::new();
+        let run = cmd("sh")
+            .args([
+                "-c",
+                "printf 'out 1\\nout 2\\n'; printf 'err 1\\n' >&2; exit 7",
+            ])
+            .run_streaming(|stream, line| lines.push((stream, line.to_owned())))
+            .expect("sh spawns");
+
+        assert!(!run.ok());
+        assert_eq!(run.stdout(), "out 1\nout 2\n");
+        assert_eq!(run.stderr(), "err 1\n");
+        assert!(lines.contains(&(OutputStream::Stdout, "out 1".to_owned())));
+        assert!(lines.contains(&(OutputStream::Stdout, "out 2".to_owned())));
+        assert!(lines.contains(&(OutputStream::Stderr, "err 1".to_owned())));
     }
 
     #[test]
