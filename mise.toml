@@ -12,11 +12,11 @@ zig = "0.16.0"
 
 [tasks.run]
 description = "Run the jjfx TUI"
-run = "cargo run -p jjfx -- tui"
+run = "cargo run --release -p jjfx -- tui"
 
 [tasks.build]
 description = "Build every workspace package"
-run = "cargo build --workspace"
+run = "cargo build --release --workspace"
 
 [tasks.wsg-test-install]
 description = "Install Rust wsg into an isolated repository-local target"
@@ -33,6 +33,10 @@ run = [
   "cargo test -p wsg --test tui -- --include-ignored --test-threads=1",
 ]
 
+[tasks.clean-check]
+description = "Remove all Cargo artifacts after verification"
+run = "cargo clean"
+
 [tasks.conformance]
 description = "Run Go/Rust wsg conformance with explicit Go oracle binaries"
 run = "test -x \"${WSG_GO_BINARY:-}\" && test -x \"${WSG_GO_TEST_BINARY:-}\" && cargo test -p wsg --test conformance -- --include-ignored --test-threads=1"
@@ -46,10 +50,5 @@ description = "Clippy across every workspace package, warnings as errors"
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.check]
-description = "fmt + lint + build + test (the pre-land gate)"
-run = [
-  { task = "fmt" },
-  { task = "lint" },
-  { task = "build" },
-  { task = "test" },
-]
+description = "fmt + lint + build + test + cleanup (the pre-land gate)"
+run = "trap 'status=$?; cargo clean; exit \"$status\"' EXIT; mise run fmt && mise run lint && mise run build && mise run test"

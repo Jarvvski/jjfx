@@ -94,9 +94,13 @@ fn jjfx_binary() -> PathBuf {
     std::env::var_os("CARGO_BIN_EXE_jjfx")
         .map(PathBuf::from)
         .unwrap_or_else(|| {
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../../target/debug/jjfx")
-                .to_path_buf()
+            let target = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target");
+            let release = target.join("release/jjfx");
+            if release.is_file() {
+                release
+            } else {
+                target.join("debug/jjfx")
+            }
         })
 }
 

@@ -84,7 +84,7 @@ fn focus_window_args(window_id: &str) -> Vec<String> {
 }
 
 /// A terminal multiplexer jjfx drives to host workspace tabs.
-pub trait Terminal: Send {
+pub trait Terminal: Send + Sync {
     /// Is a tab for this workspace currently open?
     fn is_open(&self, name: &str) -> bool;
     /// Open a tab for the workspace rooted at `path`: a full-width shell on top

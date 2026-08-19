@@ -3,6 +3,7 @@
 //! redraws (the engine shape from the PRD).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ratatui::Frame;
@@ -164,6 +165,14 @@ pub struct PendingWorkspace {
     started_at: Instant,
 }
 
+/// The workspace identity retained in the list while its persistent deletion
+/// runs outside the App task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingDeletion {
+    operation: OperationId,
+    workspace: Workspace,
+}
+
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
 pub enum Msg {
@@ -191,6 +200,14 @@ pub enum Msg {
     WorkspaceConfigured {
         workspace: PendingWorkspace,
         result: Result<(), String>,
+    },
+    /// A background workspace deletion finished. The worker always includes a
+    /// fresh Store, even when a later deletion phase reports an error.
+    WorkspaceDeletionCompleted {
+        operation: OperationId,
+        workspace: Workspace,
+        result: Result<(), String>,
+        store: Option<Store>,
     },
     /// The diff for a workspace finished loading (ticket 10).
     DiffLoaded { ws: String, files: Vec<FileDiff> },
@@ -291,6 +308,12 @@ pub struct App {
     workspace_config: WorkspaceConfig,
     /// The single new workspace whose configured command is still running.
     pending_workspace: Option<PendingWorkspace>,
+    /// The single workspace whose persistent deletion is running in a blocking
+    /// worker. Its tombstone remains visible until completion.
+    pending_deletion: Option<PendingDeletion>,
+    /// Quit requested while deletion was running; completion decides whether it
+    /// is safe to leave the TUI.
+    quit_after_deletion: bool,
     /// Latest non-empty line emitted by that workspace's setup command.
     config_output: Option<(OutputStream, String)>,
     /// The deep Forge module owns execution, progress, and Pull Request rules.
@@ -299,8 +322,9 @@ pub struct App {
     /// back as [`Msg::Forge`].
     tx: UnboundedSender<Msg>,
     /// The multiplexer jjfx drives for workspace tabs (behind a trait so kitty is
-    /// swappable - ticket 07).
-    terminal: Box<dyn Terminal>,
+    /// swappable - ticket 07). Shared so a background delete can close its tab
+    /// without taking ownership of the App's terminal adapter.
+    terminal: Arc<dyn Terminal>,
     /// The jj mutations the destructive verbs perform, behind a trait so they are
     /// testable against a fake (like `terminal`), rather than shelling out inline.
     jj: Box<dyn jj::Jj>,
@@ -368,10 +392,12 @@ impl App {
             fetching: false,
             workspace_config: config.workspace,
             pending_workspace: None,
+            pending_deletion: None,
+            quit_after_deletion: false,
             config_output: None,
             forge,
             tx,
-            terminal,
+            terminal: terminal.into(),
             jj,
             mode: Mode::Normal,
             graph: None,
@@ -405,6 +431,12 @@ impl App {
             Msg::WorkspaceConfigured { workspace, result } => {
                 self.on_workspace_configured(workspace, result);
             }
+            Msg::WorkspaceDeletionCompleted {
+                operation,
+                workspace,
+                result,
+                store,
+            } => self.on_workspace_deletion_completed(operation, workspace, result, store),
             Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
             Msg::GraphLoaded(graph) => self.graph = Some(graph),
             Msg::StatusExpired(generation) => {
@@ -857,7 +889,14 @@ impl App {
 
     fn on_key_normal(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => self.should_quit = true,
+            KeyCode::Char('q') | KeyCode::Esc => {
+                if self.pending_deletion.is_some() {
+                    self.quit_after_deletion = true;
+                    self.pin_status("waiting for workspace deletion...".to_string());
+                } else {
+                    self.should_quit = true;
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
             KeyCode::Char('n') => {
@@ -929,6 +968,9 @@ impl App {
         let Some(w) = self.selected_workspace().cloned() else {
             return;
         };
+        if self.refuse_if_configuring(&w.name) {
+            return;
+        }
         self.mode = Mode::Detail(Detail::loading(w.name.clone()));
         let tx = self.tx.clone();
         let repo_root = self.store.repo_root().to_path_buf();
@@ -1680,6 +1722,14 @@ impl App {
     }
 
     fn refuse_if_configuring(&mut self, name: &str) -> bool {
+        if self
+            .pending_deletion
+            .as_ref()
+            .is_some_and(|pending| pending.workspace.name == name)
+        {
+            self.set_status(format!("workspace '{name}' is being deleted"));
+            return true;
+        }
         let configuring = self
             .pending_workspace
             .as_ref()
@@ -1849,16 +1899,92 @@ impl App {
         }
     }
 
-    /// Close a workspace's terminal presentation before deleting it through the
-    /// lifecycle module, preserving the existing best-effort terminal ordering.
+    /// Start deleting a workspace without taking the App task off the event
+    /// loop. The row remains as a tombstone until the worker returns a fresh
+    /// projection of persistent state.
     fn delete_workspace(&mut self, name: &str) {
-        let _ = self.terminal.close(name); // best-effort; jj is the source of truth
-        if let Err(error) = self.store.delete(name) {
-            self.set_status(format!("{error:#}"));
+        if self.pending_deletion.is_some() {
+            self.set_status("another workspace deletion is already running".to_string());
             return;
         }
-        self.after_store_changed();
-        self.set_status(format!("deleted '{name}'"));
+        let Some(workspace) = self.store.workspace(name).cloned() else {
+            return;
+        };
+        self.next_operation = self.next_operation.wrapping_add(1).max(1);
+        let operation = self.next_operation;
+        let pending = PendingDeletion {
+            operation,
+            workspace: workspace.clone(),
+        };
+        self.pending_deletion = Some(pending);
+        self.quit_after_deletion = false;
+        self.pin_status(format!("deleting '{name}'..."));
+
+        let repo_root = self.store.repo_root().to_path_buf();
+        let known_path = workspace.path.clone();
+        let terminal = self.terminal.clone();
+        let tx = self.tx.clone();
+        let workspace_name = workspace.name.clone();
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                // Terminal presentation is best-effort, but it belongs in the
+                // same blocking worker as jj and recursive filesystem cleanup.
+                let _ = terminal.close(&workspace_name);
+                let deletion =
+                    Store::delete_persisted(&repo_root, &workspace_name, known_path.as_deref())
+                        .map_err(|error| format!("{error:#}"));
+                let store = Store::load(&repo_root);
+                (deletion, store)
+            })
+            .await;
+            let message = match result {
+                Ok((result, store)) => Msg::WorkspaceDeletionCompleted {
+                    operation,
+                    workspace,
+                    result,
+                    store: Some(store),
+                },
+                Err(error) => Msg::WorkspaceDeletionCompleted {
+                    operation,
+                    workspace,
+                    result: Err(format!("workspace deletion worker failed: {error:#}")),
+                    store: None,
+                },
+            };
+            let _ = tx.send(message);
+        });
+    }
+
+    fn on_workspace_deletion_completed(
+        &mut self,
+        operation: OperationId,
+        workspace: Workspace,
+        result: Result<(), String>,
+        store: Option<Store>,
+    ) {
+        let matches_pending = self.pending_deletion.as_ref().is_some_and(|pending| {
+            pending.operation == operation && pending.workspace == workspace
+        });
+        if !matches_pending {
+            return;
+        }
+        self.pending_deletion = None;
+        if let Some(store) = store {
+            self.store = store;
+            self.after_store_changed();
+        }
+        match result {
+            Ok(()) => {
+                self.set_status(format!("deleted '{}'", workspace.name));
+                if self.quit_after_deletion {
+                    self.should_quit = true;
+                }
+            }
+            Err(error) => {
+                self.quit_after_deletion = false;
+                self.set_status(error);
+            }
+        }
     }
 
     /// `t`: reset idle, empty, undescribed workspace working-copies onto latest
@@ -1992,7 +2118,17 @@ impl App {
         if self.refuse_while_configuring() {
             return;
         }
-        let all: Vec<Workspace> = self.store.workspaces().to_vec();
+        let deleting = self
+            .pending_deletion
+            .as_ref()
+            .map(|pending| pending.workspace.name.as_str());
+        let all: Vec<Workspace> = self
+            .store
+            .workspaces()
+            .iter()
+            .filter(|workspace| Some(workspace.name.as_str()) != deleting)
+            .cloned()
+            .collect();
         self.start_forge(all);
     }
 
@@ -2047,10 +2183,12 @@ impl App {
     /// Re-reconcile from disk; the selection follows its workspace by name.
     fn reload(&mut self) {
         self.store.reload();
+        self.restore_pending_deletion();
         self.after_store_changed();
     }
 
     fn after_store_changed(&mut self) {
+        self.restore_pending_deletion();
         self.ensure_selection();
         // The cache/op-log changed on disk (new commits, fetch, workspace edits);
         // refresh the graph if a graph-bearing view is open.
@@ -2062,6 +2200,12 @@ impl App {
     fn ensure_selection(&mut self) {
         let names = self.selectable_names();
         self.list.ensure_selection(&names);
+    }
+
+    fn restore_pending_deletion(&mut self) {
+        if let Some(pending) = &self.pending_deletion {
+            self.store.restore_workspace(pending.workspace.clone());
+        }
     }
 
     /// Workspaces paired with their derived Attention, grouped needs-you ->
@@ -2711,10 +2855,21 @@ impl App {
             ),
         ];
         // While a forge is running, its live pipeline takes the work column;
-        // otherwise the work label shows there.
-        match self.forge_progress.get(&w.name) {
-            Some(progress) => spans.extend(forge_spans(progress)),
-            None => spans.push(Span::styled(
+        // otherwise the work label shows there. A deleting tombstone has its
+        // own disabled marker so it remains understandable while selected.
+        let deleting = self
+            .pending_deletion
+            .as_ref()
+            .is_some_and(|pending| pending.workspace.name == w.name);
+        match (deleting, self.forge_progress.get(&w.name)) {
+            (true, _) => spans.push(Span::styled(
+                format!("{:<16}", "deleting..."),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            )),
+            (false, Some(progress)) => spans.extend(forge_spans(progress)),
+            (false, None) => spans.push(Span::styled(
                 format!("{:<16}", work.label()),
                 Style::default().fg(work_color(work)),
             )),
@@ -2726,7 +2881,15 @@ impl App {
         // The name is boxed (reversed) when selected - a tight highlight instead
         // of a full-width bar; the path trails in dim.
         let name_style = if selected {
-            Style::default().add_modifier(Modifier::REVERSED)
+            let mut style = Style::default().add_modifier(Modifier::REVERSED);
+            if deleting {
+                style = style.add_modifier(Modifier::DIM);
+            }
+            style
+        } else if deleting {
+            Style::default()
+                .add_modifier(Modifier::BOLD)
+                .add_modifier(Modifier::DIM)
         } else {
             Style::default().add_modifier(Modifier::BOLD)
         };
@@ -2832,8 +2995,16 @@ impl App {
                 format!(" dismiss Worker {worker}? (y/n) "),
                 Style::default().fg(Color::Red),
             )),
-            Mode::Normal => match (&self.pending_workspace, &self.status) {
-                (Some(workspace), _) => {
+            Mode::Normal => match (
+                &self.pending_deletion,
+                &self.pending_workspace,
+                &self.status,
+            ) {
+                (Some(deletion), _, _) => Paragraph::new(Span::styled(
+                    format!(" deleting '{}'... ", deletion.workspace.name),
+                    Style::default().fg(Color::Yellow),
+                )),
+                (None, Some(workspace), _) => {
                     let elapsed = workspace.started_at.elapsed().as_secs();
                     let output = self
                         .config_output
@@ -2845,11 +3016,11 @@ impl App {
                         Style::default().fg(Color::Yellow),
                     ))
                 }
-                (None, Some(msg)) => Paragraph::new(Span::styled(
+                (None, None, Some(msg)) => Paragraph::new(Span::styled(
                     format!(" {msg} "),
                     Style::default().fg(Color::Yellow),
                 )),
-                (None, None) => Paragraph::new(Span::styled(
+                (None, None, None) => Paragraph::new(Span::styled(
                     if self.worker_pool.is_some() {
                         " wsg pool  ·  p manage  j/k move  ? help  q quit "
                     } else if self.world.is_some() {
@@ -3751,6 +3922,23 @@ mod tests {
                 .expect("on-create command completes")
                 .expect("completion message arrives");
             let completed = matches!(message, Msg::WorkspaceConfigured { .. });
+            app.handle(message);
+            if completed {
+                break;
+            }
+        }
+    }
+
+    async fn handle_workspace_deletion_completion(
+        app: &mut App,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    ) {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+                .await
+                .expect("workspace deletion completes")
+                .expect("deletion completion message arrives");
+            let completed = matches!(message, Msg::WorkspaceDeletionCompleted { .. });
             app.handle(message);
             if completed {
                 break;
@@ -5699,22 +5887,166 @@ mod tests {
         std::fs::remove_dir_all(repo).unwrap();
     }
 
-    #[test]
-    fn confirmed_delete_closes_terminal_and_removes_workspace() {
+    #[tokio::test]
+    async fn confirmed_delete_starts_in_the_background_and_removes_workspace() {
         let repo = store::test_local_repo("app-delete");
         let mut store = Store::load(&repo);
         store.create("feat").unwrap();
         let terminal = FakeTerminal::default();
-        let mut app = app_with_store(store, Box::new(terminal.clone()));
+        let (mut app, mut rx) = app_with_store_and_workspace_config(
+            store,
+            Box::new(terminal.clone()),
+            WorkspaceConfig::default(),
+        );
 
         app.handle(press(KeyCode::Down));
         app.handle(press(KeyCode::Char('d')));
         app.handle(press(KeyCode::Char('y')));
 
+        assert_eq!(
+            app.pending_deletion
+                .as_ref()
+                .map(|d| d.workspace.name.as_str()),
+            Some("feat")
+        );
+        assert!(app.store.workspace("feat").is_some());
+        assert_eq!(app.status.as_deref(), Some("deleting 'feat'..."));
+
+        handle_workspace_deletion_completion(&mut app, &mut rx).await;
+
         assert_eq!(terminal.closed.lock().unwrap().as_slice(), &["feat"]);
         assert!(Store::load(&repo).workspace("feat").is_none());
 
         std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn unrelated_workspace_actions_remain_available_during_delete() {
+        let terminal = FakeTerminal::default();
+        let mut app = app_with_terminal(
+            &["default", "deleting", "other"],
+            Box::new(terminal.clone()),
+        );
+        let workspace = app.store.workspace("deleting").unwrap().clone();
+        app.pending_deletion = Some(PendingDeletion {
+            operation: 1,
+            workspace,
+        });
+
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Enter));
+
+        assert_eq!(app.list.selected(), Some("other"));
+        assert_eq!(
+            terminal.opened.lock().unwrap().as_slice(),
+            &[("other".to_string(), true)]
+        );
+    }
+
+    #[test]
+    fn deleting_workspace_rejects_actions_and_second_delete() {
+        let terminal = FakeTerminal::default();
+        let mut app = app_with_terminal(&["default", "feat", "other"], Box::new(terminal));
+        let workspace = app.store.workspace("feat").unwrap().clone();
+        app.pending_deletion = Some(PendingDeletion {
+            operation: 1,
+            workspace,
+        });
+
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Char('d')));
+
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("workspace 'feat' is being deleted")
+        );
+    }
+
+    #[test]
+    fn stale_workspace_deletion_completion_is_ignored() {
+        let mut app = app_with(&["default", "feat"]);
+        let workspace = app.store.workspace("feat").unwrap().clone();
+        app.pending_deletion = Some(PendingDeletion {
+            operation: 7,
+            workspace: workspace.clone(),
+        });
+        app.status = Some("deleting 'feat'...".to_string());
+        let replacement = Store::from_workspaces_for_test(
+            PathBuf::from("/repo"),
+            vec![Workspace {
+                name: "replacement".to_string(),
+                path: Some(PathBuf::from("/wt/replacement")),
+            }],
+        );
+
+        app.handle(Msg::WorkspaceDeletionCompleted {
+            operation: 8,
+            workspace,
+            result: Ok(()),
+            store: Some(replacement),
+        });
+
+        assert_eq!(app.pending_deletion.as_ref().map(|d| d.operation), Some(7));
+        assert!(app.store.workspace("feat").is_some());
+        assert!(app.store.workspace("replacement").is_none());
+        assert_eq!(app.status.as_deref(), Some("deleting 'feat'..."));
+    }
+
+    #[test]
+    fn deleting_row_is_marked_in_the_rendered_list() {
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default", "feat"]);
+        let workspace = app.store.workspace("feat").unwrap().clone();
+        app.pending_deletion = Some(PendingDeletion {
+            operation: 1,
+            workspace,
+        });
+        app.handle(press(KeyCode::Down));
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(100, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+
+        assert!(text.contains("deleting..."), "{text}");
+        assert!(text.contains("feat"), "{text}");
+    }
+
+    #[test]
+    fn quit_waits_for_deletion_then_exits_after_success() {
+        let mut app = app_with(&["default", "feat"]);
+        let workspace = app.store.workspace("feat").unwrap().clone();
+        app.pending_deletion = Some(PendingDeletion {
+            operation: 1,
+            workspace: workspace.clone(),
+        });
+        app.handle(press(KeyCode::Char('q')));
+        assert!(!app.should_quit);
+        assert!(app.quit_after_deletion);
+
+        let store = Store::from_workspaces_for_test(
+            PathBuf::from("/repo"),
+            vec![Workspace {
+                name: "default".to_string(),
+                path: Some(PathBuf::from("/repo")),
+            }],
+        );
+        app.handle(Msg::WorkspaceDeletionCompleted {
+            operation: 1,
+            workspace,
+            result: Ok(()),
+            store: Some(store),
+        });
+
+        assert!(app.should_quit);
+        assert!(app.pending_deletion.is_none());
     }
 
     #[test]

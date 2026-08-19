@@ -368,9 +368,12 @@ fn provisioning_rejects_a_claimed_worker_without_touching_it() {
 #[test]
 fn provisioning_compensates_when_cache_projection_fails() {
     let (_temporary_directory, repository) = local_repository();
-    let temporary_cache = repository
-        .root()
-        .join(format!(".jj/ws-cache.{}.tmp", std::process::id()));
+    let thread = format!("{:?}", std::thread::current().id());
+    let temporary_cache = repository.root().join(format!(
+        ".jj/ws-cache.{}.{}.tmp",
+        std::process::id(),
+        thread
+    ));
     fs::create_dir(&temporary_cache).expect("cache temporary collision should be created");
     let worker = WorkerId::parse("worker-01").expect("Worker ID should be valid");
 

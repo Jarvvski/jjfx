@@ -7,6 +7,14 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-08-20 - New TUI workspaces now start from jjfx's canonical trunk
+  revision instead of inheriting an unrelated `default@` parent, while the
+  existing CLI revision option remains unchanged (jjfx 0.43.0).
+
+- 2026-08-19 - Workspace deletion now runs in the background, keeping the TUI
+  responsive for navigation and operations on other workspaces while the
+  deleting row remains visible and disabled (jjfx 0.43.0).
+
 - 2026-08-18 - New workspace configuration now reports elapsed time and the
   latest setup output in the footer, while the default setup hook only trusts
   the project's `mise.toml` and defers heavyweight dependency installation

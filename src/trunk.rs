@@ -86,7 +86,7 @@ pub(crate) fn as_revset() -> String {
         .map(|s| s.revset_fragment())
         .collect::<Vec<_>>()
         .join(" | ");
-    format!("latest({union})")
+    format!("latest({union} | root())")
 }
 
 /// The trunk candidate commit ids, highest-priority first, gathered from
@@ -179,7 +179,7 @@ mod tests {
         // reproduce this exactly.
         assert_eq!(
             as_revset(),
-            "latest((trunk() ~ root()) | present(main) | present(master) | present(trunk))"
+            "latest((trunk() ~ root()) | present(main) | present(master) | present(trunk) | root())"
         );
     }
 

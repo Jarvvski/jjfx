@@ -3,7 +3,7 @@
 //! to fold in shell-created workspaces and writes through to keep the bash tools
 //! consistent. It is a mirror, never the source of truth.
 
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -54,16 +54,30 @@ pub fn render(entries: &[(String, PathBuf)]) -> String {
 /// or ping our own watcher when nothing changed. Returns whether a write happened.
 pub fn write_through(cache_path: &Path, entries: &[(String, PathBuf)]) -> io::Result<bool> {
     let desired = render(entries);
+    let dir = cache_path
+        .parent()
+        .ok_or_else(|| io::Error::other("ws-cache path has no parent"))?;
+    fs::create_dir_all(dir)?;
+
+    // wsg-core and jjfx share this lock file. Hold it across the read-modify-
+    // write transaction so a background lifecycle operation cannot be
+    // resurrected by a concurrent Store reload.
+    let lock_path = dir.join("ws-cache.lock");
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(lock_path)?;
+    lock.lock()?;
+
     if let Ok(existing) = fs::read_to_string(cache_path)
         && existing == desired
     {
         return Ok(false);
     }
-    let dir = cache_path
-        .parent()
-        .ok_or_else(|| io::Error::other("ws-cache path has no parent"))?;
-    fs::create_dir_all(dir)?;
-    let tmp = dir.join(format!("ws-cache.{}.tmp", std::process::id()));
+    let thread = format!("{:?}", std::thread::current().id());
+    let tmp = dir.join(format!("ws-cache.{}.{}.tmp", std::process::id(), thread));
     fs::write(&tmp, desired.as_bytes())?;
     // Rename is atomic within a filesystem: readers see either the old or the
     // new file, never a partial write.

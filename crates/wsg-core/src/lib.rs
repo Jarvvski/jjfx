@@ -148,7 +148,16 @@ impl Repository {
         &self,
         requested_name: &str,
     ) -> Result<AdHocWorkspace, AdHocWorkspaceError> {
-        workspace::create_ad_hoc(self, requested_name)
+        self.create_ad_hoc_workspace_with_revision(requested_name, None)
+    }
+
+    /// Creates an Ad Hoc Workspace with an optional explicit parent revision.
+    pub fn create_ad_hoc_workspace_with_revision(
+        &self,
+        requested_name: &str,
+        revision: Option<&str>,
+    ) -> Result<AdHocWorkspace, AdHocWorkspaceError> {
+        workspace::create_ad_hoc(self, requested_name, revision)
     }
 
     /// Removes an Ad Hoc Workspace and its optional known directory.

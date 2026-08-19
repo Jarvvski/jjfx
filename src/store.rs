@@ -149,8 +149,9 @@ impl Store {
         }
 
         let repository = Repository::open(&self.repo_root).context("create failed")?;
+        let trunk = crate::trunk::as_revset();
         let workspace = repository
-            .create_ad_hoc_workspace(name)
+            .create_ad_hoc_workspace_with_revision(name, Some(&trunk))
             .context("create failed")?;
         let created = CreatedWorkspace {
             name: workspace.name().to_owned(),
@@ -168,19 +169,45 @@ impl Store {
 
     /// Forget a workspace in jj, clean up its guarded directory and cache entry,
     /// then reload the authoritative state from its live sources.
+    #[cfg(test)]
     pub(crate) fn delete(&mut self, name: &str) -> anyhow::Result<()> {
-        if name == DEFAULT_WORKSPACE {
-            anyhow::bail!("the default workspace cannot be deleted");
-        }
         let path = self
             .workspace(name)
             .and_then(|workspace| workspace.path.clone());
-        let repository = Repository::open(&self.repo_root).context("delete failed")?;
-        repository
-            .remove_ad_hoc_workspace(name, path.as_deref())
-            .context("delete failed")?;
+        Self::delete_persisted(&self.repo_root, name, path.as_deref())?;
         self.reload();
         Ok(())
+    }
+
+    /// Delete one workspace's persistent state without replacing this Store.
+    /// Callers running outside the App task can then load a fresh projection,
+    /// including any partial changes if a later cleanup phase fails.
+    pub(crate) fn delete_persisted(
+        repo_root: &Path,
+        name: &str,
+        known_path: Option<&Path>,
+    ) -> anyhow::Result<()> {
+        if name == DEFAULT_WORKSPACE {
+            anyhow::bail!("the default workspace cannot be deleted");
+        }
+        let repository = Repository::open(repo_root).context("delete failed")?;
+        repository
+            .remove_ad_hoc_workspace(name, known_path)
+            .context("delete failed")?;
+        Ok(())
+    }
+
+    /// Keep a pending deletion visible in the App's in-memory projection after
+    /// a watcher reload. The tombstone is never written back to the cache.
+    pub(crate) fn restore_workspace(&mut self, workspace: Workspace) {
+        if self.workspace(&workspace.name).is_some() {
+            return;
+        }
+        self.workspaces.push(workspace);
+        self.workspaces.sort_by(|left, right| {
+            (left.name != DEFAULT_WORKSPACE, &left.name)
+                .cmp(&(right.name != DEFAULT_WORKSPACE, &right.name))
+        });
     }
 
     /// Mirror the path-bearing workspaces to `.jj/ws-cache` atomically. Workspaces
@@ -301,6 +328,58 @@ mod tests {
         assert_eq!(fresh.workspace("feat").unwrap().path, None);
 
         std::fs::remove_dir_all(&path).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
+    fn create_uses_canonical_trunk_when_default_is_elsewhere() {
+        use std::process::Command;
+
+        let repo = test_local_repo("create-canonical-trunk");
+        let run_jj = |args: &[&str]| {
+            let output = Command::new("jj")
+                .args(["--config", "signing.behavior=drop"])
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .expect("jj should run");
+            assert!(
+                output.status.success(),
+                "jj command failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_jj(&["new", "-m", "mainline"]);
+        run_jj(&["bookmark", "set", "main"]);
+        run_jj(&["new", "root()"]);
+
+        let mut store = Store::load(&repo);
+        let created = store.create("feat").expect("workspace should be created");
+        let parent = Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "log",
+                "-r",
+                "feat@-",
+                "--no-graph",
+                "-T",
+                "bookmarks ++ \"\\n\"",
+            ])
+            .current_dir(&repo)
+            .output()
+            .expect("jj should inspect the workspace parent");
+        assert!(
+            parent.status.success(),
+            "jj parent inspection failed: {}",
+            String::from_utf8_lossy(&parent.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(parent.stdout).expect("jj output should be UTF-8"),
+            "main\n"
+        );
+
+        std::fs::remove_dir_all(created.path()).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
     }
 

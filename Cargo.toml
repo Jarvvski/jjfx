@@ -4,12 +4,22 @@ resolver = "3"
 
 [package]
 name = "jjfx"
-version = "0.42.0"
+version = "0.43.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
 [features]
 test-support = []
+
+# Keep local development and test artifacts small. Release builds are used by
+# the normal mise run/build tasks, while tests retain their separate profile.
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.test]
+debug = 0
+incremental = false
 
 [dependencies]
 anyhow = "1"

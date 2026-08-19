@@ -187,8 +187,10 @@ impl Workspaces {
             .iter()
             .map(|entry| (entry.name.clone(), entry.path.clone()))
             .collect::<Vec<_>>();
-        write_cache(&cache_path(self.repository.root()), &cache_entries)
-            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        with_cache_lock(self.repository.root(), || {
+            write_cache(&cache_path(self.repository.root()), &cache_entries)
+        })
+        .map_err(|error| AdHocWorkspaceError::new(error.message))?;
         Ok(WorkspaceSnapshot { entries })
     }
 
@@ -327,6 +329,7 @@ fn cache_is_stale(root: &Path, cache: &Path) -> bool {
 pub(crate) fn create_ad_hoc(
     repository: &Repository,
     requested_name: &str,
+    revision: Option<&str>,
 ) -> Result<AdHocWorkspace, AdHocWorkspaceError> {
     let name = requested_name.trim();
     if name.is_empty() {
@@ -344,7 +347,8 @@ pub(crate) fn create_ad_hoc(
     }
 
     let path = ad_hoc_path(root, name);
-    add_workspace(root, name, &path).map_err(|error| AdHocWorkspaceError::new(error.message))?;
+    add_workspace_with_revision(root, name, &path, revision)
+        .map_err(|error| AdHocWorkspaceError::new(error.message))?;
     let _ = project_cache_entry(root, name, &path);
     Ok(AdHocWorkspace {
         name: name.to_owned(),
@@ -889,7 +893,7 @@ fn with_cache_lock<T>(
         .write(true)
         .open(path)
         .map_err(|error| WorkerWorkspaceError::new(format!("open ws-cache lock: {error}")))?;
-    flock(&file, FlockOperation::LockExclusive)
+    file.lock()
         .map_err(|error| WorkerWorkspaceError::new(format!("lock ws-cache: {error}")))?;
     operation()
 }
@@ -922,7 +926,8 @@ fn write_cache(path: &Path, entries: &[(String, PathBuf)]) -> Result<(), WorkerW
     fs::create_dir_all(parent).map_err(|error| {
         WorkerWorkspaceError::new(format!("create ws-cache directory: {error}"))
     })?;
-    let temporary = parent.join(format!("ws-cache.{}.tmp", std::process::id()));
+    let thread = format!("{:?}", std::thread::current().id());
+    let temporary = parent.join(format!("ws-cache.{}.{}.tmp", std::process::id(), thread));
     let mut text = String::new();
     for (name, workspace_path) in entries {
         text.push_str(name);
