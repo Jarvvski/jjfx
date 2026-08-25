@@ -874,13 +874,25 @@ impl WorkerPool {
 
     /// Resizes the Pool, provisioning new Workers or detaching its stable tail.
     pub fn resize_to(&self, capacity: PoolCapacity) -> Result<PoolResize, WorkerPoolError> {
-        let mut recovered = self.retry_detached_cleanup()?;
+        self.resize_to_with_progress(capacity, |_, _| {})
+    }
+
+    /// Resizes the Worker Pool while reporting lifecycle hook output.
+    pub fn resize_to_with_progress<F>(
+        &self,
+        capacity: PoolCapacity,
+        mut on_output: F,
+    ) -> Result<PoolResize, WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
+        let mut recovered = self.retry_detached_cleanup(&mut on_output)?;
         let pool_repository = self.repository.state_store().pool();
         let current = self.load_or_create(&pool_repository)?;
         let current_size = usize::try_from(current.value.size)
             .map_err(|_| WorkerPoolError::InvalidSize(current.value.size))?;
         if capacity.as_usize() >= current_size {
-            let mut growth = self.grow(capacity)?;
+            let mut growth = self.grow(capacity, &mut on_output)?;
             growth.removed_workers = recovered;
             return Ok(growth);
         }
@@ -891,7 +903,7 @@ impl WorkerPool {
             .shrink_pool(capacity.as_usize())?
         {
             crate::state::PoolMembershipOutcome::Changed { capacity, removed } => {
-                recovered.extend(self.cleanup_detached(&removed)?);
+                recovered.extend(self.cleanup_detached_with_progress(&removed, &mut on_output)?);
                 Ok(PoolResize {
                     capacity: PoolCapacity::new(capacity)
                         .map_err(|_| WorkerPoolError::InvalidSize(capacity as i64))?,
@@ -917,9 +929,21 @@ impl WorkerPool {
 
     /// Removes one named non-busy Worker while preserving remaining Pool order.
     pub fn remove(&self, worker: WorkerId) -> Result<PoolResize, WorkerPoolError> {
+        self.remove_with_progress(worker, |_, _| {})
+    }
+
+    /// Removes a Worker while reporting teardown hook output.
+    pub fn remove_with_progress<F>(
+        &self,
+        worker: WorkerId,
+        mut on_output: F,
+    ) -> Result<PoolResize, WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
         match self.repository.state_store().remove_pool_worker(&worker)? {
             crate::state::PoolMembershipOutcome::Changed { capacity, removed } => {
-                let removed = self.cleanup_detached(&removed)?;
+                let removed = self.cleanup_detached_with_progress(&removed, &mut on_output)?;
                 Ok(PoolResize {
                     capacity: PoolCapacity::new(capacity)
                         .map_err(|_| WorkerPoolError::InvalidSize(capacity as i64))?,
@@ -934,7 +958,10 @@ impl WorkerPool {
                 if !self.worker_repository(&worker).cleanup_marker_exists() {
                     return Err(WorkerPoolError::WorkerNotInPool { worker });
                 }
-                let removed = self.cleanup_detached(std::slice::from_ref(&worker))?;
+                let removed = self.cleanup_detached_with_progress(
+                    std::slice::from_ref(&worker),
+                    &mut on_output,
+                )?;
                 if removed.is_empty() {
                     return Err(WorkerPoolError::WorkerNotInPool { worker });
                 }
@@ -956,15 +983,30 @@ impl WorkerPool {
     /// Worker state and cleanup markers remain durable until external cleanup
     /// succeeds, so repeating this operation resumes an interrupted destroy.
     pub fn destroy(&self) -> Result<(), WorkerPoolError> {
+        self.destroy_with_progress(|_, _| {})
+    }
+
+    /// Destroys the Pool while reporting teardown hook output.
+    pub fn destroy_with_progress<F>(&self, mut on_output: F) -> Result<(), WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
         let state_store = self.repository.state_store();
         state_store.detach_pool_for_destroy()?;
         let workers = state_store.detached_cleanup_markers()?;
-        self.destroy_detached(&workers)?;
+        self.destroy_detached(&workers, &mut on_output)?;
         state_store.finish_pool_destroy()?;
         Ok(())
     }
 
-    fn destroy_detached(&self, workers: &[WorkerId]) -> Result<(), WorkerPoolError> {
+    fn destroy_detached<F>(
+        &self,
+        workers: &[WorkerId],
+        on_output: &mut F,
+    ) -> Result<(), WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
         let state_store = self.repository.state_store();
         let mut residual = Vec::new();
         let mut failures = Vec::new();
@@ -992,7 +1034,11 @@ impl WorkerPool {
                 | crate::state::DetachedCleanupStatus::Ready => {}
                 crate::state::DetachedCleanupStatus::NotDetached => continue,
             }
-            if let Err(error) = crate::workspace::teardown_detached(&self.repository, worker) {
+            if let Err(error) = crate::workspace::teardown_detached_with_progress(
+                &self.repository,
+                worker,
+                &mut *on_output,
+            ) {
                 residual.push(worker.clone());
                 failures.push(format!("{worker}: {error}"));
                 continue;
@@ -1037,7 +1083,14 @@ impl WorkerPool {
     /// commands run outside state locks; the final manifest update uses the
     /// loaded exact-byte revision, and newly provisioned Workers are
     /// compensated if another process wins the mutation.
-    fn grow(&self, capacity: PoolCapacity) -> Result<PoolResize, WorkerPoolError> {
+    fn grow<F>(
+        &self,
+        capacity: PoolCapacity,
+        on_output: &mut F,
+    ) -> Result<PoolResize, WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
         let pool = self.repository.state_store().pool();
         let current = self.load_or_create(&pool)?;
         let current_size = usize::try_from(current.value.size)
@@ -1063,13 +1116,16 @@ impl WorkerPool {
         let mut added = Vec::with_capacity(count);
         for _ in 0..count {
             let worker = next_worker_id(&self.repository, &known)?;
-            match self.repository.provision_worker_workspace(&worker) {
+            match self
+                .repository
+                .provision_worker_workspace_with_progress(&worker, &mut *on_output)
+            {
                 Ok(_) => {
                     known.insert(worker.clone());
                     added.push(worker);
                 }
                 Err(source) => {
-                    return match self.cleanup_workers(&added) {
+                    return match self.cleanup_workers_with_progress(&added, on_output) {
                         Ok(()) => Err(WorkerPoolError::Provision { worker, source }),
                         Err(cleanup) => Err(WorkerPoolError::Compensation(format!(
                             "{source}; {cleanup}"
@@ -1093,23 +1149,35 @@ impl WorkerPool {
                 added_workers: added,
                 removed_workers: Vec::new(),
             }),
-            Ok(CommitOutcome::Conflict(_)) => match self.cleanup_workers(&added) {
-                Ok(()) => Err(WorkerPoolError::Conflict),
-                Err(cleanup) => Err(WorkerPoolError::Compensation(cleanup.to_string())),
-            },
-            Err(error) => match self.cleanup_workers(&added) {
+            Ok(CommitOutcome::Conflict(_)) => {
+                match self.cleanup_workers_with_progress(&added, on_output) {
+                    Ok(()) => Err(WorkerPoolError::Conflict),
+                    Err(cleanup) => Err(WorkerPoolError::Compensation(cleanup.to_string())),
+                }
+            }
+            Err(error) => match self.cleanup_workers_with_progress(&added, on_output) {
                 Ok(()) => Err(WorkerPoolError::State(error)),
                 Err(cleanup) => Err(WorkerPoolError::Compensation(format!("{error}; {cleanup}"))),
             },
         }
     }
 
-    fn retry_detached_cleanup(&self) -> Result<Vec<WorkerId>, WorkerPoolError> {
+    fn retry_detached_cleanup<F>(&self, on_output: &mut F) -> Result<Vec<WorkerId>, WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
         let markers = self.repository.state_store().detached_cleanup_markers()?;
-        self.cleanup_detached(&markers)
+        self.cleanup_detached_with_progress(&markers, on_output)
     }
 
-    fn cleanup_detached(&self, workers: &[WorkerId]) -> Result<Vec<WorkerId>, WorkerPoolError> {
+    fn cleanup_detached_with_progress<F>(
+        &self,
+        workers: &[WorkerId],
+        on_output: &mut F,
+    ) -> Result<Vec<WorkerId>, WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
         let state_store = self.repository.state_store();
         let mut cleaned = Vec::new();
         let mut busy = Vec::new();
@@ -1117,9 +1185,11 @@ impl WorkerPool {
         for worker in workers {
             match state_store.detached_cleanup_status(worker) {
                 Ok(crate::state::DetachedCleanupStatus::Ready) => {
-                    if let Err(error) =
-                        crate::workspace::teardown_detached(&self.repository, worker)
-                    {
+                    if let Err(error) = crate::workspace::teardown_detached_with_progress(
+                        &self.repository,
+                        worker,
+                        &mut *on_output,
+                    ) {
                         failures.push(format!("{worker}: {error}"));
                         continue;
                     }
@@ -1149,6 +1219,31 @@ impl WorkerPool {
         let mut failures = Vec::new();
         for worker in workers {
             if let Err(error) = crate::workspace::deprovision(&self.repository, worker) {
+                failures.push(format!("{worker}: {error}"));
+            }
+        }
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(WorkerPoolError::Compensation(failures.join("; ")))
+        }
+    }
+
+    fn cleanup_workers_with_progress<F>(
+        &self,
+        workers: &[WorkerId],
+        on_output: &mut F,
+    ) -> Result<(), WorkerPoolError>
+    where
+        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+    {
+        let mut failures = Vec::new();
+        for worker in workers {
+            if let Err(error) = crate::workspace::deprovision_with_progress(
+                &self.repository,
+                worker,
+                &mut *on_output,
+            ) {
                 failures.push(format!("{worker}: {error}"));
             }
         }

@@ -14,7 +14,17 @@ use crate::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, Wor
 const CACHE_PATH: &str = ".jj/ws-cache";
 const CACHE_LOCK_PATH: &str = ".jj/ws-cache.lock";
 const DEFAULT_WORKSPACE: &str = "default";
-const SYNAPSE_PATH: &str = "tools/dev-cli/synapse/clone";
+const SETUP_HOOK_PATH: &str = ".jjfx/setup.sh";
+const TEARDOWN_HOOK_PATH: &str = ".jjfx/teardown.sh";
+
+/// The output stream used by a repository Workspace lifecycle hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceHookStream {
+    /// Output written to the hook's standard output.
+    Stdout,
+    /// Output written to the hook's standard error.
+    Stderr,
+}
 
 /// A user-created Workspace independent of the Worker Pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -200,6 +210,19 @@ impl Workspaces {
         requested_name: &str,
         revision: Option<&str>,
     ) -> Result<WorkspaceAddOutcome, AdHocWorkspaceError> {
+        self.add_with_progress(requested_name, revision, |_, _| {})
+    }
+
+    /// Adds a Workspace while reporting lifecycle hook output.
+    pub fn add_with_progress<F>(
+        &self,
+        requested_name: &str,
+        revision: Option<&str>,
+        on_output: F,
+    ) -> Result<WorkspaceAddOutcome, AdHocWorkspaceError>
+    where
+        F: FnMut(WorkspaceHookStream, &str),
+    {
         let name = requested_name.trim();
         validate_workspace_name(name)?;
         if name == DEFAULT_WORKSPACE {
@@ -223,8 +246,13 @@ impl Workspaces {
         })?;
         add_workspace_with_revision(self.repository.root(), name, &path, revision)
             .map_err(|error| AdHocWorkspaceError::new(error.message))?;
-        copy_setup_sources(self.repository.root(), &path)
-            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        if let Err(error) = run_setup_hook(&path, on_output) {
+            let error = match rollback_workspace_creation(self.repository.root(), name, &path) {
+                Ok(()) => error,
+                Err(cleanup) => format!("{error}; compensation failed: {cleanup}"),
+            };
+            return Err(AdHocWorkspaceError::new(error));
+        }
         self.refresh()?;
         Ok(WorkspaceAddOutcome::Created(AdHocWorkspace {
             name: name.to_owned(),
@@ -232,43 +260,56 @@ impl Workspaces {
         }))
     }
 
-    /// Removes one named Workspace, optionally skipping the repository cleanup hook.
+    /// Removes one named Workspace, optionally skipping the repository teardown hook.
     pub fn remove(&self, name: &str, force: bool) -> Result<bool, AdHocWorkspaceError> {
+        self.remove_with_progress(name, force, |_, _| {})
+    }
+
+    /// Removes one named Workspace while reporting teardown hook output.
+    pub fn remove_with_progress<F>(
+        &self,
+        name: &str,
+        force: bool,
+        mut on_output: F,
+    ) -> Result<bool, AdHocWorkspaceError>
+    where
+        F: FnMut(WorkspaceHookStream, &str),
+    {
         if name == DEFAULT_WORKSPACE {
             return Err(AdHocWorkspaceError::new(
                 "the default workspace cannot be deleted",
             ));
         }
+        let root = self.repository.root();
         let path = self.path(name);
-        if !force && path.is_dir() {
-            let output = Command::new("mise")
-                .args(["run", ":dev", "--", "murder"])
-                .current_dir(&path)
-                .output()
-                .map_err(|error| {
-                    AdHocWorkspaceError::new(format!("run workspace cleanup: {error}"))
-                })?;
-            if !output.status.success() {
-                return Err(AdHocWorkspaceError::new(format!(
-                    "Cleanup failed for {name}:\n{}",
-                    command_error(&output)
-                )));
-            }
-        }
         let existed = path.is_dir();
-        let names = workspace_names(self.repository.root())
-            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
-        if names.iter().any(|candidate| candidate == name) {
-            forget_workspace(self.repository.root(), name)
-                .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        let mut failures = Vec::new();
+        if !force
+            && existed
+            && let Err(error) = run_teardown_hook(&path, &mut on_output)
+        {
+            failures.push(error);
         }
-        if existed {
-            fs::remove_dir_all(&path).map_err(|error| {
-                AdHocWorkspaceError::new(format!("remove Workspace directory: {error}"))
-            })?;
+        match workspace_names(root) {
+            Ok(names) if names.iter().any(|candidate| candidate == name) => {
+                if let Err(error) = forget_workspace(root, name) {
+                    failures.push(error.message);
+                }
+            }
+            Ok(_) => {}
+            Err(error) => failures.push(error.message),
         }
-        let _ = unproject_cache_entry(self.repository.root(), name);
-        Ok(existed)
+        if existed && let Err(error) = fs::remove_dir_all(&path) {
+            failures.push(format!("remove Workspace directory: {error}"));
+        }
+        if let Err(error) = unproject_cache_entry(root, name) {
+            failures.push(error.message);
+        }
+        if failures.is_empty() {
+            Ok(existed)
+        } else {
+            Err(AdHocWorkspaceError::new(failures.join("; ")))
+        }
     }
 
     /// Plans removal of every non-default Workspace in projection order.
@@ -289,11 +330,24 @@ impl Workspaces {
         plan: &WorkspaceCleanPlan,
         decision: CleanDecision,
     ) -> Result<(), AdHocWorkspaceError> {
+        self.clean_with_progress(plan, decision, |_, _| {})
+    }
+
+    /// Applies a clean plan while reporting teardown hook output.
+    pub fn clean_with_progress<F>(
+        &self,
+        plan: &WorkspaceCleanPlan,
+        decision: CleanDecision,
+        mut on_output: F,
+    ) -> Result<(), AdHocWorkspaceError>
+    where
+        F: FnMut(WorkspaceHookStream, &str),
+    {
         if decision == CleanDecision::Declined {
             return Ok(());
         }
         for entry in &plan.entries {
-            self.remove(&entry.name, false)?;
+            self.remove_with_progress(&entry.name, false, &mut on_output)?;
         }
         Ok(())
     }
@@ -326,11 +380,15 @@ fn cache_is_stale(root: &Path, cache: &Path) -> bool {
 }
 
 /// Creates an Ad Hoc Workspace without applying Worker Pool policy.
-pub(crate) fn create_ad_hoc(
+pub(crate) fn create_ad_hoc<F>(
     repository: &Repository,
     requested_name: &str,
     revision: Option<&str>,
-) -> Result<AdHocWorkspace, AdHocWorkspaceError> {
+    on_output: F,
+) -> Result<AdHocWorkspace, AdHocWorkspaceError>
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
     let name = requested_name.trim();
     if name.is_empty() {
         return Err(AdHocWorkspaceError::new("workspace name required"));
@@ -349,6 +407,13 @@ pub(crate) fn create_ad_hoc(
     let path = ad_hoc_path(root, name);
     add_workspace_with_revision(root, name, &path, revision)
         .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+    if let Err(error) = run_setup_hook(&path, on_output) {
+        let error = match rollback_workspace_creation(root, name, &path) {
+            Ok(()) => error,
+            Err(cleanup) => format!("{error}; compensation failed: {cleanup}"),
+        };
+        return Err(AdHocWorkspaceError::new(error));
+    }
     let _ = project_cache_entry(root, name, &path);
     Ok(AdHocWorkspace {
         name: name.to_owned(),
@@ -368,15 +433,33 @@ pub(crate) fn remove_ad_hoc(
         ));
     }
     let root = repository.root();
-    forget_workspace(root, name).map_err(|error| AdHocWorkspaceError::new(error.message))?;
-    if let Some(path) = known_path
-        && path != root
+    let path = known_path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| ad_hoc_path(root, name));
+    let mut failures = Vec::new();
+    if path != root
         && path.is_dir()
+        && let Err(error) = run_teardown_hook(&path, |_, _| {})
     {
-        let _ = fs::remove_dir_all(path);
+        failures.push(error);
     }
-    let _ = unproject_cache_entry(root, name);
-    Ok(())
+    if let Err(error) = forget_workspace(root, name) {
+        failures.push(error.message);
+    }
+    if path != root
+        && path.is_dir()
+        && let Err(error) = fs::remove_dir_all(&path)
+    {
+        failures.push(format!("remove Workspace directory: {error}"));
+    }
+    if let Err(error) = unproject_cache_entry(root, name) {
+        failures.push(error.message);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(AdHocWorkspaceError::new(failures.join("; ")))
+    }
 }
 
 fn ad_hoc_path(root: &Path, name: &str) -> PathBuf {
@@ -505,6 +588,17 @@ pub(crate) fn provision(
     repository: &Repository,
     worker_id: &WorkerId,
 ) -> Result<WorkerWorkspace, WorkerWorkspaceError> {
+    provision_with_progress(repository, worker_id, |_, _| {})
+}
+
+pub(crate) fn provision_with_progress<F>(
+    repository: &Repository,
+    worker_id: &WorkerId,
+    mut on_output: F,
+) -> Result<WorkerWorkspace, WorkerWorkspaceError>
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
     let root = repository.root();
     let path = worker_path(root, worker_id);
     let state = repository.state_store().worker(worker_id.clone());
@@ -526,7 +620,7 @@ pub(crate) fn provision(
 
     let mut state_revision = None;
     let result = (|| {
-        copy_setup_sources(root, &path)?;
+        run_setup_hook(&path, &mut on_output).map_err(WorkerWorkspaceError::new)?;
         let idle = WorkerState::new(WireStatus::new("idle"));
         let committed = state
             .commit(Expected::Missing, StateChange::Replace(idle))
@@ -577,6 +671,17 @@ pub(crate) fn deprovision(
     repository: &Repository,
     worker_id: &WorkerId,
 ) -> Result<(), WorkerWorkspaceError> {
+    deprovision_with_progress(repository, worker_id, |_, _| {})
+}
+
+pub(crate) fn deprovision_with_progress<F>(
+    repository: &Repository,
+    worker_id: &WorkerId,
+    mut on_output: F,
+) -> Result<(), WorkerWorkspaceError>
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
     let root = repository.root();
     let path = worker_path(root, worker_id);
     let state = repository.state_store().worker(worker_id.clone());
@@ -594,8 +699,15 @@ pub(crate) fn deprovision(
         }
     };
 
-    teardown_workspace_resources(root, worker_id, &path)?;
-    remove_detached_state(&state, Some(revision))
+    let resources = teardown_workspace_resources(root, worker_id, &path, &mut on_output);
+    let state_result = if resources.external_resources_succeeded {
+        remove_detached_state(&state, Some(revision))
+    } else {
+        Err(WorkerWorkspaceError::new(
+            "preserve Worker state until Workspace cleanup succeeds",
+        ))
+    };
+    combine_cleanup_results(resources.result, state_result)
 }
 
 /// Finishes cleanup for a Worker already detached from Pool membership.
@@ -603,44 +715,108 @@ pub(crate) fn deprovision(
 /// Worker state remains as the durable cleanup marker until the external jj,
 /// directory, and cache operations have succeeded. Repeating this operation is
 /// safe after either partial or complete cleanup.
-pub(crate) fn teardown_detached(
+pub(crate) fn teardown_detached_with_progress<F>(
     repository: &Repository,
     worker_id: &WorkerId,
-) -> Result<(), WorkerWorkspaceError> {
+    mut on_output: F,
+) -> Result<(), WorkerWorkspaceError>
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
     let root = repository.root();
     let path = worker_path(root, worker_id);
-    teardown_workspace_resources(root, worker_id, &path)?;
+    let resources = teardown_workspace_resources(root, worker_id, &path, &mut on_output);
     let state = repository.state_store().worker(worker_id.clone());
-    remove_detached_state(&state, None)
+    let state_result = if resources.external_resources_succeeded {
+        remove_detached_state(&state, None)
+    } else {
+        Err(WorkerWorkspaceError::new(
+            "preserve Worker state until Workspace cleanup succeeds",
+        ))
+    };
+    combine_cleanup_results(resources.result, state_result)
 }
 
-fn teardown_workspace_resources(
+struct WorkspaceCleanup {
+    result: Result<(), WorkerWorkspaceError>,
+    external_resources_succeeded: bool,
+}
+
+fn teardown_workspace_resources<F>(
     root: &Path,
     worker_id: &WorkerId,
     path: &Path,
-) -> Result<(), WorkerWorkspaceError> {
+    mut on_output: F,
+) -> WorkspaceCleanup
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
     let mut failures = Vec::new();
+    let mut external_failures = Vec::new();
+    if path.is_dir()
+        && let Err(error) = run_teardown_hook(path, &mut on_output)
+    {
+        failures.push(error);
+    }
     match workspace_names(root) {
         Ok(names) if names.iter().any(|name| name == worker_id.as_str()) => {
             if let Err(error) = forget_workspace(root, worker_id.as_str()) {
-                failures.push(error.to_string());
+                let detail = error.to_string();
+                failures.push(detail.clone());
+                external_failures.push(detail);
             }
         }
         Ok(_) => {}
-        Err(error) => failures.push(error.to_string()),
+        Err(error) => {
+            let detail = error.to_string();
+            failures.push(detail.clone());
+            external_failures.push(detail);
+        }
     }
     if path.exists()
         && let Err(error) = fs::remove_dir_all(path)
     {
-        failures.push(format!("remove Worker Workspace directory: {error}"));
+        let detail = format!("remove Worker Workspace directory: {error}");
+        failures.push(detail.clone());
+        external_failures.push(detail);
     }
     if let Err(error) = unproject_cache(root, worker_id) {
-        failures.push(error.to_string());
+        let detail = error.to_string();
+        failures.push(detail.clone());
+        external_failures.push(detail);
+    }
+    let result = if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(WorkerWorkspaceError::new(format!(
+            "Workspace cleanup continued: {}",
+            failures.join("; ")
+        )))
+    };
+    WorkspaceCleanup {
+        result,
+        external_resources_succeeded: external_failures.is_empty(),
+    }
+}
+
+fn combine_cleanup_results(
+    resources: Result<(), WorkerWorkspaceError>,
+    state: Result<(), WorkerWorkspaceError>,
+) -> Result<(), WorkerWorkspaceError> {
+    let mut failures = Vec::new();
+    if let Err(error) = resources {
+        failures.push(error.message);
+    }
+    if let Err(error) = state {
+        failures.push(error.message);
     }
     if failures.is_empty() {
         Ok(())
     } else {
-        Err(WorkerWorkspaceError::new(failures.join("; ")))
+        Err(WorkerWorkspaceError::new(format!(
+            "Workspace cleanup continued: {}",
+            failures.join("; ")
+        )))
     }
 }
 
@@ -808,47 +984,146 @@ fn workspace_names(root: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
         .collect())
 }
 
-fn copy_setup_sources(root: &Path, destination: &Path) -> Result<(), WorkerWorkspaceError> {
-    let env_source = root.join(".env");
-    let env_destination = destination.join(".env");
-    if env_source.exists() && !env_destination.exists() {
-        fs::copy(&env_source, &env_destination).map_err(|error| {
-            WorkerWorkspaceError::new(format!("copy .env into Worker Workspace: {error}"))
-        })?;
-    }
-
-    let synapse_source = root.join(SYNAPSE_PATH);
-    let synapse_destination = destination.join(SYNAPSE_PATH);
-    if synapse_source.is_dir() && !synapse_destination.exists() {
-        copy_directory(&synapse_source, &synapse_destination).map_err(|error| {
-            WorkerWorkspaceError::new(format!("copy Synapse clone into Worker Workspace: {error}"))
-        })?;
-    }
-    Ok(())
+fn run_setup_hook<F>(workspace: &Path, on_output: F) -> Result<(), String>
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
+    run_hook(workspace, SETUP_HOOK_PATH, on_output)
 }
 
-fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
-    fs::create_dir_all(destination)?;
-    for entry in fs::read_dir(source)? {
-        let entry = entry?;
-        if entry.file_name() == ".git" {
-            continue;
-        }
-        let source_path = entry.path();
-        let destination_path = destination.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_directory(&source_path, &destination_path)?;
-        } else if file_type.is_file() {
-            fs::copy(&source_path, &destination_path)?;
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("unsupported Synapse entry {}", source_path.display()),
-            ));
-        }
+fn run_teardown_hook(
+    workspace: &Path,
+    on_output: impl FnMut(WorkspaceHookStream, &str),
+) -> Result<(), String> {
+    run_hook(workspace, TEARDOWN_HOOK_PATH, on_output)
+}
+
+fn run_hook<F>(workspace: &Path, relative_path: &str, mut on_output: F) -> Result<(), String>
+where
+    F: FnMut(WorkspaceHookStream, &str),
+{
+    let hook = workspace.join(relative_path);
+    if !hook.is_file() {
+        return Ok(());
     }
-    Ok(())
+
+    let mut child = Command::new("/bin/sh")
+        .arg(relative_path)
+        .current_dir(workspace)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("run {relative_path}: {error}"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| format!("run {relative_path}: capture stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| format!("run {relative_path}: capture stderr"))?;
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout_thread = spawn_hook_output_reader(stdout, WorkspaceHookStream::Stdout, tx.clone());
+    let stderr_thread = spawn_hook_output_reader(stderr, WorkspaceHookStream::Stderr, tx);
+
+    let mut stdout_text = String::new();
+    let mut stderr_text = String::new();
+    for (stream, line) in rx {
+        match stream {
+            WorkspaceHookStream::Stdout => stdout_text.push_str(&line),
+            WorkspaceHookStream::Stderr => stderr_text.push_str(&line),
+        }
+        on_output(stream, line.trim_end_matches(['\r', '\n']));
+    }
+
+    let mut reader_failures = Vec::new();
+    match stdout_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => reader_failures.push(format!("read stdout: {error}")),
+        Err(_) => reader_failures.push("read stdout: reader thread panicked".to_owned()),
+    }
+    match stderr_thread.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => reader_failures.push(format!("read stderr: {error}")),
+        Err(_) => reader_failures.push("read stderr: reader thread panicked".to_owned()),
+    }
+    if !reader_failures.is_empty() {
+        let _ = child.wait();
+        return Err(format!(
+            "run {relative_path}: {}",
+            reader_failures.join("; ")
+        ));
+    }
+
+    let status = child
+        .wait()
+        .map_err(|error| format!("wait for {relative_path}: {error}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    let detail = stderr_text.trim();
+    if detail.is_empty() {
+        Err(format!("run {relative_path}: command exited with {status}"))
+    } else {
+        Err(format!(
+            "run {relative_path}: command exited with {status}: {detail}"
+        ))
+    }
+}
+
+fn spawn_hook_output_reader<R: io::Read + Send + 'static>(
+    reader: R,
+    stream: WorkspaceHookStream,
+    tx: std::sync::mpsc::Sender<(WorkspaceHookStream, String)>,
+) -> std::thread::JoinHandle<io::Result<()>> {
+    std::thread::spawn(move || {
+        let mut reader = io::BufReader::new(reader);
+        let mut line = Vec::new();
+        loop {
+            line.clear();
+            let bytes = io::BufRead::read_until(&mut reader, b'\n', &mut line)?;
+            if bytes == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&line).into_owned();
+            tx.send((stream, text)).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "hook output receiver closed")
+            })?;
+        }
+        Ok(())
+    })
+}
+
+fn rollback_workspace_creation(root: &Path, name: &str, path: &Path) -> Result<(), String> {
+    let mut failures = Vec::new();
+    if path.is_dir()
+        && let Err(error) = run_teardown_hook(path, |_, _| {})
+    {
+        failures.push(error);
+    }
+    match workspace_names(root) {
+        Ok(names) if names.iter().any(|candidate| candidate == name) => {
+            if let Err(error) = forget_workspace(root, name) {
+                failures.push(error.message);
+            }
+        }
+        Ok(_) => {}
+        Err(error) => failures.push(error.message),
+    }
+    if path.exists()
+        && let Err(error) = fs::remove_dir_all(path)
+    {
+        failures.push(format!("remove Workspace directory: {error}"));
+    }
+    if let Err(error) = unproject_cache_entry(root, name) {
+        failures.push(error.message);
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
 }
 
 fn project_cache(
@@ -953,6 +1228,11 @@ fn rollback_provisioning(
     state_revision: Option<crate::StateRevision<WorkerState>>,
 ) -> Result<(), WorkerWorkspaceError> {
     let mut failures = Vec::new();
+    if path.is_dir()
+        && let Err(error) = run_teardown_hook(path, |_, _| {})
+    {
+        failures.push(error);
+    }
     if let Err(error) = forget_workspace(root, worker_id.as_str()) {
         failures.push(error.to_string());
     }

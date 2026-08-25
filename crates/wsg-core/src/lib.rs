@@ -72,7 +72,8 @@ pub use worker_actions::{
 };
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, CleanDecision, WorkerWorkspace, WorkerWorkspaceError,
-    WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceSnapshot, Workspaces,
+    WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceHookStream,
+    WorkspaceSnapshot, Workspaces,
 };
 
 /// A Jujutsu repository discovered from a starting path.
@@ -157,7 +158,24 @@ impl Repository {
         requested_name: &str,
         revision: Option<&str>,
     ) -> Result<AdHocWorkspace, AdHocWorkspaceError> {
-        workspace::create_ad_hoc(self, requested_name, revision)
+        self.create_ad_hoc_workspace_with_revision_and_progress(requested_name, revision, |_, _| {})
+    }
+
+    /// Creates an Ad Hoc Workspace while reporting lifecycle hook output.
+    ///
+    /// The callback runs synchronously from the caller's thread. Callers that
+    /// must remain responsive should invoke this blocking operation from their
+    /// own worker thread.
+    pub fn create_ad_hoc_workspace_with_revision_and_progress<F>(
+        &self,
+        requested_name: &str,
+        revision: Option<&str>,
+        on_output: F,
+    ) -> Result<AdHocWorkspace, AdHocWorkspaceError>
+    where
+        F: FnMut(WorkspaceHookStream, &str),
+    {
+        workspace::create_ad_hoc(self, requested_name, revision, on_output)
     }
 
     /// Removes an Ad Hoc Workspace and its optional known directory.
@@ -181,6 +199,18 @@ impl Repository {
         worker_id: &WorkerId,
     ) -> Result<WorkerWorkspace, WorkerWorkspaceError> {
         workspace::provision(self, worker_id)
+    }
+
+    /// Provisions a Worker Workspace while reporting lifecycle hook output.
+    pub fn provision_worker_workspace_with_progress<F>(
+        &self,
+        worker_id: &WorkerId,
+        on_output: F,
+    ) -> Result<WorkerWorkspace, WorkerWorkspaceError>
+    where
+        F: FnMut(WorkspaceHookStream, &str),
+    {
+        workspace::provision_with_progress(self, worker_id, on_output)
     }
 
     pub(crate) fn prepare_worker_workspace_for_dispatch(

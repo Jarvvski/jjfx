@@ -17,6 +17,7 @@ mod jj;
 mod prs;
 mod repo;
 mod store;
+mod task_editor;
 mod terminal;
 mod trunk;
 mod tui;
@@ -159,7 +160,6 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         )),
         Box::new(jj::RealJj::new(repo_root.clone())),
         AppConfig {
-            workspace: config.workspace,
             forge: config.forge,
         },
         ui.world_pane,

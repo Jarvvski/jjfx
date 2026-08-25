@@ -7,6 +7,15 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-09-01 - Workspace creation and removal now run repository-local
+  `.jjfx/setup.sh` and `.jjfx/teardown.sh` hooks across CLI, TUI, and Worker
+  Workspaces, with transactional setup and best-effort teardown (jjfx 0.45.0,
+  wsg 0.15.0).
+
+- 2026-08-25 - Worker task Send now opens a full-screen multiline editor with
+  line numbers, natural editing controls, Shift+Enter newlines, bracketed
+  paste, and an any-idle-Worker shortcut (jjfx 0.44.0).
+
 - 2026-08-20 - New TUI workspaces now start from jjfx's canonical trunk
   revision instead of inheriting an unrelated `default@` parent, while the
   existing CLI revision option remains unchanged (jjfx 0.43.0).

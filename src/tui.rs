@@ -4,15 +4,24 @@
 
 use std::io::{self, Stdout};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::event::{
+    DisableBracketedPaste, EnableBracketedPaste, KeyboardEnhancementFlags,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
 pub type Tui = Terminal<CrosstermBackend<Stdout>>;
+
+static ALTERNATE_SCREEN: AtomicBool = AtomicBool::new(false);
+static BRACKETED_PASTE: AtomicBool = AtomicBool::new(false);
+static KEYBOARD_ENHANCEMENT: AtomicBool = AtomicBool::new(false);
 
 /// Owns an entered terminal until normal restoration completes.
 ///
@@ -33,6 +42,20 @@ impl Session {
             let _ = restore();
             return Err(error);
         }
+        ALTERNATE_SCREEN.store(true, Ordering::Release);
+        if let Err(error) = execute!(stdout, EnableBracketedPaste) {
+            let _ = restore();
+            return Err(error);
+        }
+        BRACKETED_PASTE.store(true, Ordering::Release);
+        if let Err(error) = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        ) {
+            let _ = restore();
+            return Err(error);
+        }
+        KEYBOARD_ENHANCEMENT.store(true, Ordering::Release);
         let terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
             Ok(terminal) => terminal,
             Err(error) => {
@@ -74,15 +97,31 @@ impl Drop for Session {
     }
 }
 
-/// Leave the alternate screen and raw mode. Safe to call more than once, and
-/// both operations are attempted even if the first one fails.
+/// Leave the alternate screen, input modes, and raw mode. Safe to call more
+/// than once, and every enabled mode is attempted even if an earlier cleanup
+/// operation fails.
 pub fn restore() -> io::Result<()> {
-    let raw_mode = disable_raw_mode();
-    let alternate_screen = execute!(io::stdout(), LeaveAlternateScreen);
-    match (raw_mode, alternate_screen) {
-        (Ok(()), Ok(())) => Ok(()),
-        (Err(error), Ok(())) | (Ok(()), Err(error)) => Err(error),
-        (Err(raw_error), Err(_alternate_error)) => Err(raw_error),
+    let alternate_screen = ALTERNATE_SCREEN.swap(false, Ordering::AcqRel);
+    let bracketed_paste = BRACKETED_PASTE.swap(false, Ordering::AcqRel);
+    let keyboard_enhancement = KEYBOARD_ENHANCEMENT.swap(false, Ordering::AcqRel);
+    let mut result = disable_raw_mode();
+    let mut stdout = io::stdout();
+
+    if bracketed_paste {
+        remember_first_error(&mut result, execute!(stdout, DisableBracketedPaste));
+    }
+    if keyboard_enhancement {
+        remember_first_error(&mut result, execute!(stdout, PopKeyboardEnhancementFlags));
+    }
+    if alternate_screen {
+        remember_first_error(&mut result, execute!(stdout, LeaveAlternateScreen));
+    }
+    result
+}
+
+fn remember_first_error(result: &mut io::Result<()>, next: io::Result<()>) {
+    if result.is_ok() && next.is_err() {
+        *result = next;
     }
 }
 

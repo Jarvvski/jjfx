@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use anyhow::Context;
 
 use crate::{cache, jj};
-use wsg_core::Repository;
+use wsg_core::{Repository, WorkspaceHookStream};
 
 #[cfg(test)]
 /// Create an isolated local jj repository with signing disabled for tests.
@@ -61,11 +61,13 @@ pub(crate) struct CreatedWorkspace {
 }
 
 impl CreatedWorkspace {
+    #[cfg(test)]
     /// The normalized name accepted by jj.
     pub(crate) fn name(&self) -> &str {
         &self.name
     }
 
+    #[cfg(test)]
     /// The sibling path chosen for the new Workspace.
     pub(crate) fn path(&self) -> &Path {
         &self.path
@@ -84,7 +86,6 @@ pub(crate) const DEFAULT_WORKSPACE: &str = "default";
 /// Derive the on-disk path for a new named workspace: a sibling of the repo root
 /// named `<repo>-<name>`. jj does not record workspace paths (spike 02), so jjfx
 /// chooses this and persists it in the ws-cache (ADR 0006).
-#[cfg(test)]
 fn new_workspace_path(repo_root: &Path, name: &str) -> PathBuf {
     let base = repo_root
         .file_name()
@@ -137,28 +138,46 @@ impl Store {
         }
     }
 
+    #[cfg(test)]
     /// Create a workspace at the derived sibling path, project it to ws-cache,
     /// then reload the authoritative state from its live sources.
     pub(crate) fn create(&mut self, requested_name: &str) -> anyhow::Result<CreatedWorkspace> {
+        let created =
+            Self::create_persisted_with_progress(&self.repo_root, requested_name, |_, _| {})?;
+        self.reload();
+        Ok(created)
+    }
+
+    /// Create a workspace and run its repository lifecycle hook without
+    /// mutating an in-memory Store. This is used by the TUI's blocking worker so
+    /// setup does not pause input handling.
+    pub(crate) fn create_persisted_with_progress<F>(
+        repo_root: &Path,
+        requested_name: &str,
+        on_output: F,
+    ) -> anyhow::Result<CreatedWorkspace>
+    where
+        F: FnMut(WorkspaceHookStream, &str),
+    {
         let name = requested_name.trim();
         if name.is_empty() {
             anyhow::bail!("workspace name required");
         }
-        if self.workspace(name).is_some() {
-            anyhow::bail!("workspace '{name}' already exists");
-        }
 
-        let repository = Repository::open(&self.repo_root).context("create failed")?;
+        let repository = Repository::open(repo_root).context("create failed")?;
         let trunk = crate::trunk::as_revset();
         let workspace = repository
-            .create_ad_hoc_workspace_with_revision(name, Some(&trunk))
+            .create_ad_hoc_workspace_with_revision_and_progress(name, Some(&trunk), on_output)
             .context("create failed")?;
-        let created = CreatedWorkspace {
+        Ok(CreatedWorkspace {
             name: workspace.name().to_owned(),
             path: workspace.path().to_owned(),
-        };
-        self.reload();
-        Ok(created)
+        })
+    }
+
+    /// Return the sibling path used for a new named workspace.
+    pub(crate) fn new_workspace_path(&self, name: &str) -> PathBuf {
+        new_workspace_path(&self.repo_root, name)
     }
 
     /// Reconcile the Store from jj and the ws-cache mirror.
@@ -427,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn delete_jj_failure_preserves_store_cache_and_directory() {
+    fn delete_jj_failure_continues_filesystem_cleanup() {
         let repo = test_local_repo("delete-jj-failure");
         let path = new_workspace_path(&repo, "ghost");
         std::fs::create_dir(&path).unwrap();
@@ -451,15 +470,11 @@ mod tests {
             store.workspace("ghost").unwrap().path.as_deref(),
             Some(path.as_path())
         );
-        assert!(path.is_dir());
+        assert!(!path.exists());
         std::fs::rename(&disabled_repo_state, &repo_state).unwrap();
         let fresh = Store::load(&repo);
-        assert_eq!(
-            fresh.workspace("ghost").unwrap().path.as_deref(),
-            Some(path.as_path())
-        );
+        assert!(fresh.workspace("ghost").is_none());
 
-        std::fs::remove_dir_all(&path).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
     }
 

@@ -91,6 +91,61 @@ fn run_with_input(
 }
 
 #[test]
+fn workspace_add_routes_lifecycle_output_to_stderr() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    let hooks = directory.path().join(".jjfx");
+    fs::create_dir_all(&hooks).expect("hook directory should be created");
+    fs::write(
+        hooks.join("setup.sh"),
+        "#!/bin/sh\nprintf 'setup stdout\\n'\nprintf 'setup stderr\\n' >&2\n",
+    )
+    .expect("setup hook should be written");
+    let tracked = Command::new("jj")
+        .args(["file", "track", "root:.jjfx/setup.sh"])
+        .current_dir(directory.path())
+        .output()
+        .expect("jj file track should run");
+    assert!(
+        tracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&tracked.stderr)
+    );
+    let committed = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "commit",
+            "-m",
+            "setup hook",
+        ])
+        .current_dir(directory.path())
+        .output()
+        .expect("jj commit should run");
+    assert!(
+        committed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+
+    let output = run(binary, directory.path(), &["add", "feat"]);
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stdout.ends_with("/feat\n"), "{stdout}");
+    assert!(!stdout.contains("setup stdout"), "{stdout}");
+    assert!(stderr.contains("setup stdout"), "{stderr}");
+    assert!(stderr.contains("setup stderr"), "{stderr}");
+
+    fs::remove_dir_all(stdout.trim()).expect("workspace should be removed");
+}
+
+#[test]
 fn pi_dispatch_all_reports_missing_helper_without_reserving_a_worker() {
     let binary = env!("CARGO_BIN_EXE_wsg");
     let directory = local_repository();

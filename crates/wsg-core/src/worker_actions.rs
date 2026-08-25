@@ -38,12 +38,18 @@ pub enum FollowUpExecution {
 /// The typed result of launching one Follow-up Run.
 #[derive(Debug)]
 pub struct FollowUpOutcome {
+    worker: WorkerId,
     runtime: AgentRuntime,
     session: AgentSessionResolution,
     execution: FollowUpExecution,
 }
 
 impl FollowUpOutcome {
+    /// Returns the Worker that owns the launched Run.
+    pub const fn worker(&self) -> &WorkerId {
+        &self.worker
+    }
+
     /// Returns the Agent Runtime selected from compatible Worker or Pool state.
     pub const fn runtime(&self) -> AgentRuntime {
         self.runtime
@@ -257,12 +263,40 @@ impl WorkerActions {
         prompt: impl Into<String>,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
+        let prompt = prompt.into();
         self.follow_up(
             worker,
-            prompt.into(),
+            &prompt,
             Some(send_system_prompt(&repository_slug(&self.repository))),
             mode,
         )
+    }
+
+    /// Send a prompt to the first Worker that is idle when the reservation is attempted.
+    pub fn send_any(
+        &self,
+        prompt: impl Into<String>,
+        mode: RunMode,
+    ) -> Result<FollowUpOutcome, WorkerActionError> {
+        let prompt = prompt.into();
+        let snapshot = self.repository.worker_pool().snapshot();
+        let candidates = snapshot
+            .workers()
+            .iter()
+            .filter(|worker| worker.status() == WorkerStatus::Idle)
+            .map(|worker| worker.worker_id().clone())
+            .collect::<Vec<_>>();
+        let system_prompt = send_system_prompt(&repository_slug(&self.repository));
+
+        for worker in candidates {
+            match self.follow_up(&worker, &prompt, Some(system_prompt.clone()), mode) {
+                Ok(outcome) => return Ok(outcome),
+                Err(WorkerActionError::WorkerPool(WorkerPoolError::WorkerNotIdle { .. }))
+                | Err(WorkerActionError::WorkerNotFound { .. }) => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(WorkerActionError::NoIdleWorker)
     }
 
     /// Returns the Worker's structured Run log without choosing a rendering.
@@ -467,7 +501,7 @@ impl WorkerActions {
             .commands
             .failing_checks(&repository, pull_request.number)?;
         let prompt = build_review_prompt(&repository, &pull_request, &checks);
-        self.follow_up(worker, prompt, None, mode)
+        self.follow_up(worker, &prompt, None, mode)
     }
 
     fn branch_and_workspace(
@@ -500,7 +534,7 @@ impl WorkerActions {
     fn follow_up(
         &self,
         worker: &WorkerId,
-        prompt: String,
+        prompt: &str,
         fresh_system_prompt: Option<String>,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
@@ -556,6 +590,7 @@ impl WorkerActions {
             )),
         };
         Ok(FollowUpOutcome {
+            worker: worker.clone(),
             runtime,
             session,
             execution,
@@ -973,6 +1008,9 @@ CRITICAL RULES:\n\
 /// Failure to perform a frontend-neutral Worker action.
 #[derive(Debug, Error)]
 pub enum WorkerActionError {
+    /// No idle Worker was available for an arbitrary task.
+    #[error("no idle Worker is available")]
+    NoIdleWorker,
     /// The requested Worker was not present in the Pool snapshot.
     #[error("Worker {worker} not found")]
     WorkerNotFound { worker: WorkerId },

@@ -286,10 +286,11 @@ pub enum WorkspaceDispatchCommand {
         operation: OperationId,
         parent: String,
     },
-    /// Send a prompt to one selected Worker.
+    /// Send a prompt to one selected Worker, or the first idle Worker when no
+    /// target is supplied.
     Send {
         operation: OperationId,
-        worker: String,
+        worker: Option<String>,
         prompt: String,
     },
     /// Start a Pull Request review on one selected Worker.
@@ -930,8 +931,9 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
         parent: &str,
         emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
     ) -> Result<(), String>;
-    /// Launch a user prompt as a background Follow-up Run.
-    fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String>;
+    /// Launch a user prompt as a background Follow-up Run, optionally choosing
+    /// the first idle Worker.
+    fn send(&self, worker: Option<&str>, prompt: &str) -> Result<WorkerSessionOutcome, String>;
     /// Launch a Pull Request review as a background Follow-up Run.
     fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String>;
     /// Reset a Worker and return its independent Workspace restoration handle.
@@ -1169,7 +1171,7 @@ impl WorkspaceDispatchController {
                 operation,
                 worker,
                 prompt,
-            } => match adapter.send(&worker, &prompt) {
+            } => match adapter.send(worker.as_deref(), &prompt) {
                 Ok(outcome) => {
                     emit(WorkspaceDispatchEvent::WorkerActionCompleted { operation, outcome })
                 }
@@ -1438,25 +1440,35 @@ impl RealWorkspaceDispatch {
 
     fn worker_action(
         &self,
-        worker: &str,
+        worker: Option<&str>,
         action: WorkerActionKind,
         prompt: Option<&str>,
     ) -> Result<WorkerSessionOutcome, String> {
         let repository = self.repository()?;
-        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let worker_id = worker
+            .map(|worker| WorkerId::parse(worker.to_owned()))
+            .transpose()
+            .map_err(|error| error.to_string())?;
         let actions = wsg_core::WorkerActions::new(repository);
         let outcome = match action {
-            WorkerActionKind::Send => actions
-                .send(
-                    &worker_id,
-                    prompt.ok_or_else(|| "Send prompt cannot be missing".to_owned())?,
+            WorkerActionKind::Send => {
+                let prompt = prompt.ok_or_else(|| "Send prompt cannot be missing".to_owned())?;
+                match worker_id.as_ref() {
+                    Some(worker) => actions.send(worker, prompt, RunMode::Background),
+                    None => actions.send_any(prompt, RunMode::Background),
+                }
+                .map_err(|error| error.to_string())?
+            }
+            WorkerActionKind::Review => actions
+                .review(
+                    worker_id
+                        .as_ref()
+                        .ok_or_else(|| "Review worker cannot be missing".to_owned())?,
                     RunMode::Background,
                 )
                 .map_err(|error| error.to_string())?,
-            WorkerActionKind::Review => actions
-                .review(&worker_id, RunMode::Background)
-                .map_err(|error| error.to_string())?,
         };
+        let resolved_worker = outcome.worker().to_string();
         let runtime = outcome.runtime();
         let session = outcome.session().clone();
         let wsg_core::FollowUpExecution::Background(run) = outcome.into_execution() else {
@@ -1467,7 +1479,7 @@ impl RealWorkspaceDispatch {
             let _ = run.wait();
         });
         Ok(WorkerSessionOutcome::new(
-            worker.to_owned(),
+            resolved_worker,
             action,
             runtime,
             session,
@@ -1650,12 +1662,12 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         self.dispatch_with_strategy(tickets, worker, DispatchStrategy::Available)
     }
 
-    fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String> {
+    fn send(&self, worker: Option<&str>, prompt: &str) -> Result<WorkerSessionOutcome, String> {
         self.worker_action(worker, WorkerActionKind::Send, Some(prompt))
     }
 
     fn review(&self, worker: &str) -> Result<WorkerSessionOutcome, String> {
-        self.worker_action(worker, WorkerActionKind::Review, None)
+        self.worker_action(Some(worker), WorkerActionKind::Review, None)
     }
 
     fn reset(&self, worker: &str) -> Result<ResetAdapterResult, String> {
@@ -1941,16 +1953,16 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
         Ok(())
     }
 
-    fn send(&self, worker: &str, prompt: &str) -> Result<WorkerSessionOutcome, String> {
+    fn send(&self, worker: Option<&str>, prompt: &str) -> Result<WorkerSessionOutcome, String> {
         self.commands.lock().expect("recording adapter lock").push(
             WorkspaceDispatchCommand::Send {
                 operation: 0,
-                worker: worker.to_owned(),
+                worker: worker.map(str::to_owned),
                 prompt: prompt.to_owned(),
             },
         );
         Ok(WorkerSessionOutcome::new(
-            worker,
+            worker.unwrap_or("worker-01"),
             WorkerActionKind::Send,
             AgentRuntime::Claude,
             AgentSessionResolution::Fresh {
@@ -2333,7 +2345,7 @@ mod tests {
 
         controller.submit(WorkspaceDispatchCommand::Send {
             operation: 40,
-            worker: "worker-01".to_owned(),
+            worker: Some("worker-01".to_owned()),
             prompt: "continue the work".to_owned(),
         });
         assert!(matches!(
@@ -2368,11 +2380,37 @@ mod tests {
         assert!(commands.iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Send { worker, prompt, .. }
-                if worker == "worker-01" && prompt == "continue the work"
+                if worker.as_deref() == Some("worker-01") && prompt == "continue the work"
         )));
         assert!(commands.iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Review { worker, .. } if worker == "worker-01"
+        )));
+    }
+
+    #[test]
+    fn controller_forwards_an_any_worker_send_target() {
+        let adapter = RecordingAdapter::new(empty_snapshot());
+        let (events_tx, events_rx) = std::sync::mpsc::channel();
+        let controller = WorkspaceDispatchController::new(adapter.clone(), move |event| {
+            events_tx.send(event).expect("event receiver");
+        });
+
+        controller.submit(WorkspaceDispatchCommand::Send {
+            operation: 42,
+            worker: None,
+            prompt: "take the next task".to_owned(),
+        });
+
+        assert!(matches!(
+            events_rx.recv().expect("send event"),
+            WorkspaceDispatchEvent::WorkerActionCompleted { operation: 42, outcome }
+                if outcome.worker() == "worker-01"
+        ));
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Send { worker, prompt, .. }
+                if worker.is_none() && prompt == "take the next task"
         )));
     }
 

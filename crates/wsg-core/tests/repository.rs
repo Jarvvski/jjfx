@@ -1,5 +1,6 @@
 use std::env;
 use std::fs;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -20,6 +21,50 @@ fn local_repository() -> (TempDir, Repository) {
     );
     let repository = Repository::open(temporary_directory.path()).expect("repository should open");
     (temporary_directory, repository)
+}
+
+fn install_lifecycle_hooks(root: &Path, teardown_marker: &str) {
+    install_lifecycle_hooks_with_scripts(
+        root,
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > .jjfx-setup-ran\n",
+        &format!("#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\n"),
+    );
+}
+
+fn install_lifecycle_hooks_with_scripts(root: &Path, setup: &str, teardown: &str) {
+    let hooks = root.join(".jjfx");
+    fs::create_dir_all(&hooks).expect("lifecycle hook directory should be created");
+    fs::write(hooks.join("setup.sh"), setup).expect("setup hook should be written");
+    fs::write(hooks.join("teardown.sh"), teardown).expect("teardown hook should be written");
+
+    for file in ["root:.jjfx/setup.sh", "root:.jjfx/teardown.sh"] {
+        let output = Command::new("jj")
+            .args(["file", "track", file])
+            .current_dir(root)
+            .output()
+            .expect("jj file track should run");
+        assert!(
+            output.status.success(),
+            "jj file track failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let output = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "commit",
+            "-m",
+            "lifecycle hooks",
+        ])
+        .current_dir(root)
+        .output()
+        .expect("jj commit should run");
+    assert!(
+        output.status.success(),
+        "jj commit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn default_worker_path(root: &Path, worker: &str) -> std::path::PathBuf {
@@ -304,7 +349,419 @@ fn uses_an_absolute_workspace_directory_from_environment() {
 }
 
 #[test]
-fn provisions_present_setup_sources_without_copying_synapse_git_metadata() {
+fn workspaces_run_repository_lifecycle_hooks_without_copying_legacy_sources() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    install_lifecycle_hooks(root, &teardown_marker);
+    fs::write(root.join(".env"), "DATABASE_URL=private\n")
+        .expect("environment source should exist");
+    let datagrip = root.join("tools/dev-cli/synapse/clone/contrib/datagrip");
+    fs::create_dir_all(&datagrip).expect("Synapse source should exist");
+    fs::write(datagrip.join("schema.sql"), "CREATE TABLE test;\n")
+        .expect("Synapse schema should exist");
+    symlink("schema.sql", datagrip.join("state.sql")).expect("Synapse link should exist");
+
+    let outcome = repository
+        .workspaces()
+        .add("feature", None)
+        .expect("Workspace should be added");
+    let WorkspaceAddOutcome::Created(workspace) = outcome else {
+        panic!("Workspace should be created");
+    };
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".jjfx-setup-ran"))
+            .expect("setup hook should run")
+            .trim(),
+        workspace.path().to_string_lossy()
+    );
+    assert!(
+        !workspace.path().join(".env").exists(),
+        "built-in .env copying should be removed"
+    );
+    assert!(
+        !workspace
+            .path()
+            .join("tools/dev-cli/synapse/clone")
+            .exists(),
+        "built-in Synapse copying should be removed"
+    );
+
+    assert!(
+        repository
+            .workspaces()
+            .remove("feature", false)
+            .expect("Workspace should be removed")
+    );
+    assert_eq!(
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run")
+            .trim(),
+        workspace.path().to_string_lossy()
+    );
+}
+
+#[test]
+fn ad_hoc_workspaces_run_repository_lifecycle_hooks() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    install_lifecycle_hooks(root, &teardown_marker);
+
+    let workspace = repository
+        .create_ad_hoc_workspace("feature")
+        .expect("Ad Hoc Workspace should be created");
+    assert_eq!(
+        fs::read_to_string(workspace.path().join(".jjfx-setup-ran"))
+            .expect("setup hook should run")
+            .trim(),
+        workspace.path().to_string_lossy()
+    );
+
+    repository
+        .remove_ad_hoc_workspace(workspace.name(), Some(workspace.path()))
+        .expect("Ad Hoc Workspace should be removed");
+    let teardown_path = root
+        .parent()
+        .expect("temporary repository should have a parent")
+        .join(&teardown_marker);
+    assert_eq!(
+        fs::read_to_string(teardown_path)
+            .expect("teardown hook should run")
+            .trim(),
+        workspace.path().to_string_lossy()
+    );
+}
+
+#[test]
+fn worker_pool_runs_repository_lifecycle_hooks() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    install_lifecycle_hooks(root, &teardown_marker);
+    let worker = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Pool should grow")
+        .added_workers()[0]
+        .clone();
+    let worker_path = repository.workspaces().base_dir().join(worker.as_str());
+    assert_eq!(
+        fs::read_to_string(worker_path.join(".jjfx-setup-ran"))
+            .expect("setup hook should run")
+            .trim(),
+        worker_path.to_string_lossy()
+    );
+
+    repository
+        .worker_pool()
+        .remove(worker.clone())
+        .expect("Worker should be removed");
+    assert_eq!(
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run")
+            .trim(),
+        worker_path.to_string_lossy()
+    );
+}
+
+#[test]
+fn workspace_setup_failure_rolls_back_the_cli_workspace_and_runs_teardown() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-rollback-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!("#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\n");
+    install_lifecycle_hooks_with_scripts(
+        root,
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > .jjfx-setup-started\nexit 23\n",
+        &teardown,
+    );
+
+    let error = repository
+        .workspaces()
+        .add("feature", None)
+        .expect_err("failed setup should reject the Workspace");
+
+    assert!(error.to_string().contains("setup.sh"), "{error}");
+    assert!(!workspace_names(root).contains(&"feature".to_owned()));
+    assert!(!repository.workspaces().path("feature").exists());
+    assert!(
+        !fs::read_to_string(root.join(".jj/ws-cache"))
+            .expect("workspace cache should remain readable")
+            .lines()
+            .any(|line| line.starts_with("feature\\t"))
+    );
+    assert_eq!(
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run during rollback")
+            .trim(),
+        repository.workspaces().path("feature").to_string_lossy()
+    );
+}
+
+#[test]
+fn workspace_setup_failure_rolls_back_the_tui_workspace_and_runs_teardown() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-rollback-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!("#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\n");
+    install_lifecycle_hooks_with_scripts(
+        root,
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > .jjfx-setup-started\nexit 23\n",
+        &teardown,
+    );
+    let expected_path = repository.root().with_file_name(format!(
+        "{}-feature",
+        repository
+            .root()
+            .file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    ));
+
+    let error = repository
+        .create_ad_hoc_workspace("feature")
+        .expect_err("failed setup should reject the Ad Hoc Workspace");
+
+    assert!(error.to_string().contains("setup.sh"), "{error}");
+    assert!(!workspace_names(root).contains(&"feature".to_owned()));
+    assert!(!expected_path.exists());
+    if let Ok(cache) = fs::read_to_string(root.join(".jj/ws-cache")) {
+        assert!(!cache.lines().any(|line| line.starts_with("feature\\t")));
+    }
+    assert_eq!(
+        fs::read_to_string(
+            root.parent()
+                .expect("temporary repository should have a parent")
+                .join(&teardown_marker)
+        )
+        .expect("teardown hook should run during rollback")
+        .trim(),
+        expected_path.to_string_lossy()
+    );
+}
+
+#[test]
+fn worker_setup_failure_rolls_back_the_worker_and_runs_teardown() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-rollback-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!("#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\n");
+    install_lifecycle_hooks_with_scripts(
+        root,
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > .jjfx-setup-started\nexit 23\n",
+        &teardown,
+    );
+    let worker_id = "worker-01";
+    let worker_path = repository.workspaces().base_dir().join(worker_id);
+
+    let error = repository
+        .provision_worker_workspace(&WorkerId::parse(worker_id).expect("Worker ID"))
+        .expect_err("failed setup should reject the Worker Workspace");
+
+    assert!(error.to_string().contains("setup.sh"), "{error}");
+    assert!(!workspace_names(root).contains(&worker_id.to_owned()));
+    assert!(!worker_path.exists());
+    assert!(!root.join(".jj/pool/worker-01.json").exists());
+    if let Ok(cache) = fs::read_to_string(root.join(".jj/ws-cache")) {
+        assert!(!cache.lines().any(|line| line.starts_with("worker-01\\t")));
+    }
+    assert_eq!(
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run during rollback")
+            .trim(),
+        worker_path.to_string_lossy()
+    );
+}
+
+#[test]
+fn failed_cli_teardown_still_removes_the_workspace_and_reports_the_error() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-failed-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\nprintf '%s\\n' 'failed' >&2\nexit 29\n"
+    );
+    install_lifecycle_hooks_with_scripts(root, "#!/bin/sh\nexit 0\n", &teardown);
+    let outcome = repository
+        .workspaces()
+        .add("feature", None)
+        .expect("Workspace should be added");
+    let WorkspaceAddOutcome::Created(workspace) = outcome else {
+        panic!("Workspace should be created");
+    };
+
+    let error = repository
+        .workspaces()
+        .remove("feature", false)
+        .expect_err("teardown failure should be reported");
+
+    assert!(error.to_string().contains("teardown.sh"), "{error}");
+    assert!(!workspace_names(root).contains(&"feature".to_owned()));
+    assert!(!workspace.path().exists());
+    assert_eq!(
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run")
+            .trim(),
+        workspace.path().to_string_lossy()
+    );
+}
+
+#[test]
+fn failed_tui_teardown_still_removes_the_workspace_and_reports_the_error() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-failed-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\nprintf '%s\\n' 'failed' >&2\nexit 29\n"
+    );
+    install_lifecycle_hooks_with_scripts(root, "#!/bin/sh\nexit 0\n", &teardown);
+    let workspace = repository
+        .create_ad_hoc_workspace("feature")
+        .expect("Ad Hoc Workspace should be created");
+
+    let error = repository
+        .remove_ad_hoc_workspace(workspace.name(), Some(workspace.path()))
+        .expect_err("teardown failure should be reported");
+
+    assert!(error.to_string().contains("teardown.sh"), "{error}");
+    assert!(!workspace_names(root).contains(&"feature".to_owned()));
+    assert!(!workspace.path().exists());
+    assert_eq!(
+        fs::read_to_string(
+            root.parent()
+                .expect("temporary repository should have a parent")
+                .join(&teardown_marker)
+        )
+        .expect("teardown hook should run")
+        .trim(),
+        workspace.path().to_string_lossy()
+    );
+}
+
+#[test]
+fn failed_worker_teardown_still_removes_the_workspace_and_reports_the_error() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-failed-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!(
+        "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\nprintf '%s\\n' 'failed' >&2\nexit 29\n"
+    );
+    install_lifecycle_hooks_with_scripts(root, "#!/bin/sh\nexit 0\n", &teardown);
+    let worker = repository
+        .worker_pool()
+        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Pool should grow")
+        .added_workers()[0]
+        .clone();
+    let worker_path = repository.workspaces().base_dir().join(worker.as_str());
+
+    let error = repository
+        .worker_pool()
+        .remove(worker.clone())
+        .expect_err("teardown failure should be reported");
+
+    assert!(error.to_string().contains("teardown.sh"), "{error}");
+    assert!(!workspace_names(root).contains(&worker.as_str().to_owned()));
+    assert!(!worker_path.exists());
+    assert!(matches!(
+        repository
+            .state_store()
+            .worker(worker.clone())
+            .load()
+            .expect("Worker state should load"),
+        wsg_core::Loaded::Missing
+    ));
+    assert_eq!(
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run")
+            .trim(),
+        worker_path.to_string_lossy()
+    );
+}
+
+#[test]
+fn force_removal_skips_the_repository_teardown_hook() {
+    let (temporary_directory, repository) = local_repository();
+    let root = temporary_directory.path();
+    let teardown_marker = format!(
+        "{}-forced-teardown-ran",
+        root.file_name()
+            .expect("temporary repository should have a name")
+            .to_string_lossy()
+    );
+    let teardown = format!("#!/bin/sh\nprintf '%s\\n' \"$PWD\" > ../{teardown_marker}\nexit 29\n");
+    install_lifecycle_hooks_with_scripts(root, "#!/bin/sh\nexit 0\n", &teardown);
+    let outcome = repository
+        .workspaces()
+        .add("feature", None)
+        .expect("Workspace should be added");
+    let WorkspaceAddOutcome::Created(workspace) = outcome else {
+        panic!("Workspace should be created");
+    };
+
+    repository
+        .workspaces()
+        .remove("feature", true)
+        .expect("forced removal should skip teardown failure");
+
+    assert!(!workspace.path().exists());
+    assert!(
+        !repository
+            .workspaces()
+            .base_dir()
+            .join(teardown_marker)
+            .exists()
+    );
+}
+
+#[test]
+fn provisioning_ignores_repository_specific_setup_sources() {
     let (temporary_directory, repository) = local_repository();
     fs::write(
         temporary_directory.path().join(".env"),
@@ -313,33 +770,23 @@ fn provisions_present_setup_sources_without_copying_synapse_git_metadata() {
     .expect("environment source should be written");
     let synapse = temporary_directory
         .path()
-        .join("tools/dev-cli/synapse/clone");
+        .join("tools/dev-cli/synapse/clone/contrib/datagrip");
     fs::create_dir_all(synapse.join(".git")).expect("Synapse git directory should be created");
     fs::write(synapse.join(".git/config"), "private").expect("git metadata should be written");
-    fs::write(synapse.join("prompt.txt"), "prompt").expect("Synapse file should be written");
+    fs::write(synapse.join("schema.sql"), "CREATE TABLE test;\n")
+        .expect("Synapse schema should be written");
+    symlink("schema.sql", synapse.join("state.sql")).expect("Synapse link should be written");
     let worker = WorkerId::parse("worker-01").expect("Worker ID should be valid");
 
     let workspace = repository
         .provision_worker_workspace(&worker)
         .expect("Worker Workspace should be provisioned");
 
-    assert_eq!(
-        fs::read_to_string(workspace.path().join(".env")).expect("environment should copy"),
-        "DATABASE_URL=test\n"
-    );
-    assert_eq!(
-        fs::read_to_string(
-            workspace
-                .path()
-                .join("tools/dev-cli/synapse/clone/prompt.txt")
-        )
-        .expect("Synapse file should copy"),
-        "prompt"
-    );
+    assert!(!workspace.path().join(".env").exists());
     assert!(
         !workspace
             .path()
-            .join("tools/dev-cli/synapse/clone/.git")
+            .join("tools/dev-cli/synapse/clone")
             .exists()
     );
 }
@@ -382,24 +829,6 @@ fn provisioning_compensates_when_cache_projection_fails() {
         .expect_err("cache projection should fail");
 
     assert!(error.to_string().contains("write ws-cache temporary file"));
-    assert!(!workspace_names(repository.root()).contains(&"worker-01".to_owned()));
-    assert!(!default_worker_path(repository.root(), "worker-01").exists());
-    assert!(!repository.root().join(".jj/pool/worker-01.json").exists());
-    assert!(!repository.root().join(".jj/ws-cache").exists());
-}
-
-#[test]
-fn provisioning_compensates_when_an_existing_environment_source_cannot_be_copied() {
-    let (temporary_directory, repository) = local_repository();
-    fs::create_dir(temporary_directory.path().join(".env"))
-        .expect("invalid environment source should be created");
-    let worker = WorkerId::parse("worker-01").expect("Worker ID should be valid");
-
-    let error = repository
-        .provision_worker_workspace(&worker)
-        .expect_err("copying a directory as .env should fail");
-
-    assert!(error.to_string().contains("copy .env"));
     assert!(!workspace_names(repository.root()).contains(&"worker-01".to_owned()));
     assert!(!default_worker_path(repository.root(), "worker-01").exists());
     assert!(!repository.root().join(".jj/pool/worker-01.json").exists());

@@ -10,10 +10,13 @@
 //! both output streams. `.output()` closes stdin, so it cannot host that case.
 
 use std::ffi::OsStr;
+#[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Command, Stdio};
+#[cfg(test)]
 use std::sync::mpsc;
+#[cfg(test)]
 use std::thread;
 
 use anyhow::{Context, Result, anyhow};
@@ -27,6 +30,7 @@ pub struct Cmd {
     label: String,
 }
 
+#[cfg(test)]
 /// Which output stream produced a progress line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum OutputStream {
@@ -102,6 +106,7 @@ impl Cmd {
         })
     }
 
+    #[cfg(test)]
     /// Run to completion while delivering complete output lines to `on_line`.
     /// Both streams remain captured in the returned [`Run`].
     pub(crate) fn run_streaming<F>(mut self, mut on_line: F) -> Result<Run>
@@ -148,6 +153,7 @@ impl Cmd {
     }
 }
 
+#[cfg(test)]
 fn spawn_output_reader<R: std::io::Read + Send + 'static>(
     reader: R,
     stream: OutputStream,

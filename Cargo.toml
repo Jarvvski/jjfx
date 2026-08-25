@@ -4,7 +4,7 @@ resolver = "3"
 
 [package]
 name = "jjfx"
-version = "0.43.0"
+version = "0.45.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 
@@ -26,6 +26,7 @@ anyhow = "1"
 jiff = "0.2"
 wsg-core = { path = "crates/wsg-core" }
 ratatui = "0.29"
+ratatui-textarea = "0.8"
 notify = "8"
 # jj-lib reads the on-disk .jj store directly for the commit graph (ADR 0007),
 # so its version must equal the `jj` mise pin (0.43.0) and upgrade in lockstep.

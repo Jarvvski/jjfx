@@ -13,6 +13,7 @@ use wsg_core::{
     PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, Repository,
     RunActivity, RunActivityKind, RunMode, TicketDiscovery, TicketId, TicketStatus, WireAgent,
     WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream,
 };
 
 pub const HELP: &str = concat!(
@@ -627,6 +628,12 @@ fn repository() -> Result<Repository> {
     Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))
 }
 
+fn print_hook_output(_stream: WorkspaceHookStream, line: &str) {
+    if !line.is_empty() {
+        eprintln!("{line}");
+    }
+}
+
 fn root_command(repository: &Repository) -> Result<()> {
     println!("{}", repository.root().display());
     Ok(())
@@ -653,7 +660,10 @@ fn refresh_command(repository: &Repository) -> Result<()> {
 }
 
 fn add_command(repository: &Repository, name: &str, revision: Option<&str>) -> Result<()> {
-    match repository.workspaces().add(name, revision)? {
+    match repository
+        .workspaces()
+        .add_with_progress(name, revision, print_hook_output)?
+    {
         WorkspaceAddOutcome::Default(path) => println!("{}", path.display()),
         WorkspaceAddOutcome::Existing(workspace) | WorkspaceAddOutcome::Created(workspace) => {
             println!("{}", workspace.path().display())
@@ -688,7 +698,7 @@ fn remove_command(repository: &Repository, force: bool, names: &[String]) -> Res
             continue;
         }
         let path = workspaces.path(name);
-        match workspaces.remove(name, force) {
+        match workspaces.remove_with_progress(name, force, print_hook_output) {
             Ok(true) => eprintln!("Deleted {}", path.display()),
             Ok(false) => {}
             Err(error) => {
@@ -722,7 +732,7 @@ fn clean_command(repository: &Repository) -> Result<()> {
     } else {
         CleanDecision::Declined
     };
-    workspaces.clean(&plan, decision)?;
+    workspaces.clean_with_progress(&plan, decision, print_hook_output)?;
     Ok(())
 }
 
@@ -807,7 +817,9 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
         .snapshot()
         .pool()
         .map_or(0, |pool| usize::try_from(pool.size()).unwrap_or_default());
-    let resize = repository.worker_pool().resize_to(capacity)?;
+    let resize = repository
+        .worker_pool()
+        .resize_to_with_progress(capacity, print_hook_output)?;
     for worker in resize.added_workers() {
         eprintln!("  Created {worker}");
     }
@@ -892,7 +904,9 @@ fn normalize_worker(value: &str) -> Result<WorkerId> {
 
 fn remove_worker_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
-    let resize = repository.worker_pool().remove(worker.clone())?;
+    let resize = repository
+        .worker_pool()
+        .remove_with_progress(worker.clone(), print_hook_output)?;
     eprintln!(
         "Removed {worker} (pool size: {})",
         resize.capacity().as_usize()
@@ -928,7 +942,9 @@ fn destroy_pool_command(repository: &Repository) -> Result<()> {
         eprintln!("No pool to destroy");
         return Ok(());
     }
-    repository.worker_pool().destroy()?;
+    repository
+        .worker_pool()
+        .destroy_with_progress(print_hook_output)?;
     eprintln!("Pool destroyed");
     Ok(())
 }

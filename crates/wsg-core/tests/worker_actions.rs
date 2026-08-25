@@ -49,6 +49,69 @@ fn send_rejects_a_busy_worker_through_the_actions_facade() {
 }
 
 #[test]
+fn send_any_reports_that_no_idle_worker_is_available() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    repository
+        .worker_pool()
+        .reserve_named(worker, "ENG-303")
+        .expect("initial Run reservation");
+
+    let error = WorkerActions::new(repository)
+        .send_any("continue the work", RunMode::Background)
+        .expect_err("an all-busy Pool cannot accept an arbitrary task");
+
+    assert!(error.to_string().contains("no idle Worker"));
+}
+
+#[test]
+fn send_any_uses_the_first_idle_worker_and_reports_its_identity() {
+    let (temporary_directory, repository) = local_repository();
+    let growth = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(2).expect("capacity"))
+        .expect("Worker Workspaces should be provisioned");
+    let busy = growth.added_workers()[0].clone();
+    let idle = growth.added_workers()[1].clone();
+    repository
+        .worker_pool()
+        .reserve_named(busy, "ENG-304")
+        .expect("first Worker should be busy");
+
+    let bin = temporary_directory.path().join("send-any-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
+    );
+    let result = temporary_directory.path().join("send-any-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "send_any_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .output()
+        .expect("Send-any helper should run");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("Send-any result"),
+        format!("worker={idle}; completed=true")
+    );
+}
+
+#[test]
 fn dismiss_removes_an_idle_worker_and_reduces_pool_capacity() {
     let (_temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
@@ -1330,6 +1393,22 @@ fn failed_send_action_helper() {
         error.to_string(),
     )
     .expect("failed Send result");
+}
+
+#[test]
+#[ignore]
+fn send_any_action_helper() {
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let outcome = WorkerActions::new(repository)
+        .send_any("continue the work", RunMode::Foreground)
+        .expect("Send-any should launch");
+    let completed = matches!(outcome.execution(), FollowUpExecution::Foreground(_));
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        format!("worker={}; completed={completed}", outcome.worker()),
+    )
+    .expect("Send-any result");
 }
 
 #[test]

@@ -18,14 +18,14 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentKind, AgentState};
 use crate::attention::{self, Attention};
-use crate::cmd::{OutputStream, cmd};
-use crate::config::{ForgeConfig, WorkspaceConfig};
+use crate::config::ForgeConfig;
 use crate::diff::{self, FileDiff};
 use crate::diff_view::Detail;
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj;
 use crate::store::{self, Store, Workspace};
+use crate::task_editor::{TaskEditor, TaskEditorAction};
 use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
@@ -53,8 +53,9 @@ enum PoolMode {
         selected: Option<String>,
     },
     SendInput {
-        worker: String,
-        buffer: String,
+        worker: Option<String>,
+        selected: Option<String>,
+        editor: Box<TaskEditor>,
     },
     AliasInput {
         worker: String,
@@ -141,7 +142,8 @@ const NORMAL_BINDINGS: &[(&str, &str)] = &[
 const POOL_BINDINGS: &[(&str, &str)] = &[
     ("Move between Workers", "j / k / ↑ / ↓"),
     ("Ticket Dispatch", "d"),
-    ("Send to Worker", "s"),
+    ("Send to selected Worker", "s"),
+    ("Send to any idle Worker", "S"),
     ("Review Worker", "v"),
     ("Rebase Worker", "g"),
     ("Open Pull Request", "P"),
@@ -157,7 +159,7 @@ const POOL_BINDINGS: &[(&str, &str)] = &[
     ("Back", "q / esc"),
 ];
 
-/// The identity of the single workspace whose on-create command is running.
+/// The identity of the single workspace whose setup hook is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWorkspace {
     name: String,
@@ -190,14 +192,14 @@ pub enum Msg {
     Forge(forge::Update),
     /// The background `jj git fetch` finished; `Err` carries jj's error text.
     Fetched(Result<(), String>),
-    /// A line of output from the configured command for a new workspace.
-    WorkspaceConfigOutput {
+    /// A line of output from the setup hook for a new workspace.
+    WorkspaceSetupOutput {
         workspace: PendingWorkspace,
-        stream: OutputStream,
+        stream: wsg_core::WorkspaceHookStream,
         line: String,
     },
-    /// The configured command for a newly-created workspace finished.
-    WorkspaceConfigured {
+    /// The setup hook for a newly-created workspace finished.
+    WorkspaceSetupCompleted {
         workspace: PendingWorkspace,
         result: Result<(), String>,
     },
@@ -225,38 +227,9 @@ pub enum Msg {
 /// How long a transient footer status message stays before expiring.
 const STATUS_TTL: Duration = Duration::from_secs(5);
 
-/// Run the configured new-workspace command directly from `path`. An empty
-/// argv disables the hook; otherwise its first item is the program and the rest
-/// are passed unchanged as arguments, with no shell interpretation.
-#[cfg(test)]
-pub(crate) fn run_on_create(command: &[String], path: &std::path::Path) -> anyhow::Result<()> {
-    run_on_create_with_progress(command, path, |_, _| {})
-}
-
-pub(crate) fn run_on_create_with_progress<F>(
-    command: &[String],
-    path: &std::path::Path,
-    on_line: F,
-) -> anyhow::Result<()>
-where
-    F: FnMut(OutputStream, &str),
-{
-    let Some((program, args)) = command.split_first() else {
-        return Ok(());
-    };
-    cmd(program)
-        .args(args)
-        .current_dir(path)
-        .run_streaming(on_line)?
-        .checked()?;
-    Ok(())
-}
-
 /// Startup settings owned by the App rather than its terminal or store.
 #[derive(Debug, Default)]
 pub struct AppConfig {
-    /// How newly-created workspaces are prepared before their tabs open.
-    pub workspace: WorkspaceConfig,
     /// How the forge pipeline opens and maintains pull requests.
     pub forge: ForgeConfig,
 }
@@ -304,8 +277,6 @@ pub struct App {
     /// A background `jj git fetch` is in flight; a second `u` is ignored until
     /// it resolves (two would just contend on the repo lock).
     fetching: bool,
-    /// User-owned command run once after workspace creation. Empty disables it.
-    workspace_config: WorkspaceConfig,
     /// The single new workspace whose configured command is still running.
     pending_workspace: Option<PendingWorkspace>,
     /// The single workspace whose persistent deletion is running in a blocking
@@ -315,7 +286,7 @@ pub struct App {
     /// is safe to leave the TUI.
     quit_after_deletion: bool,
     /// Latest non-empty line emitted by that workspace's setup command.
-    config_output: Option<(OutputStream, String)>,
+    setup_output: Option<(wsg_core::WorkspaceHookStream, String)>,
     /// The deep Forge module owns execution, progress, and Pull Request rules.
     forge: forge::Forge,
     /// Channel to the app's own message loop, so forge tasks can stream updates
@@ -390,11 +361,10 @@ impl App {
             group_progress: None,
             forge_progress: HashMap::new(),
             fetching: false,
-            workspace_config: config.workspace,
             pending_workspace: None,
             pending_deletion: None,
             quit_after_deletion: false,
-            config_output: None,
+            setup_output: None,
             forge,
             tx,
             terminal: terminal.into(),
@@ -415,21 +385,20 @@ impl App {
     /// Fold one message into the state.
     pub fn handle(&mut self, msg: Msg) {
         match msg {
-            Msg::Input(Event::Key(key)) => self.on_key(key),
-            Msg::Input(_) => {}
+            Msg::Input(event) => self.on_input(event),
             Msg::Reload => self.reload(),
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
             Msg::WorkSnapshot(work) => self.work = work,
             Msg::WorkspaceDispatch(event) => self.on_workspace_dispatch(event),
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
-            Msg::WorkspaceConfigOutput {
+            Msg::WorkspaceSetupOutput {
                 workspace,
                 stream,
                 line,
-            } => self.on_workspace_config_output(workspace, stream, line),
-            Msg::WorkspaceConfigured { workspace, result } => {
-                self.on_workspace_configured(workspace, result);
+            } => self.on_workspace_setup_output(workspace, stream, line),
+            Msg::WorkspaceSetupCompleted { workspace, result } => {
+                self.on_workspace_setup_completed(workspace, result);
             }
             Msg::WorkspaceDeletionCompleted {
                 operation,
@@ -861,9 +830,23 @@ impl App {
         self.work.get(&w.name).map(|wk| wk.behind).unwrap_or(0)
     }
 
+    fn on_input(&mut self, event: Event) {
+        match event {
+            Event::Key(key) => self.on_key(key),
+            event if matches!(&self.mode, Mode::Pool(PoolMode::SendInput { .. })) => {
+                self.on_task_editor_event(event);
+            }
+            _ => {}
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) {
         // Only react to presses; crossterm can also deliver Release/Repeat.
         if key.kind == KeyEventKind::Release {
+            return;
+        }
+        if matches!(&self.mode, Mode::Pool(PoolMode::SendInput { .. })) {
+            self.on_task_editor_key(key);
             return;
         }
         if key.code == KeyCode::Char('?') && !matches!(self.mode, Mode::Help(_)) {
@@ -884,6 +867,63 @@ impl App {
             Mode::Help(_) => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
             Mode::Graph(_) => self.on_key_graph(key),
+        }
+    }
+
+    fn on_task_editor_key(&mut self, key: KeyEvent) {
+        let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        match mode {
+            Mode::Pool(PoolMode::SendInput {
+                worker,
+                selected,
+                mut editor,
+            }) => {
+                let action = editor.on_key(key);
+                self.finish_task_editor(worker, selected, editor, action);
+            }
+            other => self.mode = other,
+        }
+    }
+
+    fn on_task_editor_event(&mut self, event: Event) {
+        let mode = std::mem::replace(&mut self.mode, Mode::Normal);
+        match mode {
+            Mode::Pool(PoolMode::SendInput {
+                worker,
+                selected,
+                mut editor,
+            }) => {
+                let action = editor.on_event(event);
+                self.finish_task_editor(worker, selected, editor, action);
+            }
+            other => self.mode = other,
+        }
+    }
+
+    fn finish_task_editor(
+        &mut self,
+        worker: Option<String>,
+        selected: Option<String>,
+        editor: Box<TaskEditor>,
+        action: TaskEditorAction,
+    ) {
+        match action {
+            TaskEditorAction::Continue => {
+                self.mode = Mode::Pool(PoolMode::SendInput {
+                    worker,
+                    selected,
+                    editor,
+                });
+            }
+            TaskEditorAction::Cancel => {
+                self.mode = Mode::Pool(PoolMode::View { selected });
+            }
+            TaskEditorAction::Submit(prompt) => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: selected.clone(),
+                });
+                self.send_to_worker(worker, prompt);
+            }
         }
     }
 
@@ -1106,9 +1146,22 @@ impl App {
                         });
                     } else {
                         self.mode = Mode::Pool(PoolMode::SendInput {
-                            worker,
-                            buffer: String::new(),
+                            worker: Some(worker.clone()),
+                            selected: Some(worker.clone()),
+                            editor: Box::new(TaskEditor::new(worker)),
                         });
+                    }
+                }
+                KeyCode::Char('S') => {
+                    if self.has_idle_worker() {
+                        self.mode = Mode::Pool(PoolMode::SendInput {
+                            worker: None,
+                            selected,
+                            editor: Box::new(TaskEditor::new("any idle Worker")),
+                        });
+                    } else {
+                        self.set_status("No idle Worker is available for Send".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
                     }
                 }
                 KeyCode::Char('v') => {
@@ -1276,32 +1329,14 @@ impl App {
                 }
                 _ => self.mode = Mode::Pool(PoolMode::AliasInput { worker, buffer }),
             },
-            Mode::Pool(PoolMode::SendInput { worker, mut buffer }) => match key.code {
-                KeyCode::Esc => {
-                    self.mode = Mode::Pool(PoolMode::View {
-                        selected: Some(worker),
-                    })
-                }
-                KeyCode::Backspace => {
-                    buffer.pop();
-                    self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer });
-                }
-                KeyCode::Char(c) if !c.is_control() => {
-                    buffer.push(c);
-                    self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer });
-                }
-                KeyCode::Enter if !buffer.trim().is_empty() => {
-                    self.mode = Mode::Pool(PoolMode::View {
-                        selected: Some(worker.clone()),
-                    });
-                    self.send_to_worker(worker, buffer);
-                }
-                KeyCode::Enter => {
-                    self.set_status("Send prompt cannot be empty".to_owned());
-                    self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer });
-                }
-                _ => self.mode = Mode::Pool(PoolMode::SendInput { worker, buffer }),
-            },
+            Mode::Pool(PoolMode::SendInput {
+                worker,
+                selected,
+                mut editor,
+            }) => {
+                let action = editor.on_key(key);
+                self.finish_task_editor(worker, selected, editor, action);
+            }
             Mode::Pool(PoolMode::TicketInput {
                 mut buffer,
                 selected,
@@ -1418,9 +1453,21 @@ impl App {
             .is_some_and(|worker| worker.status() != WorkerStatus::Busy)
     }
 
-    fn send_to_worker(&mut self, worker: String, prompt: String) {
+    fn has_idle_worker(&self) -> bool {
+        self.worker_pool.as_ref().is_some_and(|snapshot| {
+            snapshot
+                .workers()
+                .iter()
+                .any(|worker| worker.status() == WorkerStatus::Idle)
+        })
+    }
+
+    fn send_to_worker(&mut self, worker: Option<String>, prompt: String) {
+        let target = worker
+            .as_deref()
+            .map_or_else(|| "any idle Worker".to_owned(), ToOwned::to_owned);
         let operation = self.begin_dispatch();
-        self.pin_status(format!("sending to {worker}..."));
+        self.pin_status(format!("sending to {target}..."));
         self.dispatch.submit(WorkspaceDispatchCommand::Send {
             operation,
             worker,
@@ -1735,7 +1782,7 @@ impl App {
             .as_ref()
             .is_some_and(|pending| pending.name == name);
         if configuring {
-            self.set_status(format!("workspace '{name}' is still configuring"));
+            self.set_status(format!("workspace '{name}' is still setting up"));
         }
         configuring
     }
@@ -1744,7 +1791,7 @@ impl App {
         let Some(pending) = self.pending_workspace.as_ref() else {
             return false;
         };
-        let message = format!("workspace '{}' is still configuring", pending.name);
+        let message = format!("workspace '{}' is still setting up", pending.name);
         self.set_status(message);
         true
     }
@@ -1799,64 +1846,76 @@ impl App {
     }
 
     /// Create a workspace through the lifecycle module, then present it in the
-    /// terminal. Persistence and reconciliation stay behind the Store interface.
+    /// terminal. The blocking lifecycle operation runs outside the App task so
+    /// setup cannot pause input handling.
     fn create_workspace(&mut self, requested_name: &str) {
-        let created = match self.store.create(requested_name) {
-            Ok(created) => created,
-            Err(error) => {
-                self.set_status(format!("{error:#}"));
-                return;
-            }
-        };
-        self.after_store_changed();
-        if self.workspace_config.on_create.is_empty() {
-            self.open_created_workspace(created.name(), created.path());
+        let name = requested_name.trim();
+        if name.is_empty() {
+            self.set_status("workspace name required".to_string());
+            return;
+        }
+        if self.pending_workspace.is_some() {
+            self.set_status("another workspace setup is already running".to_string());
+            return;
+        }
+        if self.store.workspace(name).is_some() {
+            self.set_status(format!("workspace '{name}' already exists"));
             return;
         }
 
         let workspace = PendingWorkspace {
-            name: created.name().to_string(),
-            path: created.path().to_path_buf(),
+            name: name.to_owned(),
+            path: self.store.new_workspace_path(name),
             started_at: Instant::now(),
         };
         self.pending_workspace = Some(workspace.clone());
-        self.config_output = None;
-        self.pin_status(format!("configuring '{}'...", workspace.name));
+        self.setup_output = None;
+        self.pin_status(format!("setting up '{}'...", workspace.name));
 
-        let command = self.workspace_config.on_create.clone();
+        let repo_root = self.store.repo_root().to_path_buf();
+        let requested_name = workspace.name.clone();
         let tx = self.tx.clone();
-        let run_path = workspace.path.clone();
         let progress_workspace = workspace.clone();
         tokio::spawn(async move {
             let progress_tx = tx.clone();
             let result = tokio::task::spawn_blocking(move || {
-                run_on_create_with_progress(&command, &run_path, move |stream, line| {
-                    if !line.trim().is_empty() {
-                        let _ = progress_tx.send(Msg::WorkspaceConfigOutput {
-                            workspace: progress_workspace.clone(),
-                            stream,
-                            line: line.to_owned(),
-                        });
-                    }
-                })
+                Store::create_persisted_with_progress(
+                    &repo_root,
+                    &requested_name,
+                    move |stream, line| {
+                        if !line.trim().is_empty() {
+                            let _ = progress_tx.send(Msg::WorkspaceSetupOutput {
+                                workspace: progress_workspace.clone(),
+                                stream,
+                                line: line.to_owned(),
+                            });
+                        }
+                    },
+                )
             })
             .await
             .map_err(|error| format!("{error:#}"))
-            .and_then(|result| result.map_err(|error| format!("{error:#}")));
-            let _ = tx.send(Msg::WorkspaceConfigured { workspace, result });
+            .and_then(|result| result.map(|_| ()).map_err(|error| format!("{error:#}")));
+            let _ = tx.send(Msg::WorkspaceSetupCompleted { workspace, result });
         });
     }
 
-    fn on_workspace_configured(&mut self, workspace: PendingWorkspace, result: Result<(), String>) {
+    fn on_workspace_setup_completed(
+        &mut self,
+        workspace: PendingWorkspace,
+        result: Result<(), String>,
+    ) {
         if self.pending_workspace.as_ref() != Some(&workspace) {
             return;
         }
         self.pending_workspace = None;
-        self.config_output = None;
+        self.setup_output = None;
+        self.store.reload();
+        self.after_store_changed();
         let PendingWorkspace { name, path, .. } = workspace;
 
         if let Err(error) = result {
-            self.set_status(format!("created '{name}', on-create failed: {error}"));
+            self.set_status(format!("created '{name}', setup failed: {error}"));
             return;
         }
         let still_exists = self
@@ -1867,17 +1926,17 @@ impl App {
             && path.is_dir();
         if !still_exists {
             self.set_status(format!(
-                "created '{name}', on-create finished after the workspace disappeared"
+                "created '{name}', setup finished after the workspace disappeared"
             ));
             return;
         }
         self.open_created_workspace(&name, &path);
     }
 
-    fn on_workspace_config_output(
+    fn on_workspace_setup_output(
         &mut self,
         workspace: PendingWorkspace,
-        stream: OutputStream,
+        stream: wsg_core::WorkspaceHookStream,
         line: String,
     ) {
         if self.pending_workspace.as_ref() != Some(&workspace) {
@@ -1888,7 +1947,7 @@ impl App {
             .filter(|character| !character.is_control() || *character == '\t')
             .collect::<String>();
         if !line.trim().is_empty() {
-            self.config_output = Some((stream, line));
+            self.setup_output = Some((stream, line));
         }
     }
 
@@ -2230,6 +2289,11 @@ impl App {
     pub fn render(&mut self, frame: &mut Frame) {
         self.ensure_selection();
 
+        if matches!(&self.mode, Mode::Pool(PoolMode::SendInput { .. })) {
+            self.render_send_editor(frame);
+            return;
+        }
+
         let base_mode = match &self.mode {
             Mode::Help(previous) => previous.as_ref(),
             mode => mode,
@@ -2356,6 +2420,12 @@ impl App {
         }
     }
 
+    fn render_send_editor(&mut self, frame: &mut Frame) {
+        if let Mode::Pool(PoolMode::SendInput { editor, .. }) = &mut self.mode {
+            editor.render(frame);
+        }
+    }
+
     fn pool_mode(&self) -> Option<&PoolMode> {
         match &self.mode {
             Mode::Pool(mode) => Some(mode),
@@ -2377,9 +2447,8 @@ impl App {
             | PoolMode::ConfirmDispatchCapacity {
                 worker: selected, ..
             } => selected.as_deref(),
-            PoolMode::SendInput { worker, .. }
-            | PoolMode::AliasInput { worker, .. }
-            | PoolMode::LogDetail { worker } => Some(worker),
+            PoolMode::SendInput { selected, .. } => selected.as_deref(),
+            PoolMode::AliasInput { worker, .. } | PoolMode::LogDetail { worker } => Some(worker),
             PoolMode::ParentInput { .. } => None,
         }
     }
@@ -2932,7 +3001,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  s send  v review  g rebase  P PR  e alias  x dismiss  o orchestrate  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  o orchestrate  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -2943,10 +3012,7 @@ impl App {
                 format!(" Ticket IDs: {buffer}_  (enter preview, esc cancel) "),
                 Style::default().fg(Color::Cyan),
             )),
-            Mode::Pool(PoolMode::SendInput { worker, buffer }) => Paragraph::new(Span::styled(
-                format!(" Send to {worker}: {buffer}_  (enter send, esc cancel) "),
-                Style::default().fg(Color::Cyan),
-            )),
+            Mode::Pool(PoolMode::SendInput { .. }) => Paragraph::new(Span::raw("")),
             Mode::Pool(PoolMode::AliasInput { worker, buffer }) => Paragraph::new(Span::styled(
                 format!(" Alias for {worker}: {buffer}_  (enter save, esc cancel) "),
                 Style::default().fg(Color::Cyan),
@@ -3007,12 +3073,12 @@ impl App {
                 (None, Some(workspace), _) => {
                     let elapsed = workspace.started_at.elapsed().as_secs();
                     let output = self
-                        .config_output
+                        .setup_output
                         .as_ref()
                         .map(|(_, line)| elide_right(line.trim(), 80))
                         .unwrap_or_else(|| "waiting for setup output".to_owned());
                     Paragraph::new(Span::styled(
-                        format!(" configuring '{}' ({elapsed}s): {output} ", workspace.name),
+                        format!(" setting up '{}' ({elapsed}s): {output} ", workspace.name),
                         Style::default().fg(Color::Yellow),
                     ))
                 }
@@ -3865,14 +3931,9 @@ mod tests {
         )
     }
 
-    fn app_with_store(store: Store, terminal: Box<dyn Terminal>) -> App {
-        app_with_store_and_workspace_config(store, terminal, WorkspaceConfig::default()).0
-    }
-
-    fn app_with_store_and_workspace_config(
+    fn app_with_store_and_channel(
         store: Store,
         terminal: Box<dyn Terminal>,
-        workspace_config: WorkspaceConfig,
     ) -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let app = App::new(
@@ -3881,27 +3942,12 @@ mod tests {
             terminal,
             Box::new(FakeJj::default()),
             AppConfig {
-                workspace: workspace_config,
                 forge: ForgeConfig::default(),
             },
             false,
             tx,
         );
         (app, rx)
-    }
-
-    fn workspace_config(command: &[&str]) -> WorkspaceConfig {
-        WorkspaceConfig {
-            on_create: command.iter().map(|part| (*part).to_string()).collect(),
-        }
-    }
-
-    fn waiting_workspace_config() -> WorkspaceConfig {
-        workspace_config(&[
-            "sh",
-            "-c",
-            "i=0; while [ \"$i\" -lt 1000 ]; do [ -f on-create-release ] && exit 0; i=$((i + 1)); sleep 0.01; done; exit 1",
-        ])
     }
 
     fn submit_new_workspace(app: &mut App, name: &str) {
@@ -3912,16 +3958,16 @@ mod tests {
         app.handle(press(KeyCode::Enter));
     }
 
-    async fn handle_on_create_completion(
+    async fn handle_setup_completion(
         app: &mut App,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
         loop {
             let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
                 .await
-                .expect("on-create command completes")
+                .expect("setup hook completes")
                 .expect("completion message arrives");
-            let completed = matches!(message, Msg::WorkspaceConfigured { .. });
+            let completed = matches!(message, Msg::WorkspaceSetupCompleted { .. });
             app.handle(message);
             if completed {
                 break;
@@ -3980,49 +4026,16 @@ mod tests {
     }
 
     fn press(code: KeyCode) -> Msg {
+        press_with(code, KeyModifiers::NONE)
+    }
+
+    fn press_with(code: KeyCode, modifiers: KeyModifiers) -> Msg {
         Msg::Input(Event::Key(KeyEvent {
             code,
-            modifiers: KeyModifiers::NONE,
+            modifiers,
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }))
-    }
-
-    #[test]
-    fn on_create_command_runs_exact_argv_in_workspace() {
-        let dir =
-            std::env::temp_dir().join(format!("jjfx-on-create-runner-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let command = vec![
-            "sh".to_string(),
-            "-c".to_string(),
-            "printf '%s|%s' \"$1\" \"$2\" > on-create-result".to_string(),
-            "on-create".to_string(),
-            "first argument".to_string(),
-            "second argument".to_string(),
-        ];
-
-        run_on_create(&command, &dir).expect("command succeeds");
-
-        assert_eq!(
-            std::fs::read_to_string(dir.join("on-create-result")).unwrap(),
-            "first argument|second argument"
-        );
-        std::fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn missing_on_create_program_is_an_error() {
-        let command = vec!["jjfx-no-such-on-create-program".to_string()];
-        let error = run_on_create(&command, std::path::Path::new("/tmp"))
-            .expect_err("missing program fails");
-
-        assert!(
-            error
-                .to_string()
-                .contains("running jjfx-no-such-on-create-program"),
-            "{error}"
-        );
     }
 
     #[test]
@@ -4055,7 +4068,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Send to Worker"), "{text}");
+        assert!(text.contains("Send to selected Worker"), "{text}");
+        assert!(text.contains("Send to any idle Worker"), "{text}");
         assert!(text.contains("Reset Worker"), "{text}");
 
         app.handle(press(KeyCode::Esc));
@@ -4129,6 +4143,7 @@ mod tests {
         let pool_keys: Vec<&str> = POOL_BINDINGS.iter().map(|(_, k)| *k).collect();
         assert!(normal_keys.contains(&"j / ↓"));
         assert!(pool_keys.contains(&"s"));
+        assert!(pool_keys.contains(&"S"));
         assert!(pool_keys.contains(&"K"));
         assert!(normal_keys.contains(&"?"));
         assert!(pool_keys.contains(&"?"));
@@ -4206,7 +4221,7 @@ mod tests {
             assert!(matches!(app.mode, Mode::Normal));
             assert_eq!(
                 app.status.as_deref(),
-                Some("workspace 'feat' is still configuring")
+                Some("workspace 'feat' is still setting up")
             );
         }
 
@@ -4253,7 +4268,7 @@ mod tests {
         assert!(fake.opened.lock().unwrap().is_empty());
         assert_eq!(
             app.status.as_deref(),
-            Some("workspace 'feat' is still configuring")
+            Some("workspace 'feat' is still setting up")
         );
     }
 
@@ -4280,7 +4295,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("configuring 'feat' ("), "{text}");
+        assert!(text.contains("setting up 'feat' ("), "{text}");
         assert!(text.contains("waiting for setup output"), "{text}");
     }
 
@@ -4297,18 +4312,18 @@ mod tests {
             started_at,
         };
         app.pending_workspace = Some(workspace.clone());
-        app.handle(Msg::WorkspaceConfigOutput {
+        app.handle(Msg::WorkspaceSetupOutput {
             workspace: workspace.clone(),
-            stream: OutputStream::Stdout,
+            stream: wsg_core::WorkspaceHookStream::Stdout,
             line: "==> compiling backend".to_string(),
         });
-        app.handle(Msg::WorkspaceConfigOutput {
+        app.handle(Msg::WorkspaceSetupOutput {
             workspace: PendingWorkspace {
                 name: "other".to_string(),
                 path: PathBuf::from("/wt/other"),
                 started_at,
             },
-            stream: OutputStream::Stderr,
+            stream: wsg_core::WorkspaceHookStream::Stderr,
             line: "stale output".to_string(),
         });
 
@@ -4321,7 +4336,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("configuring 'feat' ("), "{text}");
+        assert!(text.contains("setting up 'feat' ("), "{text}");
         assert!(text.contains("compiling backend"), "{text}");
         assert!(!text.contains("stale output"), "{text}");
     }
@@ -4339,7 +4354,7 @@ mod tests {
             started_at,
         });
 
-        app.handle(Msg::WorkspaceConfigured {
+        app.handle(Msg::WorkspaceSetupCompleted {
             workspace: PendingWorkspace {
                 name: "feat".to_string(),
                 path,
@@ -4352,7 +4367,7 @@ mod tests {
         assert!(app.pending_workspace.is_none());
         assert_eq!(
             app.status.as_deref(),
-            Some("created 'feat', on-create finished after the workspace disappeared")
+            Some("created 'feat', setup finished after the workspace disappeared")
         );
     }
 
@@ -4588,12 +4603,38 @@ mod tests {
         app.handle(press(KeyCode::Char('s')));
         assert!(matches!(
             app.mode,
-            Mode::Pool(PoolMode::SendInput { ref worker, ref buffer })
-                if worker == "worker-01" && buffer.is_empty()
+            Mode::Pool(PoolMode::SendInput {
+                ref worker,
+                ref selected,
+                ref editor,
+            }) if worker.as_deref() == Some("worker-01")
+                && selected.as_deref() == Some("worker-01")
+                && editor.prompt().is_empty()
         ));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 12)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let rendered = terminal.backend().to_string();
+        assert!(rendered.contains("Send task to worker-01"), "{rendered}");
+        assert!(rendered.contains("1"), "{rendered}");
+        assert!(
+            !rendered.contains("Worker Pool  [p management]"),
+            "{rendered}"
+        );
+
         for character in "continue the work".chars() {
             app.handle(press(KeyCode::Char(character)));
         }
+        app.handle(press_with(KeyCode::Enter, KeyModifiers::SHIFT));
+        for character in "with more detail".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Char('?')));
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::SendInput { ref editor, .. })
+                if editor.prompt() == "continue the work\nwith more detail?"
+        ));
         app.handle(press(KeyCode::Enter));
 
         for _ in 0..100 {
@@ -4601,7 +4642,8 @@ mod tests {
                 matches!(
                     command,
                     WorkspaceDispatchCommand::Send { worker, prompt, .. }
-                        if worker == "worker-01" && prompt == "continue the work"
+                        if worker.as_deref() == Some("worker-01")
+                            && prompt == "continue the work\nwith more detail?"
                 )
             }) {
                 break;
@@ -4612,11 +4654,118 @@ mod tests {
             matches!(
                 command,
                 WorkspaceDispatchCommand::Send { worker, prompt, .. }
-                    if worker == "worker-01" && prompt == "continue the work"
+                    if worker.as_deref() == Some("worker-01")
+                        && prompt == "continue the work\nwith more detail?"
             )
         }));
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
         assert!(app.active_operation.is_some());
+    }
+
+    #[test]
+    fn pool_any_send_editor_submits_without_a_worker_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{},"agent":"claude"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let adapter = RecordingAdapter::new(snapshot.clone());
+        let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
+        let mut app = app_with(&["default", "worker-01"]);
+        app.worker_pool = Some(snapshot);
+        app.dispatch = controller;
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        app.handle(press(KeyCode::Char('S')));
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::SendInput {
+                ref worker,
+                ref selected,
+                ref editor,
+            }) if worker.is_none()
+                && selected.as_deref() == Some("worker-01")
+                && editor.prompt().is_empty()
+        ));
+        app.handle(Msg::Input(Event::Paste(
+            "take the next task\nand report progress".to_owned(),
+        )));
+        app.handle(press(KeyCode::Enter));
+
+        for _ in 0..100 {
+            if adapter.commands().iter().any(|command| {
+                matches!(
+                    command,
+                    WorkspaceDispatchCommand::Send { worker, prompt, .. }
+                        if worker.is_none() && prompt == "take the next task\nand report progress"
+                )
+            }) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(adapter.commands().iter().any(|command| {
+            matches!(
+                command,
+                WorkspaceDispatchCommand::Send { worker, prompt, .. }
+                    if worker.is_none() && prompt == "take the next task\nand report progress"
+            )
+        }));
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::View { ref selected })
+                if selected.as_deref() == Some("worker-01")
+        ));
+    }
+
+    #[test]
+    fn pool_any_send_requires_an_idle_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{},"agent":"claude"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"busy","agent":"claude","ticket":"ENG-1","pid":null,"started_at":"2026-07-27T10:00:00Z","completed_at":null,"log_file":null,"branch_name":"eng-1","exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = wsg_core::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let mut app = app_with(&["default", "worker-01"]);
+        app.worker_pool = Some(snapshot);
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        app.handle(press(KeyCode::Char('S')));
+
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::View { ref selected })
+                if selected.as_deref() == Some("worker-01")
+        ));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("No idle Worker is available for Send")
+        );
     }
 
     #[test]
@@ -5729,17 +5878,78 @@ mod tests {
         );
     }
 
-    #[test]
-    fn submitted_workspace_name_creates_and_opens_terminal() {
+    fn install_setup_hook(root: &std::path::Path, script: &str) {
+        let hooks = root.join(".jjfx");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("setup.sh"), script).unwrap();
+        let output = std::process::Command::new("jj")
+            .args(["file", "track", "root:.jjfx/setup.sh"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "commit",
+                "-m",
+                "setup hook",
+            ])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let output = std::process::Command::new("jj")
+            .args(["bookmark", "set", "main", "-r", "@-"])
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn pending_path(app: &App) -> PathBuf {
+        app.pending_workspace
+            .as_ref()
+            .expect("workspace setup should be pending")
+            .path
+            .clone()
+    }
+
+    async fn wait_for_directory(path: &std::path::Path) {
+        for _ in 0..100 {
+            if path.is_dir() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("workspace directory was not created: {}", path.display());
+    }
+
+    #[tokio::test]
+    async fn submitted_workspace_name_creates_and_opens_terminal_after_setup() {
         let repo = store::test_local_repo("app-create");
         let terminal = FakeTerminal::default();
-        let mut app = app_with_store(Store::load(&repo), Box::new(terminal.clone()));
+        let (mut app, mut rx) =
+            app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
-        app.handle(press(KeyCode::Char('n')));
-        for character in "feat".chars() {
-            app.handle(press(KeyCode::Char(character)));
-        }
-        app.handle(press(KeyCode::Enter));
+        submit_new_workspace(&mut app, "feat");
+
+        assert!(terminal.opened.lock().unwrap().is_empty());
+        assert_eq!(app.status.as_deref(), Some("setting up 'feat'..."));
+        handle_setup_completion(&mut app, &mut rx).await;
 
         assert_eq!(
             terminal.opened.lock().unwrap().as_slice(),
@@ -5758,23 +5968,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn configured_workspace_creation_waits_for_command_before_opening() {
-        let repo = store::test_local_repo("app-create-on-create");
-        let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_workspace_config(
-            Store::load(&repo),
-            Box::new(terminal.clone()),
-            waiting_workspace_config(),
+    async fn repository_setup_hook_runs_in_background_before_opening() {
+        let repo = store::test_local_repo("app-create-setup");
+        install_setup_hook(
+            &repo,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 500 ]; do\n  [ -f setup-release ] && printf 'setup stdout\\n' && printf 'setup stderr\\n' >&2 && exit 0\n  i=$((i + 1))\n  sleep 0.01\ndone\nprintf 'setup timeout\\n' >&2\nexit 1\n",
         );
+        let terminal = FakeTerminal::default();
+        let (mut app, mut rx) =
+            app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
         submit_new_workspace(&mut app, "feat");
 
         assert!(terminal.opened.lock().unwrap().is_empty());
-        assert_eq!(app.status.as_deref(), Some("configuring 'feat'..."));
-        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
-        std::fs::write(path.join("on-create-release"), "").unwrap();
-
-        handle_on_create_completion(&mut app, &mut rx).await;
+        assert_eq!(app.status.as_deref(), Some("setting up 'feat'..."));
+        let path = pending_path(&app);
+        wait_for_directory(&path).await;
+        std::fs::write(path.join("setup-release"), "").unwrap();
+        handle_setup_completion(&mut app, &mut rx).await;
 
         assert_eq!(
             terminal.opened.lock().unwrap().as_slice(),
@@ -5787,14 +5998,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_second_creation_is_refused_while_on_create_is_running() {
-        let repo = store::test_local_repo("app-create-on-create-busy");
-        let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_workspace_config(
-            Store::load(&repo),
-            Box::new(terminal),
-            waiting_workspace_config(),
+    async fn a_second_creation_is_refused_while_setup_is_running() {
+        let repo = store::test_local_repo("app-create-setup-busy");
+        install_setup_hook(
+            &repo,
+            "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 500 ]; do\n  [ -f setup-release ] && exit 0\n  i=$((i + 1))\n  sleep 0.01\ndone\nexit 1\n",
         );
+        let terminal = FakeTerminal::default();
+        let (mut app, mut rx) = app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
 
         submit_new_workspace(&mut app, "feat");
         app.handle(press(KeyCode::Char('n')));
@@ -5802,55 +6013,49 @@ mod tests {
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(
             app.status.as_deref(),
-            Some("workspace 'feat' is still configuring")
+            Some("workspace 'feat' is still setting up")
         );
 
-        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
-        std::fs::write(path.join("on-create-release"), "").unwrap();
-        handle_on_create_completion(&mut app, &mut rx).await;
+        let path = pending_path(&app);
+        wait_for_directory(&path).await;
+        std::fs::write(path.join("setup-release"), "").unwrap();
+        handle_setup_completion(&mut app, &mut rx).await;
 
         std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[tokio::test]
-    async fn failed_on_create_keeps_workspace_closed_and_reports_stderr() {
-        let repo = store::test_local_repo("app-create-on-create-failure");
+    async fn failed_setup_keeps_workspace_closed_and_reports_stderr() {
+        let repo = store::test_local_repo("app-create-setup-failure");
+        install_setup_hook(&repo, "#!/bin/sh\nprintf 'setup boom\\n' >&2\nexit 7\n");
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_workspace_config(
-            Store::load(&repo),
-            Box::new(terminal.clone()),
-            workspace_config(&["sh", "-c", "printf 'setup boom' >&2; exit 7"]),
-        );
+        let (mut app, mut rx) =
+            app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
         submit_new_workspace(&mut app, "feat");
-        handle_on_create_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &mut rx).await;
 
-        assert!(app.store.workspace("feat").is_some());
+        assert!(app.store.workspace("feat").is_none());
         assert!(app.pending_workspace.is_none());
         assert!(terminal.opened.lock().unwrap().is_empty());
         let status = app.status.as_deref().unwrap();
-        assert!(status.starts_with("created 'feat', on-create failed:"));
+        assert!(status.starts_with("created 'feat', setup failed:"));
         assert!(status.contains("setup boom"), "{status}");
+        assert!(Store::load(&repo).workspace("feat").is_none());
 
-        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
-        std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[tokio::test]
-    async fn successful_on_create_reports_terminal_open_failure() {
-        let repo = store::test_local_repo("app-create-on-create-tab-failure");
+    async fn successful_setup_reports_terminal_open_failure() {
+        let repo = store::test_local_repo("app-create-setup-tab-failure");
         let terminal = FakeTerminal::default();
         *terminal.open_error.lock().unwrap() = Some("kitty unavailable".to_string());
-        let (mut app, mut rx) = app_with_store_and_workspace_config(
-            Store::load(&repo),
-            Box::new(terminal),
-            workspace_config(&["true"]),
-        );
+        let (mut app, mut rx) = app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
 
         submit_new_workspace(&mut app, "feat");
-        handle_on_create_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &mut rx).await;
 
         assert_eq!(
             app.status.as_deref(),
@@ -5862,8 +6067,8 @@ mod tests {
         std::fs::remove_dir_all(repo).unwrap();
     }
 
-    #[test]
-    fn create_failure_opens_no_terminal() {
+    #[tokio::test]
+    async fn create_failure_opens_no_terminal() {
         let repo = store::test_local_repo("app-create-failure");
         let store = Store::load(&repo);
         let path = repo.with_file_name(format!(
@@ -5872,15 +6077,16 @@ mod tests {
         ));
         jj::add_workspace(&repo, "feat", &path).unwrap();
         let terminal = FakeTerminal::default();
-        let mut app = app_with_store(store, Box::new(terminal.clone()));
+        let (mut app, mut rx) = app_with_store_and_channel(store, Box::new(terminal.clone()));
 
-        app.handle(press(KeyCode::Char('n')));
-        for character in "feat".chars() {
-            app.handle(press(KeyCode::Char(character)));
-        }
-        app.handle(press(KeyCode::Enter));
+        submit_new_workspace(&mut app, "feat");
+        handle_setup_completion(&mut app, &mut rx).await;
 
-        assert!(app.status.as_deref().unwrap().starts_with("create failed:"));
+        let status = app.status.as_deref().unwrap();
+        assert!(
+            status.contains("workspace 'feat' already exists"),
+            "{status}"
+        );
         assert!(terminal.opened.lock().unwrap().is_empty());
 
         std::fs::remove_dir_all(path).unwrap();
@@ -5893,11 +6099,7 @@ mod tests {
         let mut store = Store::load(&repo);
         store.create("feat").unwrap();
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_workspace_config(
-            store,
-            Box::new(terminal.clone()),
-            WorkspaceConfig::default(),
-        );
+        let (mut app, mut rx) = app_with_store_and_channel(store, Box::new(terminal.clone()));
 
         app.handle(press(KeyCode::Down));
         app.handle(press(KeyCode::Char('d')));

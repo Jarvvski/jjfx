@@ -1250,24 +1250,6 @@ fn named_removal_clears_a_go_created_worker_alias() {
 }
 
 #[test]
-fn failed_pool_growth_leaves_no_registered_worker() {
-    let (temporary_directory, repository) = local_repository_with_origin();
-    fs::create_dir(temporary_directory.path().join(".env"))
-        .expect("invalid environment source should be created");
-    let pool = repository.worker_pool();
-
-    let error = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
-        .expect_err("invalid setup source should fail growth");
-
-    assert!(matches!(error, wsg_core::WorkerPoolError::Provision { .. }));
-    let snapshot = pool.snapshot();
-    assert_eq!(snapshot.pool().expect("empty pool manifest").size(), 0);
-    assert!(snapshot.workers().is_empty());
-    assert!(snapshot.diagnostics().is_empty());
-}
-
-#[test]
 fn concurrent_growth_keeps_registered_workers_in_the_workspace_cache() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
