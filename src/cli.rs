@@ -582,7 +582,14 @@ impl From<PoolCommand> for Command {
     }
 }
 
-pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>) -> Result<()> {
+/// Route a CLI invocation. `launch` enters the interactive TUI; `first_pane_command`
+/// lazily resolves the configured first-pane command (empty when unconfigured),
+/// which only `mount` consumes - so no other command reads the config file.
+pub fn run(
+    args: Vec<String>,
+    launch: fn(PathBuf) -> Result<()>,
+    first_pane_command: fn() -> Result<Vec<String>>,
+) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
         Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
@@ -604,7 +611,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>) -> Result<()> {
         } => send_command(&repository()?, &worker, &prompt, mode)?,
         Command::Review { worker, mode } => review_command(&repository()?, &worker, mode)?,
         Command::Logs { worker } => logs_command(&repository()?, &worker)?,
-        Command::Mount { worker } => mount_command(&repository()?, &worker)?,
+        Command::Mount { worker } => mount_command(&repository()?, &worker, first_pane_command)?,
         Command::Rebase { worker } => rebase_command(&repository()?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository()?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
@@ -1212,9 +1219,15 @@ fn render_activity(activity: &RunActivity) -> String {
     }
 }
 
-fn mount_command(repository: &Repository, value: &str) -> Result<()> {
+fn mount_command(
+    repository: &Repository,
+    value: &str,
+    first_pane_command: fn() -> Result<Vec<String>>,
+) -> Result<()> {
     let worker = normalize_worker(value)?;
-    let outcome = WorkerActions::new(repository.clone()).mount(&worker)?;
+    let outcome = WorkerActions::new(repository.clone())
+        .with_first_pane_command(first_pane_command()?)
+        .mount(&worker)?;
     render_session(outcome.session());
     eprintln!(
         "Mounted {worker} with {} in kitty tab {}",

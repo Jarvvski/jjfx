@@ -229,6 +229,7 @@ pub struct WorkerActions {
     supervisor: RunSupervisor,
     commands: SystemCommands,
     model: Option<AgentModel>,
+    first_pane_command: Vec<String>,
 }
 
 impl WorkerActions {
@@ -239,6 +240,7 @@ impl WorkerActions {
             supervisor: RunSupervisor::new(),
             commands: SystemCommands,
             model: None,
+            first_pane_command: Vec::new(),
         }
     }
 
@@ -248,6 +250,13 @@ impl WorkerActions {
     /// existing provider-managed defaults when no profile is supplied.
     pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         self.model = Some(model.into());
+        self
+    }
+
+    /// Supplies the resolved command (program + args) for a mounted tab's first
+    /// pane. Empty (the default) opens that pane as a plain shell.
+    pub fn with_first_pane_command(mut self, command: Vec<String>) -> Self {
+        self.first_pane_command = command;
         self
     }
 
@@ -388,14 +397,15 @@ impl WorkerActions {
         runtime.probe(&workspace)?;
         runtime.preflight_dispatch_input(profile.model())?;
         let session_directory = self.repository.root().join(".jj/pool/pi-sessions");
-        let tab_id = self.commands.mount(
-            worker,
-            &workspace,
-            runtime,
-            profile.model(),
-            &session_directory,
-            &session,
-        )?;
+        let session_id = match &session {
+            AgentSessionResolution::Resumed { session_id } => Some(session_id.as_str()),
+            AgentSessionResolution::Fresh { .. } => None,
+        };
+        let command =
+            interactive_agent_command(runtime, profile.model(), &session_directory, session_id)?;
+        let tab_id = self
+            .commands
+            .mount(worker, &workspace, &command, &self.first_pane_command)?;
         Ok(MountOutcome {
             runtime,
             session,
@@ -623,84 +633,108 @@ impl SystemCommands {
         self,
         worker: &WorkerId,
         workspace: &Path,
-        runtime: AgentRuntime,
-        model: Option<&AgentModel>,
-        session_directory: &Path,
-        session: &AgentSessionResolution,
+        command: &str,
+        first_pane_command: &[String],
     ) -> Result<String, WorkerActionError> {
         let address = kitty_address()?;
-        let session_id = match session {
-            AgentSessionResolution::Resumed { session_id } => Some(session_id.as_str()),
-            AgentSessionResolution::Fresh { .. } => None,
-        };
-        let command = interactive_agent_command(runtime, model, session_directory, session_id)?;
         let cwd = format!("--cwd={}", workspace.display());
         let title = worker.as_str();
-        let tab_id = self.run(
-            "create kitty tab",
-            "kitten",
-            &[
-                "@",
-                &address,
-                "launch",
-                "--type=tab",
-                "--tab-title",
-                title,
-                &cwd,
-                "--",
-                "zsh",
-                "-ic",
-                &command,
-            ],
-        )?;
+        // The first pane runs the configured command when one is supplied,
+        // otherwise a plain shell with the scrollback cleared.
+        let pane_command = if first_pane_command.is_empty() {
+            vec![
+                "zsh".to_string(),
+                "-ic".to_string(),
+                "clear; exec zsh".to_string(),
+            ]
+        } else {
+            first_pane_command.to_vec()
+        };
+        let mut tab_args = vec![
+            "@",
+            &address,
+            "launch",
+            "--type=tab",
+            "--tab-title",
+            title,
+            &cwd,
+            "--",
+        ];
+        tab_args.extend(pane_command.iter().map(String::as_str));
+        let tab_id = self.run("create kitty tab", "kitten", &tab_args)?;
         let tab_id = tab_id.trim().to_owned();
         if !tab_id.is_empty() {
-            let match_id = format!("id:{tab_id}");
-            let right = self
-                .run(
-                    "split kitty tab",
-                    "kitten",
-                    &[
-                        "@",
-                        &address,
-                        "launch",
-                        "--match",
-                        &match_id,
-                        "--location=vsplit",
-                        &cwd,
-                        "--",
-                        "zsh",
-                        "-ic",
-                        "clear; exec zsh",
-                    ],
-                )
-                .unwrap_or_default();
-            let right = right.trim();
-            if !right.is_empty() {
-                let right_match = format!("id:{right}");
+            let shell_match = format!("window_id:{tab_id}");
+            // `--bias` is only a percentage under the splits layout, so force
+            // it before splitting the agent off to the right of the shell.
+            let _ = self.run(
+                "force kitty splits layout",
+                "kitten",
+                &[
+                    "@",
+                    &address,
+                    "goto-layout",
+                    "--match",
+                    &shell_match,
+                    "splits",
+                ],
+            );
+            let agent = self.run(
+                "split kitty tab",
+                "kitten",
+                &[
+                    "@",
+                    &address,
+                    "launch",
+                    "--match",
+                    &shell_match,
+                    "--next-to",
+                    &format!("id:{tab_id}"),
+                    "--location=vsplit",
+                    "--bias=81",
+                    &cwd,
+                    "--",
+                    "zsh",
+                    "-ic",
+                    command,
+                ],
+            )?;
+            let agent = agent.trim();
+            // Split the left column into two evenly stacked shells beneath the
+            // agent, which stays full height on the right.
+            let _ = self.run(
+                "split kitty pane",
+                "kitten",
+                &[
+                    "@",
+                    &address,
+                    "launch",
+                    "--match",
+                    &shell_match,
+                    "--next-to",
+                    &format!("id:{tab_id}"),
+                    "--location=hsplit",
+                    "--bias=50",
+                    &cwd,
+                    "--",
+                    "zsh",
+                    "-ic",
+                    "clear; exec zsh",
+                ],
+            );
+            if !agent.is_empty() {
                 let _ = self.run(
-                    "split kitty pane",
+                    "focus kitty window",
                     "kitten",
                     &[
                         "@",
                         &address,
-                        "launch",
+                        "focus-window",
                         "--match",
-                        &right_match,
-                        "--location=hsplit",
-                        &cwd,
-                        "--",
-                        "zsh",
-                        "-ic",
-                        "clear; exec zsh",
+                        &format!("id:{agent}"),
                     ],
                 );
             }
-            let _ = self.run(
-                "focus kitty tab",
-                "kitten",
-                &["@", &address, "focus-window", "--match", &match_id],
-            );
         }
         Ok(tab_id)
     }

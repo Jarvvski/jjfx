@@ -5,6 +5,15 @@ version of record lives in the project manifest.
 
 ## [Unreleased]
 
+### Changed
+
+- 2026-09-11 - Redesigned the window-opening layout: opening a workspace and
+  Mounting a Worker now both build a 19% shell column on the left, split into
+  two stacked shells, with the agent taking the remaining 81% width, replacing
+  the previous top-shell and three-pane layouts. Every pane still starts in the
+  workspace directory and focus finishes on the agent pane (jjfx 0.47.0,
+  wsg 0.17.0).
+
 ### Fixed
 
 - 2026-09-11 - The TUI now reads its Workspace list through the same
@@ -16,6 +25,12 @@ version of record lives in the project manifest.
   wsg 0.16.1).
 
 ### Added
+
+- 2026-09-11 - The opened tab's first (top-left) pane can now run a configured
+  command - e.g. a dev server or watcher - via the new
+  `terminal.first_pane_command` setting, in both the TUI and `mount`. It runs
+  in the login interactive shell and drops back to a shell when the command
+  exits; unset leaves that pane a plain shell (jjfx 0.47.0, wsg 0.17.0).
 
 - 2026-09-11 - Added OpenCode as a Worker Pool runtime with JSON Run logging,
   session resume, Linear discovery, interactive workspace lifecycle tracking,

@@ -26,27 +26,51 @@ pub struct Config {
 }
 
 impl Config {
-    /// The command run in a workspace's bottom-left pane, wrapped in the user's login
+    /// The command run in a workspace's agent pane, wrapped in the user's login
     /// interactive shell as `$SHELL -l -i -c <command>`. The shell sources
     /// login and interactive files, so configured aliases and the user's PATH
     /// are available. Falls back to `/bin/sh` when `$SHELL` is unset.
     pub fn agent_command(&self) -> Vec<String> {
-        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
-        vec![
-            shell,
-            "-l".to_string(),
-            "-i".to_string(),
-            "-c".to_string(),
-            self.agent.command.clone(),
-        ]
+        login_shell_command(&self.agent.command)
     }
+
+    /// The command run in a workspace tab's first (top-left) pane, wrapped in
+    /// the login interactive shell like [`Self::agent_command`] and followed by
+    /// a fallback shell so the pane survives the command exiting. Empty when the
+    /// setting is absent, leaving that pane a plain shell.
+    pub fn first_pane_command(&self) -> Vec<String> {
+        self.terminal
+            .first_pane_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(|command| login_shell_command(&format!("{command}; exec \"$SHELL\"")))
+            .unwrap_or_default()
+    }
+}
+
+/// Wrap a shell command in `$SHELL -l -i -c <command>` so login and interactive
+/// files have run before it starts (aliases and the user's PATH are available).
+fn login_shell_command(command: &str) -> Vec<String> {
+    vec![
+        login_shell_program(),
+        "-l".to_string(),
+        "-i".to_string(),
+        "-c".to_string(),
+        command.to_string(),
+    ]
+}
+
+/// The user's login shell program, or `/bin/sh` when `$SHELL` is unset.
+fn login_shell_program() -> String {
+    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
 /// How jjfx launches the coding agent in a workspace.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct AgentConfig {
-    /// The shell command run in a workspace's bottom-left pane. Because it runs in the
+    /// The shell command run in a workspace's agent pane. Because it runs in the
     /// user's login interactive shell, this may name an alias such as `cx`.
     pub command: String,
 }
@@ -102,6 +126,13 @@ pub struct TerminalConfig {
     /// reports the target as not running.
     #[serde(default)]
     pub launch_command: Vec<String>,
+    /// Shell command run in an opened tab's first (top-left) pane - e.g. a dev
+    /// server or watcher. It runs in the login interactive shell like
+    /// `agent.command`, and the pane drops back to a shell when the command
+    /// exits. Absent (the default) leaves that pane a plain shell; the second
+    /// left pane and the agent pane are unaffected.
+    #[serde(default)]
+    pub first_pane_command: Option<String>,
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml` - the same XDG convention as
@@ -144,6 +175,7 @@ mod tests {
         let cfg: Config = toml::from_str("").expect("empty toml parses");
         assert!(cfg.terminal.listen_on.is_none());
         assert!(cfg.terminal.launch_command.is_empty());
+        assert!(cfg.terminal.first_pane_command.is_none());
         assert_eq!(cfg.agent.command, "claude");
         // Forge PR management is on-by-default, drafts on-by-default.
         assert!(cfg.forge.pull_requests);
@@ -191,6 +223,7 @@ mod tests {
             [terminal]
             listen_on = "unix:/tmp/kitty-visor"
             launch_command = ["kitty", "--detach", "-o", "listen_on=unix:/tmp/kitty-visor"]
+            first_pane_command = "dev-server"
             "#,
         )
         .expect("toml parses");
@@ -201,6 +234,10 @@ mod tests {
         assert_eq!(
             cfg.terminal.launch_command,
             ["kitty", "--detach", "-o", "listen_on=unix:/tmp/kitty-visor"]
+        );
+        assert_eq!(
+            cfg.terminal.first_pane_command.as_deref(),
+            Some("dev-server")
         );
     }
 
@@ -231,6 +268,28 @@ mod tests {
         let cmd = cfg.agent_command();
         assert_eq!(&cmd[1..], ["-l", "-i", "-c", "claude"]);
         assert!(!cmd[0].is_empty(), "a shell program is always chosen");
+    }
+
+    #[test]
+    fn a_configured_first_pane_command_runs_through_the_login_shell_with_a_fallback() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [terminal]
+            first_pane_command = "dev-server"
+            "#,
+        )
+        .expect("toml parses");
+        let cmd = cfg.first_pane_command();
+        assert_eq!(&cmd[1..], ["-l", "-i", "-c", "dev-server; exec \"$SHELL\""]);
+        assert!(!cmd[0].is_empty(), "a shell program is always chosen");
+    }
+
+    #[test]
+    fn an_absent_or_blank_first_pane_command_leaves_the_shell_bare() {
+        for text in ["", "[terminal]\nfirst_pane_command = \"   \"\n"] {
+            let cfg: Config = toml::from_str(text).expect("toml parses");
+            assert!(cfg.first_pane_command().is_empty(), "{text:?}");
+        }
     }
 
     #[test]

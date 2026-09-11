@@ -72,7 +72,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // help, so scripts and shell completion never unexpectedly claim the
     // terminal.
     if args.is_empty() {
-        return cli::run(vec!["help".to_owned()], launch);
+        return cli::run(vec!["help".to_owned()], launch, first_pane_command);
     }
     if args.first().map(String::as_str) == Some("tui") {
         if args.len() != 1 {
@@ -102,7 +102,17 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    cli::run(args, launch)
+    cli::run(args, launch, first_pane_command)
+}
+
+/// Resolve the configured command for an opened tab's first pane, wrapped in
+/// the login interactive shell (empty when unconfigured).
+///
+/// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so the
+/// `mount` command opens the same first pane as the TUI. It is loaded lazily -
+/// only a `mount` invocation reads jjfx's config file.
+pub fn first_pane_command() -> anyhow::Result<Vec<String>> {
+    Ok(config::load()?.first_pane_command())
 }
 
 /// Launch the shared interactive jjfx TUI for a discovered repository.
@@ -157,6 +167,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     let terminal: Arc<dyn terminal::Terminal> = Arc::from(Box::new(terminal::KittyTerminal::new(
         &config.terminal,
         config.agent_command(),
+        config.first_pane_command(),
     )) as Box<dyn terminal::Terminal>);
     let runtime = Runtime::new(
         tx.clone(),

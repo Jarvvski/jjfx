@@ -23,6 +23,7 @@ const HELPER_CAPTURE: &str = "WSG_ACTION_CAPTURE";
 const HELPER_MODE: &str = "WSG_ACTION_MODE";
 const HELPER_PROVIDER: &str = "WSG_ACTION_PROVIDER";
 const HELPER_MODEL: &str = "WSG_ACTION_MODEL";
+const HELPER_PANE_COMMAND: &str = "WSG_ACTION_PANE_COMMAND";
 const HELPER_PROCESS: &str = "WSG_ACTION_PROCESS";
 const HELPER_DESCENDANT: &str = "WSG_ACTION_DESCENDANT";
 const HELPER_DIAGNOSTIC: &str = "WSG_ACTION_DIAGNOSTIC";
@@ -335,7 +336,6 @@ fn mount_opens_a_resumable_provider_session_and_reports_the_tab() {
             "case \"$*\" in\n",
             "  *--type=tab*) echo 42 ;;\n",
             "  *--location=vsplit*) echo 43 ;;\n",
-            "  *--location=hsplit*) echo 44 ;;\n",
             "esac\n"
         ),
     );
@@ -369,10 +369,84 @@ fn mount_opens_a_resumable_provider_session_and_reports_the_tab() {
     );
     let commands = fs::read_to_string(&capture).expect("command capture");
     assert!(commands.contains("@ --to=unix:/tmp/fake-kitty launch --type=tab"));
+    assert!(commands.contains("clear; exec zsh"));
     assert!(commands.contains("claude --resume 'session-mount'; exec zsh"));
     assert!(commands.contains("--location=vsplit"));
+    assert!(commands.contains("--bias=81"));
     assert!(commands.contains("--location=hsplit"));
-    assert!(commands.contains("focus-window --match id:42"));
+    assert!(commands.contains("--bias=50"));
+    assert!(commands.contains("focus-window --match id:43"));
+}
+
+#[test]
+fn mount_runs_the_configured_command_in_the_first_pane() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("mount-pane.log");
+    fs::write(
+        &log,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-mount\"}\n",
+    )
+    .expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\necho --forward-subagent-text\n",
+    );
+    write_executable(
+        &bin.join("kitten"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "case \"$*\" in\n",
+            "  *--type=tab*) echo 42 ;;\n",
+            "  *--location=vsplit*) echo 43 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("commands");
+    let result = temporary_directory.path().join("result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env(HELPER_PANE_COMMAND, "dev-server")
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("Mount action helper should run");
+
+    assert!(
+        output.status.success(),
+        "Mount action helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commands = fs::read_to_string(&capture).expect("command capture");
+    // The configured command rides on the tab launch (the first, top-left
+    // pane); the second left pane and the agent pane are unaffected.
+    let tab_launch = commands
+        .lines()
+        .find(|line| line.contains("--type=tab"))
+        .expect("tab launch");
+    assert!(tab_launch.contains("dev-server"), "{tab_launch}");
+    assert!(!tab_launch.contains("clear; exec zsh"), "{tab_launch}");
+    let pane_split = commands
+        .lines()
+        .find(|line| line.contains("--location=hsplit"))
+        .expect("pane split");
+    assert!(pane_split.contains("clear; exec zsh"), "{pane_split}");
+    assert!(commands.contains("claude --resume 'session-mount'; exec zsh"));
 }
 
 #[test]
@@ -403,7 +477,6 @@ fn mount_opens_a_resumed_pi_session_with_the_trusted_worker_policy() {
             "case \"$*\" in\n",
             "  *--type=tab*) echo 52 ;;\n",
             "  *--location=vsplit*) echo 53 ;;\n",
-            "  *--location=hsplit*) echo 54 ;;\n",
             "esac\n"
         ),
     );
@@ -452,10 +525,12 @@ fn mount_opens_a_resumed_pi_session_with_the_trusted_worker_policy() {
     assert!(commands.contains(".jj/pool/pi-sessions"));
     assert!(commands.contains("'--no-extensions' '--no-skills' '--no-prompt-templates' '--no-themes' '--no-context-files' '--no-approve'"));
     assert!(commands.contains("'--tools' 'read,bash,edit,write,grep,find,ls'"));
+    assert!(commands.contains("--bias=81"));
     let agent_launch = commands
         .lines()
-        .find(|line| line.contains("--type=tab"))
-        .expect("agent tab launch");
+        .find(|line| line.contains("--location=vsplit"))
+        .expect("agent split launch");
+    assert!(agent_launch.contains("exec 'pi'"));
     assert!(!agent_launch.contains("exec zsh"));
     assert!(
         !pi_capture.exists(),
@@ -514,8 +589,8 @@ fn mount_opens_a_fresh_pi_session_without_a_resume_argument() {
     let commands = fs::read_to_string(&capture).expect("fresh Pi mount command capture");
     let agent_launch = commands
         .lines()
-        .find(|line| line.contains("--type=tab"))
-        .expect("agent tab launch");
+        .find(|line| line.contains("--location=vsplit"))
+        .expect("agent split launch");
     assert!(agent_launch.contains("exec 'pi'"));
     assert!(!agent_launch.contains("'--session'"));
 }
@@ -1310,6 +1385,9 @@ fn mount_action_helper() {
     let mut actions = WorkerActions::new(repository);
     if let (Ok(provider), Ok(model)) = (env::var(HELPER_PROVIDER), env::var(HELPER_MODEL)) {
         actions = actions.with_model(AgentModel::new(model).with_provider(provider));
+    }
+    if let Ok(command) = env::var(HELPER_PANE_COMMAND) {
+        actions = actions.with_first_pane_command(vec![command]);
     }
     let outcome = actions.mount(&worker).expect("Mount should succeed");
     let session = match outcome.session() {
