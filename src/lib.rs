@@ -13,6 +13,7 @@ mod forge;
 mod graph;
 mod hooks;
 mod jj;
+mod pool_session;
 mod prs;
 mod repo;
 mod runtime;

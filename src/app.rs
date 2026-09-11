@@ -23,6 +23,7 @@ use crate::diff_view::Detail;
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj;
+use crate::pool_session::{PoolSession, PoolUpdate};
 use crate::runtime::Effect;
 use crate::store::{self, Store, Workspace};
 use crate::task_editor::{TaskEditor, TaskEditorAction};
@@ -30,8 +31,8 @@ use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::workspace_dispatch::{
-    OperationId, RealWorkspaceDispatch, WorkerCommandResult, WorkerSessionOutcome,
-    WorkspaceDispatchCommand, WorkspaceDispatchController, WorkspaceDispatchEvent,
+    OperationId, RealWorkspaceDispatch, WorkspaceDispatchCommand, WorkspaceDispatchController,
+    WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{PresentationRow, WorkspaceList};
 use wsg_core::{
@@ -244,33 +245,13 @@ pub struct App {
     /// Latest work-lifecycle snapshot per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, Work>,
-    /// Latest immutable Worker Pool presentation snapshot.
-    worker_pool: Option<WorkerPoolSnapshot>,
     /// The deep Workspace Dispatch seam for Pool commands and events.
     dispatch: WorkspaceDispatchController,
-    /// Operation generation used to reject stale mutation results.
+    /// All Worker Pool interaction state and its operation-identity rules.
+    pool: PoolSession,
+    /// Operation generation used to reject stale mutation results. Shared by
+    /// Pool commands and workspace deletion.
     next_operation: OperationId,
-    active_operation: Option<OperationId>,
-    /// A Reset keeps its operation active until Workspace restoration completes.
-    worker_reset_operation: Option<OperationId>,
-    /// Independent operation identity for durable Parent orchestration.
-    orchestration_operation: Option<OperationId>,
-    /// Independent operation identity for the selected Worker log watcher.
-    worker_log_operation: Option<OperationId>,
-    /// Latest immutable provider-neutral Worker log snapshot.
-    worker_log: Option<crate::workspace_dispatch::WorkerLogSnapshot>,
-    /// The latest selected-Worker Follow-up Session outcome.
-    worker_session: Option<WorkerSessionOutcome>,
-    /// The latest typed non-Run Worker action result.
-    worker_command_result: Option<WorkerCommandResult>,
-    /// Latest Worker log failure retained for the focused detail view.
-    worker_log_error: Option<String>,
-    /// Latest ordered Direct Dispatch outcomes for the Pool view.
-    dispatch_result: Option<crate::workspace_dispatch::DispatchResult>,
-    /// Latest Ready Ticket discovery result awaiting preview or launch.
-    ready_tickets: Option<crate::workspace_dispatch::ReadyTicketResult>,
-    /// Latest immutable Dispatch Group presentation projection.
-    group_progress: Option<crate::workspace_dispatch::DispatchGroupProgress>,
     /// Live forge progress per workspace, keyed by name. An entry exists only
     /// while a forge runs.
     forge_progress: HashMap<String, forge::Progress>,
@@ -341,20 +322,9 @@ impl App {
             store,
             agents,
             work: HashMap::new(),
-            worker_pool: None,
             dispatch,
+            pool: PoolSession::default(),
             next_operation: 0,
-            active_operation: None,
-            worker_reset_operation: None,
-            orchestration_operation: None,
-            worker_log_operation: None,
-            worker_log: None,
-            worker_session: None,
-            worker_command_result: None,
-            worker_log_error: None,
-            dispatch_result: None,
-            ready_tickets: None,
-            group_progress: None,
             forge_progress: HashMap::new(),
             fetching: false,
             pending_workspace: None,
@@ -427,242 +397,28 @@ impl App {
         std::mem::take(&mut self.effects)
     }
 
-    fn on_worker_pool_snapshot(&mut self, operation: OperationId, snapshot: WorkerPoolSnapshot) {
-        if operation == 0 {
-            if self.active_operation.is_some() {
-                return;
-            }
-        } else if self.active_operation != Some(operation) {
-            return;
-        }
-        if self.worker_pool.as_ref() == Some(&snapshot) {
-            if operation != 0 {
-                self.active_operation = None;
-            }
-            return;
-        }
-        self.worker_pool = Some(snapshot);
-        if operation != 0 && self.worker_reset_operation != Some(operation) {
-            self.active_operation = None;
-        }
-    }
-
+    /// Fold one Workspace Dispatch event through the Pool session's
+    /// operation-identity rules, then act on what it asks for.
     fn on_workspace_dispatch(&mut self, event: WorkspaceDispatchEvent) {
-        match event {
-            WorkspaceDispatchEvent::Snapshot {
-                operation,
-                snapshot,
-            } => self.on_worker_pool_snapshot(operation, snapshot),
-            WorkspaceDispatchEvent::Resized { operation, result } => {
-                if self.active_operation == Some(operation) {
-                    self.set_status(format!(
-                        "Pool resized to {} ({} added, {} removed)",
-                        result.capacity(),
-                        result.added_workers().len(),
-                        result.removed_workers().len()
-                    ));
-                }
-            }
-            WorkspaceDispatchEvent::Destroyed { operation } => {
-                if self.active_operation == Some(operation) {
-                    self.set_status("Worker Pool destroyed".to_string());
-                    self.mode = Mode::Normal;
-                }
-            }
-            WorkspaceDispatchEvent::Dispatched { operation, result } => {
-                if self.active_operation == Some(operation) {
-                    let count = result.outcomes().len();
-                    let partial = result.is_partial();
-                    self.dispatch_result = Some(result);
-                    self.active_operation = None;
-                    self.refresh_worker_pool();
-                    self.set_status(if partial {
-                        format!("Dispatched {count} Ticket(s) with partial capacity")
-                    } else {
-                        format!("Dispatched {count} Ticket(s)")
-                    });
-                }
-            }
-            WorkspaceDispatchEvent::DispatchCapacity {
-                operation,
-                tickets,
-                worker,
-                shortage,
-            } => {
-                if self.active_operation == Some(operation) {
+        for update in self.pool.apply(event) {
+            match update {
+                PoolUpdate::Status(message) => self.set_status(message),
+                PoolUpdate::RefreshPool => self.refresh_worker_pool(),
+                PoolUpdate::ConfirmCapacity {
+                    tickets,
+                    worker,
+                    shortage,
+                } => {
                     self.mode = Mode::Pool(PoolMode::ConfirmDispatchCapacity {
                         tickets,
                         worker,
                         shortage,
                     });
-                    self.set_status(format!(
-                        "Dispatch needs {} idle Worker(s); only {} available",
-                        shortage.requested(),
-                        shortage.available()
-                    ));
                 }
-            }
-            WorkspaceDispatchEvent::ReadyTickets { operation, result } => {
-                if self.active_operation == Some(operation) {
-                    let count = result.tickets().len();
-                    self.ready_tickets = Some(result);
-                    self.active_operation = None;
+                PoolUpdate::ReadyPreview => {
                     self.mode = Mode::Pool(PoolMode::ReadyPreview { selected: None });
-                    self.set_status(format!("Found {count} Ready Ticket(s)"));
                 }
-            }
-            WorkspaceDispatchEvent::GroupProgress {
-                operation,
-                progress,
-            } => {
-                if operation == 0
-                    || self.active_operation == Some(operation)
-                    || self.orchestration_operation == Some(operation)
-                {
-                    self.group_progress = Some(progress);
-                }
-            }
-            WorkspaceDispatchEvent::OrchestrationStarted {
-                operation,
-                parent,
-                resumed,
-            } => {
-                if self.orchestration_operation == Some(operation) {
-                    self.set_status(format!(
-                        "{} Dispatch Group {parent}",
-                        if resumed { "Resuming" } else { "Starting" }
-                    ));
-                }
-            }
-            WorkspaceDispatchEvent::OrchestrationProgress {
-                operation,
-                progress,
-                notice,
-            } => {
-                if self.orchestration_operation == Some(operation) {
-                    self.group_progress = Some(progress);
-                    if let Some(notice) = notice {
-                        self.set_status(notice);
-                    }
-                }
-            }
-            WorkspaceDispatchEvent::OrchestrationDirect {
-                operation,
-                parent,
-                worker,
-                pid,
-            } => {
-                if self.orchestration_operation == Some(operation) {
-                    self.orchestration_operation = None;
-                    self.set_status(format!(
-                        "Dispatched Parent {parent} to {worker} (PID {pid})"
-                    ));
-                }
-            }
-            WorkspaceDispatchEvent::OrchestrationTerminal {
-                operation,
-                parent,
-                counts,
-            } => {
-                if self.orchestration_operation == Some(operation) {
-                    self.orchestration_operation = None;
-                    self.set_status(format!(
-                        "Dispatch Group {parent} complete: {} done, {} failed, {} skipped",
-                        counts.done(),
-                        counts.failed(),
-                        counts.skipped()
-                    ));
-                }
-            }
-            WorkspaceDispatchEvent::WorkerActionCompleted { operation, outcome } => {
-                if self.active_operation == Some(operation) {
-                    let worker = outcome.worker().to_owned();
-                    let action = outcome.action();
-                    self.worker_session = Some(outcome);
-                    self.active_operation = None;
-                    self.refresh_worker_pool();
-                    self.set_status(format!(
-                        "{} {} (PID {})",
-                        action.as_str(),
-                        worker,
-                        self.worker_session
-                            .as_ref()
-                            .map_or(0, WorkerSessionOutcome::pid)
-                    ));
-                }
-            }
-            WorkspaceDispatchEvent::WorkerResetCompleted { operation, outcome } => {
-                if self.active_operation == Some(operation) {
-                    self.set_status(format!(
-                        "Reset {} ({:?}) to idle",
-                        outcome.worker(),
-                        outcome.run()
-                    ));
-                    self.refresh_worker_pool();
-                }
-            }
-            WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result } => {
-                if self.active_operation == Some(operation) {
-                    self.worker_command_result = Some(result.clone());
-                    self.active_operation = None;
-                    self.refresh_worker_pool();
-                    self.set_status(result.notice());
-                }
-            }
-            WorkspaceDispatchEvent::WorkspaceRestorationCompleted {
-                operation,
-                worker,
-                result,
-            } => {
-                if self.worker_reset_operation == Some(operation) {
-                    self.worker_reset_operation = None;
-                    self.active_operation = None;
-                    self.set_status(match result {
-                        crate::workspace_dispatch::WorkspaceRestorationResult::Skipped => {
-                            format!("Reset {worker}: Workspace restoration skipped")
-                        }
-                        crate::workspace_dispatch::WorkspaceRestorationResult::Restored => {
-                            format!("Reset {worker}: Workspace restored")
-                        }
-                        crate::workspace_dispatch::WorkspaceRestorationResult::Failed(error) => {
-                            format!("Reset {worker}: Workspace restoration failed: {error}")
-                        }
-                    });
-                    self.refresh_worker_pool();
-                }
-            }
-            WorkspaceDispatchEvent::WorkerLogUpdated {
-                operation,
-                snapshot,
-            } => {
-                if self.worker_log_operation == Some(operation) {
-                    let terminal = snapshot.result().is_some();
-                    self.worker_log = Some(*snapshot);
-                    self.worker_log_error = None;
-                    if terminal {
-                        self.worker_log_operation = None;
-                    }
-                }
-            }
-            WorkspaceDispatchEvent::WorkerLogFailed {
-                operation,
-                worker: _,
-                message,
-            } => {
-                if self.worker_log_operation == Some(operation) {
-                    self.worker_log_operation = None;
-                    self.worker_log_error = Some(message);
-                }
-            }
-            WorkspaceDispatchEvent::Failed { operation, message } => {
-                if self.active_operation == Some(operation) {
-                    self.active_operation = None;
-                    self.worker_reset_operation = None;
-                    self.set_status(format!("Worker Pool: {message}"));
-                } else if self.orchestration_operation == Some(operation) {
-                    self.orchestration_operation = None;
-                    self.set_status(format!("Dispatch Group: {message}"));
-                }
+                PoolUpdate::ClosePoolMode => self.mode = Mode::Normal,
             }
         }
     }
@@ -676,27 +432,36 @@ impl App {
             .submit(WorkspaceDispatchCommand::Refresh { operation: 0 });
     }
 
-    fn begin_dispatch(&mut self) -> OperationId {
+    /// Allocate the next operation identity. Results carrying an older
+    /// identity are ignored by their owning state (Pool or deletion).
+    fn allocate_operation(&mut self) -> OperationId {
         self.next_operation = self.next_operation.wrapping_add(1).max(1);
-        self.active_operation = Some(self.next_operation);
         self.next_operation
     }
 
+    fn begin_dispatch(&mut self) -> OperationId {
+        let operation = self.allocate_operation();
+        self.pool.begin_dispatch(operation);
+        operation
+    }
+
+    fn begin_reset(&mut self) -> OperationId {
+        let operation = self.allocate_operation();
+        self.pool.begin_reset(operation);
+        operation
+    }
+
     fn orchestrate_parent(&mut self, parent: String) {
-        self.next_operation = self.next_operation.wrapping_add(1).max(1);
-        let operation = self.next_operation;
-        self.orchestration_operation = Some(operation);
+        let operation = self.allocate_operation();
+        self.pool.begin_orchestration(operation);
         self.pin_status(format!("starting Dispatch Group {parent}..."));
         self.dispatch
             .submit(WorkspaceDispatchCommand::Orchestrate { operation, parent });
     }
 
     fn start_worker_log(&mut self, worker: String) {
-        self.next_operation = self.next_operation.wrapping_add(1).max(1);
-        let operation = self.next_operation;
-        self.worker_log_operation = Some(operation);
-        self.worker_log = None;
-        self.worker_log_error = None;
+        let operation = self.allocate_operation();
+        self.pool.begin_log(operation);
         self.mode = Mode::Pool(PoolMode::LogDetail {
             worker: worker.clone(),
         });
@@ -706,7 +471,7 @@ impl App {
     }
 
     fn stop_worker_log(&mut self) {
-        if let Some(operation) = self.worker_log_operation.take() {
+        if let Some(operation) = self.pool.stop_log() {
             self.dispatch
                 .submit(WorkspaceDispatchCommand::StopWorkerLog { operation });
         }
@@ -725,7 +490,7 @@ impl App {
                     .workspaces()
                     .iter()
                     .any(|w| self.agent_state(w) == AgentState::Working)
-                || self.worker_pool.as_ref().is_some_and(|snapshot| {
+                || self.pool.worker_pool.as_ref().is_some_and(|snapshot| {
                     snapshot
                         .workers()
                         .iter()
@@ -1175,6 +940,7 @@ impl App {
                         return;
                     };
                     let alias = self
+                        .pool
                         .worker_pool
                         .as_ref()
                         .and_then(|snapshot| snapshot.worker(&worker))
@@ -1373,6 +1139,7 @@ impl App {
                 KeyCode::Esc => self.mode = Mode::Pool(PoolMode::View { selected }),
                 KeyCode::Enter => {
                     let tickets = self
+                        .pool
                         .ready_tickets
                         .as_ref()
                         .map(|ready| {
@@ -1431,14 +1198,15 @@ impl App {
     }
 
     fn worker_is_available_for_action(&self, worker: &str) -> bool {
-        self.worker_pool
+        self.pool
+            .worker_pool
             .as_ref()
             .and_then(|snapshot| snapshot.worker(worker))
             .is_some_and(|worker| worker.status() != WorkerStatus::Busy)
     }
 
     fn has_idle_worker(&self) -> bool {
-        self.worker_pool.as_ref().is_some_and(|snapshot| {
+        self.pool.worker_pool.as_ref().is_some_and(|snapshot| {
             snapshot
                 .workers()
                 .iter()
@@ -1519,7 +1287,7 @@ impl App {
         worker: Option<String>,
         shortage: crate::workspace_dispatch::DispatchCapacityShortage,
     ) {
-        let Some(operation) = self.active_operation else {
+        let Some(operation) = self.pool.active_operation else {
             self.mode = Mode::Pool(PoolMode::View { selected: worker });
             return;
         };
@@ -1544,7 +1312,7 @@ impl App {
                     });
             }
             KeyCode::Esc => {
-                self.active_operation = None;
+                self.pool.cancel_dispatch();
                 self.mode = Mode::Pool(PoolMode::View { selected: worker });
                 self.set_status("Dispatch cancelled".to_string());
             }
@@ -1586,8 +1354,7 @@ impl App {
                 self.mode = Mode::Pool(PoolMode::View {
                     selected: Some(worker.clone()),
                 });
-                let operation = self.begin_dispatch();
-                self.worker_reset_operation = Some(operation);
+                let operation = self.begin_reset();
                 self.pin_status(format!("resetting Worker {worker}..."));
                 self.dispatch
                     .submit(WorkspaceDispatchCommand::Reset { operation, worker });
@@ -1665,14 +1432,16 @@ impl App {
     }
 
     fn pool_capacity(&self) -> Option<usize> {
-        self.worker_pool
+        self.pool
+            .worker_pool
             .as_ref()?
             .pool()
             .and_then(|pool| usize::try_from(pool.size()).ok())
     }
 
     fn worker_is_idle(&self, worker_id: &str) -> bool {
-        self.worker_pool
+        self.pool
+            .worker_pool
             .as_ref()
             .and_then(|snapshot| {
                 snapshot
@@ -1684,7 +1453,7 @@ impl App {
     }
 
     fn pool_worker_after(&self, selected: Option<&str>, delta: isize) -> Option<String> {
-        let workers = self.worker_pool.as_ref()?.workers();
+        let workers = self.pool.worker_pool.as_ref()?.workers();
         if workers.is_empty() {
             return None;
         }
@@ -1927,8 +1696,7 @@ impl App {
         let Some(workspace) = self.store.workspace(name).cloned() else {
             return;
         };
-        self.next_operation = self.next_operation.wrapping_add(1).max(1);
-        let operation = self.next_operation;
+        let operation = self.allocate_operation();
         let pending = PendingDeletion {
             operation,
             workspace: workspace.clone(),
@@ -2235,7 +2003,7 @@ impl App {
         .horizontal_margin(2)
         .areas(frame.area());
 
-        let title = match &self.worker_pool {
+        let title = match &self.pool.worker_pool {
             Some(snapshot) if snapshot.diagnostics().is_empty() => format!(
                 "jjfx - {} workspace(s)  [wsg pool]",
                 self.store.workspaces().len()
@@ -2275,6 +2043,7 @@ impl App {
         // selected workspace lands on so the highlight follows it.
         let classified = self.classified();
         let workers = self
+            .pool
             .worker_pool
             .as_ref()
             .map_or(&[][..], WorkerPoolSnapshot::workers);
@@ -2383,7 +2152,7 @@ impl App {
         );
 
         let mut lines = Vec::new();
-        if let Some(snapshot) = &self.worker_pool {
+        if let Some(snapshot) = &self.pool.worker_pool {
             let capacity = snapshot
                 .pool()
                 .and_then(|pool| usize::try_from(pool.size()).ok())
@@ -2432,7 +2201,7 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )));
             }
-            if let Some(progress) = &self.group_progress {
+            if let Some(progress) = &self.pool.group_progress {
                 let counts = progress.counts();
                 let terminal = if progress.is_terminal() {
                     " terminal"
@@ -2491,7 +2260,7 @@ impl App {
                     }
                 }
                 Mode::Pool(PoolMode::ReadyPreview { .. }) => {
-                    if let Some(ready) = &self.ready_tickets {
+                    if let Some(ready) = &self.pool.ready_tickets {
                         lines.push(dim_line(" Ready Ticket preview:"));
                         for ticket in ready.tickets() {
                             lines.push(Line::from(format!(
@@ -2510,7 +2279,7 @@ impl App {
                 }
                 _ => {}
             }
-            if let Some(session) = &self.worker_session {
+            if let Some(session) = &self.pool.worker_session {
                 let session_text = match session.session() {
                     AgentSessionResolution::Resumed { session_id } => {
                         format!("resumed session {session_id}")
@@ -2528,10 +2297,10 @@ impl App {
                 )));
                 lines.push(Line::from(format!("  {session_text}")));
             }
-            if let Some(result) = &self.worker_command_result {
+            if let Some(result) = &self.pool.worker_command_result {
                 lines.push(dim_line(&format!(" Worker action: {}", result.notice())));
             }
-            if let Some(result) = &self.dispatch_result {
+            if let Some(result) = &self.pool.dispatch_result {
                 lines.push(dim_line(&format!(
                     " Dispatch outcomes (runtime: {}):",
                     result.runtime().as_str()
@@ -2558,12 +2327,12 @@ impl App {
             }
             if let Mode::Pool(PoolMode::LogDetail { worker }) = &self.mode {
                 lines.push(dim_line(&format!(" Worker log: {worker}")));
-                if let Some(error) = &self.worker_log_error {
+                if let Some(error) = &self.pool.worker_log_error {
                     lines.push(Line::from(Span::styled(
                         format!(" ! {error}"),
                         Style::default().fg(Color::Yellow),
                     )));
-                } else if let Some(snapshot) = &self.worker_log {
+                } else if let Some(snapshot) = &self.pool.worker_log {
                     lines.push(Line::from(format!(
                         " runtime: {}  worker: {}",
                         snapshot.runtime().as_str(),
@@ -2890,7 +2659,8 @@ impl App {
 
     #[cfg(test)]
     fn worker_for(&self, workspace: &Workspace) -> Option<&WorkerSnapshot> {
-        self.worker_pool
+        self.pool
+            .worker_pool
             .as_ref()?
             .workers()
             .iter()
@@ -3000,7 +2770,7 @@ impl App {
                     Style::default().fg(Color::Yellow),
                 )),
                 (None, None, None) => Paragraph::new(Span::styled(
-                    if self.worker_pool.is_some() {
+                    if self.pool.worker_pool.is_some() {
                         " wsg pool  ·  p manage  j/k move  ? help  q quit "
                     } else if self.world.is_some() {
                         " j/k move  J/K scroll world  ? help  q quit "
@@ -3728,7 +3498,7 @@ mod tests {
     use crate::config::ForgeConfig;
     use crate::runtime::Runtime;
     use crate::store::Workspace;
-    use crate::workspace_dispatch::RecordingAdapter;
+    use crate::workspace_dispatch::{RecordingAdapter, WorkerCommandResult, WorkerSessionOutcome};
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -4411,7 +4181,7 @@ mod tests {
             .unwrap()
             .read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
-        app.worker_pool = Some(snapshot);
+        app.pool.worker_pool = Some(snapshot);
         app.handle(press(KeyCode::Char('p')));
         app.handle(press(KeyCode::Char('d')));
         for character in "ENG-42 ENG-43".chars() {
@@ -4426,14 +4196,14 @@ mod tests {
         ));
         app.handle(press(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
-        assert_eq!(app.active_operation, None);
+        assert_eq!(app.pool.active_operation, None);
     }
 
     #[test]
     fn ready_ticket_event_opens_an_ordered_preview() {
         let mut app = app_with(&["default"]);
         app.mode = Mode::Pool(PoolMode::View { selected: None });
-        app.active_operation = Some(4);
+        app.pool.active_operation = Some(4);
         app.handle(Msg::WorkspaceDispatch(
             WorkspaceDispatchEvent::ReadyTickets {
                 operation: 4,
@@ -4451,9 +4221,9 @@ mod tests {
             app.mode,
             Mode::Pool(PoolMode::ReadyPreview { .. })
         ));
-        assert_eq!(app.active_operation, None);
+        assert_eq!(app.pool.active_operation, None);
         assert_eq!(
-            app.ready_tickets.as_ref().unwrap().tickets()[1].id(),
+            app.pool.ready_tickets.as_ref().unwrap().tickets()[1].id(),
             "ENG-43"
         );
     }
@@ -4462,7 +4232,7 @@ mod tests {
     fn capacity_shortage_requires_a_typed_growth_decision() {
         let mut app = app_with(&["default"]);
         app.mode = Mode::Pool(PoolMode::View { selected: None });
-        app.active_operation = Some(7);
+        app.pool.active_operation = Some(7);
         app.handle(Msg::WorkspaceDispatch(
             WorkspaceDispatchEvent::DispatchCapacity {
                 operation: 7,
@@ -4480,7 +4250,7 @@ mod tests {
         ));
         app.handle(press(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
-        assert_eq!(app.active_operation, None);
+        assert_eq!(app.pool.active_operation, None);
         assert_eq!(app.status.as_deref(), Some("Dispatch cancelled"));
     }
 
@@ -4491,7 +4261,7 @@ mod tests {
             buffer: String::new(),
             selected: None,
         });
-        app.active_operation = Some(8);
+        app.pool.active_operation = Some(8);
         app.handle(press(KeyCode::Char('E')));
         app.handle(press(KeyCode::Char('N')));
         app.handle(press(KeyCode::Char('G')));
@@ -4500,7 +4270,7 @@ mod tests {
             app.mode,
             Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG"
         ));
-        assert_eq!(app.active_operation, Some(8));
+        assert_eq!(app.pool.active_operation, Some(8));
     }
 
     #[test]
@@ -4524,7 +4294,7 @@ mod tests {
         let adapter = RecordingAdapter::new(snapshot.clone());
         let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
         let mut app = app_with(&["default", "worker-01"]);
-        app.worker_pool = Some(snapshot);
+        app.pool.worker_pool = Some(snapshot);
         app.dispatch = controller;
         app.mode = Mode::Pool(PoolMode::View {
             selected: Some("worker-01".to_owned()),
@@ -4589,7 +4359,7 @@ mod tests {
             )
         }));
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
-        assert!(app.active_operation.is_some());
+        assert!(app.pool.active_operation.is_some());
     }
 
     #[test]
@@ -4613,7 +4383,7 @@ mod tests {
         let adapter = RecordingAdapter::new(snapshot.clone());
         let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
         let mut app = app_with(&["default", "worker-01"]);
-        app.worker_pool = Some(snapshot);
+        app.pool.worker_pool = Some(snapshot);
         app.dispatch = controller;
         app.mode = Mode::Pool(PoolMode::View {
             selected: Some("worker-01".to_owned()),
@@ -4680,7 +4450,7 @@ mod tests {
             .unwrap()
             .read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
-        app.worker_pool = Some(snapshot);
+        app.pool.worker_pool = Some(snapshot);
         app.mode = Mode::Pool(PoolMode::View {
             selected: Some("worker-01".to_owned()),
         });
@@ -4708,13 +4478,13 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         let mut app = app_with(&["default"]);
-        app.worker_pool = Some(
+        app.pool.worker_pool = Some(
             wsg_core::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
         app.mode = Mode::Pool(PoolMode::View { selected: None });
-        app.active_operation = Some(12);
+        app.pool.active_operation = Some(12);
         app.handle(Msg::WorkspaceDispatch(
             WorkspaceDispatchEvent::WorkerActionCompleted {
                 operation: 12,
@@ -4730,7 +4500,7 @@ mod tests {
             },
         ));
 
-        assert!(app.active_operation.is_none());
+        assert!(app.pool.active_operation.is_none());
         assert!(
             app.status
                 .as_deref()
@@ -4769,7 +4539,7 @@ mod tests {
         )
         .unwrap();
         let mut app = app_with(&["default", "worker-01"]);
-        app.worker_pool = Some(
+        app.pool.worker_pool = Some(
             wsg_core::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
@@ -4815,7 +4585,7 @@ mod tests {
         let adapter = RecordingAdapter::new(snapshot.clone());
         let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
         let mut app = app_with(&["default", "worker-01"]);
-        app.worker_pool = Some(snapshot);
+        app.pool.worker_pool = Some(snapshot);
         app.dispatch = controller;
         app.mode = Mode::Pool(PoolMode::View {
             selected: Some("worker-01".to_owned()),
@@ -4843,7 +4613,7 @@ mod tests {
         app.handle(press(KeyCode::Enter));
         app.handle(Msg::WorkspaceDispatch(
             WorkspaceDispatchEvent::WorkerCommandCompleted {
-                operation: app.active_operation.unwrap(),
+                operation: app.pool.active_operation.unwrap(),
                 result: WorkerCommandResult::AliasChanged {
                     worker: "worker-01".to_owned(),
                     alias: Some("primary".to_owned()),
@@ -4899,12 +4669,12 @@ mod tests {
             command,
             WorkspaceDispatchCommand::OpenPullRequest { worker, .. } if worker == "worker-01"
         )));
-        let operation = app.active_operation.expect("Pull Request operation");
+        let operation = app.pool.active_operation.expect("Pull Request operation");
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Failed {
             operation,
             message: "browser unavailable".to_owned(),
         }));
-        assert_eq!(app.active_operation, None);
+        assert_eq!(app.pool.active_operation, None);
         assert_eq!(
             app.status.as_deref(),
             Some("Worker Pool: browser unavailable")
@@ -4928,8 +4698,8 @@ mod tests {
         app.mode = Mode::Pool(PoolMode::View {
             selected: Some("worker-01".to_owned()),
         });
-        app.active_operation = Some(8);
-        app.worker_reset_operation = Some(8);
+        app.pool.active_operation = Some(8);
+        app.pool.worker_reset_operation = Some(8);
         app.handle(Msg::WorkspaceDispatch(
             WorkspaceDispatchEvent::WorkerResetCompleted {
                 operation: 8,
@@ -4941,7 +4711,7 @@ mod tests {
                 ),
             },
         ));
-        assert_eq!(app.active_operation, Some(8));
+        assert_eq!(app.pool.active_operation, Some(8));
         assert!(
             app.status
                 .as_deref()
@@ -4954,8 +4724,8 @@ mod tests {
                 result: crate::workspace_dispatch::WorkspaceRestorationResult::Restored,
             },
         ));
-        assert_eq!(app.active_operation, None);
-        assert_eq!(app.worker_reset_operation, None);
+        assert_eq!(app.pool.active_operation, None);
+        assert_eq!(app.pool.worker_reset_operation, None);
         assert!(
             app.status
                 .as_deref()
@@ -5010,7 +4780,7 @@ mod tests {
                     if parent == "ENG-100"
             )
         }));
-        assert!(app.orchestration_operation.is_some());
+        assert!(app.pool.orchestration_operation.is_some());
     }
 
     #[test]
@@ -5023,12 +4793,12 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         let mut app = app_with(&["default"]);
-        app.worker_pool = Some(
+        app.pool.worker_pool = Some(
             wsg_core::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
-        app.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
+        app.pool.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
             wsg_core::AgentRuntime::Pi,
             Some(RunActivity::new(RunActivityKind::FileChanges {
@@ -5080,8 +4850,8 @@ mod tests {
             wsg_core::AgentRuntime::Pi,
         ] {
             let mut app = app_with(&["default"]);
-            app.worker_pool = Some(snapshot.clone());
-            app.worker_session = Some(WorkerSessionOutcome::new(
+            app.pool.worker_pool = Some(snapshot.clone());
+            app.pool.worker_session = Some(WorkerSessionOutcome::new(
                 "worker-01",
                 crate::workspace_dispatch::WorkerActionKind::Send,
                 runtime,
@@ -5090,7 +4860,7 @@ mod tests {
                 },
                 77,
             ));
-            app.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
+            app.pool.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
                 "worker-01",
                 runtime,
                 Some(RunActivity::new(RunActivityKind::Warning {
@@ -5098,7 +4868,7 @@ mod tests {
                 })),
                 Some(RunResult::failed("provider stopped")),
             ));
-            app.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
+            app.pool.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
                 runtime,
                 vec![crate::workspace_dispatch::DispatchOutcome::failure(
                     "ENG-43".to_owned(),
@@ -5147,7 +4917,7 @@ mod tests {
         app.mode = Mode::Pool(PoolMode::LogDetail {
             worker: "worker-01".to_owned(),
         });
-        app.worker_log_operation = Some(7);
+        app.pool.worker_log_operation = Some(7);
         let first = crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
             wsg_core::AgentRuntime::Claude,
@@ -5156,7 +4926,7 @@ mod tests {
             })),
             None,
         );
-        app.worker_log = Some(first.clone());
+        app.pool.worker_log = Some(first.clone());
         let stale = crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
             wsg_core::AgentRuntime::Codex,
@@ -5171,8 +4941,8 @@ mod tests {
                 snapshot: Box::new(stale),
             },
         ));
-        assert_eq!(app.worker_log.as_ref(), Some(&first));
-        assert_eq!(app.worker_log_operation, Some(7));
+        assert_eq!(app.pool.worker_log.as_ref(), Some(&first));
+        assert_eq!(app.pool.worker_log_operation, Some(7));
 
         let terminal = crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
@@ -5186,9 +4956,10 @@ mod tests {
                 snapshot: Box::new(terminal),
             },
         ));
-        assert_eq!(app.worker_log_operation, None);
+        assert_eq!(app.pool.worker_log_operation, None);
         assert_eq!(
-            app.worker_log
+            app.pool
+                .worker_log
                 .as_ref()
                 .unwrap()
                 .result()
@@ -5204,7 +4975,7 @@ mod tests {
         app.mode = Mode::Pool(PoolMode::LogDetail {
             worker: "worker-01".to_owned(),
         });
-        app.worker_log_error = Some("log file unavailable: missing Worker log".to_owned());
+        app.pool.worker_log_error = Some("log file unavailable: missing Worker log".to_owned());
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(20, 5)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
@@ -5220,12 +4991,12 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        app.worker_pool = Some(
+        app.pool.worker_pool = Some(
             wsg_core::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
-        app.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
+        app.pool.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
             wsg_core::AgentRuntime::Pi,
             vec![
                 crate::workspace_dispatch::DispatchOutcome::success(
@@ -5305,7 +5076,7 @@ mod tests {
         state.sub_issues = sub_issues;
 
         let mut app = app_with(&["default"]);
-        app.worker_pool = Some(
+        app.pool.worker_pool = Some(
             wsg_core::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
@@ -5387,12 +5158,12 @@ mod tests {
                 .iter()
                 .any(|command| matches!(command, WorkspaceDispatchCommand::Resize { .. }))
         );
-        app.active_operation = Some(3);
+        app.pool.active_operation = Some(3);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Failed {
             operation: 3,
             message: "refresh failed".to_string(),
         }));
-        assert!(app.worker_pool.is_some());
+        assert!(app.pool.worker_pool.is_some());
         assert_eq!(app.status.as_deref(), Some("Worker Pool: refresh failed"));
     }
 
@@ -5416,12 +5187,12 @@ mod tests {
     #[test]
     fn stale_workspace_dispatch_events_do_not_replace_newer_operations() {
         let mut app = app_with(&["default"]);
-        app.active_operation = Some(9);
+        app.pool.active_operation = Some(9);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Failed {
             operation: 8,
             message: "old failure".to_string(),
         }));
-        assert_eq!(app.active_operation, Some(9));
+        assert_eq!(app.pool.active_operation, Some(9));
         assert_eq!(app.status, None);
     }
 
