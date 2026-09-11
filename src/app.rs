@@ -18,12 +18,12 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentKind, AgentState};
 use crate::attention::{self, Attention};
-use crate::config::ForgeConfig;
-use crate::diff::{self, FileDiff};
+use crate::diff::FileDiff;
 use crate::diff_view::Detail;
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj;
+use crate::runtime::Effect;
 use crate::store::{self, Store, Workspace};
 use crate::task_editor::{TaskEditor, TaskEditorAction};
 use crate::terminal::Terminal;
@@ -167,6 +167,13 @@ pub struct PendingWorkspace {
     started_at: Instant,
 }
 
+impl PendingWorkspace {
+    /// The normalized name the Workspace will be created under.
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
 /// The workspace identity retained in the list while its persistent deletion
 /// runs outside the App task.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -225,14 +232,7 @@ pub enum Msg {
 }
 
 /// How long a transient footer status message stays before expiring.
-const STATUS_TTL: Duration = Duration::from_secs(5);
-
-/// Startup settings owned by the App rather than its terminal or store.
-#[derive(Debug, Default)]
-pub struct AppConfig {
-    /// How the forge pipeline opens and maintains pull requests.
-    pub forge: ForgeConfig,
-}
+pub(crate) const STATUS_TTL: Duration = Duration::from_secs(5);
 
 /// The whole application state - one owned value on the main task.
 pub struct App {
@@ -287,11 +287,9 @@ pub struct App {
     quit_after_deletion: bool,
     /// Latest non-empty line emitted by that workspace's setup command.
     setup_output: Option<(wsg_core::WorkspaceHookStream, String)>,
-    /// The deep Forge module owns execution, progress, and Pull Request rules.
-    forge: forge::Forge,
-    /// Channel to the app's own message loop, so forge tasks can stream updates
-    /// back as [`Msg::Forge`].
-    tx: UnboundedSender<Msg>,
+    /// Effects requested during the current fold. [`App::handle`] drains them so
+    /// the runtime performs exactly the work the fold asked for.
+    effects: Vec<Effect>,
     /// The multiplexer jjfx drives for workspace tabs (behind a trait so kitty is
     /// swappable - ticket 07). Shared so a background delete can close its tab
     /// without taking ownership of the App's terminal adapter.
@@ -327,13 +325,11 @@ impl App {
     pub fn new(
         store: Store,
         agents: agent::AgentStates,
-        terminal: Box<dyn Terminal>,
+        terminal: Arc<dyn Terminal>,
         jj: Box<dyn jj::Jj>,
-        config: AppConfig,
         world_pane: bool,
         tx: UnboundedSender<Msg>,
     ) -> Self {
-        let forge = forge::Forge::new(store.repo_root().to_path_buf(), config.forge);
         let dispatch_tx = tx.clone();
         let dispatch = WorkspaceDispatchController::new(
             RealWorkspaceDispatch::new(store.repo_root()),
@@ -365,9 +361,8 @@ impl App {
             pending_deletion: None,
             quit_after_deletion: false,
             setup_output: None,
-            forge,
-            tx,
-            terminal: terminal.into(),
+            effects: Vec::new(),
+            terminal,
             jj,
             mode: Mode::Normal,
             graph: None,
@@ -382,8 +377,9 @@ impl App {
         app
     }
 
-    /// Fold one message into the state.
-    pub fn handle(&mut self, msg: Msg) {
+    /// Fold one message into the state, then return the effects the fold asked
+    /// for. The runtime performs them; the fold itself never spawns work.
+    pub fn handle(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Input(event) => self.on_input(event),
             Msg::Reload => self.reload(),
@@ -417,6 +413,18 @@ impl App {
                 self.animate();
             }
         }
+        self.take_effects()
+    }
+
+    /// Queue an effect for the runtime. Drained by [`App::handle`].
+    fn emit(&mut self, effect: Effect) {
+        self.effects.push(effect);
+    }
+
+    /// Drain the effects requested since the last drain. Startup callers that
+    /// act outside `handle` use this instead.
+    pub(crate) fn take_effects(&mut self) -> Vec<Effect> {
+        std::mem::take(&mut self.effects)
     }
 
     fn on_worker_pool_snapshot(&mut self, operation: OperationId, snapshot: WorkerPoolSnapshot) {
@@ -735,21 +743,13 @@ impl App {
         }
     }
 
-    /// Show a transient footer message and arm a timer to clear it after
+    /// Show a transient footer message and ask the runtime to clear it after
     /// [`STATUS_TTL`]. The generation stamp disarms any earlier timer, so an old
     /// expiry can never wipe a newer message.
     fn set_status(&mut self, msg: String) {
         self.pin_status(msg);
         let generation = self.status_gen;
-        let tx = self.tx.clone();
-        // Unit tests drive `handle` without a tokio runtime; there the message
-        // simply never expires, which keeps assertions on `status` simple.
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move {
-                tokio::time::sleep(STATUS_TTL).await;
-                let _ = tx.send(Msg::StatusExpired(generation));
-            });
-        }
+        self.emit(Effect::ScheduleStatusExpiry { generation });
     }
 
     /// Show a footer message that stays until replaced - for in-flight progress
@@ -1000,9 +1000,9 @@ impl App {
         }
     }
 
-    /// `→`/`l`: open the diff-detail view for the selected workspace and kick off
-    /// an async read of its diff from trunk (a blocking jj read on a worker
-    /// thread, so a large patch never stalls the render loop).
+    /// `→`/`l`: open the diff-detail view for the selected workspace and ask the
+    /// runtime for its diff from trunk (a blocking jj read, so a large patch
+    /// never stalls the render loop).
     fn open_detail(&mut self) {
         self.status = None;
         let Some(w) = self.selected_workspace().cloned() else {
@@ -1012,30 +1012,21 @@ impl App {
             return;
         }
         self.mode = Mode::Detail(Detail::loading(w.name.clone()));
-        let tx = self.tx.clone();
-        let repo_root = self.store.repo_root().to_path_buf();
-        let ws = w.name;
-        tokio::spawn(async move {
-            let load_ws = ws.clone();
-            let files = tokio::task::spawn_blocking(move || diff::load(&repo_root, &load_ws))
-                .await
-                .unwrap_or_default();
-            let _ = tx.send(Msg::DiffLoaded { ws, files });
-        });
+        self.emit(Effect::LoadDiff { workspace: w.name });
         // The detail view carries a per-workspace graph strip; load the graph
         // alongside the diff so the strip fills in.
-        self.spawn_graph_load();
+        self.request_graph_load();
     }
 
     /// `w`: toggle the inline world-graph pane under the home list. Turning it
-    /// on kicks off an async jj-lib read; the last-loaded graph (if any) shows
+    /// on asks for an async jj-lib read; the last-loaded graph (if any) shows
     /// immediately while the fresh one loads.
     fn toggle_world(&mut self) {
         match self.world {
             Some(_) => self.world = None,
             None => {
                 self.world = Some(Viewport::default());
-                self.spawn_graph_load();
+                self.request_graph_load();
             }
         }
     }
@@ -1056,12 +1047,12 @@ impl App {
         self.list.idle_collapsed()
     }
 
-    /// `W`: open the full-screen world graph and kick off an async jj-lib read.
+    /// `W`: open the full-screen world graph and ask for an async jj-lib read.
     /// The last-loaded graph shows immediately (if any) while the fresh one loads.
     fn open_graph(&mut self) {
         self.status = None;
         self.mode = Mode::Graph(Viewport::default());
-        self.spawn_graph_load();
+        self.request_graph_load();
     }
 
     /// World-graph keys: `j`/`k` (and arrows/page) scroll; `esc`/`W`/`q` return to
@@ -1082,28 +1073,21 @@ impl App {
         }
     }
 
-    /// Spawn a blocking jj-lib graph read on a worker thread (never the render
-    /// loop) and stream the result back as [`Msg::GraphLoaded`]. On error the last
-    /// graph simply stays; a graph read must never crash the TUI.
-    fn spawn_graph_load(&self) {
-        let tx = self.tx.clone();
-        let repo_root = self.store.repo_root().to_path_buf();
-        tokio::spawn(async move {
-            if let Ok(Ok(graph)) =
-                tokio::task::spawn_blocking(move || graph::load(&repo_root)).await
-            {
-                let _ = tx.send(Msg::GraphLoaded(graph));
-            }
-        });
+    /// Ask the runtime for a blocking jj-lib graph read and stream the result
+    /// back as [`Msg::GraphLoaded`]. On error the last graph simply stays; a
+    /// graph read must never crash the TUI.
+    fn request_graph_load(&mut self) {
+        self.emit(Effect::LoadGraph);
     }
 
-    /// Reload the graph if a graph-bearing view is on screen (the full-screen
-    /// views or the inline world pane), so it tracks the underlying revisions
-    /// changing (new commits, fetch, forge). Also called once at startup so a
-    /// persisted-on world pane fills in. `pub(crate)` for that startup call.
-    pub(crate) fn refresh_graph_if_visible(&self) {
+    /// Request a graph reload if a graph-bearing view is on screen (the
+    /// full-screen views or the inline world pane), so it tracks the underlying
+    /// revisions changing (new commits, fetch, forge). Also called once at
+    /// startup so a persisted-on world pane fills in. `pub(crate)` for that
+    /// startup call.
+    pub(crate) fn refresh_graph_if_visible(&mut self) {
         if matches!(self.mode, Mode::Graph(_) | Mode::Detail(_)) || self.world.is_some() {
-            self.spawn_graph_load();
+            self.request_graph_load();
         }
     }
 
@@ -1871,33 +1855,7 @@ impl App {
         self.pending_workspace = Some(workspace.clone());
         self.setup_output = None;
         self.pin_status(format!("setting up '{}'...", workspace.name));
-
-        let repo_root = self.store.repo_root().to_path_buf();
-        let requested_name = workspace.name.clone();
-        let tx = self.tx.clone();
-        let progress_workspace = workspace.clone();
-        tokio::spawn(async move {
-            let progress_tx = tx.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                Store::create_persisted_with_progress(
-                    &repo_root,
-                    &requested_name,
-                    move |stream, line| {
-                        if !line.trim().is_empty() {
-                            let _ = progress_tx.send(Msg::WorkspaceSetupOutput {
-                                workspace: progress_workspace.clone(),
-                                stream,
-                                line: line.to_owned(),
-                            });
-                        }
-                    },
-                )
-            })
-            .await
-            .map_err(|error| format!("{error:#}"))
-            .and_then(|result| result.map(|_| ()).map_err(|error| format!("{error:#}")));
-            let _ = tx.send(Msg::WorkspaceSetupCompleted { workspace, result });
-        });
+        self.emit(Effect::CreateWorkspace { workspace });
     }
 
     fn on_workspace_setup_completed(
@@ -1978,39 +1936,9 @@ impl App {
         self.pending_deletion = Some(pending);
         self.quit_after_deletion = false;
         self.pin_status(format!("deleting '{name}'..."));
-
-        let repo_root = self.store.repo_root().to_path_buf();
-        let known_path = workspace.path.clone();
-        let terminal = self.terminal.clone();
-        let tx = self.tx.clone();
-        let workspace_name = workspace.name.clone();
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || {
-                // Terminal presentation is best-effort, but it belongs in the
-                // same blocking worker as jj and recursive filesystem cleanup.
-                let _ = terminal.close(&workspace_name);
-                let deletion =
-                    Store::delete_persisted(&repo_root, &workspace_name, known_path.as_deref())
-                        .map_err(|error| format!("{error:#}"));
-                let store = Store::load(&repo_root);
-                (deletion, store)
-            })
-            .await;
-            let message = match result {
-                Ok((result, store)) => Msg::WorkspaceDeletionCompleted {
-                    operation,
-                    workspace,
-                    result,
-                    store: Some(store),
-                },
-                Err(error) => Msg::WorkspaceDeletionCompleted {
-                    operation,
-                    workspace,
-                    result: Err(format!("workspace deletion worker failed: {error:#}")),
-                    store: None,
-                },
-            };
-            let _ = tx.send(message);
+        self.emit(Effect::DeleteWorkspace {
+            workspace,
+            operation,
         });
     }
 
@@ -2126,14 +2054,7 @@ impl App {
         }
         self.fetching = true;
         self.pin_status("fetching…".to_string());
-        let tx = self.tx.clone();
-        let repo_root = self.store.repo_root().to_path_buf();
-        tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || jj::fetch(&repo_root))
-                .await
-                .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
-            let _ = tx.send(Msg::Fetched(result.map_err(|e| format!("{e:#}"))));
-        });
+        self.emit(Effect::Fetch);
     }
 
     /// Fold the background fetch's outcome into the footer, then reload. The
@@ -2218,15 +2139,7 @@ impl App {
             });
             return;
         }
-        let mut updates = self.forge.start(targets);
-        let tx = self.tx.clone();
-        tokio::spawn(async move {
-            while let Some(update) = updates.recv().await {
-                if tx.send(Msg::Forge(update)).is_err() {
-                    break;
-                }
-            }
-        });
+        self.emit(Effect::StartForge { targets });
     }
 
     /// The ordered selectable workspace names for the current classification.
@@ -3812,6 +3725,8 @@ fn work_color(state: WorkState) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ForgeConfig;
+    use crate::runtime::Runtime;
     use crate::store::Workspace;
     use crate::workspace_dispatch::RecordingAdapter;
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
@@ -3922,45 +3837,55 @@ mod tests {
                 path: Some(PathBuf::from(format!("/wt/{n}"))),
             })
             .collect();
-        // The rx end is dropped: tests fold messages by hand, they never spawn a
-        // real forge, so nothing needs to receive on this channel.
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         App::new(
             Store::from_workspaces_for_test(PathBuf::from("/repo"), workspaces),
             agent::AgentStates::default(),
-            terminal,
+            terminal.into(),
             jj,
-            AppConfig::default(),
             false,
             tx,
         )
     }
 
+    /// An App plus the Runtime that executes its effects, sharing one message
+    /// channel so a test can drive a full request/response cycle.
     fn app_with_store_and_channel(
         store: Store,
         terminal: Box<dyn Terminal>,
-    ) -> (App, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+    ) -> (App, Runtime, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let terminal: Arc<dyn Terminal> = terminal.into();
+        let runtime = Runtime::new(
+            tx.clone(),
+            store.repo_root().to_path_buf(),
+            ForgeConfig::default(),
+            Arc::clone(&terminal),
+        );
         let app = App::new(
             store,
             agent::AgentStates::default(),
             terminal,
             Box::new(FakeJj::default()),
-            AppConfig {
-                forge: ForgeConfig::default(),
-            },
             false,
             tx,
         );
-        (app, rx)
+        (app, runtime, rx)
     }
 
-    fn submit_new_workspace(app: &mut App, name: &str) {
-        app.handle(press(KeyCode::Char('n')));
-        for character in name.chars() {
-            app.handle(press(KeyCode::Char(character)));
+    /// Fold one message and execute every effect it requests.
+    fn handle(app: &mut App, runtime: &Runtime, msg: Msg) {
+        for effect in app.handle(msg) {
+            runtime.execute(effect);
         }
-        app.handle(press(KeyCode::Enter));
+    }
+
+    fn submit_new_workspace(app: &mut App, runtime: &Runtime, name: &str) {
+        handle(app, runtime, press(KeyCode::Char('n')));
+        for character in name.chars() {
+            handle(app, runtime, press(KeyCode::Char(character)));
+        }
+        handle(app, runtime, press(KeyCode::Enter));
     }
 
     async fn handle_setup_completion(
@@ -5857,20 +5782,85 @@ mod tests {
         assert_eq!(app.status.as_deref(), Some("nothing to lift"));
     }
 
-    #[tokio::test]
-    async fn u_starts_one_background_fetch_and_folds_its_outcome() {
+    #[test]
+    fn u_requests_one_fetch_effect_and_folds_its_outcome() {
         let mut app = app_with(&["default"]);
-        app.handle(press(KeyCode::Char('u')));
+        let effects = app.handle(press(KeyCode::Char('u')));
+        assert!(matches!(effects.as_slice(), [Effect::Fetch]));
         assert_eq!(app.status.as_deref(), Some("fetching…"));
         // A second press while one is in flight is ignored (repo-lock contention).
-        app.handle(press(KeyCode::Char('u')));
+        assert!(app.handle(press(KeyCode::Char('u'))).is_empty());
         assert_eq!(app.status.as_deref(), Some("fetching…"));
 
         app.handle(Msg::Fetched(Ok(())));
         assert_eq!(app.status.as_deref(), Some("fetched"));
         // Resolved: the next press may fetch again.
-        app.handle(press(KeyCode::Char('u')));
-        assert_eq!(app.status.as_deref(), Some("fetching…"));
+        assert!(matches!(
+            app.handle(press(KeyCode::Char('u'))).as_slice(),
+            [Effect::Fetch]
+        ));
+    }
+
+    #[test]
+    fn set_status_requests_an_expiry_effect_for_its_generation() {
+        let mut app = app_with(&["default"]);
+        app.set_status("hello".to_owned());
+        let generation = app.status_gen;
+        assert!(matches!(
+            app.take_effects().as_slice(),
+            [Effect::ScheduleStatusExpiry { generation: effect_generation }] if *effect_generation == generation
+        ));
+        assert!(app.take_effects().is_empty());
+    }
+
+    #[test]
+    fn workspace_creation_requests_a_create_effect_for_the_pending_workspace() {
+        let mut app = app_with(&["default"]);
+        app.handle(press(KeyCode::Char('n')));
+        for character in "feat".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        let effects = app.handle(press(KeyCode::Enter));
+        let pending = app
+            .pending_workspace
+            .clone()
+            .expect("the submitted workspace is pending");
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::CreateWorkspace { workspace }] if *workspace == pending
+        ));
+    }
+
+    #[test]
+    fn workspace_deletion_requests_a_delete_effect_for_the_tombstone() {
+        let mut app = app_with(&["default", "feat"]);
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Char('d')));
+        let effects = app.handle(press(KeyCode::Char('y')));
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::DeleteWorkspace { workspace, .. } if workspace.name == "feat"
+        )));
+    }
+
+    #[test]
+    fn forge_requests_a_start_forge_effect_for_the_selected_workspace() {
+        let mut app = app_with(&["default"]);
+        let effects = app.handle(press(KeyCode::Char('f')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::StartForge { targets }] if targets.len() == 1
+        ));
+    }
+
+    #[test]
+    fn refresh_graph_if_visible_requests_a_load_only_for_a_graph_view() {
+        let mut app = app_with(&["default"]);
+        app.refresh_graph_if_visible();
+        assert!(app.take_effects().is_empty());
+        app.world = Some(Viewport::default());
+        app.refresh_graph_if_visible();
+        assert!(matches!(app.take_effects().as_slice(), [Effect::LoadGraph]));
     }
 
     #[test]
@@ -5947,10 +5937,10 @@ mod tests {
     async fn submitted_workspace_name_creates_and_opens_terminal_after_setup() {
         let repo = store::test_local_repo("app-create");
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) =
+        let (mut app, runtime, mut rx) =
             app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
-        submit_new_workspace(&mut app, "feat");
+        submit_new_workspace(&mut app, &runtime, "feat");
 
         assert!(terminal.opened.lock().unwrap().is_empty());
         assert_eq!(app.status.as_deref(), Some("setting up 'feat'..."));
@@ -5980,10 +5970,10 @@ mod tests {
             "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 500 ]; do\n  [ -f setup-release ] && printf 'setup stdout\\n' && printf 'setup stderr\\n' >&2 && exit 0\n  i=$((i + 1))\n  sleep 0.01\ndone\nprintf 'setup timeout\\n' >&2\nexit 1\n",
         );
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) =
+        let (mut app, runtime, mut rx) =
             app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
-        submit_new_workspace(&mut app, "feat");
+        submit_new_workspace(&mut app, &runtime, "feat");
 
         assert!(terminal.opened.lock().unwrap().is_empty());
         assert_eq!(app.status.as_deref(), Some("setting up 'feat'..."));
@@ -6010,9 +6000,10 @@ mod tests {
             "#!/bin/sh\ni=0\nwhile [ \"$i\" -lt 500 ]; do\n  [ -f setup-release ] && exit 0\n  i=$((i + 1))\n  sleep 0.01\ndone\nexit 1\n",
         );
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
+        let (mut app, runtime, mut rx) =
+            app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
 
-        submit_new_workspace(&mut app, "feat");
+        submit_new_workspace(&mut app, &runtime, "feat");
         app.handle(press(KeyCode::Char('n')));
 
         assert!(matches!(app.mode, Mode::Normal));
@@ -6035,10 +6026,10 @@ mod tests {
         let repo = store::test_local_repo("app-create-setup-failure");
         install_setup_hook(&repo, "#!/bin/sh\nprintf 'setup boom\\n' >&2\nexit 7\n");
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) =
+        let (mut app, runtime, mut rx) =
             app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
-        submit_new_workspace(&mut app, "feat");
+        submit_new_workspace(&mut app, &runtime, "feat");
         handle_setup_completion(&mut app, &mut rx).await;
 
         assert!(app.store.workspace("feat").is_none());
@@ -6057,9 +6048,10 @@ mod tests {
         let repo = store::test_local_repo("app-create-setup-tab-failure");
         let terminal = FakeTerminal::default();
         *terminal.open_error.lock().unwrap() = Some("kitty unavailable".to_string());
-        let (mut app, mut rx) = app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
+        let (mut app, runtime, mut rx) =
+            app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
 
-        submit_new_workspace(&mut app, "feat");
+        submit_new_workspace(&mut app, &runtime, "feat");
         handle_setup_completion(&mut app, &mut rx).await;
 
         assert_eq!(
@@ -6082,9 +6074,10 @@ mod tests {
         ));
         jj::add_workspace(&repo, "feat", &path).unwrap();
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_channel(store, Box::new(terminal.clone()));
+        let (mut app, runtime, mut rx) =
+            app_with_store_and_channel(store, Box::new(terminal.clone()));
 
-        submit_new_workspace(&mut app, "feat");
+        submit_new_workspace(&mut app, &runtime, "feat");
         handle_setup_completion(&mut app, &mut rx).await;
 
         let status = app.status.as_deref().unwrap();
@@ -6104,11 +6097,12 @@ mod tests {
         let mut store = Store::load(&repo);
         store.create("feat").unwrap();
         let terminal = FakeTerminal::default();
-        let (mut app, mut rx) = app_with_store_and_channel(store, Box::new(terminal.clone()));
+        let (mut app, runtime, mut rx) =
+            app_with_store_and_channel(store, Box::new(terminal.clone()));
 
-        app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Char('d')));
-        app.handle(press(KeyCode::Char('y')));
+        handle(&mut app, &runtime, press(KeyCode::Down));
+        handle(&mut app, &runtime, press(KeyCode::Char('d')));
+        handle(&mut app, &runtime, press(KeyCode::Char('y')));
 
         assert_eq!(
             app.pending_deletion
@@ -6420,13 +6414,23 @@ mod tests {
         let mut app = app_with(&["default", "feat"]);
         app.list.select("feat");
         // `l` (and `→`) drills into the diff viewer for the selected workspace;
-        // the diff itself loads on a background task. (The loading/populate
-        // behaviour is tested directly against `Detail` in `diff_view`.)
-        app.handle(press(KeyCode::Char('l')));
+        // the diff and its graph strip load through the effect seam. (The
+        // loading/populate behaviour is tested directly against `Detail` in
+        // `diff_view`.)
+        let effects = app.handle(press(KeyCode::Char('l')));
         match &app.mode {
             Mode::Detail(d) => assert_eq!(d.workspace(), "feat"),
             _ => panic!("expected Detail mode"),
         }
+        assert!(effects.iter().any(|effect| matches!(
+            effect,
+            Effect::LoadDiff { workspace } if workspace == "feat"
+        )));
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::LoadGraph))
+        );
     }
 
     #[test]
@@ -6537,9 +6541,8 @@ mod tests {
         let app = App::new(
             Store::from_workspaces_for_test(PathBuf::from("/repo"), vec![]),
             agent::AgentStates::default(),
-            Box::new(FakeTerminal::default()),
+            Arc::from(Box::new(FakeTerminal::default()) as Box<dyn Terminal>),
             Box::new(FakeJj::default()),
-            AppConfig::default(),
             true,
             tx,
         );

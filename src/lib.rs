@@ -16,6 +16,7 @@ mod hooks;
 mod jj;
 mod prs;
 mod repo;
+mod runtime;
 mod store;
 mod task_editor;
 mod terminal;
@@ -30,13 +31,15 @@ mod workspace_list;
 
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use ratatui::crossterm::event;
 use tokio::sync::mpsc::{self, UnboundedSender};
 use wsg_core as _;
 
-use crate::app::{App, AppConfig, Msg};
+use crate::app::{App, Msg};
+use crate::runtime::Runtime;
 use crate::store::Store;
 
 #[cfg(feature = "test-support")]
@@ -151,24 +154,31 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     // Animation ticker -> Msg::Tick, driving the working-glyph bounce.
     spawn_animation_ticker(tx.clone());
 
+    let terminal: Arc<dyn terminal::Terminal> = Arc::from(Box::new(terminal::KittyTerminal::new(
+        &config.terminal,
+        config.agent_command(),
+    )) as Box<dyn terminal::Terminal>);
+    let runtime = Runtime::new(
+        tx.clone(),
+        repo_root.clone(),
+        config.forge,
+        Arc::clone(&terminal),
+    );
     let mut app = App::new(
         Store::load(&repo_root),
         initial_agents,
-        Box::new(terminal::KittyTerminal::new(
-            &config.terminal,
-            config.agent_command(),
-        )),
+        terminal,
         Box::new(jj::RealJj::new(repo_root.clone())),
-        AppConfig {
-            forge: config.forge,
-        },
         ui.world_pane,
         tx,
     );
-    // A persisted-on world pane needs its first graph load kicked off here (the
+    // A persisted-on world pane needs its first graph load requested here (the
     // load is otherwise only triggered by the toggle keys).
     app.set_idle_collapsed(ui.idle_collapsed);
     app.refresh_graph_if_visible();
+    for effect in app.take_effects() {
+        runtime.execute(effect);
+    }
 
     let (worker_tx, worker_rx) = mpsc::unbounded_channel::<()>();
     spawn_worker_pool_poller(app.workspace_dispatch_controller(), worker_rx);
@@ -178,6 +188,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         session.terminal_mut(),
         &mut rx,
         &mut app,
+        &runtime,
         work_tx,
         worker_tx,
     )
@@ -202,6 +213,7 @@ async fn event_loop(
     terminal: &mut tui::Tui,
     rx: &mut mpsc::UnboundedReceiver<Msg>,
     app: &mut App,
+    runtime: &Runtime,
     work_tx: UnboundedSender<()>,
     worker_tx: UnboundedSender<()>,
 ) -> anyhow::Result<()> {
@@ -224,13 +236,19 @@ async fn event_loop(
                 // otherwise the steady tick stream would repaint an idle TUI.
                 Msg::Tick => needs_redraw |= app.animate(),
                 input => {
-                    app.handle(input);
+                    let effects = app.handle(input);
+                    for effect in effects {
+                        runtime.execute(effect);
+                    }
                     needs_redraw = true;
                 }
             }
         }
         if needs_reload {
-            app.handle(Msg::Reload);
+            let effects = app.handle(Msg::Reload);
+            for effect in effects {
+                runtime.execute(effect);
+            }
             // A repo change may have altered the work state; nudge the poller so
             // the row refreshes without waiting for the next interval tick.
             let _ = work_tx.send(());
