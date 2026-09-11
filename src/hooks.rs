@@ -71,6 +71,9 @@ const MARKER: &str = "jjfx/events.jsonl";
 const PI_EXTENSION_SOURCE: &str = include_str!("../assets/pi/jjfx-lifecycle.ts");
 const PI_EXTENSION_MARKER: &str = "// jjfx-pi-lifecycle-extension:";
 const PI_EXTENSION_NAME: &str = "lifecycle extension";
+const OPENCODE_PLUGIN_SOURCE: &str = include_str!("../assets/opencode/jjfx-lifecycle.ts");
+const OPENCODE_PLUGIN_MARKER: &str = "// jjfx-opencode-lifecycle-plugin:";
+const OPENCODE_PLUGIN_NAME: &str = "lifecycle plugin";
 
 fn pi_extension_source() -> &'static str {
     PI_EXTENSION_SOURCE
@@ -113,10 +116,19 @@ fn pi_extension_path() -> PathBuf {
         .join("jjfx-lifecycle.ts")
 }
 
+fn opencode_plugin_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| home_dir().join(".config"))
+        .join("opencode/plugins/jjfx-lifecycle.ts")
+}
+
 struct IntegrationPaths {
     claude_settings: PathBuf,
     codex_hooks: PathBuf,
     pi_extension: PathBuf,
+    opencode_plugin: PathBuf,
 }
 
 impl IntegrationPaths {
@@ -125,6 +137,7 @@ impl IntegrationPaths {
             claude_settings: claude_settings_path(),
             codex_hooks: codex_hooks_path(),
             pi_extension: pi_extension_path(),
+            opencode_plugin: opencode_plugin_path(),
         }
     }
 }
@@ -189,7 +202,62 @@ fn install_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<InstallOut
         })
         .collect::<anyhow::Result<_>>()?;
     outcomes.push(install_pi_extension(&paths.pi_extension)?);
+    outcomes.push(install_opencode_plugin(&paths.opencode_plugin)?);
     Ok(outcomes)
+}
+
+fn install_opencode_plugin(path: &Path) -> anyhow::Result<InstallOutcome> {
+    install_owned_source(
+        path,
+        OPENCODE_PLUGIN_SOURCE,
+        OPENCODE_PLUGIN_MARKER,
+        "opencode",
+        OPENCODE_PLUGIN_NAME,
+    )
+}
+
+fn install_owned_source(
+    path: &Path,
+    source: &str,
+    marker: &str,
+    agent: &'static str,
+    name: &str,
+) -> anyhow::Result<InstallOutcome> {
+    let current = match fs::read_to_string(path) {
+        Ok(source) => Some(source),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    };
+    let (added, updated, already) = match current.as_deref() {
+        Some(existing) if existing == source => (Vec::new(), Vec::new(), vec![name.to_owned()]),
+        Some(existing) if existing.contains(marker) => {
+            (Vec::new(), vec![name.to_owned()], Vec::new())
+        }
+        Some(_) => bail!(
+            "refusing to overwrite non-jjfx OpenCode plugin at {}",
+            path.display()
+        ),
+        None => (vec![name.to_owned()], Vec::new(), Vec::new()),
+    };
+    if !already.is_empty() {
+        return Ok(InstallOutcome {
+            agent,
+            added,
+            updated,
+            already,
+        });
+    }
+    let directory = path
+        .parent()
+        .ok_or_else(|| anyhow!("OpenCode plugin path has no parent"))?;
+    fs::create_dir_all(directory)?;
+    fs::write(path, source)?;
+    Ok(InstallOutcome {
+        agent,
+        added,
+        updated,
+        already,
+    })
 }
 
 fn install_pi_extension(path: &Path) -> anyhow::Result<InstallOutcome> {
@@ -272,7 +340,32 @@ fn status_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<StatusRepor
         })
         .collect::<anyhow::Result<_>>()?;
     reports.push(pi_extension_status(&paths.pi_extension)?);
+    reports.push(opencode_plugin_status(&paths.opencode_plugin)?);
     Ok(reports)
+}
+
+fn opencode_plugin_status(path: &Path) -> anyhow::Result<StatusReport> {
+    let mut report = StatusReport {
+        agent: "opencode",
+        installed: Vec::new(),
+        missing: Vec::new(),
+        outdated: Vec::new(),
+        conflicting: Vec::new(),
+    };
+    match fs::read_to_string(path) {
+        Ok(source) if source == OPENCODE_PLUGIN_SOURCE => {
+            report.installed.push(OPENCODE_PLUGIN_NAME.to_owned())
+        }
+        Ok(source) if source.contains(OPENCODE_PLUGIN_MARKER) => {
+            report.outdated.push(OPENCODE_PLUGIN_NAME.to_owned())
+        }
+        Ok(_) => report.conflicting.push(OPENCODE_PLUGIN_NAME.to_owned()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            report.missing.push(OPENCODE_PLUGIN_NAME.to_owned())
+        }
+        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
+    }
+    Ok(report)
 }
 
 fn pi_extension_status(path: &Path) -> anyhow::Result<StatusReport> {
@@ -499,6 +592,24 @@ mod tests {
     }
 
     #[test]
+    fn opencode_plugin_emits_the_versioned_lifecycle_contract() {
+        for field in [
+            "jjfx_event_version",
+            "hook_event_name",
+            "agent_kind: \"opencode\"",
+            "session_id",
+            "cwd",
+        ] {
+            assert!(
+                OPENCODE_PLUGIN_SOURCE.contains(field),
+                "missing plugin field {field}"
+            );
+        }
+        assert!(OPENCODE_PLUGIN_SOURCE.contains("session.status"));
+        assert!(OPENCODE_PLUGIN_SOURCE.contains("permission.asked"));
+    }
+
+    #[test]
     fn pi_extension_install_is_idempotent_and_preserves_other_state() {
         let dir = tempfile::tempdir().unwrap();
         let pi_dir = dir.path().join("pi-agent");
@@ -506,6 +617,7 @@ mod tests {
             claude_settings: dir.path().join("claude/settings.json"),
             codex_hooks: dir.path().join("codex/hooks.json"),
             pi_extension: pi_dir.join("extensions/jjfx-lifecycle.ts"),
+            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
         };
         fs::create_dir_all(pi_dir.join("extensions")).unwrap();
         fs::write(pi_dir.join("settings.json"), "{\"theme\":\"custom\"}\n").unwrap();
@@ -581,6 +693,7 @@ mod tests {
             claude_settings: dir.path().join("claude/settings.json"),
             codex_hooks: dir.path().join("codex/hooks.json"),
             pi_extension: dir.path().join("pi-agent/extensions/jjfx-lifecycle.ts"),
+            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
         };
         install_with_paths(&paths).unwrap();
 
@@ -652,6 +765,7 @@ mod tests {
             claude_settings: home.join(".claude/settings.json"),
             codex_hooks: home.join(".codex/hooks.json"),
             pi_extension: pi_dir.join("extensions/jjfx-lifecycle.ts"),
+            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
         };
         install_with_paths(&paths).unwrap();
 
@@ -695,6 +809,7 @@ mod tests {
             claude_settings: dir.path().join("claude/settings.json"),
             codex_hooks: dir.path().join("codex/hooks.json"),
             pi_extension: dir.path().join("pi-agent/extensions/jjfx-lifecycle.ts"),
+            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
         };
         fs::create_dir_all(paths.pi_extension.parent().unwrap()).unwrap();
         fs::write(&paths.pi_extension, "export default () => {};\n").unwrap();

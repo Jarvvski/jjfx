@@ -199,6 +199,10 @@ impl AgentRuntimeQuery {
             AgentRuntime::Pi => {
                 command.arg(prompt);
             }
+            AgentRuntime::OpenCode => {
+                command.args(["run", "--format", "json"]);
+                command.arg(prompt);
+            }
         }
         command
     }
@@ -290,8 +294,23 @@ fn normalize_query_output(runtime: AgentRuntime, output: &str) -> Option<String>
         }
         AgentRuntime::Codex => codex_query_text(output).unwrap_or_else(|| output.to_owned()),
         AgentRuntime::Pi => output.to_owned(),
+        AgentRuntime::OpenCode => opencode_query_text(output).unwrap_or_else(|| output.to_owned()),
     };
     extract_json_object(&output).map(str::to_owned)
+}
+
+fn opencode_query_text(output: &str) -> Option<String> {
+    output
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+        .filter_map(|event| {
+            event
+                .pointer("/part/text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .rfind(|text| !text.trim().is_empty())
 }
 
 fn codex_query_text(output: &str) -> Option<String> {

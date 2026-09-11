@@ -7,6 +7,11 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-09-11 - Added OpenCode as a Worker Pool runtime with JSON Run logging,
+  session resume, Linear discovery, interactive workspace lifecycle tracking,
+  and an idempotently installed OpenCode lifecycle plugin (jjfx 0.46.0,
+  wsg 0.16.0).
+
 - 2026-09-01 - Workspace creation and removal now run repository-local
   `.jjfx/setup.sh` and `.jjfx/teardown.sh` hooks across CLI, TUI, and Worker
   Workspaces, with transactional setup and best-effort teardown (jjfx 0.45.0,

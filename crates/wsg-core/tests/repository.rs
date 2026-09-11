@@ -318,7 +318,8 @@ fn assert_workspace_directory_environment(
     let output = command.output().expect("workspace helper should run");
     assert!(
         output.status.success(),
-        "workspace helper failed: {}",
+        "workspace helper failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
@@ -343,7 +344,14 @@ fn uses_an_absolute_workspace_directory_from_environment() {
         .root()
         .parent()
         .expect("temporary repository should have a parent")
-        .join("absolute-workspaces");
+        .join(format!(
+            "absolute-workspaces-{}",
+            repository
+                .root()
+                .file_name()
+                .expect("temporary repository should have a name")
+                .to_string_lossy()
+        ));
     let expected = value.join("worker-env");
     assert_workspace_directory_environment(&value, &repository, expected);
 }

@@ -919,6 +919,10 @@ fn interactive_agent_command(
                 session,
             )?));
         }
+        (AgentRuntime::OpenCode, Some(session)) => {
+            format!("opencode --session {}; exec zsh", shell_quote(session))
+        }
+        (AgentRuntime::OpenCode, None) => "opencode; exec zsh".to_owned(),
     };
     Ok(command)
 }

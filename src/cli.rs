@@ -313,7 +313,7 @@ fn parse_pool_profile(args: &[String]) -> Result<Command> {
     let usage = concat!(
         "Usage: ",
         env!("CARGO_PKG_NAME"),
-        " pool profile <claude|codex|pi> [--provider PROVIDER] [--model MODEL]"
+        " pool profile <claude|codex|pi|opencode> [--provider PROVIDER] [--model MODEL]"
     );
     let Some(runtime) = args.first().filter(|value| !value.starts_with('-')) else {
         bail!(usage);
@@ -774,7 +774,7 @@ fn runtime_profile(
 ) -> Result<AgentRuntimeProfile> {
     let configured = WireAgent::new(runtime);
     let runtime = AgentRuntime::from_configured(Some(&configured)).map_err(|value| {
-        anyhow::anyhow!("invalid Agent Runtime {value:?} (expected claude, codex, or pi)")
+        anyhow::anyhow!("invalid Agent Runtime {value:?} (expected claude, codex, pi, or opencode)")
     })?;
     let mut profile = AgentRuntimeProfile::new(runtime);
     if let Some(selection) = selected_model(provider, model)? {
@@ -1407,7 +1407,7 @@ _wsg() {
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' ;;
         mount|m|reset|logs|log|rebase|rb|open-pr|pr) _arguments '1:worker:__wsg_workers' ;;
-        pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
+        pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;

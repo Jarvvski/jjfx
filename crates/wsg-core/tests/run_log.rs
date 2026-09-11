@@ -1361,3 +1361,30 @@ fn collaboration_preserves_participant_failure_context_without_allocating_worker
         &RunActivityKind::Collaboration(collaboration)
     );
 }
+
+#[test]
+fn opencode_json_events_preserve_activity_result_and_session_identity() {
+    let mut parser = RunLogParser::new(AgentRuntime::OpenCode);
+    let activity = parser
+        .parse_line(r#"{"type":"tool_use","sessionID":"ses_123","part":{"id":"tool_1","tool":"bash","state":{"status":"running","input":{"command":"jj st"}}}}"#)
+        .expect("OpenCode tool event should parse");
+    assert!(matches!(
+        activity.as_slice(),
+        [RunLogEvent::Activity(RunActivity { .. })]
+    ));
+    let result = parser
+        .parse_line(r#"{"type":"step_finish","sessionID":"ses_123","part":{}}"#)
+        .expect("OpenCode terminal event should parse");
+    assert!(result.is_empty());
+
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("worker.log");
+    fs::write(&path, r#"{"type":"step_start","sessionID":"ses_123"}"#)
+        .expect("Run log should be written");
+    assert_eq!(
+        resolve_agent_session_for_runtime(AgentRuntime::OpenCode, Some(&path)),
+        AgentSessionResolution::Resumed {
+            session_id: "ses_123".to_owned()
+        }
+    );
+}

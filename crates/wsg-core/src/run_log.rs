@@ -132,6 +132,9 @@ pub fn resolve_agent_session_for_runtime(
     runtime: AgentRuntime,
     prior_log: Option<&Path>,
 ) -> AgentSessionResolution {
+    if runtime == AgentRuntime::OpenCode {
+        return resolve_opencode_session(prior_log);
+    }
     if runtime != AgentRuntime::Pi {
         return resolve_agent_session(prior_log);
     }
@@ -207,6 +210,43 @@ pub fn resolve_agent_session_for_runtime(
         };
     }
 
+    AgentSessionResolution::Fresh {
+        reason: FreshSessionReason::MissingIdentity,
+    }
+}
+
+fn resolve_opencode_session(prior_log: Option<&Path>) -> AgentSessionResolution {
+    let Some(path) = prior_log.filter(|path| !path.as_os_str().is_empty()) else {
+        return AgentSessionResolution::Fresh {
+            reason: FreshSessionReason::NoPriorLog,
+        };
+    };
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
+        Err(source) => return unreadable_agent_session_log(path, source),
+    };
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            return AgentSessionResolution::Fresh {
+                reason: FreshSessionReason::UnreadableLog {
+                    path: path.to_path_buf(),
+                    detail: "failed reading OpenCode Run log".to_owned(),
+                },
+            };
+        };
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if let Some(session_id) = event
+            .get("sessionID")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            return AgentSessionResolution::Resumed {
+                session_id: session_id.to_owned(),
+            };
+        }
+    }
     AgentSessionResolution::Fresh {
         reason: FreshSessionReason::MissingIdentity,
     }
@@ -456,6 +496,7 @@ pub struct RunLogParser {
     runtime: AgentRuntime,
     claude_tools: HashMap<String, ClaudeToolCall>,
     pi_tools: HashMap<String, PiToolCall>,
+    opencode_tools: HashMap<String, OpenCodeToolCall>,
 }
 
 impl RunLogParser {
@@ -465,6 +506,7 @@ impl RunLogParser {
             runtime,
             claude_tools: HashMap::new(),
             pi_tools: HashMap::new(),
+            opencode_tools: HashMap::new(),
         }
     }
 
@@ -474,6 +516,7 @@ impl RunLogParser {
             AgentRuntime::Claude => parse_claude_line(line, &mut self.claude_tools),
             AgentRuntime::Codex => parse_codex_line(line),
             AgentRuntime::Pi => parse_pi_line(line, &mut self.pi_tools),
+            AgentRuntime::OpenCode => parse_opencode_line(line, &mut self.opencode_tools),
         }
     }
 }
@@ -648,6 +691,111 @@ struct PiCost {
 struct PiToolCall {
     name: String,
     detail: Option<String>,
+}
+
+#[derive(Debug)]
+struct OpenCodeToolCall {
+    name: String,
+    detail: Option<String>,
+}
+
+fn parse_opencode_line(
+    line: &str,
+    tools: &mut HashMap<String, OpenCodeToolCall>,
+) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+    let event: Value =
+        serde_json::from_str(line).map_err(|source| RunLogParseError::InvalidEvent {
+            runtime: AgentRuntime::OpenCode,
+            source,
+        })?;
+    let event_type = event
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    match event_type {
+        "text" | "reasoning" => event
+            .pointer("/part/text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| {
+                let kind = if event_type == "text" {
+                    RunActivityKind::Message {
+                        text: text.to_owned(),
+                    }
+                } else {
+                    RunActivityKind::Reasoning {
+                        text: text.to_owned(),
+                    }
+                };
+                vec![RunLogEvent::Activity(RunActivity::new(kind))]
+            })
+            .map_or_else(|| Ok(Vec::new()), Ok),
+        "tool_use" => parse_opencode_tool(&event, tools),
+        "error" => Ok(vec![RunLogEvent::Result(RunResult::failed(
+            event
+                .pointer("/error/data/message")
+                .or_else(|| event.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .unwrap_or("OpenCode session failure"),
+        ))]),
+        _ => Ok(Vec::new()),
+    }
+}
+
+fn parse_opencode_tool(
+    event: &Value,
+    tools: &mut HashMap<String, OpenCodeToolCall>,
+) -> Result<Vec<RunLogEvent>, RunLogParseError> {
+    let Some(part) = event.get("part") else {
+        return Ok(Vec::new());
+    };
+    let id = part.get("id").and_then(Value::as_str).unwrap_or_default();
+    let name = part.get("tool").and_then(Value::as_str).unwrap_or_default();
+    if name.is_empty() {
+        return Ok(Vec::new());
+    }
+    let detail = summarize_pi_value(part.pointer("/state/input"));
+    let status = part
+        .pointer("/state/status")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if status == "running" {
+        if !id.is_empty() {
+            tools.insert(
+                id.to_owned(),
+                OpenCodeToolCall {
+                    name: name.to_owned(),
+                    detail: detail.clone(),
+                },
+            );
+        }
+        return Ok(vec![RunLogEvent::Activity(RunActivity::new(
+            RunActivityKind::Tool {
+                name: name.to_owned(),
+                detail,
+                status: RunActivityStatus::InProgress,
+            },
+        ))]);
+    }
+    let prior = tools.remove(id);
+    let detail = summarize_pi_value(part.pointer("/state/output"))
+        .or_else(|| prior.as_ref().and_then(|tool| tool.detail.clone()))
+        .or(detail);
+    let name = prior.as_ref().map_or(name, |tool| &tool.name).to_owned();
+    let status = if status == "error" {
+        RunActivityStatus::Failed {
+            message: detail.clone(),
+        }
+    } else {
+        RunActivityStatus::Completed
+    };
+    Ok(vec![RunLogEvent::Activity(RunActivity::new(
+        RunActivityKind::Tool {
+            name,
+            detail,
+            status,
+        },
+    ))])
 }
 
 fn parse_pi_line(

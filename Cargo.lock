@@ -1801,7 +1801,7 @@ dependencies = [
 
 [[package]]
 name = "jjfx"
-version = "0.45.0"
+version = "0.46.0"
 dependencies = [
  "anyhow",
  "jiff",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "wsg"
-version = "0.15.0"
+version = "0.16.0"
 dependencies = [
  "anyhow",
  "jiff",

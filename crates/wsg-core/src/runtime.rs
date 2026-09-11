@@ -58,6 +58,8 @@ pub enum AgentRuntime {
     Codex,
     /// The Pi coding-agent runtime.
     Pi,
+    /// OpenCode's multi-provider coding-agent runtime.
+    OpenCode,
 }
 
 /// A provider-aware model selection supplied to an Agent Runtime.
@@ -110,6 +112,7 @@ impl From<String> for AgentModel {
 pub struct AgentRuntimeProfile {
     runtime: AgentRuntime,
     model: Option<AgentModel>,
+    agent: Option<String>,
 }
 
 impl AgentRuntimeProfile {
@@ -118,6 +121,7 @@ impl AgentRuntimeProfile {
         Self {
             runtime,
             model: None,
+            agent: None,
         }
     }
 
@@ -125,6 +129,17 @@ impl AgentRuntimeProfile {
     pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         self.model = Some(model.into());
         self
+    }
+
+    /// Selects a named provider-side agent, when the runtime supports one.
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
+        self
+    }
+
+    /// Returns the optional provider-side agent name.
+    pub fn agent(&self) -> Option<&str> {
+        self.agent.as_deref()
     }
 
     /// Reconstructs a compatible profile from persisted runtime, provider, and model fields.
@@ -166,6 +181,7 @@ impl AgentRuntimeProfile {
         Self {
             runtime,
             model: selection,
+            agent: None,
         }
     }
 
@@ -230,6 +246,7 @@ pub struct AgentRuntimeInvocation {
     session_id: Option<String>,
     session_directory: Option<PathBuf>,
     name: Option<String>,
+    agent: Option<String>,
     system_prompt: Option<String>,
     profile: AgentRuntimeInvocationProfile,
 }
@@ -244,6 +261,7 @@ impl AgentRuntimeInvocation {
             session_id: None,
             session_directory: None,
             name: None,
+            agent: None,
             system_prompt: None,
             profile: AgentRuntimeInvocationProfile::Standard,
         }
@@ -276,6 +294,12 @@ impl AgentRuntimeInvocation {
     /// Adds a display name for a fresh Agent Runtime invocation.
     pub fn with_name(mut self, name: impl Into<String>) -> Self {
         self.name = Some(name.into());
+        self
+    }
+
+    /// Selects a named provider-side agent.
+    pub fn with_agent(mut self, agent: impl Into<String>) -> Self {
+        self.agent = Some(agent.into());
         self
     }
 
@@ -667,8 +691,11 @@ impl RunCompletion {
             .root()
             .join(".jj/pool")
             .join(format!("{worker}.log"));
-        let (result, source) =
-            crate::run_log::result_for_finalization(&log_path, self.reservation.agent_runtime());
+        let (result, source) = result_for_completion(
+            &log_path,
+            self.reservation.agent_runtime(),
+            outcome.exit_code,
+        );
         self.reservation
             .finalize(self.revision, &result)
             .map_err(|source| RunSupervisorError::Finalize { worker, source })?;
@@ -702,13 +729,28 @@ impl BackgroundRun {
             return completion.finalize(outcome);
         }
         let (result, result_source) =
-            crate::run_log::result_for_finalization(&self.log_path, self.runtime);
+            result_for_completion(&self.log_path, self.runtime, outcome.exit_code);
         Ok(CompletedRun {
             process: outcome,
             result,
             result_source,
         })
     }
+}
+
+fn result_for_completion(
+    log_path: &Path,
+    runtime: AgentRuntime,
+    exit_code: Option<i32>,
+) -> (RunResult, RunResultSource) {
+    let result = crate::run_log::result_for_finalization(log_path, runtime);
+    if runtime == AgentRuntime::OpenCode
+        && exit_code == Some(0)
+        && matches!(result.1, RunResultSource::Fallback { .. })
+    {
+        return (RunResult::succeeded(), RunResultSource::Provider);
+    }
+    result
 }
 
 /// A reaped Run together with its provider-neutral terminal result.
@@ -1170,6 +1212,7 @@ impl AgentRuntime {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
             "pi" => Some(Self::Pi),
+            "opencode" => Some(Self::OpenCode),
             _ => None,
         }
     }
@@ -1184,6 +1227,7 @@ impl AgentRuntime {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
             "pi" => Ok(Self::Pi),
+            "opencode" => Ok(Self::OpenCode),
             _ => Err(configured.to_owned()),
         }
     }
@@ -1194,6 +1238,7 @@ impl AgentRuntime {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Pi => "pi",
+            Self::OpenCode => "opencode",
         }
     }
 
@@ -1210,6 +1255,7 @@ impl AgentRuntime {
             Self::Claude => Ok(claude_command(invocation, capabilities)),
             Self::Codex => Ok(codex_command(invocation, capabilities)),
             Self::Pi => pi_command(invocation),
+            Self::OpenCode => Ok(opencode_command(invocation)),
         }
     }
 
@@ -1266,6 +1312,7 @@ impl AgentRuntime {
             Self::Claude => (["--help"].as_slice(), Capability::ForwardSubagentText),
             Self::Codex => (["features", "list"].as_slice(), Capability::MultiAgent),
             Self::Pi => unreachable!("Pi probes through probe_pi"),
+            Self::OpenCode => (["--version"].as_slice(), Capability::ForwardSubagentText),
         };
         let output = Command::new(self.as_str())
             .args(arguments)
@@ -1675,6 +1722,48 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
     }
     command.arg(&prompt);
     Ok(command)
+}
+
+fn opencode_command(invocation: &AgentRuntimeInvocation) -> Command {
+    let (system_prompt, prompt) = invocation.session_prompts();
+    let mut command = Command::new(AgentRuntime::OpenCode.as_str());
+    command.args(["run", "--format", "json", "--auto"]);
+    if invocation.profile == AgentRuntimeInvocationProfile::TicketDelivery {
+        command.args(["--agent", "build"]);
+    }
+    if let Some(model) = invocation
+        .model
+        .as_ref()
+        .filter(|model| !model.model().is_empty())
+    {
+        let model = model.provider().map_or_else(
+            || model.model().to_owned(),
+            |provider| format!("{provider}/{}", model.model()),
+        );
+        command.args(["--model", &model]);
+    }
+    if let Some(session_id) = invocation
+        .session_id
+        .as_deref()
+        .filter(|session_id| !session_id.is_empty())
+    {
+        command.args(["--session", session_id]);
+    }
+    if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
+        command.args(["--title", name]);
+    }
+    if let Some(agent) = invocation
+        .agent
+        .as_deref()
+        .filter(|agent| !agent.is_empty())
+    {
+        command.args(["--agent", agent]);
+    }
+    let prompt = system_prompt.map_or(prompt.clone(), |system_prompt| {
+        format!("{system_prompt}\n\n{prompt}")
+    });
+    command.arg(prompt);
+    command
 }
 
 pub(crate) fn pi_interactive_command(

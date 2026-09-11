@@ -41,6 +41,8 @@ pub enum AgentKind {
     Codex,
     /// Pi coding agent.
     Pi,
+    /// OpenCode coding agent.
+    OpenCode,
 }
 
 impl AgentKind {
@@ -50,6 +52,7 @@ impl AgentKind {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
             AgentKind::Pi => "pi",
+            AgentKind::OpenCode => "opencode",
             AgentKind::Unknown => "agent",
         }
     }
@@ -60,6 +63,7 @@ impl AgentKind {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
             "pi" => AgentKind::Pi,
+            "opencode" => AgentKind::OpenCode,
             _ => AgentKind::Unknown,
         }
     }

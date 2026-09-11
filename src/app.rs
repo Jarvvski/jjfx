@@ -3678,6 +3678,8 @@ const CODEX_CYAN: Color = Color::Rgb(34, 211, 238);
 
 /// Pi's violet identity.
 const PI_VIOLET: Color = Color::Rgb(168, 85, 247);
+/// OpenCode's green identity.
+const OPENCODE_GREEN: Color = Color::Rgb(74, 222, 128);
 
 /// Each known agent's signature colour, worn while working. Unknown identity
 /// stays neutral instead of borrowing another provider's styling.
@@ -3686,6 +3688,7 @@ fn brand_color(kind: AgentKind) -> Color {
         AgentKind::Claude => CLAUDE_ORANGE,
         AgentKind::Codex => CODEX_CYAN,
         AgentKind::Pi => PI_VIOLET,
+        AgentKind::OpenCode => OPENCODE_GREEN,
         AgentKind::Unknown => Color::DarkGray,
     }
 }
@@ -3702,6 +3705,7 @@ fn working_frame(kind: AgentKind, tick: u64) -> char {
         }
         AgentKind::Codex => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
         AgentKind::Pi => PI_FRAMES[(tick % PI_FRAMES.len() as u64) as usize],
+        AgentKind::OpenCode => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
         AgentKind::Unknown => '?',
     }
 }
@@ -3727,6 +3731,7 @@ fn paused_glyph(kind: AgentKind) -> char {
         AgentKind::Claude => '✻',
         AgentKind::Codex => '\u{f02d9}', // 󰋙 hexagon_outline
         AgentKind::Pi => 'π',
+        AgentKind::OpenCode => 'O',
         AgentKind::Unknown => '?',
     }
 }
