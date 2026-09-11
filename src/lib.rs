@@ -3,7 +3,6 @@
 mod agent;
 mod app;
 mod attention;
-mod cache;
 mod cli;
 mod cmd;
 mod config;

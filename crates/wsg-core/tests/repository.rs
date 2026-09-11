@@ -147,6 +147,53 @@ fn workspaces_facade_exposes_compatible_paths_and_idempotent_add() {
 }
 
 #[test]
+fn refresh_preserves_cached_paths_for_ad_hoc_workspaces() {
+    let (_temporary_directory, repository) = local_repository();
+    let workspace = repository
+        .create_ad_hoc_workspace("feature")
+        .expect("ad hoc workspace should be created");
+    let root = repository.root();
+    assert_eq!(
+        workspace.path(),
+        root.with_file_name(format!(
+            "{}-feature",
+            root.file_name()
+                .expect("repository directory should have a name")
+                .to_string_lossy()
+        ))
+    );
+
+    let snapshot = repository
+        .workspaces()
+        .refresh()
+        .expect("refresh should succeed");
+    let entry = snapshot
+        .entries()
+        .iter()
+        .find(|entry| entry.name() == "feature")
+        .expect("refreshed projection should include the ad hoc workspace");
+    assert_eq!(entry.path(), workspace.path());
+
+    fs::remove_dir_all(workspace.path()).expect("ad hoc workspace should be removed");
+}
+
+#[test]
+fn projection_reads_without_writing_the_workspace_cache() {
+    let (temporary_directory, repository) = local_repository();
+    let cache = temporary_directory.path().join(".jj").join("ws-cache");
+    assert!(!cache.exists());
+
+    let snapshot = repository
+        .workspaces()
+        .projection()
+        .expect("projection should succeed");
+
+    assert!(!cache.exists(), "a read must not write the mirror");
+    assert_eq!(snapshot.entries().len(), 1);
+    assert_eq!(snapshot.entries()[0].name(), "default");
+}
+
+#[test]
 fn reports_missing_repository_with_typed_context() {
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
 

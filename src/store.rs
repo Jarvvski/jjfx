@@ -1,22 +1,20 @@
-//! The authoritative per-repo workspace store (ADR 0006).
+//! The per-repo Workspace projection for the TUI (ADR 0006).
 //!
-//! jjfx owns this model; `.jj/ws-cache` is a lossy mirror of it. The skeleton
-//! tracks only a workspace's name and path, so the model is held in memory and
-//! its sole persistent projection is the ws-cache. A separate on-disk store file
-//! is deferred until there is state the cache cannot hold (labels, pin order,
-//! forge history) - persisting only what cannot be derived, per ADR 0006.
+//! The projection is read through [`wsg_core::Workspaces`], so the TUI sees the
+//! same cache-backed Workspace model the CLI and Worker Pool operate on; the
+//! ws-cache is a lossy mirror and never the source of truth. This module keeps
+//! only the presentation facts: the default Workspace is always visible (ADR
+//! 0008), a Workspace whose directory is absent has no usable path, and the
+//! pending-deletion tombstone stays in memory until the runtime reports back.
 //!
-//! Existence of a workspace is the union of three sources: the always-derivable
-//! `default` (its path is the repo root), the names jj reports, and the
-//! `name\tpath` entries in the ws-cache. Paths come only from the ws-cache
-//! (and the derived default) because jj does not record them (spike 02).
+//! Existence of a Workspace is the union of the always-derivable `default`, the
+//! names jj reports, and the `name\tpath` entries in the ws-cache - a union
+//! [`wsg_core::Workspaces`] now owns.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use crate::{cache, jj};
 use wsg_core::{Repository, WorkspaceHookStream};
 
 #[cfg(test)]
@@ -44,9 +42,9 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
     repo.canonicalize().unwrap()
 }
 
-/// A single workspace. `path` is `None` when jj knows the workspace but the
-/// ws-cache has no path for it (e.g. created with bare `jj workspace add`, whose
-/// path the bash tools have not yet mirrored).
+/// A single workspace. `path` is `None` when no usable path is known: jj knows
+/// the workspace but the ws-cache has no path for it, or the projected path's
+/// directory is absent.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Workspace {
     pub(crate) name: String,
@@ -74,7 +72,7 @@ impl CreatedWorkspace {
     }
 }
 
-/// The reconciled, authoritative workspace list for one repo.
+/// The TUI's Workspace projection for one repo.
 #[derive(Debug, Clone)]
 pub(crate) struct Store {
     repo_root: PathBuf,
@@ -83,33 +81,58 @@ pub(crate) struct Store {
 
 pub(crate) const DEFAULT_WORKSPACE: &str = "default";
 
-/// Derive the on-disk path for a new named workspace: a sibling of the repo root
-/// named `<repo>-<name>`. jj does not record workspace paths (spike 02), so jjfx
-/// chooses this and persists it in the ws-cache (ADR 0006).
+/// Derive the on-disk path for a new ad hoc workspace. The rule lives in the
+/// shared library, next to the creation that uses it, so the pending tombstone
+/// and the real creation can never disagree.
 fn new_workspace_path(repo_root: &Path, name: &str) -> PathBuf {
-    let base = repo_root
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("repo");
-    let parent = repo_root.parent().unwrap_or(repo_root);
-    parent.join(format!("{base}-{name}"))
+    wsg_core::ad_hoc_workspace_path(repo_root, name)
 }
 
 impl Store {
-    /// Load and reconcile from all live sources (jj names + ws-cache + derived
-    /// default), then write the result through to the ws-cache so the bash tools
-    /// stay consistent.
+    /// Load the Workspace projection through the shared cache-backed model.
+    ///
+    /// The read never writes the mirror; `default` is guaranteed present with its
+    /// path pinned to the repository root (ADR 0008), every other entry keeps the
+    /// path the mirror holds, and a Workspace whose directory is absent projects
+    /// as pathless so the TUI will not target a working copy that is not there. A
+    /// broken repository degrades to just the default rather than crashing the TUI.
     pub(crate) fn load(repo_root: &Path) -> Self {
-        let jj_names = jj::workspace_names(repo_root);
-        let cache_entries = cache::read(&cache::path(repo_root)).unwrap_or_default();
-        let workspaces = reconcile(repo_root, &cache_entries, &jj_names);
-        let store = Store {
+        let entries = Repository::open(repo_root)
+            .ok()
+            .and_then(|repository| repository.workspaces().projection().ok())
+            .map(|snapshot| snapshot.entries().to_vec())
+            .unwrap_or_default();
+        let mut workspaces: Vec<Workspace> = entries
+            .into_iter()
+            .map(|entry| Workspace {
+                name: entry.name().to_owned(),
+                path: (!entry.is_missing()).then(|| entry.path().to_path_buf()),
+            })
+            .collect();
+        // The default Workspace is always visible, its path authoritative at the
+        // repository root (ADR 0008).
+        let root = repo_root.to_path_buf();
+        match workspaces
+            .iter_mut()
+            .find(|workspace| workspace.name == DEFAULT_WORKSPACE)
+        {
+            Some(default) => default.path = Some(root),
+            None => workspaces.insert(
+                0,
+                Workspace {
+                    name: DEFAULT_WORKSPACE.to_owned(),
+                    path: Some(root),
+                },
+            ),
+        }
+        workspaces.sort_by(|left, right| {
+            (left.name != DEFAULT_WORKSPACE, &left.name)
+                .cmp(&(right.name != DEFAULT_WORKSPACE, &right.name))
+        });
+        Store {
             repo_root: repo_root.to_path_buf(),
             workspaces,
-        };
-        // Best-effort write-through; a read-only repo must not crash the TUI.
-        let _ = store.write_through_cache();
-        store
+        }
     }
 
     /// The repository whose Workspace state this Store owns.
@@ -228,71 +251,37 @@ impl Store {
                 .cmp(&(right.name != DEFAULT_WORKSPACE, &right.name))
         });
     }
-
-    /// Mirror the path-bearing workspaces to `.jj/ws-cache` atomically. Workspaces
-    /// with no known path cannot be mirrored (the cache is `name\tpath`), so they
-    /// are dropped from the projection - the lossiness ADR 0006 describes.
-    fn write_through_cache(&self) -> std::io::Result<bool> {
-        let entries: Vec<(String, PathBuf)> = self
-            .workspaces
-            .iter()
-            .filter_map(|w| w.path.clone().map(|p| (w.name.clone(), p)))
-            .collect();
-        cache::write_through(&cache::path(&self.repo_root), &entries)
-    }
-}
-
-/// Pure reconciliation - no I/O, so it is unit-testable. `default` is always
-/// present with its path pinned to the repo root (authoritative, overriding any
-/// stale cache entry); ws-cache paths win over jj-only names; the result is
-/// ordered `default` first, then the rest alphabetically.
-fn reconcile(
-    repo_root: &Path,
-    cache_entries: &[(String, PathBuf)],
-    jj_names: &[String],
-) -> Vec<Workspace> {
-    let mut paths: BTreeMap<String, Option<PathBuf>> = BTreeMap::new();
-
-    for name in jj_names {
-        paths.entry(name.clone()).or_insert(None);
-    }
-    for (name, path) in cache_entries {
-        paths.insert(name.clone(), Some(path.clone()));
-    }
-    // The default workspace's path is the repo root, by definition.
-    paths.insert(DEFAULT_WORKSPACE.to_string(), Some(repo_root.to_path_buf()));
-
-    let mut out = Vec::with_capacity(paths.len());
-    if let Some(path) = paths.remove(DEFAULT_WORKSPACE) {
-        out.push(Workspace {
-            name: DEFAULT_WORKSPACE.to_string(),
-            path,
-        });
-    }
-    for (name, path) in paths {
-        out.push(Workspace { name, path });
-    }
-    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jj;
+
+    /// Write the compatible ws-cache byte format directly, as the bash tools do.
+    fn write_cache(repo: &Path, entries: &[(&str, &Path)]) {
+        let body: String = entries
+            .iter()
+            .map(|(name, path)| format!("{name}\t{}\n", path.display()))
+            .collect();
+        std::fs::write(repo.join(".jj").join("ws-cache"), body).unwrap();
+    }
 
     #[test]
     fn load_orders_cache_workspaces_and_pins_default_to_repo_root() {
         let repo = test_local_repo("load-cache");
         let alpha = repo.with_file_name("alpha-workspace");
         let zeta = repo.with_file_name("zeta-workspace");
-        cache::write_through(
-            &cache::path(&repo),
+        std::fs::create_dir_all(&alpha).unwrap();
+        std::fs::create_dir_all(&zeta).unwrap();
+        write_cache(
+            &repo,
             &[
-                ("zeta".to_string(), zeta),
-                (DEFAULT_WORKSPACE.to_string(), PathBuf::from("/stale/path")),
-                ("alpha".to_string(), alpha.clone()),
+                ("zeta", zeta.as_path()),
+                (DEFAULT_WORKSPACE, Path::new("/stale/path")),
+                ("alpha", alpha.as_path()),
             ],
-        )
-        .unwrap();
+        );
 
         let store = Store::load(&repo);
         let names: Vec<_> = store
@@ -311,6 +300,8 @@ mod tests {
             Some(alpha.as_path())
         );
 
+        std::fs::remove_dir_all(&alpha).unwrap();
+        std::fs::remove_dir_all(&zeta).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
 
@@ -326,6 +317,49 @@ mod tests {
 
         std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn store_projection_agrees_with_the_shared_workspace_projection() {
+        use std::collections::BTreeSet;
+        use wsg_core::WorkspaceAddOutcome;
+
+        let repo = test_local_repo("store-agrees");
+        let repository = Repository::open(&repo).unwrap();
+        let WorkspaceAddOutcome::Created(created) = repository
+            .workspaces()
+            .add("feature", None)
+            .expect("workspace should be added")
+        else {
+            panic!("workspace should be created");
+        };
+
+        let store = Store::load(&repo);
+        let shared = repository.workspaces().snapshot().unwrap();
+
+        let tui: BTreeSet<(String, Option<PathBuf>)> = store
+            .workspaces()
+            .iter()
+            .map(|workspace| (workspace.name.clone(), workspace.path.clone()))
+            .collect();
+        let cli: BTreeSet<(String, Option<PathBuf>)> = shared
+            .entries()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.name().to_owned(),
+                    (!entry.is_missing()).then(|| entry.path().to_path_buf()),
+                )
+            })
+            .collect();
+        assert_eq!(tui, cli);
+        assert_eq!(
+            store.workspace("feature").unwrap().path.as_deref(),
+            Some(created.path())
+        );
+
+        std::fs::remove_dir_all(created.path()).unwrap();
+        std::fs::remove_dir_all(&repo).unwrap();
     }
 
     #[test]
@@ -430,8 +464,10 @@ mod tests {
     fn create_survives_cache_projection_failure() {
         let repo = test_local_repo("create-cache-failure");
         let mut store = Store::load(&repo);
-        let cache_path = cache::path(&repo);
-        std::fs::remove_file(&cache_path).unwrap();
+        let cache_path = repo.join(".jj").join("ws-cache");
+        if cache_path.exists() {
+            std::fs::remove_file(&cache_path).unwrap();
+        }
         std::fs::create_dir(&cache_path).unwrap();
 
         let created = store.create("feat").unwrap();
@@ -450,14 +486,13 @@ mod tests {
         let repo = test_local_repo("delete-jj-failure");
         let path = new_workspace_path(&repo, "ghost");
         std::fs::create_dir(&path).unwrap();
-        cache::write_through(
-            &cache::path(&repo),
+        write_cache(
+            &repo,
             &[
-                (DEFAULT_WORKSPACE.to_string(), repo.clone()),
-                ("ghost".to_string(), path.clone()),
+                (DEFAULT_WORKSPACE, repo.as_path()),
+                ("ghost", path.as_path()),
             ],
-        )
-        .unwrap();
+        );
         let mut store = Store::load(&repo);
         let repo_state = repo.join(".jj").join("repo");
         let disabled_repo_state = repo.join(".jj").join("repo-disabled");

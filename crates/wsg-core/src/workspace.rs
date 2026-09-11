@@ -169,31 +169,49 @@ impl Workspaces {
         Ok(WorkspaceSnapshot { entries })
     }
 
-    /// Rebuilds the compatible Workspace cache from jj's live Workspace list.
-    pub fn refresh(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
+    /// Reads the current Workspace projection without writing the mirror.
+    ///
+    /// Existence is the union of jj's live Workspace names and the cache's
+    /// `name\tpath` entries (ADR 0006): a path already cached for a name is
+    /// preserved (jj does not record paths), a jj-only name falls back to the
+    /// naming convention, and a cache-only name keeps its cached path. The
+    /// default Workspace is always included and pinned to the repository root.
+    /// Use [`Workspaces::refresh`] to rebuild and persist the mirror.
+    pub fn projection(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
         let names = workspace_names(self.repository.root())
             .map_err(|error| AdHocWorkspaceError::new(error.message))?;
-        let mut entries = Vec::with_capacity(names.len() + 1);
-        let mut has_default = false;
+        let cached = read_cache(&cache_path(self.repository.root())).unwrap_or_default();
+        let mut entries = Vec::with_capacity(names.len() + cached.len() + 1);
+        let mut seen = std::collections::HashSet::new();
+        entries.push(WorkspaceEntry {
+            name: DEFAULT_WORKSPACE.to_owned(),
+            path: self.repository.root().to_path_buf(),
+        });
+        seen.insert(DEFAULT_WORKSPACE.to_owned());
         for name in names {
-            if name == DEFAULT_WORKSPACE {
-                has_default = true;
+            if !seen.insert(name.clone()) {
+                continue;
             }
-            entries.push(WorkspaceEntry {
-                path: self.path(&name),
-                name,
-            });
+            let path = cached
+                .iter()
+                .find(|(cached_name, _)| cached_name == &name)
+                .map(|(_, path)| path.clone())
+                .unwrap_or_else(|| self.path(&name));
+            entries.push(WorkspaceEntry { path, name });
         }
-        if !has_default {
-            entries.insert(
-                0,
-                WorkspaceEntry {
-                    name: DEFAULT_WORKSPACE.to_owned(),
-                    path: self.repository.root().to_path_buf(),
-                },
-            );
+        for (name, path) in cached {
+            if seen.insert(name.clone()) {
+                entries.push(WorkspaceEntry { path, name });
+            }
         }
-        let cache_entries = entries
+        Ok(WorkspaceSnapshot { entries })
+    }
+
+    /// Rebuilds the compatible Workspace cache from the live projection.
+    pub fn refresh(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
+        let snapshot = self.projection()?;
+        let cache_entries = snapshot
+            .entries
             .iter()
             .map(|entry| (entry.name.clone(), entry.path.clone()))
             .collect::<Vec<_>>();
@@ -201,7 +219,7 @@ impl Workspaces {
             write_cache(&cache_path(self.repository.root()), &cache_entries)
         })
         .map_err(|error| AdHocWorkspaceError::new(error.message))?;
-        Ok(WorkspaceSnapshot { entries })
+        Ok(snapshot)
     }
 
     /// Adds a Workspace, preserving the Go-compatible idempotent behavior.
@@ -404,7 +422,7 @@ where
         )));
     }
 
-    let path = ad_hoc_path(root, name);
+    let path = ad_hoc_workspace_path(root, name);
     add_workspace_with_revision(root, name, &path, revision)
         .map_err(|error| AdHocWorkspaceError::new(error.message))?;
     if let Err(error) = run_setup_hook(&path, on_output) {
@@ -435,7 +453,7 @@ pub(crate) fn remove_ad_hoc(
     let root = repository.root();
     let path = known_path
         .map(Path::to_path_buf)
-        .unwrap_or_else(|| ad_hoc_path(root, name));
+        .unwrap_or_else(|| ad_hoc_workspace_path(root, name));
     let mut failures = Vec::new();
     if path != root
         && path.is_dir()
@@ -462,7 +480,9 @@ pub(crate) fn remove_ad_hoc(
     }
 }
 
-fn ad_hoc_path(root: &Path, name: &str) -> PathBuf {
+/// The on-disk path for a new ad hoc Workspace before it exists: a jjfx-compatible
+/// sibling of the repository root, `<parent>/<repo>-<name>`.
+pub fn ad_hoc_workspace_path(root: &Path, name: &str) -> PathBuf {
     let base = root
         .file_name()
         .and_then(|value| value.to_str())

@@ -73,7 +73,7 @@ pub use worker_actions::{
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, CleanDecision, WorkerWorkspace, WorkerWorkspaceError,
     WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceHookStream,
-    WorkspaceSnapshot, Workspaces,
+    WorkspaceSnapshot, Workspaces, ad_hoc_workspace_path,
 };
 
 /// A Jujutsu repository discovered from a starting path.
