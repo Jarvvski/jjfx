@@ -5,6 +5,16 @@ version of record lives in the project manifest.
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-09-11 - The TUI now reads its Workspace list through the same
+  cache-backed projection as the CLI and Worker Pool, so a Workspace whose
+  directory is absent has no usable path: `jjfx --list` prints an empty path
+  and forge or terminal actions refuse it instead of targeting a missing
+  working copy. `wsg refresh` preserves cached ad-hoc Workspace paths instead
+  of rewriting them to the named-Workspace convention (jjfx 0.46.1,
+  wsg 0.16.1).
+
 ### Added
 
 - 2026-09-11 - Added OpenCode as a Worker Pool runtime with JSON Run logging,
