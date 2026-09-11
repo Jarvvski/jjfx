@@ -107,25 +107,75 @@ impl WorkState {
     }
 }
 
-/// Compute the [`Work`] snapshot for each named workspace. One `gh` call serves
-/// all workspaces; jj is queried per workspace. Runs blocking subprocesses, so
-/// call it from `spawn_blocking`.
-///
-/// Every workspace's chain is read up front so each commit can be attributed to
-/// at most one workspace before classifying: a commit several workspaces share
-/// (a common base they are all stacked on) must not make each of them look
-/// dirty/pushed or claim the same PR - only the workspace that uniquely *heads*
-/// that commit owns it, and a base nobody uniquely heads is owned by none.
-pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work> {
-    let prs = crate::jj::derive_repo_slug(repo_root)
-        .ok()
-        .flatten()
-        .map(|slug| crate::prs::list(&slug))
-        .unwrap_or_default();
+/// The read port behind the Work snapshot: the jj and gh facts classification
+/// needs. Classification runs through the same interface callers use, so a test
+/// adapter substitutes exactly the facts that vary in production.
+pub(crate) trait WorkReads {
+    /// Every PR reported for the repository, in one read.
+    fn pull_requests(&self) -> Vec<crate::prs::Pr>;
+    /// One Workspace's own change chain (`trunk..<ws>@`), tip first. `None` on a
+    /// read failure, rendered as [`WorkState::Unknown`].
+    fn chain(&self, workspace: &str) -> Option<Chain>;
+    /// How far trunk has advanced past the Workspace's base.
+    fn behind(&self, workspace: &str) -> u32;
+    /// Insertions/deletions from the base of the owned line to the Workspace's
+    /// `@`. `base` is the deepest owned commit's change id, or `None` when the
+    /// line reaches the trunk revset itself.
+    fn line_delta(&self, workspace: &str, base: Option<&str>) -> Option<(u32, u32)>;
+}
+
+/// The production adapter: jj CLI reads plus one `gh pr list` (ADR 0007).
+pub(crate) struct SystemWorkReads {
+    repo_root: std::path::PathBuf,
+}
+
+impl SystemWorkReads {
+    /// Bind the port to one repository root.
+    pub(crate) fn new(repo_root: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            repo_root: repo_root.into(),
+        }
+    }
+}
+
+impl WorkReads for SystemWorkReads {
+    fn pull_requests(&self) -> Vec<crate::prs::Pr> {
+        crate::jj::derive_repo_slug(&self.repo_root)
+            .ok()
+            .flatten()
+            .map(|slug| crate::prs::list(&slug))
+            .unwrap_or_default()
+    }
+
+    fn chain(&self, workspace: &str) -> Option<Chain> {
+        read_chain(&self.repo_root, workspace)
+    }
+
+    fn behind(&self, workspace: &str) -> u32 {
+        behind(&self.repo_root, workspace)
+    }
+
+    fn line_delta(&self, workspace: &str, base: Option<&str>) -> Option<(u32, u32)> {
+        let from = base
+            .map(|change_id| format!("{change_id}-"))
+            .unwrap_or_else(crate::trunk::as_revset);
+        diff_loc(&self.repo_root, &from, workspace)
+    }
+}
+
+/// Compute the [`Work`] snapshot for each named workspace through the read port.
+/// One PR read serves all workspaces; chains are read up front so each commit can
+/// be attributed to at most one workspace before classifying: a commit several
+/// workspaces share (a common base they are all stacked on) must not make each of
+/// them look dirty/pushed or claim the same PR - only the workspace that uniquely
+/// *heads* that commit owns it, and a base nobody uniquely heads is owned by
+/// none.
+pub fn snapshot(reads: &dyn WorkReads, workspaces: &[String]) -> HashMap<String, Work> {
+    let prs = reads.pull_requests();
 
     let chains: Vec<(String, Option<Chain>)> = workspaces
         .iter()
-        .map(|name| (name.clone(), read_chain(repo_root, name)))
+        .map(|name| (name.clone(), reads.chain(name)))
         .collect();
     let ownership = Ownership::compute(&chains);
 
@@ -140,12 +190,12 @@ pub fn snapshot(repo_root: &Path, workspaces: &[String]) -> HashMap<String, Work
                         .iter()
                         .filter(|c| ownership.owns(name, c))
                         .collect();
-                    classify(repo_root, name, &owned, &prs)
+                    classify(reads, name, &owned, &prs)
                 }
             };
             let work = Work {
                 state,
-                behind: behind(repo_root, name),
+                behind: reads.behind(name),
             };
             (name.clone(), work)
         })
@@ -230,7 +280,7 @@ fn behind(repo_root: &Path, ws: &str) -> u32 {
 /// derive the state from jj facts. `owned` is the workspace's own commits (a
 /// shared base is already filtered out by [`Ownership`]).
 fn classify(
-    repo_root: &Path,
+    reads: &dyn WorkReads,
     ws: &str,
     owned: &[&ChainCommit],
     prs: &[crate::prs::Pr],
@@ -239,11 +289,8 @@ fn classify(
         // Fill in the line delta, measured from the base of the owned line (its
         // deepest owned commit's parent) so a shared ancestor's diff is excluded.
         WorkState::Dirty { .. } => {
-            let from = owned
-                .last()
-                .map(|c| format!("{}-", c.change_id))
-                .unwrap_or_else(crate::trunk::as_revset);
-            let (added, removed) = diff_loc(repo_root, &from, ws).unwrap_or((0, 0));
+            let base = owned.last().map(|c| c.change_id.as_str());
+            let (added, removed) = reads.line_delta(ws, base).unwrap_or((0, 0));
             WorkState::Dirty { added, removed }
         }
         other => other,
@@ -327,7 +374,8 @@ fn pr_matches_commit(pr: &crate::prs::Pr, commit: &ChainCommit) -> bool {
 }
 
 /// One commit on a workspace's own change chain (`trunk..<ws>@`).
-struct ChainCommit {
+#[derive(Debug, Clone)]
+pub(crate) struct ChainCommit {
     /// The commit's change id (full, for cross-workspace ownership comparison).
     change_id: String,
     /// The commit is empty (no content of its own beyond its parent).
@@ -344,7 +392,8 @@ struct ChainCommit {
 }
 
 /// A workspace's own change chain (`trunk..<ws>@`), tip first.
-struct Chain {
+#[derive(Debug, Clone)]
+pub(crate) struct Chain {
     commits: Vec<ChainCommit>,
 }
 
@@ -741,6 +790,138 @@ mod tests {
             WorkState::PrOpen {
                 number: 20,
                 verdict: ReviewVerdict::None,
+            }
+        );
+    }
+
+    /// A read port programmed with the jj/gh facts one scenario needs, so the
+    /// classification runs through the same interface production does.
+    #[derive(Default)]
+    struct FakeWorkReads {
+        prs: Vec<crate::prs::Pr>,
+        chains: HashMap<String, Option<Chain>>,
+        behind: HashMap<String, u32>,
+        deltas: HashMap<String, (u32, u32)>,
+        /// When set, `line_delta` answers only for this base change id.
+        delta_base: Option<String>,
+    }
+
+    impl WorkReads for FakeWorkReads {
+        fn pull_requests(&self) -> Vec<crate::prs::Pr> {
+            self.prs.clone()
+        }
+
+        fn chain(&self, workspace: &str) -> Option<Chain> {
+            self.chains.get(workspace).cloned().unwrap_or(None)
+        }
+
+        fn behind(&self, workspace: &str) -> u32 {
+            self.behind.get(workspace).copied().unwrap_or(0)
+        }
+
+        fn line_delta(&self, workspace: &str, base: Option<&str>) -> Option<(u32, u32)> {
+            if self.delta_base.as_deref() != base {
+                return None;
+            }
+            self.deltas.get(workspace).copied()
+        }
+    }
+
+    fn chain(commits: Vec<ChainCommit>) -> Option<Chain> {
+        Some(Chain { commits })
+    }
+
+    #[test]
+    fn snapshot_classifies_every_workspace_through_the_read_port() {
+        let fake = FakeWorkReads {
+            chains: HashMap::from([
+                (
+                    "clean".to_string(),
+                    chain(vec![cc("c", true, &[], false, true)]),
+                ),
+                (
+                    "dirty".to_string(),
+                    chain(vec![cc("d", false, &[], false, true)]),
+                ),
+            ]),
+            behind: HashMap::from([("dirty".to_string(), 4)]),
+            deltas: HashMap::from([("dirty".to_string(), (3, 1))]),
+            delta_base: Some("d".to_string()),
+            ..FakeWorkReads::default()
+        };
+
+        let work = snapshot(&fake, &["clean".to_string(), "dirty".to_string()]);
+
+        assert_eq!(
+            work["clean"],
+            Work {
+                state: WorkState::Clean,
+                behind: 0,
+            }
+        );
+        assert_eq!(
+            work["dirty"],
+            Work {
+                state: WorkState::Dirty {
+                    added: 3,
+                    removed: 1,
+                },
+                behind: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_degrades_to_unknown_when_a_chain_read_fails() {
+        let fake = FakeWorkReads::default();
+        let work = snapshot(&fake, &["gone".to_string()]);
+        assert_eq!(work["gone"].state, WorkState::Unknown);
+    }
+
+    #[test]
+    fn snapshot_matches_an_open_pull_request_by_bookmark_through_the_read_port() {
+        let fake = FakeWorkReads {
+            prs: vec![reviewed_pr(12, "feat-br", "APPROVED")],
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![cc("tip", false, &["feat-br"], true, true)]),
+            )]),
+            ..FakeWorkReads::default()
+        };
+
+        let work = snapshot(&fake, &["feat".to_string()]);
+
+        assert_eq!(
+            work["feat"].state,
+            WorkState::PrOpen {
+                number: 12,
+                verdict: ReviewVerdict::Approved,
+            }
+        );
+    }
+
+    #[test]
+    fn snapshot_measures_the_line_delta_from_the_deepest_owned_commit() {
+        let fake = FakeWorkReads {
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![
+                    cc("tip", false, &[], false, true),
+                    cc("base", false, &[], false, true),
+                ]),
+            )]),
+            deltas: HashMap::from([("feat".to_string(), (7, 2))]),
+            delta_base: Some("base".to_string()),
+            ..FakeWorkReads::default()
+        };
+
+        let work = snapshot(&fake, &["feat".to_string()]);
+
+        assert_eq!(
+            work["feat"].state,
+            WorkState::Dirty {
+                added: 7,
+                removed: 2,
             }
         );
     }

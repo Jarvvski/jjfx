@@ -283,7 +283,7 @@ fn spawn_work_poller(
                 if !names.iter().any(|n| n == store::DEFAULT_WORKSPACE) {
                     names.push(store::DEFAULT_WORKSPACE.to_string());
                 }
-                work::snapshot(&root, &names)
+                work::snapshot(&work::SystemWorkReads::new(root), &names)
             })
             .await;
             if let Ok(snapshot) = snapshot
