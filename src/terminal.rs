@@ -16,9 +16,12 @@ use std::time::Duration;
 
 use anyhow::{Context, anyhow};
 use serde_json::Value;
+use wsg_core::{PaneLayout, PaneRole, SplitLocation};
 
 use crate::cmd::cmd;
 use crate::config::TerminalConfig;
+use crate::display;
+use crate::layout::LayoutSettings;
 
 /// Tab-title prefix that marks (and locates) a workspace's tab.
 const TAB_PREFIX: &str = "jjfx:";
@@ -84,14 +87,61 @@ fn focus_window_args(window_id: &str) -> Vec<String> {
     ]
 }
 
+/// One step in building a tab. Pane references are layout indices; the executor
+/// replaces them with the live kitty window ids as panes open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OpenStep {
+    /// Launch the tab's own pane (pane 0 of the layout).
+    LaunchTab { command: Vec<String> },
+    /// Force kitty's splits layout, required before a biased split.
+    ForceSplits,
+    /// Split the pane at `anchor`; a missing `location` (only possible in an
+    /// unvalidated plan) records a pane that never opened.
+    Split {
+        anchor: usize,
+        location: Option<SplitLocation>,
+        bias: u8,
+        command: Vec<String>,
+    },
+    /// Focus the pane at `pane` after the tab is built.
+    Focus { pane: usize },
+}
+
+/// Map a layout to the ordered steps that build it. Split out from
+/// [`KittyTerminal::open`] so the layout-to-invocation mapping is unit-testable
+/// without a running kitty.
+fn open_steps(layout: &PaneLayout, command_for: impl Fn(PaneRole) -> Vec<String>) -> Vec<OpenStep> {
+    let mut steps = Vec::with_capacity(layout.panes.len() + 2);
+    for (index, pane) in layout.panes.iter().enumerate() {
+        let command = command_for(pane.role);
+        if index == 0 {
+            steps.push(OpenStep::LaunchTab { command });
+            if layout.panes.len() > 1 {
+                // `--bias` is only a percentage under the splits layout.
+                steps.push(OpenStep::ForceSplits);
+            }
+            continue;
+        }
+        steps.push(OpenStep::Split {
+            anchor: pane.from,
+            location: pane.location,
+            bias: pane.bias,
+            command,
+        });
+    }
+    steps.push(OpenStep::Focus {
+        pane: layout.focus_pane(),
+    });
+    steps
+}
+
 /// A terminal multiplexer jjfx drives to host workspace tabs.
 pub trait Terminal: Send + Sync {
     /// Is a tab for this workspace currently open?
     fn is_open(&self, name: &str) -> bool;
-    /// Open a tab for the workspace rooted at `path`: a shell column on the
-    /// left, split into two stacked shells - the top one running the configured
-    /// first-pane command when set - and the agent filling the rest. `focus`
-    /// lands on the agent pane; otherwise the tab is built without the target
+    /// Open a tab for the workspace rooted at `path` using the layout selected
+    /// for the current display. `focus` lands on the layout's focus pane (the
+    /// agent when it has one); otherwise the tab is built without the target
     /// taking focus.
     fn open(&self, name: &str, path: &Path, focus: bool) -> anyhow::Result<()>;
     /// Focus the workspace's existing tab.
@@ -123,6 +173,10 @@ pub struct KittyTerminal {
     /// through the login interactive shell. Empty leaves that pane a plain
     /// shell.
     first_pane_command: Vec<String>,
+    /// The named layouts and display mapping from config, plus the
+    /// `JJFX_LAYOUT` override. Resolved per open so a display change is picked
+    /// up without restarting.
+    layout: LayoutSettings,
 }
 
 /// How long to wait for a freshly-launched target to expose its socket, and how
@@ -145,6 +199,7 @@ impl KittyTerminal {
             launch_command: cfg.launch_command.clone(),
             agent_command,
             first_pane_command,
+            layout: LayoutSettings::from_config(cfg),
         }
     }
 
@@ -222,6 +277,16 @@ impl KittyTerminal {
     fn launch<S: AsRef<str>>(&self, args: &[S]) -> anyhow::Result<String> {
         Ok(self.run(args)?.trim().to_string())
     }
+
+    /// The command for a pane role: the configured first-pane command, the
+    /// agent command, or nothing (kitty's default shell).
+    fn pane_command(&self, role: PaneRole) -> &[String] {
+        match role {
+            PaneRole::First => &self.first_pane_command,
+            PaneRole::Agent => &self.agent_command,
+            PaneRole::Shell => &[],
+        }
+    }
 }
 
 impl Terminal for KittyTerminal {
@@ -243,50 +308,60 @@ impl Terminal for KittyTerminal {
         // first if it is configured but not yet running.
         self.ensure_ready()?;
 
+        let layout = self.layout.resolve(display::attached_condition())?;
         let title = tab_title(name);
         let cwd = path.to_string_lossy();
         let cwd_arg = format!("--cwd={cwd}");
 
-        // Start with the top-left pane - a plain shell, or the configured
-        // first-pane command - then force the tab into kitty's splits layout
-        // before adding the agent pane and the second shell.
-        let top_shell_id = self.launch(&new_shell_tab_args(
-            &title,
-            &cwd_arg,
-            focus,
-            &self.first_pane_command,
-        ))?;
-        if top_shell_id.is_empty() {
-            return Ok(()); // tab exists but there is no id to anchor splits to
+        // Window ids stay aligned with layout pane indices: a pane that fails
+        // to open records `None`, and panes anchored to it are skipped.
+        let mut windows: Vec<Option<String>> = Vec::with_capacity(layout.panes.len());
+        for step in open_steps(layout, |role| self.pane_command(role).to_vec()) {
+            match step {
+                OpenStep::LaunchTab { command } => {
+                    let id = self.launch(&new_shell_tab_args(&title, &cwd_arg, focus, &command))?;
+                    if id.is_empty() {
+                        // The tab exists but has no id to anchor splits to.
+                        return Ok(());
+                    }
+                    windows.push(Some(id));
+                }
+                OpenStep::ForceSplits => {
+                    if let Some(Some(tab)) = windows.first() {
+                        self.run(&splits_layout_args(tab))?;
+                    }
+                }
+                OpenStep::Split {
+                    anchor,
+                    location,
+                    bias,
+                    command,
+                } => {
+                    let anchor = windows.get(anchor).and_then(Option::as_deref);
+                    let Some((anchor, location)) = anchor.zip(location) else {
+                        windows.push(None);
+                        continue;
+                    };
+                    let id = self.launch(&split_args(
+                        anchor,
+                        location.as_kitty_value(),
+                        bias,
+                        &cwd_arg,
+                        focus,
+                        &command,
+                    ))?;
+                    windows.push(if id.is_empty() { None } else { Some(id) });
+                }
+                OpenStep::Focus { pane } => {
+                    if !focus {
+                        continue;
+                    }
+                    if let Some(id) = windows.get(pane).and_then(Option::as_deref) {
+                        self.run(&focus_window_args(id))?;
+                    }
+                }
+            }
         }
-        self.run(&splits_layout_args(&top_shell_id))?;
-
-        // The new vertical split receives 81% of the width, leaving the shell
-        // column the measured 19%.
-        let agent_id = self.launch(&split_args(
-            &top_shell_id,
-            "vsplit",
-            81,
-            &cwd_arg,
-            focus,
-            &self.agent_command,
-        ))?;
-        if agent_id.is_empty() {
-            return Ok(()); // agent exists but there is no id to anchor focus on
-        }
-
-        // Split the left column into two evenly stacked shells.
-        self.run(&split_args(
-            &top_shell_id,
-            "hsplit",
-            50,
-            &cwd_arg,
-            focus,
-            &[],
-        ))?;
-
-        // Land on the agent pane (kitty otherwise focuses the last-created one).
-        self.run(&focus_window_args(&agent_id))?;
         Ok(())
     }
 
@@ -392,6 +467,7 @@ fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wsg_core::PanePlacement;
 
     #[test]
     fn tab_title_is_prefixed() {
@@ -420,6 +496,156 @@ mod tests {
                 "--match",
                 "title:^x$"
             ],
+        );
+    }
+
+    /// The command roles used by the layout tests, so the assertions below name
+    /// the roles rather than repeating the vectors.
+    fn role_command(role: PaneRole) -> Vec<String> {
+        match role {
+            PaneRole::First => vec!["dev-server".to_string()],
+            PaneRole::Agent => vec!["pi".to_string()],
+            PaneRole::Shell => Vec::new(),
+        }
+    }
+
+    fn pane(
+        role: PaneRole,
+        from: usize,
+        location: Option<SplitLocation>,
+        bias: u8,
+    ) -> PanePlacement {
+        PanePlacement {
+            role,
+            from,
+            location,
+            bias,
+        }
+    }
+
+    #[test]
+    fn builtin_layout_builds_the_tab_then_biased_splits_then_focus() {
+        let steps = open_steps(&PaneLayout::builtin(), role_command);
+        assert_eq!(
+            steps,
+            vec![
+                OpenStep::LaunchTab {
+                    command: vec!["dev-server".to_string()],
+                },
+                OpenStep::ForceSplits,
+                OpenStep::Split {
+                    anchor: 0,
+                    location: Some(SplitLocation::Vsplit),
+                    bias: 81,
+                    command: vec!["pi".to_string()],
+                },
+                OpenStep::Split {
+                    anchor: 0,
+                    location: Some(SplitLocation::Hsplit),
+                    bias: 50,
+                    command: Vec::new(),
+                },
+                OpenStep::Focus { pane: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_wider_left_column_changes_only_the_agent_bias() {
+        let layout = PaneLayout {
+            panes: vec![
+                pane(PaneRole::First, 0, None, 50),
+                pane(PaneRole::Agent, 0, Some(SplitLocation::Vsplit), 70),
+                pane(PaneRole::Shell, 0, Some(SplitLocation::Hsplit), 50),
+            ],
+        };
+        let steps = open_steps(&layout, role_command);
+        assert_eq!(
+            steps,
+            vec![
+                OpenStep::LaunchTab {
+                    command: vec!["dev-server".to_string()],
+                },
+                OpenStep::ForceSplits,
+                OpenStep::Split {
+                    anchor: 0,
+                    location: Some(SplitLocation::Vsplit),
+                    bias: 70,
+                    command: vec!["pi".to_string()],
+                },
+                OpenStep::Split {
+                    anchor: 0,
+                    location: Some(SplitLocation::Hsplit),
+                    bias: 50,
+                    command: Vec::new(),
+                },
+                OpenStep::Focus { pane: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_pane_layout_launches_only_the_tab() {
+        let layout = PaneLayout {
+            panes: vec![pane(PaneRole::Agent, 0, None, 50)],
+        };
+        // No splits means no splits layout to force.
+        assert_eq!(
+            open_steps(&layout, role_command),
+            vec![
+                OpenStep::LaunchTab {
+                    command: vec!["pi".to_string()],
+                },
+                OpenStep::Focus { pane: 0 },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_anchors_and_focus_follow_the_plan() {
+        let layout = PaneLayout {
+            panes: vec![
+                pane(PaneRole::First, 0, None, 50),
+                pane(PaneRole::Agent, 0, Some(SplitLocation::Vsplit), 81),
+                pane(PaneRole::Shell, 1, Some(SplitLocation::Hsplit), 50),
+            ],
+        };
+        let steps = open_steps(&layout, role_command);
+        assert_eq!(
+            steps,
+            vec![
+                OpenStep::LaunchTab {
+                    command: vec!["dev-server".to_string()],
+                },
+                OpenStep::ForceSplits,
+                OpenStep::Split {
+                    anchor: 0,
+                    location: Some(SplitLocation::Vsplit),
+                    bias: 81,
+                    command: vec!["pi".to_string()],
+                },
+                OpenStep::Split {
+                    anchor: 1,
+                    location: Some(SplitLocation::Hsplit),
+                    bias: 50,
+                    command: Vec::new(),
+                },
+                OpenStep::Focus { pane: 1 },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_plan_without_an_agent_focuses_its_first_pane() {
+        let layout = PaneLayout {
+            panes: vec![
+                pane(PaneRole::First, 0, None, 50),
+                pane(PaneRole::Shell, 0, Some(SplitLocation::Vsplit), 50),
+            ],
+        };
+        assert_eq!(
+            open_steps(&layout, role_command).last(),
+            Some(&OpenStep::Focus { pane: 0 })
         );
     }
 

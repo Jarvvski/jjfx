@@ -3,11 +3,13 @@
 //! jjfx itself owns. Absent file -> defaults; malformed file -> a startup error
 //! surfaced before the TUI takes over the screen.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
 use anyhow::Context;
 use serde::Deserialize;
+use wsg_core::PaneLayout;
 
 /// The whole jjfx config tree.
 #[derive(Debug, Default, Deserialize)]
@@ -46,6 +48,36 @@ impl Config {
             .filter(|command| !command.is_empty())
             .map(|command| login_shell_command(&format!("{command}; exec \"$SHELL\"")))
             .unwrap_or_default()
+    }
+
+    /// Reject layouts and display mappings that cannot be built, so a bad
+    /// config fails here rather than when a tab opens.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, layout) in &self.terminal.layouts {
+            layout
+                .validate()
+                .map_err(|error| anyhow::anyhow!("terminal.layouts.{name}: {error}"))?;
+        }
+        for (condition, name) in [
+            ("laptop", self.terminal.layout_by_display.laptop.as_deref()),
+            (
+                "external",
+                self.terminal.layout_by_display.external.as_deref(),
+            ),
+            (
+                "default",
+                self.terminal.layout_by_display.fallback.as_deref(),
+            ),
+        ] {
+            if let Some(name) = name
+                && !self.terminal.layouts.contains_key(name)
+            {
+                anyhow::bail!(
+                    "terminal.layout_by_display.{condition} names unknown layout `{name}`"
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -133,6 +165,26 @@ pub struct TerminalConfig {
     /// left pane and the agent pane are unaffected.
     #[serde(default)]
     pub first_pane_command: Option<String>,
+    /// Named pane layouts opened tabs can use, keyed by name.
+    #[serde(default)]
+    pub layouts: BTreeMap<String, PaneLayout>,
+    /// Which named layout jjfx builds for each display condition.
+    #[serde(default)]
+    pub layout_by_display: DisplayLayouts,
+}
+
+/// Which named layout jjfx builds for each display condition. An unmapped
+/// condition falls back to `default`, then to the built-in layout.
+#[derive(Debug, Default, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DisplayLayouts {
+    /// Used when only the built-in display is attached.
+    pub laptop: Option<String>,
+    /// Used when at least one external display is attached.
+    pub external: Option<String>,
+    /// Used when detection is unavailable or a condition has no entry.
+    #[serde(rename = "default")]
+    pub fallback: Option<String>,
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml` - the same XDG convention as
@@ -163,7 +215,12 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Config::default()),
         Err(e) => return Err(e).with_context(|| format!("reading config {}", path.display())),
     };
-    toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))
+    let config: Config =
+        toml::from_str(&text).with_context(|| format!("parsing config {}", path.display()))?;
+    config
+        .validate()
+        .with_context(|| format!("validating config {}", path.display()))?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -176,10 +233,125 @@ mod tests {
         assert!(cfg.terminal.listen_on.is_none());
         assert!(cfg.terminal.launch_command.is_empty());
         assert!(cfg.terminal.first_pane_command.is_none());
+        assert!(cfg.terminal.layouts.is_empty());
+        assert!(cfg.terminal.layout_by_display.laptop.is_none());
+        assert!(cfg.terminal.layout_by_display.external.is_none());
+        assert!(cfg.terminal.layout_by_display.fallback.is_none());
         assert_eq!(cfg.agent.command, "claude");
         // Forge PR management is on-by-default, drafts on-by-default.
         assert!(cfg.forge.pull_requests);
         assert!(cfg.forge.draft);
+    }
+
+    #[test]
+    fn layouts_and_their_display_mapping_parse_and_validate() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [terminal.layout_by_display]
+            laptop = "narrow"
+            external = "wide"
+            default = "wide"
+
+            [terminal.layouts.wide]
+            [[terminal.layouts.wide.panes]]
+            role = "first"
+            [[terminal.layouts.wide.panes]]
+            role = "agent"
+            location = "vsplit"
+            bias = 81
+            [[terminal.layouts.wide.panes]]
+            role = "shell"
+            location = "hsplit"
+
+            [terminal.layouts.narrow]
+            [[terminal.layouts.narrow.panes]]
+            role = "first"
+            [[terminal.layouts.narrow.panes]]
+            role = "agent"
+            location = "vsplit"
+            bias = 70
+            [[terminal.layouts.narrow.panes]]
+            role = "shell"
+            location = "hsplit"
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.terminal.layouts["wide"].panes[1].bias, 81);
+        assert_eq!(cfg.terminal.layouts["narrow"].panes[1].bias, 70);
+        assert_eq!(
+            cfg.terminal.layout_by_display.laptop.as_deref(),
+            Some("narrow")
+        );
+        assert_eq!(
+            cfg.terminal.layout_by_display.fallback.as_deref(),
+            Some("wide")
+        );
+    }
+
+    #[test]
+    fn a_display_mapping_to_an_unknown_layout_is_an_error() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [terminal.layout_by_display]
+            laptop = "narrow"
+            "#,
+        )
+        .expect("toml parses");
+        let error = cfg.validate().expect_err("dangling mapping");
+        assert!(
+            error.to_string().contains("unknown layout `narrow`"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_invalid_layout_is_an_error_naming_the_profile() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [terminal.layouts.broken]
+            [[terminal.layouts.broken.panes]]
+            role = "first"
+            [[terminal.layouts.broken.panes]]
+            role = "shell"
+            "#,
+        )
+        .expect("toml parses");
+        let error = cfg.validate().expect_err("missing location");
+        assert!(
+            error.to_string().contains("terminal.layouts.broken"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("location"), "{error}");
+    }
+
+    #[test]
+    fn unknown_layout_keys_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [terminal.layouts.wide]
+            [[terminal.layouts.wide.panes]]
+            role = "first"
+            [[terminal.layouts.wide.panes]]
+            role = "agent"
+            location = "vsplit"
+            bais = 70
+            "#,
+        )
+        .expect_err("typo is an error");
+        assert!(err.to_string().contains("bais"), "{err}");
+    }
+
+    #[test]
+    fn unknown_display_condition_keys_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [terminal.layout_by_display]
+            monitor = "wide"
+            "#,
+        )
+        .expect_err("unknown condition is an error");
+        assert!(err.to_string().contains("monitor"), "{err}");
     }
 
     #[test]
