@@ -30,7 +30,21 @@ fn tab_title(name: &str) -> String {
     format!("{TAB_PREFIX}{name}")
 }
 
-fn new_shell_tab_args(title: &str, cwd_arg: &str, focus: bool, command: &[String]) -> Vec<String> {
+/// The kitty user variable every jjfx pane is tagged with, so the pane running
+/// the agent can be found again when a workspace is re-opened.
+const ROLE_VAR: &str = "jjfx_role";
+
+fn role_var_args(role: PaneRole) -> [String; 2] {
+    ["--var".to_string(), format!("{ROLE_VAR}={}", role.as_str())]
+}
+
+fn new_shell_tab_args(
+    title: &str,
+    cwd_arg: &str,
+    focus: bool,
+    role: PaneRole,
+    command: &[String],
+) -> Vec<String> {
     let mut args = vec![
         "launch".to_string(),
         "--type=tab".to_string(),
@@ -38,6 +52,7 @@ fn new_shell_tab_args(title: &str, cwd_arg: &str, focus: bool, command: &[String
         title.to_string(),
         cwd_arg.to_string(),
     ];
+    args.extend(role_var_args(role));
     if !focus {
         args.push("--dont-take-focus".to_string());
     }
@@ -60,6 +75,7 @@ fn split_args(
     bias: u8,
     cwd_arg: &str,
     focus: bool,
+    role: PaneRole,
     command: &[String],
 ) -> Vec<String> {
     let mut args = vec![
@@ -72,6 +88,7 @@ fn split_args(
         format!("--bias={bias}"),
         cwd_arg.to_string(),
     ];
+    args.extend(role_var_args(role));
     if !focus {
         args.push("--dont-take-focus".to_string());
     }
@@ -92,13 +109,17 @@ fn focus_window_args(window_id: &str) -> Vec<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum OpenStep {
     /// Launch the tab's own pane (pane 0 of the layout).
-    LaunchTab { command: Vec<String> },
+    LaunchTab {
+        role: PaneRole,
+        command: Vec<String>,
+    },
     /// Force kitty's splits layout, required before a biased split.
     ForceSplits,
     /// Split the pane at `anchor`; a missing `location` (only possible in an
     /// unvalidated plan) records a pane that never opened.
     Split {
         anchor: usize,
+        role: PaneRole,
         location: Option<SplitLocation>,
         bias: u8,
         command: Vec<String>,
@@ -115,7 +136,10 @@ fn open_steps(layout: &PaneLayout, command_for: impl Fn(PaneRole) -> Vec<String>
     for (index, pane) in layout.panes.iter().enumerate() {
         let command = command_for(pane.role);
         if index == 0 {
-            steps.push(OpenStep::LaunchTab { command });
+            steps.push(OpenStep::LaunchTab {
+                role: pane.role,
+                command,
+            });
             if layout.panes.len() > 1 {
                 // `--bias` is only a percentage under the splits layout.
                 steps.push(OpenStep::ForceSplits);
@@ -124,6 +148,7 @@ fn open_steps(layout: &PaneLayout, command_for: impl Fn(PaneRole) -> Vec<String>
         }
         steps.push(OpenStep::Split {
             anchor: pane.from,
+            role: pane.role,
             location: pane.location,
             bias: pane.bias,
             command,
@@ -287,6 +312,17 @@ impl KittyTerminal {
             PaneRole::Shell => &[],
         }
     }
+
+    /// The window id of the agent pane in `name`'s tab, when the tab has one.
+    /// Tagged panes are found by role; tabs opened before panes were tagged
+    /// fall back to matching the configured agent command.
+    fn agent_window(&self, name: &str) -> Option<String> {
+        let tree = self.ls().ok()?;
+        let title = tab_title(name);
+        tagged_window(&tree, &title, PaneRole::Agent)
+            .or_else(|| window_with_command(&tree, &title, &self.agent_command))
+            .map(|id| id.to_string())
+    }
 }
 
 impl Terminal for KittyTerminal {
@@ -318,8 +354,9 @@ impl Terminal for KittyTerminal {
         let mut windows: Vec<Option<String>> = Vec::with_capacity(layout.panes.len());
         for step in open_steps(layout, |role| self.pane_command(role).to_vec()) {
             match step {
-                OpenStep::LaunchTab { command } => {
-                    let id = self.launch(&new_shell_tab_args(&title, &cwd_arg, focus, &command))?;
+                OpenStep::LaunchTab { role, command } => {
+                    let id =
+                        self.launch(&new_shell_tab_args(&title, &cwd_arg, focus, role, &command))?;
                     if id.is_empty() {
                         // The tab exists but has no id to anchor splits to.
                         return Ok(());
@@ -333,6 +370,7 @@ impl Terminal for KittyTerminal {
                 }
                 OpenStep::Split {
                     anchor,
+                    role,
                     location,
                     bias,
                     command,
@@ -348,6 +386,7 @@ impl Terminal for KittyTerminal {
                         bias,
                         &cwd_arg,
                         focus,
+                        role,
                         &command,
                     ))?;
                     windows.push(if id.is_empty() { None } else { Some(id) });
@@ -365,8 +404,16 @@ impl Terminal for KittyTerminal {
         Ok(())
     }
 
+    /// Focus the workspace's tab and land keyboard focus in its agent pane.
+    /// Switching to a tab restores whatever pane was last active there, which
+    /// is rarely the agent when returning to a workspace, so jjfx re-focuses
+    /// the tagged agent window. A tab without one (a custom layout, or one
+    /// built before the agent existed) keeps its own focus.
     fn focus(&self, name: &str) -> anyhow::Result<()> {
         self.run(&["focus-tab", "--match", &title_match(name)])?;
+        if let Some(agent) = self.agent_window(name) {
+            let _ = self.run(&focus_window_args(&agent));
+        }
         Ok(())
     }
 
@@ -443,6 +490,58 @@ fn is_pid_socket(base_name: &str, name: &str) -> bool {
         Some(pid) => !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
+}
+
+/// The tab titled `title` in a `kitten @ ls` tree, if it exists.
+fn tab_in<'a>(tree: &'a Value, title: &str) -> Option<&'a Value> {
+    tree.as_array()?
+        .iter()
+        .filter_map(|os_window| os_window.get("tabs")?.as_array())
+        .flatten()
+        .find(|tab| tab.get("title").and_then(Value::as_str) == Some(title))
+}
+
+/// The id of the window in the tab titled `title` that carries `role`'s jjfx
+/// tag, if any. Panes are tagged at launch ([`role_var_args`]), so a role is
+/// found by what jjfx put there rather than by a live process name.
+fn tagged_window(tree: &Value, title: &str, role: PaneRole) -> Option<i64> {
+    tab_in(tree, title)?
+        .get("windows")?
+        .as_array()?
+        .iter()
+        .find(|window| {
+            window
+                .get("user_vars")
+                .and_then(|vars| vars.get(ROLE_VAR))
+                .and_then(Value::as_str)
+                == Some(role.as_str())
+        })?
+        .get("id")?
+        .as_i64()
+}
+
+/// The id of the window in the tab titled `title` whose launch command is
+/// `command`, if any. This finds the agent pane in tabs built before panes were
+/// tagged with roles.
+fn window_with_command(tree: &Value, title: &str, command: &[String]) -> Option<i64> {
+    tab_in(tree, title)?
+        .get("windows")?
+        .as_array()?
+        .iter()
+        .find(|window| {
+            window
+                .get("cmdline")
+                .and_then(Value::as_array)
+                .is_some_and(|cmdline| {
+                    cmdline.len() == command.len()
+                        && cmdline
+                            .iter()
+                            .zip(command)
+                            .all(|(actual, expected)| actual.as_str() == Some(expected.as_str()))
+                })
+        })?
+        .get("id")?
+        .as_i64()
 }
 
 /// An anchored title match for kitty's `--match`, so `feat` never matches
@@ -530,17 +629,20 @@ mod tests {
             steps,
             vec![
                 OpenStep::LaunchTab {
+                    role: PaneRole::First,
                     command: vec!["dev-server".to_string()],
                 },
                 OpenStep::ForceSplits,
                 OpenStep::Split {
                     anchor: 0,
+                    role: PaneRole::Agent,
                     location: Some(SplitLocation::Vsplit),
                     bias: 81,
                     command: vec!["pi".to_string()],
                 },
                 OpenStep::Split {
                     anchor: 0,
+                    role: PaneRole::Shell,
                     location: Some(SplitLocation::Hsplit),
                     bias: 50,
                     command: Vec::new(),
@@ -564,17 +666,20 @@ mod tests {
             steps,
             vec![
                 OpenStep::LaunchTab {
+                    role: PaneRole::First,
                     command: vec!["dev-server".to_string()],
                 },
                 OpenStep::ForceSplits,
                 OpenStep::Split {
                     anchor: 0,
+                    role: PaneRole::Agent,
                     location: Some(SplitLocation::Vsplit),
                     bias: 70,
                     command: vec!["pi".to_string()],
                 },
                 OpenStep::Split {
                     anchor: 0,
+                    role: PaneRole::Shell,
                     location: Some(SplitLocation::Hsplit),
                     bias: 50,
                     command: Vec::new(),
@@ -594,6 +699,7 @@ mod tests {
             open_steps(&layout, role_command),
             vec![
                 OpenStep::LaunchTab {
+                    role: PaneRole::Agent,
                     command: vec!["pi".to_string()],
                 },
                 OpenStep::Focus { pane: 0 },
@@ -615,17 +721,20 @@ mod tests {
             steps,
             vec![
                 OpenStep::LaunchTab {
+                    role: PaneRole::First,
                     command: vec!["dev-server".to_string()],
                 },
                 OpenStep::ForceSplits,
                 OpenStep::Split {
                     anchor: 0,
+                    role: PaneRole::Agent,
                     location: Some(SplitLocation::Vsplit),
                     bias: 81,
                     command: vec!["pi".to_string()],
                 },
                 OpenStep::Split {
                     anchor: 1,
+                    role: PaneRole::Shell,
                     location: Some(SplitLocation::Hsplit),
                     bias: 50,
                     command: Vec::new(),
@@ -654,13 +763,15 @@ mod tests {
         let agent_command = vec!["zsh".to_string(), "-lc".to_string(), "pi".to_string()];
 
         assert_eq!(
-            new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", true, &[]),
+            new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", true, PaneRole::First, &[],),
             [
                 "launch",
                 "--type=tab",
                 "--tab-title",
                 "jjfx:feat",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=first",
             ]
         );
         // A configured first-pane command rides on the tab launch, making the
@@ -670,6 +781,7 @@ mod tests {
                 "jjfx:feat",
                 "--cwd=/repo-feat",
                 true,
+                PaneRole::First,
                 &[
                     "zsh".to_string(),
                     "-lc".to_string(),
@@ -682,6 +794,8 @@ mod tests {
                 "--tab-title",
                 "jjfx:feat",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=first",
                 "zsh",
                 "-lc",
                 "dev-server",
@@ -694,7 +808,15 @@ mod tests {
         // The agent is the new window in the split, so it carries the bias and
         // takes 81% of the width, leaving the shell column the measured 19%.
         assert_eq!(
-            split_args("41", "vsplit", 81, "--cwd=/repo-feat", true, &agent_command,),
+            split_args(
+                "41",
+                "vsplit",
+                81,
+                "--cwd=/repo-feat",
+                true,
+                PaneRole::Agent,
+                &agent_command,
+            ),
             [
                 "launch",
                 "--match",
@@ -704,6 +826,8 @@ mod tests {
                 "--location=vsplit",
                 "--bias=81",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=agent",
                 "zsh",
                 "-lc",
                 "pi",
@@ -711,7 +835,15 @@ mod tests {
         );
         // The left column is then split into two evenly stacked shells.
         assert_eq!(
-            split_args("41", "hsplit", 50, "--cwd=/repo-feat", true, &[]),
+            split_args(
+                "41",
+                "hsplit",
+                50,
+                "--cwd=/repo-feat",
+                true,
+                PaneRole::Shell,
+                &[],
+            ),
             [
                 "launch",
                 "--match",
@@ -721,6 +853,8 @@ mod tests {
                 "--location=hsplit",
                 "--bias=50",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=shell",
             ]
         );
         assert_eq!(
@@ -734,13 +868,15 @@ mod tests {
         let agent_command = vec!["pi".to_string()];
 
         assert_eq!(
-            new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", false, &[]),
+            new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", false, PaneRole::First, &[],),
             [
                 "launch",
                 "--type=tab",
                 "--tab-title",
                 "jjfx:feat",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=first",
                 "--dont-take-focus",
             ]
         );
@@ -751,6 +887,7 @@ mod tests {
                 81,
                 "--cwd=/repo-feat",
                 false,
+                PaneRole::Agent,
                 &agent_command,
             ),
             [
@@ -762,12 +899,22 @@ mod tests {
                 "--location=vsplit",
                 "--bias=81",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=agent",
                 "--dont-take-focus",
                 "pi",
             ]
         );
         assert_eq!(
-            split_args("41", "hsplit", 50, "--cwd=/repo-feat", false, &[]),
+            split_args(
+                "41",
+                "hsplit",
+                50,
+                "--cwd=/repo-feat",
+                false,
+                PaneRole::Shell,
+                &[],
+            ),
             [
                 "launch",
                 "--match",
@@ -777,8 +924,70 @@ mod tests {
                 "--location=hsplit",
                 "--bias=50",
                 "--cwd=/repo-feat",
+                "--var",
+                "jjfx_role=shell",
                 "--dont-take-focus",
             ]
+        );
+    }
+
+    #[test]
+    fn tagged_window_finds_the_role_in_the_matching_tab_only() {
+        let tree: Value = serde_json::from_str(
+            r#"
+            [
+              {
+                "tabs": [
+                  {
+                    "title": "jjfx:feat",
+                    "windows": [
+                      { "id": 41, "user_vars": { "jjfx_role": "first" } },
+                      { "id": 42, "user_vars": { "jjfx_role": "agent" } },
+                      { "id": 43, "user_vars": { "jjfx_role": "shell" } }
+                    ]
+                  },
+                  {
+                    "title": "jjfx:other",
+                    "windows": [
+                      { "id": 51, "user_vars": { "jjfx_role": "agent" } }
+                    ]
+                  },
+                  {
+                    "title": "jjfx:legacy",
+                    "windows": [
+                      { "id": 61, "cmdline": ["/bin/zsh", "-l", "-i", "-c", "opencode"] },
+                      { "id": 62, "cmdline": ["/bin/zsh"] }
+                    ]
+                  }
+                ]
+              }
+            ]
+            "#,
+        )
+        .expect("ls fixture parses");
+
+        assert_eq!(tagged_window(&tree, "jjfx:feat", PaneRole::Agent), Some(42));
+        assert_eq!(
+            tagged_window(&tree, "jjfx:other", PaneRole::Agent),
+            Some(51)
+        );
+        // A tab whose panes predate the tag has no match, and a missing tab is
+        // not a panic.
+        assert_eq!(tagged_window(&tree, "jjfx:untagged", PaneRole::Agent), None);
+        assert_eq!(tagged_window(&tree, "jjfx:feat", PaneRole::First), Some(41));
+
+        let agent_command = ["/bin/zsh", "-l", "-i", "-c", "opencode"].map(String::from);
+        assert_eq!(
+            window_with_command(&tree, "jjfx:legacy", &agent_command),
+            Some(61)
+        );
+        assert_eq!(
+            window_with_command(&tree, "jjfx:feat", &agent_command),
+            None
+        );
+        assert_eq!(
+            window_with_command(&tree, "jjfx:untagged", &agent_command),
+            None
         );
     }
 

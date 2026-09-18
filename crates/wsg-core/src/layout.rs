@@ -28,6 +28,18 @@ pub enum PaneRole {
     Shell,
 }
 
+impl PaneRole {
+    /// The role's name, as written in config and as tagged on the kitty window
+    /// (`--var jjfx_role=<name>`) so a pane can be found again by role.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PaneRole::First => "first",
+            PaneRole::Agent => "agent",
+            PaneRole::Shell => "shell",
+        }
+    }
+}
+
 /// How a pane splits away from its anchor. The names match kitty's `--location`
 /// values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,6 +208,16 @@ mod tests {
             ]
         );
         layout.validate().expect("the built-in plan is valid");
+    }
+
+    #[test]
+    fn role_names_round_trip_through_config() {
+        for role in [PaneRole::First, PaneRole::Agent, PaneRole::Shell] {
+            let layout: PaneLayout =
+                toml::from_str(&format!("[[panes]]\nrole = \"{}\"\n", role.as_str()))
+                    .expect("role name parses");
+            assert_eq!(layout.panes[0].role, role);
+        }
     }
 
     #[test]

@@ -118,3 +118,10 @@ bias = 50
   captured one. Confirm with a real `system_profiler SPDisplaysDataType -json`
   dump while the monitor is attached and adjust the classifier if the keys
   differ.
+- 2026-09-18: follow-up landed above `main` as `Focus the agent pane when
+  entering an open workspace`: panes are tagged at launch with
+  `--var jjfx_role=<role>` and `KittyTerminal::focus` looks the agent pane up in
+  the reopened tab, falling back to the configured agent command for tabs
+  opened before the tag. Background opens (`--dont-take-focus`) cannot set the
+  active pane without raising the OS window, so their agent takes focus once the
+  tab is entered through jjfx (jjfx 0.48.1).

@@ -16,6 +16,11 @@ version of record lives in the project manifest.
 
 ### Fixed
 
+- 2026-09-18 - Returning to an already-open Workspace now focuses its agent
+  pane rather than just its tab. Panes are tagged with their role at launch
+  (`jjfx_role`) so the agent can be found again, falling back to the configured
+  agent command for tabs opened before the tag existed (jjfx 0.48.1).
+
 - 2026-09-11 - The TUI now reads its Workspace list through the same
   cache-backed projection as the CLI and Worker Pool, so a Workspace whose
   directory is absent has no usable path: `jjfx --list` prints an empty path
