@@ -9,6 +9,7 @@ use std::thread::{self, JoinHandle};
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::layout::{PaneLayout, PaneRole};
 use crate::runtime::pi_interactive_command;
 use crate::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
@@ -230,6 +231,7 @@ pub struct WorkerActions {
     commands: SystemCommands,
     model: Option<AgentModel>,
     first_pane_command: Vec<String>,
+    layout: PaneLayout,
 }
 
 impl WorkerActions {
@@ -241,6 +243,7 @@ impl WorkerActions {
             commands: SystemCommands,
             model: None,
             first_pane_command: Vec::new(),
+            layout: PaneLayout::builtin(),
         }
     }
 
@@ -257,6 +260,13 @@ impl WorkerActions {
     /// pane. Empty (the default) opens that pane as a plain shell.
     pub fn with_first_pane_command(mut self, command: Vec<String>) -> Self {
         self.first_pane_command = command;
+        self
+    }
+
+    /// Supplies the pane layout for mounted tabs. Defaults to the built-in
+    /// layout jjfx has always built.
+    pub fn with_layout(mut self, layout: PaneLayout) -> Self {
+        self.layout = layout;
         self
     }
 
@@ -403,9 +413,13 @@ impl WorkerActions {
         };
         let command =
             interactive_agent_command(runtime, profile.model(), &session_directory, session_id)?;
-        let tab_id = self
-            .commands
-            .mount(worker, &workspace, &command, &self.first_pane_command)?;
+        let tab_id = self.commands.mount(
+            worker,
+            &workspace,
+            &command,
+            &self.first_pane_command,
+            &self.layout,
+        )?;
         Ok(MountOutcome {
             runtime,
             session,
@@ -629,114 +643,118 @@ struct Check {
 }
 
 impl SystemCommands {
+    /// Build a worker's kitty tab from `layout`. The first pane becomes the
+    /// tab; every later pane splits from the window of an earlier one. Role
+    /// commands follow the mount's own policy: the configured first-pane
+    /// command (else a cleared shell), the agent invocation, and cleared
+    /// shells.
     fn mount(
         self,
         worker: &WorkerId,
         workspace: &Path,
         command: &str,
         first_pane_command: &[String],
+        layout: &PaneLayout,
     ) -> Result<String, WorkerActionError> {
         let address = kitty_address()?;
         let cwd = format!("--cwd={}", workspace.display());
         let title = worker.as_str();
-        // The first pane runs the configured command when one is supplied,
-        // otherwise a plain shell with the scrollback cleared.
-        let pane_command = if first_pane_command.is_empty() {
-            vec![
-                "zsh".to_string(),
-                "-ic".to_string(),
-                "clear; exec zsh".to_string(),
-            ]
-        } else {
-            first_pane_command.to_vec()
-        };
-        let mut tab_args = vec![
-            "@",
-            &address,
-            "launch",
-            "--type=tab",
-            "--tab-title",
-            title,
-            &cwd,
-            "--",
-        ];
-        tab_args.extend(pane_command.iter().map(String::as_str));
-        let tab_id = self.run("create kitty tab", "kitten", &tab_args)?;
-        let tab_id = tab_id.trim().to_owned();
-        if !tab_id.is_empty() {
-            let shell_match = format!("window_id:{tab_id}");
-            // `--bias` is only a percentage under the splits layout, so force
-            // it before splitting the agent off to the right of the shell.
-            let _ = self.run(
-                "force kitty splits layout",
-                "kitten",
-                &[
-                    "@",
-                    &address,
-                    "goto-layout",
-                    "--match",
-                    &shell_match,
-                    "splits",
-                ],
-            );
-            let agent = self.run(
-                "split kitty tab",
-                "kitten",
-                &[
+        let mut windows: Vec<Option<String>> = vec![None; layout.panes.len()];
+
+        for (index, pane) in layout.panes.iter().enumerate() {
+            let pane_command = match pane.role {
+                PaneRole::First if first_pane_command.is_empty() => shell_command(),
+                PaneRole::First => first_pane_command.to_vec(),
+                PaneRole::Agent => vec!["zsh".to_string(), "-ic".to_string(), command.to_string()],
+                PaneRole::Shell => shell_command(),
+            };
+            if index == 0 {
+                let mut tab_args = vec![
                     "@",
                     &address,
                     "launch",
-                    "--match",
-                    &shell_match,
-                    "--next-to",
-                    &format!("id:{tab_id}"),
-                    "--location=vsplit",
-                    "--bias=81",
+                    "--type=tab",
+                    "--tab-title",
+                    title,
                     &cwd,
                     "--",
-                    "zsh",
-                    "-ic",
-                    command,
-                ],
-            )?;
-            let agent = agent.trim();
-            // Split the left column into two evenly stacked shells beneath the
-            // agent, which stays full height on the right.
-            let _ = self.run(
-                "split kitty pane",
-                "kitten",
-                &[
-                    "@",
-                    &address,
-                    "launch",
-                    "--match",
-                    &shell_match,
-                    "--next-to",
-                    &format!("id:{tab_id}"),
-                    "--location=hsplit",
-                    "--bias=50",
-                    &cwd,
-                    "--",
-                    "zsh",
-                    "-ic",
-                    "clear; exec zsh",
-                ],
-            );
-            if !agent.is_empty() {
-                let _ = self.run(
-                    "focus kitty window",
-                    "kitten",
-                    &[
-                        "@",
-                        &address,
-                        "focus-window",
-                        "--match",
-                        &format!("id:{agent}"),
-                    ],
-                );
+                ];
+                tab_args.extend(pane_command.iter().map(String::as_str));
+                let tab_id = self.run("create kitty tab", "kitten", &tab_args)?;
+                let tab_id = tab_id.trim().to_owned();
+                if tab_id.is_empty() {
+                    // The tab exists but has no id to anchor splits to.
+                    return Ok(tab_id);
+                }
+                if layout.panes.len() > 1 {
+                    // `--bias` is only a percentage under the splits layout, so
+                    // force it before the first split.
+                    let _ = self.run(
+                        "force kitty splits layout",
+                        "kitten",
+                        &[
+                            "@",
+                            &address,
+                            "goto-layout",
+                            "--match",
+                            &format!("window_id:{tab_id}"),
+                            "splits",
+                        ],
+                    );
+                }
+                windows[0] = Some(tab_id);
+                continue;
             }
+
+            let Some(anchor) = windows.get(pane.from).and_then(Option::as_deref) else {
+                // The anchor pane never opened; panes hanging off it cannot be
+                // placed, so leave the tab as far as it got.
+                continue;
+            };
+            let Some(location) = pane.location else {
+                // Validation rejects this; stay tolerant of hand-built plans.
+                continue;
+            };
+            let match_arg = format!("window_id:{anchor}");
+            let next_to_arg = format!("id:{anchor}");
+            let location_arg = format!("--location={}", location.as_kitty_value());
+            let bias_arg = format!("--bias={}", pane.bias);
+            let mut split_args = vec![
+                "@",
+                &address,
+                "launch",
+                "--match",
+                &match_arg,
+                "--next-to",
+                &next_to_arg,
+                &location_arg,
+                &bias_arg,
+                &cwd,
+                "--",
+            ];
+            split_args.extend(pane_command.iter().map(String::as_str));
+            let window = self.run("split kitty tab", "kitten", &split_args)?;
+            let window = window.trim().to_owned();
+            if window.is_empty() {
+                continue;
+            }
+            windows[index] = Some(window);
         }
-        Ok(tab_id)
+
+        if let Some(agent) = windows.get(layout.focus_pane()).and_then(Option::as_deref) {
+            let _ = self.run(
+                "focus kitty window",
+                "kitten",
+                &[
+                    "@",
+                    &address,
+                    "focus-window",
+                    "--match",
+                    &format!("id:{agent}"),
+                ],
+            );
+        }
+        Ok(windows.first().cloned().flatten().unwrap_or_default())
     }
 
     fn rebase(self, workspace: &Path, branch: &str) -> Result<(), String> {
@@ -905,6 +923,16 @@ impl SystemCommands {
             detail: source.to_string(),
         })
     }
+}
+
+/// The command for a plain mount shell: an interactive shell with the
+/// scrollback cleared, so a reused tab does not show the previous run.
+fn shell_command() -> Vec<String> {
+    vec![
+        "zsh".to_string(),
+        "-ic".to_string(),
+        "clear; exec zsh".to_string(),
+    ]
 }
 
 fn kitty_address() -> Result<String, WorkerActionError> {

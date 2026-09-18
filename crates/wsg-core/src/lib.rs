@@ -9,6 +9,7 @@ use thiserror::Error;
 mod direct_dispatch;
 mod dispatch_group;
 mod dispatch_prompt;
+mod layout;
 mod orchestration;
 mod pool;
 mod run_log;
@@ -31,6 +32,7 @@ pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
     DispatchPromptError,
 };
+pub use layout::{DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation};
 pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationPreparation,
     OrchestrationRequest, OrchestrationRunner, OrchestrationStart, OrchestrationSummary,

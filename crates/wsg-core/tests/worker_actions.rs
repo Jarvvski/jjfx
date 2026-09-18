@@ -12,8 +12,8 @@ use rustix::process::{
 use tempfile::TempDir;
 use wsg_core::{
     AgentModel, AgentRuntime, AgentSessionResolution, DismissOutcome, Expected, FollowUpExecution,
-    Loaded, PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent, WireStatus,
-    WireTimestamp, WorkerActions, WorkerId, WorkspaceRestoration,
+    Loaded, PaneLayout, PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent,
+    WireStatus, WireTimestamp, WorkerActions, WorkerId, WorkspaceRestoration,
 };
 
 const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
@@ -24,6 +24,7 @@ const HELPER_MODE: &str = "WSG_ACTION_MODE";
 const HELPER_PROVIDER: &str = "WSG_ACTION_PROVIDER";
 const HELPER_MODEL: &str = "WSG_ACTION_MODEL";
 const HELPER_PANE_COMMAND: &str = "WSG_ACTION_PANE_COMMAND";
+const HELPER_LAYOUT: &str = "WSG_ACTION_LAYOUT";
 const HELPER_PROCESS: &str = "WSG_ACTION_PROCESS";
 const HELPER_DESCENDANT: &str = "WSG_ACTION_DESCENDANT";
 const HELPER_DIAGNOSTIC: &str = "WSG_ACTION_DIAGNOSTIC";
@@ -447,6 +448,167 @@ fn mount_runs_the_configured_command_in_the_first_pane() {
         .expect("pane split");
     assert!(pane_split.contains("clear; exec zsh"), "{pane_split}");
     assert!(commands.contains("claude --resume 'session-mount'; exec zsh"));
+}
+
+#[test]
+fn mount_builds_the_configured_layout_from_the_plan() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("mount-layout.log");
+    fs::write(
+        &log,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-layout\"}\n",
+    )
+    .expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("layout-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\necho --forward-subagent-text\n",
+    );
+    write_executable(
+        &bin.join("kitten"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "case \"$*\" in\n",
+            "  *--type=tab*) echo 42 ;;\n",
+            "  *--location=vsplit*) echo 43 ;;\n",
+            "  *--location=hsplit*) echo 44 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("layout-commands");
+    let result = temporary_directory.path().join("layout-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env(
+            HELPER_LAYOUT,
+            concat!(
+                "[[panes]]\n",
+                "role = \"first\"\n",
+                "[[panes]]\n",
+                "role = \"agent\"\n",
+                "location = \"vsplit\"\n",
+                "bias = 70\n",
+                "[[panes]]\n",
+                "role = \"shell\"\n",
+                "location = \"hsplit\"\n",
+            ),
+        )
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("Mount action helper should run");
+
+    assert!(
+        output.status.success(),
+        "Mount action helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commands = fs::read_to_string(&capture).expect("command capture");
+    assert!(commands.contains("--bias=70"), "{commands}");
+    assert!(!commands.contains("--bias=81"), "{commands}");
+    // The plan anchors the shell pane to the tab window, not the agent, so the
+    // left column stays a column when the bias changes.
+    let shell_split = commands
+        .lines()
+        .find(|line| line.contains("--location=hsplit"))
+        .expect("shell split");
+    assert!(
+        shell_split.contains("--match window_id:42"),
+        "{shell_split}"
+    );
+    assert!(shell_split.contains("--next-to id:42"), "{shell_split}");
+    // Focus still lands on the agent pane from the plan.
+    assert!(
+        commands.contains("focus-window --match id:43"),
+        "{commands}"
+    );
+}
+
+#[test]
+fn mount_honors_a_single_pane_layout() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("mount-single.log");
+    fs::write(
+        &log,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"session-single\"}\n",
+    )
+    .expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("single-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\necho --forward-subagent-text\n",
+    );
+    write_executable(
+        &bin.join("kitten"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "case \"$*\" in\n",
+            "  *--type=tab*) echo 42 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("single-commands");
+    let result = temporary_directory.path().join("single-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "mount_action_helper"])
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env(HELPER_LAYOUT, "[[panes]]\nrole = \"agent\"\n")
+        .env("KITTY_LISTEN_ON", "unix:/tmp/fake-kitty")
+        .env("PATH", path)
+        .output()
+        .expect("Mount action helper should run");
+
+    assert!(
+        output.status.success(),
+        "Mount action helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commands = fs::read_to_string(&capture).expect("command capture");
+    // A single-pane plan launches the agent in the tab itself: no splits layout
+    // to force and no split launches.
+    let tab_launch = commands
+        .lines()
+        .find(|line| line.contains("--type=tab"))
+        .expect("tab launch");
+    assert!(
+        tab_launch.contains("claude --resume 'session-single'"),
+        "{tab_launch}"
+    );
+    assert!(!commands.contains("goto-layout"), "{commands}");
+    assert!(!commands.contains("--location"), "{commands}");
+    assert!(
+        commands.contains("focus-window --match id:42"),
+        "{commands}"
+    );
 }
 
 #[test]
@@ -1388,6 +1550,10 @@ fn mount_action_helper() {
     }
     if let Ok(command) = env::var(HELPER_PANE_COMMAND) {
         actions = actions.with_first_pane_command(vec![command]);
+    }
+    if let Ok(layout) = env::var(HELPER_LAYOUT) {
+        let layout: PaneLayout = toml::from_str(&layout).expect("layout TOML should parse");
+        actions = actions.with_layout(layout);
     }
     let outcome = actions.mount(&worker).expect("Mount should succeed");
     let session = match outcome.session() {

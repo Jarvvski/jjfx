@@ -13,6 +13,9 @@ thiserror = "2"
 rustix = { version = "1", features = ["fs", "process"] }
 tempfile = "3"
 
+[dev-dependencies]
+toml = "0.8"
+
 [lints.rust]
 unsafe_code = "forbid"
 unused = { level = "warn", priority = -1 }
