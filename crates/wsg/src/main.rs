@@ -5,7 +5,7 @@ fn main() {
     let result = cli::run(
         std::env::args().skip(1).collect(),
         jjfx::launch,
-        jjfx::first_pane_command,
+        jjfx::terminal_settings,
     );
     if let Err(error) = result {
         eprintln!("{error}");

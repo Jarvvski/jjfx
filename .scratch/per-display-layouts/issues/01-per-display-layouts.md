@@ -1,6 +1,6 @@
 # Configurable window layouts per display
 
-Status: in-progress
+Status: resolved
 
 ## Parent
 
@@ -87,16 +87,34 @@ bias = 50
 
 ## Acceptance criteria
 
-- [ ] No config: identical argv to today for both workspace tabs and Mount.
-- [ ] Laptop-only resolves the `laptop` layout; external attached resolves the
+- [x] No config: identical argv to today for both workspace tabs and Mount.
+- [x] Laptop-only resolves the `laptop` layout; external attached resolves the
       `external` layout; both verified with unit tests over fixtures.
-- [ ] `JJFX_LAYOUT` overrides the condition; unknown names error.
-- [ ] Invalid layouts and dangling mapping targets are startup errors.
-- [ ] Focus still lands on the agent (else the first pane) and background opens
+- [x] `JJFX_LAYOUT` overrides the condition; unknown names error.
+- [x] Invalid layouts and dangling mapping targets are startup errors.
+- [x] Focus still lands on the agent (else the first pane) and background opens
       still never raise the target.
-- [ ] `mise run check` passes.
+- [x] `mise run check` passes.
 
 ## Comments
 
 - 2026-09-18: filed from the planning session; implementation starts on the
   stack above `main`.
+- 2026-09-18: landed as three focused commits above `main`:
+  - `Build mounted worker tabs from a pane layout plan`: `wsg-core` gains the
+    `PaneLayout`/`PanePlacement`/`PaneRole`/`SplitLocation` model with
+    validation, and `SystemCommands::mount` walks the plan instead of hardcoding
+    splits. The built-in plan reproduces the previous argv.
+  - `Choose a workspace tab layout from the display and config`: `terminal.layouts`
+    and `terminal.layout_by_display` parse and validate at load; `src/display.rs`
+    classifies the `system_profiler` report; `LayoutSettings` selects the layout
+    (forced profile, condition mapping, `default`, built-in); `KittyTerminal`
+    builds tabs from `open_steps`.
+  - `Mount workers with the configured display layout`: the CLI seam now passes
+    a `TerminalSettings` (first-pane command + display-selected layout) into
+    `WorkerActions`, so `mount` honors the same profiles; version bump and
+    changelog entry.
+- 2026-09-18: the external-display fixture is a plausible report, not yet a
+  captured one. Confirm with a real `system_profiler SPDisplaysDataType -json`
+  dump while the monitor is attached and adjust the classifier if the keys
+  differ.

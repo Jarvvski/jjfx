@@ -26,6 +26,13 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-09-18 - Window layouts are now configurable per display: named pane
+  layouts under `terminal.layouts` are selected by `terminal.layout_by_display`
+  (built-in display vs external monitor attached), and both workspace tabs and
+  worker `mount` build from the selection. `JJFX_LAYOUT` forces a named layout.
+  Without configuration jjfx still builds the existing 19% shell column with the
+  agent filling the rest (jjfx 0.48.0, wsg 0.18.0).
+
 - 2026-09-11 - The opened tab's first (top-left) pane can now run a configured
   command - e.g. a dev server or watcher - via the new
   `terminal.first_pane_command` setting, in both the TUI and `mount`. It runs

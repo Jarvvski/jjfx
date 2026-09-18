@@ -32,7 +32,9 @@ pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
     DispatchPromptError,
 };
-pub use layout::{DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation};
+pub use layout::{
+    DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
+};
 pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationPreparation,
     OrchestrationRequest, OrchestrationRunner, OrchestrationStart, OrchestrationSummary,

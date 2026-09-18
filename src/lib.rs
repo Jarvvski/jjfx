@@ -74,7 +74,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // help, so scripts and shell completion never unexpectedly claim the
     // terminal.
     if args.is_empty() {
-        return cli::run(vec!["help".to_owned()], launch, first_pane_command);
+        return cli::run(vec!["help".to_owned()], launch, terminal_settings);
     }
     if args.first().map(String::as_str) == Some("tui") {
         if args.len() != 1 {
@@ -104,17 +104,25 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    cli::run(args, launch, first_pane_command)
+    cli::run(args, launch, terminal_settings)
 }
 
-/// Resolve the configured command for an opened tab's first pane, wrapped in
-/// the login interactive shell (empty when unconfigured).
+/// Resolve the terminal settings a `mount` invocation needs: the first-pane
+/// command, wrapped in the login interactive shell (empty when unconfigured),
+/// and the pane layout selected for the current display.
 ///
-/// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so the
-/// `mount` command opens the same first pane as the TUI. It is loaded lazily -
-/// only a `mount` invocation reads jjfx's config file.
-pub fn first_pane_command() -> anyhow::Result<Vec<String>> {
-    Ok(config::load()?.first_pane_command())
+/// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so
+/// `mount` opens the same first pane and layout as the TUI. It is loaded lazily
+/// - only a `mount` invocation reads jjfx's config file.
+pub fn terminal_settings() -> anyhow::Result<wsg_core::TerminalSettings> {
+    let config = config::load()?;
+    let layout = layout::LayoutSettings::from_config(&config.terminal)
+        .resolve(display::attached_condition())?
+        .clone();
+    Ok(wsg_core::TerminalSettings {
+        first_pane_command: config.first_pane_command(),
+        layout,
+    })
 }
 
 /// Launch the shared interactive jjfx TUI for a discovered repository.

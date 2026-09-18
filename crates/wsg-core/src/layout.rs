@@ -77,6 +77,17 @@ pub struct PaneLayout {
     pub panes: Vec<PanePlacement>,
 }
 
+/// The terminal settings a mounted tab is built from, resolved by the frontend
+/// from its config: the first-pane command plus the pane layout selected for
+/// the current display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalSettings {
+    /// Command (program + args) for the tab's first pane; empty leaves a shell.
+    pub first_pane_command: Vec<String>,
+    /// The pane layout the tab is built from.
+    pub layout: PaneLayout,
+}
+
 impl PaneLayout {
     /// The layout jjfx builds without configuration: a shell column on the
     /// left, split into the configured first pane over a second shell, and the

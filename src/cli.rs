@@ -11,9 +11,9 @@ use wsg_core::{
     CleanDecision, DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome,
     DirectDispatchRequest, DispatchBudget, FollowUpExecution, OrchestrationEvent,
     PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, Repository,
-    RunActivity, RunActivityKind, RunMode, TicketDiscovery, TicketId, TicketStatus, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
-    WorkspaceHookStream,
+    RunActivity, RunActivityKind, RunMode, TerminalSettings, TicketDiscovery, TicketId,
+    TicketStatus, WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
+    WorkspaceAddOutcome, WorkspaceHookStream,
 };
 
 pub const HELP: &str = concat!(
@@ -582,13 +582,14 @@ impl From<PoolCommand> for Command {
     }
 }
 
-/// Route a CLI invocation. `launch` enters the interactive TUI; `first_pane_command`
-/// lazily resolves the configured first-pane command (empty when unconfigured),
-/// which only `mount` consumes - so no other command reads the config file.
+/// Route a CLI invocation. `launch` enters the interactive TUI; `terminal_settings`
+/// lazily resolves the configured terminal settings (the first-pane command and
+/// the display-selected layout), which only `mount` consumes - so no other
+/// command reads the config file.
 pub fn run(
     args: Vec<String>,
     launch: fn(PathBuf) -> Result<()>,
-    first_pane_command: fn() -> Result<Vec<String>>,
+    terminal_settings: fn() -> Result<TerminalSettings>,
 ) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
@@ -611,7 +612,7 @@ pub fn run(
         } => send_command(&repository()?, &worker, &prompt, mode)?,
         Command::Review { worker, mode } => review_command(&repository()?, &worker, mode)?,
         Command::Logs { worker } => logs_command(&repository()?, &worker)?,
-        Command::Mount { worker } => mount_command(&repository()?, &worker, first_pane_command)?,
+        Command::Mount { worker } => mount_command(&repository()?, &worker, terminal_settings)?,
         Command::Rebase { worker } => rebase_command(&repository()?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository()?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
@@ -1222,11 +1223,13 @@ fn render_activity(activity: &RunActivity) -> String {
 fn mount_command(
     repository: &Repository,
     value: &str,
-    first_pane_command: fn() -> Result<Vec<String>>,
+    terminal_settings: fn() -> Result<TerminalSettings>,
 ) -> Result<()> {
     let worker = normalize_worker(value)?;
+    let settings = terminal_settings()?;
     let outcome = WorkerActions::new(repository.clone())
-        .with_first_pane_command(first_pane_command()?)
+        .with_first_pane_command(settings.first_pane_command)
+        .with_layout(settings.layout)
         .mount(&worker)?;
     render_session(outcome.session());
     eprintln!(
