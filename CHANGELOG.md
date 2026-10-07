@@ -7,6 +7,11 @@ version of record lives in the project manifest.
 
 ### Changed
 
+- 2026-10-07 - Lifting a workspace (`r`) and lifting all (`R`) now run in the
+  background through a serial queue instead of blocking the UI, so several
+  rebases can be kicked off in a row. Rows show `queued`/`lifting...` while their
+  job is pending, and the footer tracks queue depth and failures (jjfx 0.49.0).
+
 - 2026-09-11 - Redesigned the window-opening layout: opening a workspace and
   Mounting a Worker now both build a 19% shell column on the left, split into
   two stacked shells, with the agent taking the remaining 81% width, replacing

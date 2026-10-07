@@ -2,7 +2,7 @@
 //! over a channel to the single owned `App`, which the main loop mutates and
 //! redraws (the engine shape from the PRD).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -183,6 +183,27 @@ struct PendingDeletion {
     workspace: Workspace,
 }
 
+/// One queued lift: a single workspace's stack (`r`), or every workspace (`R`).
+/// The App owns a serial FIFO queue of these and runs exactly one at a time, so
+/// several `r` presses never contend on jj's repo lock.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiftJob {
+    /// Lift one workspace's own mutable stack onto the trunk base.
+    Workspace(String),
+    /// Lift every workspace's stack in one rebase.
+    All,
+}
+
+impl LiftJob {
+    /// A short human label for the footer ("default", or "all workspaces").
+    fn label(&self) -> String {
+        match self {
+            LiftJob::Workspace(ws) => ws.clone(),
+            LiftJob::All => "all workspaces".to_string(),
+        }
+    }
+}
+
 /// Messages folded into the app from the terminal and background watchers.
 #[derive(Debug)]
 pub enum Msg {
@@ -200,6 +221,13 @@ pub enum Msg {
     Forge(forge::Update),
     /// The background `jj git fetch` finished; `Err` carries jj's error text.
     Fetched(Result<(), String>),
+    /// A background queued lift finished. `result` is `Ok(true)` when something
+    /// was rebased, `Ok(false)` when there was nothing to lift, `Err` with jj's
+    /// error text on failure.
+    Lifted {
+        job: LiftJob,
+        result: Result<bool, String>,
+    },
     /// A line of output from the setup hook for a new workspace.
     WorkspaceSetupOutput {
         workspace: PendingWorkspace,
@@ -258,6 +286,16 @@ pub struct App {
     /// A background `jj git fetch` is in flight; a second `u` is ignored until
     /// it resolves (two would just contend on the repo lock).
     fetching: bool,
+    /// The serial lift queue: pending jobs waiting for the one in flight to
+    /// finish. Fed by `r`/`R`, drained by [`App::pump_lift`].
+    lift_queue: VecDeque<LiftJob>,
+    /// The one lift currently running in a blocking worker, if any. Its row
+    /// renders "lifting…" until [`Msg::Lifted`] clears it.
+    lift_in_flight: Option<LiftJob>,
+    /// How many queued jobs have completed since the queue last drained, and the
+    /// errors from any that failed - folded into the footer's summary.
+    lift_done: usize,
+    lift_failures: Vec<String>,
     /// The single new workspace whose configured command is still running.
     pending_workspace: Option<PendingWorkspace>,
     /// The single workspace whose persistent deletion is running in a blocking
@@ -327,6 +365,10 @@ impl App {
             next_operation: 0,
             forge_progress: HashMap::new(),
             fetching: false,
+            lift_queue: VecDeque::new(),
+            lift_in_flight: None,
+            lift_done: 0,
+            lift_failures: Vec::new(),
             pending_workspace: None,
             pending_deletion: None,
             quit_after_deletion: false,
@@ -358,6 +400,7 @@ impl App {
             Msg::WorkspaceDispatch(event) => self.on_workspace_dispatch(event),
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
+            Msg::Lifted { job, result } => self.on_lifted(job, result),
             Msg::WorkspaceSetupOutput {
                 workspace,
                 stream,
@@ -588,6 +631,18 @@ impl App {
             .get(&w.name)
             .map(|wk| wk.state)
             .unwrap_or_default()
+    }
+
+    /// Whether this workspace's own lift is the one currently running.
+    fn is_lifting(&self, name: &str) -> bool {
+        matches!(&self.lift_in_flight, Some(LiftJob::Workspace(ws)) if ws == name)
+    }
+
+    /// Whether this workspace has a lift waiting in the queue.
+    fn is_lift_queued(&self, name: &str) -> bool {
+        self.lift_queue
+            .iter()
+            .any(|job| matches!(job, LiftJob::Workspace(ws) if ws == name))
     }
 
     /// How far the workspace is behind `trunk()`, `0` until the first snapshot.
@@ -1779,8 +1834,9 @@ impl App {
         self.reload();
     }
 
-    /// `r`: lift the selected workspace's stack onto trunk (local rebase, no
-    /// push) - the remedy for a `behind` workspace, empty or not.
+    /// `r`: queue the selected workspace's stack onto trunk (local rebase, no
+    /// push) - the remedy for a `behind` workspace, empty or not. Runs in the
+    /// background so the user can line up several lifts in a row.
     fn lift_selected(&mut self) {
         let Some(w) = self.selected_workspace().cloned() else {
             return;
@@ -1788,27 +1844,95 @@ impl App {
         if self.refuse_if_configuring(&w.name) {
             return;
         }
-        let msg = match self.jj.lift(&w.name) {
-            Ok(true) => format!("lifted {} onto trunk", w.name),
-            Ok(false) => format!("{}: nothing to lift", w.name),
-            Err(e) => format!("lift failed: {e}"),
-        };
-        self.set_status(msg);
-        self.reload();
+        self.enqueue_lift(LiftJob::Workspace(w.name));
     }
 
-    /// `R`: lift every workspace's stack onto trunk in one rebase.
+    /// `R`: queue every workspace's stack onto trunk in one rebase. Routed
+    /// through the same background queue so it never blocks or contends with a
+    /// running `r`.
     fn lift_all(&mut self) {
         if self.refuse_while_configuring() {
             return;
         }
-        let msg = match self.jj.lift_all() {
-            Ok(true) => "lifted all workspaces onto trunk".to_string(),
-            Ok(false) => "nothing to lift".to_string(),
-            Err(e) => format!("lift failed: {e}"),
+        self.enqueue_lift(LiftJob::All);
+    }
+
+    /// Add one job to the serial lift queue, ignoring a duplicate of the job
+    /// already in flight or waiting. Starts the queue when idle.
+    fn enqueue_lift(&mut self, job: LiftJob) {
+        if self.lift_in_flight.as_ref() == Some(&job) || self.lift_queue.contains(&job) {
+            // Pin (don't arm an expiry): the running job's next event replaces it.
+            self.pin_status(format!("{}: already queued", job.label()));
+            return;
+        }
+        self.lift_queue.push_back(job);
+        self.pump_lift();
+    }
+
+    /// Start the next queued lift when nothing is in flight, then pin the footer
+    /// to the current progress. Called on enqueue and after each completion.
+    fn pump_lift(&mut self) {
+        if self.lift_in_flight.is_none()
+            && let Some(job) = self.lift_queue.pop_front()
+        {
+            self.lift_in_flight = Some(job.clone());
+            self.emit(Effect::Lift { job });
+        }
+        self.refresh_lift_status();
+    }
+
+    /// Pin the footer to the running lift, with the queue depth and any failures
+    /// so far. A no-op when nothing is in flight.
+    fn refresh_lift_status(&mut self) {
+        let Some(job) = self.lift_in_flight.clone() else {
+            return;
         };
-        self.set_status(msg);
+        let mut detail = Vec::new();
+        if !self.lift_queue.is_empty() {
+            detail.push(format!("{} queued", self.lift_queue.len()));
+        }
+        if !self.lift_failures.is_empty() {
+            detail.push(format!("{} failed", self.lift_failures.len()));
+        }
+        let suffix = if detail.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", detail.join(", "))
+        };
+        self.pin_status(format!("lifting {}…{suffix}", job.label()));
+    }
+
+    /// Fold one completed background lift: clear the in-flight marker, record
+    /// the outcome, refresh the rows, then start the next queued job. The footer
+    /// reports a summary only once the queue drains; until then the pinned
+    /// progress carries a running failed count, so a failure is never lost.
+    fn on_lifted(&mut self, job: LiftJob, result: Result<bool, String>) {
+        self.lift_in_flight = None;
+        match result {
+            Ok(true) => self.lift_done += 1,
+            Ok(false) => {}
+            Err(error) => self.lift_failures.push(error),
+        }
         self.reload();
+        if self.lift_queue.is_empty() {
+            if !self.lift_failures.is_empty() {
+                let error = self.lift_failures.join("; ");
+                self.set_status(format!("lift failed: {error}"));
+            } else if self.lift_done > 0 {
+                let what = match &job {
+                    LiftJob::All => "all workspaces".to_string(),
+                    LiftJob::Workspace(_) if self.lift_done == 1 => job.label(),
+                    LiftJob::Workspace(_) => format!("{} workspace(s)", self.lift_done),
+                };
+                self.set_status(format!("lifted {what} onto trunk"));
+            } else {
+                self.set_status(format!("{}: nothing to lift", job.label()));
+            }
+            self.lift_done = 0;
+            self.lift_failures.clear();
+        } else {
+            self.pump_lift();
+        }
     }
 
     /// `u`: fetch from the git remote on a background task (network-bound - it
@@ -2606,24 +2730,39 @@ impl App {
             ),
         ];
         // While a forge is running, its live pipeline takes the work column;
-        // otherwise the work label shows there. A deleting tombstone has its
-        // own disabled marker so it remains understandable while selected.
+        // otherwise the work label shows there. A deleting tombstone and a
+        // background lift each get their own marker so they remain understandable
+        // while selected.
         let deleting = self
             .pending_deletion
             .as_ref()
             .is_some_and(|pending| pending.workspace.name == w.name);
-        match (deleting, self.forge_progress.get(&w.name)) {
-            (true, _) => spans.push(Span::styled(
+        if deleting {
+            spans.push(Span::styled(
                 format!("{:<16}", "deleting..."),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::DIM),
-            )),
-            (false, Some(progress)) => spans.extend(forge_spans(progress)),
-            (false, None) => spans.push(Span::styled(
+            ));
+        } else if self.is_lifting(&w.name) {
+            spans.push(Span::styled(
+                format!("{:<16}", "lifting..."),
+                Style::default().fg(Color::Yellow),
+            ));
+        } else if self.is_lift_queued(&w.name) {
+            spans.push(Span::styled(
+                format!("{:<16}", "queued"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::DIM),
+            ));
+        } else if let Some(progress) = self.forge_progress.get(&w.name) {
+            spans.extend(forge_spans(progress));
+        } else {
+            spans.push(Span::styled(
                 format!("{:<16}", work.label()),
                 Style::default().fg(work_color(work)),
-            )),
+            ));
         }
         spans.push(Span::styled(
             format!("{behind_label:<5}"),
@@ -3542,8 +3681,6 @@ mod tests {
         fail: Option<String>,
         tidyws_n: usize,
         tidy_n: usize,
-        lift_ok: bool,
-        lift_all_ok: bool,
     }
 
     /// A `Jj` that records calls instead of shelling out and returns programmed
@@ -3551,8 +3688,6 @@ mod tests {
     /// Cloning shares the recorders (like `FakeTerminal`); the outcome is copied.
     #[derive(Clone, Default)]
     struct FakeJj {
-        lifted: Arc<Mutex<Vec<String>>>,
-        lift_all_calls: Arc<Mutex<usize>>,
         tidyws_calls: Arc<Mutex<usize>>,
         tidy_calls: Arc<Mutex<usize>>,
         outcome: FakeOutcome,
@@ -3576,14 +3711,6 @@ mod tests {
         fn tidy(&self) -> anyhow::Result<usize> {
             *self.tidy_calls.lock().unwrap() += 1;
             self.result(self.outcome.tidy_n)
-        }
-        fn lift(&self, ws: &str) -> anyhow::Result<bool> {
-            self.lifted.lock().unwrap().push(ws.to_string());
-            self.result(self.outcome.lift_ok)
-        }
-        fn lift_all(&self) -> anyhow::Result<bool> {
-            *self.lift_all_calls.lock().unwrap() += 1;
-            self.result(self.outcome.lift_all_ok)
         }
     }
 
@@ -3917,7 +4044,13 @@ mod tests {
             KeyCode::Char('f'),
             KeyCode::Char('F'),
         ] {
-            app.handle(press(key));
+            let effects = app.handle(press(key));
+            assert!(
+                effects
+                    .iter()
+                    .all(|e| matches!(e, Effect::ScheduleStatusExpiry { .. })),
+                "no mutation may run while configuring: {effects:?}"
+            );
             assert!(matches!(app.mode, Mode::Normal));
             assert_eq!(
                 app.status.as_deref(),
@@ -3926,8 +4059,6 @@ mod tests {
         }
 
         assert!(fake_terminal.closed.lock().unwrap().is_empty());
-        assert!(fake_jj.lifted.lock().unwrap().is_empty());
-        assert_eq!(*fake_jj.lift_all_calls.lock().unwrap(), 0);
         assert_eq!(*fake_jj.tidyws_calls.lock().unwrap(), 0);
         assert_eq!(*fake_jj.tidy_calls.lock().unwrap(), 0);
     }
@@ -5463,55 +5594,59 @@ mod tests {
     }
 
     #[test]
-    fn lift_selected_rebases_the_selected_workspace_and_reports() {
-        let fake = FakeJj {
-            outcome: FakeOutcome {
-                lift_ok: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
+    fn lift_selected_queues_the_workspace_and_reports_on_completion() {
         // "default" is the sole workspace, so it is the selection.
-        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
-        app.handle(press(KeyCode::Char('r')));
-        assert_eq!(*fake.lifted.lock().unwrap(), vec!["default".to_string()]);
+        let mut app = app_with(&["default"]);
+        let effects = app.handle(press(KeyCode::Char('r')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Lift { job: LiftJob::Workspace(ws) }] if ws == "default"
+        ));
+        assert_eq!(app.status.as_deref(), Some("lifting default…"));
+
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Ok(true),
+        });
         assert_eq!(app.status.as_deref(), Some("lifted default onto trunk"));
     }
 
     #[test]
     fn lift_selected_reports_nothing_to_lift_when_already_on_trunk() {
-        let fake = FakeJj::default(); // lift_ok defaults to false
-        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Char('r')));
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Ok(false),
+        });
         assert_eq!(app.status.as_deref(), Some("default: nothing to lift"));
     }
 
     #[test]
     fn lift_selected_surfaces_the_jj_error() {
-        let fake = FakeJj {
-            outcome: FakeOutcome {
-                fail: Some("immutable commit".to_string()),
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
+        let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Char('r')));
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Err("immutable commit".to_string()),
+        });
         assert_eq!(app.status.as_deref(), Some("lift failed: immutable commit"));
     }
 
     #[test]
-    fn lift_all_rebases_every_workspace_and_reports() {
-        let fake = FakeJj {
-            outcome: FakeOutcome {
-                lift_all_ok: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut app = app_with_jj(&["default", "feat"], Box::new(fake.clone()));
-        app.handle(press(KeyCode::Char('R')));
-        assert_eq!(*fake.lift_all_calls.lock().unwrap(), 1);
+    fn lift_all_queues_one_all_job_and_reports() {
+        let mut app = app_with(&["default", "feat"]);
+        let effects = app.handle(press(KeyCode::Char('R')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Lift { job: LiftJob::All }]
+        ));
+        assert_eq!(app.status.as_deref(), Some("lifting all workspaces…"));
+
+        app.handle(Msg::Lifted {
+            job: LiftJob::All,
+            result: Ok(true),
+        });
         assert_eq!(
             app.status.as_deref(),
             Some("lifted all workspaces onto trunk")
@@ -5519,16 +5654,70 @@ mod tests {
     }
 
     #[test]
+    fn a_duplicate_lift_press_is_ignored_while_in_flight() {
+        let mut app = app_with(&["default"]);
+        assert!(!app.handle(press(KeyCode::Char('r'))).is_empty());
+        // A second press while the first is in flight queues no new lift.
+        let effects = app.handle(press(KeyCode::Char('r')));
+        assert!(!effects.iter().any(|e| matches!(e, Effect::Lift { .. })));
+        assert_eq!(app.status.as_deref(), Some("default: already queued"));
+    }
+
+    #[test]
+    fn a_second_workspace_queues_and_runs_after_the_first_completes() {
+        let mut app = app_with(&["default", "feat"]);
+        // "default" starts immediately; "feat" waits behind it.
+        assert!(matches!(
+            app.handle(press(KeyCode::Char('r'))).as_slice(),
+            [Effect::Lift { job: LiftJob::Workspace(ws) }] if ws == "default"
+        ));
+        app.handle(press(KeyCode::Down));
+        // The second press queues behind the first (no new lift starts yet).
+        assert!(app.handle(press(KeyCode::Char('r'))).is_empty());
+        assert_eq!(app.status.as_deref(), Some("lifting default… (1 queued)"));
+
+        // Completing the first pumps the second.
+        let effects = app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Ok(true),
+        });
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Lift { job: LiftJob::Workspace(ws) }] if ws == "feat"
+        ));
+        assert_eq!(app.status.as_deref(), Some("lifting feat…"));
+
+        // Draining the queue reports the batch summary.
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("feat".to_string()),
+            result: Ok(true),
+        });
+        assert_eq!(
+            app.status.as_deref(),
+            Some("lifted 2 workspace(s) onto trunk")
+        );
+    }
+
+    #[test]
+    fn queued_and_in_flight_lifts_are_visible_per_row() {
+        let mut app = app_with(&["default", "feat"]);
+        app.handle(press(KeyCode::Char('r'))); // default in flight
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Char('r'))); // feat queued
+        assert!(app.is_lifting("default"));
+        assert!(!app.is_lifting("feat"));
+        assert!(app.is_lift_queued("feat"));
+        assert!(!app.is_lift_queued("default"));
+    }
+
+    #[test]
     fn status_clears_when_its_expiry_fires() {
-        let fake = FakeJj {
-            outcome: FakeOutcome {
-                lift_ok: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut app = app_with_jj(&["default"], Box::new(fake));
+        let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Char('r')));
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Ok(true),
+        });
         assert!(app.status.is_some());
         app.handle(Msg::StatusExpired(app.status_gen));
         assert!(app.status.is_none());
@@ -5536,21 +5725,22 @@ mod tests {
 
     #[test]
     fn stale_expiry_leaves_a_newer_status_alone() {
-        let fake = FakeJj {
-            outcome: FakeOutcome {
-                lift_ok: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-        let mut app = app_with_jj(&["default"], Box::new(fake));
+        let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Char('r')));
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Ok(true),
+        });
         let stale = app.status_gen;
         // A second action replaces the message before the first timer fires.
-        app.handle(press(KeyCode::Char('R')));
-        assert_eq!(app.status.as_deref(), Some("nothing to lift"));
+        app.handle(press(KeyCode::Char('r')));
+        app.handle(Msg::Lifted {
+            job: LiftJob::Workspace("default".to_string()),
+            result: Ok(false),
+        });
+        assert_eq!(app.status.as_deref(), Some("default: nothing to lift"));
         app.handle(Msg::StatusExpired(stale));
-        assert_eq!(app.status.as_deref(), Some("nothing to lift"));
+        assert_eq!(app.status.as_deref(), Some("default: nothing to lift"));
     }
 
     #[test]

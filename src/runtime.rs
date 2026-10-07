@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{Msg, PendingWorkspace, STATUS_TTL};
+use crate::app::{LiftJob, Msg, PendingWorkspace, STATUS_TTL};
 use crate::config::ForgeConfig;
 use crate::diff;
 use crate::forge::{self, Target};
@@ -40,6 +40,9 @@ pub(crate) enum Effect {
     },
     /// Run a remote fetch and report [`Msg::Fetched`].
     Fetch,
+    /// Run one queued lift (a single workspace or all of them) and report
+    /// [`Msg::Lifted`].
+    Lift { job: LiftJob },
     /// Run the forge pipeline for these targets, streaming [`Msg::Forge`].
     StartForge { targets: Vec<Target> },
 }
@@ -80,6 +83,7 @@ impl Runtime {
                 operation,
             } => self.delete_workspace(workspace, operation),
             Effect::Fetch => self.fetch(),
+            Effect::Lift { job } => self.lift(job),
             Effect::StartForge { targets } => self.start_forge(targets),
         }
     }
@@ -192,6 +196,27 @@ impl Runtime {
                 .await
                 .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
             let _ = tx.send(Msg::Fetched(result.map_err(|e| format!("{e:#}"))));
+        });
+    }
+
+    /// Run one queued lift on a blocking worker (jj takes the repo lock, so it
+    /// must never run on the render loop), then report it as [`Msg::Lifted`]. The
+    /// App owns the serial queue; this executes exactly one job per effect.
+    fn lift(&self, job: LiftJob) {
+        let tx = self.tx.clone();
+        let repo_root = self.repo_root.clone();
+        tokio::spawn(async move {
+            let worker_job = job.clone();
+            let result = tokio::task::spawn_blocking(move || match worker_job {
+                LiftJob::Workspace(ws) => jj::lift(&repo_root, &ws),
+                LiftJob::All => jj::lift_all(&repo_root),
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+            let _ = tx.send(Msg::Lifted {
+                job,
+                result: result.map_err(|e| format!("{e:#}")),
+            });
         });
     }
 

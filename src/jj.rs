@@ -131,20 +131,6 @@ pub trait Jj: Send {
     /// matched. A no-op (returning 0) when nothing is eligible. Destructive -
     /// callers confirm first.
     fn tidy(&self) -> anyhow::Result<usize>;
-
-    /// Rebase one workspace's own mutable stack onto the trunk base
-    /// ([`crate::trunk::as_revset`]), lifting it up to date **without pushing** -
-    /// the local remedy for a `behind` workspace, for empty and non-empty alike.
-    /// `-s` moves the whole stack; `--skip-emptied` drops commits the rebase makes
-    /// empty (e.g. an idle empty `@`, recreated on trunk). Returns `false` when the
-    /// workspace has nothing of ours to lift. Idempotent: a no-op when already on
-    /// the trunk tip.
-    fn lift(&self, ws: &str) -> anyhow::Result<bool>;
-
-    /// Lift every workspace's stack onto the trunk base in one rebase (the bulk
-    /// form of [`lift`](Jj::lift), keyed off every workspace's `@` via
-    /// `working_copies()`). Returns `false` when there is nothing to lift.
-    fn lift_all(&self) -> anyhow::Result<bool>;
 }
 
 /// The real jj, driving the CLI against a fixed repo root. Each method performs
@@ -189,32 +175,44 @@ impl Jj for RealJj {
         run_mut(&self.repo_root, &["abandon", TIDY_REVSET])?;
         Ok(n)
     }
+}
 
-    fn lift(&self, ws: &str) -> anyhow::Result<bool> {
-        let src = lift_src(ws);
-        if count(&self.repo_root, &src) == 0 {
-            return Ok(false);
-        }
-        let trunk = crate::trunk::as_revset();
-        run_mut(
-            &self.repo_root,
-            &["rebase", "--skip-emptied", "-s", &src, "-d", &trunk],
-        )?;
-        Ok(true)
+/// Rebase one workspace's own mutable stack onto the trunk base
+/// ([`crate::trunk::as_revset`]), lifting it up to date **without pushing** - the
+/// local remedy for a `behind` workspace, for empty and non-empty alike. `-s`
+/// moves the whole stack; `--skip-emptied` drops commits the rebase makes empty
+/// (e.g. an idle empty `@`, recreated on trunk). Returns `false` when the
+/// workspace has nothing of ours to lift. Idempotent: a no-op when already on the
+/// trunk tip. Blocking - callers must run it off the render loop
+/// (`spawn_blocking`), which is why it is a free function rather than a [`Jj`]
+/// method (the boxed trait object cannot move to a worker thread).
+pub fn lift(repo_root: &Path, ws: &str) -> anyhow::Result<bool> {
+    let src = lift_src(ws);
+    if count(repo_root, &src) == 0 {
+        return Ok(false);
     }
+    let trunk = crate::trunk::as_revset();
+    run_mut(
+        repo_root,
+        &["rebase", "--skip-emptied", "-s", &src, "-d", &trunk],
+    )?;
+    Ok(true)
+}
 
-    fn lift_all(&self) -> anyhow::Result<bool> {
-        let src = "roots(mutable() & mine() & ::working_copies())";
-        if count(&self.repo_root, src) == 0 {
-            return Ok(false);
-        }
-        let trunk = crate::trunk::as_revset();
-        run_mut(
-            &self.repo_root,
-            &["rebase", "--skip-emptied", "-s", src, "-d", &trunk],
-        )?;
-        Ok(true)
+/// Lift every workspace's stack onto the trunk base in one rebase (the bulk form
+/// of [`lift`], keyed off every workspace's `@` via `working_copies()`). Returns
+/// `false` when there is nothing to lift. Blocking, like [`lift`].
+pub fn lift_all(repo_root: &Path) -> anyhow::Result<bool> {
+    let src = "roots(mutable() & mine() & ::working_copies())";
+    if count(repo_root, src) == 0 {
+        return Ok(false);
     }
+    let trunk = crate::trunk::as_revset();
+    run_mut(
+        repo_root,
+        &["rebase", "--skip-emptied", "-s", src, "-d", &trunk],
+    )?;
+    Ok(true)
 }
 
 /// Fetch from the git remote (`jj git fetch`), surfacing jj's error text on
