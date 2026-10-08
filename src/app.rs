@@ -8,10 +8,10 @@ use std::time::{Duration, Instant};
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
-use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, ListItem, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
@@ -22,7 +22,8 @@ use crate::graph;
 use crate::jj;
 use crate::pool_session::{PoolSession, PoolUpdate};
 use crate::render;
-use crate::render::graph::{render_graph_pane, world_graph_lines};
+use crate::render::graph::world_graph_lines;
+use crate::render::pool::{PoolPane, PoolView};
 use crate::render::style::{dim_line, elide_right, now_millis, pane_border};
 use crate::render::view::{HomeRow, RowMarker};
 use crate::runtime::Effect;
@@ -36,10 +37,7 @@ use crate::workspace_dispatch::{
     WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
-use wsg_core::{
-    AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
-    WorkerPoolSnapshot, WorkerStatus,
-};
+use wsg_core::{WorkerPoolSnapshot, WorkerStatus};
 
 /// The focused Worker Pool management interaction.
 enum PoolMode {
@@ -2135,7 +2133,7 @@ impl App {
         if matches!(base_mode, Mode::Pool(_)) {
             self.render_pool(frame);
             if matches!(self.mode, Mode::Help(_)) {
-                self.render_help(frame, POOL_BINDINGS);
+                render::help::draw(frame, POOL_BINDINGS);
             }
             return;
         }
@@ -2231,7 +2229,7 @@ impl App {
         frame.render_widget(self.footer(), footer);
 
         if matches!(self.mode, Mode::Help(_)) {
-            self.render_help(frame, NORMAL_BINDINGS);
+            render::help::draw(frame, NORMAL_BINDINGS);
         }
     }
 
@@ -2269,304 +2267,27 @@ impl App {
     }
 
     fn render_pool(&mut self, frame: &mut Frame) {
-        let [header, body, footer] = Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .horizontal_margin(2)
-        .areas(frame.area());
-        frame.render_widget(
-            Paragraph::new(Span::styled(
-                "Worker Pool  [p management]",
-                Style::default().add_modifier(Modifier::BOLD),
-            )),
-            header,
-        );
-
-        let mut lines = Vec::new();
-        if let Some(snapshot) = &self.pool.worker_pool {
-            let capacity = snapshot
-                .pool()
-                .and_then(|pool| usize::try_from(pool.size()).ok())
-                .map_or_else(|| "missing".to_string(), |capacity| capacity.to_string());
-            lines.push(Line::from(format!(" capacity: {capacity}")));
-            if let Some(runtime) = snapshot.pool().and_then(|pool| pool.agent_runtime()) {
-                lines.push(Line::from(format!(" profile: {}", runtime.as_str())));
-            }
-            if snapshot.workers().is_empty() {
-                lines.push(dim_line(" (no Workers)"));
-            }
-            let selected = self.pool_selected();
-            for worker in snapshot.workers() {
-                let marker = if selected == Some(worker.worker_id().as_str()) {
-                    "▸"
-                } else {
-                    "·"
-                };
-                let line = if body.width < 55 {
-                    format!(
-                        " {marker} {}  {}  runtime: {}  ticket:{}",
-                        worker.worker_id(),
-                        worker.status().as_str(),
-                        worker
-                            .agent_runtime()
-                            .map_or("-", |runtime| runtime.as_str()),
-                        worker.ticket().unwrap_or("-")
-                    )
-                } else {
-                    format!(
-                        " {marker} {}  {:<7} {}  runtime: {}  {}",
-                        worker.worker_id(),
-                        worker.status().as_str(),
-                        worker.alias(),
-                        worker
-                            .agent_runtime()
-                            .map_or("-", |runtime| runtime.as_str()),
-                        worker.workspace()
-                    )
-                };
-                lines.push(Line::from(line));
-            }
-            for diagnostic in snapshot.diagnostics() {
-                lines.push(Line::from(Span::styled(
-                    format!(" ! {}", diagnostic.message()),
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            if let Some(progress) = &self.pool.group_progress {
-                let counts = progress.counts();
-                let terminal = if progress.is_terminal() {
-                    " terminal"
-                } else {
-                    ""
-                };
-                lines.push(dim_line(&format!(
-                    " Dispatch Group {}  runtime: {}  waves: {}  done: {}  failed: {}  skipped: {}{}",
-                    progress.parent(),
-                    progress.runtime().as_str(),
-                    progress.maximum_wave(),
-                    counts.done(),
-                    counts.failed(),
-                    counts.skipped(),
-                    terminal
-                )));
-                if !progress.ready().is_empty() {
-                    lines.push(Line::from(format!(
-                        "  ready: {}",
-                        progress
-                            .ready()
-                            .iter()
-                            .map(wsg_core::TicketId::as_str)
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )));
-                }
-                for issue in progress.issues() {
-                    let blockers = if issue.blockers().is_empty() {
-                        String::new()
-                    } else {
-                        format!(
-                            "  blocked by {}",
-                            issue
-                                .blockers()
-                                .iter()
-                                .map(wsg_core::TicketId::as_str)
-                                .collect::<Vec<_>>()
-                                .join(", ")
-                        )
-                    };
-                    let retry = if issue.retries() > 0 {
-                        format!("  retry {}", issue.retries())
-                    } else {
-                        String::new()
-                    };
-                    lines.push(Line::from(format!(
-                        "  wave {}  {:<10} {}  {} -> {}{}{}",
-                        issue.wave(),
-                        issue.status().as_str(),
-                        issue.ticket(),
-                        issue.title(),
-                        issue
-                            .worker()
-                            .map_or("unassigned", wsg_core::WorkerId::as_str),
-                        retry,
-                        blockers
-                    )));
-                }
-            }
-            match &self.mode {
-                Mode::Pool(PoolMode::DispatchPreview { tickets, selected }) => {
-                    lines.push(dim_line(" Dispatch preview:"));
-                    for ticket in tickets {
-                        let target = if tickets.len() == 1 {
-                            selected.as_deref().unwrap_or("no Worker")
-                        } else {
-                            "first idle Worker"
-                        };
-                        lines.push(Line::from(format!("  ? {ticket} -> {target}")));
-                    }
-                }
-                Mode::Pool(PoolMode::ReadyPreview { .. }) => {
-                    if let Some(ready) = &self.pool.ready_tickets {
-                        lines.push(dim_line(" Ready Ticket preview:"));
-                        for ticket in ready.tickets() {
-                            lines.push(Line::from(format!(
-                                "  ? {}  {}",
-                                ticket.id(),
-                                ticket.title()
-                            )));
-                        }
-                        for diagnostic in ready.diagnostics() {
-                            lines.push(Line::from(Span::styled(
-                                format!(" ! {diagnostic}"),
-                                Style::default().fg(Color::Yellow),
-                            )));
-                        }
-                    }
-                }
-                _ => {}
-            }
-            if let Some(session) = &self.pool.worker_session {
-                let session_text = match session.session() {
-                    AgentSessionResolution::Resumed { session_id } => {
-                        format!("resumed session {session_id}")
-                    }
-                    AgentSessionResolution::Fresh { reason } => {
-                        format!("fresh session ({reason})")
-                    }
-                };
-                lines.push(dim_line(&format!(
-                    " {} {}  runtime: {}  PID {}",
-                    session.action().as_str(),
-                    session.worker(),
-                    session.runtime().as_str(),
-                    session.pid()
-                )));
-                lines.push(Line::from(format!("  {session_text}")));
-            }
-            if let Some(result) = &self.pool.worker_command_result {
-                lines.push(dim_line(&format!(" Worker action: {}", result.notice())));
-            }
-            if let Some(result) = &self.pool.dispatch_result {
-                lines.push(dim_line(&format!(
-                    " Dispatch outcomes (runtime: {}):",
-                    result.runtime().as_str()
-                )));
-                for outcome in result.outcomes() {
-                    let line = if outcome.succeeded() {
-                        format!(
-                            "  ✓ {}  {} -> {} (PID {})",
-                            outcome.ticket(),
-                            outcome.title(),
-                            outcome.worker().unwrap_or("?"),
-                            outcome.pid().unwrap_or_default()
-                        )
-                    } else {
-                        format!(
-                            "  ✗ {} [{}] {}",
-                            outcome.ticket(),
-                            outcome.phase().unwrap_or("unknown"),
-                            outcome.detail().unwrap_or("Dispatch failed")
-                        )
-                    };
-                    lines.push(Line::from(line));
-                }
-            }
-            if let Mode::Pool(PoolMode::LogDetail { worker }) = &self.mode {
-                lines.push(dim_line(&format!(" Worker log: {worker}")));
-                if let Some(error) = &self.pool.worker_log_error {
-                    lines.push(Line::from(Span::styled(
-                        format!(" ! {error}"),
-                        Style::default().fg(Color::Yellow),
-                    )));
-                } else if let Some(snapshot) = &self.pool.worker_log {
-                    lines.push(Line::from(format!(
-                        " runtime: {}  worker: {}",
-                        snapshot.runtime().as_str(),
-                        snapshot.worker()
-                    )));
-                    match snapshot.activity() {
-                        Some(activity) => lines.push(Line::from(format!(
-                            " activity: {}",
-                            worker_activity_line(activity)
-                        ))),
-                        None => lines.push(dim_line(" no recognized activity yet")),
-                    }
-                    if let Some(result) = snapshot.result() {
-                        lines.push(Line::from(format!(
-                            " result: {}",
-                            worker_result_line(result)
-                        )));
-                    }
-                } else {
-                    lines.push(dim_line(" loading latest activity..."));
-                }
-            }
-        } else {
-            lines.push(dim_line(" loading Worker Pool..."));
-        }
-        frame.render_widget(
-            Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title(" pool ")),
-            body,
-        );
-        frame.render_widget(self.footer(), footer);
+        let view = self.pool_view();
+        let footer = self.footer();
+        render::pool::draw(frame, &view, footer);
     }
 
-    /// The `?` overlay: a centered, bordered box listing every binding
-    /// (label-left, key-right) drawn over a dimmed copy of the list behind it.
-    fn render_help(&self, frame: &mut Frame, bindings: &[(&str, &str)]) {
-        let label_w = bindings
-            .iter()
-            .map(|(label, _)| label.chars().count())
-            .max()
-            .unwrap_or(0);
-        let key_w = bindings
-            .iter()
-            .map(|(_, key)| key.chars().count())
-            .max()
-            .unwrap_or(0);
-
-        let lines: Vec<Line> = bindings
-            .iter()
-            .map(|(label, key)| {
-                Line::from(vec![
-                    Span::raw(format!(" {label:<label_w$}")),
-                    Span::raw("   "),
-                    Span::styled(
-                        format!("{key:>key_w$} "),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                ])
-            })
-            .collect();
-
-        // Inner content is " label   key " plus the two borders.
-        let width = (label_w + key_w + 5) as u16 + 2;
-        let height = bindings.len() as u16 + 2;
-        let area = centered_rect(frame.area(), width, height);
-
-        // Dim everything already drawn so the popup reads as the foreground,
-        // then punch the popup area clear before drawing it.
-        let full = frame.area();
-        let buf = frame.buffer_mut();
-        for y in full.top()..full.bottom() {
-            for x in full.left()..full.right() {
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_style(Style::default().add_modifier(Modifier::DIM));
-                }
-            }
+    /// Project the Pool session and focused pane into the read-only pool view.
+    fn pool_view(&self) -> PoolView<'_> {
+        let pane = match self.pool_mode() {
+            Some(PoolMode::DispatchPreview { tickets, selected }) => PoolPane::DispatchPreview {
+                tickets,
+                selected: selected.as_deref(),
+            },
+            Some(PoolMode::ReadyPreview { .. }) => PoolPane::ReadyPreview,
+            Some(PoolMode::LogDetail { worker }) => PoolPane::LogDetail { worker },
+            _ => PoolPane::View,
+        };
+        PoolView {
+            session: &self.pool,
+            pane,
+            selected_worker: self.pool_selected(),
         }
-
-        frame.render_widget(Clear, area);
-        frame.render_widget(
-            Paragraph::new(lines).block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Keybindings "),
-            ),
-            area,
-        );
     }
 
     /// The full-screen diff detail: a title line, a horizontal split of the
@@ -2579,50 +2300,7 @@ impl App {
         let Mode::Detail(d) = mode else {
             return;
         };
-
-        let [title, body, footer] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
-        .horizontal_margin(2)
-        .areas(frame.area());
-
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("diff  ", Style::default().add_modifier(Modifier::DIM)),
-                Span::styled(
-                    d.workspace().to_string(),
-                    Style::default().add_modifier(Modifier::BOLD),
-                ),
-                Span::styled("  from trunk", Style::default().add_modifier(Modifier::DIM)),
-            ])),
-            title,
-        );
-
-        // The per-workspace graph strip rides on the right, but only when there is
-        // room for files + a usable diff + the strip; otherwise it is dropped so a
-        // narrow terminal keeps a readable diff (graceful degradation, AC 4).
-        let show_graph = body.width >= FILES_PANE_WIDTH + GRAPH_PANE_WIDTH + MIN_DIFF_WIDTH;
-        if show_graph {
-            let [files_area, diff_area, graph_area] = Layout::horizontal([
-                Constraint::Length(FILES_PANE_WIDTH),
-                Constraint::Min(0),
-                Constraint::Length(GRAPH_PANE_WIDTH),
-            ])
-            .areas(body);
-            d.render_files(frame, files_area);
-            d.render_diff(frame, diff_area);
-            render_graph_pane(frame, graph.as_ref(), d.workspace(), graph_area);
-        } else {
-            let [files_area, diff_area] =
-                Layout::horizontal([Constraint::Length(FILES_PANE_WIDTH), Constraint::Min(0)])
-                    .areas(body);
-            d.render_files(frame, files_area);
-            d.render_diff(frame, diff_area);
-        }
-
-        frame.render_widget(d.footer(), footer);
+        render::detail::draw(frame, d, graph.as_ref());
     }
 
     /// The full-screen world graph: a title, the bordered graph (trunk plus every
@@ -2874,71 +2552,9 @@ impl App {
     }
 }
 
-fn worker_activity_line(activity: &RunActivity) -> String {
-    let detail = match activity.kind() {
-        RunActivityKind::SessionStarted => "session started".to_owned(),
-        RunActivityKind::Message { text } => text.clone(),
-        RunActivityKind::Reasoning { text } => format!("reasoning: {text}"),
-        RunActivityKind::Warning { message } => format!("warning: {message}"),
-        RunActivityKind::FileChanges { paths } => format!("files: {}", paths.join(", ")),
-        RunActivityKind::Plan { completed, total } => format!("plan: {completed}/{total}"),
-        RunActivityKind::Tool {
-            name,
-            detail,
-            status,
-        } => format!(
-            "tool {name} {status:?}{}",
-            detail
-                .as_deref()
-                .map_or(String::new(), |value| format!(" {value}"))
-        ),
-        RunActivityKind::Collaboration(event) => format!("collaboration: {:?}", event),
-    };
-    match activity.usage() {
-        Some(usage) => format!("{detail} [{}]", worker_usage_line(usage)),
-        None => detail,
-    }
-}
-
-fn worker_usage_line(usage: &RunUsage) -> String {
-    format!(
-        "input {} cached {} output {} reasoning {}",
-        usage.input_tokens(),
-        usage.cached_input_tokens(),
-        usage.output_tokens(),
-        usage.reasoning_output_tokens()
-    )
-}
-
-fn worker_result_line(result: &RunResult) -> String {
-    match result.conclusion() {
-        RunConclusion::Succeeded => "succeeded".to_owned(),
-        RunConclusion::Failed { message } => format!("failed: {message}"),
-    }
-}
-
-const FILES_PANE_WIDTH: u16 = 34;
-/// Width of the per-workspace graph strip in the detail view (borders included).
-const GRAPH_PANE_WIDTH: u16 = 34;
-/// Minimum diff width to keep the strip; below this the strip is dropped so a
-/// narrow terminal keeps a readable diff.
-const MIN_DIFF_WIDTH: u16 = 40;
 /// Minimum rows (borders included) the inline world pane needs; when half the
 /// home body is shorter than this the pane is dropped so the list stays usable.
 const MIN_WORLD_PANE_HEIGHT: u16 = 5;
-
-/// A `width` x `height` rect centered in `area`, clamped so it never exceeds the
-/// frame - the popup shrinks to fit a short/narrow terminal instead of panicking.
-fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    Rect {
-        x: area.x + area.width.saturating_sub(w) / 2,
-        y: area.y + area.height.saturating_sub(h) / 2,
-        width: w,
-        height: h,
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -2955,6 +2571,9 @@ mod tests {
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
+    use wsg_core::{
+        AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult,
+    };
 
     /// A `Terminal` that records calls instead of driving kitty, so key handling
     /// is testable without a real multiplexer. Cloning shares the recorders, so a
