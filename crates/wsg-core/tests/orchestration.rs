@@ -68,6 +68,46 @@ fn orchestration_request_and_repository_expose_the_frontend_neutral_seam() {
 }
 
 #[test]
+fn progress_projects_a_persisted_group_and_reports_absence() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let ticket = TicketId::parse("ENG-101").expect("Sub-issue");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-08-04T12:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    group.sub_issues.insert(
+        ticket.clone(),
+        SubIssueState::new("Foundation", WireStatus::new("pending"), Vec::new()),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent.clone())
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save group");
+
+    let runner = repository.orchestration_runner();
+    let progress = runner
+        .progress(&parent)
+        .expect("projection")
+        .expect("persisted group");
+    assert_eq!(progress.parent(), &parent);
+    assert_eq!(progress.runtime(), AgentRuntime::Claude);
+    assert_eq!(progress.issues().len(), 1);
+    assert_eq!(progress.issues()[0].ticket(), &ticket);
+    assert_eq!(progress.issues()[0].wave(), 1);
+    assert_eq!(progress.ready(), &[ticket]);
+    assert_eq!(progress.maximum_wave(), 1);
+
+    let absent = TicketId::parse("ENG-999").expect("unknown Parent");
+    assert!(runner.progress(&absent).expect("projection").is_none());
+}
+
+#[test]
 fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     let directory = TempDir::new().expect("temporary repository");
     let output = Command::new("jj")

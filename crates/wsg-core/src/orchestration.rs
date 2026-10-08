@@ -18,11 +18,11 @@ use crate::pool::current_timestamp;
 use crate::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
     DirectDispatchRequest, DirectDispatchSuccess, DispatchGroup, DispatchGroupBuildOptions,
-    DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions, DispatchGroupState,
-    DispatchGroupStatusCounts, Expected, Loaded, ParentTicket, Repository, RepositoryIdentity,
-    Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket, TicketDiscovery,
-    TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp, WorkerActions,
-    WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions, DispatchGroupProgress,
+    DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded, ParentTicket, Repository,
+    RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket,
+    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -787,6 +787,27 @@ impl OrchestrationRunner {
     /// Returns the Repository root owned by this runner.
     pub fn repository_root(&self) -> &Path {
         self.repository.root()
+    }
+
+    /// Projects the persisted Dispatch Group for a Parent Ticket without
+    /// performing rendering or execution.
+    ///
+    /// Returns `Ok(None)` when no group is persisted for the Parent, keeping the
+    /// state store behind the orchestration seam.
+    pub fn progress(
+        &self,
+        parent: &TicketId,
+    ) -> Result<Option<DispatchGroupProgress>, OrchestrationError> {
+        let repository = self.repository.state_store().dispatch_group(parent.clone());
+        match repository
+            .load()
+            .map_err(|error| OrchestrationError::Execution(error.to_string()))?
+        {
+            Loaded::Present(versioned) => Ok(Some(
+                DispatchGroup::from_state(versioned.value)?.progress()?,
+            )),
+            Loaded::Missing => Ok(None),
+        }
     }
 
     /// Reserves a placeholder while discovering children, then releases it before

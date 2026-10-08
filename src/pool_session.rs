@@ -7,11 +7,10 @@
 //! events through `apply`, and reads the projection when rendering the Pool.
 
 use crate::workspace_dispatch::{
-    DispatchCapacityShortage, DispatchGroupProgress, DispatchResult, OperationId,
-    ReadyTicketResult, WorkerCommandResult, WorkerLogSnapshot, WorkerSessionOutcome,
-    WorkspaceDispatchEvent, WorkspaceRestorationResult,
+    DispatchCapacityShortage, DispatchResult, OperationId, ReadyTicketResult, WorkerCommandResult,
+    WorkerLogSnapshot, WorkerSessionOutcome, WorkspaceDispatchEvent, WorkspaceRestorationResult,
 };
-use wsg_core::WorkerPoolSnapshot;
+use wsg_core::{DispatchGroupProgress, WorkerPoolSnapshot};
 
 /// The App-facing consequence of one accepted Dispatch event.
 #[derive(Debug)]
@@ -170,18 +169,6 @@ impl PoolSession {
                         PoolUpdate::ReadyPreview,
                         PoolUpdate::Status(format!("Found {count} Ready Ticket(s)")),
                     ];
-                }
-                Vec::new()
-            }
-            WorkspaceDispatchEvent::GroupProgress {
-                operation,
-                progress,
-            } => {
-                if operation == 0
-                    || self.active_operation == Some(operation)
-                    || self.orchestration_operation == Some(operation)
-                {
-                    self.group_progress = Some(progress);
                 }
                 Vec::new()
             }

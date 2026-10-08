@@ -2361,14 +2361,27 @@ impl App {
                 if !progress.ready().is_empty() {
                     lines.push(Line::from(format!(
                         "  ready: {}",
-                        progress.ready().join(", ")
+                        progress
+                            .ready()
+                            .iter()
+                            .map(wsg_core::TicketId::as_str)
+                            .collect::<Vec<_>>()
+                            .join(", ")
                     )));
                 }
                 for issue in progress.issues() {
                     let blockers = if issue.blockers().is_empty() {
                         String::new()
                     } else {
-                        format!("  blocked by {}", issue.blockers().join(", "))
+                        format!(
+                            "  blocked by {}",
+                            issue
+                                .blockers()
+                                .iter()
+                                .map(wsg_core::TicketId::as_str)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
                     };
                     let retry = if issue.retries() > 0 {
                         format!("  retry {}", issue.retries())
@@ -2381,7 +2394,9 @@ impl App {
                         issue.status().as_str(),
                         issue.ticket(),
                         issue.title(),
-                        issue.worker().unwrap_or("unassigned"),
+                        issue
+                            .worker()
+                            .map_or("unassigned", wsg_core::WorkerId::as_str),
                         retry,
                         blockers
                     )));
@@ -5228,14 +5243,12 @@ mod tests {
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
-        let progress = crate::workspace_dispatch::DispatchGroupProgress::from_state(state).unwrap();
+        let progress = wsg_core::DispatchGroup::from_state(state)
+            .unwrap()
+            .progress()
+            .unwrap();
         app.mode = Mode::Pool(PoolMode::View { selected: None });
-        app.handle(Msg::WorkspaceDispatch(
-            WorkspaceDispatchEvent::GroupProgress {
-                operation: 0,
-                progress,
-            },
-        ));
+        app.pool.group_progress = Some(progress);
 
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 15)).unwrap();

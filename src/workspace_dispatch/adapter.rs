@@ -383,11 +383,9 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
                     return;
                 }
                 let notice = orchestration_notice(&event);
-                let progress = match repository.state_store().dispatch_group(id.clone()).load() {
-                    Ok(wsg_core::Loaded::Present(versioned)) => {
-                        DispatchGroupProgress::from_state(versioned.value)
-                    }
-                    Ok(wsg_core::Loaded::Missing) => Err(format!(
+                let progress = match runner.progress(&id) {
+                    Ok(Some(progress)) => Ok(progress),
+                    Ok(None) => Err(format!(
                         "Dispatch Group {id} disappeared during orchestration"
                     )),
                     Err(error) => Err(error.to_string()),

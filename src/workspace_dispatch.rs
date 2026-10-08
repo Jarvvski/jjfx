@@ -11,10 +11,10 @@ use std::sync::{Arc, Mutex};
 use wsg_core::{
     AgentRuntime, AgentRuntimeQuery, AgentSessionResolution, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchFailurePhase, DirectDispatchOutcome,
-    DirectDispatchRequest, DispatchGroup, DispatchGroupState, DispatchGroupStatusCounts,
+    DirectDispatchRequest, DispatchGroupProgress, DispatchGroupStatusCounts,
     PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, RunActivity,
-    RunMode, RunResult, SubIssueStatus, TicketDiscovery, TicketId, TicketStatus, WorkerId,
-    WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
+    RunMode, RunResult, TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError,
+    WorkerPoolSnapshot, WorkerStatus,
 };
 
 mod adapter;
@@ -517,176 +517,6 @@ impl ReadyTicket {
     }
 }
 
-/// Immutable Dispatch Group progress reduced to presentation data.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchGroupProgress {
-    parent: String,
-    runtime: AgentRuntime,
-    issues: Vec<DispatchIssueProgress>,
-    ready: Vec<String>,
-    maximum_wave: usize,
-    counts: DispatchGroupStatusCounts,
-    terminal: bool,
-}
-
-impl DispatchGroupProgress {
-    // The orchestration adapter consumes this projection in the next vertical slice.
-    #[allow(dead_code)]
-    pub(crate) fn from_state(state: DispatchGroupState) -> Result<Self, String> {
-        let group = DispatchGroup::from_state(state).map_err(|error| error.to_string())?;
-        let state = group.state();
-        let runtime =
-            AgentRuntime::from_configured(state.opts.agent.as_ref()).map_err(|value| {
-                format!("invalid persisted Agent Runtime {value:?} in Dispatch Group")
-            })?;
-        let mut waves = BTreeMap::new();
-        let issues = state
-            .sub_issues
-            .iter()
-            .map(|(ticket, issue)| {
-                let status =
-                    SubIssueStatus::try_from(&issue.status).map_err(|error| error.to_string())?;
-                let wave = dependency_wave(ticket, state, &mut waves);
-                Ok(DispatchIssueProgress {
-                    ticket: ticket.to_string(),
-                    title: issue.title.clone(),
-                    status,
-                    blockers: issue.blocked_by.iter().map(ToString::to_string).collect(),
-                    worker: issue.worker.as_ref().map(ToString::to_string),
-                    retries: issue.retries,
-                    wave,
-                })
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        let ready = group.ready().iter().map(ToString::to_string).collect();
-        Ok(Self {
-            parent: state.parent.to_string(),
-            runtime,
-            issues,
-            ready,
-            maximum_wave: group.maximum_wave_size(),
-            counts: group.status_counts(),
-            terminal: group.is_terminal(),
-        })
-    }
-
-    /// Returns the Parent Ticket identifier.
-    pub fn parent(&self) -> &str {
-        &self.parent
-    }
-
-    /// Returns the persisted Agent Runtime without provider configuration details.
-    pub const fn runtime(&self) -> AgentRuntime {
-        self.runtime
-    }
-
-    /// Returns the stable, provider-order-independent Sub-issue rows.
-    pub fn issues(&self) -> &[DispatchIssueProgress] {
-        &self.issues
-    }
-
-    /// Returns currently dispatchable Tickets in stable order.
-    pub fn ready(&self) -> &[String] {
-        &self.ready
-    }
-
-    /// Returns the largest dependency wave width.
-    pub const fn maximum_wave(&self) -> usize {
-        self.maximum_wave
-    }
-
-    /// Returns terminal outcome counts.
-    pub const fn counts(&self) -> DispatchGroupStatusCounts {
-        self.counts
-    }
-
-    /// Reports whether all Sub-issues have reached terminal states.
-    pub const fn is_terminal(&self) -> bool {
-        self.terminal
-    }
-}
-
-/// One immutable Sub-issue row in Dispatch Group progress.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchIssueProgress {
-    ticket: String,
-    title: String,
-    status: SubIssueStatus,
-    blockers: Vec<String>,
-    worker: Option<String>,
-    retries: i64,
-    wave: usize,
-}
-
-impl DispatchIssueProgress {
-    /// Returns the Sub-issue identifier.
-    pub fn ticket(&self) -> &str {
-        &self.ticket
-    }
-
-    /// Returns the human-facing Sub-issue title.
-    pub fn title(&self) -> &str {
-        &self.title
-    }
-
-    /// Returns the normalized lifecycle status.
-    pub const fn status(&self) -> SubIssueStatus {
-        self.status
-    }
-
-    /// Returns direct dependency identifiers.
-    pub fn blockers(&self) -> &[String] {
-        &self.blockers
-    }
-
-    /// Returns the assigned Worker, when the Sub-issue is dispatched.
-    pub fn worker(&self) -> Option<&str> {
-        self.worker.as_deref()
-    }
-
-    /// Returns the number of completed retries.
-    pub const fn retries(&self) -> i64 {
-        self.retries
-    }
-
-    /// Returns the derived dependency wave number.
-    pub const fn wave(&self) -> usize {
-        self.wave
-    }
-}
-
-// The orchestration adapter consumes this projection in the next vertical slice.
-#[allow(dead_code)]
-fn dependency_wave(
-    ticket: &TicketId,
-    state: &DispatchGroupState,
-    waves: &mut BTreeMap<TicketId, usize>,
-) -> usize {
-    if let Some(wave) = waves.get(ticket) {
-        return *wave;
-    }
-    let Some(issue) = state.sub_issues.get(ticket) else {
-        return 0;
-    };
-    let status = match SubIssueStatus::try_from(&issue.status) {
-        Ok(status) => status,
-        Err(_) => return 0,
-    };
-    let wave = if status == SubIssueStatus::Skipped {
-        0
-    } else {
-        issue
-            .blocked_by
-            .iter()
-            .map(|blocker| dependency_wave(blocker, state, waves))
-            .max()
-            .unwrap_or(0)
-            .saturating_add(1)
-    };
-    waves.insert(ticket.clone(), wave);
-    wave
-}
-
 /// Ready Ticket discovery results, including safely excluded entries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyTicketResult {
@@ -799,13 +629,6 @@ pub enum WorkspaceDispatchEvent {
     ReadyTickets {
         operation: OperationId,
         result: ReadyTicketResult,
-    },
-    /// The latest committed Dispatch Group progress projection.
-    // The orchestration stream constructs this event in the next vertical slice.
-    #[allow(dead_code)]
-    GroupProgress {
-        operation: OperationId,
-        progress: DispatchGroupProgress,
     },
     /// Orchestration preparation or execution started.
     OrchestrationStarted {
@@ -1406,7 +1229,10 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             wsg_core::DispatchGroupOptions::new(""),
         );
         state.sub_issues = std::collections::BTreeMap::new();
-        let progress = DispatchGroupProgress::from_state(state)?;
+        let progress = wsg_core::DispatchGroup::from_state(state)
+            .map_err(|error| error.to_string())?
+            .progress()
+            .map_err(|error| error.to_string())?;
         emit(WorkspaceDispatchOrchestrationEvent::Started {
             parent: parent.to_owned(),
             resumed: true,
@@ -1792,7 +1618,7 @@ mod tests {
                 operation: 22,
                 progress,
                 notice: Some(notice),
-            } if progress.parent() == "ENG-100" && notice == "orchestration test update"
+            } if progress.parent().as_str() == "ENG-100" && notice == "orchestration test update"
         ));
         assert!(matches!(
             events_rx.recv().expect("terminal event"),
@@ -2057,70 +1883,5 @@ mod tests {
                 WorkspaceDispatchCommand::Refresh { operation: 0 }
             ))
         );
-    }
-
-    #[test]
-    fn dispatch_group_progress_projects_dependency_waves_and_ready_tickets() {
-        use std::collections::BTreeMap;
-        use wsg_core::{DispatchGroupState, SubIssueState, TicketId, WireStatus, WireTimestamp};
-
-        let parent = TicketId::parse("ENG-100").expect("parent Ticket");
-        let blocker = TicketId::parse("ENG-101").expect("blocker Ticket");
-        let dependent = TicketId::parse("ENG-102").expect("dependent Ticket");
-        let leaf = TicketId::parse("ENG-103").expect("leaf Ticket");
-        let independent = TicketId::parse("ENG-104").expect("independent Ticket");
-        let mut sub_issues = BTreeMap::new();
-        sub_issues.insert(
-            blocker.clone(),
-            SubIssueState::new("Foundation", WireStatus::new("done"), Vec::new()),
-        );
-        sub_issues.insert(
-            dependent.clone(),
-            SubIssueState::new(
-                "Dependent work",
-                WireStatus::new("pending"),
-                vec![blocker.clone()],
-            ),
-        );
-        sub_issues.insert(
-            leaf.clone(),
-            SubIssueState::new(
-                "Leaf work",
-                WireStatus::new("pending"),
-                vec![dependent.clone()],
-            ),
-        );
-        let mut assigned = SubIssueState::new(
-            "Independent work",
-            WireStatus::new("dispatched"),
-            Vec::new(),
-        );
-        assigned.worker = Some(wsg_core::WorkerId::parse("worker-01").expect("Worker"));
-        assigned.dispatched_at = Some(WireTimestamp::new("2026-08-10T10:01:00Z"));
-        assigned.retries = 1;
-        sub_issues.insert(independent.clone(), assigned);
-
-        let mut state = DispatchGroupState::new(
-            parent,
-            WireTimestamp::new("2026-08-10T10:00:00Z"),
-            "Jarvvski/jjfx",
-            wsg_core::DispatchGroupOptions::new(""),
-        );
-        state.sub_issues = sub_issues;
-
-        let progress = DispatchGroupProgress::from_state(state).expect("valid progress");
-
-        assert_eq!(progress.parent(), "ENG-100");
-        assert_eq!(progress.maximum_wave(), 2);
-        assert_eq!(progress.ready(), &["ENG-102"]);
-        assert_eq!(progress.issues()[0].ticket(), "ENG-101");
-        assert_eq!(progress.issues()[1].wave(), 2);
-        assert_eq!(progress.issues()[2].wave(), 3);
-        assert_eq!(
-            progress.issues()[3].status(),
-            wsg_core::SubIssueStatus::Dispatched
-        );
-        assert_eq!(progress.issues()[3].worker(), Some("worker-01"));
-        assert_eq!(progress.issues()[3].retries(), 1);
     }
 }

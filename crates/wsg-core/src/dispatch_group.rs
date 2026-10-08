@@ -4,14 +4,14 @@
 //! aggregate accepts and returns the wire state, but never reads files, clocks,
 //! processes, Linear, or terminal output.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use thiserror::Error;
 
 use crate::{
-    DependencyGraph, DispatchDependencyContext, DispatchGroupOptions, DispatchGroupState,
-    SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
+    AgentRuntime, DependencyGraph, DispatchDependencyContext, DispatchGroupOptions,
+    DispatchGroupState, SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
 };
 
 /// The five Sub-issue statuses persisted by Go wsg.
@@ -135,6 +135,107 @@ impl DispatchGroupStatusCounts {
     /// Returns the number of skipped Sub-issues.
     pub const fn skipped(self) -> usize {
         self.skipped
+    }
+}
+
+/// A data-only projection of a Dispatch Group for presentation.
+///
+/// Built by [`DispatchGroup::progress`]. It carries no behavior beyond accessors
+/// so renderers cannot drift from the aggregate's rules.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchGroupProgress {
+    parent: TicketId,
+    runtime: AgentRuntime,
+    issues: Vec<DispatchIssueProgress>,
+    ready: Vec<TicketId>,
+    maximum_wave: usize,
+    counts: DispatchGroupStatusCounts,
+    terminal: bool,
+}
+
+impl DispatchGroupProgress {
+    /// Returns the Parent Ticket identifier.
+    pub fn parent(&self) -> &TicketId {
+        &self.parent
+    }
+
+    /// Returns the persisted Agent Runtime without provider configuration details.
+    pub const fn runtime(&self) -> AgentRuntime {
+        self.runtime
+    }
+
+    /// Returns Sub-issue rows in stable Ticket order.
+    pub fn issues(&self) -> &[DispatchIssueProgress] {
+        &self.issues
+    }
+
+    /// Returns currently dispatchable Tickets in stable order.
+    pub fn ready(&self) -> &[TicketId] {
+        &self.ready
+    }
+
+    /// Returns the largest dependency wave width.
+    pub const fn maximum_wave(&self) -> usize {
+        self.maximum_wave
+    }
+
+    /// Returns terminal outcome counts.
+    pub const fn counts(&self) -> DispatchGroupStatusCounts {
+        self.counts
+    }
+
+    /// Reports whether all Sub-issues have reached terminal states.
+    pub const fn is_terminal(&self) -> bool {
+        self.terminal
+    }
+}
+
+/// One Sub-issue row in a [`DispatchGroupProgress`] projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchIssueProgress {
+    ticket: TicketId,
+    title: String,
+    status: SubIssueStatus,
+    blockers: Vec<TicketId>,
+    worker: Option<WorkerId>,
+    retries: i64,
+    wave: usize,
+}
+
+impl DispatchIssueProgress {
+    /// Returns the Sub-issue identifier.
+    pub fn ticket(&self) -> &TicketId {
+        &self.ticket
+    }
+
+    /// Returns the human-facing Sub-issue title.
+    pub fn title(&self) -> &str {
+        &self.title
+    }
+
+    /// Returns the normalized lifecycle status.
+    pub const fn status(&self) -> SubIssueStatus {
+        self.status
+    }
+
+    /// Returns direct dependency identifiers.
+    pub fn blockers(&self) -> &[TicketId] {
+        &self.blockers
+    }
+
+    /// Returns the assigned Worker, when the Sub-issue is dispatched.
+    pub fn worker(&self) -> Option<&WorkerId> {
+        self.worker.as_ref()
+    }
+
+    /// Returns the number of completed retries.
+    pub const fn retries(&self) -> i64 {
+        self.retries
+    }
+
+    /// Returns the derived longest-path wave number.
+    pub const fn wave(&self) -> usize {
+        self.wave
     }
 }
 
@@ -444,6 +545,43 @@ impl DispatchGroup {
         )
     }
 
+    /// Projects a data-only progress read model from this validated group.
+    ///
+    /// The projection performs no I/O and keeps persisted Sub-issue fields in
+    /// stable Ticket order. Rendering stays outside the shared library.
+    pub fn progress(&self) -> Result<DispatchGroupProgress, DispatchGroupError> {
+        let runtime =
+            AgentRuntime::from_configured(self.state.opts.agent.as_ref()).map_err(|value| {
+                DispatchGroupError::Invalid(format!(
+                    "invalid persisted Agent Runtime {value:?} in Dispatch Group"
+                ))
+            })?;
+        let waves = self.waves();
+        let issues = self
+            .state
+            .sub_issues
+            .iter()
+            .map(|(ticket, issue)| DispatchIssueProgress {
+                ticket: ticket.clone(),
+                title: issue.title.clone(),
+                status: status_of(issue),
+                blockers: issue.blocked_by.clone(),
+                worker: issue.worker.clone(),
+                retries: issue.retries,
+                wave: waves.get(ticket).copied().unwrap_or(0),
+            })
+            .collect();
+        Ok(DispatchGroupProgress {
+            parent: self.state.parent.clone(),
+            runtime,
+            issues,
+            ready: self.ready(),
+            maximum_wave: self.maximum_wave_size(),
+            counts: self.status_counts(),
+            terminal: self.is_terminal(),
+        })
+    }
+
     /// Returns the largest dependency wave in the group's graph.
     pub fn maximum_wave_size(&self) -> usize {
         let mut resolved = self
@@ -478,6 +616,50 @@ impl DispatchGroup {
             resolved.extend(wave);
         }
         maximum
+    }
+
+    /// Returns the longest-path wave depth of every Sub-issue.
+    ///
+    /// Skipped Sub-issues are wave 0, and a Sub-issue whose direct Blockers are
+    /// all skipped or absent is wave 1. Cycles cannot occur because construction
+    /// rejects them.
+    pub fn waves(&self) -> BTreeMap<TicketId, usize> {
+        let mut waves = BTreeMap::new();
+        for ticket in self.state.sub_issues.keys() {
+            self.wave_depth(ticket, &mut waves);
+        }
+        waves
+    }
+
+    /// Returns the longest-path wave depth of one Sub-issue, or `None` when the
+    /// Ticket is not part of the group.
+    pub fn wave_of(&self, ticket: &TicketId) -> Option<usize> {
+        self.state.sub_issues.contains_key(ticket).then(|| {
+            let mut waves = BTreeMap::new();
+            self.wave_depth(ticket, &mut waves)
+        })
+    }
+
+    fn wave_depth(&self, ticket: &TicketId, waves: &mut BTreeMap<TicketId, usize>) -> usize {
+        if let Some(wave) = waves.get(ticket) {
+            return *wave;
+        }
+        let Some(issue) = self.state.sub_issues.get(ticket) else {
+            return 0;
+        };
+        let wave = if status_of(issue) == SubIssueStatus::Skipped {
+            0
+        } else {
+            issue
+                .blocked_by
+                .iter()
+                .map(|blocker| self.wave_depth(blocker, waves))
+                .max()
+                .unwrap_or(0)
+                .saturating_add(1)
+        };
+        waves.insert(ticket.clone(), wave);
+        wave
     }
 
     fn issue_mut(&mut self, ticket: &TicketId) -> Result<&mut SubIssueState, DispatchGroupError> {

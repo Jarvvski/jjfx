@@ -1,10 +1,10 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
 use wsg_core::{
-    CommitOutcome, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent,
+    AgentRuntime, CommitOutcome, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent,
     DispatchGroupOptions, DispatchGroupState, DispatchGroupTransition, Expected, Loaded,
     ParentTicket, Repository, StateChange, SubIssueState, SubIssueStatus, TicketDiscovery,
     TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus, WireTimestamp,
@@ -667,6 +667,134 @@ fn maximum_wave_size_excludes_already_skipped_nodes() {
         r#"{"sub_issues":[{"id":"ENG-101","title":"Merged","status":"Merged","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Left","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Right","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
     );
     assert_eq!(group.maximum_wave_size(), 2);
+}
+
+#[test]
+fn wave_depth_is_zero_for_an_empty_group_and_one_for_independent_tickets() {
+    assert!(
+        DispatchGroup::from_state(state())
+            .expect("empty group")
+            .waves()
+            .is_empty()
+    );
+
+    let independent = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"First","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Second","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    let waves = independent.waves();
+    assert_eq!(waves[&TicketId::parse("ENG-101").expect("Ticket")], 1);
+    assert_eq!(waves[&TicketId::parse("ENG-102").expect("Ticket")], 1);
+}
+
+#[test]
+fn wave_depth_tracks_the_longest_path_through_a_chain_and_diamond() {
+    let chain = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"First","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Second","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Third","status":"Todo","blocked_by":["ENG-102"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        chain.wave_of(&TicketId::parse("ENG-101").expect("Ticket")),
+        Some(1)
+    );
+    assert_eq!(
+        chain.wave_of(&TicketId::parse("ENG-102").expect("Ticket")),
+        Some(2)
+    );
+    assert_eq!(
+        chain.wave_of(&TicketId::parse("ENG-103").expect("Ticket")),
+        Some(3)
+    );
+
+    let diamond = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Root","status":"Todo","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Left","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-103","title":"Right","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false},{"id":"ENG-104","title":"Tip","status":"Todo","blocked_by":["ENG-102","ENG-103"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        diamond.wave_of(&TicketId::parse("ENG-104").expect("Ticket")),
+        Some(3)
+    );
+    assert_eq!(diamond.waves().len(), 4);
+}
+
+#[test]
+fn wave_depth_places_skipped_nodes_at_zero_and_their_dependents_at_one() {
+    let group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Merged","status":"Merged","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Dependent","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        group.wave_of(&TicketId::parse("ENG-101").expect("Ticket")),
+        Some(0)
+    );
+    assert_eq!(
+        group.wave_of(&TicketId::parse("ENG-102").expect("Ticket")),
+        Some(1)
+    );
+}
+
+#[test]
+fn wave_depth_is_none_for_a_ticket_outside_the_group() {
+    let group = DispatchGroup::from_state(state()).expect("empty group");
+    assert_eq!(
+        group.wave_of(&TicketId::parse("ENG-999").expect("Ticket")),
+        None
+    );
+}
+
+#[test]
+fn progress_projects_waves_ready_counts_and_assignment() {
+    let blocker = TicketId::parse("ENG-101").expect("Ticket");
+    let dependent = TicketId::parse("ENG-102").expect("Ticket");
+    let leaf = TicketId::parse("ENG-103").expect("Ticket");
+    let independent = TicketId::parse("ENG-104").expect("Ticket");
+    let mut sub_issues = BTreeMap::new();
+    sub_issues.insert(
+        blocker.clone(),
+        SubIssueState::new("Foundation", WireStatus::new("done"), Vec::new()),
+    );
+    sub_issues.insert(
+        dependent.clone(),
+        SubIssueState::new(
+            "Dependent work",
+            WireStatus::new("pending"),
+            vec![blocker.clone()],
+        ),
+    );
+    sub_issues.insert(
+        leaf.clone(),
+        SubIssueState::new(
+            "Leaf work",
+            WireStatus::new("pending"),
+            vec![dependent.clone()],
+        ),
+    );
+    let mut assigned = SubIssueState::new(
+        "Independent work",
+        WireStatus::new("dispatched"),
+        Vec::new(),
+    );
+    assigned.worker = Some(WorkerId::parse("worker-01").expect("Worker"));
+    assigned.dispatched_at = Some(WireTimestamp::new("2026-08-10T10:01:00Z"));
+    assigned.retries = 1;
+    sub_issues.insert(independent.clone(), assigned);
+
+    let mut group_state = state();
+    group_state.sub_issues = sub_issues;
+    let group = DispatchGroup::from_state(group_state).expect("valid group");
+    let progress = group.progress().expect("progress");
+
+    assert_eq!(progress.parent().as_str(), "ENG-100");
+    assert_eq!(progress.runtime(), AgentRuntime::Claude);
+    assert_eq!(progress.maximum_wave(), 2);
+    assert_eq!(progress.ready(), &[dependent]);
+    assert_eq!(progress.issues().len(), 4);
+    assert_eq!(progress.issues()[0].ticket(), &blocker);
+    assert_eq!(progress.issues()[1].wave(), 2);
+    assert_eq!(progress.issues()[2].wave(), 3);
+    assert_eq!(progress.issues()[3].status(), SubIssueStatus::Dispatched);
+    assert_eq!(
+        progress.issues()[3].worker().map(WorkerId::as_str),
+        Some("worker-01")
+    );
+    assert_eq!(progress.issues()[3].retries(), 1);
+    assert!(!progress.is_terminal());
 }
 
 #[test]
