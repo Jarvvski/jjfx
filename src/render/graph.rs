@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
@@ -14,6 +14,7 @@ use renderdag::{Ancestor, GraphRowRenderer, Renderer};
 
 use crate::graph;
 use crate::render::style::{dim_line, elide_right, freshness_style, now_millis, pane_border};
+use crate::viewport::Viewport;
 
 /// One commit row: `<prefix><glyph><change-id>[ @]  <summary> <bookmarks>`. The
 /// change id is freshness-shaded (bold when on the highlighted chain); the
@@ -294,4 +295,68 @@ pub(crate) fn render_graph_pane(
         None => vec![dim_line(" loading…")],
     };
     frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// The world graph's rendered lines with loading/empty placeholders - shared by
+/// the full-screen view and the inline home pane.
+pub(crate) fn world_lines(
+    graph: Option<&graph::Graph>,
+    selected: Option<&str>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    match graph {
+        Some(g) if !g.chains.is_empty() => world_graph_lines(g, selected, now_millis(), width),
+        Some(_) => vec![dim_line(" (no workspaces)")],
+        None => vec![dim_line(" loading…")],
+    }
+}
+
+/// Draw the full-screen world graph: a title, the bordered graph scrolled to
+/// `viewport`, and the scroll hint. Geometry is refreshed before draw.
+pub(crate) fn draw_world(
+    frame: &mut Frame,
+    graph: Option<&graph::Graph>,
+    selected: Option<&str>,
+    viewport: &Viewport,
+) {
+    let [title, body, footer] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .horizontal_margin(2)
+    .areas(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("graph  ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("world", Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "  every workspace, jj log shaped",
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ])),
+        title,
+    );
+
+    let lines = world_lines(graph, selected, body.width);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_style(pane_border(true))
+                    .title(" commit graph "),
+            )
+            .scroll((viewport.scroll(), 0)),
+        body,
+    );
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            " j/k scroll · PgUp/PgDn page · g/G top/bottom · esc back ",
+            Style::default().add_modifier(Modifier::DIM),
+        )),
+        footer,
+    );
 }

@@ -1,18 +1,119 @@
 //! Home-list rendering: the Attention group headers and the workspace rows,
 //! drawn from the read-only [`HomeRow`] projection. No `App` dependency.
 
+use ratatui::Frame;
+use ratatui::layout::{Constraint, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::ListItem;
+use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::attention::Attention;
+use crate::render::graph;
+use crate::render::state::RenderState;
 use crate::render::style::{
     agent_color, agent_glyph, agent_label, attention_color, behind_color, display_path,
-    elapsed_label, forge_spans, work_color,
+    elapsed_label, forge_spans, pane_border, work_color,
 };
 use crate::render::view::{HomeRow, RowMarker};
 use wsg_core::{WorkerSnapshot, WorkerStatus};
 
+/// Minimum rows (borders included) the inline world pane needs; when half the
+/// home body is shorter than this the pane is dropped so the list stays usable.
+const MIN_WORLD_PANE_HEIGHT: u16 = 5;
+
+/// One rendered home-list line: a group header or a workspace row.
+pub(crate) enum HomeRowKind<'a> {
+    Header { attention: Attention, count: usize },
+    Workspace(HomeRow<'a>),
+}
+
+/// A read-only projection of the home list: the classified rows plus the
+/// content the title and inline world pane need.
+pub(crate) struct HomeView<'a> {
+    pub rows: Vec<HomeRowKind<'a>>,
+    pub selected: Option<&'a str>,
+    pub idle_collapsed: bool,
+    pub tick: u64,
+    pub graph: Option<&'a crate::graph::Graph>,
+    pub title: String,
+}
+
+/// Draw the Attention-grouped list plus its header and footer. The only mutable
+/// input is the renderer's own cursor state.
+pub(crate) fn draw(
+    frame: &mut Frame,
+    view: &HomeView<'_>,
+    state: &RenderState,
+    footer: Paragraph<'_>,
+) {
+    let [header, body, footer_area] = Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Min(0),
+        Constraint::Length(1),
+    ])
+    .horizontal_margin(2)
+    .areas(frame.area());
+
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            view.title.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        header,
+    );
+
+    // The optional world-graph pane under the list: content-sized, capped at
+    // half the body, and dropped entirely when the body is too short to split
+    // usefully (the list stays readable - graceful degradation).
+    let world_lines = (state.world.is_some() && body.height / 2 >= MIN_WORLD_PANE_HEIGHT)
+        .then(|| graph::world_lines(view.graph, view.selected, body.width));
+    let world_areas = world_lines.as_ref().map(|lines| {
+        let h = (lines.len() as u16).saturating_add(2).min(body.height / 2);
+        Layout::vertical([Constraint::Min(0), Constraint::Length(h)]).areas(body)
+    });
+    let list_area = world_areas.map_or(body, |[list_area, _]| list_area);
+
+    let mut cursor = None;
+    let items: Vec<ListItem> = view
+        .rows
+        .iter()
+        .enumerate()
+        .map(|(i, row)| match row {
+            HomeRowKind::Header { attention, count } => {
+                header_item(*attention, *count, view.idle_collapsed)
+            }
+            HomeRowKind::Workspace(row) => {
+                let is_selected = view.selected == Some(row.workspace.name.as_str());
+                if is_selected {
+                    cursor = Some(i);
+                }
+                workspace_item(row, is_selected, list_area.width, view.tick)
+            }
+        })
+        .collect();
+
+    let mut list_state = ListState::default();
+    list_state.select(cursor);
+    frame.render_stateful_widget(List::new(items), list_area, &mut list_state);
+
+    if let (Some([_, world_area]), Some(lines)) = (world_areas, world_lines)
+        && let Some(vp) = &state.world
+    {
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .border_style(pane_border(false))
+                        .title(" world "),
+                )
+                .scroll((vp.scroll(), 0)),
+            world_area,
+        );
+    }
+
+    frame.render_widget(footer, footer_area);
+}
 /// A group-header row: the Attention heading, count, and a fold hint for idle.
 pub(crate) fn header_item(att: Attention, count: usize, idle_collapsed: bool) -> ListItem<'static> {
     let mut text = format!("{} ({count})", att.heading());

@@ -11,10 +11,6 @@
 //! groups internally, display order is a property of the type rather than a
 //! contract the caller must satisfy.
 
-use ratatui::Frame;
-use ratatui::layout::Rect;
-use ratatui::widgets::{List, ListItem, ListState};
-
 use crate::agent::Agent;
 use crate::attention::{self, Attention};
 use crate::store::{DEFAULT_WORKSPACE, Workspace};
@@ -123,8 +119,8 @@ fn row<'a>(input: &RowInput<'a>) -> Row<'a> {
     })
 }
 
-/// The stateful workspace list: which workspace is selected (by name), whether
-/// the idle group is folded, and the render-only highlight cursor.
+/// The stateful workspace list: which workspace is selected (by name) and
+/// whether the idle group is folded. The render cursor lives with the renderer.
 #[derive(Default)]
 pub struct WorkspaceList {
     /// Selection tracked by workspace name, not row index, so it follows a
@@ -132,9 +128,6 @@ pub struct WorkspaceList {
     selected: Option<String>,
     /// Whether the idle group is folded away.
     idle_collapsed: bool,
-    /// Render-only: the highlighted row index, recomputed from `selected` each
-    /// draw (the list interleaves non-selectable group headers).
-    list_state: ListState,
 }
 
 impl WorkspaceList {
@@ -209,18 +202,6 @@ impl WorkspaceList {
     #[cfg(test)]
     pub fn select(&mut self, name: &str) {
         self.selected = Some(name.to_string());
-    }
-
-    /// Render the list into `area`, highlighting row `cursor` (owns `list_state`).
-    pub fn render_body(
-        &mut self,
-        frame: &mut Frame,
-        area: Rect,
-        items: Vec<ListItem<'static>>,
-        cursor: Option<usize>,
-    ) {
-        self.list_state.select(cursor);
-        frame.render_stateful_widget(List::new(items), area, &mut self.list_state);
     }
 }
 

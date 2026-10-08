@@ -6,5 +6,6 @@ pub(crate) mod graph;
 pub(crate) mod help;
 pub(crate) mod home;
 pub(crate) mod pool;
+pub(crate) mod state;
 pub(crate) mod style;
 pub(crate) mod view;
