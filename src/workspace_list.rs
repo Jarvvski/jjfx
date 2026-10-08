@@ -154,6 +154,16 @@ impl WorkspaceList {
         self.selected = Some(selectable[next as usize].clone());
     }
 
+    /// Select the first selectable name (clearing when nothing is selectable).
+    pub fn select_first(&mut self, selectable: &[String]) {
+        self.selected = selectable.first().cloned();
+    }
+
+    /// Select the last selectable name (clearing when nothing is selectable).
+    pub fn select_last(&mut self, selectable: &[String]) {
+        self.selected = selectable.last().cloned();
+    }
+
     /// Point the selection at a real, currently-selectable workspace, falling
     /// back to the first one when the current target is gone or hidden (and to
     /// `None` when nothing is selectable). `selectable` is the ordered name list
@@ -256,6 +266,29 @@ mod tests {
         let mut list = WorkspaceList::default();
         list.ensure_selection(&["a".to_string()]);
         list.move_selection(&[], 1);
+        assert_eq!(list.selected(), None);
+    }
+
+    #[test]
+    fn select_first_and_last_jump_to_each_edge() {
+        let names = ["a", "b", "c"].map(String::from).to_vec();
+        let mut list = WorkspaceList::default();
+
+        list.select_last(&names);
+        assert_eq!(list.selected(), Some("c"));
+        list.select_first(&names);
+        assert_eq!(list.selected(), Some("a"));
+    }
+
+    #[test]
+    fn select_first_and_last_clear_when_nothing_is_selectable() {
+        let mut list = WorkspaceList::default();
+        list.ensure_selection(&["a".to_string()]);
+
+        list.select_first(&[]);
+        assert_eq!(list.selected(), None);
+        list.ensure_selection(&["a".to_string()]);
+        list.select_last(&[]);
         assert_eq!(list.selected(), None);
     }
 

@@ -5,6 +5,11 @@ version of record lives in the project manifest.
 
 ## [Unreleased]
 
+### Added
+
+- 2026-10-08 - `PageUp` and `PageDown` now jump the workspace-list selection
+  straight to the first or last workspace (jjfx 0.50.0).
+
 ### Changed
 
 - 2026-10-07 - Lifting a workspace (`r`) and lifting all (`R`) now run in the

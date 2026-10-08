@@ -115,6 +115,8 @@ enum Mode {
 const NORMAL_BINDINGS: &[(&str, &str)] = &[
     ("Move down", "j / ↓"),
     ("Move up", "k / ↑"),
+    ("Go to first", "PgUp"),
+    ("Go to last", "PgDn"),
     ("Open workspace", "enter"),
     ("Open in background", "o"),
     ("Diff detail", "→ / l"),
@@ -759,6 +761,8 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => self.move_selection(1),
             KeyCode::Char('k') | KeyCode::Up => self.move_selection(-1),
+            KeyCode::PageDown => self.select_last(),
+            KeyCode::PageUp => self.select_first(),
             KeyCode::Char('n') => {
                 if self.refuse_while_configuring() {
                     return;
@@ -2044,6 +2048,18 @@ impl App {
         self.list.move_selection(&names, delta);
     }
 
+    /// Jump the selection to the first selectable workspace.
+    fn select_first(&mut self) {
+        let names = self.selectable_names();
+        self.list.select_first(&names);
+    }
+
+    /// Jump the selection to the last selectable workspace.
+    fn select_last(&mut self) {
+        let names = self.selectable_names();
+        self.list.select_last(&names);
+    }
+
     /// Re-reconcile from disk; the selection follows its workspace by name.
     fn reload(&mut self) {
         self.store.reload();
@@ -2914,7 +2930,7 @@ impl App {
                     } else if self.world.is_some() {
                         " j/k move  J/K scroll world  ? help  q quit "
                     } else {
-                        " j/k move  ? help  q quit "
+                        " j/k move  PgUp/PgDn top/bottom  ? help  q quit "
                     },
                     Style::default().add_modifier(Modifier::DIM),
                 )),
@@ -6224,6 +6240,25 @@ mod tests {
         assert_eq!(app.list.selected(), Some("b"));
         app.handle(press(KeyCode::Down));
         assert_eq!(app.list.selected(), Some("b")); // clamp at bottom
+    }
+
+    #[test]
+    fn page_keys_jump_to_first_and_last() {
+        // Default is pinned first; the idle group is sorted by name: a, b.
+        let mut app = app_with(&["default", "a", "b"]);
+        app.handle(press(KeyCode::Down));
+        app.handle(press(KeyCode::Down));
+        assert_eq!(app.list.selected(), Some("b"));
+
+        app.handle(press(KeyCode::PageUp));
+        assert_eq!(app.list.selected(), Some("default"));
+        app.handle(press(KeyCode::PageUp)); // clamp at top
+        assert_eq!(app.list.selected(), Some("default"));
+
+        app.handle(press(KeyCode::PageDown));
+        assert_eq!(app.list.selected(), Some("b"));
+        app.handle(press(KeyCode::PageDown)); // clamp at bottom
+        assert_eq!(app.list.selected(), Some("b"));
     }
 
     #[test]
