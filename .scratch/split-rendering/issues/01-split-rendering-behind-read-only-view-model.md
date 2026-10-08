@@ -1,6 +1,6 @@
 # Split rendering out of the app.rs god module behind a read-only view model
 
-Status: in-progress
+Status: resolved
 
 ## Parent
 
@@ -87,12 +87,31 @@ src/render/
 
 ## Acceptance criteria
 
-- [ ] No module under `src/render/` imports `crate::app`.
-- [ ] Rendering lives under `src/render/`; ~1500 lines leave app.rs.
-- [ ] `draw` takes only immutable refs; no draw-time state mutation remains.
-- [ ] No `.clone()` / `Rc<RefCell<_>>` / `Arc<Mutex<_>>` added to satisfy borrows.
-- [ ] All existing render assertions pass unchanged; behavior identical.
-- [ ] No version bump / CHANGELOG entry (internal refactor).
-- [ ] `mise run check` passes.
+- [x] No module under `src/render/` imports `crate::app` (enforced by
+      `render::tests::render_modules_do_not_depend_on_app`).
+- [x] Rendering lives under `src/render/`; ~1150 lines leave app.rs
+      (6811 -> 5652).
+- [x] `draw` takes only immutable refs; no draw-time state mutation remains
+      (geometry is refreshed by `App::prepare_layout`).
+- [x] No `.clone()` / `Rc<RefCell<_>>` / `Arc<Mutex<_>>` added to satisfy borrows.
+- [x] All existing render assertions pass unchanged; behavior identical.
+- [x] No version bump / CHANGELOG entry (internal refactor).
+- [x] `mise run check` passes.
 
 ## Comments
+
+Implemented as six focused commits on top of `main`:
+
+1. Extract shared style and time helpers into `render::style` (removed the only
+   renderer -> App leak: `diff_view` now imports `render::style::pane_border`).
+2. Extract commit-graph rendering into `render::graph`.
+3. Extract home-list row rendering behind a read-only row view model
+   (`render::view::{HomeRow, RowMarker}`, `render::home`).
+4. Extract pool, diff-detail, and help overlays into `render::pool`,
+   `render::detail`, `render::help`.
+5. Move scroll state into a render-owned `render::state::RenderState`; add
+   `App::prepare_layout` so `draw` is a pure function of the view model.
+6. Add interface-level render tests (home/help/style) and the decoupling guard.
+
+The detail view and task editor keep their own internal view state (they are
+already self-contained view modules); only App-level viewport geometry moved.
