@@ -300,3 +300,85 @@ fn worker_detail_line(worker: &WorkerSnapshot, width: u16) -> Option<Line<'stati
         Span::styled(fields.join("  "), Style::default().fg(Color::Cyan)),
     ]))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::{Agent, AgentState};
+    use crate::store::Workspace;
+    use crate::work::WorkState;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn row<'a>(workspace: &'a Workspace, attention: Attention) -> HomeRow<'a> {
+        HomeRow {
+            workspace,
+            attention,
+            agent: Agent {
+                state: AgentState::Absent,
+                ..Default::default()
+            },
+            work: WorkState::Clean,
+            worker: None,
+            behind: 0,
+            marker: RowMarker::None,
+        }
+    }
+
+    #[test]
+    fn draws_the_title_group_headers_and_workspace_names() {
+        let ws = Workspace {
+            name: "feature".to_string(),
+            path: None,
+        };
+        let view = HomeView {
+            rows: vec![
+                HomeRowKind::Header {
+                    attention: Attention::NeedsYou,
+                    count: 1,
+                },
+                HomeRowKind::Workspace(row(&ws, Attention::NeedsYou)),
+            ],
+            selected: Some("feature"),
+            idle_collapsed: false,
+            tick: 0,
+            graph: None,
+            title: "jjfx - 1 workspace(s)".to_string(),
+        };
+        let state = RenderState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new("")))
+            .unwrap();
+        let text = term.backend().to_string();
+        assert!(text.contains("jjfx - 1 workspace(s)"), "{text}");
+        assert!(text.contains("needs you"), "{text}");
+        assert!(text.contains("feature"), "{text}");
+    }
+
+    #[test]
+    fn a_too_short_body_drops_the_world_pane_but_keeps_the_list() {
+        let ws = Workspace {
+            name: "feature".to_string(),
+            path: None,
+        };
+        let view = HomeView {
+            rows: vec![HomeRowKind::Workspace(row(&ws, Attention::Idle))],
+            selected: Some("feature"),
+            idle_collapsed: false,
+            tick: 0,
+            graph: None,
+            title: "jjfx".to_string(),
+        };
+        let state = RenderState {
+            world: Some(crate::viewport::Viewport::default()),
+            ..RenderState::default()
+        };
+        // Three rows total leaves no half-body for the pane; it must be dropped.
+        let mut term = Terminal::new(TestBackend::new(120, 4)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new("")))
+            .unwrap();
+        let text = term.backend().to_string();
+        assert!(text.contains("feature"), "{text}");
+        assert!(!text.contains(" world "), "{text}");
+    }
+}

@@ -326,3 +326,32 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
     let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
     Some(era * 146_097 + day_of_era - 719_468)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn elide_right_keeps_the_head_with_an_ellipsis() {
+        assert_eq!(elide_right("short", 10), "short");
+        assert_eq!(elide_right("abcdefghij", 5), "abcd…");
+    }
+
+    #[test]
+    fn working_frames_cycle_per_provider() {
+        assert_eq!(working_frame(AgentKind::Claude, 0), '❀');
+        // Claude bounces: frame 5 is the turn-around, then it walks back.
+        assert_eq!(working_frame(AgentKind::Claude, 5), '•');
+        assert_eq!(working_frame(AgentKind::Claude, 6), '✛');
+        assert_eq!(working_frame(AgentKind::Unknown, 3), '?');
+    }
+
+    #[test]
+    fn brand_colour_is_provider_specific() {
+        assert_eq!(brand_color(AgentKind::Claude), CLAUDE_ORANGE);
+        assert_eq!(brand_color(AgentKind::Codex), CODEX_CYAN);
+        assert_eq!(brand_color(AgentKind::Pi), PI_VIOLET);
+        assert_eq!(brand_color(AgentKind::OpenCode), OPENCODE_GREEN);
+        assert_eq!(brand_color(AgentKind::Unknown), Color::DarkGray);
+    }
+}

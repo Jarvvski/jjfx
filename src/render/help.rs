@@ -74,3 +74,29 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
         height: h,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    #[test]
+    fn draws_every_binding_label_and_key() {
+        let bindings = [("Move down", "j / ↓"), ("Quit", "q / esc")];
+        let mut term = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        term.draw(|frame| draw(frame, &bindings)).unwrap();
+        let text = term.backend().to_string();
+        assert!(text.contains("Move down"), "{text}");
+        assert!(text.contains("j / ↓"), "{text}");
+        assert!(text.contains("Quit"), "{text}");
+        assert!(text.contains("Keybindings"), "{text}");
+    }
+
+    #[test]
+    fn a_tiny_terminal_clamps_the_popup_instead_of_panicking() {
+        let bindings = [("A very long label", "x")];
+        let mut term = Terminal::new(TestBackend::new(6, 3)).unwrap();
+        term.draw(|frame| draw(frame, &bindings)).unwrap();
+    }
+}
