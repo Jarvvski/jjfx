@@ -2,4 +2,6 @@
 //! from a read-only view model rather than reaching into `App`.
 
 pub(crate) mod graph;
+pub(crate) mod home;
 pub(crate) mod style;
+pub(crate) mod view;

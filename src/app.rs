@@ -15,18 +15,16 @@ use ratatui::widgets::{Block, Borders, Clear, ListItem, Paragraph};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentState};
-use crate::attention::Attention;
 use crate::diff::FileDiff;
 use crate::diff_view::Detail;
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj;
 use crate::pool_session::{PoolSession, PoolUpdate};
+use crate::render;
 use crate::render::graph::{render_graph_pane, world_graph_lines};
-use crate::render::style::{
-    agent_color, agent_glyph, agent_label, attention_color, behind_color, dim_line, elapsed_label,
-    elide_right, forge_spans, now_millis, pane_border, work_color,
-};
+use crate::render::style::{dim_line, elide_right, now_millis, pane_border};
+use crate::render::view::{HomeRow, RowMarker};
 use crate::runtime::Effect;
 use crate::store::{self, Store, Workspace};
 use crate::task_editor::{TaskEditor, TaskEditorAction};
@@ -40,7 +38,7 @@ use crate::workspace_dispatch::{
 use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
 use wsg_core::{
     AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
-    WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
+    WorkerPoolSnapshot, WorkerStatus,
 };
 
 /// The focused Worker Pool management interaction.
@@ -2196,7 +2194,9 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, row)| match row {
-                Row::Header(att, count) => self.header_item(*att, *count),
+                Row::Header(att, count) => {
+                    render::home::header_item(*att, *count, self.list.idle_collapsed())
+                }
                 Row::Ws(row) => {
                     let is_selected = self.list.selected() == Some(row.workspace.name.as_str());
                     if is_selected {
@@ -2691,21 +2691,40 @@ impl App {
     }
 
     /// A group-header row: the Attention heading, count, and a fold hint for idle.
-    fn header_item(&self, att: Attention, count: usize) -> ListItem<'static> {
-        let mut text = format!("{} ({count})", att.heading());
-        if att == Attention::Idle {
-            text.push_str(if self.list.idle_collapsed() {
-                "  [c: expand]"
-            } else {
-                "  [c: fold]"
-            });
+    /// Project a classified row into the read-only home view model: the two
+    /// lifecycle axes plus the row-level facts rendering needs (`behind`, marker).
+    fn home_row<'a>(&'a self, row: &WorkspaceRow<'a>) -> HomeRow<'a> {
+        let WorkspaceRow {
+            workspace,
+            attention,
+            agent,
+            work,
+            worker,
+        } = *row;
+        let marker = if self
+            .pending_deletion
+            .as_ref()
+            .is_some_and(|pending| pending.workspace.name == workspace.name)
+        {
+            RowMarker::Deleting
+        } else if self.is_lifting(&workspace.name) {
+            RowMarker::Lifting
+        } else if self.is_lift_queued(&workspace.name) {
+            RowMarker::Queued
+        } else if let Some(progress) = self.forge_progress.get(&workspace.name) {
+            RowMarker::Forge(progress)
+        } else {
+            RowMarker::None
+        };
+        HomeRow {
+            workspace,
+            attention,
+            agent,
+            work,
+            worker,
+            behind: self.behind(workspace),
+            marker,
         }
-        ListItem::new(Line::from(Span::styled(
-            text,
-            Style::default()
-                .fg(attention_color(att))
-                .add_modifier(Modifier::BOLD),
-        )))
     }
 
     /// A workspace row: Attention badge, then the two lifecycle axes, then name
@@ -2717,115 +2736,12 @@ impl App {
         selected: bool,
         width: u16,
     ) -> ListItem<'static> {
-        let WorkspaceRow {
-            workspace: w,
-            attention: att,
-            agent,
-            work,
-            worker,
-        } = *row;
-        let behind = self.behind(w);
-        // How far behind trunk: dimmed unless it is far enough to warrant tidyws.
-        let behind_label = if behind > 0 {
-            format!("↓{behind}")
-        } else {
-            String::new()
-        };
-        let path = w
-            .path
-            .as_deref()
-            .map(display_path)
-            .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
-        // A dim bullet marks every row; the selected row's bullet brightens as the
-        // only structural cue, keeping the line otherwise calm.
-        let bullet = if selected {
-            Span::styled("▸ ", Style::default().fg(Color::White))
-        } else {
-            Span::styled("· ", Style::default().fg(Color::DarkGray))
-        };
-        let mut spans = vec![
-            bullet,
-            Span::styled(
-                // Widest heading ("ready to forge") is 14 chars; pad past it so
-                // the following columns align across every row.
-                format!("{:<15}", att.heading()),
-                Style::default().fg(attention_color(att)),
-            ),
-            agent_glyph(agent, self.tick),
-            Span::styled(
-                format!("{:<11}", agent_label(agent)),
-                Style::default().fg(agent_color(agent)),
-            ),
-        ];
-        // While a forge is running, its live pipeline takes the work column;
-        // otherwise the work label shows there. A deleting tombstone and a
-        // background lift each get their own marker so they remain understandable
-        // while selected.
-        let deleting = self
-            .pending_deletion
-            .as_ref()
-            .is_some_and(|pending| pending.workspace.name == w.name);
-        if deleting {
-            spans.push(Span::styled(
-                format!("{:<16}", "deleting..."),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            ));
-        } else if self.is_lifting(&w.name) {
-            spans.push(Span::styled(
-                format!("{:<16}", "lifting..."),
-                Style::default().fg(Color::Yellow),
-            ));
-        } else if self.is_lift_queued(&w.name) {
-            spans.push(Span::styled(
-                format!("{:<16}", "queued"),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::DIM),
-            ));
-        } else if let Some(progress) = self.forge_progress.get(&w.name) {
-            spans.extend(forge_spans(progress));
-        } else {
-            spans.push(Span::styled(
-                format!("{:<16}", work.label()),
-                Style::default().fg(work_color(work)),
-            ));
-        }
-        spans.push(Span::styled(
-            format!("{behind_label:<5}"),
-            Style::default().fg(behind_color(behind)),
-        ));
-        // The name is boxed (reversed) when selected - a tight highlight instead
-        // of a full-width bar; the path trails in dim.
-        let name_style = if selected {
-            let mut style = Style::default().add_modifier(Modifier::REVERSED);
-            if deleting {
-                style = style.add_modifier(Modifier::DIM);
-            }
-            style
-        } else if deleting {
-            Style::default()
-                .add_modifier(Modifier::BOLD)
-                .add_modifier(Modifier::DIM)
-        } else {
-            Style::default().add_modifier(Modifier::BOLD)
-        };
-        let pad = 18usize.saturating_sub(w.name.chars().count()).max(1);
-        spans.push(Span::styled(w.name.clone(), name_style));
-        spans.push(Span::styled(
-            format!("{:pad$}{path}", ""),
-            Style::default().fg(Color::DarkGray),
-        ));
-        let lines = match worker.and_then(|worker| worker_detail_line(worker, width)) {
-            Some(detail) => vec![Line::from(spans), detail],
-            None => vec![Line::from(spans)],
-        };
-        ListItem::new(lines)
+        let home = self.home_row(row);
+        render::home::workspace_item(&home, selected, width, self.tick)
     }
 
     #[cfg(test)]
-    fn worker_for(&self, workspace: &Workspace) -> Option<&WorkerSnapshot> {
+    fn worker_for(&self, workspace: &Workspace) -> Option<&wsg_core::WorkerSnapshot> {
         self.pool
             .worker_pool
             .as_ref()?
@@ -2958,10 +2874,6 @@ impl App {
     }
 }
 
-fn display_path(path: &std::path::Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
 fn worker_activity_line(activity: &RunActivity) -> String {
     let detail = match activity.kind() {
         RunActivityKind::SessionStarted => "session started".to_owned(),
@@ -3005,52 +2917,6 @@ fn worker_result_line(result: &RunResult) -> String {
     }
 }
 
-fn worker_detail_line(worker: &WorkerSnapshot, width: u16) -> Option<Line<'static>> {
-    let status = if worker.status() == WorkerStatus::Busy && worker.has_dead_process() {
-        "stale"
-    } else {
-        worker.status().as_str()
-    };
-    let ticket = worker.ticket();
-
-    // An idle, unassigned Worker contributes no information beyond the main
-    // workspace row. Keep it there rather than adding a placeholder-only line.
-    if worker.status() == WorkerStatus::Idle && ticket.is_none() {
-        return None;
-    }
-
-    if width < 55 {
-        let mut fields = vec![worker.worker_id().to_string(), status.to_owned()];
-        if let Some(ticket) = ticket {
-            fields.push(format!("ticket:{ticket}"));
-        }
-        return Some(Line::from(Span::styled(
-            format!("  {}", fields.join("  ")),
-            Style::default().fg(Color::Cyan),
-        )));
-    }
-
-    let mut fields = vec![worker.alias().to_owned(), status.to_owned()];
-    if let Some(runtime) = worker.agent_runtime() {
-        fields.push(runtime.as_str().to_owned());
-    }
-    if let Some(ticket) = ticket {
-        fields.push(format!("ticket:{ticket}"));
-    }
-    if let Some(activity) = worker
-        .last_activity_at()
-        .or_else(|| worker.started_at())
-        .map(elapsed_label)
-    {
-        fields.push(activity);
-    }
-
-    Some(Line::from(vec![
-        Span::styled("  wsg ", Style::default().fg(Color::DarkGray)),
-        Span::styled(fields.join("  "), Style::default().fg(Color::Cyan)),
-    ]))
-}
-
 const FILES_PANE_WIDTH: u16 = 34;
 /// Width of the per-workspace graph strip in the detail view (borders included).
 const GRAPH_PANE_WIDTH: u16 = 34;
@@ -3078,8 +2944,11 @@ fn centered_rect(area: Rect, width: u16, height: u16) -> Rect {
 mod tests {
     use super::*;
     use crate::agent::AgentKind;
+    use crate::attention::Attention;
     use crate::config::ForgeConfig;
-    use crate::render::style::{CLAUDE_ORANGE, CODEX_CYAN, PI_VIOLET, working_frame};
+    use crate::render::style::{
+        CLAUDE_ORANGE, CODEX_CYAN, PI_VIOLET, agent_glyph, agent_label, working_frame,
+    };
     use crate::runtime::Runtime;
     use crate::store::Workspace;
     use crate::workspace_dispatch::{RecordingAdapter, WorkerCommandResult, WorkerSessionOutcome};

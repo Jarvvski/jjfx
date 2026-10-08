@@ -67,6 +67,12 @@ pub(crate) fn elide_right(s: &str, max: usize) -> String {
     format!("{head}…")
 }
 
+/// A workspace path rendered for a row; lossy because the display is not the
+/// source of truth for the path.
+pub(crate) fn display_path(path: &std::path::Path) -> String {
+    path.to_string_lossy().into_owned()
+}
+
 /// Colour cue for the Attention badge - the primary triage signal.
 pub(crate) fn attention_color(att: Attention) -> Color {
     match att {
