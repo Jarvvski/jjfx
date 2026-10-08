@@ -17,6 +17,7 @@ mod jj;
 mod layout;
 mod pool_session;
 mod prs;
+mod render;
 mod repo;
 mod runtime;
 mod store;

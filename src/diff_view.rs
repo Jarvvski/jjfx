@@ -10,8 +10,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use crate::app::pane_border;
 use crate::diff::{self, FileDiff};
+use crate::render::style::pane_border;
 use crate::viewport::Viewport;
 
 /// Width of a file's +/- magnitude bar, in cells.
