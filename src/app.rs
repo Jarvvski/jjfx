@@ -17,7 +17,7 @@ use renderdag::{Ancestor, GraphRowRenderer, Renderer};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::agent::{self, AgentKind, AgentState};
-use crate::attention::{self, Attention};
+use crate::attention::Attention;
 use crate::diff::FileDiff;
 use crate::diff_view::Detail;
 use crate::forge::{self, Target};
@@ -34,7 +34,7 @@ use crate::workspace_dispatch::{
     OperationId, RealWorkspaceDispatch, WorkspaceDispatchCommand, WorkspaceDispatchController,
     WorkspaceDispatchEvent,
 };
-use crate::workspace_list::{PresentationRow, WorkspaceList};
+use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
 use wsg_core::{
     AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
     WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
@@ -331,10 +331,11 @@ pub struct App {
     /// Bumped whenever the status is replaced, so an expiry timer armed for an
     /// older message cannot clear a newer one.
     status_gen: u64,
-    /// The attention-grouped, idle-collapsible workspace list: owns grouping,
-    /// the idle fold, and the name-tracked selection + render cursor. The fold
-    /// state persists across launches through [`crate::ui_state::UiState`]. `App`
-    /// supplies the [`Attention`] per workspace via [`App::classified`].
+    /// The attention-grouped, idle-collapsible workspace list: owns the idle
+    /// fold, the name-tracked selection, and the render cursor. The fold state
+    /// persists across launches through [`crate::ui_state::UiState`]. `App`
+    /// supplies the raw per-workspace axes via [`App::row_inputs`], and the list
+    /// classifies and lays them out through [`WorkspaceList::view`].
     list: WorkspaceList,
     /// The working-glyph animation frame counter, advanced by [`App::animate`]
     /// on each [`Msg::Tick`].
@@ -2040,7 +2041,8 @@ impl App {
 
     /// The ordered selectable workspace names for the current classification.
     fn selectable_names(&self) -> Vec<String> {
-        self.list.selectable(&self.classified())
+        let inputs = self.row_inputs();
+        self.list.view(&inputs).selectable_names()
     }
 
     fn move_selection(&mut self, delta: isize) {
@@ -2088,22 +2090,24 @@ impl App {
         }
     }
 
-    /// Workspaces paired with their derived Attention, grouped needs-you ->
-    /// working -> ready-to-forge -> idle, sorted by name within each group.
-    fn classified(&self) -> Vec<(Attention, &Workspace)> {
-        let mut v: Vec<(Attention, &Workspace)> = self
-            .store
+    /// The raw per-workspace inputs the list classifies and renders from: each
+    /// workspace paired with its agent, work state, and joined Worker snapshot.
+    fn row_inputs(&self) -> Vec<RowInput<'_>> {
+        let workers = self
+            .pool
+            .worker_pool
+            .as_ref()
+            .map_or(&[][..], WorkerPoolSnapshot::workers);
+        self.store
             .workspaces()
             .iter()
-            .map(|w| {
-                (
-                    attention::derive(self.agent_state(w), self.work_state(w)),
-                    w,
-                )
+            .map(|w| RowInput {
+                workspace: w,
+                agent: self.agent_of(w),
+                work: self.work_state(w),
+                worker: workers.iter().find(|worker| worker.workspace() == w.name),
             })
-            .collect();
-        v.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.name.cmp(&b.1.name)));
-        v
+            .collect()
     }
 
     /// Render the Attention-grouped workspace list plus a header and footer.
@@ -2179,42 +2183,28 @@ impl App {
             });
         let list_area = world.as_ref().map_or(body, |(_, list_area, _)| *list_area);
 
-        // Build list items from the grouped rows, tracking which item index the
-        // selected workspace lands on so the highlight follows it.
-        let classified = self.classified();
-        let workers = self
-            .pool
-            .worker_pool
-            .as_ref()
-            .map_or(&[][..], WorkerPoolSnapshot::workers);
-        let rows = self.list.presentation_rows(&classified, workers);
+        // Build list items from the classified rows, tracking which item index
+        // the selected workspace lands on so the highlight follows it.
+        let inputs = self.row_inputs();
+        let view = self.list.view(&inputs);
         let mut cursor = None;
-        let items: Vec<ListItem> = rows
+        let items: Vec<ListItem> = view
+            .rows()
             .iter()
             .enumerate()
             .map(|(i, row)| match row {
-                PresentationRow::Header(att, count) => self.header_item(*att, *count),
-                PresentationRow::Ws {
-                    workspace,
-                    attention,
-                    worker,
-                } => {
-                    let is_selected = self.list.selected() == Some(workspace.name.as_str());
+                Row::Header(att, count) => self.header_item(*att, *count),
+                Row::Ws(row) => {
+                    let is_selected = self.list.selected() == Some(row.workspace.name.as_str());
                     if is_selected {
                         cursor = Some(i);
                     }
-                    self.workspace_item(
-                        workspace,
-                        *attention,
-                        is_selected,
-                        *worker,
-                        list_area.width,
-                    )
+                    self.workspace_item(row, is_selected, list_area.width)
                 }
             })
             .collect();
-        drop(rows);
-        drop(classified);
+        drop(view);
+        drop(inputs);
 
         self.list.render_body(frame, list_area, items, cursor);
 
@@ -2716,17 +2706,21 @@ impl App {
     }
 
     /// A workspace row: Attention badge, then the two lifecycle axes, then name
-    /// and path.
+    /// and path. The row's axes come from the classified view rather than being
+    /// re-read, so what the row shows has one source.
     fn workspace_item(
         &self,
-        w: &Workspace,
-        att: Attention,
+        row: &WorkspaceRow<'_>,
         selected: bool,
-        worker: Option<&WorkerSnapshot>,
         width: u16,
     ) -> ListItem<'static> {
-        let agent = self.agent_of(w);
-        let work = self.work_state(w);
+        let WorkspaceRow {
+            workspace: w,
+            attention: att,
+            agent,
+            work,
+            worker,
+        } = *row;
         let behind = self.behind(w);
         // How far behind trunk: dimmed unless it is far enough to warrant tidyws.
         let behind_label = if behind > 0 {
@@ -5400,7 +5394,16 @@ mod tests {
 
         let workspace = app.store.workspace("worker-01").unwrap();
         let worker = app.worker_for(workspace).unwrap();
-        let item = app.workspace_item(workspace, Attention::Idle, false, Some(worker), 120);
+        let agent = app.agent_of(workspace);
+        let work = app.work_state(workspace);
+        let row = WorkspaceRow {
+            workspace,
+            attention: Attention::Idle,
+            agent,
+            work,
+            worker: Some(worker),
+        };
+        let item = app.workspace_item(&row, false, 120);
         assert_eq!(item.height(), 1);
 
         let mut terminal =
@@ -6277,7 +6280,7 @@ mod tests {
     #[test]
     fn list_groups_by_attention_needs_you_first() {
         use crate::work::Work;
-        let mut app = app_with(&["default", "busy", "blocked", "dirtyws"]);
+        let mut app = app_with(&["default", "busy", "blocked", "dirtyws", "idlews"]);
         // Give each workspace a distinct axis so they land in distinct groups.
         // canon() no-ops on the nonexistent /wt/* paths, so agent keys match.
         app.handle(Msg::AgentEvent(agent::Event {
@@ -6309,12 +6312,26 @@ mod tests {
         );
         app.handle(Msg::WorkSnapshot(snap));
 
-        // Group order via classified(): needs-you, working, ready-to-forge, idle.
-        let groups: Vec<Attention> = app.classified().iter().map(|(a, _)| *a).collect();
-        assert_eq!(groups[0], Attention::NeedsYou); // blocked
-        assert_eq!(groups[1], Attention::Working); // busy
-        assert_eq!(groups[2], Attention::ReadyToForge); // dirtyws
-        assert_eq!(groups[3], Attention::Idle); // default
+        // Group order: needs-you, working, ready-to-forge, idle.
+        let inputs = app.row_inputs();
+        let view = app.list.view(&inputs);
+        let groups: Vec<Attention> = view
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                Row::Header(att, _) => Some(*att),
+                Row::Ws(_) => None,
+            })
+            .collect();
+        assert_eq!(
+            groups,
+            [
+                Attention::NeedsYou,
+                Attention::Working,
+                Attention::ReadyToForge,
+                Attention::Idle,
+            ]
+        );
     }
 
     #[test]

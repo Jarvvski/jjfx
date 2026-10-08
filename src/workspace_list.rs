@@ -1,37 +1,126 @@
 //! The default-pinned, attention-grouped, idle-collapsible, name-tracked
-//! workspace list (ADR 0008). Owns the list's *mechanics*: pinning `default`,
-//! grouping the remaining classified workspaces into display rows, folding the
-//! idle group away, and tracking the selection by workspace **name** so it
-//! follows a workspace as live state re-sorts it between Attention groups.
+//! workspace list (ADR 0008). Owns the list's *mechanics*: classifying each
+//! workspace's [`Attention`], pinning `default`, grouping the rest into display
+//! rows, folding the idle group away, and tracking the selection by workspace
+//! **name** so it follows a workspace as live state re-sorts it between
+//! Attention groups.
 //!
-//! `App` derives each workspace's [`Attention`] (that needs `agents`/`work`, so
-//! it stays there) and hands the already-sorted `(Attention, &Workspace)` pairs
-//! in; this module hands back the display rows and the selected name.
+//! `App` supplies each workspace's raw axes (agent + work + worker) via
+//! [`RowInput`]; [`ClassifiedView::build`] does the classification, ordering,
+//! grouping, and projection to rows in one place. Because the only constructor
+//! groups internally, display order is a property of the type rather than a
+//! contract the caller must satisfy.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::widgets::{List, ListItem, ListState};
 
-use crate::attention::Attention;
+use crate::agent::Agent;
+use crate::attention::{self, Attention};
 use crate::store::{DEFAULT_WORKSPACE, Workspace};
+use crate::work::WorkState;
 use wsg_core::WorkerSnapshot;
 
-/// One rendered list line: a group header (non-selectable) or a workspace row.
+/// The raw per-workspace inputs the list classifies and renders from: the two
+/// lifecycle axes (agent + work) plus the joined Worker snapshot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct RowInput<'a> {
+    pub workspace: &'a Workspace,
+    pub agent: Agent,
+    pub work: WorkState,
+    pub worker: Option<&'a WorkerSnapshot>,
+}
+
+/// One selectable workspace row's presentation data. Carries everything
+/// selection (`workspace`) and rendering (`attention`, `agent`, `work`,
+/// `worker`) need.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WorkspaceRow<'a> {
+    pub workspace: &'a Workspace,
+    pub attention: Attention,
+    pub agent: Agent,
+    pub work: WorkState,
+    pub worker: Option<&'a WorkerSnapshot>,
+}
+
+/// One rendered list line: a group header (non-selectable) or a self-describing
+/// workspace row. There is no second row enum to hand-map between.
 #[derive(Debug, PartialEq)]
 pub enum Row<'a> {
     Header(Attention, usize),
-    Ws(&'a Workspace, Attention),
+    Ws(WorkspaceRow<'a>),
 }
 
-/// A workspace row enriched once with its immutable Worker presentation data.
-#[derive(Debug, PartialEq)]
-pub enum PresentationRow<'a, 'b> {
-    Header(Attention, usize),
-    Ws {
-        workspace: &'a Workspace,
-        attention: Attention,
-        worker: Option<&'b WorkerSnapshot>,
-    },
+/// The workspaces classified by [`Attention`] and laid out as display rows:
+/// `default` pinned first, then a header per non-empty group and its workspace
+/// rows in [`Attention::ALL`] order (the idle group folded when collapsed).
+#[derive(Debug)]
+pub struct ClassifiedView<'a> {
+    rows: Vec<Row<'a>>,
+}
+
+impl<'a> ClassifiedView<'a> {
+    /// Classify `inputs`, order and group them, and project to display rows.
+    /// `default` is pinned first regardless of its Attention; the remaining
+    /// workspaces are grouped needs-you -> working -> ready-to-forge -> idle,
+    /// sorted by name within each group.
+    pub fn build(inputs: &[RowInput<'a>], idle_collapsed: bool) -> Self {
+        let mut rows = Vec::new();
+
+        if let Some(input) = inputs
+            .iter()
+            .find(|input| input.workspace.name == DEFAULT_WORKSPACE)
+        {
+            rows.push(row(input));
+        }
+
+        for att in Attention::ALL {
+            let mut members: Vec<&RowInput<'a>> = inputs
+                .iter()
+                .filter(|input| input.workspace.name != DEFAULT_WORKSPACE)
+                .filter(|input| attention::derive(input.agent.state, input.work) == att)
+                .collect();
+            if members.is_empty() {
+                continue;
+            }
+            members.sort_by(|a, b| a.workspace.name.cmp(&b.workspace.name));
+            rows.push(Row::Header(att, members.len()));
+            if att == Attention::Idle && idle_collapsed {
+                continue;
+            }
+            rows.extend(members.into_iter().map(row));
+        }
+
+        Self { rows }
+    }
+
+    /// The display rows in render order.
+    pub fn rows(&self) -> &[Row<'a>] {
+        &self.rows
+    }
+
+    /// The selectable workspace names in display order (excludes headers and any
+    /// workspace hidden in a collapsed idle group).
+    pub fn selectable_names(&self) -> Vec<String> {
+        self.rows
+            .iter()
+            .filter_map(|row| match row {
+                Row::Ws(WorkspaceRow { workspace, .. }) => Some(workspace.name.clone()),
+                Row::Header(..) => None,
+            })
+            .collect()
+    }
+}
+
+/// Project one input to its workspace row.
+fn row<'a>(input: &RowInput<'a>) -> Row<'a> {
+    Row::Ws(WorkspaceRow {
+        workspace: input.workspace,
+        attention: attention::derive(input.agent.state, input.work),
+        agent: input.agent,
+        work: input.work,
+        worker: input.worker,
+    })
 }
 
 /// The stateful workspace list: which workspace is selected (by name), whether
@@ -69,73 +158,10 @@ impl WorkspaceList {
         self.idle_collapsed = collapsed;
     }
 
-    /// The display rows for the classified workspaces: `default` pinned first,
-    /// then a header per non-empty group and its workspace rows (unless the idle
-    /// group is collapsed).
-    ///
-    /// `classified` must be grouped by Attention (contiguous runs), which is how
-    /// `App::classified` sorts it.
-    pub fn rows<'a>(&self, classified: &[(Attention, &'a Workspace)]) -> Vec<Row<'a>> {
-        let mut rows = Vec::new();
-        if let Some((attention, workspace)) = classified
-            .iter()
-            .find(|(_, workspace)| workspace.name == DEFAULT_WORKSPACE)
-        {
-            rows.push(Row::Ws(workspace, *attention));
-        }
-
-        let grouped: Vec<_> = classified
-            .iter()
-            .copied()
-            .filter(|(_, workspace)| workspace.name != DEFAULT_WORKSPACE)
-            .collect();
-        let mut idx = 0;
-        while idx < grouped.len() {
-            let att = grouped[idx].0;
-            let end = idx + grouped[idx..].iter().take_while(|(a, _)| *a == att).count();
-            rows.push(Row::Header(att, end - idx));
-            if !(att == Attention::Idle && self.idle_collapsed) {
-                for (a, w) in &grouped[idx..end] {
-                    rows.push(Row::Ws(w, *a));
-                }
-            }
-            idx = end;
-        }
-        rows
-    }
-
-    /// The display rows with Worker metadata joined before rendering.
-    pub fn presentation_rows<'a, 'b>(
-        &self,
-        classified: &[(Attention, &'a Workspace)],
-        workers: &'b [WorkerSnapshot],
-    ) -> Vec<PresentationRow<'a, 'b>> {
-        self.rows(classified)
-            .into_iter()
-            .map(|row| match row {
-                Row::Header(attention, count) => PresentationRow::Header(attention, count),
-                Row::Ws(workspace, attention) => PresentationRow::Ws {
-                    worker: workers
-                        .iter()
-                        .find(|worker| worker.workspace() == workspace.name),
-                    workspace,
-                    attention,
-                },
-            })
-            .collect()
-    }
-
-    /// The selectable workspace names in display order (excludes headers and any
-    /// workspace hidden in a collapsed idle group). Owned, so callers can mutate
-    /// the list afterwards without holding a borrow of the store.
-    pub fn selectable(&self, classified: &[(Attention, &Workspace)]) -> Vec<String> {
-        self.rows(classified)
-            .into_iter()
-            .filter_map(|r| match r {
-                Row::Ws(w, _) => Some(w.name.clone()),
-                Row::Header(..) => None,
-            })
-            .collect()
+    /// Classify and lay out `inputs` into the current view, honoring the idle
+    /// fold. The single interface both selection and rendering go through.
+    pub fn view<'a>(&self, inputs: &[RowInput<'a>]) -> ClassifiedView<'a> {
+        ClassifiedView::build(inputs, self.idle_collapsed)
     }
 
     /// Move the selection by `delta` among the ordered selectable names,
@@ -167,7 +193,7 @@ impl WorkspaceList {
     /// Point the selection at a real, currently-selectable workspace, falling
     /// back to the first one when the current target is gone or hidden (and to
     /// `None` when nothing is selectable). `selectable` is the ordered name list
-    /// from [`WorkspaceList::selectable`].
+    /// from [`ClassifiedView::selectable_names`].
     pub fn ensure_selection(&mut self, selectable: &[String]) {
         let valid = self
             .selected
@@ -201,6 +227,7 @@ impl WorkspaceList {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::{Agent, AgentState};
     use std::path::PathBuf;
 
     fn ws(name: &str) -> Workspace {
@@ -210,39 +237,105 @@ mod tests {
         }
     }
 
+    fn input<'a>(workspace: &'a Workspace, agent: AgentState, work: WorkState) -> RowInput<'a> {
+        RowInput {
+            workspace,
+            agent: Agent {
+                state: agent,
+                ..Default::default()
+            },
+            work,
+            worker: None,
+        }
+    }
+
+    /// The structural shape of a view: header markers and workspace names in
+    /// display order, ignoring the per-row presentation fields.
+    fn shape(view: &ClassifiedView<'_>) -> Vec<String> {
+        view.rows()
+            .iter()
+            .map(|row| match row {
+                Row::Header(att, count) => format!("header:{att:?}({count})"),
+                Row::Ws(WorkspaceRow { workspace, .. }) => format!("ws:{}", workspace.name),
+            })
+            .collect()
+    }
+
     #[test]
-    fn rows_emit_a_header_per_group_then_its_workspaces() {
+    fn build_orders_unsorted_inputs_into_attention_groups() {
         let (a, b, c) = (ws("a"), ws("b"), ws("c"));
-        let classified = [
-            (Attention::NeedsYou, &a),
-            (Attention::Idle, &b),
-            (Attention::Idle, &c),
+        // Deliberately unsorted: idle first, needs-you last.
+        let inputs = [
+            input(&b, AgentState::Absent, WorkState::Clean),
+            input(&a, AgentState::NeedsAttention, WorkState::Clean),
+            input(&c, AgentState::Absent, WorkState::Clean),
         ];
-        let list = WorkspaceList::default();
+        let view = ClassifiedView::build(&inputs, false);
         assert_eq!(
-            list.rows(&classified),
-            vec![
-                Row::Header(Attention::NeedsYou, 1),
-                Row::Ws(&a, Attention::NeedsYou),
-                Row::Header(Attention::Idle, 2),
-                Row::Ws(&b, Attention::Idle),
-                Row::Ws(&c, Attention::Idle),
+            shape(&view),
+            [
+                "header:NeedsYou(1)",
+                "ws:a",
+                "header:Idle(2)",
+                "ws:b",
+                "ws:c",
             ]
         );
     }
 
     #[test]
-    fn selectable_lists_workspace_names_in_display_order_skipping_collapsed_idle() {
+    fn build_pins_default_first_regardless_of_attention() {
+        let (d, a) = (ws(DEFAULT_WORKSPACE), ws("a"));
+        let inputs = [
+            input(&a, AgentState::NeedsAttention, WorkState::Clean),
+            input(&d, AgentState::Absent, WorkState::Clean),
+        ];
+        let view = ClassifiedView::build(&inputs, false);
+        assert_eq!(shape(&view), ["ws:default", "header:NeedsYou(1)", "ws:a"]);
+    }
+
+    #[test]
+    fn selectable_names_list_display_order_skipping_collapsed_idle() {
         let (a, b, c) = (ws("a"), ws("b"), ws("c"));
-        let classified = [
-            (Attention::NeedsYou, &a),
-            (Attention::Idle, &b),
-            (Attention::Idle, &c),
+        let inputs = [
+            input(&a, AgentState::NeedsAttention, WorkState::Clean),
+            input(&b, AgentState::Absent, WorkState::Clean),
+            input(&c, AgentState::Absent, WorkState::Clean),
+        ];
+        assert_eq!(
+            ClassifiedView::build(&inputs, false).selectable_names(),
+            ["a", "b", "c"]
+        );
+        assert_eq!(
+            ClassifiedView::build(&inputs, true).selectable_names(),
+            ["a"]
+        );
+    }
+
+    #[test]
+    fn collapsing_idle_hides_its_workspace_rows_but_keeps_the_header() {
+        let (a, b) = (ws("a"), ws("b"));
+        let inputs = [
+            input(&a, AgentState::NeedsAttention, WorkState::Clean),
+            input(&b, AgentState::Absent, WorkState::Clean),
+        ];
+        assert_eq!(
+            shape(&ClassifiedView::build(&inputs, true)),
+            ["header:NeedsYou(1)", "ws:a", "header:Idle(1)"]
+        );
+    }
+
+    #[test]
+    fn view_honors_the_lists_idle_fold() {
+        let (a, b) = (ws("a"), ws("b"));
+        let inputs = [
+            input(&a, AgentState::NeedsAttention, WorkState::Clean),
+            input(&b, AgentState::Absent, WorkState::Clean),
         ];
         let mut list = WorkspaceList::default();
-        assert_eq!(list.selectable(&classified), vec!["a", "b", "c"]);
+        assert_eq!(list.view(&inputs).selectable_names(), ["a", "b"]);
         list.toggle_idle();
-        assert_eq!(list.selectable(&classified), vec!["a"]);
+        assert_eq!(list.view(&inputs).selectable_names(), ["a"]);
     }
 
     #[test]
@@ -312,21 +405,5 @@ mod tests {
         // Nothing selectable -> selection clears.
         list.ensure_selection(&[]);
         assert_eq!(list.selected(), None);
-    }
-
-    #[test]
-    fn collapsing_idle_hides_its_workspace_rows_but_keeps_the_header() {
-        let (a, b) = (ws("a"), ws("b"));
-        let classified = [(Attention::NeedsYou, &a), (Attention::Idle, &b)];
-        let mut list = WorkspaceList::default();
-        list.toggle_idle();
-        assert_eq!(
-            list.rows(&classified),
-            vec![
-                Row::Header(Attention::NeedsYou, 1),
-                Row::Ws(&a, Attention::NeedsYou),
-                Row::Header(Attention::Idle, 1),
-            ]
-        );
     }
 }

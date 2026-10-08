@@ -21,6 +21,16 @@ pub enum Attention {
 }
 
 impl Attention {
+    /// The canonical group order the list lays rows out in: needs-you first,
+    /// idle last. One home for the ordering, so grouping never relies on a
+    /// caller handing rows in already-sorted, contiguous runs.
+    pub const ALL: [Attention; 4] = [
+        Attention::NeedsYou,
+        Attention::Working,
+        Attention::ReadyToForge,
+        Attention::Idle,
+    ];
+
     /// Group heading for the list.
     pub fn heading(self) -> &'static str {
         match self {
