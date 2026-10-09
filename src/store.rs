@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use wsg_core::{Repository, WorkspaceHookStream};
+use wsg_core::{AdHocWorkspacePhase, Repository, WorkspaceHookStream};
 
 #[cfg(test)]
 /// Create an isolated local jj repository with signing disabled for tests.
@@ -69,6 +69,33 @@ impl CreatedWorkspace {
     /// The sibling path chosen for the new Workspace.
     pub(crate) fn path(&self) -> &Path {
         &self.path
+    }
+}
+
+/// A failed Workspace creation, tagged with the lifecycle phase so the TUI can
+/// say whether anything was created: `Create` means nothing was; `Hook` means the
+/// Workspace exists but its setup did not finish.
+#[derive(Debug)]
+pub(crate) struct WorkspaceCreateError {
+    pub(crate) phase: AdHocWorkspacePhase,
+    pub(crate) message: String,
+}
+
+impl std::fmt::Display for WorkspaceCreateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for WorkspaceCreateError {}
+
+impl WorkspaceCreateError {
+    /// A creation-step failure carrying `message` (nothing was created).
+    pub(crate) fn create(message: impl Into<String>) -> Self {
+        Self {
+            phase: AdHocWorkspacePhase::Create,
+            message: message.into(),
+        }
     }
 }
 
@@ -178,20 +205,29 @@ impl Store {
         repo_root: &Path,
         requested_name: &str,
         on_output: F,
-    ) -> anyhow::Result<CreatedWorkspace>
+    ) -> Result<CreatedWorkspace, WorkspaceCreateError>
     where
         F: FnMut(WorkspaceHookStream, &str),
     {
         let name = requested_name.trim();
         if name.is_empty() {
-            anyhow::bail!("workspace name required");
+            return Err(WorkspaceCreateError {
+                phase: AdHocWorkspacePhase::Create,
+                message: "workspace name required".to_string(),
+            });
         }
 
-        let repository = Repository::open(repo_root).context("create failed")?;
+        let repository = Repository::open(repo_root).map_err(|error| WorkspaceCreateError {
+            phase: AdHocWorkspacePhase::Create,
+            message: format!("{error:#}"),
+        })?;
         let trunk = crate::trunk::as_revset();
         let workspace = repository
             .create_ad_hoc_workspace_with_revision_and_progress(name, Some(&trunk), on_output)
-            .context("create failed")?;
+            .map_err(|error| WorkspaceCreateError {
+                phase: error.phase(),
+                message: error.to_string(),
+            })?;
         Ok(CreatedWorkspace {
             name: workspace.name().to_owned(),
             path: workspace.path().to_owned(),
@@ -375,7 +411,7 @@ mod tests {
 
         let error = store.create("feat").unwrap_err();
 
-        assert!(format!("{error:#}").starts_with("create failed:"));
+        assert!(format!("{error:#}").contains("already exists"));
         assert_eq!(store.workspaces(), before);
         let fresh = Store::load(&repo);
         assert_eq!(fresh.workspace("feat").unwrap().path, None);

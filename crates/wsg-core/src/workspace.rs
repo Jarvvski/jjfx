@@ -45,18 +45,47 @@ impl AdHocWorkspace {
     }
 }
 
+/// Which step of the Ad Hoc Workspace lifecycle an [`AdHocWorkspaceError`] came
+/// from, so callers can phrase the failure accurately: nothing was created when
+/// the creation step fails, whereas a `Hook` failure means the Workspace exists
+/// but its setup did not finish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdHocWorkspacePhase {
+    /// The Workspace itself could not be created (validation, naming, or
+    /// `jj workspace add`).
+    Create,
+    /// The Workspace was created but its `.jjfx/setup.sh` hook failed.
+    Hook,
+}
+
 /// An error from an Ad Hoc Workspace lifecycle operation.
 #[derive(Debug, Error)]
 #[error("{message}")]
 pub struct AdHocWorkspaceError {
     message: String,
+    phase: AdHocWorkspacePhase,
 }
 
 impl AdHocWorkspaceError {
+    /// A creation-step failure; nothing was created.
     fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
+            phase: AdHocWorkspacePhase::Create,
         }
+    }
+
+    /// A setup-hook failure; the Workspace was created but setup did not finish.
+    fn hook(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            phase: AdHocWorkspacePhase::Hook,
+        }
+    }
+
+    /// Which lifecycle step this error came from.
+    pub fn phase(&self) -> AdHocWorkspacePhase {
+        self.phase
     }
 }
 
@@ -262,14 +291,19 @@ impl Workspaces {
         fs::create_dir_all(base).map_err(|error| {
             AdHocWorkspaceError::new(format!("create workspace directory: {error}"))
         })?;
-        add_workspace_with_revision(self.repository.root(), name, &path, revision)
-            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+        let existed_before = path.exists();
+        if let Err(error) =
+            add_workspace_with_revision(self.repository.root(), name, &path, revision)
+        {
+            cleanup_failed_create(self.repository.root(), name, &path, existed_before);
+            return Err(AdHocWorkspaceError::new(error.message));
+        }
         if let Err(error) = run_setup_hook(&path, on_output) {
             let error = match rollback_workspace_creation(self.repository.root(), name, &path) {
                 Ok(()) => error,
                 Err(cleanup) => format!("{error}; compensation failed: {cleanup}"),
             };
-            return Err(AdHocWorkspaceError::new(error));
+            return Err(AdHocWorkspaceError::hook(error));
         }
         self.refresh()?;
         Ok(WorkspaceAddOutcome::Created(AdHocWorkspace {
@@ -423,14 +457,17 @@ where
     }
 
     let path = ad_hoc_workspace_path(root, name);
-    add_workspace_with_revision(root, name, &path, revision)
-        .map_err(|error| AdHocWorkspaceError::new(error.message))?;
+    let existed_before = path.exists();
+    if let Err(error) = add_workspace_with_revision(root, name, &path, revision) {
+        cleanup_failed_create(root, name, &path, existed_before);
+        return Err(AdHocWorkspaceError::new(error.message));
+    }
     if let Err(error) = run_setup_hook(&path, on_output) {
         let error = match rollback_workspace_creation(root, name, &path) {
             Ok(()) => error,
             Err(cleanup) => format!("{error}; compensation failed: {cleanup}"),
         };
-        return Err(AdHocWorkspaceError::new(error));
+        return Err(AdHocWorkspaceError::hook(error));
     }
     let _ = project_cache_entry(root, name, &path);
     Ok(AdHocWorkspace {
@@ -1115,6 +1152,35 @@ fn spawn_hook_output_reader<R: io::Read + Send + 'static>(
     })
 }
 
+/// Best-effort removal of a Workspace directory a failed `jj workspace add`
+/// left behind. Only removes a directory we just created (`!existed_before`),
+/// that is not the repository root, and that jj does not list as a Workspace -
+/// so a race where the name appears between the pre-check and the add never
+/// destroys someone else's Workspace. A `workspace_names` failure is treated as
+/// "still listed" and leaves the directory alone.
+fn cleanup_failed_create(root: &Path, name: &str, path: &Path, existed_before: bool) {
+    let still_listed = workspace_names(root)
+        .map(|names| names.iter().any(|candidate| candidate == name))
+        .unwrap_or(true);
+    if !should_cleanup_failed_create(existed_before, path == root, path.exists(), still_listed) {
+        return;
+    }
+    let _ = fs::remove_dir_all(path);
+    let _ = unproject_cache_entry(root, name);
+}
+
+/// The safety guard for [`cleanup_failed_create`]: remove a directory only when
+/// we just created it, it is not the repository root, it exists, and jj does not
+/// list the name (so a race that registered a Workspace is never destroyed).
+fn should_cleanup_failed_create(
+    existed_before: bool,
+    is_root: bool,
+    path_exists: bool,
+    still_listed: bool,
+) -> bool {
+    !existed_before && !is_root && path_exists && !still_listed
+}
+
 fn rollback_workspace_creation(root: &Path, name: &str, path: &Path) -> Result<(), String> {
     let mut failures = Vec::new();
     if path.is_dir()
@@ -1289,5 +1355,66 @@ fn command_error(output: &std::process::Output) -> String {
         format!("command exited with {}", output.status)
     } else {
         stderr
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_repo(tag: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let repo =
+            std::env::temp_dir().join(format!("wsg-core-{tag}-{}-{nonce}", std::process::id()));
+        let status = Command::new("jj")
+            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .arg(&repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "jj git init should succeed");
+        repo
+    }
+
+    fn sibling(root: &Path, name: &str) -> PathBuf {
+        let base = root.file_name().unwrap().to_string_lossy();
+        root.parent().unwrap().join(format!("{base}-{name}"))
+    }
+
+    #[test]
+    fn should_cleanup_only_removes_a_freshly_created_unlisted_dir() {
+        assert!(should_cleanup_failed_create(false, false, true, false));
+        // Left alone when it pre-existed, is the root, is gone, or is still listed.
+        assert!(!should_cleanup_failed_create(true, false, true, false));
+        assert!(!should_cleanup_failed_create(false, true, true, false));
+        assert!(!should_cleanup_failed_create(false, false, false, false));
+        assert!(!should_cleanup_failed_create(false, false, true, true));
+    }
+
+    #[test]
+    fn cleanup_failed_create_removes_a_partial_dir_and_preserves_a_preexisting_one() {
+        let repo = temp_repo("cleanup");
+        let root = repo.canonicalize().unwrap();
+        let path = sibling(&root, "feat");
+
+        // jj created the directory but did not register the Workspace: removed.
+        fs::create_dir_all(path.join(".jj")).unwrap();
+        cleanup_failed_create(&root, "feat", &path, false);
+        assert!(
+            !path.exists(),
+            "partial Workspace directory should be removed"
+        );
+
+        // A directory that existed before the add is never destroyed.
+        fs::create_dir_all(&path).unwrap();
+        cleanup_failed_create(&root, "feat", &path, true);
+        assert!(path.exists(), "pre-existing directory must be preserved");
+
+        std::fs::remove_dir_all(&path).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

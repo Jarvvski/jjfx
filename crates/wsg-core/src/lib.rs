@@ -76,9 +76,9 @@ pub use worker_actions::{
     WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
 pub use workspace::{
-    AdHocWorkspace, AdHocWorkspaceError, CleanDecision, WorkerWorkspace, WorkerWorkspaceError,
-    WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceHookStream,
-    WorkspaceSnapshot, Workspaces, ad_hoc_workspace_path,
+    AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, WorkerWorkspace,
+    WorkerWorkspaceError, WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry,
+    WorkspaceHookStream, WorkspaceSnapshot, Workspaces, ad_hoc_workspace_path,
 };
 
 /// A Jujutsu repository discovered from a starting path.

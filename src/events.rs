@@ -2,8 +2,8 @@
 //! that dumb hooks append to and the TUI both replays (on startup) and tails
 //! (live). One fixed path, filtered by `cwd`; hooks never resolve a repo root.
 
-use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
@@ -17,9 +17,9 @@ use crate::app::Msg;
 /// grow the file without limit (ticket 04: size-based rotation).
 pub const MAX_LOG_BYTES: u64 = 4 * 1024 * 1024;
 
-/// The one fixed global log path: `${XDG_STATE_HOME:-~/.local/state}/jjfx/
-/// events.jsonl` - the exact path the installed hook appends to.
-pub fn log_path() -> PathBuf {
+/// The one fixed global state directory jjfx owns:
+/// `${XDG_STATE_HOME:-~/.local/state}/jjfx`.
+pub fn state_dir() -> PathBuf {
     let base = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
@@ -29,7 +29,36 @@ pub fn log_path() -> PathBuf {
                 .unwrap_or_default();
             home.join(".local").join("state")
         });
-    base.join("jjfx").join("events.jsonl")
+    base.join("jjfx")
+}
+
+/// The one fixed global log path: `${XDG_STATE_HOME:-~/.local/state}/jjfx/
+/// events.jsonl` - the exact path the installed hook appends to.
+pub fn log_path() -> PathBuf {
+    state_dir().join("events.jsonl")
+}
+
+/// Where the TUI appends full setup/tab failure text, so a failure the footer
+/// truncated stays inspectable after the fact.
+pub fn setup_error_log_path() -> PathBuf {
+    state_dir().join("setup-errors.log")
+}
+
+/// Append a timestamped failure block to `path`, best-effort. A missing
+/// directory or write error is ignored: diagnostics must never break the TUI.
+pub fn append_failure(path: &Path, context: &str, message: &str) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let block = format!("[{}] {context}\n{message}\n\n", jiff::Timestamp::now());
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(block.as_bytes()));
 }
 
 /// Read the whole log into events, for the startup replay. A missing or garbled
@@ -158,6 +187,28 @@ mod tests {
     fn read_events_on_missing_file_is_empty() {
         let dir = scratch("missing");
         assert!(read_events(&dir.join("events.jsonl")).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn append_failure_writes_a_timestamped_block_and_appends() {
+        let dir = scratch("failure");
+        let path = dir.join("nested").join("setup-errors.log");
+        append_failure(&path, "create workspace 'feat' (Create)", "boom");
+        append_failure(&path, "open workspace 'feat'", "kitty unavailable");
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(
+            text.contains("create workspace 'feat' (Create)\nboom"),
+            "{text}"
+        );
+        assert!(
+            text.contains("open workspace 'feat'\nkitty unavailable"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with("\n\n"),
+            "blocks are blank-line separated: {text:?}"
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 

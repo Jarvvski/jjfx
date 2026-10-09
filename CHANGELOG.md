@@ -5,6 +5,16 @@ version of record lives in the project manifest.
 
 ## [Unreleased]
 
+### Fixed
+
+- 2026-10-09 - Workspace creation (`n`) now reports the real failure and cleans
+  up after itself: a failed `jj workspace add` no longer leaves a stray
+  `<repo>-<name>` directory behind, a create-step failure says `could not create
+  '<name>'` instead of the misleading `created '<name>', setup failed`, signing
+  failures surface an actionable GPG hint, and the full error text is appended to
+  `${XDG_STATE_HOME:-~/.local/state}/jjfx/setup-errors.log` so a footer-truncated
+  failure stays inspectable (jjfx 0.50.1).
+
 ### Added
 
 - 2026-10-08 - `PageUp` and `PageDown` now jump the workspace-list selection

@@ -185,6 +185,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         repo_root.clone(),
         config.forge,
         Arc::clone(&terminal),
+        Some(events::setup_error_log_path()),
     );
     let mut app = App::new(
         Store::load(&repo_root),

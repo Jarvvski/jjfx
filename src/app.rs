@@ -239,7 +239,7 @@ pub enum Msg {
     /// The setup hook for a newly-created workspace finished.
     WorkspaceSetupCompleted {
         workspace: PendingWorkspace,
-        result: Result<(), String>,
+        result: Result<(), store::WorkspaceCreateError>,
     },
     /// A background workspace deletion finished. The worker always includes a
     /// fresh Store, even when a later deletion phase reports an error.
@@ -1694,7 +1694,7 @@ impl App {
     fn on_workspace_setup_completed(
         &mut self,
         workspace: PendingWorkspace,
-        result: Result<(), String>,
+        result: Result<(), store::WorkspaceCreateError>,
     ) {
         if self.pending_workspace.as_ref() != Some(&workspace) {
             return;
@@ -1706,7 +1706,21 @@ impl App {
         let PendingWorkspace { name, path, .. } = workspace;
 
         if let Err(error) = result {
-            self.set_status(format!("created '{name}', setup failed: {error}"));
+            let store::WorkspaceCreateError { phase, message } = error;
+            self.emit(Effect::RecordFailure {
+                context: format!("create workspace '{name}' ({phase:?})"),
+                message: message.clone(),
+            });
+            let friendly = friendly_setup_error(&message);
+            let status = match phase {
+                wsg_core::AdHocWorkspacePhase::Create => {
+                    format!("could not create '{name}': {friendly}")
+                }
+                wsg_core::AdHocWorkspacePhase::Hook => {
+                    format!("created '{name}', setup failed: {friendly}")
+                }
+            };
+            self.set_status(status);
             return;
         }
         let still_exists = self
@@ -1745,7 +1759,13 @@ impl App {
     fn open_created_workspace(&mut self, name: &str, path: &std::path::Path) {
         match self.terminal.open(name, path, true) {
             Ok(()) => self.set_status(format!("created '{name}'")),
-            Err(error) => self.set_status(format!("created '{name}', tab failed: {error}")),
+            Err(error) => {
+                self.emit(Effect::RecordFailure {
+                    context: format!("open workspace '{name}'"),
+                    message: error.to_string(),
+                });
+                self.set_status(format!("created '{name}', tab failed: {error}"));
+            }
         }
     }
 
@@ -2482,6 +2502,21 @@ impl App {
 /// home body is shorter than this the pane is dropped so the list stays usable.
 const MIN_WORLD_PANE_HEIGHT: u16 = 5;
 
+/// Turn a raw create/setup failure into a short, actionable footer line. A
+/// signing failure (jj's GPG path) becomes a pointed hint, since the raw text is
+/// a multi-line internal-error stack; everything else passes through unchanged.
+fn friendly_setup_error(message: &str) -> String {
+    let signing = message.contains("Signing error")
+        || message.contains("signing failed")
+        || message.contains("gpg:");
+    if signing {
+        "could not sign the new workspace commit - unlock your GPG key or check gpg-agent"
+            .to_string()
+    } else {
+        message.to_string()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2617,6 +2652,7 @@ mod tests {
             store.repo_root().to_path_buf(),
             ForgeConfig::default(),
             Arc::clone(&terminal),
+            None,
         );
         let app = App::new(
             store,
@@ -3058,6 +3094,51 @@ mod tests {
         assert_eq!(
             app.status.as_deref(),
             Some("created 'feat', setup finished after the workspace disappeared")
+        );
+    }
+
+    #[test]
+    fn create_phase_failure_says_could_not_create_and_logs_full_text() {
+        let mut app = app_with(&["default"]);
+        let started_at = std::time::Instant::now();
+        let pending = |path: &str| PendingWorkspace {
+            name: "feat".to_string(),
+            path: std::path::PathBuf::from(path),
+            started_at,
+        };
+        app.pending_workspace = Some(pending("/wt/feat"));
+
+        let effects = app.handle(Msg::WorkspaceSetupCompleted {
+            workspace: pending("/wt/feat"),
+            result: Err(crate::store::WorkspaceCreateError {
+                phase: wsg_core::AdHocWorkspacePhase::Create,
+                message: "run jj workspace add: boom".to_string(),
+            }),
+        });
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("could not create 'feat': run jj workspace add: boom")
+        );
+        assert!(
+            effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::RecordFailure { message, .. } if message == "run jj workspace add: boom")),
+            "the full failure should be logged"
+        );
+    }
+
+    #[test]
+    fn friendly_setup_error_maps_signing_failures_to_a_hint() {
+        let raw = "Internal error: Failed to check out the initial commit\n\
+                   3: Signing error\n4: gpg: signing failed: No secret key";
+        assert_eq!(
+            friendly_setup_error(raw),
+            "could not sign the new workspace commit - unlock your GPG key or check gpg-agent"
+        );
+        assert_eq!(
+            friendly_setup_error("run jj workspace add: boom"),
+            "run jj workspace add: boom"
         );
     }
 
@@ -4907,6 +4988,7 @@ mod tests {
         handle_setup_completion(&mut app, &mut rx).await;
 
         let status = app.status.as_deref().unwrap();
+        assert!(status.starts_with("could not create 'feat':"), "{status}");
         assert!(
             status.contains("workspace 'feat' already exists"),
             "{status}"

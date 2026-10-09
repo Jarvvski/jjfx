@@ -18,7 +18,7 @@ use crate::diff;
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj;
-use crate::store::{Store, Workspace};
+use crate::store::{Store, Workspace, WorkspaceCreateError};
 use crate::terminal::Terminal;
 use crate::workspace_dispatch::OperationId;
 
@@ -45,6 +45,9 @@ pub(crate) enum Effect {
     Lift { job: LiftJob },
     /// Run the forge pipeline for these targets, streaming [`Msg::Forge`].
     StartForge { targets: Vec<Target> },
+    /// Append a full failure (with context) to the on-disk setup-error log so a
+    /// one-off, footer-truncated failure stays inspectable later.
+    RecordFailure { context: String, message: String },
 }
 
 /// The one owner of effect execution for the running application.
@@ -53,21 +56,26 @@ pub(crate) struct Runtime {
     repo_root: PathBuf,
     terminal: Arc<dyn Terminal>,
     forge: forge::Forge,
+    /// Where full failure text is appended; `None` disables logging (tests).
+    failure_log: Option<PathBuf>,
 }
 
 impl Runtime {
     /// Bind the runtime to the message loop, repository, terminal, and config.
+    /// `failure_log` is where [`Effect::RecordFailure`] appends full error text.
     pub(crate) fn new(
         tx: UnboundedSender<Msg>,
         repo_root: PathBuf,
         forge: ForgeConfig,
         terminal: Arc<dyn Terminal>,
+        failure_log: Option<PathBuf>,
     ) -> Self {
         Self {
             tx,
             forge: forge::Forge::new(repo_root.clone(), forge),
             repo_root,
             terminal,
+            failure_log,
         }
     }
 
@@ -85,6 +93,11 @@ impl Runtime {
             Effect::Fetch => self.fetch(),
             Effect::Lift { job } => self.lift(job),
             Effect::StartForge { targets } => self.start_forge(targets),
+            Effect::RecordFailure { context, message } => {
+                if let Some(path) = &self.failure_log {
+                    crate::events::append_failure(path, &context, &message);
+                }
+            }
         }
     }
 
@@ -146,8 +159,8 @@ impl Runtime {
                 )
             })
             .await
-            .map_err(|error| format!("{error:#}"))
-            .and_then(|result| result.map(|_| ()).map_err(|error| format!("{error:#}")));
+            .map_err(|error| WorkspaceCreateError::create(format!("create failed: {error:#}")))
+            .and_then(|result| result.map(|_| ()));
             let _ = tx.send(Msg::WorkspaceSetupCompleted { workspace, result });
         });
     }
