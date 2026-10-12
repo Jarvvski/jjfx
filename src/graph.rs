@@ -6,7 +6,7 @@
 //! layout is built by us from typed commit data.
 //!
 //! jj-lib has no stability guarantee and reads the store format of the installed
-//! `jj`, so its version is locked to the `jj` mise pin (0.43.0) and the two move
+//! `jj`, so its version is locked to the `jj` mise pin (0.46.0) and the two move
 //! in lockstep. The surface used here is deliberately minimal - open, read heads
 //! and bookmarks, walk parents - to keep the migration cost of a `jj` bump small.
 //!
@@ -20,10 +20,13 @@ use std::path::Path;
 use anyhow::{Context, anyhow};
 use jj_lib::backend::CommitId;
 use jj_lib::config::StackedConfig;
+use jj_lib::default_backend_factories::{
+    default_backend_factories, default_working_copy_factories,
+};
 use jj_lib::object_id::ObjectId;
-use jj_lib::repo::{Repo, StoreFactories};
+use jj_lib::repo::Repo;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::{Workspace, default_working_copy_factories};
+use jj_lib::workspace::Workspace;
 
 /// One commit in the graph, in display form (owned strings, no jj-lib types leak
 /// out of this module).
@@ -88,12 +91,13 @@ impl Graph {
 /// `block_on`s jj-lib's async loader), so callers run it on `spawn_blocking`,
 /// never the render task.
 pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
-    let settings =
-        UserSettings::from_config(StackedConfig::with_defaults()).context("build jj settings")?;
+    let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let settings = UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), home_dir)
+        .context("build jj settings")?;
     let workspace = Workspace::load(
         &settings,
         repo_root,
-        &StoreFactories::default(),
+        &default_backend_factories(),
         &default_working_copy_factories(),
     )
     .context("open jj workspace")?;

@@ -2,8 +2,8 @@
 rust = "1.97.1"
 # jj-lib reads the on-disk .jj store directly, so jjfx is version-coupled to the
 # jj binary's store format (ADR 0007). Pin jj to the version jj-lib targets and
-# upgrade them in lockstep. Spike 02 confirmed jj 0.43.0 <-> jj-lib 0.43.0.
-jj = "0.43.0"
+# upgrade them in lockstep.
+jj = "0.46.0"
 # Cross-compilation toolchain for `mise run release`. zig is the C cross-linker
 # cargo-zigbuild drives; together they build Linux (musl/gnu) and both macOS
 # arches from this host without Docker (cross/Docker cannot target apple-darwin).
