@@ -28,27 +28,18 @@ agents.
 
 - **jj 0.46.0** on your `PATH`. jjfx reads jj's on-disk store directly through
   `jj-lib`, so the two are version-coupled - upgrade them together.
-- **Rust 1.97.1**. [mise](https://mise.jdx.dev) pins it for you; a rustup
-  toolchain of the same version works too.
+- **Rust 1.97.1 or newer** - [rustup](https://rustup.rs) is the usual way to
+  get it.
 
 ### 2. Install
-
-From crates.io:
 
 ```bash
 cargo install jjfx
 ```
 
-Or from a clone, which also builds the `wsg` compatibility binary:
-
-```bash
-git clone git@github.com:Jarvvski/jjfx.git
-cd jjfx
-mise install        # pin Rust and jj
-mise run install    # release build, installed to ~/.cargo/bin/jjfx
-```
-
-Without mise, `cargo install --path .` builds the same binary from the clone.
+That builds and installs the `jjfx` binary into Cargo's bin directory
+(`~/.cargo/bin`). To build from a clone instead - which also builds the `wsg`
+compatibility binary - see [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### 3. Open the TUI
 
@@ -100,30 +91,6 @@ The same binary carries the non-interactive command surface alongside the TUI:
 
 Run `jjfx help` for usage.
 
-## Build & develop
-
-Tooling is driven by [mise](https://mise.jdx.dev):
-
-```bash
-mise install            # pin the Rust toolchain and jj
-mise run run            # cargo run --release -p jjfx -- tui
-mise run build          # cargo build --release --workspace
-mise run test           # build the workspace, then cargo test
-mise run fmt            # cargo fmt --all
-mise run lint           # cargo clippy --all-targets -- -D warnings
-mise run check          # fmt + lint + build + test (the pre-land gate)
-mise run conformance    # Go/Rust wsg conformance (needs the Go oracle; see docs/wsg-conformance.md)
-mise run release            # bundle jjfx+wsg archives + sha256 into dist/
-mise run install-candidate  # stage both binaries under a non-PATH prefix
-```
-
-Plain cargo works too:
-
-```bash
-cargo run -p jjfx -- tui        # open the TUI
-cargo run -p jjfx -- pool list  # run a CLI command
-```
-
 ## Documentation
 
 - [Configuration](docs/configuration.md) - the `config.toml` reference: agent,
@@ -152,7 +119,9 @@ compatibility `wsg` target remains available for migration conformance.
 
 ## Contributing
 
-Project conventions and agent guidance live in [`CLAUDE.md`](CLAUDE.md).
+Build instructions, the development task list, and where things live are in
+[`CONTRIBUTING.md`](CONTRIBUTING.md). Project conventions and agent guidance
+live in [`CLAUDE.md`](CLAUDE.md).
 
 ## License
 
