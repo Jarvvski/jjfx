@@ -989,7 +989,11 @@ fn add_workspace_with_revision(
     revision: Option<&str>,
 ) -> Result<(), WorkerWorkspaceError> {
     let mut command = Command::new("jj");
-    command.args(["workspace", "add", "--name", name]);
+    // jj 0.46 defaults `workspace add` to colocating (creating a Git worktree)
+    // when the repo is colocated. jjfx has not adopted colocation yet, so pin
+    // the pre-0.46 non-colocated behavior explicitly instead of inheriting the
+    // new default.
+    command.args(["workspace", "add", "--name", name, "--no-colocate"]);
     if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
         command.args(["--revision", revision]);
     }
