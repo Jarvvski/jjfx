@@ -99,7 +99,10 @@ jobs:
             "${{ steps.version.outputs.version }}" "$(date -u +%Y-%m-%d)"
 
       - name: Verify the package without publishing
-        run: cargo publish --dry-run --locked
+        # The bump above is deliberately uncommitted at this point, so the
+        # checkout is dirty by design; --allow-dirty packages exactly what the
+        # commit below will record.
+        run: cargo publish --dry-run --locked --allow-dirty
 
       - name: Summarise the dry run
         if: inputs.dry_run

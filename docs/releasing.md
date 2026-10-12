@@ -66,9 +66,12 @@ gh run watch
 ```
 
 That runs the gate, derives the version, bumps the manifest, stamps the
-changelog, and verifies the package with `cargo publish --dry-run --locked` -
-then stops and prints the diff. Nothing is committed, tagged, published, or
-released.
+changelog, and verifies the package with
+`cargo publish --dry-run --locked --allow-dirty` - then stops and prints the
+diff. `--allow-dirty` is required because the bump is deliberately left
+uncommitted at that point, so the checkout is dirty by design; it packages
+exactly what the commit step would record. Nothing is committed, tagged,
+published, or released.
 
 The real thing:
 
