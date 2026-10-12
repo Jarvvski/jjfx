@@ -720,7 +720,31 @@ fn where_command(repository: &Repository) -> Result<()> {
 }
 
 fn path_command(repository: &Repository, name: &str) -> Result<()> {
-    println!("{}", repository.workspaces().path(name).display());
+    // Dispatch and the Pool list use the short Worker id, while the Workspace
+    // is named `worker-<id>`. Resolve either form against the real projection so
+    // `path <short-id>` returns the directory that actually exists.
+    let workspaces = repository.workspaces();
+    let prefixed = format!("worker-{name}");
+    let path = workspaces
+        .projection()
+        .ok()
+        .and_then(|snapshot| {
+            let entries = snapshot.entries();
+            entries
+                .iter()
+                .find(|entry| entry.name() == name)
+                .or_else(|| entries.iter().find(|entry| entry.name() == prefixed))
+                .map(|entry| entry.path().to_path_buf())
+        })
+        .unwrap_or_else(|| {
+            let worker_path = workspaces.path(&prefixed);
+            if worker_path.is_dir() {
+                worker_path
+            } else {
+                workspaces.path(name)
+            }
+        });
+    println!("{}", path.display());
     Ok(())
 }
 
