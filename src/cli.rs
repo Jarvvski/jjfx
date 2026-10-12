@@ -42,7 +42,7 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " pool <N>                  Set pool size (creates pool if needed, safe shrink)\n  ",
     env!("CARGO_PKG_NAME"),
-    " pool list                 Show pool status\n  ",
+    " pool list [--json]        Show pool status\n  ",
     env!("CARGO_PKG_NAME"),
     " pool rm <worker>          Remove a worker from the pool (must not be busy)\n  ",
     env!("CARGO_PKG_NAME"),
@@ -68,7 +68,7 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " completion [zsh]         Print zsh completion\n\nObservability:\n  ",
     env!("CARGO_PKG_NAME"),
-    " status                    Alias for pool list\n  ",
+    " status [--json]           Alias for pool list\n  ",
     env!("CARGO_PKG_NAME"),
     " version                   Print the ",
     env!("CARGO_PKG_NAME"),
@@ -99,7 +99,9 @@ pub enum Command {
     Colocation {
         action: ColocationAction,
     },
-    Status,
+    Status {
+        json: bool,
+    },
     Dispatch(DispatchArgs),
     Send {
         worker: String,
@@ -161,7 +163,9 @@ pub enum PoolCommand {
     Resize {
         size: String,
     },
-    List,
+    List {
+        json: bool,
+    },
     Remove {
         worker: String,
     },
@@ -197,8 +201,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         .map(|name| Command::Path { name }),
         "refresh" | "sync" => Ok(Command::Refresh),
         "colocation" | "colocate" => parse_colocation(&args[1..]),
-        "status" => ensure_no_extra(concat!(env!("CARGO_PKG_NAME"), " status"), &args[1..])
-            .map(|_| Command::Status),
+        "status" => parse_status(&args[1..]),
         "reset" => parse_single_exact(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " reset <worker>"),
             &args[1..],
@@ -316,12 +319,36 @@ fn parse_remove(args: &[String]) -> Result<Command> {
     Ok(Command::Remove { force, names })
 }
 
+/// Parse the top-level `status` alias, which accepts `--json`.
+fn parse_status(args: &[String]) -> Result<Command> {
+    let mut json = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json = true,
+            value => bail!("Unknown option for status: {value}"),
+        }
+    }
+    Ok(Command::Status { json })
+}
+
+/// Parse `pool list`/`ls`/`status`, which accepts `--json`.
+fn parse_pool_list(args: &[String]) -> Result<Command> {
+    let mut json = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json = true,
+            value => bail!("Unknown option for pool list: {value}"),
+        }
+    }
+    Ok(PoolCommand::List { json }.into())
+}
+
 fn parse_pool(args: &[String]) -> Result<Command> {
     let Some(subcommand) = args.first().map(String::as_str) else {
-        return Ok(PoolCommand::List.into());
+        return Ok(PoolCommand::List { json: false }.into());
     };
     match subcommand {
-        "list" | "ls" | "status" => Ok(PoolCommand::List.into()),
+        "list" | "ls" | "status" => parse_pool_list(&args[1..]),
         "destroy" => Ok(PoolCommand::Destroy.into()),
         "help" => Ok(PoolCommand::Help.into()),
         "rm" | "remove" => parse_single(
@@ -414,14 +441,6 @@ fn parse_single_exact(usage: &str, args: &[String]) -> Result<String> {
         bail!("{usage}");
     }
     Ok(args[0].clone())
-}
-
-fn ensure_no_extra(usage: &str, args: &[String]) -> Result<()> {
-    if args.is_empty() {
-        Ok(())
-    } else {
-        bail!("{usage}");
-    }
 }
 
 fn parse_worker_command(usage: &str, args: &[String]) -> Result<String> {
@@ -639,7 +658,7 @@ pub fn run(
         Command::List => list_command(&repository(colocate)?)?,
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
         Command::Clean => clean_command(&repository(colocate)?)?,
-        Command::Status => pool_list_command(&repository(colocate)?)?,
+        Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
         Command::Dispatch(args) => dispatch_command(&repository(colocate)?, &args)?,
         Command::Send {
             worker,
@@ -810,7 +829,7 @@ fn clean_command(repository: &Repository) -> Result<()> {
 fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
     match command {
         PoolCommand::Resize { size } => resize_pool_command(repository, &size),
-        PoolCommand::List => pool_list_command(repository),
+        PoolCommand::List { json } => pool_list_command(repository, json),
         PoolCommand::Remove { worker } => remove_worker_command(repository, &worker),
         PoolCommand::Reset { worker } => reset_worker_command(repository, &worker),
         PoolCommand::Profile {
@@ -907,11 +926,14 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
-fn pool_list_command(repository: &Repository) -> Result<()> {
+fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     let snapshot = repository.worker_pool().reconcile_runs();
     let pool = snapshot
         .pool()
         .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
+    if json {
+        return pool_list_json(&snapshot);
+    }
     for diagnostic in snapshot.diagnostics() {
         eprintln!("{}", diagnostic.message());
     }
@@ -932,11 +954,7 @@ fn pool_list_command(repository: &Repository) -> Result<()> {
             WorkerStatus::Failed => 3,
         };
         counts[index] += 1;
-        let short = worker
-            .worker_id()
-            .as_str()
-            .strip_prefix("worker-")
-            .unwrap_or(worker.worker_id().as_str());
+        let short = short_worker_id(worker.worker_id().as_str());
         let name = if worker.alias().is_empty() {
             "-"
         } else {
@@ -948,6 +966,20 @@ fn pool_list_command(repository: &Repository) -> Result<()> {
             "{short:<10} {name:<12} {:<10} {ticket:<14} {elapsed}",
             worker.status().as_str()
         );
+        // A terminal Worker's reason is only useful when surfaced here: the raw
+        // diagnosis lives in its Run log, and the persisted error may be a
+        // generic fallback.
+        if worker.status() == WorkerStatus::Failed {
+            if let Some(error) = worker.error().filter(|error| !error.is_empty()) {
+                println!("           reason: {error}");
+            }
+            if let Some(code) = worker.exit_code() {
+                println!("           exit: {code}");
+            }
+            if let Some(log) = worker.log_file().filter(|log| !log.is_empty()) {
+                println!("           log: {log}");
+            }
+        }
     }
     println!();
     if let Some(profile) = pool.profile() {
@@ -961,6 +993,33 @@ fn pool_list_command(repository: &Repository) -> Result<()> {
         counts[3],
         pool.size()
     );
+    Ok(())
+}
+
+/// The short Worker id (without the `worker-` prefix) used in the list view.
+fn short_worker_id(worker_id: &str) -> &str {
+    worker_id.strip_prefix("worker-").unwrap_or(worker_id)
+}
+
+/// Machine-readable Pool status, including the failure fields the table omits.
+fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
+    let workers = snapshot
+        .workers()
+        .iter()
+        .map(|worker| {
+            serde_json::json!({
+                "worker": worker.worker_id().as_str(),
+                "name": if worker.alias().is_empty() { "-" } else { worker.alias() },
+                "status": worker.status().as_str(),
+                "ticket": worker.ticket(),
+                "elapsed": elapsed_display(worker.started_at(), worker.completed_at()),
+                "error": worker.error(),
+                "exit_code": worker.exit_code(),
+                "log_file": worker.log_file(),
+            })
+        })
+        .collect::<Vec<_>>();
+    println!("{}", serde_json::to_string_pretty(&workers)?);
     Ok(())
 }
 
@@ -1576,6 +1635,32 @@ mod tests {
         assert!(parse(&args(&["colocation"])).is_err());
         assert!(parse(&args(&["colocation", "wat"])).is_err());
         assert!(parse(&args(&["colocation", "enable", "extra"])).is_err());
+    }
+
+    #[test]
+    fn status_and_pool_list_accept_json_and_reject_other_options() {
+        assert_eq!(
+            parse(&args(&["status"])).unwrap(),
+            Command::Status { json: false }
+        );
+        assert_eq!(
+            parse(&args(&["status", "--json"])).unwrap(),
+            Command::Status { json: true }
+        );
+        assert!(parse(&args(&["status", "--wat"])).is_err());
+        assert_eq!(
+            parse(&args(&["pool", "list"])).unwrap(),
+            Command::Pool(PoolCommand::List { json: false })
+        );
+        assert_eq!(
+            parse(&args(&["pool", "list", "--json"])).unwrap(),
+            Command::Pool(PoolCommand::List { json: true })
+        );
+        assert_eq!(
+            parse(&args(&["pool"])).unwrap(),
+            Command::Pool(PoolCommand::List { json: false })
+        );
+        assert!(parse(&args(&["pool", "list", "--wat"])).is_err());
     }
 
     #[test]
