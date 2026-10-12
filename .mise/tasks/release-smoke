@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+#MISE description="Verify a bundled release archive: checksum, layout, manifest, versions, and non-Repository startup"
+#
+# Usage:
+#   mise run release-smoke dist/<archive>.tar.gz
+#
+# Executes the archive's own binaries, so it only works for a host-target
+# archive. Cross archives are produced but not smoke-tested here.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+
+archive="${1:-}"
+if [ -z "$archive" ]; then
+  echo "usage: mise run release-smoke <archive.tar.gz>" >&2
+  exit 2
+fi
+case "$archive" in
+  /*) : ;;
+  *) archive="$root/$archive" ;;
+esac
+if [ ! -f "$archive" ]; then
+  echo "error: archive not found: $archive" >&2
+  exit 1
+fi
+
+if command -v shasum >/dev/null 2>&1; then
+  sha() { shasum -a 256 "$1" | awk '{print $1}'; }
+else
+  sha() { sha256sum "$1" | awk '{print $1}'; }
+fi
+
+# Checksum sidecar (when present).
+if [ -f "$archive.sha256" ]; then
+  expected=$(awk '{print $1}' "$archive.sha256")
+  actual=$(sha "$archive")
+  if [ "$expected" != "$actual" ]; then
+    echo "error: checksum mismatch for $archive" >&2
+    exit 1
+  fi
+  echo "    checksum ok"
+fi
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+tar -C "$work" -xzf "$archive"
+
+# Archive layout.
+for f in bin/jjfx bin/wsg release-manifest.json LICENSE; do
+  if [ ! -e "$work/$f" ]; then
+    echo "error: archive missing $f" >&2
+    exit 1
+  fi
+done
+echo "    layout ok"
+
+# Manifest records both independent versions and the target.
+manifest="$work/release-manifest.json"
+for key in '"target"' '"jjfx"' '"wsg"' '"version"'; do
+  if ! grep -q "$key" "$manifest"; then
+    echo "error: manifest missing $key" >&2
+    exit 1
+  fi
+done
+echo "    manifest ok"
+
+# The host binaries must start and report their versions from outside a Repository.
+jjfx_out=$(cd "$work" && ./bin/jjfx --version)
+case "$jjfx_out" in
+  jjfx*) ;;
+  *) echo "error: unexpected jjfx version output: $jjfx_out" >&2; exit 1 ;;
+esac
+wsg_out=$(cd "$work" && ./bin/wsg version)
+case "$wsg_out" in
+  wsg*) ;;
+  *) echo "error: unexpected wsg version output: $wsg_out" >&2; exit 1 ;;
+esac
+echo "    versions ok ($jjfx_out; $wsg_out)"

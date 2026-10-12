@@ -1,6 +1,6 @@
 # Package jjfx and wsg release artifacts
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -61,13 +61,13 @@ and release publication.
 
 ## Acceptance Criteria
 
-- [ ] Release artifacts contain working `jjfx` and `wsg` binaries.
-- [ ] Artifact metadata records both package versions and target information.
-- [ ] Checksums and archive layout are verified automatically.
-- [ ] Candidate installation uses a non-PATH prefix and leaves the installed
+- [x] Release artifacts contain working `jjfx` and `wsg` binaries.
+- [x] Artifact metadata records both package versions and target information.
+- [x] Checksums and archive layout are verified automatically.
+- [x] Candidate installation uses a non-PATH prefix and leaves the installed
       Go `wsg` and `qwe` unchanged.
-- [ ] CI can produce inspectable artifacts without publishing or promoting them.
-- [ ] `mise run check` is green.
+- [x] CI can produce inspectable artifacts without publishing or promoting them.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 

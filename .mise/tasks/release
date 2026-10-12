@@ -1,10 +1,16 @@
 #!/usr/bin/env bash
-#MISE description="Build stripped release tarball(s) + sha256 into dist/ for one or more targets (default: host)"
+#MISE description="Build a bundled jjfx+wsg release archive + sha256 into dist/ for one or more targets (default: host)"
 #
 # Examples:
 #   mise run release                                   # host only
 #   mise run release aarch64-apple-darwin x86_64-apple-darwin
 #   mise run release x86_64-unknown-linux-musl         # cross via cargo-zigbuild
+#
+# Each target produces ONE archive containing bin/jjfx, bin/wsg,
+# release-manifest.json, and LICENSE. The two package versions are independent
+# and both appear in the archive name and manifest. The host archive is
+# smoke-tested. Publication, signing, notarization, tagging, and promotion are
+# owner decisions and are never performed here.
 #
 # The host target builds with plain `cargo build` (no zig needed). Any other
 # target is cross-compiled with cargo-zigbuild, which is pinned in mise.toml.
@@ -13,8 +19,8 @@ set -euo pipefail
 root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
 
-bin=jjfx
-version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+jjfx_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+wsg_version=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/wsg/Cargo.toml | head -1)
 host=$(rustc -vV | sed -n 's/^host: //p')
 
 targets=("$@")
@@ -43,27 +49,42 @@ dist="$root/dist"
 mkdir -p "$dist"
 
 for target in "${targets[@]}"; do
-  echo "==> building $bin $version for $target"
+  echo "==> building jjfx $jjfx_version + wsg $wsg_version for $target"
   rustup target add "$target" >/dev/null 2>&1 || true
 
   if [ "$target" = "$host" ]; then
-    cargo build --release --target "$target" --config profile.release.strip=true
+    cargo build --release --target "$target" --config profile.release.strip=true -p jjfx -p wsg
   else
-    cargo zigbuild --release --target "$target" --config profile.release.strip=true
+    cargo zigbuild --release --target "$target" --config profile.release.strip=true -p jjfx -p wsg
   fi
 
   ext=""
   case "$target" in *windows*) ext=".exe" ;; esac
-  binpath="target/$target/release/$bin$ext"
 
-  # Host binaries run here, so smoke-test that the artifact actually starts.
-  # Cross binaries target another OS/arch and can't be executed on this host.
-  if [ "$target" = "$host" ]; then
-    echo "    smoke-test: $("$binpath" --version)"
-  fi
+  stage="$dist/.stage-$target"
+  rm -rf "$stage"
+  mkdir -p "$stage/bin"
+  cp "target/$target/release/jjfx$ext" "$stage/bin/jjfx$ext"
+  cp "target/$target/release/wsg$ext" "$stage/bin/wsg$ext"
+  cp LICENSE "$stage/LICENSE"
+  cat >"$stage/release-manifest.json" <<JSON
+{
+  "target": "$target",
+  "binaries": [
+    { "name": "jjfx", "version": "$jjfx_version", "path": "bin/jjfx$ext" },
+    { "name": "wsg", "version": "$wsg_version", "path": "bin/wsg$ext" }
+  ]
+}
+JSON
 
-  name="$bin-$version-$target"
-  tar -C "target/$target/release" -czf "$dist/$name.tar.gz" "$bin$ext"
+  name="jjfx-$jjfx_version-wsg-$wsg_version-$target"
+  tar -C "$stage" -czf "$dist/$name.tar.gz" bin release-manifest.json LICENSE
+  rm -rf "$stage"
   ( cd "$dist" && sha "$name.tar.gz" >"$name.tar.gz.sha256" )
   echo "    dist/$name.tar.gz (+ .sha256)"
+
+  # Host binaries run here, so smoke-test the exact archive we just produced.
+  if [ "$target" = "$host" ]; then
+    bash "$root/.mise/tasks/release-smoke" "$dist/$name.tar.gz"
+  fi
 done
