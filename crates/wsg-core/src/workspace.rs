@@ -1026,9 +1026,13 @@ fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError>
     Ok(())
 }
 
+/// List workspace names through an explicit template. The default
+/// `jj workspace list` output is version-coupled (0.44 added workspace roots,
+/// 0.46 added template labels and unreachable paths), so read the `name` field
+/// directly rather than splitting the human-readable line.
 fn workspace_names(root: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
     let output = Command::new("jj")
-        .args(["workspace", "list"])
+        .args(["workspace", "list", "-T", "name ++ \"\\n\""])
         .current_dir(root)
         .output()
         .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace list: {error}")))?;
@@ -1040,8 +1044,9 @@ fn workspace_names(root: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
     }
     Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim().to_owned()))
+        .map(str::trim)
         .filter(|name| !name.is_empty())
+        .map(str::to_owned)
         .collect())
 }
 
