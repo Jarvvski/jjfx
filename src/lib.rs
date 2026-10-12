@@ -65,6 +65,15 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Help is repo-independent, like --version: print usage and exit 0 even
+    // outside a jj repo, so discovery stays possible.
+    if matches!(
+        args.first().map(String::as_str),
+        Some("help" | "-h" | "--help")
+    ) {
+        return cli::run(args, launch, terminal_settings, colocate_setting);
+    }
+
     // `jjfx hooks [install|status]` is global - it manages ~/.claude/settings.json
     // and needs no jj repo, so it runs before repo discovery.
     if args.first().map(String::as_str) == Some("hooks") {

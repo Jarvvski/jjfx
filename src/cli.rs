@@ -350,7 +350,7 @@ fn parse_pool(args: &[String]) -> Result<Command> {
     match subcommand {
         "list" | "ls" | "status" => parse_pool_list(&args[1..]),
         "destroy" => Ok(PoolCommand::Destroy.into()),
-        "help" => Ok(PoolCommand::Help.into()),
+        "help" | "-h" | "--help" => Ok(PoolCommand::Help.into()),
         "rm" | "remove" => parse_single(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " pool rm <worker>"),
             &args[1..],
@@ -1732,6 +1732,17 @@ mod tests {
             Command::Pool(PoolCommand::List { json: false })
         );
         assert!(parse(&args(&["pool", "list", "--wat"])).is_err());
+    }
+
+    #[test]
+    fn pool_help_forms_all_parse_to_help() {
+        for form in ["help", "--help", "-h"] {
+            assert_eq!(
+                parse(&args(&["pool", form])).unwrap(),
+                Command::Pool(PoolCommand::Help),
+                "pool {form} should print help"
+            );
+        }
     }
 
     #[test]
