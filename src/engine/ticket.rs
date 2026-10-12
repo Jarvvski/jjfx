@@ -20,6 +20,12 @@ pub const PI_DISCOVERY_HELPER_ENV: &str = "JJFX_PI_LINEAR_HELPER";
 
 const DEFAULT_PI_HELPER_TIMEOUT: Duration = Duration::from_secs(30);
 const PI_HELPER_POLL_INTERVAL: Duration = Duration::from_millis(10);
+// `exec` refuses a helper that any process still holds open for writing, so a
+// helper that is being replaced - or, in tests, freshly written by a concurrent
+// test - fails with `ETXTBSY` until that writer finishes. The condition clears
+// on its own, so retry briefly instead of failing the discovery.
+const PI_HELPER_SPAWN_ATTEMPTS: u32 = 20;
+const PI_HELPER_SPAWN_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Configuration for the dedicated read-only Pi discovery helper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,22 +50,7 @@ impl PiDiscoveryHelper {
     }
 
     fn run(&self, workspace: &std::path::Path, input: &str) -> Result<Vec<u8>, TicketQueryError> {
-        let mut child = Command::new(&self.executable)
-            .current_dir(workspace)
-            // Own process group, so a helper that forks a long-lived descendant
-            // can be stopped as a whole. `Child::kill` only signals the direct
-            // child, and a surviving grandchild keeps the piped stdout/stderr
-            // open, which would block the reader threads below.
-            .process_group(0)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|source| {
-                TicketQueryError::setup(format!(
-                    "cannot start pi ticket discovery helper: {source}"
-                ))
-            })?;
+        let mut child = self.spawn_helper(workspace)?;
         let stdout = child
             .stdout
             .take()
@@ -107,6 +98,42 @@ impl PiDiscoveryHelper {
         let _stderr = finish_pipe(stderr_reader, "stderr")?;
         successful_helper_output(status, stdout)
     }
+
+    /// Builds the helper invocation.
+    ///
+    /// The helper runs in its own process group so a helper that forks a
+    /// long-lived descendant can be stopped as a whole.
+    fn command(&self, workspace: &std::path::Path) -> Command {
+        let mut command = Command::new(&self.executable);
+        command
+            .current_dir(workspace)
+            .process_group(0)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    /// Starts the helper, retrying while the executable is momentarily busy.
+    fn spawn_helper(&self, workspace: &std::path::Path) -> Result<Child, TicketQueryError> {
+        let mut attempts = 1;
+        loop {
+            match self.command(workspace).spawn() {
+                Ok(child) => return Ok(child),
+                Err(source)
+                    if is_text_file_busy(&source) && attempts < PI_HELPER_SPAWN_ATTEMPTS =>
+                {
+                    attempts += 1;
+                    thread::sleep(PI_HELPER_SPAWN_RETRY_INTERVAL);
+                }
+                Err(source) => {
+                    return Err(TicketQueryError::setup(format!(
+                        "cannot start pi ticket discovery helper: {source}"
+                    )));
+                }
+            }
+        }
+    }
 }
 
 /// Stops the helper and every process it spawned, then reaps the direct child.
@@ -128,6 +155,12 @@ fn terminate_helper(
     let _ = child.wait();
     drop(stdout_reader);
     drop(stderr_reader);
+}
+
+/// Whether `exec` refused the helper because the file is still open for
+/// writing. `ETXTBSY` is transient: it clears as soon as the writer finishes.
+fn is_text_file_busy(source: &io::Error) -> bool {
+    source.raw_os_error() == Some(rustix::io::Errno::TXTBSY.raw_os_error())
 }
 
 fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {

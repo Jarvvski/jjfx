@@ -441,6 +441,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-12 - Starting the Pi ticket discovery helper now retries briefly
+  while the executable is momentarily open for writing, instead of failing the
+  discovery with `Text file busy` (ETXTBSY). A helper being replaced while jjfx
+  runs, or written by a concurrent process, used to fail the query as a setup
+  error. (fix)
+
 - 2026-10-12 - Pi ticket discovery now stops a helper that overruns its
   configured timeout, along with anything the helper spawned. Only the helper's
   own process used to be signalled, so a helper that had forked a long-running

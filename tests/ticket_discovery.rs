@@ -220,6 +220,49 @@ fn pi_discovery_times_out_and_reaps_the_helper_process() {
 }
 
 #[test]
+fn pi_helper_spawn_survives_an_executable_that_is_open_for_writing() {
+    // Linux refuses to `exec` a file that any process holds open for writing,
+    // reporting ETXTBSY. That is what a helper looks like mid-replacement, and
+    // what a freshly written helper looks like to a spawn that races a
+    // concurrent write, so starting the helper has to retry rather than fail
+    // the discovery as a setup error. macOS does not enforce this, so the
+    // retry itself is only exercised on Linux.
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let helper = temporary_directory.path().join("pi-linear-helper");
+    write_executable(
+        &helper,
+        "#!/bin/sh\ncat >/dev/null\nprintf '%s\\n' '{\"version\":1,\"result\":{\"tickets\":[]}}'\n",
+    );
+
+    let held = helper.clone();
+    let holder = std::thread::spawn(move || {
+        let open = fs::OpenOptions::new()
+            .write(true)
+            .open(&held)
+            .expect("hold the helper open for writing");
+        std::thread::sleep(Duration::from_millis(20));
+        drop(open);
+    });
+
+    let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
+        .with_pi_helper(PiDiscoveryHelper::new(&helper));
+    let request = TicketQueryRequest::ReadyTickets {
+        filter: ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("Todo").expect("expected status"),
+        )
+        .expect("Ready Ticket filter"),
+    };
+
+    let output = query
+        .query(&request)
+        .expect("a helper that is momentarily open for writing should be retried");
+    holder.join().expect("helper writer");
+
+    assert!(output.contains("tickets"));
+}
+
+#[test]
 fn pi_helper_malformed_ticket_payload_uses_the_existing_single_retry() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let helper = temporary_directory.path().join("pi-linear-helper");
