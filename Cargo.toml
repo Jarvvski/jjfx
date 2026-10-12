@@ -7,6 +7,29 @@ name = "jjfx"
 version = "0.51.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
+description = "A terminal UI for working with Jujutsu (jj) workspaces and the coding agents editing them"
+repository = "https://github.com/Jarvvski/jjfx"
+readme = "README.md"
+keywords = ["jujutsu", "jj", "tui", "workspaces", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+# The project pins its toolchain in rust-toolchain.toml and mise.toml; this is
+# the version the suite is verified against, not a hand-computed minimum.
+rust-version = "1.97"
+# Keep the published crate to what a `cargo install` consumer needs: agent
+# state, local planning notes, CI config, and the compatibility binary (which
+# has its own workspace member) are not part of the library or the binary.
+exclude = [
+  ".agents/",
+  ".claude/",
+  ".github/",
+  ".mise/",
+  ".pi-subagents/",
+  ".scratch/",
+  "crates/",
+  # `rust-version` already states the toolchain floor; shipping the pin would
+  # make `cargo install` download a specific toolchain instead.
+  "rust-toolchain.toml",
+]
 
 [features]
 test-support = []
