@@ -382,6 +382,11 @@ pub enum TicketQueryRequest {
         /// The repository used to identify cross-repository children.
         repository: RepositoryIdentity,
     },
+    /// Fetches one Ticket's title and description for prompt inlining.
+    TicketDetails {
+        /// The Ticket to fetch.
+        id: TicketId,
+    },
 }
 
 const PI_HELPER_PROTOCOL_VERSION: u8 = 1;
@@ -414,6 +419,11 @@ impl TicketQueryRequest {
                 parent.id(),
                 repository.as_str(),
             ),
+            Self::TicketDetails { id } => format!(
+                "Fetch Linear issue {} and return only JSON as {{\"id\":\"{}\",\"title\":\"Title\",\"description\":\"the full issue description, including acceptance criteria\"}}. Return an empty description string when the issue has none.",
+                id,
+                id.as_str(),
+            ),
         }
     }
 
@@ -430,6 +440,11 @@ impl TicketQueryRequest {
                 "operation": "dependency_graph",
                 "parent": parent.id().as_str(),
                 "repository": repository.as_str(),
+            }),
+            Self::TicketDetails { id } => serde_json::json!({
+                "version": PI_HELPER_PROTOCOL_VERSION,
+                "operation": "ticket_details",
+                "id": id.as_str(),
             }),
         };
         serde_json::to_string(&input).map_err(|error| {
@@ -786,6 +801,24 @@ where
         })
     }
 
+    /// Fetches one Ticket's title and description for prompt inlining.
+    ///
+    /// The description carries the acceptance criteria; a blank description is
+    /// valid (the Ticket simply has none).
+    pub fn ticket_details(
+        &self,
+        id: &TicketId,
+    ) -> Result<TicketDetails, TicketDiscoveryError> {
+        let request = TicketQueryRequest::TicketDetails { id: id.clone() };
+        let payload: RawTicketDetails = self.query_payload(&request)?;
+        let title = TicketTitle::parse(payload.title).map_err(|error| {
+            TicketDiscoveryError::QueryFailed {
+                error: TicketQueryError::permanent(error.to_string()),
+            }
+        })?;
+        Ok(TicketDetails::new(id.clone(), title, payload.description))
+    }
+
     fn query_payload<T>(&self, request: &TicketQueryRequest) -> Result<T, TicketDiscoveryError>
     where
         T: DeserializeOwned,
@@ -844,6 +877,13 @@ struct RawTicket {
     title: String,
     status: String,
     labels: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawTicketDetails {
+    title: String,
+    #[serde(default)]
+    description: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -997,6 +1037,42 @@ impl Ticket {
     /// Returns the Linear workflow status.
     pub fn status(&self) -> &TicketStatus {
         &self.status
+    }
+}
+
+/// A Ticket's fetched title and description, inlined into a Dispatch prompt so a
+/// Worker can start without tracker tools.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TicketDetails {
+    id: TicketId,
+    title: TicketTitle,
+    description: String,
+}
+
+impl TicketDetails {
+    /// Creates fetched Ticket details. A blank description means the Ticket has
+    /// none.
+    pub fn new(id: TicketId, title: TicketTitle, description: impl Into<String>) -> Self {
+        Self {
+            id,
+            title,
+            description: description.into(),
+        }
+    }
+
+    /// Returns the Ticket identifier these details were fetched for.
+    pub fn id(&self) -> &TicketId {
+        &self.id
+    }
+
+    /// Returns the fetched Ticket title.
+    pub fn title(&self) -> &TicketTitle {
+        &self.title
+    }
+
+    /// Returns the fetched Ticket description, including acceptance criteria.
+    pub fn description(&self) -> &str {
+        &self.description
     }
 }
 

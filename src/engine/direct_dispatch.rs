@@ -9,8 +9,8 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError,
     AgentRuntimeProfile, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
     DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
-    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketId, TicketStatus, TicketTitle,
-    WorkerId, WorkerPoolError, WorkerWorkspaceError,
+    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketDetails, TicketId, TicketStatus,
+    TicketTitle, WorkerId, WorkerPoolError, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -71,6 +71,7 @@ pub struct DirectDispatchRequest {
     budget: DispatchBudget,
     mode: RunMode,
     dependency_context: Option<DispatchDependencyContext>,
+    ticket_details: Option<TicketDetails>,
 }
 
 impl DirectDispatchRequest {
@@ -84,6 +85,7 @@ impl DirectDispatchRequest {
             budget: DispatchBudget::ProviderManaged,
             mode,
             dependency_context: None,
+            ticket_details: None,
         }
     }
 
@@ -130,6 +132,12 @@ impl DirectDispatchRequest {
         self
     }
 
+    /// Supplies the fetched Ticket title and description to inline in the prompt.
+    pub fn with_ticket_details(mut self, details: TicketDetails) -> Self {
+        self.ticket_details = Some(details);
+        self
+    }
+
     /// Returns the Ticket selected for Dispatch.
     pub fn ticket(&self) -> &Ticket {
         &self.ticket
@@ -165,6 +173,11 @@ impl DirectDispatchRequest {
     /// Returns dependency-derived Workspace and delivery context.
     pub const fn dependency_context(&self) -> Option<&DispatchDependencyContext> {
         self.dependency_context.as_ref()
+    }
+
+    /// Returns the fetched Ticket details inlined into the prompt, when present.
+    pub const fn ticket_details(&self) -> Option<&TicketDetails> {
+        self.ticket_details.as_ref()
     }
 }
 
@@ -532,6 +545,9 @@ impl DirectDispatch {
         }
         if let Some(dependency) = request.dependency_context() {
             context = context.with_dependency_context(dependency.clone());
+        }
+        if let Some(details) = request.ticket_details() {
+            context = context.with_ticket_details(details.clone());
         }
         Ok(DispatchPromptBuilder::new()
             .initial(context)?

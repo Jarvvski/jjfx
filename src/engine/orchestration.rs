@@ -21,8 +21,8 @@ use crate::engine::{
     DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions, DispatchGroupProgress,
     DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded, ParentTicket, Repository,
     RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket,
-    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent,
+    WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -30,6 +30,7 @@ use crate::engine::{
 pub struct OrchestrationRequest {
     parent: TicketId,
     profile: AgentRuntimeProfile,
+    ticket_details: Option<TicketDetails>,
 }
 
 /// Polling and retry limits for one foreground or detached orchestration run.
@@ -83,7 +84,20 @@ impl OrchestrationRequest {
         Self {
             parent,
             profile: AgentRuntimeProfile::new(agent_runtime),
+            ticket_details: None,
         }
+    }
+
+    /// Supplies the Parent Ticket's fetched details for the no-children direct
+    /// fallback prompt.
+    pub fn with_ticket_details(mut self, details: TicketDetails) -> Self {
+        self.ticket_details = Some(details);
+        self
+    }
+
+    /// Returns the fetched Parent Ticket details, when present.
+    pub const fn ticket_details(&self) -> Option<&TicketDetails> {
+        self.ticket_details.as_ref()
     }
 
     /// Supplies a caller-selected model override.
@@ -829,6 +843,10 @@ impl OrchestrationRunner {
             RunMode::Background,
         )
         .with_profile(request.profile().clone());
+        let placeholder = match request.ticket_details() {
+            Some(details) => placeholder.with_ticket_details(details.clone()),
+            None => placeholder,
+        };
         let reservation = match self.repository.direct_dispatch().reserve(&placeholder) {
             Ok(reservation) => reservation,
             Err(error) => return Err(OrchestrationError::Execution(error.to_string())),

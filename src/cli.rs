@@ -11,9 +11,10 @@ use crate::engine::{
     CleanDecision, DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome,
     DirectDispatchRequest, DispatchBudget, FollowUpExecution, OrchestrationEvent,
     PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, Repository,
-    RunActivity, RunActivityKind, RunMode, TerminalSettings, TicketDiscovery, TicketId,
-    TicketStatus, WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
-    WorkspaceAddOutcome, WorkspaceHookStream,
+    RunActivity, RunActivityKind, RunMode, TerminalSettings, TicketDetails, TicketDiscovery,
+    TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, TicketStatus, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream,
 };
 
 pub const HELP: &str = concat!(
@@ -1026,25 +1027,78 @@ fn short_worker_id(worker_id: &str) -> &str {
 }
 
 /// Machine-readable Pool status, including the failure fields the table omits.
+///
+/// Encoded by hand because the shared CLI router is also compiled into the
+/// `wsg` compatibility binary, which does not depend on `serde_json`.
 fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
-    let workers = snapshot
-        .workers()
-        .iter()
-        .map(|worker| {
-            serde_json::json!({
-                "worker": worker.worker_id().as_str(),
-                "name": if worker.alias().is_empty() { "-" } else { worker.alias() },
-                "status": worker.status().as_str(),
-                "ticket": worker.ticket(),
-                "elapsed": elapsed_display(worker.started_at(), worker.completed_at()),
-                "error": worker.error(),
-                "exit_code": worker.exit_code(),
-                "log_file": worker.log_file(),
-            })
-        })
-        .collect::<Vec<_>>();
-    println!("{}", serde_json::to_string_pretty(&workers)?);
+    let mut out = String::from("[\n");
+    for (index, worker) in snapshot.workers().iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        let fields = [
+            ("worker", json_string(worker.worker_id().as_str())),
+            (
+                "name",
+                json_string(if worker.alias().is_empty() {
+                    "-"
+                } else {
+                    worker.alias()
+                }),
+            ),
+            ("status", json_string(worker.status().as_str())),
+            ("ticket", json_option(worker.ticket())),
+            (
+                "elapsed",
+                json_string(&elapsed_display(worker.started_at(), worker.completed_at())),
+            ),
+            ("error", json_option(worker.error())),
+            (
+                "exit_code",
+                worker
+                    .exit_code()
+                    .map_or_else(|| "null".to_owned(), |code| code.to_string()),
+            ),
+            ("log_file", json_option(worker.log_file())),
+        ];
+        out.push_str("  {\n");
+        for (field, (key, value)) in fields.iter().enumerate() {
+            if field > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str(&format!("    \"{key}\": {value}"));
+        }
+        out.push_str("\n  }");
+    }
+    out.push_str("\n]");
+    println!("{out}");
     Ok(())
+}
+
+/// Encode a string as a JSON string literal.
+fn json_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            other => out.push(other),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Encode an optional string as a JSON value (`null` when absent).
+fn json_option(value: Option<&str>) -> String {
+    value.map_or_else(|| "null".to_owned(), json_string)
 }
 
 fn normalize_worker(value: &str) -> Result<WorkerId> {
@@ -1125,55 +1179,10 @@ fn configured_ticket_query(repository: &Repository, runtime: AgentRuntime) -> Ag
 
 fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> {
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
-    if args.all {
-        let runtime = configured_runtime(repository);
-        let status = TicketStatus::parse("Todo")?;
-        let filter = ReadyTicketFilter::new(&args.label, status)?;
-        let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
-        eprintln!("Fetching tickets with label '{}'...", args.label);
-        let ready = discovery.ready_tickets(&filter)?;
-        for diagnostic in ready.diagnostics() {
-            eprintln!("{}: {}", diagnostic.subject(), diagnostic.reason());
-        }
-        if ready.tickets().is_empty() {
-            eprintln!("No tickets found with label '{}'", args.label);
-            return Ok(());
-        }
-        let requests = ready
-            .tickets()
-            .iter()
-            .map(|ticket| {
-                let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
-                if let Some(model) = model.clone() {
-                    request = request.with_model(model);
-                }
-                if let Some(dollars) = args.budget {
-                    request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
-                }
-                Ok(request)
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let result = dispatch_with_capacity_prompt(repository, &requests)?;
-        render_dispatch_result(&result, requests.len(), true);
-        return Ok(());
-    }
 
-    let requests = args
-        .tickets
-        .iter()
-        .map(|ticket| {
-            let id = TicketId::parse(ticket.clone())?;
-            let mut request = DirectDispatchRequest::for_ticket_id(id, args.mode)?;
-            if let Some(model) = model.clone() {
-                request = request.with_model(model);
-            }
-            if let Some(dollars) = args.budget {
-                request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
-            }
-            Ok(request)
-        })
-        .collect::<Result<Vec<_>>>()?;
-    if !args.no_orchestrate && requests.len() == 1 {
+    // A single Ticket with orchestration enabled fetches its own details before
+    // reserving a placeholder, so hand off before building direct requests.
+    if !args.all && !args.no_orchestrate && args.tickets.len() == 1 {
         if args.mode == RunMode::Foreground {
             return orchestrate_command(
                 repository,
@@ -1203,9 +1212,85 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
         );
         return Ok(());
     }
+
+    let runtime = configured_runtime(repository);
+    let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
+
+    if args.all {
+        let status = TicketStatus::parse("Todo")?;
+        let filter = ReadyTicketFilter::new(&args.label, status)?;
+        eprintln!("Fetching tickets with label '{}'...", args.label);
+        let ready = discovery.ready_tickets(&filter)?;
+        for diagnostic in ready.diagnostics() {
+            eprintln!("{}: {}", diagnostic.subject(), diagnostic.reason());
+        }
+        if ready.tickets().is_empty() {
+            eprintln!("No tickets found with label '{}'", args.label);
+            return Ok(());
+        }
+        let requests = ready
+            .tickets()
+            .iter()
+            .map(|ticket| {
+                let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
+                if let Some(details) = fetch_ticket_details(runtime, &discovery, ticket.id())? {
+                    request = request.with_ticket_details(details);
+                }
+                if let Some(model) = model.clone() {
+                    request = request.with_model(model);
+                }
+                if let Some(dollars) = args.budget {
+                    request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
+                }
+                Ok(request)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let result = dispatch_with_capacity_prompt(repository, &requests)?;
+        render_dispatch_result(&result, requests.len(), true);
+        return Ok(());
+    }
+
+    let requests = args
+        .tickets
+        .iter()
+        .map(|ticket| {
+            let id = TicketId::parse(ticket.clone())?;
+            let mut request = DirectDispatchRequest::for_ticket_id(id.clone(), args.mode)?;
+            if let Some(details) = fetch_ticket_details(runtime, &discovery, &id)? {
+                request = request.with_ticket_details(details);
+            }
+            if let Some(model) = model.clone() {
+                request = request.with_model(model);
+            }
+            if let Some(dollars) = args.budget {
+                request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
+            }
+            Ok(request)
+        })
+        .collect::<Result<Vec<_>>>()?;
     let result = dispatch_with_capacity_prompt(repository, &requests)?;
     render_dispatch_result(&result, requests.len(), false);
     Ok(())
+}
+
+/// Fetch a Ticket's details to inline into the Dispatch prompt, failing before
+/// any Pool or Workspace mutation when the runtime cannot reach the tracker.
+///
+/// Pi is skipped: its Direct Dispatch preflight already guarantees the pinned
+/// Linear tools, so the Worker fetches the Ticket itself.
+fn fetch_ticket_details<Q: TicketQuery>(
+    runtime: AgentRuntime,
+    discovery: &TicketDiscovery<Q>,
+    id: &TicketId,
+) -> Result<Option<TicketDetails>> {
+    if runtime == AgentRuntime::Pi {
+        return Ok(None);
+    }
+    discovery.ticket_details(id).map(Some).with_context(|| {
+        format!(
+            "cannot fetch Ticket {id} to inline into the Dispatch prompt; ensure the pool runtime can reach Linear"
+        )
+    })
 }
 
 fn dispatch_with_capacity_prompt(
@@ -1507,16 +1592,21 @@ fn orchestrate_command(
     model: Option<&str>,
 ) -> Result<()> {
     let id = TicketId::parse(parent.to_owned())?;
-    let request =
-        crate::engine::OrchestrationRequest::new(id.clone(), configured_runtime(repository));
+    let runtime = configured_runtime(repository);
+    let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
+    // Fetch the Parent's details before `prepare` reserves a placeholder, so the
+    // no-children direct fallback inlines the Ticket body.
+    let details = fetch_ticket_details(runtime, &discovery, &id)?;
+    let mut request = crate::engine::OrchestrationRequest::new(id.clone(), runtime);
+    if let Some(details) = details {
+        request = request.with_ticket_details(details);
+    }
     let request = selected_model(provider, model)?
         .map_or(request.clone(), |selection| request.with_model(selection));
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();
     let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
-    let discovery =
-        TicketDiscovery::new(configured_ticket_query(repository, request.agent_runtime()));
     let runner = repository.orchestration_runner();
     let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;
     render_orchestration_event(&OrchestrationEvent::Started {
@@ -1732,6 +1822,42 @@ mod tests {
             Command::Pool(PoolCommand::List { json: false })
         );
         assert!(parse(&args(&["pool", "list", "--wat"])).is_err());
+    }
+
+    struct FailingQuery;
+
+    impl TicketQuery for FailingQuery {
+        fn query(&self, _request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
+            Err(TicketQueryError::permanent("no Linear tools in this session"))
+        }
+    }
+
+    #[test]
+    fn fetch_ticket_details_aborts_with_context_and_skips_pi() {
+        let discovery = TicketDiscovery::new(FailingQuery);
+        let id = TicketId::parse("AMBA-42").expect("Ticket ID");
+
+        let error = fetch_ticket_details(AgentRuntime::Claude, &discovery, &id)
+            .expect_err("a runtime that cannot fetch the Ticket must abort Dispatch");
+        let message = error.to_string();
+        assert!(message.contains("AMBA-42"), "{message}");
+        assert!(message.contains("Linear"), "{message}");
+
+        // Pi is skipped: its Direct Dispatch preflight owns tool validation.
+        assert_eq!(
+            fetch_ticket_details(AgentRuntime::Pi, &discovery, &id).expect("Pi is skipped"),
+            None
+        );
+    }
+
+    #[test]
+    fn json_string_escapes_and_options_render_null() {
+        assert_eq!(json_string("plain"), "\"plain\"");
+        assert_eq!(json_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(json_string("line\nbreak"), "\"line\\nbreak\"");
+        assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
+        assert_eq!(json_option(None), "null");
+        assert_eq!(json_option(Some("x")), "\"x\"");
     }
 
     #[test]

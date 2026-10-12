@@ -70,7 +70,7 @@ pub use state::{
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
     PI_DISCOVERY_HELPER_ENV, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter, ReadyTickets,
-    RepositoryIdentity, Ticket, TicketDiscovery, TicketDiscoveryError, TicketQuery,
+    RepositoryIdentity, Ticket, TicketDetails, TicketDiscovery, TicketDiscoveryError, TicketQuery,
     TicketQueryError, TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
     TicketValueError,
 };

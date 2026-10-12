@@ -3,8 +3,19 @@ use std::ffi::OsStr;
 use jjfx::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
     AgentRuntimeInvocation, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
-    DispatchPromptContext, RepositoryIdentity, Ticket, TicketId, TicketStatus, TicketTitle,
+    DispatchPromptContext, RepositoryIdentity, Ticket, TicketDetails, TicketId, TicketStatus,
+    TicketTitle,
 };
+
+fn prompt_args(runtime: AgentRuntime, invocation: &AgentRuntimeInvocation) -> Vec<String> {
+    runtime
+        .command(invocation, AgentRuntimeCapabilities::default())
+        .expect("runtime command should build")
+        .get_args()
+        .map(OsStr::to_string_lossy)
+        .map(|argument| argument.into_owned())
+        .collect()
+}
 
 #[test]
 fn fresh_and_resumed_agent_sessions_receive_the_same_delegation_contract() {
@@ -107,6 +118,56 @@ fn pi_dispatch_prompt_selects_the_explicit_trusted_linear_profile() {
         args.iter()
             .any(|argument| argument.contains("Call linear_get_issue directly"))
     );
+}
+
+#[test]
+fn inlined_ticket_details_replace_the_fetch_step_and_soften_status_updates() {
+    let details = TicketDetails::new(
+        TicketId::parse("AMBA-42").expect("Ticket ID"),
+        TicketTitle::parse("Ship typed discovery").expect("Ticket title"),
+        "Acceptance criteria:\n- inline the body",
+    );
+    let invocation = DispatchPromptBuilder::new()
+        .initial(dispatch_context(AgentRuntime::Claude).with_ticket_details(details))
+        .expect("initial Dispatch prompt");
+    let prompt = prompt_args(AgentRuntime::Claude, &invocation).join("\n");
+
+    assert!(prompt.contains("TICKET DETAILS"));
+    assert!(prompt.contains("inline the body"));
+    assert!(!prompt.contains("Fetch the Ticket through Linear tools"));
+    assert!(prompt.contains("otherwise note the summary in the Pull Request"));
+}
+
+#[test]
+fn only_pi_receives_pi_specific_tool_guidance() {
+    for runtime in [
+        AgentRuntime::Claude,
+        AgentRuntime::Codex,
+        AgentRuntime::OpenCode,
+    ] {
+        let invocation = DispatchPromptBuilder::new()
+            .initial(dispatch_context(runtime))
+            .expect("Dispatch prompt");
+        let prompt = prompt_args(runtime, &invocation).join("\n");
+        assert!(
+            !prompt.contains("Call linear_get_issue directly"),
+            "{runtime:?} must not receive Pi-only guidance"
+        );
+        assert!(
+            !prompt.contains("direct Pi tools"),
+            "{runtime:?} must not receive Pi-only guidance"
+        );
+    }
+
+    let invocation = DispatchPromptBuilder::new()
+        .initial(
+            dispatch_context(AgentRuntime::Pi)
+                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
+        )
+        .expect("Pi Dispatch prompt")
+        .with_session_directory("/tmp/jjfx-pi-session");
+    let prompt = prompt_args(AgentRuntime::Pi, &invocation).join("\n");
+    assert!(prompt.contains("Call linear_get_issue directly"));
 }
 
 #[test]

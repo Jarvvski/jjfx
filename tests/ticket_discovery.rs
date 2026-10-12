@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 
 use jjfx::engine::{
     AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter,
-    RepositoryIdentity, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
-    TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
+    RepositoryIdentity, Ticket, TicketDetails, TicketDiscovery, TicketId, TicketQuery,
+    TicketQueryError, TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
 };
 use tempfile::TempDir;
 
@@ -81,6 +81,63 @@ fn ready_ticket_discovery_sends_a_typed_request_to_the_query_adapter() {
             filter: filter.clone(),
         })
     );
+}
+
+struct RecordingDetailsQuery {
+    request: Arc<Mutex<Option<TicketQueryRequest>>>,
+}
+
+impl TicketQuery for RecordingDetailsQuery {
+    fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
+        self.request
+            .lock()
+            .expect("recorded request")
+            .replace(request.clone());
+        Ok(r#"{"id":"AMBA-42","title":"Ship typed discovery","description":"body"}"#.to_owned())
+    }
+}
+
+#[test]
+fn ticket_details_sends_a_typed_request_and_parses_the_body() {
+    let id = TicketId::parse("AMBA-42").expect("Ticket ID");
+    let recorded = Arc::new(Mutex::new(None));
+    let discovery = TicketDiscovery::new(RecordingDetailsQuery {
+        request: Arc::clone(&recorded),
+    });
+
+    let details = discovery.ticket_details(&id).expect("Ticket details");
+
+    assert_eq!(
+        recorded.lock().expect("recorded request").as_ref(),
+        Some(&TicketQueryRequest::TicketDetails { id: id.clone() })
+    );
+    assert_eq!(details.id(), &id);
+    assert_eq!(details.title().as_str(), "Ship typed discovery");
+    assert_eq!(details.description(), "body");
+}
+
+#[test]
+fn ticket_details_allows_a_missing_description() {
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"id":"AMBA-42","title":"No body"}"#,
+    ));
+    let id = TicketId::parse("AMBA-42").expect("Ticket ID");
+
+    let details = discovery.ticket_details(&id).expect("Ticket details");
+
+    assert_eq!(details.description(), "");
+}
+
+#[test]
+fn ticket_details_constructs_the_prompt_inline_type() {
+    let details = TicketDetails::new(
+        TicketId::parse("AMBA-42").expect("Ticket ID"),
+        TicketTitle::parse("Ship typed discovery").expect("Ticket title"),
+        "body",
+    );
+    assert_eq!(details.id().as_str(), "AMBA-42");
+    assert_eq!(details.title().as_str(), "Ship typed discovery");
+    assert_eq!(details.description(), "body");
 }
 
 #[test]

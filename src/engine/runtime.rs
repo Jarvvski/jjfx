@@ -35,6 +35,8 @@ const PI_LINEAR_TOOLS: [&str; 3] = [
     "linear_create_comment",
 ];
 const PI_DIRECT_DISPATCH_GUIDANCE: &str = "Linear delivery tools are direct Pi tools for this Run. Call linear_get_issue directly to fetch the Ticket, linear_update_issue directly to change status or assignee, and linear_create_comment directly to post delivery notes. Do not look for an MCP wrapper or another tool namespace.";
+const CLAUDE_DISPATCH_GUIDANCE: &str = "Linear delivery tools are available as the mcp__claude_ai_Linear__get_issue, mcp__claude_ai_Linear__update_issue, and mcp__claude_ai_Linear__create_comment MCP tools when this session has them. Use them to update status or post delivery notes; if they are unavailable, continue the implementation and note it - do not stop.";
+const NEUTRAL_DISPATCH_GUIDANCE: &str = "Use your configured Linear/MCP delivery tools to update status or post delivery notes when they are available. If they are unavailable, continue the implementation and note it - do not stop.";
 const PI_PROFILE_PROBE_EXTENSION: &str = r#"import { writeFileSync } from "node:fs";
 export default function (pi) {
   pi.on("session_start", () => {
@@ -48,6 +50,16 @@ export default function (pi) {
 }
 "#;
 const DELEGATION_RULES: &str = "Delegated work is read-only.\n\n- Use in-session background tasks or subagents only for independent exploration, documentation lookup, test or log analysis, or review.\n- Explicitly tell every subagent not to edit tracked files or run jj commands.\n- Do not use detached sessions, nested delegation, or worktree or workspace creation.\n- Await all delegated work before finishing.\n- If delegation is unavailable or fails, continue the work directly.\n- The main agent alone owns tracked edits, jj operations, verification, and delivery.";
+
+/// The Linear delivery guidance prepended to a TicketDelivery prompt, matched to
+/// the tools the selected Agent Runtime actually exposes.
+fn ticket_delivery_guidance(runtime: AgentRuntime) -> &'static str {
+    match runtime {
+        AgentRuntime::Pi => PI_DIRECT_DISPATCH_GUIDANCE,
+        AgentRuntime::Claude => CLAUDE_DISPATCH_GUIDANCE,
+        AgentRuntime::Codex | AgentRuntime::OpenCode => NEUTRAL_DISPATCH_GUIDANCE,
+    }
+}
 
 /// The Agent Runtime recorded for a Worker and selected for a Run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,9 +326,9 @@ impl AgentRuntimeInvocation {
         self
     }
 
-    fn session_prompts(&self) -> (Option<String>, String) {
+    fn session_prompts(&self, runtime: AgentRuntime) -> (Option<String>, String) {
         let prompt = if self.profile == AgentRuntimeInvocationProfile::TicketDelivery {
-            format!("{PI_DIRECT_DISPATCH_GUIDANCE}\n\n{}", self.prompt)
+            format!("{}\n\n{}", ticket_delivery_guidance(runtime), self.prompt)
         } else {
             self.prompt.clone()
         };
@@ -1594,7 +1606,7 @@ fn claude_command(
     invocation: &AgentRuntimeInvocation,
     capabilities: AgentRuntimeCapabilities,
 ) -> Command {
-    let (system_prompt, prompt) = invocation.session_prompts();
+    let (system_prompt, prompt) = invocation.session_prompts(AgentRuntime::Claude);
     let mut command = Command::new(AgentRuntime::Claude.as_str());
     command.arg("-p");
     if let Some(model) = invocation
@@ -1640,7 +1652,7 @@ fn codex_command(
     invocation: &AgentRuntimeInvocation,
     capabilities: AgentRuntimeCapabilities,
 ) -> Command {
-    let (system_prompt, prompt) = invocation.session_prompts();
+    let (system_prompt, prompt) = invocation.session_prompts(AgentRuntime::Codex);
     let mut command = Command::new(AgentRuntime::Codex.as_str());
     command.args([
         "--sandbox",
@@ -1686,7 +1698,7 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
     }
     let (provider, model) = pi_provider_and_model(invocation.model.as_ref())?;
     let session_directory = required_pi_session_directory(invocation.session_directory.as_deref())?;
-    let (system_prompt, prompt) = invocation.session_prompts();
+    let (system_prompt, prompt) = invocation.session_prompts(AgentRuntime::Pi);
     let mut command = Command::new(AgentRuntime::Pi.as_str());
     command.args([
         "--mode",
@@ -1725,7 +1737,7 @@ fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRunti
 }
 
 fn opencode_command(invocation: &AgentRuntimeInvocation) -> Command {
-    let (system_prompt, prompt) = invocation.session_prompts();
+    let (system_prompt, prompt) = invocation.session_prompts(AgentRuntime::OpenCode);
     let mut command = Command::new(AgentRuntime::OpenCode.as_str());
     command.args(["run", "--format", "json", "--auto"]);
     if invocation.profile == AgentRuntimeInvocationProfile::TicketDelivery {
