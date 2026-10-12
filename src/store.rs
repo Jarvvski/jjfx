@@ -30,7 +30,13 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
     let repo =
         std::env::temp_dir().join(format!("jjfx-store-{tag}-{}-{nonce}", std::process::id()));
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(&repo)
         .output()
         .unwrap();

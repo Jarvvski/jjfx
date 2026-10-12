@@ -123,3 +123,11 @@ Earlier releases configured new-workspace provisioning with a `[workspace]`
 section (for example `on_create = ["mise", "trust"]`). That moved into
 repository-owned lifecycle hooks - see [Workspace hooks](workspace-hooks.md).
 The section is still accepted and ignored so an existing config keeps parsing.
+
+## Workspace colocation
+
+New workspaces are colocated with Git: `jj workspace add` creates a Git worktree
+so every agent workspace has a working `.git`, which lets tools such as `gh
+stack` run inside it. This follows jj's own `git.colocate` setting, which
+defaults to `true`; set `git.colocate = false` in your jj config (not this file)
+to create non-colocated workspaces instead.

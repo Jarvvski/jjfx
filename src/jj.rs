@@ -92,7 +92,14 @@ pub fn workspace_names(repo_root: &Path) -> Vec<String> {
 pub(crate) fn add_workspace(repo_root: &Path, name: &str, dest: &Path) -> anyhow::Result<()> {
     run_mut(
         repo_root,
-        &["workspace", "add", "--name", name, &dest.to_string_lossy()],
+        &[
+            "workspace",
+            "add",
+            "--name",
+            name,
+            "--no-colocate",
+            &dest.to_string_lossy(),
+        ],
     )
 }
 
