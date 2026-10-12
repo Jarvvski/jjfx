@@ -1305,9 +1305,19 @@ fn truncate_prompt(prompt: &str) -> String {
     prompt.chars().take(60).collect()
 }
 
+/// How much of a Worker Run log `logs` prints before following.
+const LOG_TAIL_BYTES: u64 = 64 * 1024;
+
 fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let logs = WorkerActions::new(repository.clone()).logs(&worker)?;
+    // Print the existing log first so the command never blocks silently: a
+    // terminal Worker whose log does not parse would otherwise follow forever
+    // with no output.
+    print_log_tail(logs.path())?;
+    if worker_is_terminal(repository, &worker) {
+        return Ok(());
+    }
     eprintln!("Following {} log for {worker}", logs.runtime());
     let mut last = None;
     loop {
@@ -1320,6 +1330,43 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
         }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
+}
+
+/// Print the final [`LOG_TAIL_BYTES`] of a Worker Run log, trimmed to a whole
+/// line at the start so a partial record is never shown.
+fn print_log_tail(path: &std::path::Path) -> Result<()> {
+    use std::io::{Seek, SeekFrom};
+
+    let mut file = std::fs::File::open(path)?;
+    let length = file.metadata()?.len();
+    let start = length.saturating_sub(LOG_TAIL_BYTES);
+    file.seek(SeekFrom::Start(start))?;
+    let mut contents = Vec::new();
+    file.read_to_end(&mut contents)?;
+    let text = String::from_utf8_lossy(&contents);
+    let text = if start == 0 {
+        text.as_ref()
+    } else {
+        text.split_once('\n').map_or("", |(_, rest)| rest)
+    };
+    if !text.is_empty() {
+        print!("{text}");
+        if !text.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
+}
+
+/// Whether a Worker has reached a terminal state, so its log will not grow.
+fn worker_is_terminal(repository: &Repository, worker: &WorkerId) -> bool {
+    repository
+        .worker_pool()
+        .reconcile_runs()
+        .worker(worker.as_str())
+        .is_some_and(|worker| {
+            matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed)
+        })
 }
 
 fn render_activity(activity: &RunActivity) -> String {
