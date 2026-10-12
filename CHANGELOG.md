@@ -17,6 +17,11 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-10-12 - A `jjfx-dispatch` agent skill under `skills/`, installable into
+  any agent with `bunx skills@latest add Jarvvski/jjfx`. It walks an agent
+  through giving the Worker Pool capacity, choosing tickets, dispatching,
+  watching, steering, landing, and reclaiming. (jjfx 0.51.0, wsg 0.19.0)
+
 - 2026-10-12 - New workspaces are now colocated with Git: `jj workspace add`
   creates a Git worktree so each agent workspace has a working `.git`, which
   lets tools such as `gh stack` run inside it. Controlled by the new top-level

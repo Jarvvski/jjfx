@@ -65,6 +65,9 @@ Run `jjfx help` for usage.
 - [Pi Worker actions and ticket discovery](docs/pi-workers.md) - Pi Direct
   Dispatch, the pinned adapter, and the read-only Linear helper protocol.
 - [`docs/adr/`](docs/adr/) - architecture decision records.
+- [`skills/jjfx-dispatch/`](skills/jjfx-dispatch/SKILL.md) - an agent skill that
+  teaches a coding agent to dispatch work to Workers. Install it with
+  `bunx skills@latest add Jarvvski/jjfx`.
 - [`docs/wsg-compatibility-contract.md`](docs/wsg-compatibility-contract.md) -
   the compatibility contract for the migration-era `wsg` target.
 - [wsg conformance](docs/wsg-conformance.md) - the migration-era Go/Rust
