@@ -22,6 +22,14 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Added
 
+### Changed
+
+### Fixed
+
+## [0.52.1] - 2026-10-12
+
+### Added
+
 - 2026-10-12 - `jjfx` is now a single crate and publishes to crates.io:
   `cargo install jjfx` builds the binary from the registry. The former
   `wsg-core` crate was absorbed into jjfx as its `engine` module, so the `wsg`
