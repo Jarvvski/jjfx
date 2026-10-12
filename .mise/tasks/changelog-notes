@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+#MISE description="Print a released CHANGELOG section as release notes"
+#
+# Usage:
+#   mise run changelog-notes <version>
+#
+# Prints the body of the `## [<version>]` section with leading and trailing
+# blank lines trimmed, for use as GitHub Release notes.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+
+changelog="${CHANGELOG_FILE:-$root/CHANGELOG.md}"
+version="${1:-}"
+
+if [ -z "$version" ]; then
+  echo "usage: mise run changelog-notes <version>" >&2
+  exit 2
+fi
+
+[ -f "$changelog" ] || { echo "error: no changelog at $changelog" >&2; exit 1; }
+
+if ! grep -qE "^## \[$version\]" "$changelog"; then
+  echo "error: $changelog has no section for $version" >&2
+  exit 1
+fi
+
+notes=$(awk -v version="$version" '
+  $0 ~ "^## \\[" version "\\]([[:space:]]|$)" { inside = 1; next }
+  inside && /^## / { exit }
+  inside { print }
+' "$changelog" | awk '
+  /^[[:space:]]*$/ { if (printed) pending++; next }
+  { for (i = 0; i < pending; i++) print ""; pending = 0; printed = 1; print }
+')
+
+if [ -z "$notes" ]; then
+  echo "error: the $version section in $changelog is empty" >&2
+  exit 1
+fi
+
+printf '%s\n' "$notes"

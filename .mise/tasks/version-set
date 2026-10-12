@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#MISE description="Set the jjfx manifest version and sync Cargo.lock (release-owned)"
+#
+# Usage:
+#   mise run version-set <version>
+#
+# The manifest version is release-owned: the release workflow is what moves it.
+# For an ordinary change, add a CHANGELOG entry with an intent marker instead of
+# bumping by hand.
+#
+# Cargo.lock records the workspace member's version, so it is synced here too -
+# `cargo publish --locked` fails outright on a stale lock. Only `jjfx` is
+# versioned; `crates/wsg` is frozen and deliberately untouched.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+
+manifest="${MANIFEST_FILE:-$root/Cargo.toml}"
+version="${1:-}"
+
+if [ -z "$version" ]; then
+  echo "usage: mise run version-set <version>" >&2
+  exit 2
+fi
+if ! printf '%s' "$version" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "error: version must be X.Y.Z (got '$version')" >&2
+  exit 1
+fi
+
+[ -f "$manifest" ] || { echo "error: no manifest at $manifest" >&2; exit 1; }
+if ! grep -qE '^version = "' "$manifest"; then
+  echo "error: no 'version = \"...\"' line in $manifest" >&2
+  exit 1
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+
+awk -v version="$version" '
+  !done && /^version = "/ { sub(/"[^"]*"/, "\"" version "\""); done = 1 }
+  { print }
+' "$manifest" >"$tmp"
+
+mv "$tmp" "$manifest"
+
+# Resolving metadata rewrites the lock's workspace version entry.
+cargo metadata --format-version 1 >/dev/null
+
+echo "jjfx version set to $version"

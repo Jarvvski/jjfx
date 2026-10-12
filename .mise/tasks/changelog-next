@@ -1,0 +1,79 @@
+#!/usr/bin/env bash
+#MISE description="Derive the next jjfx version from the unreleased CHANGELOG entries"
+#
+# Reads the `## [Unreleased]` section of CHANGELOG.md, collects the semver
+# intent markers on its entries, and prints the next version on stdout
+# (diagnostics go to stderr).
+#
+# Markers are (break), (add), or (fix), trailing on an entry's last line.
+# jjfx is pre-1.0, so the minor position is the breaking slot - Cargo's
+# `^0.52.0` means `>=0.52.0, <0.53.0`:
+#
+#   break | add -> minor
+#   fix         -> patch
+#
+# With no markers at all the manifest version is printed unchanged. That is the
+# first-release path, where the accumulated entries predate the marker
+# convention.
+#
+# The base version is the manifest's, which is release-owned: it always holds
+# the last released version, and the release workflow is what moves it.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+
+changelog="${CHANGELOG_FILE:-$root/CHANGELOG.md}"
+manifest="${MANIFEST_FILE:-$root/Cargo.toml}"
+
+[ -f "$changelog" ] || { echo "error: no changelog at $changelog" >&2; exit 1; }
+[ -f "$manifest" ] || { echo "error: no manifest at $manifest" >&2; exit 1; }
+
+# The unreleased block: from the `## [Unreleased]` heading to the next `## `
+# heading (or end of file, since it is currently the only one).
+unreleased=$(awk '
+  /^## \[Unreleased\]/ { inside = 1; next }
+  inside && /^## / { exit }
+  inside { print }
+' "$changelog")
+
+if ! printf '%s\n' "$unreleased" | grep -qE '^- '; then
+  echo "error: no unreleased entries in $changelog - nothing to release" >&2
+  exit 1
+fi
+
+# Markers are anchored to the end of an entry's last line, so prose like
+# "fix the workspace list" can never match.
+marker_re='\((break|add|fix)\)[.]?[[:space:]]*$'
+
+base=$(sed -n 's/^version = "\(.*\)"/\1/p' "$manifest" | head -1)
+if ! printf '%s' "$base" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  echo "error: could not read an X.Y.Z version from $manifest (got '$base')" >&2
+  exit 1
+fi
+
+if ! printf '%s\n' "$unreleased" | grep -qE "$marker_re"; then
+  echo "note: no intent markers in the unreleased entries; keeping $base" >&2
+  printf '%s\n' "$base"
+  exit 0
+fi
+
+# Highest intent wins: break > add > fix.
+intent=fix
+if printf '%s\n' "$unreleased" | grep -qE '\(break\)[.]?[[:space:]]*$'; then
+  intent=break
+elif printf '%s\n' "$unreleased" | grep -qE '\(add\)[.]?[[:space:]]*$'; then
+  intent=add
+fi
+
+IFS=. read -r major minor patch <<<"$base"
+case "$intent" in
+  break | add)
+    minor=$((minor + 1))
+    patch=0
+    ;;
+  fix) patch=$((patch + 1)) ;;
+esac
+
+echo "note: $base + $intent -> $major.$minor.$patch" >&2
+printf '%s.%s.%s\n' "$major" "$minor" "$patch"

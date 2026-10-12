@@ -1,7 +1,22 @@
 # Changelog
 
-All notable changes to this project are documented here (newest first). The
-version of record lives in the project manifest.
+All notable changes to this project are documented here, newest first.
+
+Unreleased entries live under `## [Unreleased]` and end with a semver intent
+marker:
+
+- `(break)` - an incompatible change
+- `(add)` - new functionality, backwards compatible
+- `(fix)` - a backwards-compatible bug fix
+
+`jjfx` is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.52.0`
+means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises
+the patch. `mise run changelog-next` derives the next version from the highest
+marker in the unreleased set; the release workflow stamps the heading and moves
+the manifest version, so **do not bump the version by hand**.
+
+The `wsg` compatibility binary is frozen while the migration-era binary is
+retired, so entries here are versioned by `jjfx` alone.
 
 ## [Unreleased]
 

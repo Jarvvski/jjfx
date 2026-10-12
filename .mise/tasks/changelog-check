@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+#MISE description="Validate unreleased CHANGELOG intent markers against their subsections"
+#
+# Every unreleased entry may end with a semver intent marker: (break), (add),
+# or (fix). This checks that:
+#
+#   - the marker is not a version slot such as (minor) or (patch), which the
+#     derivation would silently ignore;
+#   - the marker does not contradict its subsection - `### Added` with (fix) is
+#     an error, since `mise run changelog-next` would then read the opposite
+#     intent to what the heading says.
+#
+# Entries with no marker pass: they predate the convention. Only the
+# `## [Unreleased]` block is checked; released sections are frozen history.
+set -euo pipefail
+
+root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
+cd "$root"
+
+changelog="${CHANGELOG_FILE:-$root/CHANGELOG.md}"
+[ -f "$changelog" ] || { echo "error: no changelog at $changelog" >&2; exit 1; }
+
+# Emit "<subsection>\t<marker>" for every unreleased entry that ends in a
+# marker-shaped parenthetical. Prose and legacy version stamps are ignored.
+markers=$(awk '
+  /^## \[Unreleased\]/ { inside = 1; next }
+  inside && /^## / { exit }
+  inside && /^### / { section = substr($0, 5); next }
+  inside && /^- / {
+    line = $0
+    sub(/[[:space:]]+$/, "", line)
+    sub(/[.]$/, "", line)
+    if (line ~ /\([A-Za-z]+\)$/) {
+      marker = line
+      sub(/^.*\(/, "", marker)
+      sub(/\)$/, "", marker)
+      print section "\t" marker
+    }
+  }
+' "$changelog")
+
+failures=0
+while IFS=$'\t' read -r section marker; do
+  [ -n "$marker" ] || continue
+
+  case "$marker" in
+    break | add | fix) ;;
+    minor | patch | major)
+      echo "error: '$marker' is a version slot, not an intent marker - use (break), (add), or (fix)" >&2
+      failures=$((failures + 1))
+      continue
+      ;;
+    *) continue ;;
+  esac
+
+  case "$section:$marker" in
+    Added:fix)
+      echo "error: an '### Added' entry is marked (fix) - use (add), or move it under '### Fixed'" >&2
+      failures=$((failures + 1))
+      ;;
+    Fixed:add | Fixed:break)
+      echo "error: an '### Fixed' entry is marked ($marker) - use (fix), or move it under '### Added'/'### Changed'" >&2
+      failures=$((failures + 1))
+      ;;
+  esac
+done <<<"$markers"
+
+if [ "$failures" -gt 0 ]; then
+  echo "error: $failures CHANGELOG marker problem(s) in $changelog" >&2
+  exit 1
+fi
+
+count=$(printf '%s\n' "$markers" | grep -c '[^[:space:]]' || true)
+echo "changelog markers ok ($count marker(s) checked)"
