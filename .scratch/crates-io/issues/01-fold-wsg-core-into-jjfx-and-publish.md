@@ -1,6 +1,6 @@
 # Fold wsg-core into jjfx and publish to crates.io
 
-Status: claimed
+Status: resolved
 
 ## Problem Statement
 
@@ -67,12 +67,12 @@ builds the tarball without publishing.
 
 ## Acceptance Criteria
 
-- [ ] `cargo package --no-verify` succeeds with no path-dependency error.
-- [ ] `cargo publish --dry-run` completes clean.
-- [ ] `crates/wsg-core` no longer exists; `cargo metadata` lists `jjfx` and
+- [x] `cargo package --no-verify` succeeds with no path-dependency error.
+- [x] `cargo publish --dry-run` completes clean.
+- [x] `crates/wsg-core` no longer exists; `cargo metadata` lists `jjfx` and
       `wsg` only.
-- [ ] The `wsg` binary still builds and reports its own version.
-- [ ] `mise run check` is green.
+- [x] The `wsg` binary still builds and reports its own version.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 

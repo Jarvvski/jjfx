@@ -31,7 +31,7 @@ actually being colocated.
   `.git` directory, and `--no-colocate` otherwise. The gate is what keeps a
   non-colocated repository - including jjfx's own test repositories - from
   creating worktrees.
-- The preference travels with the `wsg_core::Repository` (a `with_colocate`
+- The preference travels with the `jjfx::engine::Repository` (a `with_colocate`
   builder, read back as `colocate()`), so every creation path honors it: the TUI
   ad-hoc create, the Worker Pool provisioner, and the `wsg`/`jjfx` CLI `add` and
   `pool` commands.

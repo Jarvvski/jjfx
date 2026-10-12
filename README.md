@@ -33,6 +33,14 @@ agents.
 
 ### 2. Install
 
+From crates.io:
+
+```bash
+cargo install jjfx
+```
+
+Or from a clone, which also builds the `wsg` compatibility binary:
+
 ```bash
 git clone git@github.com:Jarvvski/jjfx.git
 cd jjfx
@@ -40,7 +48,7 @@ mise install        # pin Rust and jj
 mise run install    # release build, installed to ~/.cargo/bin/jjfx
 ```
 
-Without mise, `cargo install --path .` builds and installs the same binary.
+Without mise, `cargo install --path .` builds the same binary from the clone.
 
 ### 3. Open the TUI
 

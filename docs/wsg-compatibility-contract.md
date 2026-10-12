@@ -3,9 +3,9 @@
 Status: source-validated
 
 This document records the persisted Workspace Dispatch contract shared by Go
-wsg and the Rust implementation in `wsg-core`. The Go compatibility peer is
-commit `b85c8e8b24fdf5c5c39e7ceb6941cf045e8b3a10` from the wsg repository.
-The fixtures in `crates/wsg-core/tests/fixtures/compatibility/` are representative
+wsg and the Rust implementation in jjfx's `engine` module. The Go compatibility
+peer is commit `b85c8e8b24fdf5c5c39e7ceb6941cf045e8b3a10` from the wsg repository.
+The fixtures in `tests/fixtures/compatibility/` are representative
 Go-compatible documents.
 
 jj-wsx is not part of this contract. It is an obsolete predecessor to jjfx and

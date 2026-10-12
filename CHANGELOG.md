@@ -17,6 +17,12 @@ version of record lives in the project manifest.
 
 ### Added
 
+- 2026-10-12 - `jjfx` is now a single crate and publishes to crates.io:
+  `cargo install jjfx` builds the binary from the registry. The former
+  `wsg-core` crate was absorbed into jjfx as its `engine` module, so the `wsg`
+  compatibility binary now builds from this repository alone (it is not
+  published). (jjfx 0.52.0)
+
 - 2026-10-12 - A `jjfx-dispatch` agent skill under `skills/`, installable into
   any agent with `bunx skills@latest add Jarvvski/jjfx`. It walks an agent
   through giving the Worker Pool capacity, choosing tickets, dispatching,

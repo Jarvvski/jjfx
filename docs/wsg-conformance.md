@@ -2,8 +2,8 @@
 
 Status: migration-era
 
-During the wsg migration, the Rust `wsg` binary (`crates/wsg`, over the shared
-`wsg-core` library) is verified against the Go `wsg` implementation acting as a
+During the wsg migration, the Rust `wsg` binary (`crates/wsg`, over jjfx's
+`engine` module) is verified against the Go `wsg` implementation acting as a
 temporary oracle. The Go compatibility peer is source-validated at commit
 `b85c8e8b24fdf5c5c39e7ceb6941cf045e8b3a10` of the wsg repository.
 
