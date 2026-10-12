@@ -9,6 +9,7 @@ mod config;
 mod diff;
 mod diff_view;
 mod display;
+pub mod engine;
 mod events;
 mod forge;
 mod graph;
@@ -39,7 +40,6 @@ use std::sync::Arc;
 use anyhow::Context;
 use ratatui::crossterm::event;
 use tokio::sync::mpsc::{self, UnboundedSender};
-use wsg_core as _;
 
 use crate::app::{App, Msg};
 use crate::runtime::Runtime;
@@ -120,12 +120,12 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 /// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so
 /// `mount` opens the same first pane and layout as the TUI. It is loaded lazily
 /// - only a `mount` invocation reads jjfx's config file.
-pub fn terminal_settings() -> anyhow::Result<wsg_core::TerminalSettings> {
+pub fn terminal_settings() -> anyhow::Result<crate::engine::TerminalSettings> {
     let config = config::load()?;
     let layout = layout::LayoutSettings::from_config(&config.terminal)
         .resolve(display::attached_condition())?
         .clone();
-    Ok(wsg_core::TerminalSettings {
+    Ok(crate::engine::TerminalSettings {
         first_pane_command: config.first_pane_command(),
         layout,
     })

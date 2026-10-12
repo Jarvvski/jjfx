@@ -17,6 +17,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::{self, AgentState};
 use crate::diff::FileDiff;
 use crate::diff_view::Detail;
+use crate::engine::{WorkerPoolSnapshot, WorkerStatus};
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj;
@@ -38,7 +39,6 @@ use crate::workspace_dispatch::{
     WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
-use wsg_core::{WorkerPoolSnapshot, WorkerStatus};
 
 /// The focused Worker Pool management interaction.
 enum PoolMode {
@@ -233,7 +233,7 @@ pub enum Msg {
     /// A line of output from the setup hook for a new workspace.
     WorkspaceSetupOutput {
         workspace: PendingWorkspace,
-        stream: wsg_core::WorkspaceHookStream,
+        stream: crate::engine::WorkspaceHookStream,
         line: String,
     },
     /// The setup hook for a newly-created workspace finished.
@@ -307,7 +307,7 @@ pub struct App {
     /// is safe to leave the TUI.
     quit_after_deletion: bool,
     /// Latest non-empty line emitted by that workspace's setup command.
-    setup_output: Option<(wsg_core::WorkspaceHookStream, String)>,
+    setup_output: Option<(crate::engine::WorkspaceHookStream, String)>,
     /// Effects requested during the current fold. [`App::handle`] drains them so
     /// the runtime performs exactly the work the fold asked for.
     effects: Vec<Effect>,
@@ -1713,10 +1713,10 @@ impl App {
             });
             let friendly = friendly_setup_error(&message);
             let status = match phase {
-                wsg_core::AdHocWorkspacePhase::Create => {
+                crate::engine::AdHocWorkspacePhase::Create => {
                     format!("could not create '{name}': {friendly}")
                 }
-                wsg_core::AdHocWorkspacePhase::Hook => {
+                crate::engine::AdHocWorkspacePhase::Hook => {
                     format!("created '{name}', setup failed: {friendly}")
                 }
             };
@@ -1741,7 +1741,7 @@ impl App {
     fn on_workspace_setup_output(
         &mut self,
         workspace: PendingWorkspace,
-        stream: wsg_core::WorkspaceHookStream,
+        stream: crate::engine::WorkspaceHookStream,
         line: String,
     ) {
         if self.pending_workspace.as_ref() != Some(&workspace) {
@@ -2365,7 +2365,7 @@ impl App {
     }
 
     #[cfg(test)]
-    fn worker_for(&self, workspace: &Workspace) -> Option<&wsg_core::WorkerSnapshot> {
+    fn worker_for(&self, workspace: &Workspace) -> Option<&crate::engine::WorkerSnapshot> {
         self.pool
             .worker_pool
             .as_ref()?
@@ -2523,6 +2523,9 @@ mod tests {
     use crate::agent::AgentKind;
     use crate::attention::Attention;
     use crate::config::ForgeConfig;
+    use crate::engine::{
+        AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult,
+    };
     use crate::render::style::{
         CLAUDE_ORANGE, CODEX_CYAN, PI_VIOLET, agent_glyph, agent_label, working_frame,
     };
@@ -2532,9 +2535,6 @@ mod tests {
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
-    use wsg_core::{
-        AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult,
-    };
 
     /// A `Terminal` that records calls instead of driving kitty, so key handling
     /// is testable without a real multiplexer. Cloning shares the recorders, so a
@@ -3058,7 +3058,7 @@ mod tests {
         app.pending_workspace = Some(workspace.clone());
         app.handle(Msg::WorkspaceSetupOutput {
             workspace: workspace.clone(),
-            stream: wsg_core::WorkspaceHookStream::Stdout,
+            stream: crate::engine::WorkspaceHookStream::Stdout,
             line: "==> compiling backend".to_string(),
         });
         app.handle(Msg::WorkspaceSetupOutput {
@@ -3067,7 +3067,7 @@ mod tests {
                 path: PathBuf::from("/wt/other"),
                 started_at,
             },
-            stream: wsg_core::WorkspaceHookStream::Stderr,
+            stream: crate::engine::WorkspaceHookStream::Stderr,
             line: "stale output".to_string(),
         });
 
@@ -3129,7 +3129,7 @@ mod tests {
         let effects = app.handle(Msg::WorkspaceSetupCompleted {
             workspace: pending("/wt/feat"),
             result: Err(crate::store::WorkspaceCreateError {
-                phase: wsg_core::AdHocWorkspacePhase::Create,
+                phase: crate::engine::AdHocWorkspacePhase::Create,
                 message: "run jj workspace add: boom".to_string(),
             }),
         });
@@ -3266,7 +3266,7 @@ mod tests {
             br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
@@ -3377,7 +3377,7 @@ mod tests {
             br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let adapter = RecordingAdapter::new(snapshot.clone());
@@ -3463,7 +3463,7 @@ mod tests {
             br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let adapter = RecordingAdapter::new(snapshot.clone());
@@ -3529,7 +3529,7 @@ mod tests {
             br#"{"status":"busy","agent":"claude","ticket":"ENG-1","pid":null,"started_at":"2026-07-27T10:00:00Z","completed_at":null,"log_file":null,"branch_name":"eng-1","exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
@@ -3568,7 +3568,7 @@ mod tests {
         assert!(output.status.success());
         let mut app = app_with(&["default"]);
         app.pool.worker_pool = Some(
-            wsg_core::Repository::open(temp.path())
+            crate::engine::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
@@ -3580,9 +3580,9 @@ mod tests {
                 outcome: WorkerSessionOutcome::new(
                     "worker-01",
                     crate::workspace_dispatch::WorkerActionKind::Send,
-                    wsg_core::AgentRuntime::Pi,
+                    crate::engine::AgentRuntime::Pi,
                     AgentSessionResolution::Fresh {
-                        reason: wsg_core::FreshSessionReason::MissingIdentity,
+                        reason: crate::engine::FreshSessionReason::MissingIdentity,
                     },
                     77,
                 ),
@@ -3629,7 +3629,7 @@ mod tests {
         .unwrap();
         let mut app = app_with(&["default", "worker-01"]);
         app.pool.worker_pool = Some(
-            wsg_core::Repository::open(temp.path())
+            crate::engine::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
@@ -3668,7 +3668,7 @@ mod tests {
             br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let adapter = RecordingAdapter::new(snapshot.clone());
@@ -3788,7 +3788,7 @@ mod tests {
                 operation: 8,
                 outcome: crate::workspace_dispatch::WorkerResetOutcome::new(
                     "worker-01",
-                    wsg_core::RunReset::Abandoned {
+                    crate::engine::RunReset::Abandoned {
                         terminated_pid: Some(77),
                     },
                 ),
@@ -3831,7 +3831,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let adapter = RecordingAdapter::new(snapshot);
@@ -3886,13 +3886,13 @@ mod tests {
         assert!(output.status.success());
         let mut app = app_with(&["default"]);
         app.pool.worker_pool = Some(
-            wsg_core::Repository::open(temp.path())
+            crate::engine::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
         app.pool.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
-            wsg_core::AgentRuntime::Pi,
+            crate::engine::AgentRuntime::Pi,
             Some(RunActivity::new(RunActivityKind::FileChanges {
                 paths: vec![
                     "src/app.rs".to_owned(),
@@ -3938,14 +3938,14 @@ mod tests {
             .output()
             .unwrap();
         assert!(output.status.success());
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
 
         for runtime in [
-            wsg_core::AgentRuntime::Claude,
-            wsg_core::AgentRuntime::Codex,
-            wsg_core::AgentRuntime::Pi,
+            crate::engine::AgentRuntime::Claude,
+            crate::engine::AgentRuntime::Codex,
+            crate::engine::AgentRuntime::Pi,
         ] {
             let mut app = app_with(&["default"]);
             app.pool.worker_pool = Some(snapshot.clone());
@@ -3954,7 +3954,7 @@ mod tests {
                 crate::workspace_dispatch::WorkerActionKind::Send,
                 runtime,
                 AgentSessionResolution::Fresh {
-                    reason: wsg_core::FreshSessionReason::MissingIdentity,
+                    reason: crate::engine::FreshSessionReason::MissingIdentity,
                 },
                 77,
             ));
@@ -3972,7 +3972,7 @@ mod tests {
                     "ENG-43".to_owned(),
                     "Runtime matrix".to_owned(),
                     None,
-                    wsg_core::DirectDispatchFailurePhase::Launch,
+                    crate::engine::DirectDispatchFailurePhase::Launch,
                     format!("{} capability failed", runtime.as_str()),
                 )],
                 false,
@@ -4018,7 +4018,7 @@ mod tests {
         app.pool.worker_log_operation = Some(7);
         let first = crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
-            wsg_core::AgentRuntime::Claude,
+            crate::engine::AgentRuntime::Claude,
             Some(RunActivity::new(RunActivityKind::Message {
                 text: "current".to_owned(),
             })),
@@ -4027,7 +4027,7 @@ mod tests {
         app.pool.worker_log = Some(first.clone());
         let stale = crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
-            wsg_core::AgentRuntime::Codex,
+            crate::engine::AgentRuntime::Codex,
             Some(RunActivity::new(RunActivityKind::Message {
                 text: "stale".to_owned(),
             })),
@@ -4044,7 +4044,7 @@ mod tests {
 
         let terminal = crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
-            wsg_core::AgentRuntime::Claude,
+            crate::engine::AgentRuntime::Claude,
             None,
             Some(RunResult::succeeded()),
         );
@@ -4096,12 +4096,12 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
         app.pool.worker_pool = Some(
-            wsg_core::Repository::open(temp.path())
+            crate::engine::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
         app.pool.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
-            wsg_core::AgentRuntime::Pi,
+            crate::engine::AgentRuntime::Pi,
             vec![
                 crate::workspace_dispatch::DispatchOutcome::success(
                     "ENG-42".to_owned(),
@@ -4113,7 +4113,7 @@ mod tests {
                     "ENG-43".to_owned(),
                     "Second Ticket".to_owned(),
                     None,
-                    wsg_core::DirectDispatchFailurePhase::Capacity,
+                    crate::engine::DirectDispatchFailurePhase::Capacity,
                     "no idle Worker".to_owned(),
                 ),
             ],
@@ -4154,32 +4154,32 @@ mod tests {
             .unwrap();
         assert!(output.status.success());
 
-        let parent = wsg_core::TicketId::parse("ENG-100").unwrap();
-        let blocker = wsg_core::TicketId::parse("ENG-101").unwrap();
-        let dependent = wsg_core::TicketId::parse("ENG-102").unwrap();
+        let parent = crate::engine::TicketId::parse("ENG-100").unwrap();
+        let blocker = crate::engine::TicketId::parse("ENG-101").unwrap();
+        let dependent = crate::engine::TicketId::parse("ENG-102").unwrap();
         let mut sub_issues = BTreeMap::new();
         sub_issues.insert(
             blocker,
-            wsg_core::SubIssueState::new(
+            crate::engine::SubIssueState::new(
                 "Foundation",
-                wsg_core::WireStatus::new("done"),
+                crate::engine::WireStatus::new("done"),
                 Vec::new(),
             ),
         );
         sub_issues.insert(
             dependent,
-            wsg_core::SubIssueState::new(
+            crate::engine::SubIssueState::new(
                 "Dependent work",
-                wsg_core::WireStatus::new("pending"),
-                vec![wsg_core::TicketId::parse("ENG-101").unwrap()],
+                crate::engine::WireStatus::new("pending"),
+                vec![crate::engine::TicketId::parse("ENG-101").unwrap()],
             ),
         );
-        let mut group_options = wsg_core::DispatchGroupOptions::new("gpt-5.4");
-        group_options.agent = Some(wsg_core::WireAgent::new("pi"));
+        let mut group_options = crate::engine::DispatchGroupOptions::new("gpt-5.4");
+        group_options.agent = Some(crate::engine::WireAgent::new("pi"));
         group_options.provider = Some("openai".to_owned());
-        let mut state = wsg_core::DispatchGroupState::new(
+        let mut state = crate::engine::DispatchGroupState::new(
             parent,
-            wsg_core::WireTimestamp::new("2026-08-10T10:00:00Z"),
+            crate::engine::WireTimestamp::new("2026-08-10T10:00:00Z"),
             "Jarvvski/jjfx",
             group_options,
         );
@@ -4187,11 +4187,11 @@ mod tests {
 
         let mut app = app_with(&["default"]);
         app.pool.worker_pool = Some(
-            wsg_core::Repository::open(temp.path())
+            crate::engine::Repository::open(temp.path())
                 .unwrap()
                 .read_worker_pool_snapshot(),
         );
-        let progress = wsg_core::DispatchGroup::from_state(state)
+        let progress = crate::engine::DispatchGroup::from_state(state)
             .unwrap()
             .progress()
             .unwrap();
@@ -4234,7 +4234,7 @@ mod tests {
             br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let adapter = RecordingAdapter::new(snapshot.clone());
@@ -4337,7 +4337,7 @@ mod tests {
             br#"{"status":"idle","agent":null,"ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
@@ -4389,7 +4389,7 @@ mod tests {
             br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let repository = wsg_core::Repository::open(temp.path()).unwrap();
+        let repository = crate::engine::Repository::open(temp.path()).unwrap();
         let idle = repository.read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
@@ -4448,7 +4448,7 @@ mod tests {
             br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
         let mut app = app_with(&["default", "worker-01"]);
@@ -4487,7 +4487,7 @@ mod tests {
             br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":"2026-07-21T10:00:00Z","completed_at":null,"log_file":"/repo/.jj/pool/worker-01.log","branch_name":"eng-101","exit_code":null,"error":null}"#,
         )
         .unwrap();
-        let snapshot = wsg_core::Repository::open(temp.path())
+        let snapshot = crate::engine::Repository::open(temp.path())
             .unwrap()
             .read_worker_pool_snapshot();
 

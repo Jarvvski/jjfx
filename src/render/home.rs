@@ -8,6 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::attention::Attention;
+use crate::engine::{WorkerSnapshot, WorkerStatus};
 use crate::render::graph;
 use crate::render::state::RenderState;
 use crate::render::style::{
@@ -15,7 +16,6 @@ use crate::render::style::{
     elapsed_label, forge_spans, pane_border, work_color,
 };
 use crate::render::view::{HomeRow, RowMarker};
-use wsg_core::{WorkerSnapshot, WorkerStatus};
 
 /// Minimum rows (borders included) the inline world pane needs; when half the
 /// home body is shorter than this the pane is dropped so the list stays usable.

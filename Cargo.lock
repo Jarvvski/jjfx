@@ -1880,20 +1880,22 @@ name = "jjfx"
 version = "0.51.0"
 dependencies = [
  "anyhow",
+ "getrandom",
  "jiff",
  "jj-lib",
  "notify",
  "pollster 0.4.0",
  "ratatui",
  "ratatui-textarea",
+ "rustix 1.1.4",
  "sapling-renderdag",
  "serde",
  "serde_json",
  "syntect",
  "tempfile",
+ "thiserror 2.0.18",
  "tokio",
  "toml",
- "wsg-core",
 ]
 
 [[package]]
@@ -3581,21 +3583,6 @@ dependencies = [
  "rustix 1.1.4",
  "serde_json",
  "tempfile",
- "wsg-core",
-]
-
-[[package]]
-name = "wsg-core"
-version = "0.1.0"
-dependencies = [
- "getrandom",
- "jiff",
- "rustix 1.1.4",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.18",
- "toml",
 ]
 
 [[package]]

@@ -8,7 +8,7 @@ use std::process::Command;
 use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 use thiserror::Error;
 
-use crate::{
+use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, Expected, Loaded, PoolState, Repository,
     RunConclusion, RunResult, StateChange, StateError, StateRevision, WireStatus, WireTimestamp,
     WorkerId, WorkerState, WorkerWorkspaceError,
@@ -283,7 +283,7 @@ pub enum WorkerPoolError {
     #[error("invalid configured Agent Runtime {value:?} (expected claude, codex, or pi)")]
     InvalidAgentRuntime { value: String },
     #[error(transparent)]
-    InvalidRuntimeProfile(#[from] crate::AgentRuntimePreflightError),
+    InvalidRuntimeProfile(#[from] crate::engine::AgentRuntimePreflightError),
     #[error("cannot discover GitHub repository: {0}")]
     RepositoryDiscovery(String),
     #[error("cannot create a Worker timestamp: {0}")]
@@ -367,11 +367,13 @@ impl WorkerPool {
             .zip(state.log_file.as_deref())
             .map_or_else(
                 || {
-                    crate::run_log::unexpected_result(
-                        crate::RunResultFallback::MissingTerminalEvent,
+                    crate::engine::run_log::unexpected_result(
+                        crate::engine::RunResultFallback::MissingTerminalEvent,
                     )
                 },
-                |(runtime, path)| crate::run_log::result_for_finalization(Path::new(path), runtime),
+                |(runtime, path)| {
+                    crate::engine::run_log::result_for_finalization(Path::new(path), runtime)
+                },
             )
             .0;
         apply_run_result(&mut state, &result)?;
@@ -477,7 +479,7 @@ impl WorkerPool {
         })
     }
 
-    fn worker_repository(&self, worker: &WorkerId) -> crate::WorkerStateRepository {
+    fn worker_repository(&self, worker: &WorkerId) -> crate::engine::WorkerStateRepository {
         self.repository.state_store().worker(worker.clone())
     }
 
@@ -498,7 +500,7 @@ impl WorkerPool {
             log_path.to_string_lossy().into_owned(),
             Some(profile),
         )? {
-            crate::state::FollowUpOutcome::Started {
+            crate::engine::state::FollowUpOutcome::Started {
                 profile,
                 prior_log,
                 revision,
@@ -514,20 +516,22 @@ impl WorkerPool {
                 },
                 prior_log.map(PathBuf::from),
             )),
-            crate::state::FollowUpOutcome::WorkerNotInPool => {
+            crate::engine::state::FollowUpOutcome::WorkerNotInPool => {
                 Err(WorkerPoolError::WorkerNotInPool {
                     worker: worker.clone(),
                 })
             }
-            crate::state::FollowUpOutcome::WorkerBusy => Err(WorkerPoolError::WorkerNotIdle {
-                worker: worker.clone(),
-            }),
-            crate::state::FollowUpOutcome::WorkerStateMissing => {
+            crate::engine::state::FollowUpOutcome::WorkerBusy => {
+                Err(WorkerPoolError::WorkerNotIdle {
+                    worker: worker.clone(),
+                })
+            }
+            crate::engine::state::FollowUpOutcome::WorkerStateMissing => {
                 Err(WorkerPoolError::WorkerStateMissing {
                     worker: worker.clone(),
                 })
             }
-            crate::state::FollowUpOutcome::InvalidAgentRuntime { value } => {
+            crate::engine::state::FollowUpOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
         }
@@ -569,7 +573,7 @@ impl WorkerPool {
         let inputs = requests
             .iter()
             .map(|(ticket, worker, profile)| {
-                Ok(crate::state::ReservationInput {
+                Ok(crate::engine::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
                     ticket: ticket.clone(),
                     requested_worker: worker.clone(),
@@ -579,7 +583,7 @@ impl WorkerPool {
             })
             .collect::<Result<Vec<_>, WorkerPoolError>>()?;
         match self.repository.state_store().reserve_workers(inputs)? {
-            crate::state::ReservationsOutcome::Reserved {
+            crate::engine::state::ReservationsOutcome::Reserved {
                 workers,
                 unavailable,
             } => {
@@ -596,16 +600,16 @@ impl WorkerPool {
                     })
                     .collect())
             }
-            crate::state::ReservationsOutcome::NoIdle { available } => {
+            crate::engine::state::ReservationsOutcome::NoIdle { available } => {
                 Err(CapacityShortage::new(requests.len(), available).into())
             }
-            crate::state::ReservationsOutcome::WorkerNotInPool { worker } => {
+            crate::engine::state::ReservationsOutcome::WorkerNotInPool { worker } => {
                 Err(WorkerPoolError::WorkerNotInPool { worker })
             }
-            crate::state::ReservationsOutcome::WorkerNotIdle { worker } => {
+            crate::engine::state::ReservationsOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
             }
-            crate::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
+            crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
         }
@@ -618,7 +622,7 @@ impl WorkerPool {
         let inputs = requests
             .iter()
             .map(|(ticket, worker, profile)| {
-                Ok(crate::state::ReservationInput {
+                Ok(crate::engine::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
                     ticket: ticket.clone(),
                     requested_worker: worker.clone(),
@@ -632,7 +636,7 @@ impl WorkerPool {
             .state_store()
             .reserve_available_workers(inputs)?
         {
-            crate::state::ReservationsOutcome::Reserved {
+            crate::engine::state::ReservationsOutcome::Reserved {
                 workers,
                 unavailable,
             } => {
@@ -659,16 +663,16 @@ impl WorkerPool {
                     unavailable,
                 })
             }
-            crate::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
+            crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
-            crate::state::ReservationsOutcome::NoIdle { available } => {
+            crate::engine::state::ReservationsOutcome::NoIdle { available } => {
                 Err(CapacityShortage::new(requests.len(), available).into())
             }
-            crate::state::ReservationsOutcome::WorkerNotInPool { worker } => {
+            crate::engine::state::ReservationsOutcome::WorkerNotInPool { worker } => {
                 Err(WorkerPoolError::WorkerNotInPool { worker })
             }
-            crate::state::ReservationsOutcome::WorkerNotIdle { worker } => {
+            crate::engine::state::ReservationsOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
             }
         }
@@ -741,7 +745,7 @@ impl WorkerPool {
         let inputs = requests
             .iter()
             .map(|(ticket, worker, profile)| {
-                Ok(crate::state::ReservationInput {
+                Ok(crate::engine::state::ReservationInput {
                     branch_name: ticket.to_lowercase(),
                     ticket: ticket.clone(),
                     requested_worker: worker.clone(),
@@ -756,7 +760,7 @@ impl WorkerPool {
             inputs,
         );
         let result = match outcome {
-            Ok(crate::state::GrowReservationsOutcome::Reserved(reserved)) => Ok(reserved
+            Ok(crate::engine::state::GrowReservationsOutcome::Reserved(reserved)) => Ok(reserved
                 .into_iter()
                 .map(|reserved| Reservation {
                     worker_id: reserved.worker,
@@ -767,11 +771,13 @@ impl WorkerPool {
                     rollback: reserved.rollback,
                 })
                 .collect()),
-            Ok(crate::state::GrowReservationsOutcome::Conflict) => Err(WorkerPoolError::Conflict),
-            Ok(crate::state::GrowReservationsOutcome::NoIdle { available }) => {
+            Ok(crate::engine::state::GrowReservationsOutcome::Conflict) => {
+                Err(WorkerPoolError::Conflict)
+            }
+            Ok(crate::engine::state::GrowReservationsOutcome::NoIdle { available }) => {
                 Err(CapacityShortage::new(requests.len(), available).into())
             }
-            Ok(crate::state::GrowReservationsOutcome::InvalidAgentRuntime { value }) => {
+            Ok(crate::engine::state::GrowReservationsOutcome::InvalidAgentRuntime { value }) => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
             Err(error) => Err(WorkerPoolError::State(error)),
@@ -821,11 +827,11 @@ impl WorkerPool {
             .state_store()
             .set_worker_alias(&worker, alias)?
         {
-            crate::state::PoolAliasOutcome::Updated => Ok(()),
-            crate::state::PoolAliasOutcome::WorkerNotInPool => {
+            crate::engine::state::PoolAliasOutcome::Updated => Ok(()),
+            crate::engine::state::PoolAliasOutcome::WorkerNotInPool => {
                 Err(WorkerPoolError::WorkerNotInPool { worker })
             }
-            crate::state::PoolAliasOutcome::Destroying => Err(WorkerPoolError::Conflict),
+            crate::engine::state::PoolAliasOutcome::Destroying => Err(WorkerPoolError::Conflict),
         }
     }
 
@@ -844,7 +850,7 @@ impl WorkerPool {
             profile,
         )?;
         match outcome {
-            crate::state::ReservationOutcome::Reserved {
+            crate::engine::state::ReservationOutcome::Reserved {
                 worker,
                 profile,
                 revision,
@@ -857,16 +863,16 @@ impl WorkerPool {
                 worker_revision: revision,
                 rollback: *rollback,
             }),
-            crate::state::ReservationOutcome::NoIdle { available } => {
+            crate::engine::state::ReservationOutcome::NoIdle { available } => {
                 Err(WorkerPoolError::NoIdleWorkers { ticket, available })
             }
-            crate::state::ReservationOutcome::WorkerNotInPool { worker } => {
+            crate::engine::state::ReservationOutcome::WorkerNotInPool { worker } => {
                 Err(WorkerPoolError::WorkerNotInPool { worker })
             }
-            crate::state::ReservationOutcome::WorkerNotIdle { worker } => {
+            crate::engine::state::ReservationOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
             }
-            crate::state::ReservationOutcome::InvalidAgentRuntime { value } => {
+            crate::engine::state::ReservationOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
         }
@@ -884,7 +890,7 @@ impl WorkerPool {
         mut on_output: F,
     ) -> Result<PoolResize, WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let mut recovered = self.retry_detached_cleanup(&mut on_output)?;
         let pool_repository = self.repository.state_store().pool();
@@ -902,7 +908,7 @@ impl WorkerPool {
             .state_store()
             .shrink_pool(capacity.as_usize())?
         {
-            crate::state::PoolMembershipOutcome::Changed { capacity, removed } => {
+            crate::engine::state::PoolMembershipOutcome::Changed { capacity, removed } => {
                 recovered.extend(self.cleanup_detached_with_progress(&removed, &mut on_output)?);
                 Ok(PoolResize {
                     capacity: PoolCapacity::new(capacity)
@@ -911,17 +917,19 @@ impl WorkerPool {
                     removed_workers: recovered,
                 })
             }
-            crate::state::PoolMembershipOutcome::NoChange { capacity } => Ok(PoolResize {
+            crate::engine::state::PoolMembershipOutcome::NoChange { capacity } => Ok(PoolResize {
                 capacity: PoolCapacity::new(capacity)
                     .map_err(|_| WorkerPoolError::InvalidSize(capacity as i64))?,
                 added_workers: Vec::new(),
                 removed_workers: recovered,
             }),
-            crate::state::PoolMembershipOutcome::NeedsGrowth => Err(WorkerPoolError::Conflict),
-            crate::state::PoolMembershipOutcome::Busy { workers } => {
+            crate::engine::state::PoolMembershipOutcome::NeedsGrowth => {
+                Err(WorkerPoolError::Conflict)
+            }
+            crate::engine::state::PoolMembershipOutcome::Busy { workers } => {
                 Err(WorkerPoolError::WorkersBusy { workers })
             }
-            crate::state::PoolMembershipOutcome::WorkerNotInPool { .. } => {
+            crate::engine::state::PoolMembershipOutcome::WorkerNotInPool { .. } => {
                 Err(WorkerPoolError::Conflict)
             }
         }
@@ -939,10 +947,10 @@ impl WorkerPool {
         mut on_output: F,
     ) -> Result<PoolResize, WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         match self.repository.state_store().remove_pool_worker(&worker)? {
-            crate::state::PoolMembershipOutcome::Changed { capacity, removed } => {
+            crate::engine::state::PoolMembershipOutcome::Changed { capacity, removed } => {
                 let removed = self.cleanup_detached_with_progress(&removed, &mut on_output)?;
                 Ok(PoolResize {
                     capacity: PoolCapacity::new(capacity)
@@ -951,10 +959,10 @@ impl WorkerPool {
                     removed_workers: removed,
                 })
             }
-            crate::state::PoolMembershipOutcome::Busy { workers } => {
+            crate::engine::state::PoolMembershipOutcome::Busy { workers } => {
                 Err(WorkerPoolError::WorkersBusy { workers })
             }
-            crate::state::PoolMembershipOutcome::WorkerNotInPool { worker } => {
+            crate::engine::state::PoolMembershipOutcome::WorkerNotInPool { worker } => {
                 if !self.worker_repository(&worker).cleanup_marker_exists() {
                     return Err(WorkerPoolError::WorkerNotInPool { worker });
                 }
@@ -972,8 +980,10 @@ impl WorkerPool {
                     removed_workers: removed,
                 })
             }
-            crate::state::PoolMembershipOutcome::NoChange { .. }
-            | crate::state::PoolMembershipOutcome::NeedsGrowth => Err(WorkerPoolError::Conflict),
+            crate::engine::state::PoolMembershipOutcome::NoChange { .. }
+            | crate::engine::state::PoolMembershipOutcome::NeedsGrowth => {
+                Err(WorkerPoolError::Conflict)
+            }
         }
     }
 
@@ -989,7 +999,7 @@ impl WorkerPool {
     /// Destroys the Pool while reporting teardown hook output.
     pub fn destroy_with_progress<F>(&self, mut on_output: F) -> Result<(), WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let state_store = self.repository.state_store();
         state_store.detach_pool_for_destroy()?;
@@ -1005,7 +1015,7 @@ impl WorkerPool {
         on_output: &mut F,
     ) -> Result<(), WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let state_store = self.repository.state_store();
         let mut residual = Vec::new();
@@ -1020,8 +1030,9 @@ impl WorkerPool {
                 }
             };
             match status {
-                crate::state::DetachedCleanupStatus::Busy { pid: Some(pid) } => {
-                    if let Err(error) = crate::RunSupervisor::new().terminate_recorded_process(pid)
+                crate::engine::state::DetachedCleanupStatus::Busy { pid: Some(pid) } => {
+                    if let Err(error) =
+                        crate::engine::RunSupervisor::new().terminate_recorded_process(pid)
                     {
                         residual.push(worker.clone());
                         failures.push(format!(
@@ -1030,11 +1041,11 @@ impl WorkerPool {
                         continue;
                     }
                 }
-                crate::state::DetachedCleanupStatus::Busy { pid: None }
-                | crate::state::DetachedCleanupStatus::Ready => {}
-                crate::state::DetachedCleanupStatus::NotDetached => continue,
+                crate::engine::state::DetachedCleanupStatus::Busy { pid: None }
+                | crate::engine::state::DetachedCleanupStatus::Ready => {}
+                crate::engine::state::DetachedCleanupStatus::NotDetached => continue,
             }
-            if let Err(error) = crate::workspace::teardown_detached_with_progress(
+            if let Err(error) = crate::engine::workspace::teardown_detached_with_progress(
                 &self.repository,
                 worker,
                 &mut *on_output,
@@ -1089,7 +1100,7 @@ impl WorkerPool {
         on_output: &mut F,
     ) -> Result<PoolResize, WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let pool = self.repository.state_store().pool();
         let current = self.load_or_create(&pool)?;
@@ -1164,7 +1175,7 @@ impl WorkerPool {
 
     fn retry_detached_cleanup<F>(&self, on_output: &mut F) -> Result<Vec<WorkerId>, WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let markers = self.repository.state_store().detached_cleanup_markers()?;
         self.cleanup_detached_with_progress(&markers, on_output)
@@ -1176,7 +1187,7 @@ impl WorkerPool {
         on_output: &mut F,
     ) -> Result<Vec<WorkerId>, WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let state_store = self.repository.state_store();
         let mut cleaned = Vec::new();
@@ -1184,8 +1195,8 @@ impl WorkerPool {
         let mut failures = Vec::new();
         for worker in workers {
             match state_store.detached_cleanup_status(worker) {
-                Ok(crate::state::DetachedCleanupStatus::Ready) => {
-                    if let Err(error) = crate::workspace::teardown_detached_with_progress(
+                Ok(crate::engine::state::DetachedCleanupStatus::Ready) => {
+                    if let Err(error) = crate::engine::workspace::teardown_detached_with_progress(
                         &self.repository,
                         worker,
                         &mut *on_output,
@@ -1200,8 +1211,10 @@ impl WorkerPool {
                         Err(error) => failures.push(format!("{worker}: {error}")),
                     }
                 }
-                Ok(crate::state::DetachedCleanupStatus::Busy { .. }) => busy.push(worker.clone()),
-                Ok(crate::state::DetachedCleanupStatus::NotDetached) => {}
+                Ok(crate::engine::state::DetachedCleanupStatus::Busy { .. }) => {
+                    busy.push(worker.clone())
+                }
+                Ok(crate::engine::state::DetachedCleanupStatus::NotDetached) => {}
                 Err(error) => failures.push(format!("{worker}: {error}")),
             }
         }
@@ -1218,7 +1231,7 @@ impl WorkerPool {
     fn cleanup_workers(&self, workers: &[WorkerId]) -> Result<(), WorkerPoolError> {
         let mut failures = Vec::new();
         for worker in workers {
-            if let Err(error) = crate::workspace::deprovision(&self.repository, worker) {
+            if let Err(error) = crate::engine::workspace::deprovision(&self.repository, worker) {
                 failures.push(format!("{worker}: {error}"));
             }
         }
@@ -1235,11 +1248,11 @@ impl WorkerPool {
         on_output: &mut F,
     ) -> Result<(), WorkerPoolError>
     where
-        F: FnMut(crate::workspace::WorkspaceHookStream, &str),
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
         let mut failures = Vec::new();
         for worker in workers {
-            if let Err(error) = crate::workspace::deprovision_with_progress(
+            if let Err(error) = crate::engine::workspace::deprovision_with_progress(
                 &self.repository,
                 worker,
                 &mut *on_output,
@@ -1256,8 +1269,8 @@ impl WorkerPool {
 
     fn load_or_create(
         &self,
-        pool: &crate::PoolStateRepository,
-    ) -> Result<crate::Versioned<PoolState>, WorkerPoolError> {
+        pool: &crate::engine::PoolStateRepository,
+    ) -> Result<crate::engine::Versioned<PoolState>, WorkerPoolError> {
         match pool.load()? {
             Loaded::Present(versioned) => Ok(versioned),
             Loaded::Missing => {
@@ -1302,7 +1315,7 @@ fn next_worker_id(
 
 fn worker_claimed(repository: &Repository, worker: &WorkerId) -> bool {
     let state = repository.state_store().worker(worker.clone());
-    crate::workspace::worker_path(repository.root(), worker).exists()
+    crate::engine::workspace::worker_path(repository.root(), worker).exists()
         || state.cleanup_marker_exists()
         || state
             .load()

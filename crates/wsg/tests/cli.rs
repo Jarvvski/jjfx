@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Stdio};
 
-use wsg_core::{
+use jjfx::engine::{
     AgentRuntime, CommitOutcome, Expected, Loaded, PoolCapacity, Repository, StateChange,
     WireAgent, WorkerStatus,
 };
@@ -683,8 +683,9 @@ fn status_displays_cosmetic_worker_aliases_without_changing_worker_input() {
         .and_then(|line| line.split_whitespace().next())
         .expect("status should include a Worker")
         .to_owned();
-    let repository = wsg_core::Repository::open(directory.path()).expect("repository should open");
-    let worker = wsg_core::WorkerId::parse(format!("worker-{short_worker}"))
+    let repository =
+        jjfx::engine::Repository::open(directory.path()).expect("repository should open");
+    let worker = jjfx::engine::WorkerId::parse(format!("worker-{short_worker}"))
         .expect("Worker ID should be valid");
     repository
         .worker_pool()

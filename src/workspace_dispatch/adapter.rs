@@ -4,7 +4,7 @@
 //! production implementation over the shared Repository-owned Pool module.
 //! The seam itself - commands, events, the controller, and presentation DTOs -
 //! stays in the parent module, so a reader of the seam never wades through
-//! wsg-core mapping and process work.
+//! engine mapping and process work.
 
 use super::*;
 
@@ -64,29 +64,29 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
 
-fn orchestration_notice(event: &wsg_core::OrchestrationEvent) -> Option<String> {
+fn orchestration_notice(event: &crate::engine::OrchestrationEvent) -> Option<String> {
     match event {
-        wsg_core::OrchestrationEvent::Started { .. }
-        | wsg_core::OrchestrationEvent::Terminal(_) => None,
-        wsg_core::OrchestrationEvent::Completed { ticket, worker, .. } => {
+        crate::engine::OrchestrationEvent::Started { .. }
+        | crate::engine::OrchestrationEvent::Terminal(_) => None,
+        crate::engine::OrchestrationEvent::Completed { ticket, worker, .. } => {
             Some(format!("{ticket} completed on {worker}"))
         }
-        wsg_core::OrchestrationEvent::Retrying {
+        crate::engine::OrchestrationEvent::Retrying {
             ticket, attempt, ..
         } => Some(format!("retrying {ticket} (attempt {attempt})")),
-        wsg_core::OrchestrationEvent::Dispatched { ticket, worker } => {
+        crate::engine::OrchestrationEvent::Dispatched { ticket, worker } => {
             Some(format!("{ticket} dispatched to {worker}"))
         }
-        wsg_core::OrchestrationEvent::WaitingForCapacity { ticket } => {
+        crate::engine::OrchestrationEvent::WaitingForCapacity { ticket } => {
             Some(format!("waiting for Worker capacity: {ticket}"))
         }
-        wsg_core::OrchestrationEvent::LaunchFailed { ticket, detail, .. } => {
+        crate::engine::OrchestrationEvent::LaunchFailed { ticket, detail, .. } => {
             Some(format!("launch failed {ticket}: {detail}"))
         }
-        wsg_core::OrchestrationEvent::BranchRevalidated {
+        crate::engine::OrchestrationEvent::BranchRevalidated {
             ticket, current, ..
         } => Some(format!("repaired {ticket} -> {current}")),
-        wsg_core::OrchestrationEvent::Failed { ticket, detail, .. } => Some(format!(
+        crate::engine::OrchestrationEvent::Failed { ticket, detail, .. } => Some(format!(
             "{ticket} failed: {}",
             detail.as_deref().unwrap_or("unknown error")
         )),
@@ -102,7 +102,7 @@ pub struct RealWorkspaceDispatch {
 }
 
 fn configured_ticket_query(
-    repository: &wsg_core::Repository,
+    repository: &crate::engine::Repository,
     runtime: AgentRuntime,
 ) -> AgentRuntimeQuery {
     let query = AgentRuntimeQuery::new(runtime, repository.root());
@@ -136,8 +136,8 @@ impl RealWorkspaceDispatch {
         self
     }
 
-    fn repository(&self) -> Result<wsg_core::Repository, String> {
-        wsg_core::Repository::open(&self.repository_root)
+    fn repository(&self) -> Result<crate::engine::Repository, String> {
+        crate::engine::Repository::open(&self.repository_root)
             .map(|repository| repository.with_colocate(self.colocate))
             .map_err(|error| error.to_string())
     }
@@ -154,7 +154,7 @@ impl RealWorkspaceDispatch {
             .pool()
             .and_then(|pool| pool.profile())
             .cloned()
-            .unwrap_or_else(|| wsg_core::AgentRuntimeProfile::new(AgentRuntime::Claude));
+            .unwrap_or_else(|| crate::engine::AgentRuntimeProfile::new(AgentRuntime::Claude));
         let runtime = profile.runtime();
         let requests = tickets
             .iter()
@@ -236,7 +236,7 @@ impl RealWorkspaceDispatch {
             .map(|worker| WorkerId::parse(worker.to_owned()))
             .transpose()
             .map_err(|error| error.to_string())?;
-        let actions = wsg_core::WorkerActions::new(repository);
+        let actions = crate::engine::WorkerActions::new(repository);
         let outcome = match action {
             WorkerActionKind::Send => {
                 let prompt = prompt.ok_or_else(|| "Send prompt cannot be missing".to_owned())?;
@@ -258,7 +258,7 @@ impl RealWorkspaceDispatch {
         let resolved_worker = outcome.worker().to_string();
         let runtime = outcome.runtime();
         let session = outcome.session().clone();
-        let wsg_core::FollowUpExecution::Background(run) = outcome.into_execution() else {
+        let crate::engine::FollowUpExecution::Background(run) = outcome.into_execution() else {
             return Err("foreground Worker actions are not supported by jjfx".to_owned());
         };
         let pid = run.pid();
@@ -346,13 +346,14 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         let id = TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?;
         let pool = repository.worker_pool().snapshot();
         let profile = pool.pool().and_then(|pool| pool.profile()).cloned();
-        let runtime = profile
-            .as_ref()
-            .map_or(AgentRuntime::Claude, wsg_core::AgentRuntimeProfile::runtime);
-        let mut request = wsg_core::OrchestrationRequest::new(id.clone(), runtime);
+        let runtime = profile.as_ref().map_or(
+            AgentRuntime::Claude,
+            crate::engine::AgentRuntimeProfile::runtime,
+        );
+        let mut request = crate::engine::OrchestrationRequest::new(id.clone(), runtime);
         if let Some(model) = profile
             .as_ref()
-            .and_then(wsg_core::AgentRuntimeProfile::model)
+            .and_then(crate::engine::AgentRuntimeProfile::model)
         {
             request = request.with_model(model.clone());
         }
@@ -360,7 +361,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .map_err(|error| error.to_string())?
             .ticket()
             .clone();
-        let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
+        let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
         let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
         let runner = repository.orchestration_runner();
         let preparation = runner
@@ -371,8 +372,9 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             resumed: preparation.resumed(),
         });
         match preparation.into_start() {
-            wsg_core::OrchestrationStart::Direct(success) => {
-                let wsg_core::DirectDispatchExecution::Background { pid } = success.execution()
+            crate::engine::OrchestrationStart::Direct(success) => {
+                let crate::engine::DirectDispatchExecution::Background { pid } =
+                    success.execution()
                 else {
                     return Err("foreground Parent Dispatch is not supported by jjfx".to_owned());
                 };
@@ -383,14 +385,14 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
                 });
                 return Ok(());
             }
-            wsg_core::OrchestrationStart::Group => {}
+            crate::engine::OrchestrationStart::Group => {}
         }
 
         let mut projection_error = None;
-        let options = wsg_core::OrchestrationOptions::new();
+        let options = crate::engine::OrchestrationOptions::new();
         runner
             .run(&request, &options, |event| {
-                if matches!(event, wsg_core::OrchestrationEvent::Started { .. }) {
+                if matches!(event, crate::engine::OrchestrationEvent::Started { .. }) {
                     return;
                 }
                 let notice = orchestration_notice(&event);
@@ -407,7 +409,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
                     }
                     Err(error) => projection_error = Some(error),
                 }
-                if let wsg_core::OrchestrationEvent::Terminal(summary) = event {
+                if let crate::engine::OrchestrationEvent::Terminal(summary) = event {
                     emit(WorkspaceDispatchOrchestrationEvent::Terminal {
                         parent: summary.parent().to_string(),
                         counts: summary.counts(),
@@ -458,7 +460,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     fn reset(&self, worker: &str) -> Result<ResetAdapterResult, String> {
         let repository = self.repository()?;
         let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
-        let outcome = wsg_core::WorkerActions::new(repository)
+        let outcome = crate::engine::WorkerActions::new(repository)
             .reset(&worker_id)
             .map_err(|error| error.to_string())?;
         Ok(ResetAdapterResult::new(
@@ -470,7 +472,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     fn rebase(&self, worker: &str) -> Result<WorkerCommandResult, String> {
         let repository = self.repository()?;
         let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
-        let outcome = wsg_core::WorkerActions::new(repository)
+        let outcome = crate::engine::WorkerActions::new(repository)
             .rebase(&worker_id)
             .map_err(|error| error.to_string())?;
         Ok(WorkerCommandResult::Rebased {
@@ -482,7 +484,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     fn open_pull_request(&self, worker: &str) -> Result<WorkerCommandResult, String> {
         let repository = self.repository()?;
         let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
-        let outcome = wsg_core::WorkerActions::new(repository)
+        let outcome = crate::engine::WorkerActions::new(repository)
             .open_pull_request(&worker_id)
             .map_err(|error| error.to_string())?;
         Ok(WorkerCommandResult::PullRequestOpened {
@@ -511,14 +513,14 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     fn dismiss(&self, worker: &str) -> Result<WorkerCommandResult, String> {
         let repository = self.repository()?;
         let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
-        let outcome = wsg_core::WorkerActions::new(repository)
+        let outcome = crate::engine::WorkerActions::new(repository)
             .dismiss(&worker_id)
             .map_err(|error| error.to_string())?;
         let disposition = match outcome {
-            wsg_core::DismissOutcome::Removed { capacity } => {
+            crate::engine::DismissOutcome::Removed { capacity } => {
                 WorkerDismissDisposition::Removed { capacity }
             }
-            wsg_core::DismissOutcome::Reset => WorkerDismissDisposition::Reset,
+            crate::engine::DismissOutcome::Reset => WorkerDismissDisposition::Reset,
         };
         Ok(WorkerCommandResult::Dismissed {
             worker: worker.to_owned(),
@@ -534,7 +536,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .worker(worker)
             .ok_or_else(|| format!("Worker {worker} was not found"))?;
         let runtime = state.agent_runtime().unwrap_or(AgentRuntime::Claude);
-        let logs = wsg_core::WorkerActions::new(repository)
+        let logs = crate::engine::WorkerActions::new(repository)
             .logs(&worker_id)
             .map_err(|error| error.to_string())?;
         let log = logs.open();

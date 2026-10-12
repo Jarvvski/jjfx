@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use wsg_core::{
+use crate::engine::{
     AgentRuntime, AgentRuntimeQuery, AgentSessionResolution, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchFailurePhase, DirectDispatchOutcome,
     DirectDispatchRequest, DispatchGroupProgress, DispatchGroupStatusCounts,
@@ -145,11 +145,11 @@ impl WorkerSessionOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerResetOutcome {
     worker: String,
-    run: wsg_core::RunReset,
+    run: crate::engine::RunReset,
 }
 
 impl WorkerResetOutcome {
-    pub(crate) fn new(worker: impl Into<String>, run: wsg_core::RunReset) -> Self {
+    pub(crate) fn new(worker: impl Into<String>, run: crate::engine::RunReset) -> Self {
         Self {
             worker: worker.into(),
             run,
@@ -162,7 +162,7 @@ impl WorkerResetOutcome {
     }
 
     /// Returns how Run cleanup changed the Worker lifecycle.
-    pub const fn run(&self) -> wsg_core::RunReset {
+    pub const fn run(&self) -> crate::engine::RunReset {
         self.run
     }
 }
@@ -181,18 +181,18 @@ pub enum WorkspaceRestorationResult {
 /// Reset result plus the independent Workspace restoration handle.
 pub struct ResetAdapterResult {
     outcome: WorkerResetOutcome,
-    restoration: wsg_core::WorkspaceRestoration,
+    restoration: crate::engine::WorkspaceRestoration,
 }
 
 impl ResetAdapterResult {
-    fn new(outcome: WorkerResetOutcome, restoration: wsg_core::WorkspaceRestoration) -> Self {
+    fn new(outcome: WorkerResetOutcome, restoration: crate::engine::WorkspaceRestoration) -> Self {
         Self {
             outcome,
             restoration,
         }
     }
 
-    fn into_parts(self) -> (WorkerResetOutcome, wsg_core::WorkspaceRestoration) {
+    fn into_parts(self) -> (WorkerResetOutcome, crate::engine::WorkspaceRestoration) {
         (self.outcome, self.restoration)
     }
 }
@@ -943,10 +943,10 @@ impl WorkspaceDispatchController {
                     let restoration_emit = Arc::clone(&emit);
                     std::thread::spawn(move || {
                         let result = match restoration {
-                            wsg_core::WorkspaceRestoration::SkippedMissingWorkspace => {
+                            crate::engine::WorkspaceRestoration::SkippedMissingWorkspace => {
                                 WorkspaceRestorationResult::Skipped
                             }
-                            wsg_core::WorkspaceRestoration::Pending(handle) => {
+                            crate::engine::WorkspaceRestoration::Pending(handle) => {
                                 match handle.wait() {
                                     Ok(()) => WorkspaceRestorationResult::Restored,
                                     Err(error) => {
@@ -1222,14 +1222,14 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
                 parent: parent.to_owned(),
             },
         );
-        let mut state = wsg_core::DispatchGroupState::new(
-            wsg_core::TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?,
-            wsg_core::WireTimestamp::new("2026-08-10T10:00:00Z"),
+        let mut state = crate::engine::DispatchGroupState::new(
+            crate::engine::TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?,
+            crate::engine::WireTimestamp::new("2026-08-10T10:00:00Z"),
             "Jarvvski/jjfx",
-            wsg_core::DispatchGroupOptions::new(""),
+            crate::engine::DispatchGroupOptions::new(""),
         );
         state.sub_issues = std::collections::BTreeMap::new();
-        let progress = wsg_core::DispatchGroup::from_state(state)
+        let progress = crate::engine::DispatchGroup::from_state(state)
             .map_err(|error| error.to_string())?
             .progress()
             .map_err(|error| error.to_string())?;
@@ -1261,7 +1261,7 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             WorkerActionKind::Send,
             AgentRuntime::Claude,
             AgentSessionResolution::Fresh {
-                reason: wsg_core::FreshSessionReason::NoPriorLog,
+                reason: crate::engine::FreshSessionReason::NoPriorLog,
             },
             42,
         ))
@@ -1293,8 +1293,8 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             },
         );
         Ok(ResetAdapterResult::new(
-            WorkerResetOutcome::new(worker, wsg_core::RunReset::AlreadyIdle),
-            wsg_core::WorkspaceRestoration::SkippedMissingWorkspace,
+            WorkerResetOutcome::new(worker, crate::engine::RunReset::AlreadyIdle),
+            crate::engine::WorkspaceRestoration::SkippedMissingWorkspace,
         ))
     }
 
@@ -1388,12 +1388,12 @@ mod tests {
             .output()
             .expect("jj should be installed");
         assert!(output.status.success());
-        wsg_core::Repository::open(directory.path())
+        crate::engine::Repository::open(directory.path())
             .expect("repository should open")
             .read_worker_pool_snapshot()
     }
 
-    fn pi_repository() -> (TempDir, wsg_core::Repository) {
+    fn pi_repository() -> (TempDir, crate::engine::Repository) {
         let directory = TempDir::new().expect("temporary repository");
         let output = Command::new("jj")
             .args([
@@ -1407,25 +1407,26 @@ mod tests {
             .output()
             .expect("jj should be installed");
         assert!(output.status.success());
-        let repository = wsg_core::Repository::open(directory.path()).expect("repository opens");
+        let repository =
+            crate::engine::Repository::open(directory.path()).expect("repository opens");
         repository
             .worker_pool()
             .resize_to(PoolCapacity::new(1).expect("Pool capacity"))
             .expect("Worker Pool grows");
         let state_repository = repository.state_store().pool();
         let loaded = match state_repository.load().expect("Pool state") {
-            wsg_core::Loaded::Present(versioned) => versioned,
-            wsg_core::Loaded::Missing => panic!("Pool state should exist"),
+            crate::engine::Loaded::Present(versioned) => versioned,
+            crate::engine::Loaded::Missing => panic!("Pool state should exist"),
         };
         let (mut state, revision) = loaded.into_parts();
-        state.agent = Some(wsg_core::WireAgent::new(AgentRuntime::Pi.as_str()));
+        state.agent = Some(crate::engine::WireAgent::new(AgentRuntime::Pi.as_str()));
         let outcome = state_repository
             .commit(
-                wsg_core::Expected::Match(revision),
-                wsg_core::StateChange::Replace(state),
+                crate::engine::Expected::Match(revision),
+                crate::engine::StateChange::Replace(state),
             )
             .expect("configured Pool runtime");
-        assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+        assert!(matches!(outcome, crate::engine::CommitOutcome::Applied(_)));
         (directory, repository)
     }
 
@@ -1663,7 +1664,7 @@ mod tests {
                     && matches!(
                         outcome.session(),
                         AgentSessionResolution::Fresh {
-                            reason: wsg_core::FreshSessionReason::NoPriorLog
+                            reason: crate::engine::FreshSessionReason::NoPriorLog
                         }
                     )
         ));
@@ -1814,7 +1815,7 @@ mod tests {
             events_rx.recv().expect("reset event"),
             WorkspaceDispatchEvent::WorkerResetCompleted { operation: 42, outcome }
                 if outcome.worker() == "worker-01"
-                    && outcome.run() == wsg_core::RunReset::AlreadyIdle
+                    && outcome.run() == crate::engine::RunReset::AlreadyIdle
         ));
         assert!(matches!(
             events_rx.recv().expect("refresh event"),
@@ -1836,7 +1837,7 @@ mod tests {
 
     #[test]
     fn worker_log_watch_deduplicates_activity_and_stops_on_request() {
-        let activity = RunActivity::new(wsg_core::RunActivityKind::Message {
+        let activity = RunActivity::new(crate::engine::RunActivityKind::Message {
             text: "hello from Claude".to_owned(),
         });
         let adapter = RecordingAdapter::new(empty_snapshot()).with_log_snapshot(
@@ -1857,7 +1858,7 @@ mod tests {
                 if snapshot.worker() == "worker-01"
                     && snapshot.activity().is_some_and(|activity| matches!(
                         activity.kind(),
-                        wsg_core::RunActivityKind::Message { text } if text == "hello from Claude"
+                        crate::engine::RunActivityKind::Message { text } if text == "hello from Claude"
                     ))
         ));
         assert!(

@@ -5,7 +5,7 @@ use std::thread;
 
 use thiserror::Error;
 
-use crate::{
+use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError,
     AgentRuntimeProfile, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
     DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
@@ -90,7 +90,10 @@ impl DirectDispatchRequest {
     /// Creates a request from a stable Ticket ID when only the compatibility
     /// command input is available. The provider can still supply richer Ticket
     /// metadata in the Agent Runtime prompt.
-    pub fn for_ticket_id(id: TicketId, mode: RunMode) -> Result<Self, crate::TicketValueError> {
+    pub fn for_ticket_id(
+        id: TicketId,
+        mode: RunMode,
+    ) -> Result<Self, crate::engine::TicketValueError> {
         let title = TicketTitle::parse(id.as_str())?;
         let status = TicketStatus::parse("Todo")?;
         Ok(Self::new(Ticket::new(id, title, status), mode))

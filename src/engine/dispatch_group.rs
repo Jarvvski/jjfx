@@ -9,7 +9,7 @@ use std::fmt;
 
 use thiserror::Error;
 
-use crate::{
+use crate::engine::{
     AgentRuntime, DependencyGraph, DispatchDependencyContext, DispatchGroupOptions,
     DispatchGroupState, SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
 };
@@ -459,7 +459,7 @@ impl DispatchGroup {
     }
 
     /// Returns pending Tickets whose direct blockers all satisfy their dependencies.
-    pub fn ready(&self) -> Vec<crate::TicketId> {
+    pub fn ready(&self) -> Vec<crate::engine::TicketId> {
         self.state
             .sub_issues
             .iter()
@@ -479,7 +479,7 @@ impl DispatchGroup {
     /// Builds stacked-branch context for a Ticket from its direct blockers.
     pub fn dependency_context(
         &self,
-        ticket: &crate::TicketId,
+        ticket: &crate::engine::TicketId,
     ) -> Result<Option<DispatchDependencyContext>, DispatchGroupError> {
         let issue = self
             .state

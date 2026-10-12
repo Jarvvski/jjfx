@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
-use wsg_core::{
+use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, AgentRuntimeQuery, CapacityShortage,
     CleanDecision, DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome,
     DirectDispatchRequest, DispatchBudget, FollowUpExecution, OrchestrationEvent,
@@ -1128,7 +1128,7 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
 fn dispatch_with_capacity_prompt(
     repository: &Repository,
     requests: &[DirectDispatchRequest],
-) -> Result<wsg_core::DirectDispatchResult> {
+) -> Result<crate::engine::DirectDispatchResult> {
     let dispatcher = repository.direct_dispatch();
     match dispatcher.dispatch(requests) {
         Ok(result) => Ok(result),
@@ -1162,7 +1162,11 @@ fn confirm_growth(shortage: CapacityShortage) -> bool {
     !input.trim().eq_ignore_ascii_case("n") && !input.trim().eq_ignore_ascii_case("no")
 }
 
-fn render_dispatch_result(result: &wsg_core::DirectDispatchResult, requested: usize, all: bool) {
+fn render_dispatch_result(
+    result: &crate::engine::DirectDispatchResult,
+    requested: usize,
+    all: bool,
+) {
     for outcome in result.outcomes() {
         match outcome {
             DirectDispatchOutcome::Succeeded(success) => match success.execution() {
@@ -1227,12 +1231,12 @@ fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result
     Ok(())
 }
 
-fn render_session(session: &wsg_core::AgentSessionResolution) {
+fn render_session(session: &crate::engine::AgentSessionResolution) {
     match session {
-        wsg_core::AgentSessionResolution::Resumed { session_id } => {
+        crate::engine::AgentSessionResolution::Resumed { session_id } => {
             eprintln!("Resumed session {session_id}");
         }
-        wsg_core::AgentSessionResolution::Fresh { reason } => {
+        crate::engine::AgentSessionResolution::Fresh { reason } => {
             eprintln!("Starting fresh session ({reason})");
         }
     }
@@ -1373,13 +1377,14 @@ fn orchestrate_command(
     model: Option<&str>,
 ) -> Result<()> {
     let id = TicketId::parse(parent.to_owned())?;
-    let request = wsg_core::OrchestrationRequest::new(id.clone(), configured_runtime(repository));
+    let request =
+        crate::engine::OrchestrationRequest::new(id.clone(), configured_runtime(repository));
     let request = selected_model(provider, model)?
         .map_or(request.clone(), |selection| request.with_model(selection));
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();
-    let parent_ticket = wsg_core::ParentTicket::new(ticket.id().clone());
+    let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
     let discovery =
         TicketDiscovery::new(configured_ticket_query(repository, request.agent_runtime()));
     let runner = repository.orchestration_runner();
@@ -1388,7 +1393,7 @@ fn orchestrate_command(
         parent: id.clone(),
         resumed: preparation.resumed(),
     });
-    if let wsg_core::OrchestrationStart::Direct(success) = preparation.into_start() {
+    if let crate::engine::OrchestrationStart::Direct(success) = preparation.into_start() {
         if let DirectDispatchExecution::Background { pid } = success.execution() {
             eprintln!(
                 "  {} (PID {}) -> {}",
@@ -1399,7 +1404,7 @@ fn orchestrate_command(
         }
         return Ok(());
     }
-    let options = wsg_core::OrchestrationOptions::new();
+    let options = crate::engine::OrchestrationOptions::new();
     let summary = runner.run(&request, &options, |event| {
         render_orchestration_event(&event);
     })?;

@@ -7,11 +7,13 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::engine::{
+    DispatchGroup, Expected, Loaded, Repository, StateChange, TicketId, WireStatus,
+};
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{Pid, Signal, kill_process_group, test_kill_process};
 use serde_json::Value;
 use tempfile::TempDir;
-use wsg_core::{DispatchGroup, Expected, Loaded, Repository, StateChange, TicketId, WireStatus};
 
 const LOCK_HOLDER_MODE: &str = "WSG_CONFORMANCE_LOCK_HOLDER_MODE";
 const LOCK_HOLDER_PATH: &str = "WSG_CONFORMANCE_LOCK_HOLDER_PATH";
@@ -266,7 +268,7 @@ pub(crate) fn first_worker(root: &Path) -> String {
 
 pub(crate) fn mark_worker_done(root: &Path, worker: &str, ticket: &str) {
     let repository = Repository::open(root).expect("repository should open");
-    let worker = wsg_core::WorkerId::parse(worker).expect("Worker ID should be valid");
+    let worker = jjfx::engine::WorkerId::parse(worker).expect("Worker ID should be valid");
     let state = repository.state_store().worker(worker);
     let Loaded::Present(versioned) = state.load().expect("Worker should load") else {
         panic!("Worker should exist");
@@ -276,7 +278,7 @@ pub(crate) fn mark_worker_done(root: &Path, worker: &str, ticket: &str) {
     worker_state.ticket = Some(ticket.to_owned());
     worker_state.pid = None;
     worker_state.exit_code = Some(0);
-    worker_state.completed_at = Some(wsg_core::WireTimestamp::new("2026-08-13T00:00:00Z"));
+    worker_state.completed_at = Some(jjfx::engine::WireTimestamp::new("2026-08-13T00:00:00Z"));
     state
         .commit(
             Expected::Match(revision),
@@ -287,7 +289,7 @@ pub(crate) fn mark_worker_done(root: &Path, worker: &str, ticket: &str) {
 
 pub(crate) fn recorded_worker_pid(root: &Path, worker: &str) -> u32 {
     let repository = Repository::open(root).expect("repository should open");
-    let worker = wsg_core::WorkerId::parse(worker).expect("Worker ID should be valid");
+    let worker = jjfx::engine::WorkerId::parse(worker).expect("Worker ID should be valid");
     let Loaded::Present(state) = repository
         .state_store()
         .worker(worker)

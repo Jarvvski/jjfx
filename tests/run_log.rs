@@ -3,13 +3,13 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::time::Duration;
 
-use tempfile::tempdir;
-use wsg_core::{
+use jjfx::engine::{
     AgentRuntime, AgentSessionResolution, CollaborationEvent, CollaborationParticipant,
     FreshSessionReason, RunActivity, RunActivityKind, RunActivityStatus, RunConclusion, RunCost,
     RunLog, RunLogError, RunLogEvent, RunLogParseError, RunLogParser, RunResult, RunUsage,
     resolve_agent_session, resolve_agent_session_for_runtime,
 };
+use tempfile::tempdir;
 
 #[test]
 fn claude_session_identity_resumes_the_prior_agent_session() {

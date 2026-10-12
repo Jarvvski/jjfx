@@ -1,12 +1,12 @@
 use std::fs;
 use std::path::Path;
 
-use serde_json::Value;
-use tempfile::TempDir;
-use wsg_core::{
+use jjfx::engine::{
     CommitOutcome, DispatchGroupState, Expected, Loaded, PoolState, Repository, StateChange,
     TicketId, WorkerId, WorkerState,
 };
+use serde_json::Value;
+use tempfile::TempDir;
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
 fn fixture(name: &str) -> Vec<u8> {
@@ -185,7 +185,7 @@ fn public_state_models_accept_forward_compatible_wire_values() {
 fn go_omitempty_and_branch_null_semantics_are_preserved() {
     let (temp, repository) = repository();
     let mut pool: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("Go pool");
-    pool.agent = Some(wsg_core::WireAgent::new(""));
+    pool.agent = Some(jjfx::engine::WireAgent::new(""));
     repository
         .state_store()
         .pool()
@@ -197,7 +197,7 @@ fn go_omitempty_and_branch_null_semantics_are_preserved() {
     assert!(pool_json.get("agent").is_none());
 
     let worker_id = WorkerId::parse("worker-01").expect("Worker ID");
-    let mut worker = WorkerState::new(wsg_core::WireStatus::new("idle"));
+    let mut worker = WorkerState::new(jjfx::engine::WireStatus::new("idle"));
     worker.branch_name = Some(String::new());
     repository
         .state_store()

@@ -4,10 +4,10 @@
 
 use crate::agent::Agent;
 use crate::attention::Attention;
+use crate::engine::WorkerSnapshot;
 use crate::forge;
 use crate::store::Workspace;
 use crate::work::WorkState;
-use wsg_core::WorkerSnapshot;
 
 /// What transient row-level state rides alongside the two lifecycle axes while a
 /// row is drawn: a deletion tombstone, a background lift, or a live forge.

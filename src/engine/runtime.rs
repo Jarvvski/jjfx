@@ -15,8 +15,8 @@ use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::pool::RunClearing;
-use crate::{
+use crate::engine::pool::RunClearing;
+use crate::engine::{
     Repository, Reservation, RunResult, RunResultSource, StateError, StateRevision, WireAgent,
     WorkerId, WorkerPoolError, WorkerState,
 };
@@ -471,14 +471,14 @@ impl RunSupervisor {
         let mut persisted_revision = None;
         let outcome = match self.run_foreground_started(&request, |pid| {
             let revision = match reservation.persist_pid(pid) {
-                Ok(crate::pool::PidPersistence::Persisted(revision)) => revision,
-                Ok(crate::pool::PidPersistence::Missing) => {
+                Ok(crate::engine::pool::PidPersistence::Persisted(revision)) => revision,
+                Ok(crate::engine::pool::PidPersistence::Missing) => {
                     return Err(RunSupervisorError::PersistPidMissing {
                         worker: worker.clone(),
                         pid,
                     });
                 }
-                Ok(crate::pool::PidPersistence::Conflict) => {
+                Ok(crate::engine::pool::PidPersistence::Conflict) => {
                     return Err(RunSupervisorError::PersistPidConflict {
                         worker: worker.clone(),
                     });
@@ -518,11 +518,11 @@ impl RunSupervisor {
         };
         let pid = background.pid();
         match reservation.persist_pid(pid) {
-            Ok(crate::pool::PidPersistence::Persisted(revision)) => {
+            Ok(crate::engine::pool::PidPersistence::Persisted(revision)) => {
                 background.completion = Some(RunCompletion::new(reservation, revision));
                 Ok(background)
             }
-            Ok(crate::pool::PidPersistence::Missing) => persist_pid_failure(
+            Ok(crate::engine::pool::PidPersistence::Missing) => persist_pid_failure(
                 &reservation,
                 background,
                 RunSupervisorError::PersistPidMissing {
@@ -530,7 +530,7 @@ impl RunSupervisor {
                     pid,
                 },
             ),
-            Ok(crate::pool::PidPersistence::Conflict) => persist_pid_failure(
+            Ok(crate::engine::pool::PidPersistence::Conflict) => persist_pid_failure(
                 &reservation,
                 background,
                 RunSupervisorError::PersistPidConflict { worker: worker_id },
@@ -743,7 +743,7 @@ fn result_for_completion(
     runtime: AgentRuntime,
     exit_code: Option<i32>,
 ) -> (RunResult, RunResultSource) {
-    let result = crate::run_log::result_for_finalization(log_path, runtime);
+    let result = crate::engine::run_log::result_for_finalization(log_path, runtime);
     if runtime == AgentRuntime::OpenCode
         && exit_code == Some(0)
         && matches!(result.1, RunResultSource::Fallback { .. })
@@ -861,7 +861,7 @@ pub enum RunSupervisorError {
     #[error("cannot finalize Run for Worker {worker}: {source}")]
     Finalize {
         /// The Worker whose Run completed.
-        worker: crate::WorkerId,
+        worker: crate::engine::WorkerId,
         /// The Worker state repository failure.
         #[source]
         source: WorkerPoolError,
@@ -870,7 +870,7 @@ pub enum RunSupervisorError {
     #[error("cannot persist PID for Worker {worker}: {source}")]
     PersistPid {
         /// The Worker whose Run was launched.
-        worker: crate::WorkerId,
+        worker: crate::engine::WorkerId,
         /// The process identifier that could not be recorded.
         pid: u32,
         /// The state repository failure.
@@ -881,7 +881,7 @@ pub enum RunSupervisorError {
     #[error("cannot persist PID for Worker {worker}: Worker state is missing")]
     PersistPidMissing {
         /// The Worker whose Run was launched.
-        worker: crate::WorkerId,
+        worker: crate::engine::WorkerId,
         /// The process identifier that could not be recorded.
         pid: u32,
     },
@@ -889,13 +889,13 @@ pub enum RunSupervisorError {
     #[error("cannot persist PID for Worker {worker}: Worker state changed after reservation")]
     PersistPidConflict {
         /// The Worker whose Run was launched.
-        worker: crate::WorkerId,
+        worker: crate::engine::WorkerId,
     },
     /// The untracked process group could not be cleaned up after persistence failed.
     #[error("cannot clean up untracked Run for Worker {worker}: {source}")]
     PersistPidCleanup {
         /// The Worker whose Run was launched.
-        worker: crate::WorkerId,
+        worker: crate::engine::WorkerId,
         /// The original persistence failure.
         primary: Box<RunSupervisorError>,
         /// The process cleanup failure.
@@ -926,7 +926,7 @@ pub enum RunSupervisorError {
     #[error("{primary}; cannot release Reservation for Worker {worker}: {detail}")]
     ReservationRelease {
         /// The Worker whose Reservation was leaked.
-        worker: crate::WorkerId,
+        worker: crate::engine::WorkerId,
         /// The spawned process identifier, if launch reached that stage.
         pid: Option<u32>,
         /// The original launch or persistence failure.
@@ -975,7 +975,7 @@ fn reserved_request(reservation: &Reservation, invocation: AgentRuntimeInvocatio
     RunRequest::new(
         reservation.agent_runtime(),
         invocation.with_session_directory(repository.root().join(".jj/pool").join("pi-sessions")),
-        crate::workspace::worker_path(repository.root(), &worker_id),
+        crate::engine::workspace::worker_path(repository.root(), &worker_id),
         repository
             .root()
             .join(".jj/pool")

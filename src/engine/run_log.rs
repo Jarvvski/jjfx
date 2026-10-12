@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde_json::{Number, Value};
 use thiserror::Error;
 
-use crate::runtime::AgentRuntime;
+use crate::engine::runtime::AgentRuntime;
 
 const ACTIVITY_TAIL_BYTES: u64 = 65_536;
 

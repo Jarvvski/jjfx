@@ -9,9 +9,7 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use serde_json::Value;
-use tempfile::TempDir;
-use wsg_core::{
+use jjfx::engine::{
     AgentModel, AgentRuntimePreflightErrorKind, CommitOutcome, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchFailure, DirectDispatchFailurePhase,
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess,
@@ -19,6 +17,8 @@ use wsg_core::{
     RunSupervisor, StateChange, Ticket, TicketId, TicketStatus, TicketTitle, WireAgent, WorkerId,
     WorkerPoolError, WorkerStatus,
 };
+use serde_json::Value;
+use tempfile::TempDir;
 
 const HELPER_REPOSITORY: &str = "WSG_DIRECT_DISPATCH_REPOSITORY";
 const HELPER_RESULT: &str = "WSG_DIRECT_DISPATCH_RESULT";

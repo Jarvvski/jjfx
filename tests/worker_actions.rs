@@ -6,15 +6,15 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::process::{
-    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
-};
-use tempfile::TempDir;
-use wsg_core::{
+use jjfx::engine::{
     AgentModel, AgentRuntime, AgentSessionResolution, DismissOutcome, Expected, FollowUpExecution,
     Loaded, PaneLayout, PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent,
     WireStatus, WireTimestamp, WorkerActions, WorkerId, WorkspaceRestoration,
 };
+use rustix::process::{
+    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
+};
+use tempfile::TempDir;
 
 const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
 const HELPER_WORKER: &str = "WSG_ACTION_WORKER";
@@ -147,7 +147,7 @@ fn dismiss_clears_terminal_worker_without_restoring_or_removing_workspace() {
     let worker_state = snapshot
         .worker(worker.as_str())
         .expect("Worker remains in Pool");
-    assert_eq!(worker_state.status(), wsg_core::WorkerStatus::Idle);
+    assert_eq!(worker_state.status(), jjfx::engine::WorkerStatus::Idle);
 }
 
 #[test]
@@ -171,7 +171,7 @@ fn dismiss_rejects_a_busy_worker_without_changing_its_lifecycle() {
             .worker(worker.as_str())
             .expect("Worker remains")
             .status(),
-        wsg_core::WorkerStatus::Busy
+        jjfx::engine::WorkerStatus::Busy
     );
 }
 
@@ -947,7 +947,7 @@ fn reset_terminates_a_background_pi_follow_up_and_its_descendant() {
     assert!(test_kill_process_group(unix_pid(leader)).is_err());
     let snapshot = repository.worker_pool().snapshot();
     let state = snapshot.worker(worker.as_str()).expect("reset Worker");
-    assert_eq!(state.status(), wsg_core::WorkerStatus::Idle);
+    assert_eq!(state.status(), jjfx::engine::WorkerStatus::Idle);
     assert_eq!(state.pid(), None);
     assert_eq!(state.agent_runtime(), None);
     assert!(
@@ -1369,7 +1369,7 @@ printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"d
         .worker(worker.as_str())
         .expect("unchanged Worker")
         .clone();
-    assert_eq!(worker.status(), wsg_core::WorkerStatus::Done);
+    assert_eq!(worker.status(), jjfx::engine::WorkerStatus::Done);
     assert_eq!(
         worker.log_file(),
         Some(prior_log.to_string_lossy().as_ref())
@@ -1394,8 +1394,8 @@ fn failed_pi_send_validation_does_not_mutate_the_prior_terminal_worker() {
         .load()
         .expect("load Pi Worker before Send")
     {
-        wsg_core::Loaded::Present(worker) => worker.revision().clone(),
-        wsg_core::Loaded::Missing => panic!("Pi Worker missing before Send"),
+        jjfx::engine::Loaded::Present(worker) => worker.revision().clone(),
+        jjfx::engine::Loaded::Missing => panic!("Pi Worker missing before Send"),
     };
 
     let bin = temporary_directory.path().join("failed-pi-bin");
@@ -1431,12 +1431,12 @@ fn failed_pi_send_validation_does_not_mutate_the_prior_terminal_worker() {
         .load()
         .expect("load Pi Worker after rejected Send")
     {
-        wsg_core::Loaded::Present(worker) => worker,
-        wsg_core::Loaded::Missing => panic!("Pi Worker missing after rejected Send"),
+        jjfx::engine::Loaded::Present(worker) => worker,
+        jjfx::engine::Loaded::Missing => panic!("Pi Worker missing after rejected Send"),
     };
     assert_eq!(after.revision(), &before);
     assert_eq!(after.value.status.as_str(), "done");
-    assert_eq!(after.value.agent, Some(wsg_core::WireAgent::new("pi")));
+    assert_eq!(after.value.agent, Some(jjfx::engine::WireAgent::new("pi")));
     assert_eq!(
         after.value.log_file.as_deref(),
         Some(prior_log.to_string_lossy().as_ref())
@@ -1483,7 +1483,7 @@ fn failed_send_launch_restores_the_prior_terminal_worker() {
 
     let snapshot = repository.worker_pool().snapshot();
     let restored = snapshot.worker(worker.as_str()).expect("restored Worker");
-    assert_eq!(restored.status(), wsg_core::WorkerStatus::Done);
+    assert_eq!(restored.status(), jjfx::engine::WorkerStatus::Done);
     assert_eq!(restored.ticket(), Some("ENG-301"));
     assert_eq!(restored.branch_name(), Some("owner/eng-301-action"));
     assert_eq!(
@@ -1717,7 +1717,7 @@ fn set_pool_runtime(repository: &Repository, runtime: AgentRuntime) {
     let outcome = state_repository
         .commit(Expected::Match(revision), StateChange::Replace(state))
         .expect("configured Pool runtime");
-    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
 }
 
 fn set_terminal_worker(repository: &Repository, worker: &WorkerId, prior_log: &Path) {
@@ -1747,7 +1747,7 @@ fn set_terminal_worker_for_runtime(
     let outcome = state_repository
         .commit(Expected::Match(revision), StateChange::Replace(state))
         .expect("terminal Worker state");
-    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
 }
 
 struct BackgroundActionGuard {

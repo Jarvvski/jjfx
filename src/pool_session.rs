@@ -6,11 +6,11 @@
 //! [`PoolUpdate`]s that follow. The App keeps one field of this type, forwards
 //! events through `apply`, and reads the projection when rendering the Pool.
 
+use crate::engine::{DispatchGroupProgress, WorkerPoolSnapshot};
 use crate::workspace_dispatch::{
     DispatchCapacityShortage, DispatchResult, OperationId, ReadyTicketResult, WorkerCommandResult,
     WorkerLogSnapshot, WorkerSessionOutcome, WorkspaceDispatchEvent, WorkspaceRestorationResult,
 };
-use wsg_core::{DispatchGroupProgress, WorkerPoolSnapshot};
 
 /// The App-facing consequence of one accepted Dispatch event.
 #[derive(Debug)]
@@ -358,8 +358,8 @@ impl PoolSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::AgentRuntime;
     use crate::workspace_dispatch::{DispatchOutcome, ReadyTicket, WorkerActionKind};
-    use wsg_core::AgentRuntime;
 
     fn dispatch_result(partial: bool) -> DispatchResult {
         DispatchResult::new(
@@ -379,7 +379,7 @@ mod tests {
             "worker-01",
             AgentRuntime::Claude,
             None,
-            terminal.then(wsg_core::RunResult::succeeded),
+            terminal.then(crate::engine::RunResult::succeeded),
         )
     }
 
@@ -416,7 +416,7 @@ mod tests {
             operation: 8,
             outcome: crate::workspace_dispatch::WorkerResetOutcome::new(
                 "worker-01",
-                wsg_core::RunReset::AlreadyIdle,
+                crate::engine::RunReset::AlreadyIdle,
             ),
         });
         assert!(
@@ -593,8 +593,8 @@ mod tests {
                 "worker-01",
                 WorkerActionKind::Send,
                 AgentRuntime::Claude,
-                wsg_core::AgentSessionResolution::Fresh {
-                    reason: wsg_core::FreshSessionReason::MissingIdentity,
+                crate::engine::AgentSessionResolution::Fresh {
+                    reason: crate::engine::FreshSessionReason::MissingIdentity,
                 },
                 777,
             ),

@@ -3,7 +3,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Mutex;
 
-use wsg_core::{
+use jjfx::engine::{
     AgentRuntime, CommitOutcome, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupEvent,
     DispatchGroupOptions, DispatchGroupState, DispatchGroupTransition, Expected, Loaded,
     ParentTicket, Repository, StateChange, SubIssueState, SubIssueStatus, TicketDiscovery,
@@ -23,13 +23,13 @@ impl TicketQuery for StubQuery {
     }
 }
 
-fn graph(response: &str) -> wsg_core::DependencyGraph {
+fn graph(response: &str) -> jjfx::engine::DependencyGraph {
     let discovery =
         TicketDiscovery::new(StubQuery(Mutex::new(VecDeque::from([response.to_owned()]))));
     discovery
         .dependency_graph(
             &ParentTicket::new(TicketId::parse("ENG-100").expect("parent Ticket ID")),
-            &wsg_core::RepositoryIdentity::parse("owner/repo").expect("repository identity"),
+            &jjfx::engine::RepositoryIdentity::parse("owner/repo").expect("repository identity"),
         )
         .expect("dependency graph")
 }

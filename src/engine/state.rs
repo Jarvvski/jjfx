@@ -17,7 +17,7 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::{AgentRuntimeProfile, Repository};
+use crate::engine::{AgentRuntimeProfile, Repository};
 
 const POOL_PATH: &str = ".jj/pool.json";
 const POOL_DIRECTORY: &str = ".jj/pool";

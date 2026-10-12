@@ -8,11 +8,11 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
-use crate::pool_session::PoolSession;
-use crate::render::style::dim_line;
-use wsg_core::{
+use crate::engine::{
     AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
 };
+use crate::pool_session::PoolSession;
+use crate::render::style::dim_line;
 
 /// Which Pool interaction is focused - the subset of modes the view draws.
 pub(crate) enum PoolPane<'a> {
@@ -125,7 +125,7 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                     progress
                         .ready()
                         .iter()
-                        .map(wsg_core::TicketId::as_str)
+                        .map(crate::engine::TicketId::as_str)
                         .collect::<Vec<_>>()
                         .join(", ")
                 )));
@@ -139,7 +139,7 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                         issue
                             .blockers()
                             .iter()
-                            .map(wsg_core::TicketId::as_str)
+                            .map(crate::engine::TicketId::as_str)
                             .collect::<Vec<_>>()
                             .join(", ")
                     )
@@ -157,7 +157,7 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                     issue.title(),
                     issue
                         .worker()
-                        .map_or("unassigned", wsg_core::WorkerId::as_str),
+                        .map_or("unassigned", crate::engine::WorkerId::as_str),
                     retry,
                     blockers
                 )));

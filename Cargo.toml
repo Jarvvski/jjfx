@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/wsg-core", "crates/wsg"]
+members = ["crates/wsg"]
 resolver = "3"
 
 [package]
@@ -24,7 +24,13 @@ incremental = false
 [dependencies]
 anyhow = "1"
 jiff = "0.2"
-wsg-core = { path = "crates/wsg-core" }
+# Absorbed with wsg-core (the crate is gone; its engine lives in src/engine):
+# the state store and worker pool need OS file/process primitives and atomic
+# temp files, and every engine error type is a thiserror enum.
+getrandom = "0.4"
+rustix = { version = "1", features = ["fs", "process"] }
+tempfile = "3"
+thiserror = "2"
 ratatui = "0.29"
 ratatui-textarea = "0.8"
 notify = "8"
@@ -37,7 +43,9 @@ pollster = "0.4"
 # graph lays out exactly like jj's. Version matches the jj 0.46.0 workspace pin.
 sapling-renderdag = "0.1.0"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# arbitrary_precision preserves Go-compatible numeric fidelity when the engine
+# round-trips the persisted wire documents it reads and writes.
+serde_json = { version = "1", features = ["arbitrary_precision"] }
 # default-fancy swaps onig (a C dependency) for the pure-Rust fancy-regex engine,
 # keeping the build free of a C toolchain. syntect highlights diffs in-process,
 # replacing the original bat pipe (ADR 0007).
@@ -45,9 +53,6 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # jjfx's own config file (~/.config/jjfx/config.toml); parsed once at startup.
 toml = "0.8"
-
-[dev-dependencies]
-tempfile = "3"
 
 [lints.rust]
 unsafe_code = "forbid"

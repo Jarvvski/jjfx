@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 
-use wsg_core::{
+use jjfx::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
     AgentRuntimeInvocation, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
     DispatchPromptContext, RepositoryIdentity, Ticket, TicketId, TicketStatus, TicketTitle,

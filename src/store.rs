@@ -1,6 +1,6 @@
 //! The per-repo Workspace projection for the TUI (ADR 0006).
 //!
-//! The projection is read through [`wsg_core::Workspaces`], so the TUI sees the
+//! The projection is read through [`crate::engine::Workspaces`], so the TUI sees the
 //! same cache-backed Workspace model the CLI and Worker Pool operate on; the
 //! ws-cache is a lossy mirror and never the source of truth. This module keeps
 //! only the presentation facts: the default Workspace is always visible (ADR
@@ -9,13 +9,13 @@
 //!
 //! Existence of a Workspace is the union of the always-derivable `default`, the
 //! names jj reports, and the `name\tpath` entries in the ws-cache - a union
-//! [`wsg_core::Workspaces`] now owns.
+//! [`crate::engine::Workspaces`] now owns.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 
-use wsg_core::{AdHocWorkspacePhase, Repository, WorkspaceHookStream};
+use crate::engine::{AdHocWorkspacePhase, Repository, WorkspaceHookStream};
 
 #[cfg(test)]
 /// Create an isolated local jj repository with signing disabled for tests.
@@ -120,7 +120,7 @@ pub(crate) const DEFAULT_WORKSPACE: &str = "default";
 /// shared library, next to the creation that uses it, so the pending tombstone
 /// and the real creation can never disagree.
 fn new_workspace_path(repo_root: &Path, name: &str) -> PathBuf {
-    wsg_core::ad_hoc_workspace_path(repo_root, name)
+    crate::engine::ad_hoc_workspace_path(repo_root, name)
 }
 
 impl Store {
@@ -385,8 +385,8 @@ mod tests {
 
     #[test]
     fn store_projection_agrees_with_the_shared_workspace_projection() {
+        use crate::engine::WorkspaceAddOutcome;
         use std::collections::BTreeSet;
-        use wsg_core::WorkspaceAddOutcome;
 
         let repo = test_local_repo("store-agrees");
         let repository = Repository::open(&repo).unwrap();

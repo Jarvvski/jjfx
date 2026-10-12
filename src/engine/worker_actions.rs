@@ -9,9 +9,9 @@ use std::thread::{self, JoinHandle};
 use serde::Deserialize;
 use thiserror::Error;
 
-use crate::layout::{PaneLayout, PaneRole};
-use crate::runtime::pi_interactive_command;
-use crate::{
+use crate::engine::layout::{PaneLayout, PaneRole};
+use crate::engine::runtime::pi_interactive_command;
+use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
     CompletedRun, Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
@@ -75,13 +75,13 @@ impl FollowUpOutcome {
 /// The typed outcome of abandoning a Run and restoring its Workspace.
 #[derive(Debug)]
 pub struct ResetOutcome {
-    run: crate::RunReset,
+    run: crate::engine::RunReset,
     restoration: WorkspaceRestoration,
 }
 
 impl ResetOutcome {
     /// Returns how Run cleanup changed the Worker lifecycle.
-    pub const fn run(&self) -> crate::RunReset {
+    pub const fn run(&self) -> crate::engine::RunReset {
         self.run
     }
 
@@ -390,7 +390,7 @@ impl WorkerActions {
                 .ok_or_else(|| WorkerActionError::WorkerNotFound {
                     worker: worker.clone(),
                 })?;
-        let workspace = crate::workspace::worker_path(self.repository.root(), worker);
+        let workspace = crate::engine::workspace::worker_path(self.repository.root(), worker);
         if !workspace.is_dir() {
             return Err(WorkerActionError::MissingWorkspace {
                 worker: worker.clone(),
@@ -400,7 +400,7 @@ impl WorkerActions {
             .profile()
             .cloned()
             .or_else(|| snapshot.pool().and_then(|pool| pool.profile().cloned()))
-            .unwrap_or_else(|| crate::AgentRuntimeProfile::new(AgentRuntime::Claude))
+            .unwrap_or_else(|| crate::engine::AgentRuntimeProfile::new(AgentRuntime::Claude))
             .with_model_override(self.model.as_ref());
         let runtime = profile.runtime();
         let session = resolve_agent_session_for_runtime(runtime, state.log_file().map(Path::new));
@@ -429,14 +429,13 @@ impl WorkerActions {
 
     /// Abandons the current Run, releases capacity, and restores the Workspace.
     pub fn reset(&self, worker: &WorkerId) -> Result<ResetOutcome, WorkerActionError> {
-        let operation = crate::workspace::lock_worker_operation(&self.repository, worker).map_err(
-            |source| WorkerActionError::WorkspaceOperation {
-                worker: worker.clone(),
-                detail: source.to_string(),
-            },
-        )?;
+        let operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
+            .map_err(|source| WorkerActionError::WorkspaceOperation {
+            worker: worker.clone(),
+            detail: source.to_string(),
+        })?;
         let run = self.supervisor.reset_run(&self.repository, worker)?;
-        let workspace = crate::workspace::worker_path(self.repository.root(), worker);
+        let workspace = crate::engine::workspace::worker_path(self.repository.root(), worker);
         let restoration = if workspace.is_dir() {
             let handle_worker = worker.clone();
             let thread_worker = worker.clone();
@@ -546,7 +545,7 @@ impl WorkerActions {
             .ok_or_else(|| WorkerActionError::MissingBranch {
                 worker: worker.clone(),
             })?;
-        let workspace = crate::workspace::worker_path(self.repository.root(), worker);
+        let workspace = crate::engine::workspace::worker_path(self.repository.root(), worker);
         if !workspace.is_dir() {
             return Err(WorkerActionError::MissingWorkspace {
                 worker: worker.clone(),
@@ -573,7 +572,7 @@ impl WorkerActions {
             .profile()
             .cloned()
             .or_else(|| snapshot.pool().and_then(|pool| pool.profile().cloned()))
-            .unwrap_or_else(|| crate::AgentRuntimeProfile::new(AgentRuntime::Claude))
+            .unwrap_or_else(|| crate::engine::AgentRuntimeProfile::new(AgentRuntime::Claude))
             .with_model_override(self.model.as_ref());
         profile
             .runtime()
@@ -797,7 +796,7 @@ impl SystemCommands {
     fn restore_workspace(
         worker: &WorkerId,
         workspace: &Path,
-        _operation: crate::workspace::WorkspaceOperationGuard,
+        _operation: crate::engine::workspace::WorkspaceOperationGuard,
     ) -> Result<(), WorkspaceRestorationError> {
         Self::run_workspace_command(worker, workspace, "restore Workspace", &["restore"])?;
         Self::run_workspace_command(worker, workspace, "create fresh change", &["new", "main"])
@@ -1137,7 +1136,7 @@ pub enum WorkerActionError {
     Probe(#[from] AgentRuntimeProbeError),
     /// A compatibility state document could not be read.
     #[error(transparent)]
-    State(#[from] crate::StateError),
+    State(#[from] crate::engine::StateError),
     /// The Agent Runtime could not launch or finalize.
     #[error(transparent)]
     Run(#[from] RunSupervisorError),

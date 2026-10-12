@@ -8,12 +8,12 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rustix::fs::{FlockOperation, flock};
-use tempfile::TempDir;
-use wsg_core::{
+use jjfx::engine::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected, Loaded, PoolState,
     Repository, StateChange, TicketId, WireStatus, WireTimestamp, WorkerId, WorkerState,
 };
+use rustix::fs::{FlockOperation, flock};
+use tempfile::TempDir;
 
 const MODE: &str = "WSG_RUST_STATE_HELPER_MODE";
 const LOCK: &str = "WSG_RUST_STATE_HELPER_LOCK";
@@ -397,7 +397,7 @@ fn an_independent_rust_process_serializes_dispatch_group_commits() {
     );
 }
 
-fn rust_create(repository: &Repository, kind: &str) -> Result<(), wsg_core::StateError> {
+fn rust_create(repository: &Repository, kind: &str) -> Result<(), jjfx::engine::StateError> {
     match kind {
         "pool" => repository
             .state_store()

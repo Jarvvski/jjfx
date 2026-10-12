@@ -7,9 +7,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
+use crate::engine::PaneLayout;
 use anyhow::Context;
 use serde::Deserialize;
-use wsg_core::PaneLayout;
 
 /// The whole jjfx config tree.
 #[derive(Debug, Deserialize)]

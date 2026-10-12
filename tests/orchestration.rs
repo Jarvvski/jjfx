@@ -3,14 +3,14 @@ use std::process::Command;
 
 use rustix::fs::{FlockOperation, flock};
 
-use tempfile::TempDir;
-use wsg_core::{
+use jjfx::engine::{
     AgentModel, AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
     OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, ParentTicket, PoolState,
     Repository, RepositoryIdentity, StateChange, SubIssueState, TicketDiscovery, TicketId,
     TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus, WireTimestamp, WorkerId,
     WorkerState,
 };
+use tempfile::TempDir;
 
 const HELPER_REPOSITORY: &str = "WSG_ORCHESTRATION_REPOSITORY";
 const HELPER_RESULT: &str = "WSG_ORCHESTRATION_RESULT";
@@ -153,7 +153,7 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
         .orchestration_runner()
         .run(
             &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
-            &wsg_core::OrchestrationOptions::new()
+            &jjfx::engine::OrchestrationOptions::new()
                 .with_poll_interval(std::time::Duration::ZERO)
                 .with_max_cycles(1),
             |event| events.push(event),
@@ -179,8 +179,8 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     assert_eq!(summary.parent(), &parent);
     assert_eq!(summary.counts().done(), 1);
     let loaded = match store.load().expect("load repaired group") {
-        wsg_core::Loaded::Present(value) => value.value,
-        wsg_core::Loaded::Missing => panic!("group disappeared"),
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("group disappeared"),
     };
     assert_eq!(
         loaded.sub_issues[&TicketId::parse("ENG-101").expect("Ticket")]
@@ -216,7 +216,7 @@ fn competing_parent_runner_returns_already_running_without_waiting() {
         .expect_err("second runner must be rejected");
     assert!(matches!(
         error,
-        wsg_core::OrchestrationError::AlreadyRunning { parent: actual } if actual == parent
+        jjfx::engine::OrchestrationError::AlreadyRunning { parent: actual } if actual == parent
     ));
 }
 
@@ -243,15 +243,15 @@ fn discovery_releases_placeholder_before_persisting_a_real_group() {
             "owner/repo",
         )
         .expect("discover group");
-    assert!(matches!(result, wsg_core::OrchestrationStart::Group));
+    assert!(matches!(result, jjfx::engine::OrchestrationStart::Group));
     let loaded = match repository
         .state_store()
         .dispatch_group(parent_id.clone())
         .load()
         .expect("load group")
     {
-        wsg_core::Loaded::Present(value) => value.value,
-        wsg_core::Loaded::Missing => panic!("group missing"),
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("group missing"),
     };
     assert!(
         loaded
@@ -264,8 +264,8 @@ fn discovery_releases_placeholder_before_persisting_a_real_group() {
         .load()
         .expect("load Worker")
     {
-        wsg_core::Loaded::Present(value) => value.value,
-        wsg_core::Loaded::Missing => panic!("Worker missing"),
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("Worker missing"),
     };
     assert_eq!(worker_state.status.as_str(), "idle");
 }
@@ -291,15 +291,18 @@ fn failed_graph_discovery_releases_placeholder_and_surfaces_the_query_error() {
             "owner/repo",
         )
         .expect_err("malformed graph should fail");
-    assert!(matches!(error, wsg_core::OrchestrationError::Execution(_)));
+    assert!(matches!(
+        error,
+        jjfx::engine::OrchestrationError::Execution(_)
+    ));
     let worker_state = match repository
         .state_store()
         .worker(worker)
         .load()
         .expect("load Worker")
     {
-        wsg_core::Loaded::Present(value) => value.value,
-        wsg_core::Loaded::Missing => panic!("Worker missing"),
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("Worker missing"),
     };
     assert_eq!(worker_state.status.as_str(), "idle");
 }
@@ -325,15 +328,18 @@ fn empty_graph_uses_the_reserved_parent_fallback_and_releases_on_launch_failure(
             "owner/repo",
         )
         .expect_err("fallback launch needs a provisioned Worker workspace");
-    assert!(matches!(error, wsg_core::OrchestrationError::Execution(_)));
+    assert!(matches!(
+        error,
+        jjfx::engine::OrchestrationError::Execution(_)
+    ));
     let worker_state = match repository
         .state_store()
         .worker(worker)
         .load()
         .expect("load Worker")
     {
-        wsg_core::Loaded::Present(value) => value.value,
-        wsg_core::Loaded::Missing => panic!("Worker missing"),
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("Worker missing"),
     };
     assert_eq!(worker_state.status.as_str(), "idle");
 }
@@ -372,7 +378,7 @@ fn restart_does_not_duplicate_a_persisted_assignment_with_a_live_worker() {
         .pool()
         .commit(Expected::Missing, StateChange::Replace(pool.clone()))
         .expect("save pool");
-    let mut worker_state = wsg_core::WorkerState::new(WireStatus::new("busy"));
+    let mut worker_state = jjfx::engine::WorkerState::new(WireStatus::new("busy"));
     worker_state.ticket = Some(ticket.as_str().to_owned());
     worker_state.pid = Some(std::process::id() as i64);
     repository
@@ -398,8 +404,8 @@ fn restart_does_not_duplicate_a_persisted_assignment_with_a_live_worker() {
         .load()
         .expect("reload group")
     {
-        wsg_core::Loaded::Present(value) => value.value,
-        wsg_core::Loaded::Missing => panic!("group disappeared"),
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("group disappeared"),
     };
     assert_eq!(loaded.sub_issues[&ticket].status.as_str(), "dispatched");
 }
@@ -414,16 +420,16 @@ fn pi_orchestration_preflights_before_assignment_persistence() {
     let worker = WorkerId::parse("worker-01").expect("Worker");
     install_idle_worker(&repository, &worker);
     let pool = repository.state_store().pool();
-    let wsg_core::Loaded::Present(versioned) = pool.load().expect("load Pool") else {
+    let jjfx::engine::Loaded::Present(versioned) = pool.load().expect("load Pool") else {
         panic!("Pool missing")
     };
     let revision = versioned.revision().clone();
     let mut pool_state = versioned.value;
-    pool_state.agent = Some(wsg_core::WireAgent::new("pi"));
+    pool_state.agent = Some(jjfx::engine::WireAgent::new("pi"));
     pool.commit(Expected::Match(revision), StateChange::Replace(pool_state))
         .expect("configure Pi Pool");
     let mut group_options = DispatchGroupOptions::new("gpt-5.4");
-    group_options.agent = Some(wsg_core::WireAgent::new("pi"));
+    group_options.agent = Some(jjfx::engine::WireAgent::new("pi"));
     group_options.provider = Some("openai".to_owned());
     let mut group = DispatchGroupState::new(
         parent.clone(),
@@ -504,8 +510,8 @@ fn pi_orchestration_preflight_helper() {
         .load()
         .expect("load group")
     {
-        wsg_core::Loaded::Present(group) => group.value,
-        wsg_core::Loaded::Missing => panic!("group missing"),
+        jjfx::engine::Loaded::Present(group) => group.value,
+        jjfx::engine::Loaded::Missing => panic!("group missing"),
     };
     let issue = group.sub_issues.values().next().expect("pending issue");
     let worker = repository
@@ -523,7 +529,7 @@ fn pi_orchestration_preflight_helper() {
             issue
                 .worker
                 .as_ref()
-                .map_or("none", wsg_core::WorkerId::as_str),
+                .map_or("none", jjfx::engine::WorkerId::as_str),
             worker.status().as_str()
         ),
     )
@@ -541,7 +547,7 @@ fn persisted_runtime_matrix_survives_restart_completion_and_failure_progression(
             let ticket = TicketId::parse("ENG-801").expect("Sub-issue");
             let worker = WorkerId::parse("worker-01").expect("Worker");
             let mut options = DispatchGroupOptions::new("test-model");
-            options.agent = Some(wsg_core::WireAgent::new(runtime.as_str()));
+            options.agent = Some(jjfx::engine::WireAgent::new(runtime.as_str()));
             options.provider = Some("test-provider".to_owned());
             let mut group = DispatchGroupState::new(
                 parent.clone(),
@@ -566,7 +572,7 @@ fn persisted_runtime_matrix_survives_restart_completion_and_failure_progression(
                 vec![worker.clone()],
                 WireTimestamp::new("2026-08-17T12:00:00Z"),
             );
-            pool.agent = Some(wsg_core::WireAgent::new(runtime.as_str()));
+            pool.agent = Some(jjfx::engine::WireAgent::new(runtime.as_str()));
             pool.provider = Some("test-provider".to_owned());
             pool.model = Some("test-model".to_owned());
             repository
@@ -575,7 +581,7 @@ fn persisted_runtime_matrix_survives_restart_completion_and_failure_progression(
                 .commit(Expected::Missing, StateChange::Replace(pool))
                 .expect("save Pool");
             let mut worker_state = WorkerState::new(WireStatus::new(worker_status));
-            worker_state.agent = Some(wsg_core::WireAgent::new(runtime.as_str()));
+            worker_state.agent = Some(jjfx::engine::WireAgent::new(runtime.as_str()));
             worker_state.provider = Some("test-provider".to_owned());
             worker_state.model = Some("test-model".to_owned());
             worker_state.ticket = Some(ticket.to_string());
@@ -617,11 +623,15 @@ fn persisted_runtime_matrix_survives_restart_completion_and_failure_progression(
                 .load()
                 .expect("load terminal group")
             {
-                wsg_core::Loaded::Present(group) => group.value,
-                wsg_core::Loaded::Missing => panic!("Dispatch Group missing"),
+                jjfx::engine::Loaded::Present(group) => group.value,
+                jjfx::engine::Loaded::Missing => panic!("Dispatch Group missing"),
             };
             assert_eq!(
-                loaded.opts.agent.as_ref().map(wsg_core::WireAgent::as_str),
+                loaded
+                    .opts
+                    .agent
+                    .as_ref()
+                    .map(jjfx::engine::WireAgent::as_str),
                 Some(runtime.as_str())
             );
             assert_eq!(loaded.opts.provider.as_deref(), Some("test-provider"));
@@ -729,7 +739,7 @@ fn bounded_polling_reports_capacity_wait_without_busy_looping() {
         .expect_err("one bounded cycle cannot complete pending work");
     assert!(matches!(
         error,
-        wsg_core::OrchestrationError::PollingExhausted { parent: actual, cycles: 1 } if actual == parent
+        jjfx::engine::OrchestrationError::PollingExhausted { parent: actual, cycles: 1 } if actual == parent
     ));
     assert!(events.iter().any(|event| matches!(
         event,

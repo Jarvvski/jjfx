@@ -4,8 +4,10 @@ use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use jjfx::engine::{
+    CleanDecision, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome,
+};
 use tempfile::TempDir;
-use wsg_core::{CleanDecision, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome};
 
 fn local_repository() -> (TempDir, Repository) {
     let temporary_directory = tempfile::tempdir().expect("temporary directory should be created");
@@ -517,7 +519,7 @@ fn worker_pool_runs_repository_lifecycle_hooks() {
     install_lifecycle_hooks(root, &teardown_marker);
     let worker = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Pool should grow")
         .added_workers()[0]
         .clone();
@@ -756,7 +758,7 @@ fn failed_worker_teardown_still_removes_the_workspace_and_reports_the_error() {
     install_lifecycle_hooks_with_scripts(root, "#!/bin/sh\nexit 0\n", &teardown);
     let worker = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Pool should grow")
         .added_workers()[0]
         .clone();
@@ -776,7 +778,7 @@ fn failed_worker_teardown_still_removes_the_workspace_and_reports_the_error() {
             .worker(worker.clone())
             .load()
             .expect("Worker state should load"),
-        wsg_core::Loaded::Missing
+        jjfx::engine::Loaded::Missing
     ));
     assert_eq!(
         fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))

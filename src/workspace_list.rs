@@ -13,9 +13,9 @@
 
 use crate::agent::Agent;
 use crate::attention::{self, Attention};
+use crate::engine::WorkerSnapshot;
 use crate::store::{DEFAULT_WORKSPACE, Workspace};
 use crate::work::WorkState;
-use wsg_core::WorkerSnapshot;
 
 /// The raw per-workspace inputs the list classifies and renders from: the two
 /// lifecycle axes (agent + work) plus the joined Worker snapshot.

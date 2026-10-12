@@ -6,9 +6,9 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::engine::{AgentRuntime, Repository, SnapshotDiagnosticKind, WorkerStatus};
 use serde_json::Value;
 use tempfile::TempDir;
-use wsg_core::{AgentRuntime, Repository, SnapshotDiagnosticKind, WorkerStatus};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
 fn fixture(name: &str) -> Vec<u8> {
@@ -34,7 +34,7 @@ fn stale_reservation_after_destroy_helper() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -61,21 +61,21 @@ fn stale_reservation_after_destroy_helper() {
                 .to_string_lossy()
         ));
     fs::create_dir_all(&workspace).expect("recreate detached Workspace path");
-    let error = wsg_core::RunSupervisor::new()
+    let error = jjfx::engine::RunSupervisor::new()
         .run_reserved_background(
             reservation,
-            wsg_core::AgentRuntimeInvocation::new("stale reservation"),
+            jjfx::engine::AgentRuntimeInvocation::new("stale reservation"),
         )
         .expect_err("detached Reservation must not persist a launched PID");
     assert!(
         matches!(
             error,
-            wsg_core::RunSupervisorError::PersistPidConflict { worker: ref rejected }
+            jjfx::engine::RunSupervisorError::PersistPidConflict { worker: ref rejected }
                 if rejected == &worker
         ),
         "unexpected stale Reservation error: {error:?}"
     );
-    let wsg_core::Loaded::Present(state) = repository
+    let jjfx::engine::Loaded::Present(state) = repository
         .state_store()
         .worker(worker)
         .load()
@@ -194,11 +194,11 @@ fn repository_with_pool() -> (TempDir, Repository) {
 
 #[test]
 fn pool_capacity_accepts_an_empty_pool() {
-    let capacity = wsg_core::PoolCapacity::new(0).expect("zero capacity should be valid");
+    let capacity = jjfx::engine::PoolCapacity::new(0).expect("zero capacity should be valid");
 
     assert_eq!(capacity.as_usize(), 0);
     #[cfg(target_pointer_width = "64")]
-    assert!(wsg_core::PoolCapacity::new(usize::MAX).is_err());
+    assert!(jjfx::engine::PoolCapacity::new(usize::MAX).is_err());
 }
 
 #[test]
@@ -269,7 +269,7 @@ fn destroy_removes_worker_workspaces_state_and_cache_entries() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let grown = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow");
     let workers = grown.added_workers().to_vec();
     let workspace_paths = workers
@@ -322,23 +322,23 @@ fn destroy_removes_dispatch_and_unknown_artifacts_but_preserves_lock_sidecars() 
     let (_temporary_directory, repository) = local_repository_with_origin();
     let worker = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
-    let parent = wsg_core::TicketId::parse("AMBA-99").expect("Ticket ID");
-    let group = wsg_core::DispatchGroupState::new(
+    let parent = jjfx::engine::TicketId::parse("AMBA-99").expect("Ticket ID");
+    let group = jjfx::engine::DispatchGroupState::new(
         parent.clone(),
-        wsg_core::WireTimestamp::new("2026-07-30T10:00:00Z"),
+        jjfx::engine::WireTimestamp::new("2026-07-30T10:00:00Z"),
         "owner/repo",
-        wsg_core::DispatchGroupOptions::new(""),
+        jjfx::engine::DispatchGroupOptions::new(""),
     );
     repository
         .state_store()
         .dispatch_group(parent)
         .commit(
-            wsg_core::Expected::Missing,
-            wsg_core::StateChange::Replace(group),
+            jjfx::engine::Expected::Missing,
+            jjfx::engine::StateChange::Replace(group),
         )
         .expect("Dispatch Group state");
     let pool_directory = repository.root().join(".jj/pool");
@@ -376,23 +376,23 @@ fn destroy_removes_dispatch_and_unknown_artifacts_but_preserves_lock_sidecars() 
 fn destroy_marker_blocks_growth_until_destroy_completes() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
-    pool.resize_to(wsg_core::PoolCapacity::new(0).expect("empty capacity"))
+    pool.resize_to(jjfx::engine::PoolCapacity::new(0).expect("empty capacity"))
         .expect("create empty Pool");
     fs::write(repository.root().join(".jj/pool/.destroying"), "")
         .expect("interrupted destroy marker");
 
     let error = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect_err("growth must not commit during destroy");
 
-    assert!(matches!(error, wsg_core::WorkerPoolError::Conflict));
+    assert!(matches!(error, jjfx::engine::WorkerPoolError::Conflict));
     assert_eq!(pool.snapshot().pool().expect("empty Pool").size(), 0);
     pool.destroy()
         .expect("destroy should remove its durable marker");
     assert!(!repository.root().join(".jj/pool/.destroying").exists());
 
     let growth = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("growth should resume after destroy completes");
     assert_eq!(growth.capacity().as_usize(), 1);
 }
@@ -402,7 +402,7 @@ fn repeated_destroy_retries_interrupted_workspace_cleanup() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let worker = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -417,7 +417,7 @@ fn repeated_destroy_retries_interrupted_workspace_cleanup() {
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::DestroyCleanup { ref workers, .. }
+        jjfx::engine::WorkerPoolError::DestroyCleanup { ref workers, .. }
             if workers == &vec![worker.clone()]
     ));
     assert_eq!(
@@ -465,7 +465,7 @@ fn destroy_accepts_busy_workers_with_dead_or_absent_pids() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let grown = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow");
     let first = grown.added_workers()[0].clone();
     let second = grown.added_workers()[1].clone();
@@ -478,15 +478,16 @@ fn destroy_accepts_busy_workers_with_dead_or_absent_pids() {
         .reserve_named(second, "AMBA-NO-PID")
         .expect("reserve second");
     let state_repository = repository.state_store().worker(first);
-    let wsg_core::Loaded::Present(loaded) = state_repository.load().expect("Worker state") else {
+    let jjfx::engine::Loaded::Present(loaded) = state_repository.load().expect("Worker state")
+    else {
         panic!("Worker state should exist");
     };
     let (mut state, revision) = loaded.into_parts();
     state.pid = Some(99_999_999);
     state_repository
         .commit(
-            wsg_core::Expected::Match(revision),
-            wsg_core::StateChange::Replace(state),
+            jjfx::engine::Expected::Match(revision),
+            jjfx::engine::StateChange::Replace(state),
         )
         .expect("persist dead PID");
 
@@ -503,7 +504,7 @@ fn destroy_terminates_a_live_recorded_process_group() {
     let (temporary_directory, repository) = local_repository_with_origin();
     let worker = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -523,15 +524,16 @@ fn destroy_terminates_a_live_recorded_process_group() {
         .parse::<i64>()
         .expect("numeric PID");
     let state_repository = repository.state_store().worker(worker);
-    let wsg_core::Loaded::Present(loaded) = state_repository.load().expect("Worker state") else {
+    let jjfx::engine::Loaded::Present(loaded) = state_repository.load().expect("Worker state")
+    else {
         panic!("Worker state should exist");
     };
     let (mut state, revision) = loaded.into_parts();
     state.pid = Some(pid);
     state_repository
         .commit(
-            wsg_core::Expected::Match(revision),
-            wsg_core::StateChange::Replace(state),
+            jjfx::engine::Expected::Match(revision),
+            jjfx::engine::StateChange::Replace(state),
         )
         .expect("persist live PID");
 
@@ -555,7 +557,7 @@ fn creates_a_pool_with_one_worker_visible_through_its_snapshot() {
     let pool = repository.worker_pool();
 
     let growth = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("pool should grow");
 
     assert_eq!(growth.added_workers().len(), 1);
@@ -582,12 +584,12 @@ fn grows_a_pool_without_changing_existing_worker_ids_or_metadata() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let first = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
     let existing = first.added_workers()[0].clone();
 
     let second = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity should be valid"))
         .expect("pool should grow again");
 
     assert_eq!(second.capacity().as_usize(), 3);
@@ -606,12 +608,12 @@ fn growing_to_current_capacity_does_not_change_the_pool() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let first = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
     let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
 
     let second = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("same capacity should be accepted");
 
     assert!(second.added_workers().is_empty());
@@ -628,12 +630,12 @@ fn shrinking_removes_the_stable_pool_tail_and_reports_it() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity should be valid"))
         .expect("initial pool should grow");
     let expected_removed = grown.added_workers()[1..].to_vec();
 
     let resized = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("idle tail should shrink");
 
     assert_eq!(resized.capacity().as_usize(), 1);
@@ -658,15 +660,15 @@ fn pool_can_shrink_to_zero_and_regrow_with_new_stable_workers() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let initial = pool
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow");
     let old_workers = initial.added_workers().to_vec();
 
     let empty = pool
-        .resize_to(wsg_core::PoolCapacity::new(0).expect("zero capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(0).expect("zero capacity"))
         .expect("shrink to empty");
     let regrown = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("regrow");
 
     assert_eq!(empty.capacity().as_usize(), 0);
@@ -681,7 +683,7 @@ fn shrinking_rejects_the_whole_tail_when_a_selected_worker_is_busy() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity"))
         .expect("grow");
     let busy = grown.added_workers()[2].clone();
     pool.reserve_named(busy.clone(), "AMBA-7")
@@ -689,12 +691,12 @@ fn shrinking_rejects_the_whole_tail_when_a_selected_worker_is_busy() {
     let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
 
     let error = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect_err("busy tail should reject shrink");
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
+        jjfx::engine::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
     ));
     assert_eq!(
         fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
@@ -708,7 +710,7 @@ fn named_removal_detaches_an_idle_worker_without_reordering_the_rest() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity"))
         .expect("grow");
     let removed = grown.added_workers()[1].clone();
     let expected = vec![
@@ -736,7 +738,7 @@ fn named_removal_rejects_unknown_and_busy_workers_without_mutation() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow");
     let busy = grown.added_workers()[0].clone();
     pool.reserve_named(busy.clone(), "AMBA-8").expect("reserve");
@@ -745,18 +747,18 @@ fn named_removal_rejects_unknown_and_busy_workers_without_mutation() {
     let busy_error = pool
         .remove(busy.clone())
         .expect_err("busy Worker should not be removed");
-    let unknown = wsg_core::WorkerId::parse("worker-unknown").expect("Worker ID");
+    let unknown = jjfx::engine::WorkerId::parse("worker-unknown").expect("Worker ID");
     let unknown_error = pool
         .remove(unknown.clone())
         .expect_err("unknown Worker should not be removed");
 
     assert!(matches!(
         busy_error,
-        wsg_core::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
+        jjfx::engine::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
     ));
     assert!(matches!(
         unknown_error,
-        wsg_core::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
+        jjfx::engine::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
     ));
     assert_eq!(
         fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
@@ -770,7 +772,7 @@ fn grows_a_go_created_pool_without_replacing_its_membership_or_metadata() {
     let pool = repository.worker_pool();
 
     let growth = pool
-        .resize_to(wsg_core::PoolCapacity::new(5).expect("capacity should be valid"))
+        .resize_to(jjfx::engine::PoolCapacity::new(5).expect("capacity should be valid"))
         .expect("Go-created pool should grow");
 
     assert_eq!(growth.added_workers().len(), 1);
@@ -791,7 +793,7 @@ fn shrinks_a_go_created_pool_by_removing_a_terminal_tail_worker() {
     let pool = repository.worker_pool();
 
     let resized = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity"))
         .expect("failed Worker is terminal and removable");
 
     assert_eq!(resized.removed_workers()[0].as_str(), "worker-04");
@@ -807,7 +809,7 @@ fn repeated_resize_retries_detached_worker_cleanup() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow");
     let detached = grown.added_workers()[1].clone();
     let repo_state = repository.root().join(".jj/repo");
@@ -815,10 +817,10 @@ fn repeated_resize_retries_detached_worker_cleanup() {
     fs::rename(&repo_state, &disabled).expect("disable jj repository");
 
     let error = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect_err("Workspace cleanup should fail after membership commit");
 
-    assert!(matches!(error, wsg_core::WorkerPoolError::Cleanup(_)));
+    assert!(matches!(error, jjfx::engine::WorkerPoolError::Cleanup(_)));
     assert_eq!(pool.snapshot().pool().expect("manifest").size(), 1);
     let state = repository
         .root()
@@ -839,7 +841,7 @@ fn repeated_resize_retries_detached_worker_cleanup() {
     fs::rename(&disabled, &repo_state).expect("restore jj repository");
 
     let retried = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("same resize should retry detached cleanup");
 
     assert_eq!(retried.removed_workers(), &[detached]);
@@ -852,7 +854,7 @@ fn repeated_named_removal_retries_detached_worker_cleanup() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -864,7 +866,7 @@ fn repeated_named_removal_retries_detached_worker_cleanup() {
         .remove(worker.clone())
         .expect_err("Workspace cleanup should fail after membership commit");
 
-    assert!(matches!(error, wsg_core::WorkerPoolError::Cleanup(_)));
+    assert!(matches!(error, jjfx::engine::WorkerPoolError::Cleanup(_)));
     let marker = repository
         .root()
         .join(".jj/pool")
@@ -885,9 +887,9 @@ fn repeated_named_removal_retries_detached_worker_cleanup() {
 fn no_op_resize_preserves_nonmember_state_without_a_cleanup_marker() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
-    pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+    pool.resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow");
-    let in_flight = wsg_core::WorkerId::parse("worker-in-flight").expect("Worker ID");
+    let in_flight = jjfx::engine::WorkerId::parse("worker-in-flight").expect("Worker ID");
     let state = repository
         .root()
         .join(".jj/pool")
@@ -895,7 +897,7 @@ fn no_op_resize_preserves_nonmember_state_without_a_cleanup_marker() {
     fs::write(&state, fixture("worker-idle-claude.json")).expect("in-flight Worker state");
 
     let resized = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("no-op resize");
 
     assert!(resized.removed_workers().is_empty());
@@ -909,9 +911,9 @@ fn no_op_resize_preserves_nonmember_state_without_a_cleanup_marker() {
 fn named_removal_preserves_unknown_state_without_a_cleanup_marker() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
-    pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+    pool.resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow");
-    let unknown = wsg_core::WorkerId::parse("worker-unknown-state").expect("Worker ID");
+    let unknown = jjfx::engine::WorkerId::parse("worker-unknown-state").expect("Worker ID");
     let state = repository
         .root()
         .join(".jj/pool")
@@ -924,7 +926,7 @@ fn named_removal_preserves_unknown_state_without_a_cleanup_marker() {
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
+        jjfx::engine::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
     ));
     assert!(state.exists(), "unknown state must not be cleaned");
 }
@@ -934,7 +936,7 @@ fn busy_detached_cleanup_marker_is_not_torn_down() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -955,12 +957,12 @@ fn busy_detached_cleanup_marker_is_not_torn_down() {
     fs::write(&state, fixture("worker-busy-claude.json")).expect("busy detached state");
 
     let error = pool
-        .resize_to(wsg_core::PoolCapacity::new(0).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(0).expect("capacity"))
         .expect_err("busy detached Worker must not be torn down");
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::WorkersBusy { workers } if workers == vec![worker]
+        jjfx::engine::WorkerPoolError::WorkersBusy { workers } if workers == vec![worker]
     ));
     assert!(state.exists());
     assert!(marker.exists());
@@ -971,7 +973,7 @@ fn shrinking_permits_a_missing_tail_worker_state() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let grown = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow");
     let missing = grown.added_workers()[1].clone();
     fs::remove_file(
@@ -984,7 +986,7 @@ fn shrinking_permits_a_missing_tail_worker_state() {
 
     let resized = repository
         .worker_pool()
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("missing state should not imply busy");
 
     assert_eq!(resized.removed_workers(), &[missing]);
@@ -995,7 +997,7 @@ fn worker_alias_is_trimmed_persisted_and_cosmetic() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -1031,7 +1033,7 @@ fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -1056,7 +1058,7 @@ fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
         "empty names should be omitted"
     );
     let before = fs::read(&pool_path).expect("pool bytes");
-    let unknown = wsg_core::WorkerId::parse("worker-unknown").expect("Worker ID");
+    let unknown = jjfx::engine::WorkerId::parse("worker-unknown").expect("Worker ID");
 
     let error = pool
         .set_alias(unknown.clone(), "backend")
@@ -1064,7 +1066,7 @@ fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
+        jjfx::engine::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
     ));
     assert_eq!(fs::read(pool_path).expect("pool bytes"), before);
 }
@@ -1085,7 +1087,7 @@ fn worker_alias_mutates_a_go_created_pool_without_losing_compatible_metadata() {
     .expect("pool state");
     let worker_state_path = temporary_directory.path().join(".jj/pool/worker-01.json");
     let worker_state_before = fs::read(&worker_state_path).expect("Worker state");
-    let worker = wsg_core::WorkerId::parse("worker-01").expect("Worker ID");
+    let worker = jjfx::engine::WorkerId::parse("worker-01").expect("Worker ID");
 
     repository
         .worker_pool()
@@ -1135,7 +1137,7 @@ fn alias_and_named_removal_serialize_without_reviving_removed_metadata() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -1158,7 +1160,7 @@ fn alias_and_named_removal_serialize_without_reviving_removed_metadata() {
         alias.is_ok()
             || matches!(
                 alias,
-                Err(wsg_core::WorkerPoolError::WorkerNotInPool { .. })
+                Err(jjfx::engine::WorkerPoolError::WorkerNotInPool { .. })
             ),
         "alias must either serialize before removal or observe the removed Worker"
     );
@@ -1172,7 +1174,7 @@ fn alias_and_shrink_serialize_without_retaining_a_detached_alias() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow");
     let worker = grown.added_workers()[1].clone();
     let alias_pool = pool.clone();
@@ -1182,7 +1184,7 @@ fn alias_and_shrink_serialize_without_retaining_a_detached_alias() {
     let (alias, resize) = thread::scope(|scope| {
         let alias = scope.spawn(|| alias_pool.set_alias(alias_worker, "backend"));
         let resize = scope
-            .spawn(|| resize_pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity")));
+            .spawn(|| resize_pool.resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity")));
         (
             alias.join().expect("alias thread"),
             resize.join().expect("resize thread"),
@@ -1194,7 +1196,7 @@ fn alias_and_shrink_serialize_without_retaining_a_detached_alias() {
         alias.is_ok()
             || matches!(
                 alias,
-                Err(wsg_core::WorkerPoolError::WorkerNotInPool { .. })
+                Err(jjfx::engine::WorkerPoolError::WorkerNotInPool { .. })
             ),
         "alias must either serialize before shrink or observe the detached Worker"
     );
@@ -1208,7 +1210,7 @@ fn alias_rejects_while_pool_destruction_is_in_progress() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -1223,7 +1225,7 @@ fn alias_rejects_while_pool_destruction_is_in_progress() {
         .set_alias(worker, "backend")
         .expect_err("alias mutation should not race active destruction");
 
-    assert!(matches!(error, wsg_core::WorkerPoolError::Conflict));
+    assert!(matches!(error, jjfx::engine::WorkerPoolError::Conflict));
     assert_eq!(
         fs::read(repository.root().join(".jj/pool.json")).expect("pool state"),
         before
@@ -1240,7 +1242,7 @@ fn named_removal_clears_a_go_created_worker_alias() {
         fixture("worker-idle-claude.json"),
     )
     .expect("make aliased Worker idle");
-    let worker = wsg_core::WorkerId::parse("worker-02").expect("Worker ID");
+    let worker = jjfx::engine::WorkerId::parse("worker-02").expect("Worker ID");
 
     repository
         .worker_pool()
@@ -1248,7 +1250,7 @@ fn named_removal_clears_a_go_created_worker_alias() {
         .expect("remove aliased Worker");
 
     let loaded = repository.state_store().pool().load().expect("pool state");
-    let wsg_core::Loaded::Present(pool) = loaded else {
+    let jjfx::engine::Loaded::Present(pool) = loaded else {
         panic!("pool should remain");
     };
     assert!(!pool.value.names.contains_key(&worker));
@@ -1259,17 +1261,19 @@ fn named_removal_clears_a_go_created_worker_alias() {
 fn concurrent_growth_keeps_registered_workers_in_the_workspace_cache() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
-    pool.resize_to(wsg_core::PoolCapacity::new(1).expect("capacity should be valid"))
+    pool.resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
 
     let first_pool = pool.clone();
     let second_pool = pool.clone();
     let (first, second) = thread::scope(|scope| {
         let first = scope.spawn(|| {
-            first_pool.resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+            first_pool
+                .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity should be valid"))
         });
         let second = scope.spawn(|| {
-            second_pool.resize_to(wsg_core::PoolCapacity::new(3).expect("capacity should be valid"))
+            second_pool
+                .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity should be valid"))
         });
         (
             first.join().expect("first growth should not panic"),
@@ -1302,7 +1306,7 @@ fn reservation_and_named_removal_never_claim_and_remove_the_same_worker() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let worker = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow")
         .added_workers()[0]
         .clone();
@@ -1332,7 +1336,7 @@ fn reservation_and_shrink_never_claim_and_remove_the_same_worker() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let grown = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity"))
         .expect("grow");
     for (worker, ticket) in grown.added_workers()[..2]
         .iter()
@@ -1348,7 +1352,7 @@ fn reservation_and_shrink_never_claim_and_remove_the_same_worker() {
     let (reservation, resize) = thread::scope(|scope| {
         let reservation = scope.spawn(|| reserve_pool.reserve("AMBA-RACE"));
         let resize = scope
-            .spawn(|| resize_pool.resize_to(wsg_core::PoolCapacity::new(2).expect("capacity")));
+            .spawn(|| resize_pool.resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity")));
         (
             reservation.join().expect("reservation thread"),
             resize.join().expect("resize thread"),
@@ -1485,7 +1489,7 @@ fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
 
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::InvalidAgentRuntime { value } if value == "other"
+        jjfx::engine::WorkerPoolError::InvalidAgentRuntime { value } if value == "other"
     ));
     assert_eq!(fs::read(worker_path).expect("Worker state"), before);
 }
@@ -1535,7 +1539,7 @@ fn bulk_reservation_assigns_idle_workers_to_tickets_atomically_in_pool_order() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let workers = pool
-        .resize_to(wsg_core::PoolCapacity::new(3).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(3).expect("capacity"))
         .expect("grow Worker Pool")
         .added_workers()
         .to_vec();
@@ -1578,7 +1582,7 @@ fn bulk_reservation_reports_exact_shortage_without_writing_any_worker() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let workers = pool
-        .resize_to(wsg_core::PoolCapacity::new(2).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(2).expect("capacity"))
         .expect("grow Worker Pool")
         .added_workers()
         .to_vec();
@@ -1602,7 +1606,7 @@ fn bulk_reservation_reports_exact_shortage_without_writing_any_worker() {
         .reserve_many(&["ENG-303", "ENG-304"])
         .expect_err("one idle Worker cannot satisfy two Tickets");
 
-    let wsg_core::WorkerPoolError::CapacityShortage(shortage) = error else {
+    let jjfx::engine::WorkerPoolError::CapacityShortage(shortage) = error else {
         panic!("expected typed capacity shortage");
     };
     assert_eq!(shortage.requested(), 2);
@@ -1620,7 +1624,7 @@ fn caller_approved_growth_adopts_and_reserves_only_the_reported_gap() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let pool = repository.worker_pool();
     let original = pool
-        .resize_to(wsg_core::PoolCapacity::new(1).expect("capacity"))
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
         .expect("grow Worker Pool")
         .added_workers()[0]
         .clone();
@@ -1632,7 +1636,7 @@ fn caller_approved_growth_adopts_and_reserves_only_the_reported_gap() {
     let error = pool
         .grow_and_reserve_many(&["ENG-305", "ENG-306"], 1)
         .expect_err("approval smaller than the gap must be rejected");
-    let wsg_core::WorkerPoolError::CapacityShortage(shortage) = error else {
+    let jjfx::engine::WorkerPoolError::CapacityShortage(shortage) = error else {
         panic!("expected capacity shortage");
     };
     assert_eq!(shortage.gap(), 2);
@@ -1700,7 +1704,7 @@ fn reserves_a_named_idle_worker_without_using_pool_order() {
         fixture("worker-idle-claude.json"),
     )
     .expect("make named Worker idle");
-    let worker_id = wsg_core::WorkerId::parse("worker-04").expect("Worker ID");
+    let worker_id = jjfx::engine::WorkerId::parse("worker-04").expect("Worker ID");
 
     let reservation = repository
         .worker_pool()
@@ -1726,26 +1730,26 @@ fn reserves_a_named_idle_worker_without_using_pool_order() {
 #[test]
 fn named_reservation_rejects_unknown_or_busy_workers_without_mutation() {
     let (_temp, repository) = repository_with_pool();
-    let unknown = wsg_core::WorkerId::parse("worker-nope").expect("Worker ID");
+    let unknown = jjfx::engine::WorkerId::parse("worker-nope").expect("Worker ID");
     let error = repository
         .worker_pool()
         .reserve_named(unknown, "ENG-203")
         .expect_err("unknown Worker should be rejected");
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::WorkerNotInPool { worker }
+        jjfx::engine::WorkerPoolError::WorkerNotInPool { worker }
             if worker.as_str() == "worker-nope"
     ));
 
     let (_temp, repository) = repository_with_pool();
-    let busy = wsg_core::WorkerId::parse("worker-02").expect("Worker ID");
+    let busy = jjfx::engine::WorkerId::parse("worker-02").expect("Worker ID");
     let error = repository
         .worker_pool()
         .reserve_named(busy, "ENG-204")
         .expect_err("busy Worker should be rejected");
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::WorkerNotIdle { worker }
+        jjfx::engine::WorkerPoolError::WorkerNotIdle { worker }
             if worker.as_str() == "worker-02"
     ));
     let snapshot = repository.worker_pool().snapshot();
@@ -1794,7 +1798,7 @@ fn reservation_reports_no_idle_capacity_without_mutation() {
         .expect_err("a full pool should reject the Reservation");
     assert!(matches!(
         error,
-        wsg_core::WorkerPoolError::NoIdleWorkers {
+        jjfx::engine::WorkerPoolError::NoIdleWorkers {
             ticket,
             available: 0
         } if ticket == "ENG-207"

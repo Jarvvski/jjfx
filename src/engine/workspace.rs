@@ -9,7 +9,7 @@ use std::process::Command;
 use rustix::fs::{FlockOperation, flock};
 use thiserror::Error;
 
-use crate::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, WorkerState};
+use crate::engine::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, WorkerState};
 
 const CACHE_PATH: &str = ".jj/ws-cache";
 const CACHE_LOCK_PATH: &str = ".jj/ws-cache.lock";
@@ -691,8 +691,8 @@ where
                 WorkerWorkspaceError::new(format!("create idle Worker state: {error}"))
             })?;
         let loaded = match committed {
-            crate::CommitOutcome::Applied(loaded) => loaded,
-            crate::CommitOutcome::Conflict(_) => {
+            crate::engine::CommitOutcome::Applied(loaded) => loaded,
+            crate::engine::CommitOutcome::Conflict(_) => {
                 return Err(WorkerWorkspaceError::new(
                     "create idle Worker state: Worker state was claimed concurrently",
                 ));
@@ -884,8 +884,8 @@ fn combine_cleanup_results(
 }
 
 fn remove_detached_state(
-    state: &crate::WorkerStateRepository,
-    expected: Option<crate::StateRevision<WorkerState>>,
+    state: &crate::engine::WorkerStateRepository,
+    expected: Option<crate::engine::StateRevision<WorkerState>>,
 ) -> Result<(), WorkerWorkspaceError> {
     match state.remove_detached(expected) {
         Ok(true) => Ok(()),
@@ -922,7 +922,7 @@ fn ensure_unclaimed(
     root: &Path,
     worker_id: &WorkerId,
     path: &Path,
-    state: &crate::WorkerStateRepository,
+    state: &crate::engine::WorkerStateRepository,
 ) -> Result<(), WorkerWorkspaceError> {
     if path.exists() {
         return Err(WorkerWorkspaceError::new(format!(
@@ -1349,8 +1349,8 @@ fn rollback_provisioning(
     root: &Path,
     worker_id: &WorkerId,
     path: &Path,
-    state: &crate::WorkerStateRepository,
-    state_revision: Option<crate::StateRevision<WorkerState>>,
+    state: &crate::engine::WorkerStateRepository,
+    state_revision: Option<crate::engine::StateRevision<WorkerState>>,
 ) -> Result<(), WorkerWorkspaceError> {
     let mut failures = Vec::new();
     if path.is_dir()
@@ -1375,8 +1375,8 @@ fn rollback_provisioning(
 
     if let Some(revision) = state_revision {
         match state.commit(Expected::Match(revision), StateChange::Remove) {
-            Ok(crate::CommitOutcome::Applied(_)) => Ok(()),
-            Ok(crate::CommitOutcome::Conflict(_)) => Err(WorkerWorkspaceError::new(
+            Ok(crate::engine::CommitOutcome::Applied(_)) => Ok(()),
+            Ok(crate::engine::CommitOutcome::Conflict(_)) => Err(WorkerWorkspaceError::new(
                 "Worker state changed during rollback after Workspace cleanup",
             )),
             Err(error) => Err(WorkerWorkspaceError::new(format!(
@@ -1409,7 +1409,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let repo =
-            std::env::temp_dir().join(format!("wsg-core-{tag}-{}-{nonce}", std::process::id()));
+            std::env::temp_dir().join(format!("jjfx-engine-{tag}-{}-{nonce}", std::process::id()));
         let status = Command::new("jj")
             .args([
                 "--config",
@@ -1428,7 +1428,7 @@ mod tests {
     #[test]
     fn colocation_requires_a_colocated_repository() {
         let root = std::env::temp_dir().join(format!(
-            "wsg-core-colocation-{}-{}",
+            "jjfx-engine-colocation-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)

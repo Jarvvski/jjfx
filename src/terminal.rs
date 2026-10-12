@@ -14,9 +14,9 @@
 use std::path::Path;
 use std::time::Duration;
 
+use crate::engine::{PaneLayout, PaneRole, SplitLocation};
 use anyhow::{Context, anyhow};
 use serde_json::Value;
-use wsg_core::{PaneLayout, PaneRole, SplitLocation};
 
 use crate::cmd::cmd;
 use crate::config::TerminalConfig;
@@ -566,7 +566,7 @@ fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wsg_core::PanePlacement;
+    use crate::engine::PanePlacement;
 
     #[test]
     fn tab_title_is_prefixed() {

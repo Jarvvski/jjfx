@@ -11,7 +11,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
 
-use crate::{AgentRuntime, TicketId};
+use crate::engine::{AgentRuntime, TicketId};
 
 /// Environment variable naming the dedicated Pi Linear discovery helper.
 pub const PI_DISCOVERY_HELPER_ENV: &str = "JJFX_PI_LINEAR_HELPER";

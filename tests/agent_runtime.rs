@@ -7,16 +7,16 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::engine::{
+    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation,
+    AgentRuntimeProbeError, Expected, PoolCapacity, Repository, RunRequest, RunReset,
+    RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerId, WorkerStatus,
+};
 use rustix::process::{
     Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
 };
 use serde_json::Value;
 use tempfile::TempDir;
-use wsg_core::{
-    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation,
-    AgentRuntimeProbeError, Expected, PoolCapacity, Repository, RunRequest, RunReset,
-    RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerId, WorkerStatus,
-};
 
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "WSG_AGENT_RUNTIME_HELPER_PATH";
@@ -815,8 +815,8 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
     wait_for_file(&reserved);
     let worker_state = repository.state_store().worker(worker_id.clone());
     let loaded = match worker_state.load().expect("reserved Worker state") {
-        wsg_core::Loaded::Present(versioned) => versioned,
-        wsg_core::Loaded::Missing => panic!("reserved Worker state should exist"),
+        jjfx::engine::Loaded::Present(versioned) => versioned,
+        jjfx::engine::Loaded::Missing => panic!("reserved Worker state should exist"),
     };
     let outcome = worker_state
         .commit(
@@ -824,7 +824,7 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
             StateChange::Remove,
         )
         .expect("remove Worker state for the race");
-    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
     fs::create_dir(
         temporary_directory
             .path()
@@ -948,8 +948,8 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
     wait_for_file(&reserved);
     let worker_state = repository.state_store().worker(worker_id.clone());
     let loaded = match worker_state.load().expect("reserved Worker state") {
-        wsg_core::Loaded::Present(versioned) => versioned,
-        wsg_core::Loaded::Missing => panic!("reserved Worker state should exist"),
+        jjfx::engine::Loaded::Present(versioned) => versioned,
+        jjfx::engine::Loaded::Missing => panic!("reserved Worker state should exist"),
     };
     let outcome = worker_state
         .commit(
@@ -957,7 +957,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
             StateChange::Remove,
         )
         .expect("remove Worker state for the race");
-    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
     let worker_state_path = temporary_directory
         .path()
         .join(".jj/pool")
@@ -1949,8 +1949,8 @@ fn stale_background_waiter_cannot_finalize_newer_run() {
 
     let worker_state = repository.state_store().worker(worker_id.clone());
     let loaded = match worker_state.load().expect("Run A Worker state") {
-        wsg_core::Loaded::Present(versioned) => versioned,
-        wsg_core::Loaded::Missing => panic!("Run A Worker state should exist"),
+        jjfx::engine::Loaded::Present(versioned) => versioned,
+        jjfx::engine::Loaded::Missing => panic!("Run A Worker state should exist"),
     };
     let revision = loaded.revision().clone();
     let mut state = loaded.value;
@@ -1967,7 +1967,7 @@ fn stale_background_waiter_cannot_finalize_newer_run() {
     let outcome = worker_state
         .commit(Expected::Match(revision), StateChange::Replace(state))
         .expect("reset Run A state");
-    assert!(matches!(outcome, wsg_core::CommitOutcome::Applied(_)));
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
     repository
         .worker_pool()
         .reserve_named(worker_id.clone(), "ENG-217")
@@ -2892,7 +2892,7 @@ fn busy_run_state(pid: u32, ticket: &str) -> Value {
 fn finalize_run_in_place(repository: &Repository, worker: &WorkerId) {
     update_worker_state(repository, worker, |state| {
         state.status = WireStatus::new("done");
-        state.completed_at = Some(wsg_core::WireTimestamp::new("2026-07-30T10:05:00Z"));
+        state.completed_at = Some(jjfx::engine::WireTimestamp::new("2026-07-30T10:05:00Z"));
         state.exit_code = Some(0);
     });
 }
@@ -2916,12 +2916,12 @@ fn release_run_in_place(repository: &Repository, worker: &WorkerId) {
 fn update_worker_state(
     repository: &Repository,
     worker: &WorkerId,
-    change: impl FnOnce(&mut wsg_core::WorkerState),
+    change: impl FnOnce(&mut jjfx::engine::WorkerState),
 ) {
     let state_repository = repository.state_store().worker(worker.clone());
     let loaded = match state_repository.load().expect("Worker state") {
-        wsg_core::Loaded::Present(versioned) => versioned,
-        wsg_core::Loaded::Missing => panic!("Worker state should exist"),
+        jjfx::engine::Loaded::Present(versioned) => versioned,
+        jjfx::engine::Loaded::Missing => panic!("Worker state should exist"),
     };
     let (mut state, revision) = loaded.into_parts();
     change(&mut state);
@@ -2929,7 +2929,7 @@ fn update_worker_state(
         .commit(Expected::Match(revision), StateChange::Replace(state))
         .expect("commit Worker state");
     assert!(
-        matches!(outcome, wsg_core::CommitOutcome::Applied(_)),
+        matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)),
         "the test's own Worker mutation should apply"
     );
 }

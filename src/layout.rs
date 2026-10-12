@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
+use crate::engine::PaneLayout;
 use anyhow::{Result, anyhow};
-use wsg_core::PaneLayout;
 
 use crate::config::{DisplayLayouts, TerminalConfig};
 use crate::display::DisplayCondition;
@@ -84,7 +84,7 @@ fn forced_layout_name() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wsg_core::{PanePlacement, PaneRole};
+    use crate::engine::{PanePlacement, PaneRole};
 
     fn profile(role: PaneRole, bias: u8) -> PaneLayout {
         PaneLayout {
@@ -98,7 +98,7 @@ mod tests {
                 PanePlacement {
                     role,
                     from: 0,
-                    location: Some(wsg_core::SplitLocation::Vsplit),
+                    location: Some(crate::engine::SplitLocation::Vsplit),
                     bias,
                 },
             ],

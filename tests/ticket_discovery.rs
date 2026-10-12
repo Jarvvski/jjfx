@@ -7,12 +7,12 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use tempfile::TempDir;
-use wsg_core::{
+use jjfx::engine::{
     AgentRuntime, AgentRuntimeQuery, Blocker, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter,
     RepositoryIdentity, Ticket, TicketDiscovery, TicketId, TicketQuery, TicketQueryError,
     TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
 };
+use tempfile::TempDir;
 
 const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
 const HELPER_WORKSPACE: &str = "WSG_TICKET_QUERY_HELPER_WORKSPACE";

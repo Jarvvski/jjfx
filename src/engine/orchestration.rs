@@ -14,8 +14,8 @@ use rustix::fs::{FlockOperation, flock};
 
 use thiserror::Error;
 
-use crate::pool::current_timestamp;
-use crate::{
+use crate::engine::pool::current_timestamp;
+use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
     DirectDispatchRequest, DirectDispatchSuccess, DispatchGroup, DispatchGroupBuildOptions,
     DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions, DispatchGroupProgress,
@@ -1050,7 +1050,7 @@ mod tests {
     use std::collections::{BTreeSet, VecDeque};
 
     use super::*;
-    use crate::{DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus};
+    use crate::engine::{DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus};
 
     struct FakeClaim {
         worker: WorkerId,
