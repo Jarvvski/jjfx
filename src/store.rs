@@ -110,6 +110,8 @@ impl WorkspaceCreateError {
 pub(crate) struct Store {
     repo_root: PathBuf,
     workspaces: Vec<Workspace>,
+    /// Whether new workspaces are colocated with Git (jjfx's `colocate`).
+    colocate: bool,
 }
 
 pub(crate) const DEFAULT_WORKSPACE: &str = "default";
@@ -165,12 +167,24 @@ impl Store {
         Store {
             repo_root: repo_root.to_path_buf(),
             workspaces,
+            colocate: true,
         }
     }
 
     /// The repository whose Workspace state this Store owns.
     pub(crate) fn repo_root(&self) -> &Path {
         &self.repo_root
+    }
+
+    /// Whether new workspaces are colocated with Git.
+    pub(crate) fn colocate(&self) -> bool {
+        self.colocate
+    }
+
+    /// Sets the Workspace colocation preference (builder form).
+    pub(crate) fn with_colocate(mut self, colocate: bool) -> Self {
+        self.colocate = colocate;
+        self
     }
 
     /// The reconciled Workspaces, ordered with default first then by name.
@@ -191,6 +205,7 @@ impl Store {
         Self {
             repo_root,
             workspaces,
+            colocate: true,
         }
     }
 
@@ -198,8 +213,12 @@ impl Store {
     /// Create a workspace at the derived sibling path, project it to ws-cache,
     /// then reload the authoritative state from its live sources.
     pub(crate) fn create(&mut self, requested_name: &str) -> anyhow::Result<CreatedWorkspace> {
-        let created =
-            Self::create_persisted_with_progress(&self.repo_root, requested_name, |_, _| {})?;
+        let created = Self::create_persisted_with_progress(
+            &self.repo_root,
+            requested_name,
+            self.colocate,
+            |_, _| {},
+        )?;
         self.reload();
         Ok(created)
     }
@@ -210,6 +229,7 @@ impl Store {
     pub(crate) fn create_persisted_with_progress<F>(
         repo_root: &Path,
         requested_name: &str,
+        colocate: bool,
         on_output: F,
     ) -> Result<CreatedWorkspace, WorkspaceCreateError>
     where
@@ -223,10 +243,12 @@ impl Store {
             });
         }
 
-        let repository = Repository::open(repo_root).map_err(|error| WorkspaceCreateError {
-            phase: AdHocWorkspacePhase::Create,
-            message: format!("{error:#}"),
-        })?;
+        let repository = Repository::open(repo_root)
+            .map_err(|error| WorkspaceCreateError {
+                phase: AdHocWorkspacePhase::Create,
+                message: format!("{error:#}"),
+            })?
+            .with_colocate(colocate);
         let trunk = crate::trunk::as_revset();
         let workspace = repository
             .create_ad_hoc_workspace_with_revision_and_progress(name, Some(&trunk), on_output)

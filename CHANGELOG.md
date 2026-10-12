@@ -19,8 +19,8 @@ version of record lives in the project manifest.
 
 - 2026-10-12 - New workspaces are now colocated with Git: `jj workspace add`
   creates a Git worktree so each agent workspace has a working `.git`, which
-  lets tools such as `gh stack` run inside it. This follows jj's `git.colocate`
-  setting (default on). (jjfx 0.51.0, wsg 0.19.0)
+  lets tools such as `gh stack` run inside it. Controlled by the new top-level
+  `colocate` setting, on by default. (jjfx 0.51.0, wsg 0.19.0)
 
 - 2026-10-08 - `PageUp` and `PageDown` now jump the workspace-list selection
   straight to the first or last workspace (jjfx 0.50.0).

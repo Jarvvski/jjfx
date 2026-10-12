@@ -11,6 +11,8 @@ rather than being silently ignored.
 Every section is optional. This is a complete example:
 
 ```toml
+colocate = true
+
 [agent]
 command = "claude"
 
@@ -128,6 +130,12 @@ The section is still accepted and ignored so an existing config keeps parsing.
 
 New workspaces are colocated with Git: `jj workspace add` creates a Git worktree
 so every agent workspace has a working `.git`, which lets tools such as `gh
-stack` run inside it. This follows jj's own `git.colocate` setting, which
-defaults to `true`; set `git.colocate = false` in your jj config (not this file)
-to create non-colocated workspaces instead.
+stack` run inside it. Colocation is on by default; set the top-level `colocate`
+key to `false` to create non-colocated workspaces instead.
+
+```toml
+colocate = false
+```
+
+A repository that is not itself colocated is never colocated, whatever this says
+- run `jj git colocation enable` first if you want colocated workspaces there.

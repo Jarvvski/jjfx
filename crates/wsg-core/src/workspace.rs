@@ -292,9 +292,13 @@ impl Workspaces {
             AdHocWorkspaceError::new(format!("create workspace directory: {error}"))
         })?;
         let existed_before = path.exists();
-        if let Err(error) =
-            add_workspace_with_revision(self.repository.root(), name, &path, revision)
-        {
+        if let Err(error) = add_workspace_with_revision(
+            self.repository.root(),
+            name,
+            &path,
+            revision,
+            self.repository.colocate(),
+        ) {
             cleanup_failed_create(self.repository.root(), name, &path, existed_before);
             return Err(AdHocWorkspaceError::new(error.message));
         }
@@ -458,7 +462,9 @@ where
 
     let path = ad_hoc_workspace_path(root, name);
     let existed_before = path.exists();
-    if let Err(error) = add_workspace_with_revision(root, name, &path, revision) {
+    if let Err(error) =
+        add_workspace_with_revision(root, name, &path, revision, repository.colocate())
+    {
         cleanup_failed_create(root, name, &path, existed_before);
         return Err(AdHocWorkspaceError::new(error.message));
     }
@@ -668,7 +674,7 @@ where
     fs::create_dir_all(base).map_err(|error| {
         WorkerWorkspaceError::new(format!("create Worker Workspace directory: {error}"))
     })?;
-    if let Err(error) = add_workspace(root, worker_id.as_str(), &path) {
+    if let Err(error) = add_workspace(root, worker_id.as_str(), &path, repository.colocate()) {
         if !base_existed {
             let _ = fs::remove_dir(base);
         }
@@ -978,8 +984,25 @@ pub(crate) fn worker_path(root: &Path, worker_id: &WorkerId) -> PathBuf {
     workspace_base(root).join(worker_id.as_str())
 }
 
-fn add_workspace(root: &Path, name: &str, path: &Path) -> Result<(), WorkerWorkspaceError> {
-    add_workspace_with_revision(root, name, path, None)
+fn add_workspace(
+    root: &Path,
+    name: &str,
+    path: &Path,
+    colocate: bool,
+) -> Result<(), WorkerWorkspaceError> {
+    add_workspace_with_revision(root, name, path, None, colocate)
+}
+
+/// The `jj workspace add` colocation flag: colocate only when jjfx asks for it
+/// and the repository itself is colocated. A repository that is not colocated
+/// has no Git directory to share, so it never colocates - which is what keeps
+/// jjfx's own non-colocated test repositories from creating worktrees.
+fn colocation_flag(root: &Path, colocate: bool) -> &'static str {
+    if colocate && root.join(".git").is_dir() {
+        "--colocate"
+    } else {
+        "--no-colocate"
+    }
 }
 
 fn add_workspace_with_revision(
@@ -987,14 +1010,16 @@ fn add_workspace_with_revision(
     name: &str,
     path: &Path,
     revision: Option<&str>,
+    colocate: bool,
 ) -> Result<(), WorkerWorkspaceError> {
     let mut command = Command::new("jj");
-    // Inherit jj's colocation default: `jj workspace add` creates a Git worktree
-    // when the repository is colocated and `git.colocate` is true (the default),
-    // so every agent workspace gets a working `.git`. Set `git.colocate = false`
-    // in the jj config to opt out. jjfx's own test repositories are initialized
-    // non-colocated, so they never create worktrees.
-    command.args(["workspace", "add", "--name", name]);
+    command.args([
+        "workspace",
+        "add",
+        "--name",
+        name,
+        colocation_flag(root, colocate),
+    ]);
     if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
         command.args(["--revision", revision]);
     }
@@ -1382,12 +1407,43 @@ mod tests {
         let repo =
             std::env::temp_dir().join(format!("wsg-core-{tag}-{}-{nonce}", std::process::id()));
         let status = Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(&repo)
             .status()
             .unwrap();
         assert!(status.success(), "jj git init should succeed");
         repo
+    }
+
+    #[test]
+    fn colocation_requires_a_colocated_repository() {
+        let root = std::env::temp_dir().join(format!(
+            "wsg-core-colocation-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Without a `.git`, the repository is not colocated, so jjfx never
+        // colocates - even when the setting asks for it.
+        assert_eq!(colocation_flag(&root, true), "--no-colocate");
+
+        // A `.git` directory marks the repository colocated.
+        std::fs::create_dir(root.join(".git")).unwrap();
+        assert_eq!(colocation_flag(&root, true), "--colocate");
+        // Asking not to colocate always wins.
+        assert_eq!(colocation_flag(&root, false), "--no-colocate");
+
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn sibling(root: &Path, name: &str) -> PathBuf {

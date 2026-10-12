@@ -12,7 +12,13 @@ use wsg_core::{
 fn local_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(directory.path())
         .output()
         .expect("jj should run");

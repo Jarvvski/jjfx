@@ -1377,7 +1377,13 @@ mod tests {
     fn empty_snapshot() -> WorkerPoolSnapshot {
         let directory = TempDir::new().expect("temporary repository");
         let output = Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(directory.path())
             .output()
             .expect("jj should be installed");
@@ -1390,7 +1396,13 @@ mod tests {
     fn pi_repository() -> (TempDir, wsg_core::Repository) {
         let directory = TempDir::new().expect("temporary repository");
         let output = Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(directory.path())
             .output()
             .expect("jj should be installed");

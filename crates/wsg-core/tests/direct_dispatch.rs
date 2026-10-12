@@ -1257,7 +1257,13 @@ fn direct_dispatch_contract_carries_inputs_and_preserves_outcome_order() {
 fn local_repository() -> (TempDir, Repository) {
     let temporary_directory = tempfile::tempdir().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj init");
@@ -1310,7 +1316,13 @@ fn run_pi_profile_preflight_request_case(
     let repository_path = temporary_directory.path().join("repository");
     fs::create_dir(&repository_path).expect("repository directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(&repository_path)
         .output()
         .expect("jj init");

@@ -75,7 +75,12 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // help, so scripts and shell completion never unexpectedly claim the
     // terminal.
     if args.is_empty() {
-        return cli::run(vec!["help".to_owned()], launch, terminal_settings);
+        return cli::run(
+            vec!["help".to_owned()],
+            launch,
+            terminal_settings,
+            colocate_setting,
+        );
     }
     if args.first().map(String::as_str) == Some("tui") {
         if args.len() != 1 {
@@ -105,7 +110,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    cli::run(args, launch, terminal_settings)
+    cli::run(args, launch, terminal_settings, colocate_setting)
 }
 
 /// Resolve the terminal settings a `mount` invocation needs: the first-pane
@@ -124,6 +129,12 @@ pub fn terminal_settings() -> anyhow::Result<wsg_core::TerminalSettings> {
         first_pane_command: config.first_pane_command(),
         layout,
     })
+}
+
+/// The `colocate` setting the CLI uses when creating workspaces. Read lazily -
+/// only CLI commands that touch a repository load jjfx's config file.
+pub fn colocate_setting() -> anyhow::Result<bool> {
+    Ok(config::load()?.colocate)
 }
 
 /// Launch the shared interactive jjfx TUI for a discovered repository.
@@ -184,11 +195,12 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         tx.clone(),
         repo_root.clone(),
         config.forge,
+        config.colocate,
         Arc::clone(&terminal),
         Some(events::setup_error_log_path()),
     );
     let mut app = App::new(
-        Store::load(&repo_root),
+        Store::load(&repo_root).with_colocate(config.colocate),
         initial_agents,
         terminal,
         Box::new(jj::RealJj::new(repo_root.clone())),

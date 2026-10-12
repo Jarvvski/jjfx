@@ -590,31 +590,36 @@ pub fn run(
     args: Vec<String>,
     launch: fn(PathBuf) -> Result<()>,
     terminal_settings: fn() -> Result<TerminalSettings>,
+    colocate: fn() -> Result<bool>,
 ) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
         Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
         Command::Default => default_command(launch)?,
-        Command::Root => root_command(&repository()?)?,
-        Command::Where => where_command(&repository()?)?,
-        Command::Path { name } => path_command(&repository()?, &name)?,
-        Command::Refresh => refresh_command(&repository()?)?,
-        Command::Add { name, revision } => add_command(&repository()?, &name, revision.as_deref())?,
-        Command::List => list_command(&repository()?)?,
-        Command::Remove { force, names } => remove_command(&repository()?, force, &names)?,
-        Command::Clean => clean_command(&repository()?)?,
-        Command::Status => pool_list_command(&repository()?)?,
-        Command::Dispatch(args) => dispatch_command(&repository()?, &args)?,
+        Command::Root => root_command(&repository(colocate)?)?,
+        Command::Where => where_command(&repository(colocate)?)?,
+        Command::Path { name } => path_command(&repository(colocate)?, &name)?,
+        Command::Refresh => refresh_command(&repository(colocate)?)?,
+        Command::Add { name, revision } => {
+            add_command(&repository(colocate)?, &name, revision.as_deref())?
+        }
+        Command::List => list_command(&repository(colocate)?)?,
+        Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
+        Command::Clean => clean_command(&repository(colocate)?)?,
+        Command::Status => pool_list_command(&repository(colocate)?)?,
+        Command::Dispatch(args) => dispatch_command(&repository(colocate)?, &args)?,
         Command::Send {
             worker,
             prompt,
             mode,
-        } => send_command(&repository()?, &worker, &prompt, mode)?,
-        Command::Review { worker, mode } => review_command(&repository()?, &worker, mode)?,
-        Command::Logs { worker } => logs_command(&repository()?, &worker)?,
-        Command::Mount { worker } => mount_command(&repository()?, &worker, terminal_settings)?,
-        Command::Rebase { worker } => rebase_command(&repository()?, &worker)?,
-        Command::OpenPullRequest { worker } => open_pr_command(&repository()?, &worker)?,
+        } => send_command(&repository(colocate)?, &worker, &prompt, mode)?,
+        Command::Review { worker, mode } => review_command(&repository(colocate)?, &worker, mode)?,
+        Command::Logs { worker } => logs_command(&repository(colocate)?, &worker)?,
+        Command::Mount { worker } => {
+            mount_command(&repository(colocate)?, &worker, terminal_settings)?
+        }
+        Command::Rebase { worker } => rebase_command(&repository(colocate)?, &worker)?,
+        Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
         Command::InternalComplete { mode } => internal_complete_command(&mode)?,
         Command::InternalOrchestrate {
@@ -622,18 +627,24 @@ pub fn run(
             provider,
             model,
         } => orchestrate_command(
-            &repository()?,
+            &repository(colocate)?,
             &parent,
             provider.as_deref(),
             model.as_deref(),
         )?,
-        Command::Pool(command) => pool_command(&repository()?, command)?,
+        Command::Pool(command) => pool_command(&repository(colocate)?, command)?,
     }
     Ok(())
 }
 
-fn repository() -> Result<Repository> {
-    Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))
+fn repository(colocate: fn() -> Result<bool>) -> Result<Repository> {
+    // New workspaces follow jjfx's `colocate` setting, read lazily so only
+    // commands that touch a repository pay for it; a broken config is a loud
+    // error, exactly as it is in the TUI.
+    let colocate = colocate()?;
+    Repository::open(".")
+        .map(|repository| repository.with_colocate(colocate))
+        .map_err(|_| anyhow::anyhow!("Not in a jj repo"))
 }
 
 fn print_hook_output(_stream: WorkspaceHookStream, line: &str) {

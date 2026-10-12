@@ -97,6 +97,8 @@ fn orchestration_notice(event: &wsg_core::OrchestrationEvent) -> Option<String> 
 #[derive(Debug, Clone)]
 pub struct RealWorkspaceDispatch {
     repository_root: PathBuf,
+    /// Whether new Workspaces are colocated with Git (jjfx's `colocate`).
+    colocate: bool,
 }
 
 fn configured_ticket_query(
@@ -124,11 +126,20 @@ impl RealWorkspaceDispatch {
     pub fn new(repository_root: impl Into<PathBuf>) -> Self {
         Self {
             repository_root: repository_root.into(),
+            colocate: true,
         }
     }
 
+    /// Sets the Workspace colocation preference (builder form).
+    pub fn with_colocate(mut self, colocate: bool) -> Self {
+        self.colocate = colocate;
+        self
+    }
+
     fn repository(&self) -> Result<wsg_core::Repository, String> {
-        wsg_core::Repository::open(&self.repository_root).map_err(|error| error.to_string())
+        wsg_core::Repository::open(&self.repository_root)
+            .map(|repository| repository.with_colocate(self.colocate))
+            .map_err(|error| error.to_string())
     }
 
     fn dispatch_with_strategy(

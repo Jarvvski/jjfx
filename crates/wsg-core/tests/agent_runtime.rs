@@ -550,7 +550,13 @@ fn probe_runs_in_the_worker_workspace() {
 fn reserved_background_run_persists_pid_before_returning() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -639,7 +645,13 @@ fn reserved_background_run_persists_pid_before_returning() {
 fn reserved_background_run_releases_worker_when_runtime_probe_fails() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -727,7 +739,13 @@ fn reserved_background_run_releases_worker_when_runtime_probe_fails() {
 fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_persistence() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -848,7 +866,13 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
 fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -1437,7 +1461,13 @@ fn foreground_run_spawn_failure_is_typed() {
 fn reserved_background_run_finalizes_worker_after_wait() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -1527,7 +1557,13 @@ fn reserved_background_run_finalizes_worker_after_wait() {
 fn reserved_background_pi_run_uses_shared_pid_and_finalization_supervision() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -1629,7 +1665,13 @@ fn reserved_background_pi_run_uses_shared_pid_and_finalization_supervision() {
 fn reserved_background_run_finalizes_failed_worker_after_wait() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -1719,7 +1761,13 @@ fn reserved_background_run_finalizes_failed_worker_after_wait() {
 fn reserved_foreground_run_finalizes_worker_after_completion() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -1830,7 +1878,13 @@ fn reserved_foreground_run_finalize_helper() {
 fn stale_background_waiter_cannot_finalize_newer_run() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");
@@ -2932,7 +2986,13 @@ fn dead_pid() -> u32 {
 
 fn initialize_repository(root: &std::path::Path) -> Repository {
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(root)
         .output()
         .expect("jj should be installed");

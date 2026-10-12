@@ -354,7 +354,7 @@ impl App {
     ) -> Self {
         let dispatch_tx = tx.clone();
         let dispatch = WorkspaceDispatchController::new(
-            RealWorkspaceDispatch::new(store.repo_root()),
+            RealWorkspaceDispatch::new(store.repo_root()).with_colocate(store.colocate()),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
             },
@@ -2651,6 +2651,7 @@ mod tests {
             tx.clone(),
             store.repo_root().to_path_buf(),
             ForgeConfig::default(),
+            store.colocate(),
             Arc::clone(&terminal),
             None,
         );
@@ -3543,7 +3544,13 @@ mod tests {
     fn worker_action_event_keeps_session_outcome_visible() {
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(temp.path())
             .output()
             .unwrap();
@@ -3808,7 +3815,13 @@ mod tests {
     fn parent_orchestration_uses_o_without_changing_direct_dispatch_d() {
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(temp.path())
             .output()
             .unwrap();
@@ -3858,7 +3871,13 @@ mod tests {
     fn worker_log_detail_renders_provider_neutral_pi_activity_and_result() {
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(temp.path())
             .output()
             .unwrap();
@@ -3906,7 +3925,13 @@ mod tests {
     fn tui_runtime_matrix_preserves_session_activity_failure_and_completion_rendering() {
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(temp.path())
             .output()
             .unwrap();
@@ -4057,7 +4082,13 @@ mod tests {
         let mut app = app_with(&["default"]);
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(temp.path())
             .output()
             .unwrap();
@@ -4109,7 +4140,13 @@ mod tests {
 
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
-            .args(["--config", "signing.behavior=drop", "git", "init"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
             .arg(temp.path())
             .output()
             .unwrap();

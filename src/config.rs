@@ -12,7 +12,7 @@ use serde::Deserialize;
 use wsg_core::PaneLayout;
 
 /// The whole jjfx config tree.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// How jjfx launches the coding agent in each workspace.
@@ -21,10 +21,29 @@ pub struct Config {
     pub terminal: TerminalConfig,
     /// How the forge pipeline opens and maintains pull requests.
     pub forge: ForgeConfig,
+    /// Whether new workspaces are colocated with Git: `jj workspace add` creates
+    /// a Git worktree so each agent workspace has a working `.git`, which lets
+    /// tools such as `gh stack` run inside it. On by default; set false to create
+    /// non-colocated workspaces. A repository that is not itself colocated never
+    /// colocates, whatever this says.
+    pub colocate: bool,
     /// Legacy workspace settings are accepted and ignored after lifecycle hooks
     /// moved into the repository's `.jjfx` scripts.
     #[serde(rename = "workspace")]
     _legacy_workspace: Option<toml::Value>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            agent: AgentConfig::default(),
+            terminal: TerminalConfig::default(),
+            forge: ForgeConfig::default(),
+            // Colocation is on by default, matching jj 0.46's own default.
+            colocate: true,
+            _legacy_workspace: None,
+        }
+    }
 }
 
 impl Config {
@@ -241,6 +260,14 @@ mod tests {
         // Forge PR management is on-by-default, drafts on-by-default.
         assert!(cfg.forge.pull_requests);
         assert!(cfg.forge.draft);
+        // Workspace colocation is on-by-default.
+        assert!(cfg.colocate);
+    }
+
+    #[test]
+    fn colocation_can_be_disabled() {
+        let cfg: Config = toml::from_str("colocate = false\n").expect("toml parses");
+        assert!(!cfg.colocate);
     }
 
     #[test]

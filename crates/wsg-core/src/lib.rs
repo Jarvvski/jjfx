@@ -85,9 +85,25 @@ pub use workspace::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
     root: PathBuf,
+    colocate: bool,
 }
 
 impl Repository {
+    /// Whether new Workspaces are colocated with Git (a Git worktree with a
+    /// working `.git`). jjfx's `colocate` setting, on by default. A repository
+    /// that is not itself colocated never colocates, whatever this says.
+    pub fn colocate(&self) -> bool {
+        self.colocate
+    }
+
+    /// Returns this repository with the Workspace colocation preference set.
+    /// Keeping this a builder lets [`Repository::open`] callers (and their
+    /// tests) stay on the default without threading the setting everywhere.
+    pub fn with_colocate(mut self, colocate: bool) -> Self {
+        self.colocate = colocate;
+        self
+    }
+
     /// Discovers the nearest ancestor containing a `.jj` directory.
     pub fn open(start: impl AsRef<Path>) -> Result<Self, RepositoryError> {
         let start = start.as_ref().to_path_buf();
@@ -116,7 +132,10 @@ impl Repository {
                         source,
                     }
                 })?;
-                return Ok(Self { root });
+                return Ok(Self {
+                    root,
+                    colocate: true,
+                });
             }
             if !directory.pop() {
                 return Err(RepositoryError::NotFound { start });

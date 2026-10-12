@@ -6,6 +6,7 @@ fn main() {
         std::env::args().skip(1).collect(),
         jjfx::launch,
         jjfx::terminal_settings,
+        jjfx::colocate_setting,
     );
     if let Err(error) = result {
         eprintln!("{error}");

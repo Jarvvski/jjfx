@@ -1871,7 +1871,13 @@ fn write_executable(path: &Path, contents: &str) {
 fn local_repository() -> (TempDir, Repository) {
     let temporary_directory = tempfile::tempdir().expect("temporary directory");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(temporary_directory.path())
         .output()
         .expect("jj should be installed");

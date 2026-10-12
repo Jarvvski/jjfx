@@ -29,7 +29,13 @@ pub(crate) struct BinarySpec {
 pub(crate) fn local_repository() -> TempDir {
     let directory = tempfile::tempdir().expect("temporary directory should be created");
     let output = Command::new("jj")
-        .args(["--config", "signing.behavior=drop", "git", "init"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
         .arg(directory.path())
         .output()
         .expect("jj should run");

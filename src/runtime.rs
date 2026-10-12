@@ -56,6 +56,8 @@ pub(crate) struct Runtime {
     repo_root: PathBuf,
     terminal: Arc<dyn Terminal>,
     forge: forge::Forge,
+    /// Whether new workspaces are colocated with Git (jjfx's `colocate`).
+    colocate: bool,
     /// Where full failure text is appended; `None` disables logging (tests).
     failure_log: Option<PathBuf>,
 }
@@ -67,6 +69,7 @@ impl Runtime {
         tx: UnboundedSender<Msg>,
         repo_root: PathBuf,
         forge: ForgeConfig,
+        colocate: bool,
         terminal: Arc<dyn Terminal>,
         failure_log: Option<PathBuf>,
     ) -> Self {
@@ -74,6 +77,7 @@ impl Runtime {
             tx,
             forge: forge::Forge::new(repo_root.clone(), forge),
             repo_root,
+            colocate,
             terminal,
             failure_log,
         }
@@ -139,6 +143,7 @@ impl Runtime {
     fn create_workspace(&self, workspace: PendingWorkspace) {
         let tx = self.tx.clone();
         let repo_root = self.repo_root.clone();
+        let colocate = self.colocate;
         tokio::spawn(async move {
             let progress_tx = tx.clone();
             let progress_workspace = workspace.clone();
@@ -147,6 +152,7 @@ impl Runtime {
                 Store::create_persisted_with_progress(
                     &repo_root,
                     &requested_name,
+                    colocate,
                     move |stream, line| {
                         if !line.trim().is_empty() {
                             let _ = progress_tx.send(Msg::WorkspaceSetupOutput {
