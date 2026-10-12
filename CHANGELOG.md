@@ -27,6 +27,11 @@ version of record lives in the project manifest.
   lets tools such as `gh stack` run inside it. Controlled by the new top-level
   `colocate` setting, on by default. (jjfx 0.51.0, wsg 0.19.0)
 
+- 2026-10-12 - `jjfx colocation <enable|disable|status>` converts an existing
+  repository to Git colocation in place through `jj git colocation`, so it can
+  be switched (or checked) without hand-running jj. The decision is recorded in
+  `docs/adr/0010-colocate-workspaces-with-git.md`. (jjfx 0.51.0, wsg 0.19.0)
+
 - 2026-10-08 - `PageUp` and `PageDown` now jump the workspace-list selection
   straight to the first or last workspace (jjfx 0.50.0).
 
