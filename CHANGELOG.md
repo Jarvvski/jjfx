@@ -20,16 +20,6 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ## [Unreleased]
 
-### Fixed
-
-- 2026-10-09 - Workspace creation (`n`) now reports the real failure and cleans
-  up after itself: a failed `jj workspace add` no longer leaves a stray
-  `<repo>-<name>` directory behind, a create-step failure says `could not create
-  '<name>'` instead of the misleading `created '<name>', setup failed`, signing
-  failures surface an actionable GPG hint, and the full error text is appended to
-  `${XDG_STATE_HOME:-~/.local/state}/jjfx/setup-errors.log` so a footer-truncated
-  failure stays inspectable (jjfx 0.50.1).
-
 ### Added
 
 - 2026-10-12 - `jjfx` is now a single crate and publishes to crates.io:
@@ -55,37 +45,6 @@ retired, so entries here are versioned by `jjfx` alone.
 
 - 2026-10-08 - `PageUp` and `PageDown` now jump the workspace-list selection
   straight to the first or last workspace (jjfx 0.50.0).
-
-### Changed
-
-- 2026-10-07 - Lifting a workspace (`r`) and lifting all (`R`) now run in the
-  background through a serial queue instead of blocking the UI, so several
-  rebases can be kicked off in a row. Rows show `queued`/`lifting...` while their
-  job is pending, and the footer tracks queue depth and failures (jjfx 0.49.0).
-
-- 2026-09-11 - Redesigned the window-opening layout: opening a workspace and
-  Mounting a Worker now both build a 19% shell column on the left, split into
-  two stacked shells, with the agent taking the remaining 81% width, replacing
-  the previous top-shell and three-pane layouts. Every pane still starts in the
-  workspace directory and focus finishes on the agent pane (jjfx 0.47.0,
-  wsg 0.17.0).
-
-### Fixed
-
-- 2026-09-18 - Returning to an already-open Workspace now focuses its agent
-  pane rather than just its tab. Panes are tagged with their role at launch
-  (`jjfx_role`) so the agent can be found again, falling back to the configured
-  agent command for tabs opened before the tag existed (jjfx 0.48.1).
-
-- 2026-09-11 - The TUI now reads its Workspace list through the same
-  cache-backed projection as the CLI and Worker Pool, so a Workspace whose
-  directory is absent has no usable path: `jjfx --list` prints an empty path
-  and forge or terminal actions refuse it instead of targeting a missing
-  working copy. `wsg refresh` preserves cached ad-hoc Workspace paths instead
-  of rewriting them to the named-Workspace convention (jjfx 0.46.1,
-  wsg 0.16.1).
-
-### Added
 
 - 2026-09-18 - Window layouts are now configurable per display: named pane
   layouts under `terminal.layouts` are selected by `terminal.layout_by_display`
@@ -225,43 +184,6 @@ retired, so entries here are versioned by `jjfx` alone.
 - 2026-07-21 - Added the shared Workspace Dispatch Rust foundation and a
   repository-independent `wsg` help/version skeleton (v0.28.0).
 
-### Fixed
-
-- 2026-08-13 - Home workspace rows no longer add placeholder-only Worker
-  metadata lines for idle, unassigned Workers. Optional runtime, ticket, and
-  activity fields are omitted when unavailable.
-
-- 2026-07-27 - Worker Pool snapshots now read the actual Go wsg state layout
-  (v0.28.2), including `.jj/pool/<worker>.json`, aliases, Agent Runtime,
-  completion metadata, and partial diagnostics. Shared Pool, Worker, and
-  Dispatch Group repositories now preserve compatible state and serialize
-  concurrent Go and Rust writers through the same sidecar locks.
-
-- 2026-07-20 - Workspace rows show the least-delivered change (v0.27.1): a
-  local change now remains dirty, and a pushed change remains pushed, when a
-  lower change already has an open PR. PR-only stacks show the lowest PR with
-  the most blocking review verdict instead of whichever PR was returned first.
-
-- 2026-07-17 - Default workspace stays pinned at the top (v0.25.2): `default`
-  now remains above every attention group regardless of its current lifecycle.
-  Folding the idle group keeps it visible, and initial selection starts there.
-
-- 2026-07-17 - Completed forge pipelines no longer remain in workspace rows
-  (v0.25.1): a skipped push or Pull Request step left its final progress
-  snapshot visible forever. Finished pipelines now return to the normal work
-  status while the skip reason remains briefly in the footer.
-
-- 2026-07-16 - Needs-you no longer sticks after a permission is resolved
-  (v0.25.0): no hook fires when a permission dialog is approved/denied, so a
-  row stayed red until the turn's final Stop even though the agent had long
-  resumed. The hook set now also registers `PostToolUse` (both agents), and
-  a tool completing while a workspace is needs-attention folds it back to
-  working. Rerun `jjfx hooks install` to register the new event; running
-  agent sessions pick it up after a restart, and codex will re-prompt for
-  hook trust.
-
-### Added
-
 - 2026-07-20 - Configurable new-workspace setup (v0.27.0): set
   `[workspace] on_create = ["mise", "trust"]` to run a program and its
   arguments from each workspace created through `n`. jjfx runs it in the
@@ -294,93 +216,12 @@ retired, so entries here are versioned by `jjfx` alone.
   Codex has no `SessionEnd` hook, so a closed codex session shows `waiting`
   rather than `ended`.
 
-### Changed
-
-- 2026-07-17 - Agent launch uses one shell command (v0.26.0): configure
-  `[agent] command = "cx"` to run any coding agent command, including aliases
-  and commands with flags. It always runs through `$SHELL -l -i -c`, with
-  `"claude"` as the default. Breaking: `[terminal] agent`, `[claude]`, and
-  `[codex]` are removed; replace them with the single `[agent]` section.
-
-- 2026-07-14 - World graph shows the connected trunk spine (v0.22.2): instead
-  of eliding trunk history down to branch points, the world view now renders
-  every trunk ancestor as a connected `◆` mainline (the `::trunk()` the
-  owner's `jj log` shows), with each mutable fragment attached beside its
-  branch point. Ordering now mirrors jj's `log-graph-prioritize`: the default
-  workspace's chain leads, then the other workspaces, then fragments grouped
-  where they branch - no more free-floating hooks between fragments.
-
-- 2026-07-14 - World graph hides immutable history like jj does (v0.22.1):
-  the world view's mutable set now matches jj's `immutable_heads()..` exactly -
-  ancestors of trunk, tags, and untracked remote bookmarks (other people's
-  branches) no longer render as orphaned mutable fragments. Previously the
-  boundary was trunk-only and capped at 1,000 commits, so on a large repo
-  thousands of already-landed commits leaked into the view as disconnected `○`
-  chains; the immutable walk is now sized for whole-repo history (50k cap).
-
-- 2026-07-14 - World graph is now the real jj log DAG (v0.22.0): the world
-  view (full-screen `W` and the inline `w` pane) lays commits out like
-  `jj log` - one topologically ordered graph with fork/merge connectors and
-  elided history (`~`), drawn by sapling-renderdag (the renderer jj's own
-  CLI uses) - instead of stacking each workspace's chain under a name header
-  with the trunk floating disjointedly above. Every workspace's `@` is
-  badged `name@`; the selected workspace's chain stays highlighted.
-
-- 2026-07-14 - Selectable coding agent (v0.20.0): a new `[terminal] agent`
-  config key picks which agent a workspace tab's left pane runs - `"claude"`
-  (the default) or `"codex"`. Each agent has its own top-level section
-  (`[claude]` / `[codex]`) whose `command` overrides the default login-shell
-  wrap of the agent's binary. Breaking: `[terminal] claude_command` is
-  removed - a config still setting it fails at startup naming the key; move
-  the value to `command` under `[claude]`.
-
-- 2026-07-14 - Footer status messages expire (v0.19.0): the transient result
-  line after an action ("lifted feat onto trunk", "fetched", ...) now clears
-  itself after 5 seconds instead of sitting in the footer until the next
-  action. In-flight progress ("fetching…") still stays until its outcome
-  arrives.
-
-### Added
-
 - 2026-07-14 - Fetch keybinding (v0.18.0): `u` runs `jj git fetch` on a
   background task and reports the outcome in the footer. Remote-only changes -
   a PR merged on GitHub, its head branch deleted - now reach the work rows
   without running a full forge: fetching advances `trunk()` and propagates
   remote branch deletions, which is what lets a stale "merged" row resolve
   back to clean.
-
-### Fixed
-
-- 2026-07-14 - Quitting no longer hangs on an in-flight poll (v0.17.1): pressing
-  `q` used to leave the process lingering until any mid-flight `gh`/`jj` work
-  snapshot finished, because dropping the tokio runtime joins every blocking
-  task. The runtime now shuts down in the background on exit, so quit returns
-  the prompt immediately.
-
-- 2026-07-09 - Merged PRs read as merged in the work list (v0.16.1): a workspace
-  whose PR `gh` reports with a `mergedAt` timestamp but a non-`MERGED` state (e.g.
-  a squash-merge recorded as closed) now shows "merged" instead of falling back to
-  "pushed". The work-list overlay and the forge's stacked-PR submission now share
-  one PR model with a single mergedness rule (`state == "MERGED"` or a set
-  `mergedAt`), so the two can no longer disagree about whether a PR has merged.
-
-- 2026-07-09 - Honest forge (v0.16.0): a forge that pushed nothing no longer
-  claims "forged". `jj git push` exits 0 even when it moves nothing (printing
-  "Nothing changed."), so an undescribed or unbookmarked working copy used to
-  sail through the push step and drop the progress overlay as if it had merged
-  work. Push now reads its output and reports "nothing to push" when the push was
-  a no-op, leaving the row honestly "ready to forge".
-
-- 2026-07-09 - Claude pane inherits your shell PATH (v0.15.0): the left pane now
-  launches claude through your login shell (`$SHELL -l -i -c claude`) instead of
-  execing `claude` directly, so it sources your `.zprofile`/`.zshrc` and sees the
-  same PATH as the two shell panes beside it. Previously a GUI-launched kitty
-  handed claude launchd's bare environment, leaving it (and every command it ran)
-  with an empty PATH. A new `[terminal] claude_command` config field overrides
-  the left-pane command (program + args) if you want a different agent or to skip
-  the shell wrap.
-
-### Added
 
 - 2026-07-14 - Inline world graph (v0.17.0): `w` on the home view now toggles a
   world-graph pane underneath the workspace list, so you can watch trunk and
@@ -429,38 +270,6 @@ retired, so entries here are versioned by `jjfx` alone.
   mainline for clean PRs). Unlike `tidyws`, which only touches idle *empty*
   workspaces, `r`/`R` lift a workspace regardless of its contents.
 
-### Changed
-
-- 2026-07-09 - Workspace tab layout (v0.14.0): opening a workspace now builds
-  three panes - claude on the left, and a right column split into two stacked
-  shells - matching the `jj-wsx` layout. The splits are anchored to their window
-  ids so they land correctly even when the tab is opened in the background, which
-  now uses `--dont-take-focus` (so a background open never raises the target) and
-  then focuses the claude pane.
-
-### Fixed
-
-- 2026-07-09 - Shared-base work state (v0.14.0): a workspace's state
-  (PR / pushed / dirty) is now computed only from the commits it *owns*, not from
-  a base it shares with other workspaces. Previously a branch sitting on a common
-  ancestor - e.g. several workspaces parked on or stacked above one feature branch -
-  made every one of them claim that branch's PR (and look pushed). Each commit is
-  now attributed to at most one workspace: a commit on a single chain belongs to
-  it, and a commit several workspaces share belongs only to the one that uniquely
-  *heads* it (a base nobody uniquely heads is owned by none). So an empty workspace
-  parked on a pushed branch reads `clean`, a workspace with its own commit on top
-  reads `dirty` (measured from its own base), and normal stacked PRs still show.
-
-- 2026-07-08 - Behind indicator (v0.11.1): the `↓N` "behind trunk" count now
-  measures against the same base as the dirty/clean classification -
-  `TRUNK_BASE` (the latest of the remote mainline and the local
-  `main`/`master`/`trunk` bookmarks) - instead of jj's raw `trunk()`
-  (`origin/main`). Previously, when local `main` was ahead of `origin/main`, a
-  workspace could read `clean` yet show no `↓` despite being several commits
-  behind the base its cleanliness was judged against.
-
-### Added
-
 - 2026-07-08 - Commit graph (v0.11.0): press `w` for a full-screen "world" graph -
   `trunk()` plus every workspace's chain, each commit shown with its change id,
   summary, and bookmarks, and the selected workspace's chain highlighted.
@@ -488,35 +297,6 @@ retired, so entries here are versioned by `jjfx` alone.
   keybindings menu (action left, key right) drawn over the dimmed list; `?` or
   `esc` closes it. The footer no longer carries the full key list - in normal
   mode it now shows only `j/k move  ? help  q quit`.
-
-### Fixed
-
-- 2026-07-08 - Stop the forge pipeline from spewing over the TUI (v0.8.2): the
-  `fetch`, `weld`, `push`, and `spr` steps ran their subprocesses with bare
-  `.status()`, which inherits the parent's stdout/stderr - so jj/jj-spr output
-  (`Working copy (@) now at:`, `Nothing changed.`, `Added 0 files, modified 5
-  files`) printed straight onto the alt-screen and corrupted the workspace list.
-  Those steps now redirect both streams to `Stdio::null()`, matching the forge's
-  design of modelling step state natively rather than scraping stdout.
-
-- 2026-07-08 - Correct the diff base in never-pushed repos (v0.8.1): `trunk()`
-  resolves to the root commit when no remote mainline bookmark exists yet, which
-  made every workspace diff the entire history - so an empty workspace read as
-  `dirty` and landed in "ready to forge". The work snapshot now measures a
-  workspace's chain and diff against `trunk()` when it is a real commit, else the
-  local `main`/`master`/`trunk` bookmark. Once main is pushed, `trunk()` wins and
-  behaviour is unchanged.
-
-### Changed
-
-- 2026-07-08 - Minimal restyle of the workspace list (v0.8.0): dropped the box
-  border and the full-width reversed selection bar - the latter inverted every
-  padded, coloured column into a solid block. Rows now carry a dim `·` bullet
-  (the selected row a bright `▸`), only the selected name is boxed, and the
-  attention column is padded past its widest heading so the columns line up
-  across every row. Calmer and closer to a plain, minimal list.
-
-### Added
 
 - 2026-07-08 - Forge pipeline (v0.7.0): drive a workspace toward merge from the
   list. `f` forges the selected workspace, `F` forges every eligible one, and `g`
@@ -586,3 +366,195 @@ retired, so entries here are versioned by `jjfx` alone.
   watches `.jj/` so a shell-created workspace appears without a restart. `q`/esc
   quit and a restore-on-panic guard keeps the terminal intact. `--list` dumps the
   reconciled store headlessly.
+
+### Changed
+
+- 2026-10-07 - Lifting a workspace (`r`) and lifting all (`R`) now run in the
+  background through a serial queue instead of blocking the UI, so several
+  rebases can be kicked off in a row. Rows show `queued`/`lifting...` while their
+  job is pending, and the footer tracks queue depth and failures (jjfx 0.49.0).
+
+- 2026-09-11 - Redesigned the window-opening layout: opening a workspace and
+  Mounting a Worker now both build a 19% shell column on the left, split into
+  two stacked shells, with the agent taking the remaining 81% width, replacing
+  the previous top-shell and three-pane layouts. Every pane still starts in the
+  workspace directory and focus finishes on the agent pane (jjfx 0.47.0,
+  wsg 0.17.0).
+
+- 2026-07-17 - Agent launch uses one shell command (v0.26.0): configure
+  `[agent] command = "cx"` to run any coding agent command, including aliases
+  and commands with flags. It always runs through `$SHELL -l -i -c`, with
+  `"claude"` as the default. Breaking: `[terminal] agent`, `[claude]`, and
+  `[codex]` are removed; replace them with the single `[agent]` section.
+
+- 2026-07-14 - World graph shows the connected trunk spine (v0.22.2): instead
+  of eliding trunk history down to branch points, the world view now renders
+  every trunk ancestor as a connected `◆` mainline (the `::trunk()` the
+  owner's `jj log` shows), with each mutable fragment attached beside its
+  branch point. Ordering now mirrors jj's `log-graph-prioritize`: the default
+  workspace's chain leads, then the other workspaces, then fragments grouped
+  where they branch - no more free-floating hooks between fragments.
+
+- 2026-07-14 - World graph hides immutable history like jj does (v0.22.1):
+  the world view's mutable set now matches jj's `immutable_heads()..` exactly -
+  ancestors of trunk, tags, and untracked remote bookmarks (other people's
+  branches) no longer render as orphaned mutable fragments. Previously the
+  boundary was trunk-only and capped at 1,000 commits, so on a large repo
+  thousands of already-landed commits leaked into the view as disconnected `○`
+  chains; the immutable walk is now sized for whole-repo history (50k cap).
+
+- 2026-07-14 - World graph is now the real jj log DAG (v0.22.0): the world
+  view (full-screen `W` and the inline `w` pane) lays commits out like
+  `jj log` - one topologically ordered graph with fork/merge connectors and
+  elided history (`~`), drawn by sapling-renderdag (the renderer jj's own
+  CLI uses) - instead of stacking each workspace's chain under a name header
+  with the trunk floating disjointedly above. Every workspace's `@` is
+  badged `name@`; the selected workspace's chain stays highlighted.
+
+- 2026-07-14 - Selectable coding agent (v0.20.0): a new `[terminal] agent`
+  config key picks which agent a workspace tab's left pane runs - `"claude"`
+  (the default) or `"codex"`. Each agent has its own top-level section
+  (`[claude]` / `[codex]`) whose `command` overrides the default login-shell
+  wrap of the agent's binary. Breaking: `[terminal] claude_command` is
+  removed - a config still setting it fails at startup naming the key; move
+  the value to `command` under `[claude]`.
+
+- 2026-07-14 - Footer status messages expire (v0.19.0): the transient result
+  line after an action ("lifted feat onto trunk", "fetched", ...) now clears
+  itself after 5 seconds instead of sitting in the footer until the next
+  action. In-flight progress ("fetching…") still stays until its outcome
+  arrives.
+
+- 2026-07-09 - Workspace tab layout (v0.14.0): opening a workspace now builds
+  three panes - claude on the left, and a right column split into two stacked
+  shells - matching the `jj-wsx` layout. The splits are anchored to their window
+  ids so they land correctly even when the tab is opened in the background, which
+  now uses `--dont-take-focus` (so a background open never raises the target) and
+  then focuses the claude pane.
+
+- 2026-07-08 - Minimal restyle of the workspace list (v0.8.0): dropped the box
+  border and the full-width reversed selection bar - the latter inverted every
+  padded, coloured column into a solid block. Rows now carry a dim `·` bullet
+  (the selected row a bright `▸`), only the selected name is boxed, and the
+  attention column is padded past its widest heading so the columns line up
+  across every row. Calmer and closer to a plain, minimal list.
+
+### Fixed
+
+- 2026-10-09 - Workspace creation (`n`) now reports the real failure and cleans
+  up after itself: a failed `jj workspace add` no longer leaves a stray
+  `<repo>-<name>` directory behind, a create-step failure says `could not create
+  '<name>'` instead of the misleading `created '<name>', setup failed`, signing
+  failures surface an actionable GPG hint, and the full error text is appended to
+  `${XDG_STATE_HOME:-~/.local/state}/jjfx/setup-errors.log` so a footer-truncated
+  failure stays inspectable (jjfx 0.50.1).
+
+- 2026-09-18 - Returning to an already-open Workspace now focuses its agent
+  pane rather than just its tab. Panes are tagged with their role at launch
+  (`jjfx_role`) so the agent can be found again, falling back to the configured
+  agent command for tabs opened before the tag existed (jjfx 0.48.1).
+
+- 2026-09-11 - The TUI now reads its Workspace list through the same
+  cache-backed projection as the CLI and Worker Pool, so a Workspace whose
+  directory is absent has no usable path: `jjfx --list` prints an empty path
+  and forge or terminal actions refuse it instead of targeting a missing
+  working copy. `wsg refresh` preserves cached ad-hoc Workspace paths instead
+  of rewriting them to the named-Workspace convention (jjfx 0.46.1,
+  wsg 0.16.1).
+
+- 2026-08-13 - Home workspace rows no longer add placeholder-only Worker
+  metadata lines for idle, unassigned Workers. Optional runtime, ticket, and
+  activity fields are omitted when unavailable.
+
+- 2026-07-27 - Worker Pool snapshots now read the actual Go wsg state layout
+  (v0.28.2), including `.jj/pool/<worker>.json`, aliases, Agent Runtime,
+  completion metadata, and partial diagnostics. Shared Pool, Worker, and
+  Dispatch Group repositories now preserve compatible state and serialize
+  concurrent Go and Rust writers through the same sidecar locks.
+
+- 2026-07-20 - Workspace rows show the least-delivered change (v0.27.1): a
+  local change now remains dirty, and a pushed change remains pushed, when a
+  lower change already has an open PR. PR-only stacks show the lowest PR with
+  the most blocking review verdict instead of whichever PR was returned first.
+
+- 2026-07-17 - Default workspace stays pinned at the top (v0.25.2): `default`
+  now remains above every attention group regardless of its current lifecycle.
+  Folding the idle group keeps it visible, and initial selection starts there.
+
+- 2026-07-17 - Completed forge pipelines no longer remain in workspace rows
+  (v0.25.1): a skipped push or Pull Request step left its final progress
+  snapshot visible forever. Finished pipelines now return to the normal work
+  status while the skip reason remains briefly in the footer.
+
+- 2026-07-16 - Needs-you no longer sticks after a permission is resolved
+  (v0.25.0): no hook fires when a permission dialog is approved/denied, so a
+  row stayed red until the turn's final Stop even though the agent had long
+  resumed. The hook set now also registers `PostToolUse` (both agents), and
+  a tool completing while a workspace is needs-attention folds it back to
+  working. Rerun `jjfx hooks install` to register the new event; running
+  agent sessions pick it up after a restart, and codex will re-prompt for
+  hook trust.
+
+- 2026-07-14 - Quitting no longer hangs on an in-flight poll (v0.17.1): pressing
+  `q` used to leave the process lingering until any mid-flight `gh`/`jj` work
+  snapshot finished, because dropping the tokio runtime joins every blocking
+  task. The runtime now shuts down in the background on exit, so quit returns
+  the prompt immediately.
+
+- 2026-07-09 - Merged PRs read as merged in the work list (v0.16.1): a workspace
+  whose PR `gh` reports with a `mergedAt` timestamp but a non-`MERGED` state (e.g.
+  a squash-merge recorded as closed) now shows "merged" instead of falling back to
+  "pushed". The work-list overlay and the forge's stacked-PR submission now share
+  one PR model with a single mergedness rule (`state == "MERGED"` or a set
+  `mergedAt`), so the two can no longer disagree about whether a PR has merged.
+
+- 2026-07-09 - Honest forge (v0.16.0): a forge that pushed nothing no longer
+  claims "forged". `jj git push` exits 0 even when it moves nothing (printing
+  "Nothing changed."), so an undescribed or unbookmarked working copy used to
+  sail through the push step and drop the progress overlay as if it had merged
+  work. Push now reads its output and reports "nothing to push" when the push was
+  a no-op, leaving the row honestly "ready to forge".
+
+- 2026-07-09 - Claude pane inherits your shell PATH (v0.15.0): the left pane now
+  launches claude through your login shell (`$SHELL -l -i -c claude`) instead of
+  execing `claude` directly, so it sources your `.zprofile`/`.zshrc` and sees the
+  same PATH as the two shell panes beside it. Previously a GUI-launched kitty
+  handed claude launchd's bare environment, leaving it (and every command it ran)
+  with an empty PATH. A new `[terminal] claude_command` config field overrides
+  the left-pane command (program + args) if you want a different agent or to skip
+  the shell wrap.
+
+- 2026-07-09 - Shared-base work state (v0.14.0): a workspace's state
+  (PR / pushed / dirty) is now computed only from the commits it *owns*, not from
+  a base it shares with other workspaces. Previously a branch sitting on a common
+  ancestor - e.g. several workspaces parked on or stacked above one feature branch -
+  made every one of them claim that branch's PR (and look pushed). Each commit is
+  now attributed to at most one workspace: a commit on a single chain belongs to
+  it, and a commit several workspaces share belongs only to the one that uniquely
+  *heads* it (a base nobody uniquely heads is owned by none). So an empty workspace
+  parked on a pushed branch reads `clean`, a workspace with its own commit on top
+  reads `dirty` (measured from its own base), and normal stacked PRs still show.
+
+- 2026-07-08 - Behind indicator (v0.11.1): the `↓N` "behind trunk" count now
+  measures against the same base as the dirty/clean classification -
+  `TRUNK_BASE` (the latest of the remote mainline and the local
+  `main`/`master`/`trunk` bookmarks) - instead of jj's raw `trunk()`
+  (`origin/main`). Previously, when local `main` was ahead of `origin/main`, a
+  workspace could read `clean` yet show no `↓` despite being several commits
+  behind the base its cleanliness was judged against.
+
+- 2026-07-08 - Stop the forge pipeline from spewing over the TUI (v0.8.2): the
+  `fetch`, `weld`, `push`, and `spr` steps ran their subprocesses with bare
+  `.status()`, which inherits the parent's stdout/stderr - so jj/jj-spr output
+  (`Working copy (@) now at:`, `Nothing changed.`, `Added 0 files, modified 5
+  files`) printed straight onto the alt-screen and corrupted the workspace list.
+  Those steps now redirect both streams to `Stdio::null()`, matching the forge's
+  design of modelling step state natively rather than scraping stdout.
+
+- 2026-07-08 - Correct the diff base in never-pushed repos (v0.8.1): `trunk()`
+  resolves to the root commit when no remote mainline bookmark exists yet, which
+  made every workspace diff the entire history - so an empty workspace read as
+  `dirty` and landed in "ready to forge". The work snapshot now measures a
+  workspace's chain and diff against `trunk()` when it is a real commit, else the
+  local `main`/`master`/`trunk` bookmark. Once main is pushed, `trunk()` wins and
+  behaviour is unchanged.
