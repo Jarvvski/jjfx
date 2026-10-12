@@ -1,6 +1,6 @@
 # Prove Go/Rust conformance for wsg
 
-Status: ready-for-agent
+Status: resolved
 
 ## Parent
 
@@ -73,22 +73,22 @@ checks for the follow-up manual acceptance ticket.
 
 ## Acceptance Criteria
 
-- [ ] The conformance harness invokes selected Go and Rust binaries through a
+- [x] The conformance harness invokes selected Go and Rust binaries through a
       reusable test-only seam.
-- [ ] Workspace, Worker Pool, Reservation, Reset, resize, teardown, and
+- [x] Workspace, Worker Pool, Reservation, Reset, resize, teardown, and
       metadata scenarios pass in both implementation orders.
-- [ ] Mixed concurrent operations do not double-reserve, deadlock, lose state,
+- [x] Mixed concurrent operations do not double-reserve, deadlock, lose state,
       or leave malformed JSON or mismatched Workspace membership.
-- [ ] Runtime process leaders and descendants are cleaned across the
+- [x] Runtime process leaders and descendants are cleaned across the
       implementation boundary.
-- [ ] Dispatch Group progress resumes across implementations without duplicate
+- [x] Dispatch Group progress resumes across implementations without duplicate
       assignments and reaches matching terminal counts.
-- [ ] CLI aliases, completion, stdout/stderr roles, and exit outcomes are
+- [x] CLI aliases, completion, stdout/stderr roles, and exit outcomes are
       covered with strict versus semantic comparison applied explicitly.
-- [ ] Restart and interrupted-write scenarios preserve valid old-or-new state,
+- [x] Restart and interrupted-write scenarios preserve valid old-or-new state,
       unknown fields, and stale-revision protections.
-- [ ] `mise run conformance` requires and records explicit Go oracle paths.
-- [ ] `mise run check` is green.
+- [x] `mise run conformance` requires and records explicit Go oracle paths.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 

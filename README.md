@@ -19,6 +19,7 @@ mise run test    # cargo test
 mise run fmt     # cargo fmt --all
 mise run lint    # cargo clippy --all-targets -- -D warnings
 mise run check   # fmt + lint + build + test (the pre-land gate)
+mise run conformance  # Go/Rust wsg conformance (needs the Go oracle; see docs/wsg-conformance.md)
 ```
 
 Plain cargo works too:
@@ -64,6 +65,8 @@ Run `jjfx help` for usage.
 - [`docs/adr/`](docs/adr/) - architecture decision records.
 - [`docs/wsg-compatibility-contract.md`](docs/wsg-compatibility-contract.md) -
   the compatibility contract for the migration-era `wsg` target.
+- [wsg conformance](docs/wsg-conformance.md) - the migration-era Go/Rust
+  conformance suite, its invocation, and the accepted differences.
 - [`CHANGELOG.md`](CHANGELOG.md) - what has landed.
 
 ## Contributing
