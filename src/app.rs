@@ -2681,12 +2681,29 @@ mod tests {
         handle(app, runtime, press(KeyCode::Enter));
     }
 
+    /// How long a test waits for asynchronous work. These tests assert ordering,
+    /// not speed, so the budget only guards against a genuine hang - a heavily
+    /// loaded machine must not turn a correct run into a failure.
+    const WAIT_BUDGET: Duration = Duration::from_secs(30);
+
+    /// Poll `condition` on the calling thread until it holds or [`WAIT_BUDGET`]
+    /// passes.
+    fn wait_until(mut condition: impl FnMut() -> bool) {
+        let deadline = std::time::Instant::now() + WAIT_BUDGET;
+        while std::time::Instant::now() < deadline {
+            if condition() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     async fn handle_setup_completion(
         app: &mut App,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
         loop {
-            let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let message = tokio::time::timeout(WAIT_BUDGET, rx.recv())
                 .await
                 .expect("setup hook completes")
                 .expect("completion message arrives");
@@ -2703,7 +2720,7 @@ mod tests {
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
         loop {
-            let message = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            let message = tokio::time::timeout(WAIT_BUDGET, rx.recv())
                 .await
                 .expect("workspace deletion completes")
                 .expect("deletion completion message arrives");
@@ -3409,19 +3426,16 @@ mod tests {
         ));
         app.handle(press(KeyCode::Enter));
 
-        for _ in 0..100 {
-            if adapter.commands().iter().any(|command| {
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
                 matches!(
                     command,
                     WorkspaceDispatchCommand::Send { worker, prompt, .. }
                         if worker.as_deref() == Some("worker-01")
                             && prompt == "continue the work\nwith more detail?"
                 )
-            }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            })
+        });
         assert!(adapter.commands().iter().any(|command| {
             matches!(
                 command,
@@ -3477,18 +3491,15 @@ mod tests {
         )));
         app.handle(press(KeyCode::Enter));
 
-        for _ in 0..100 {
-            if adapter.commands().iter().any(|command| {
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
                 matches!(
                     command,
                     WorkspaceDispatchCommand::Send { worker, prompt, .. }
                         if worker.is_none() && prompt == "take the next task\nand report progress"
                 )
-            }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            })
+        });
         assert!(adapter.commands().iter().any(|command| {
             matches!(
                 command,
@@ -3713,14 +3724,11 @@ mod tests {
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
         app.handle(press(KeyCode::Char('x')));
         app.handle(press(KeyCode::Char('y')));
-        for _ in 0..100 {
-            if adapter.commands().iter().any(|command| {
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
                 matches!(command, WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01")
-            }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            })
+        });
         assert!(adapter.commands().iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01"
@@ -3731,14 +3739,11 @@ mod tests {
         });
         app.handle(press(KeyCode::Char('g')));
         app.handle(press(KeyCode::Char('P')));
-        for _ in 0..100 {
-            if adapter.commands().iter().any(|command| {
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
                 matches!(command, WorkspaceDispatchCommand::OpenPullRequest { worker, .. } if worker == "worker-01")
-            }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            })
+        });
         assert!(adapter.commands().iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Rebase { worker, .. } if worker == "worker-01"
@@ -3845,18 +3850,15 @@ mod tests {
         ));
         app.handle(press(KeyCode::Enter));
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
-        for _ in 0..100 {
-            if adapter.commands().iter().any(|command| {
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
                 matches!(
                     command,
                     WorkspaceDispatchCommand::Orchestrate { parent, .. }
                         if parent == "ENG-100"
                 )
-            }) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            })
+        });
         assert!(adapter.commands().iter().any(|command| {
             matches!(
                 command,
@@ -4867,14 +4869,32 @@ mod tests {
             .clone()
     }
 
-    async fn wait_for_directory(path: &std::path::Path) {
-        for _ in 0..100 {
+    /// Wait for a new workspace directory to appear. `jj workspace add` runs on
+    /// the blocking pool, so a loaded machine can take seconds; this asserts
+    /// ordering, not speed. On timeout, report any completion result so a real
+    /// creation failure is not mistaken for slowness.
+    async fn wait_for_directory(
+        path: &std::path::Path,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    ) {
+        let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
+        while tokio::time::Instant::now() < deadline {
             if path.is_dir() {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("workspace directory was not created: {}", path.display());
+        let detail = match rx.try_recv() {
+            Ok(Msg::WorkspaceSetupCompleted { result, .. }) => {
+                format!("; setup completed: {result:?}")
+            }
+            Ok(_) => "; setup produced output but never completed".to_owned(),
+            Err(_) => "; setup is still running".to_owned(),
+        };
+        panic!(
+            "workspace directory was not created: {}{detail}",
+            path.display()
+        );
     }
 
     #[tokio::test]
@@ -4922,7 +4942,7 @@ mod tests {
         assert!(terminal.opened.lock().unwrap().is_empty());
         assert_eq!(app.status.as_deref(), Some("setting up 'feat'..."));
         let path = pending_path(&app);
-        wait_for_directory(&path).await;
+        wait_for_directory(&path, &mut rx).await;
         std::fs::write(path.join("setup-release"), "").unwrap();
         handle_setup_completion(&mut app, &mut rx).await;
 
@@ -4957,7 +4977,7 @@ mod tests {
         );
 
         let path = pending_path(&app);
-        wait_for_directory(&path).await;
+        wait_for_directory(&path, &mut rx).await;
         std::fs::write(path.join("setup-release"), "").unwrap();
         handle_setup_completion(&mut app, &mut rx).await;
 
