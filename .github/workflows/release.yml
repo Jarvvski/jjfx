@@ -1,0 +1,148 @@
+name: Release
+
+# Owner-controlled release, dispatched by hand. It derives the next version
+# from the unreleased CHANGELOG markers, bumps the manifest, stamps the
+# changelog, builds the release archives, publishes jjfx to crates.io, and cuts
+# the GitHub Release.
+#
+# `workflow_dispatch` only runs from the default branch, so this file has to be
+# on `main` before it can be dispatched at all.
+#
+# The `release` environment gates publishing: it holds CARGO_REGISTRY_TOKEN and
+# requires a reviewer, so a real release needs an approval click on top of the
+# dispatch. `dry_run` defaults to true because a crates.io version number can
+# never be reused.
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Version bump - auto derives it from the Unreleased markers"
+        type: choice
+        options: [auto, patch, minor, major]
+        default: auto
+      dry_run:
+        description: "Stop before building, committing, tagging, publishing, or releasing"
+        type: boolean
+        default: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-14
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The "already released?" guard needs the tags.
+          fetch-depth: 0
+      - uses: jdx/mise-action@v2
+        with:
+          # Rustup components live outside mise's cached data directory.
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+
+      # The canonical gate, before anything irreversible. JJFX_KEEP_TARGET
+      # keeps `cargo clean` from throwing away the build cache that the archive
+      # build below depends on.
+      - name: Pre-land gate
+        env:
+          JJFX_KEEP_TARGET: "1"
+        run: mise run check
+
+      - name: Derive the next version
+        id: version
+        env:
+          BUMP: ${{ inputs.bump }}
+        run: |
+          set -euo pipefail
+          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+
+          if [ "$BUMP" = auto ]; then
+            version=$(mise run changelog-next)
+          else
+            IFS=. read -r major minor patch <<<"$base"
+            case "$BUMP" in
+              major) major=$((major + 1)); minor=0; patch=0 ;;
+              minor) minor=$((minor + 1)); patch=0 ;;
+              patch) patch=$((patch + 1)) ;;
+            esac
+            version="$major.$minor.$patch"
+          fi
+
+          if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
+            echo "error: tag v$version already exists" >&2
+            exit 1
+          fi
+          if curl -sf -A "jjfx-release-workflow" \
+              "https://crates.io/api/v1/crates/jjfx/$version" >/dev/null; then
+            echo "error: jjfx $version is already published on crates.io" >&2
+            exit 1
+          fi
+
+          echo "base=$base bump=$BUMP -> $version"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+
+      - name: Bump the manifest and stamp the changelog
+        run: |
+          set -euo pipefail
+          mise run version-set "${{ steps.version.outputs.version }}"
+          mise run changelog-stamp \
+            "${{ steps.version.outputs.version }}" "$(date -u +%Y-%m-%d)"
+
+      - name: Verify the package without publishing
+        run: cargo publish --dry-run --locked
+
+      - name: Summarise the dry run
+        if: inputs.dry_run
+        run: |
+          echo "dry run: would release ${{ steps.version.outputs.version }}"
+          git --no-pager diff --stat
+
+      # Built before anything is committed, so a failed cross-compile leaves a
+      # dirty checkout rather than a tag pointing at an unpublished release.
+      - name: Build the release archives
+        if: ${{ !inputs.dry_run }}
+        run: mise run release aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl
+
+      - name: Commit and tag
+        if: ${{ !inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git commit -m "Release $version"
+          git tag "v$version"
+          git push origin "HEAD:${{ github.ref_name }}" "refs/tags/v$version"
+
+      # Publish before creating the Release: a failed publish then leaves a tag
+      # but no release, which is recoverable. The reverse would leave a public
+      # release pointing at a crate version that does not exist.
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish --locked
+
+      - name: Create the GitHub Release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          version="${{ steps.version.outputs.version }}"
+          mise run changelog-notes "$version" >RELEASE_NOTES.md
+          gh release create "v$version" \
+            --title "v$version" \
+            --notes-file RELEASE_NOTES.md \
+            dist/*.tar.gz dist/*.tar.gz.sha256

@@ -141,6 +141,8 @@ cargo run -p jjfx -- pool list  # run a CLI command
   the compatibility contract for the migration-era `wsg` target.
 - [wsg conformance](docs/wsg-conformance.md) - the migration-era Go/Rust
   conformance suite, its invocation, and the accepted differences.
+- [Releasing](docs/releasing.md) - how a release is cut: the versioning model,
+  the dispatch workflow, and recovery from a partial release.
 - [`CHANGELOG.md`](CHANGELOG.md) - what has landed.
 
 ## Status
