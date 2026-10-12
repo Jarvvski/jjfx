@@ -12,7 +12,34 @@ The owner uses **Jujutsu exclusively** in a colocated repo. **Never invoke `git`
 
 **Landing is strictly local. Agents must NEVER push from this repository.** This rule applies even when the owner invokes `$land` exactly, and it overrides any generic skill contract that treats `$land` as remote-action authorization. Do not run `jj git push`, create a PR as part of landing, or otherwise publish a landed change. The owner handles all pushes.
 
-**Versioning & changelog.** Keep a single **version of record** (e.g. the manifest's version field) and treat it as authoritative. Semver: PATCH for fixes, MINOR otherwise; **never bump to 1.0.0 (or any MAJOR) without the owner's explicit approval - do not auto-bump.** A user-visible change adds a dated `CHANGELOG.md` entry (newest first) in the same commit; skip pure internal refactors.
+The one exception is the `Release` workflow (`.github/workflows/release.yml`),
+which the owner dispatches and which pushes its own bump commit and tag using
+`GITHUB_TOKEN`. That is owner-configured automation, not an agent push - do not
+"fix" it, and do not read it as licence to push yourself.
+
+**Versioning & changelog.** The version of record is `Cargo.toml`'s `version`
+field, and it is **release-owned**: only the release workflow moves it (via
+`mise run version-set`). Do not bump it by hand for an ordinary change.
+
+A user-visible change adds an entry under `## [Unreleased]` in `CHANGELOG.md`,
+newest first, ending with a semver intent marker:
+
+- `(break)` - an incompatible change
+- `(add)` - new functionality, backwards compatible
+- `(fix)` - a backwards-compatible bug fix
+
+jjfx is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.52.0`
+means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises
+the patch. `mise run changelog-next` derives the next version from the highest
+marker present, and `mise run changelog-check` (part of `mise run check`)
+validates them. **Never bump to 1.0.0 (or any MAJOR) without the owner's
+explicit approval.** Skip pure internal refactors.
+
+`crates/wsg` is frozen at its current version while the migration-era binary is
+retired; entries are versioned by `jjfx` alone.
+
+Releases are cut by dispatching `.github/workflows/release.yml` - see
+[`docs/releasing.md`](docs/releasing.md).
 
 Remote: `origin` = `Jarvvski/jjfx` (SSH: `git@github.com:Jarvvski/jjfx.git` - SSH avoids the OAuth `workflow`-scope gate on pushing `.github/workflows/`). `gh` auto-detection fails in jj workspaces - always pass `-R Jarvvski/jjfx`.
 
@@ -41,8 +68,10 @@ is the default scope for that agent session.
 
 **mise** owns tasks and the Rust pin (see `mise.toml`, `rust-toolchain.toml`). Use the tasks, don't hand-roll cargo:
 
-- `mise run check` - the pre-land gate: fmt + lint + build + test.
+- `mise run check` - the pre-land gate: changelog markers + fmt + lint + build + test.
 - `mise run run` / `build` / `test` / `fmt` / `lint` - individual steps.
+- `mise run changelog-next` / `changelog-stamp` / `changelog-check` / `changelog-notes` - the release changelog tooling.
+- `mise run version-set <version>` - move the release-owned manifest version.
 
 Rust edition 2024. `Cargo.lock` is committed (this is an app, not a library).
 
