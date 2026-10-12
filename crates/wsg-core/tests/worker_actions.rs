@@ -306,7 +306,7 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
         concat!(
             "jj rebase -b owner/eng-301-action -d main\n",
             "jj git push -b owner/eng-301-action\n",
-            "jj op undo\n"
+            "jj undo --allow-cross-workspace\n"
         )
     );
 }

@@ -766,7 +766,10 @@ impl SystemCommands {
     }
 
     fn undo(self, workspace: &Path) -> Result<(), String> {
-        self.run_status(workspace, "jj", &["op", "undo"])
+        // `jj op undo` was removed; the command is `jj undo`. jjfx shares one op
+        // log across workspaces, so allow undoing the last operation even when it
+        // was performed in another workspace (jj 0.46 refuses that by default).
+        self.run_status(workspace, "jj", &["undo", "--allow-cross-workspace"])
     }
 
     fn open_pull_request(self, repository: &str, branch: &str) -> Result<(), WorkerActionError> {
