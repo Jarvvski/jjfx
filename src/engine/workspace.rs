@@ -1510,10 +1510,7 @@ mod tests {
         );
         assert_eq!(
             JjVersion::parse("jj 1.2.3-dev"),
-            Some(JjVersion {
-                major: 1,
-                minor: 2
-            })
+            Some(JjVersion { major: 1, minor: 2 })
         );
         assert_eq!(JjVersion::parse("nonsense"), None);
     }
@@ -1533,9 +1530,27 @@ mod tests {
         // The suite runs against the pinned jj (>= 0.46), so the flag pair is
         // available; the version-dependent branches are covered by the pure
         // `supports_colocate` assertions below.
-        assert!(!JjVersion { major: 0, minor: 45 }.supports_colocate());
-        assert!(JjVersion { major: 0, minor: 46 }.supports_colocate());
-        assert!(JjVersion { major: 0, minor: 47 }.supports_colocate());
+        assert!(
+            !JjVersion {
+                major: 0,
+                minor: 45
+            }
+            .supports_colocate()
+        );
+        assert!(
+            JjVersion {
+                major: 0,
+                minor: 46
+            }
+            .supports_colocate()
+        );
+        assert!(
+            JjVersion {
+                major: 0,
+                minor: 47
+            }
+            .supports_colocate()
+        );
 
         // Without a `.git`, the repository is not colocated, so jjfx never
         // colocates - even when the setting asks for it.
@@ -1545,7 +1560,10 @@ mod tests {
         std::fs::create_dir(root.join(".git")).unwrap();
         assert_eq!(colocation_flag(&root, true).unwrap(), Some("--colocate"));
         // Asking not to colocate always wins.
-        assert_eq!(colocation_flag(&root, false).unwrap(), Some("--no-colocate"));
+        assert_eq!(
+            colocation_flag(&root, false).unwrap(),
+            Some("--no-colocate")
+        );
 
         std::fs::remove_dir_all(&root).unwrap();
     }

@@ -441,6 +441,26 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-12 - Dispatching to a runtime that cannot read its Ticket no longer
+  launches a Worker that stops immediately. jjfx fetches the Ticket's title and
+  description through the pool runtime and inlines it in the Dispatch prompt,
+  failing before any Pool or Workspace mutation when the runtime cannot reach
+  Linear; status and comment updates are best-effort, and Pi-only tool guidance
+  is no longer sent to Claude, Codex, or OpenCode. (fix)
+
+- 2026-10-12 - `jjfx pool list` (and `status`) now show a failed Worker's reason,
+  exit code, and Run-log path, with a `--json` form carrying the same fields;
+  `jjfx logs <worker>` prints the Run log tail immediately and exits for a
+  terminal Worker instead of following silently. (fix)
+
+- 2026-10-12 - `jjfx path <short-id>` resolves the real `worker-<id>` Workspace
+  instead of a non-existent path, `jjfx pool --help` exits 0 with usage, and
+  top-level `jjfx --help` works outside a jj repository. (fix)
+
+- 2026-10-12 - New workspaces no longer pass `--colocate` to a jj older than
+  0.46: jjfx probes `jj --version` and either omits the flag or fails with a
+  clear version error instead of jj's raw `unexpected argument`. (fix)
+
 - 2026-10-09 - Workspace creation (`n`) now reports the real failure and cleans
   up after itself: a failed `jj workspace add` no longer leaves a stray
   `<repo>-<name>` directory behind, a create-step failure says `could not create

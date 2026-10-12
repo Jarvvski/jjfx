@@ -56,6 +56,8 @@ Dispatch runs **in the background** by default; `--fg` runs it in the foreground
 
 A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues as a Dispatch Group in dependency order and reports each one's progress, rather than handing the Parent itself to one Worker.
 
+Before launching, jjfx fetches each Ticket's title and description through the pool runtime and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the runtime cannot reach Linear, Dispatch fails before anything is reserved. Pi Workers instead fetch the Ticket through their pinned direct Linear tools.
+
 **Done when** every ticket prints an outcome naming the Worker that took it. A ticket with no free Worker reports the capacity gap rather than waiting silently.
 
 ### 4. Watch

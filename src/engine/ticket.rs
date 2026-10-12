@@ -805,10 +805,7 @@ where
     ///
     /// The description carries the acceptance criteria; a blank description is
     /// valid (the Ticket simply has none).
-    pub fn ticket_details(
-        &self,
-        id: &TicketId,
-    ) -> Result<TicketDetails, TicketDiscoveryError> {
+    pub fn ticket_details(&self, id: &TicketId) -> Result<TicketDetails, TicketDiscoveryError> {
         let request = TicketQueryRequest::TicketDetails { id: id.clone() };
         let payload: RawTicketDetails = self.query_payload(&request)?;
         let title = TicketTitle::parse(payload.title).map_err(|error| {

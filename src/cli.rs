@@ -12,9 +12,8 @@ use crate::engine::{
     DirectDispatchRequest, DispatchBudget, FollowUpExecution, OrchestrationEvent,
     PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, Repository,
     RunActivity, RunActivityKind, RunMode, TerminalSettings, TicketDetails, TicketDiscovery,
-    TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, TicketStatus, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
-    WorkspaceHookStream,
+    TicketId, TicketQuery, TicketStatus, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
+    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
 };
 
 pub const HELP: &str = concat!(
@@ -1473,9 +1472,7 @@ fn worker_is_terminal(repository: &Repository, worker: &WorkerId) -> bool {
         .worker_pool()
         .reconcile_runs()
         .worker(worker.as_str())
-        .is_some_and(|worker| {
-            matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed)
-        })
+        .is_some_and(|worker| matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed))
 }
 
 fn render_activity(activity: &RunActivity) -> String {
@@ -1827,8 +1824,13 @@ mod tests {
     struct FailingQuery;
 
     impl TicketQuery for FailingQuery {
-        fn query(&self, _request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
-            Err(TicketQueryError::permanent("no Linear tools in this session"))
+        fn query(
+            &self,
+            _request: &crate::engine::TicketQueryRequest,
+        ) -> Result<String, crate::engine::TicketQueryError> {
+            Err(crate::engine::TicketQueryError::permanent(
+                "no Linear tools in this session",
+            ))
         }
     }
 
