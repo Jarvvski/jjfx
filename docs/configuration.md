@@ -137,5 +137,6 @@ key to `false` to create non-colocated workspaces instead.
 colocate = false
 ```
 
-A repository that is not itself colocated is never colocated, whatever this says
-- run `jj git colocation enable` first if you want colocated workspaces there.
+A repository that is not itself colocated is never colocated, whatever this says.
+Run `jjfx colocation enable` (or `jj git colocation enable`) to colocate the
+repository itself first; `jjfx colocation disable` reverses it.

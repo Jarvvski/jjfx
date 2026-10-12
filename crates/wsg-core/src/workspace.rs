@@ -1037,6 +1037,10 @@ fn add_workspace_with_revision(
     Ok(())
 }
 
+/// Forget one Workspace through jj. When the Workspace is colocated, jj removes
+/// its Git worktree registration as part of forgetting it, so teardown needs no
+/// separate Git step. (`jj workspace remove` is deliberately not used: it
+/// snapshots the working copy into a commit first, which is wrong for a delete.)
 fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError> {
     let output = Command::new("jj")
         .args(["workspace", "forget", name])

@@ -2,7 +2,7 @@ use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
@@ -36,7 +36,9 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " path <name>               Print workspace path\n  ",
     env!("CARGO_PKG_NAME"),
-    " refresh                   Rebuild workspace cache\n\nPool:\n  ",
+    " refresh                   Rebuild workspace cache\n  ",
+    env!("CARGO_PKG_NAME"),
+    " colocation <action>       Enable/disable Git colocation (enable|disable|status)\n\nPool:\n  ",
     env!("CARGO_PKG_NAME"),
     " pool <N>                  Set pool size (creates pool if needed, safe shrink)\n  ",
     env!("CARGO_PKG_NAME"),
@@ -94,6 +96,9 @@ pub enum Command {
         name: String,
     },
     Refresh,
+    Colocation {
+        action: ColocationAction,
+    },
     Status,
     Dispatch(DispatchArgs),
     Send {
@@ -129,6 +134,14 @@ pub enum Command {
         model: Option<String>,
     },
     Pool(PoolCommand),
+}
+
+/// Which colocation transition the `colocation` command performs.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ColocationAction {
+    Enable,
+    Disable,
+    Status,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -183,6 +196,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         )
         .map(|name| Command::Path { name }),
         "refresh" | "sync" => Ok(Command::Refresh),
+        "colocation" | "colocate" => parse_colocation(&args[1..]),
         "status" => ensure_no_extra(concat!(env!("CARGO_PKG_NAME"), " status"), &args[1..])
             .map(|_| Command::Status),
         "reset" => parse_single_exact(
@@ -223,6 +237,24 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "pool" => parse_pool(&args[1..]),
         unknown => bail!("Unknown command: {unknown}. Run '{PROGRAM} help' for usage."),
     }
+}
+
+fn parse_colocation(args: &[String]) -> Result<Command> {
+    let usage = concat!(
+        "Usage: ",
+        env!("CARGO_PKG_NAME"),
+        " colocation <enable|disable|status>"
+    );
+    let action = match args.first().map(String::as_str) {
+        Some("enable") => ColocationAction::Enable,
+        Some("disable") => ColocationAction::Disable,
+        Some("status") => ColocationAction::Status,
+        _ => bail!("{usage}"),
+    };
+    if args.len() > 1 {
+        bail!("{usage}");
+    }
+    Ok(Command::Colocation { action })
 }
 
 fn parse_add(args: &[String]) -> Result<Command> {
@@ -600,6 +632,7 @@ pub fn run(
         Command::Where => where_command(&repository(colocate)?)?,
         Command::Path { name } => path_command(&repository(colocate)?, &name)?,
         Command::Refresh => refresh_command(&repository(colocate)?)?,
+        Command::Colocation { action } => colocation_command(&repository(colocate)?, &action)?,
         Command::Add { name, revision } => {
             add_command(&repository(colocate)?, &name, revision.as_deref())?
         }
@@ -669,6 +702,25 @@ fn where_command(repository: &Repository) -> Result<()> {
 
 fn path_command(repository: &Repository, name: &str) -> Result<()> {
     println!("{}", repository.workspaces().path(name).display());
+    Ok(())
+}
+
+/// Transition this repository's Git colocation through jj. Enabling lets jjfx
+/// create colocated workspaces here; disabling restores plain jj workspaces.
+fn colocation_command(repository: &Repository, action: &ColocationAction) -> Result<()> {
+    let verb = match action {
+        ColocationAction::Enable => "enable",
+        ColocationAction::Disable => "disable",
+        ColocationAction::Status => "status",
+    };
+    let status = std::process::Command::new("jj")
+        .args(["git", "colocation", verb])
+        .current_dir(repository.root())
+        .status()
+        .with_context(|| format!("run jj git colocation {verb}"))?;
+    if !status.success() {
+        bail!("jj git colocation {verb} failed");
+    }
     Ok(())
 }
 
@@ -1494,6 +1546,31 @@ mod tests {
     fn parser_rejects_unknown_dispatch_options_and_budgeted_orchestration() {
         assert!(parse(&args(&["dispatch", "AMBA-42", "--wat"])).is_err());
         assert!(parse(&args(&["dispatch", "AMBA-42", "--budget", "12"])).is_err());
+    }
+
+    #[test]
+    fn colocation_parser_accepts_the_three_actions_and_rejects_anything_else() {
+        assert_eq!(
+            parse(&args(&["colocation", "enable"])).unwrap(),
+            Command::Colocation {
+                action: ColocationAction::Enable,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["colocate", "disable"])).unwrap(),
+            Command::Colocation {
+                action: ColocationAction::Disable,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["colocation", "status"])).unwrap(),
+            Command::Colocation {
+                action: ColocationAction::Status,
+            }
+        );
+        assert!(parse(&args(&["colocation"])).is_err());
+        assert!(parse(&args(&["colocation", "wat"])).is_err());
+        assert!(parse(&args(&["colocation", "enable", "extra"])).is_err());
     }
 
     #[test]
