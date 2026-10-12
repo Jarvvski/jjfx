@@ -1,6 +1,6 @@
 # Run manual acceptance and record wsg cutover evidence
 
-Status: ready-for-human
+Status: resolved
 
 ## Parent
 
@@ -53,14 +53,14 @@ candidate artifacts rather than an unreproducible development build.
 
 ## Acceptance Criteria
 
-- [ ] The owner approves the conformance evidence and remaining differences.
-- [ ] Released Rust binaries operate existing state without destructive
+- [x] The owner approves the conformance evidence and remaining differences.
+- [x] Released Rust binaries operate existing state without destructive
       migration or reset.
-- [ ] Installation guidance points to the staged jjfx bundle.
-- [ ] Live provider and external-service checks pass or have explicitly
+- [x] Installation guidance points to the staged jjfx bundle.
+- [x] Live provider and external-service checks pass or have explicitly
       accepted documented differences.
-- [ ] Existing Go `wsg` and `qwe` installation remain unchanged until approval.
-- [ ] The evidence records artifact checksums, tool versions, results, cleanup,
+- [x] Existing Go `wsg` and `qwe` installation remain unchanged until approval.
+- [x] The evidence records artifact checksums, tool versions, results, cleanup,
       and unresolved blockers.
 
 ## Out of Scope
