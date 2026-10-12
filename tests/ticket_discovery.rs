@@ -184,7 +184,12 @@ fn pi_discovery_times_out_and_reaps_the_helper_process() {
     // it that way: an order of magnitude above the timeout so a loaded machine
     // cannot fail it, and well below the sleep so a timeout that stopped firing
     // still does.
-    const TIMEOUT: Duration = Duration::from_millis(50);
+    //
+    // The timeout has to outlast the helper's own start-up: the shell that runs
+    // the helper forks `sleep` as a grandchild, and only once that fork has
+    // happened does the helper leave a process behind that holds its piped
+    // stdout and stderr open after the shell is gone.
+    const TIMEOUT: Duration = Duration::from_secs(1);
     const HELPER_SLEEP_SECS: u64 = 30;
     const BUDGET: Duration = Duration::from_secs(10);
 

@@ -441,6 +441,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-12 - Pi ticket discovery now stops a helper that overruns its
+  configured timeout, along with anything the helper spawned. Only the helper's
+  own process used to be signalled, so a helper that had forked a long-running
+  child kept the discovery command's output pipes open and the timeout did not
+  bound the call. (fix)
+
 - 2026-10-12 - Dispatching to a runtime that cannot read its Ticket no longer
   launches a Worker that stops immediately. jjfx fetches the Ticket's title and
   description through the pool runtime and inlines it in the Dispatch prompt,

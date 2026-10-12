@@ -2,11 +2,13 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Command, ExitStatus, Stdio};
-use std::thread;
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use thiserror::Error;
@@ -44,6 +46,11 @@ impl PiDiscoveryHelper {
     fn run(&self, workspace: &std::path::Path, input: &str) -> Result<Vec<u8>, TicketQueryError> {
         let mut child = Command::new(&self.executable)
             .current_dir(workspace)
+            // Own process group, so a helper that forks a long-lived descendant
+            // can be stopped as a whole. `Child::kill` only signals the direct
+            // child, and a surviving grandchild keeps the piped stdout/stderr
+            // open, which would block the reader threads below.
+            .process_group(0)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -69,10 +76,7 @@ impl PiDiscoveryHelper {
             .expect("stdin is piped for every Pi discovery helper")
             .write_all(input.as_bytes());
         if let Err(source) = write_result {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = finish_pipe(stdout_reader, "stdout");
-            let _ = finish_pipe(stderr_reader, "stderr");
+            terminate_helper(&mut child, stdout_reader, stderr_reader);
             return Err(TicketQueryError::transport(
                 format!("cannot write pi helper request: {source}"),
                 false,
@@ -84,20 +88,14 @@ impl PiDiscoveryHelper {
             match child.try_wait() {
                 Ok(Some(status)) => break status,
                 Ok(None) if Instant::now() >= deadline => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = finish_pipe(stdout_reader, "stdout");
-                    let _ = finish_pipe(stderr_reader, "stderr");
+                    terminate_helper(&mut child, stdout_reader, stderr_reader);
                     return Err(TicketQueryError::timeout(
                         "pi ticket discovery helper exceeded its configured execution limit",
                     ));
                 }
                 Ok(None) => thread::sleep(PI_HELPER_POLL_INTERVAL),
                 Err(source) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    let _ = finish_pipe(stdout_reader, "stdout");
-                    let _ = finish_pipe(stderr_reader, "stderr");
+                    terminate_helper(&mut child, stdout_reader, stderr_reader);
                     return Err(TicketQueryError::transport(
                         format!("cannot wait for pi helper: {source}"),
                         true,
@@ -109,6 +107,27 @@ impl PiDiscoveryHelper {
         let _stderr = finish_pipe(stderr_reader, "stderr")?;
         successful_helper_output(status, stdout)
     }
+}
+
+/// Stops the helper and every process it spawned, then reaps the direct child.
+///
+/// The helper runs in its own process group, so signalling the group also
+/// reaches descendants that survive `Child::kill`. The pipe readers are
+/// detached instead of joined: joining waits for every holder of the helper's
+/// stdout and stderr to close them, and a surviving descendant can postpone
+/// that indefinitely, which would defeat the configured execution limit.
+fn terminate_helper(
+    child: &mut Child,
+    stdout_reader: JoinHandle<io::Result<Vec<u8>>>,
+    stderr_reader: JoinHandle<io::Result<Vec<u8>>>,
+) {
+    if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+        let _ = kill_process_group(pid, Signal::KILL);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(stdout_reader);
+    drop(stderr_reader);
 }
 
 fn read_pipe(mut pipe: impl Read) -> io::Result<Vec<u8>> {
