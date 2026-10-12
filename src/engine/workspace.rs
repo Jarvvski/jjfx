@@ -5,6 +5,7 @@ use std::fs::{self, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 use rustix::fs::{FlockOperation, flock};
 use thiserror::Error;
@@ -993,15 +994,84 @@ fn add_workspace(
     add_workspace_with_revision(root, name, path, None, colocate)
 }
 
-/// The `jj workspace add` colocation flag: colocate only when jjfx asks for it
-/// and the repository itself is colocated. A repository that is not colocated
-/// has no Git directory to share, so it never colocates - which is what keeps
-/// jjfx's own non-colocated test repositories from creating worktrees.
-fn colocation_flag(root: &Path, colocate: bool) -> &'static str {
+/// The jj major/minor version jjfx is driving, probed from `jj --version`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct JjVersion {
+    major: u64,
+    minor: u64,
+}
+
+impl JjVersion {
+    /// Parses the `major.minor` prefix of `jj --version` output (`jj 0.46.0`).
+    fn parse(output: &str) -> Option<Self> {
+        let version = output.split_whitespace().find(|token| {
+            token
+                .split('.')
+                .next()
+                .is_some_and(|major| major.chars().all(|c| c.is_ascii_digit()))
+        })?;
+        let mut parts = version.split('.');
+        let major = parts.next()?.parse().ok()?;
+        let minor = parts.next().unwrap_or("0").parse().ok()?;
+        Some(Self { major, minor })
+    }
+
+    /// Whether this jj understands `jj workspace add --colocate`/`--no-colocate`,
+    /// added in 0.46.
+    fn supports_colocate(self) -> bool {
+        (self.major, self.minor) >= (0, 46)
+    }
+}
+
+impl std::fmt::Display for JjVersion {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}.{}", self.major, self.minor)
+    }
+}
+
+/// The jj version jjfx is driving, probed once per process. `None` when `jj
+/// --version` cannot be read; callers then assume the current flag behavior so
+/// a missing or broken jj surfaces its own error rather than a version guess.
+fn jj_version() -> Option<JjVersion> {
+    static VERSION: OnceLock<Option<JjVersion>> = OnceLock::new();
+    *VERSION.get_or_init(|| {
+        let output = Command::new("jj").arg("--version").output().ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        JjVersion::parse(&String::from_utf8_lossy(&output.stdout))
+    })
+}
+
+/// The `jj workspace add` colocation flag, or `None` to omit it. jj added
+/// `--colocate`/`--no-colocate` in 0.46: on older jj, omitting the flag is the
+/// pre-0.46 behavior (workspaces were never colocated), so non-colocated
+/// repositories keep working, while requesting colocation fails with a clear
+/// version error instead of jj's raw `unexpected argument '--colocate'`.
+///
+/// Colocation is requested only when jjfx asks for it *and* the repository
+/// itself is colocated. A repository that is not colocated has no Git directory
+/// to share, so it never colocates - which is what keeps jjfx's own
+/// non-colocated test repositories from creating worktrees.
+fn colocation_flag(
+    root: &Path,
+    colocate: bool,
+) -> Result<Option<&'static str>, WorkerWorkspaceError> {
+    let version = jj_version();
+    let supports = version.is_none_or(JjVersion::supports_colocate);
     if colocate && root.join(".git").is_dir() {
-        "--colocate"
+        if supports {
+            Ok(Some("--colocate"))
+        } else {
+            let found = version.map_or_else(|| "unknown".to_owned(), |v| v.to_string());
+            Err(WorkerWorkspaceError::new(format!(
+                "colocation requires jj >= 0.46 (found {found}); upgrade jj or set colocate = false"
+            )))
+        }
+    } else if supports {
+        Ok(Some("--no-colocate"))
     } else {
-        "--no-colocate"
+        Ok(None)
     }
 }
 
@@ -1013,13 +1083,10 @@ fn add_workspace_with_revision(
     colocate: bool,
 ) -> Result<(), WorkerWorkspaceError> {
     let mut command = Command::new("jj");
-    command.args([
-        "workspace",
-        "add",
-        "--name",
-        name,
-        colocation_flag(root, colocate),
-    ]);
+    command.args(["workspace", "add", "--name", name]);
+    if let Some(flag) = colocation_flag(root, colocate)? {
+        command.arg(flag);
+    }
     if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
         command.args(["--revision", revision]);
     }
@@ -1426,7 +1493,33 @@ mod tests {
     }
 
     #[test]
-    fn colocation_requires_a_colocated_repository() {
+    fn jj_version_parses_major_and_minor() {
+        assert_eq!(
+            JjVersion::parse("jj 0.46.0\n"),
+            Some(JjVersion {
+                major: 0,
+                minor: 46
+            })
+        );
+        assert_eq!(
+            JjVersion::parse("jj 0.45.1"),
+            Some(JjVersion {
+                major: 0,
+                minor: 45
+            })
+        );
+        assert_eq!(
+            JjVersion::parse("jj 1.2.3-dev"),
+            Some(JjVersion {
+                major: 1,
+                minor: 2
+            })
+        );
+        assert_eq!(JjVersion::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn colocation_flag_gates_on_the_repository_being_colocated() {
         let root = std::env::temp_dir().join(format!(
             "jjfx-engine-colocation-{}-{}",
             std::process::id(),
@@ -1437,15 +1530,22 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
 
+        // The suite runs against the pinned jj (>= 0.46), so the flag pair is
+        // available; the version-dependent branches are covered by the pure
+        // `supports_colocate` assertions below.
+        assert!(!JjVersion { major: 0, minor: 45 }.supports_colocate());
+        assert!(JjVersion { major: 0, minor: 46 }.supports_colocate());
+        assert!(JjVersion { major: 0, minor: 47 }.supports_colocate());
+
         // Without a `.git`, the repository is not colocated, so jjfx never
         // colocates - even when the setting asks for it.
-        assert_eq!(colocation_flag(&root, true), "--no-colocate");
+        assert_eq!(colocation_flag(&root, true).unwrap(), Some("--no-colocate"));
 
         // A `.git` directory marks the repository colocated.
         std::fs::create_dir(root.join(".git")).unwrap();
-        assert_eq!(colocation_flag(&root, true), "--colocate");
+        assert_eq!(colocation_flag(&root, true).unwrap(), Some("--colocate"));
         // Asking not to colocate always wins.
-        assert_eq!(colocation_flag(&root, false), "--no-colocate");
+        assert_eq!(colocation_flag(&root, false).unwrap(), Some("--no-colocate"));
 
         std::fs::remove_dir_all(&root).unwrap();
     }
