@@ -122,11 +122,20 @@ fn pi_discovery_without_a_helper_reports_typed_setup_guidance() {
 
 #[test]
 fn pi_discovery_times_out_and_reaps_the_helper_process() {
+    // The helper sleeps far longer than the timeout, so the elapsed check only
+    // has to tell "the timeout fired" apart from "the helper finished". Budget
+    // it that way: an order of magnitude above the timeout so a loaded machine
+    // cannot fail it, and well below the sleep so a timeout that stopped firing
+    // still does.
+    const TIMEOUT: Duration = Duration::from_millis(50);
+    const HELPER_SLEEP_SECS: u64 = 30;
+    const BUDGET: Duration = Duration::from_secs(10);
+
     let temporary_directory = TempDir::new().expect("temporary directory");
     let helper = temporary_directory.path().join("pi-linear-helper");
-    write_executable(&helper, "#!/bin/sh\nsleep 5\n");
+    write_executable(&helper, &format!("#!/bin/sh\nsleep {HELPER_SLEEP_SECS}\n"));
     let query = AgentRuntimeQuery::new(AgentRuntime::Pi, temporary_directory.path())
-        .with_pi_helper(PiDiscoveryHelper::new(&helper).with_timeout(Duration::from_millis(50)));
+        .with_pi_helper(PiDiscoveryHelper::new(&helper).with_timeout(TIMEOUT));
     let request = TicketQueryRequest::ReadyTickets {
         filter: ReadyTicketFilter::new(
             "ready-for-agent",
@@ -142,7 +151,10 @@ fn pi_discovery_times_out_and_reaps_the_helper_process() {
 
     assert_eq!(error.kind(), TicketQueryErrorKind::Timeout);
     assert!(error.is_retryable());
-    assert!(started.elapsed() < Duration::from_secs(1));
+    assert!(
+        started.elapsed() < BUDGET,
+        "the {TIMEOUT:?} timeout should fire well before the helper's {HELPER_SLEEP_SECS}s sleep"
+    );
 }
 
 #[test]
