@@ -207,24 +207,29 @@ pub struct DisplayLayouts {
 }
 
 /// `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml` - the same XDG convention as
-/// the event log's state path.
-pub fn config_path() -> PathBuf {
+/// the event log's state path. `None` when neither variable names a base
+/// directory: with no base there is no user config, and a relative fallback
+/// would resolve against the process CWD (letting a repository plant it).
+pub fn config_path() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME")
+        .or_else(|| {
+            std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .unwrap_or_default();
-            home.join(".config")
-        });
-    base.join("jjfx").join("config.toml")
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(|home| home.join(".config"))
+        })?;
+    Some(base.join("jjfx").join("config.toml"))
 }
 
 /// Load the config from its fixed path. A missing file yields defaults; a file
 /// that exists but fails to parse is an error (named so the user can find it).
 pub fn load() -> anyhow::Result<Config> {
-    load_from(&config_path())
+    match config_path() {
+        Some(path) => load_from(&path),
+        None => Ok(Config::default()),
+    }
 }
 
 /// The parse step, split out so tests can drive it from a fixture path.
@@ -268,6 +273,31 @@ mod tests {
     fn colocation_can_be_disabled() {
         let cfg: Config = toml::from_str("colocate = false\n").expect("toml parses");
         assert!(!cfg.colocate);
+    }
+
+    #[test]
+    fn config_path_is_absent_without_a_base_directory() {
+        // `env::remove_var` is `unsafe` in edition 2024 and forbidden crate-wide,
+        // so clear the variables in a child process rather than mutating this one.
+        let output = std::process::Command::new(
+            std::env::current_exe().expect("test executable should have a path"),
+        )
+        .args(["config_path_helper_without_a_base_directory", "--ignored"])
+        .env_clear()
+        .output()
+        .expect("config path helper should run");
+        assert!(
+            output.status.success(),
+            "config path helper failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "helper: run by config_path_is_absent_without_a_base_directory with a cleared environment"]
+    fn config_path_helper_without_a_base_directory() {
+        assert_eq!(config_path(), None);
     }
 
     #[test]
