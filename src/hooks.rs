@@ -730,7 +730,7 @@ mod tests {
             + "\n";
         fs::write(&log, text).unwrap();
 
-        let states = AgentStates::replay(crate::events::read_events(&log));
+        let states = AgentStates::replay(crate::events::replay(&log).0);
         let agent = states.agent_for(&workspace);
         assert_eq!(agent.kind, AgentKind::Pi);
         assert_eq!(agent.state, AgentState::Waiting);
@@ -796,7 +796,7 @@ mod tests {
         assert!(status.success(), "isolated Pi exited with {status}");
 
         let log = state.join("jjfx/events.jsonl");
-        let states = AgentStates::replay(crate::events::read_events(&log));
+        let states = AgentStates::replay(crate::events::replay(&log).0);
         let agent = states.agent_for(&workspace);
         assert_eq!(agent.kind, AgentKind::Pi);
         assert_eq!(agent.state, AgentState::Ended);

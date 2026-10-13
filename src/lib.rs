@@ -206,14 +206,17 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
 
     // Bound the event log, then reconstruct current agent state by replaying it
     // (ADR 0004). Rotate before replay so the read is already within the cap.
+    // The replay also reports the offset the tailer must start from, so a hook
+    // line landing between the two is neither lost nor replayed twice.
     let log = events::log_path();
     events::rotate_if_needed(&log, events::MAX_LOG_BYTES).ok();
-    let initial_agents = agent::AgentStates::replay(events::read_events(&log));
+    let (replayed, replay_offset) = events::replay(&log);
+    let initial_agents = agent::AgentStates::replay(replayed);
 
     // Filesystem watcher -> Msg::Reload. Held for the duration of the loop.
     let _watcher = watch::watch_repo(&repo_root, tx.clone())?;
     // Event-log tailer -> Msg::AgentEvent for each new line. Also held alive.
-    let _log_watcher = events::watch_log(&log, tx.clone())?;
+    let _log_watcher = events::watch_log(&log, tx.clone(), replay_offset)?;
 
     // Work-lifecycle poller: recompute the jj/gh work state periodically and on
     // demand, sending Msg::WorkSnapshot. `work_tx` nudges it when the repo changes.

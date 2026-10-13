@@ -35,6 +35,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - The lifecycle event log is now read line-by-line and lossily, so
+  one torn line (a rotation slice cut mid-character) no longer wipes every
+  agent's state. The tailer starts from the replay's own offset, so a hook line
+  appended during startup is neither lost nor replayed twice. The log is also
+  rotated while the TUI runs, so a long-lived session bounds `events.jsonl`, and
+  a rotated shrink is skipped rather than re-emitted as duplicates. (fix)
+
 - 2026-10-13 - A failed Dispatch Group retry now persists the group before
   resetting the Worker, matching the Done path. A save conflict can no longer
   leave a cleared Worker against a `dispatched` group, which made a restarted

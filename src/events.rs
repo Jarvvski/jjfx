@@ -61,23 +61,54 @@ pub fn append_failure(path: &Path, context: &str, message: &str) {
         .and_then(|mut file| file.write_all(block.as_bytes()));
 }
 
-/// Read the whole log into events, for the startup replay. A missing or garbled
-/// file yields an empty history rather than an error.
-pub fn read_events(path: &Path) -> Vec<Event> {
-    let text = fs::read_to_string(path).unwrap_or_default();
-    text.lines().filter_map(agent::parse_line).collect()
+/// Replay the log: the events it holds, plus the byte offset just past its last
+/// complete line.
+///
+/// The offset is what [`watch_log`] must start from. Seeding the tailer from the
+/// file length instead would drop any line appended between the replay and the
+/// watcher's first read; seeding it from the replay's own consumed length closes
+/// that window without replaying anything twice.
+///
+/// A missing or garbled file yields an empty history rather than an error.
+pub fn replay(path: &Path) -> (Vec<Event>, u64) {
+    let data = match fs::read(path) {
+        Ok(data) => data,
+        Err(_) => return (Vec::new(), 0),
+    };
+    let consumed = data
+        .iter()
+        .rposition(|&byte| byte == b'\n')
+        .map_or(0, |index| index + 1);
+    (parse_lines(&data[..consumed]), consumed as u64)
+}
+
+/// Parse newline-delimited JSONL bytes into events.
+///
+/// Every line is decoded lossily, so one invalid byte - a rotation slice cut
+/// mid-character, a torn write - costs at most that line instead of the whole
+/// history. Lines that are not events are skipped.
+fn parse_lines(bytes: &[u8]) -> Vec<Event> {
+    bytes
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .filter_map(|line| agent::parse_line(&String::from_utf8_lossy(line)))
+        .collect()
 }
 
 /// If the log exceeds `max_bytes`, retain only its tail (from the next line
 /// boundary), written atomically. Keeping the tail preserves the most recent
 /// state while bounding growth; older sessions' events are the ones dropped.
-pub fn rotate_if_needed(path: &Path, max_bytes: u64) -> io::Result<()> {
+///
+/// Returns the new length when it actually rotated, so a live tailer can reseed
+/// its offset past the retained tail it has already emitted instead of
+/// re-emitting it as duplicates.
+pub fn rotate_if_needed(path: &Path, max_bytes: u64) -> io::Result<Option<u64>> {
     let len = match fs::metadata(path) {
         Ok(m) => m.len(),
-        Err(_) => return Ok(()), // no log yet - nothing to rotate
+        Err(_) => return Ok(None), // no log yet - nothing to rotate
     };
     if len <= max_bytes {
-        return Ok(());
+        return Ok(None);
     }
     let data = fs::read(path)?;
     let keep = (max_bytes / 2) as usize;
@@ -97,16 +128,22 @@ pub fn rotate_if_needed(path: &Path, max_bytes: u64) -> io::Result<()> {
     let tmp = dir.join(format!("events.jsonl.{}.tmp", std::process::id()));
     fs::write(&tmp, tail)?;
     fs::rename(&tmp, path)?;
-    Ok(())
+    Ok(Some(tail.len() as u64))
 }
 
 /// Tail the log: watch its directory and, on every change, read the bytes
 /// appended since the last read and forward each complete line as a
 /// [`Msg::AgentEvent`]. The returned watcher must be kept alive.
 ///
-/// Starts from the current end of the file, so it complements (does not
-/// duplicate) the startup replay done via [`read_events`].
-pub fn watch_log(path: &Path, tx: UnboundedSender<Msg>) -> anyhow::Result<RecommendedWatcher> {
+/// `offset` must be the length consumed by the startup [`replay`], so a line
+/// appended between the replay and this call is neither lost nor replayed twice.
+/// The log is also rotated here, on every change, so a long-lived TUI bounds
+/// `events.jsonl` rather than only bounding it at startup.
+pub fn watch_log(
+    path: &Path,
+    tx: UnboundedSender<Msg>,
+    offset: u64,
+) -> anyhow::Result<RecommendedWatcher> {
     let dir = path
         .parent()
         .context("log path has no parent")?
@@ -116,7 +153,7 @@ pub fn watch_log(path: &Path, tx: UnboundedSender<Msg>) -> anyhow::Result<Recomm
     fs::create_dir_all(&dir).ok();
 
     let path_buf = path.to_path_buf();
-    let mut offset = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let mut offset = offset;
 
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if res.is_err() {
@@ -125,6 +162,11 @@ pub fn watch_log(path: &Path, tx: UnboundedSender<Msg>) -> anyhow::Result<Recomm
         for ev in read_new_events(&path_buf, &mut offset) {
             // The receiver only closes at shutdown; ignore send errors then.
             let _ = tx.send(Msg::AgentEvent(ev));
+        }
+        // Rotate after reading, so the retained tail is exactly the history just
+        // emitted: reseeding past it keeps it from being re-emitted.
+        if let Ok(Some(rotated)) = rotate_if_needed(&path_buf, MAX_LOG_BYTES) {
+            offset = rotated;
         }
     })
     .context("creating event-log watcher")?;
@@ -136,7 +178,11 @@ pub fn watch_log(path: &Path, tx: UnboundedSender<Msg>) -> anyhow::Result<Recomm
 
 /// Read the events appended since `offset`, advancing `offset` past only the
 /// bytes consumed (complete lines). A trailing partial line is left for the next
-/// call; a file shorter than `offset` (rotated/truncated) resets to the start.
+/// call.
+///
+/// A file shorter than `offset` was rotated or truncated out from under us. The
+/// retained tail is already-emitted history, so skip to the new end rather than
+/// replaying it as duplicates.
 /// Any read error yields no events and leaves `offset` untouched.
 fn read_new_events(path: &Path, offset: &mut u64) -> Vec<Event> {
     let Ok(mut file) = File::open(path) else {
@@ -144,7 +190,7 @@ fn read_new_events(path: &Path, offset: &mut u64) -> Vec<Event> {
     };
     let len = file.metadata().map(|m| m.len()).unwrap_or(0);
     if len < *offset {
-        *offset = 0; // file was rotated/truncated out from under us
+        *offset = len;
     }
     if file.seek(SeekFrom::Start(*offset)).is_err() {
         return Vec::new();
@@ -158,11 +204,7 @@ fn read_new_events(path: &Path, offset: &mut u64) -> Vec<Event> {
     };
     let complete = &buf[..=last_nl];
     *offset += complete.len() as u64;
-    complete
-        .split(|&b| b == b'\n')
-        .filter_map(|line| std::str::from_utf8(line).ok())
-        .filter_map(agent::parse_line)
-        .collect()
+    parse_lines(complete)
 }
 
 #[cfg(test)]
@@ -184,9 +226,11 @@ mod tests {
     }
 
     #[test]
-    fn read_events_on_missing_file_is_empty() {
+    fn replay_on_missing_file_is_empty() {
         let dir = scratch("missing");
-        assert!(read_events(&dir.join("events.jsonl")).is_empty());
+        let (events, offset) = replay(&dir.join("events.jsonl"));
+        assert!(events.is_empty());
+        assert_eq!(offset, 0);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -269,15 +313,104 @@ mod tests {
     }
 
     #[test]
-    fn read_new_events_resets_after_rotation() {
+    fn read_new_events_skips_a_rotated_shrink_without_re_emitting() {
         let dir = scratch("tail-rotate");
         let log = dir.join("events.jsonl");
-        // Pretend we had read to a large offset, then the file was rotated smaller.
+        let line = "{\"cwd\":\"/w/a\",\"hook_event_name\":\"Stop\"}\n";
+        // Pretend we had read to a large offset, then the file was rotated
+        // smaller by another instance. The retained tail is already-emitted
+        // history: replaying it would duplicate every event in it.
         let mut offset = 10_000u64;
-        fs::write(&log, "{\"cwd\":\"/w/a\",\"hook_event_name\":\"Stop\"}\n").unwrap();
+        fs::write(&log, line).unwrap();
         let got = read_new_events(&log, &mut offset);
-        assert_eq!(got.len(), 1);
-        assert_eq!(got[0].name, "Stop");
+        assert!(
+            got.is_empty(),
+            "a rotated shrink must not re-emit the retained tail"
+        );
+        assert_eq!(offset, line.len() as u64, "offset reseeds to the new end");
+
+        // A later append is still seen.
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+        let later = read_new_events(&log, &mut offset);
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].name, "Stop");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replay_tolerates_invalid_utf8_in_one_line() {
+        let dir = scratch("invalid-utf8");
+        let log = dir.join("events.jsonl");
+        // A rotation slice cut mid-character leaves a torn first line that is
+        // neither valid UTF-8 nor valid JSON. It must cost that line only - not
+        // the whole history, which is what a whole-file `read_to_string` did.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"{\"cwd\":\"/w/a\",\"hook_event_name\":\"SessionStart\"}\n");
+        bytes.extend_from_slice(b"\xe2\x82\"},\"hook_event_name\":\"Stop\"}\n");
+        bytes.extend_from_slice(b"{\"cwd\":\"/w/a\",\"hook_event_name\":\"Stop\"}\n");
+        fs::write(&log, &bytes).unwrap();
+
+        let (events, offset) = replay(&log);
+        let names: Vec<_> = events.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["SessionStart", "Stop"]);
+        assert_eq!(offset, bytes.len() as u64);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replay_offset_hands_appends_to_the_tailer() {
+        let dir = scratch("replay-offset");
+        let log = dir.join("events.jsonl");
+        let first = "{\"cwd\":\"/w/a\",\"hook_event_name\":\"SessionStart\"}\n";
+        // A complete line plus a torn one, as a hook mid-write leaves it.
+        fs::write(&log, format!("{first}{{\"cwd\":\"/w/a\",\"hook_ev")).unwrap();
+
+        let (events, replay_offset) = replay(&log);
+        assert_eq!(events.len(), 1);
+        assert_eq!(replay_offset, first.len() as u64);
+
+        // The torn line completes after the replay. A tailer seeded from the
+        // file length would have started past it and dropped the event.
+        fs::write(
+            &log,
+            format!("{first}{{\"cwd\":\"/w/a\",\"hook_event_name\":\"UserPromptSubmit\"}}\n"),
+        )
+        .unwrap();
+        let mut offset = replay_offset;
+        let tailed = read_new_events(&log, &mut offset);
+        let names: Vec<_> = tailed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["UserPromptSubmit"]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn tailer_rotation_bounds_the_log_without_re_emitting() {
+        let dir = scratch("tail-rotate-live");
+        let log = dir.join("events.jsonl");
+        let line = "{\"cwd\":\"/w/a\",\"hook_event_name\":\"Stop\"}\n";
+        let mut offset = 0u64;
+
+        // One append well past the cap, as a long-lived TUI would accumulate.
+        fs::write(&log, line.repeat(500)).unwrap();
+        let first = read_new_events(&log, &mut offset);
+        assert_eq!(first.len(), 500);
+
+        // The tailer rotates after reading and reseeds past the retained tail.
+        let rotated = rotate_if_needed(&log, 1024)
+            .unwrap()
+            .expect("a log over the cap rotates");
+        offset = rotated;
+        let bounded = fs::metadata(&log).unwrap().len();
+        assert!(bounded <= 1024, "log stays under the cap: {bounded}");
+
+        // Nothing is re-emitted from the retained tail.
+        assert!(read_new_events(&log, &mut offset).is_empty());
+
+        // And a later append is still seen.
+        let mut file = OpenOptions::new().append(true).open(&log).unwrap();
+        file.write_all(line.as_bytes()).unwrap();
+        assert_eq!(read_new_events(&log, &mut offset).len(), 1);
         fs::remove_dir_all(&dir).unwrap();
     }
 

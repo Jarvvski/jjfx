@@ -54,9 +54,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 (fixed) |
 | I5 | store | M | S | `default` workspace pinned to the current workspace when launched from a secondary workspace | 11 (fixed) |
 | I8 | dispatch | M | S | untrusted Linear text injected verbatim into prompts | 12 (fixed) |
-| T3 | events | M | S | one invalid UTF-8 byte wipes all startup agent state | 19 |
-| T4 | events | M | S | replay/tailer offset race drops events | 19 |
-| T5 | events | M | S | rotation only at startup; unbounded `events.jsonl` growth + rotation race | 19 |
+| T3 | events | M | S | one invalid UTF-8 byte wipes all startup agent state | 19 (fixed) |
+| T4 | events | M | S | replay/tailer offset race drops events | 19 (fixed) |
+| T5 | events | M | S | rotation only at startup; unbounded `events.jsonl` growth + rotation race | 19 (fixed, residual race documented) |
 | T6 | TUI | M | S | blocking `jj tidy`/`tidyws` on the UI thread | 17 |
 | T7 | TUI | M | S | per-tick `canonicalize` and duplicate graph/row projection per frame | 26 |
 | I6 | work | M-L | S | workspace names interpolated unquoted into revsets | 22 |
@@ -121,6 +121,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [18](issues/18-help-overlay-in-detail-and-graph.md) - T2.
   **resolved** - overlay drawn over Detail/Graph.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
+  **resolved** - lossy line reader, replay offset, in-tailer rotation.
 - [20](issues/20-workspace-cleanup-robustness.md) - C4, C5, C6.
 
 ### Phase 3 - improvements
