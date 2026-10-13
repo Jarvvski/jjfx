@@ -78,7 +78,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 ### Phase 0 - repro harness (build the red tests first)
 
 - [01](issues/01-reproduce-worker-run-cwd.md) - research: reproduce the Worker
-  cwd report and pin the root cause.
+  cwd report and pin the root cause. **resolved** - not reproducible; guard
+  test landed.
 - [02](issues/02-regression-harness-colocated-and-secondary.md) - task:
   regression tests for colocated "pushed" (D3) and the secondary-workspace
   default root (I5).
@@ -90,6 +91,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 
 - [04](issues/04-terminate-group-on-failed-dependency.md) - D1.
 - [05](issues/05-fix-worker-run-working-directory.md) - W1 (blocked by 01).
+  **needs-info** - no reproducible jjfx defect; recurrence diagnostic recorded.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
 - [07](issues/07-durable-run-identity.md) - C2, C7.
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
@@ -133,14 +135,17 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - Two findings are test-encoded current behaviour - non-todo dependency statuses
   unblocking (D8), and Claude usage omission (D9). Confirm intent before
   changing; both live in ticket 28.
-- The Worker cwd report's traced code path *appears* correct
-  (`runtime.rs:990` -> `:654`), so ticket 01 is a **research** ticket whose
-  answer decides whether ticket 05 fixes jjfx or opencode integration.
+- The Worker cwd report (W1) is **not reproducible** against `main` or
+  `v0.52.1`: jjfx sets the Run cwd correctly (guard test added) and opencode
+  honours it, including in a colocated worktree. Ticket 05 is `needs-info` with
+  a recurrence diagnostic; the leading untested variable is the reporter's
+  `PATH` (`opencode` may be a wrapper).
 
 ## Fog
 
 - Whether the Worker cwd failure is jjfx or opencode's project-root detection
-  under colocated Git worktrees (ticket 01 resolves this).
+  under colocated Git worktrees - **answered: neither, in isolation**; ticket 01
+  could not reproduce it. Awaiting reporter info (ticket 05).
 - Whether D8 (dependency statuses) and D9 (Claude usage) are intended
   simplifications or oversights.
 - The exact liveness contract for a Dispatch Group that contains a terminal

@@ -1,6 +1,6 @@
 # Reproduce the Worker cwd report and pin the root cause
 
-Status: ready-for-agent
+Status: resolved
 Type: research
 Blocked by: none
 
@@ -64,8 +64,31 @@ background/reserved Run's cwd (`reserved_background_run_helper:2509` and
 
 ## Answer
 
-(Fill in when resolved.) State the root cause, the evidence, and which of
-tickets 05 / 24 / a new opencode-integration ticket follows.
+Resolved 2026-10-13. **Not reproducible against `main` (nor `v0.52.1`).**
+
+Evidence:
+
+1. **jjfx sets the cwd correctly.** Added
+   `reserved_background_run_uses_the_worker_workspace_as_cwd`
+   (`tests/agent_runtime.rs`): a stub runtime writing `$PWD` through
+   `RunSupervisor::run_reserved_background` reports its own Worker Workspace.
+   It passes, and it is now a permanent guard - there was previously no test for
+   a background Run's cwd (foreground and probe were covered).
+2. **`v0.52.1` is identical.** `jj file show -r v0.52.1 src/engine/runtime.rs`
+   carries the same `current_dir(&request.workspace)` (`:654`) and
+   `reserved_request` -> `worker_path` (`:990`) as `main`, so the reported
+   binary's source is not the cause.
+3. **opencode honours the cwd**, including inside a colocated Git worktree and
+   across sequential runs from different worktrees: `opencode v2.0.27`, the
+   shell tool's `pwd` returned the invoking worktree every time (a shared-server
+   cwd was explicitly ruled out).
+
+The report is therefore not explained by the traced path. The one untested
+variable is the reporter's `PATH`: if `opencode` there is a wrapper or a
+different build, jjfx's `Command::new("opencode")` would run that. Ticket 05
+carries the recurrence diagnostic and is `needs-info`.
+
+Follow-up: none for jjfx code.
 
 ## Acceptance Criteria
 

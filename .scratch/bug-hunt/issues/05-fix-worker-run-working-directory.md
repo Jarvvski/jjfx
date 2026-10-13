@@ -1,49 +1,37 @@
 # Fix the Worker Run working directory
 
-Status: ready-for-agent
+Status: needs-info
 Type: task
 Blocked by: 01
 
 ## Problem
 
-A dispatched Worker's agent process runs with the caller's cwd instead of its
-Worker Workspace, so Workers share one working copy and their changes are not
-separable per ticket. See `@/tmp/jjfx-worker-cwd-bug.md`.
+The Worker-cwd report (`@/tmp/jjfx-worker-cwd-bug.md`) is **not reproducible**
+against `main` or `v0.52.1` (ticket 01). jjfx sets the Run cwd correctly, and
+opencode honours it, including in a colocated Git worktree.
 
-Ticket 01 pins the root cause. The traced code path appears correct
-(`src/engine/runtime.rs:990` -> `:654`), so the fix depends on the answer:
+Ticket 01 landed `reserved_background_run_uses_the_worker_workspace_as_cwd` as a
+permanent guard, so a regression in jjfx's spawn path is now caught. There is no
+jjfx fix to make without a reproduction.
 
-- **If it is a jjfx defect** (a spawn path that skips `current_dir`, or a
-  `worker_path` that resolves to the wrong root): fix that path and add the
-  background-run cwd test permanently.
-- **If it is opencode's project-root detection under colocated Git worktrees**:
-  work around it at the integration seam - pass an explicit project/working
-  directory if opencode supports one, or set the documented env var - and cover
-  it with a colocated-worker test.
-- **If it is a stale installed binary**: correct the report and keep the test.
+## Recurrence diagnostic
 
-## Fix
+If a Worker still runs in the caller's cwd, capture:
 
-Implement the fix the ticket-01 answer calls for. Keep the `RunRequest.workspace`
-contract ("the Run's working directory") and assert it for every spawn path.
-
-## Commits
-
-1. Keep the background/reserved cwd regression test from ticket 01 (move it into
-   `tests/agent_runtime.rs`).
-2. Apply the fix.
-3. CHANGELOG entry `(fix)`.
+1. `which -a opencode` and `file "$(command -v opencode)"` - is it a wrapper or
+   a different build?
+2. `jjfx --version` and the commit the running binary was built from.
+3. `ps -o pid,ppid,pgid,command=` for the whole worker process tree.
+4. `lsof -a -p <pid> -d cwd` for the agent **and** each of its children.
+5. `jjfx pool list` and the worker's `.jj/pool/<worker>.log`.
 
 ## Acceptance Criteria
 
-- [ ] After `jjfx dispatch`, the worker process's cwd equals its Worker
-      Workspace.
-- [ ] Two Workers dispatched in one call write to two different workspaces.
-- [ ] Dispatching from a secondary workspace does not write into it.
-- [ ] The regression test passes and is not `#[ignore]`d.
-- [ ] `mise run check` is green.
+- [ ] The reporter's `which -a opencode` and binary provenance are known.
+- [ ] If a wrapper or a non-jjfx cause is confirmed, this ticket closes as
+      environment with the evidence recorded.
+- [ ] If jjfx is at fault, this becomes a fix with a failing test.
 
 ## Out of Scope
 
-- The secondary-workspace root bug (I5, ticket 11), unless ticket 01 shows the
-  two share a cause.
+- The secondary-workspace root bug (I5, ticket 11).

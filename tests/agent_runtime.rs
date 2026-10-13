@@ -641,6 +641,107 @@ fn reserved_background_run_persists_pid_before_returning() {
     );
 }
 
+/// A reserved background Run must execute in its own Worker Workspace, never in
+/// the directory jjfx was invoked from. Every Worker in one dispatch sharing the
+/// caller's cwd would make their changes inseparable.
+#[test]
+fn reserved_background_run_uses_the_worker_workspace_as_cwd() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let output = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(temporary_directory.path())
+        .output()
+        .expect("jj remote add should run");
+    assert!(
+        output.status.success(),
+        "jj remote add failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let growth = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+
+    let bin_directory = temporary_directory.path().join("bin");
+    let cwd_result = temporary_directory.path().join("cwd");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\npwd > \"$WSG_AGENT_RUNTIME_HELPER_WORKSPACE\"\n",
+    );
+    let path = env::join_paths([
+        bin_directory.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "reserved_background_run_cwd_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_WORKSPACE, &cwd_result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let output = helper.output().expect("helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let expected = repository
+        .root()
+        .parent()
+        .expect("temporary repository should have a parent")
+        .join(format!(
+            "{}-workspaces/{}",
+            repository
+                .root()
+                .file_name()
+                .expect("temporary repository should have a name")
+                .to_string_lossy(),
+            worker_id.as_str()
+        ))
+        .canonicalize()
+        .expect("canonical Worker Workspace");
+    let actual = fs::read_to_string(&cwd_result)
+        .expect("runtime should record its cwd")
+        .trim()
+        .to_owned();
+    assert_eq!(
+        actual,
+        expected.display().to_string(),
+        "a background Run must execute in its own Worker Workspace"
+    );
+}
+
 #[test]
 fn reserved_background_run_releases_worker_when_runtime_probe_fails() {
     let temporary_directory = TempDir::new().expect("temporary directory");
@@ -2553,6 +2654,28 @@ fn reserved_background_run_helper() {
             fs::write(result, error.to_string()).expect("persistence error result");
         }
     }
+}
+
+#[test]
+#[ignore]
+fn reserved_background_run_cwd_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-1")
+        .expect("Worker reservation");
+    let background = RunSupervisor::new()
+        .run_reserved_background(reservation, AgentRuntimeInvocation::new("cwd test"))
+        .expect("background Run should start");
+    let outcome = background.wait().expect("background Run should complete");
+    assert_eq!(outcome.exit_code(), Some(0));
 }
 
 #[test]
