@@ -175,9 +175,24 @@ struct TrackedAgent {
 #[derive(Debug, Default)]
 pub struct AgentStates {
     states: HashMap<PathBuf, TrackedAgent>,
+    /// Workspace path -> canonical join key, memoised so a caller that asks for
+    /// the same workspace every frame or tick does not `canonicalize` it again
+    /// (that syscall dominated the idle render path). Populated by
+    /// [`track`](Self::track) when the workspace set changes; a path that moved
+    /// is simply a new key, so a stale entry can never mis-join.
+    keys: HashMap<PathBuf, PathBuf>,
 }
 
 impl AgentStates {
+    /// Remember `path`'s canonical join key, so later
+    /// [`agent_for`](Self::agent_for) lookups skip the `canonicalize` syscall.
+    /// Re-resolved on each call - the TUI calls it when the workspace set
+    /// changes, which is what picks up a path that moved - while the per-frame
+    /// lookup stays a hash probe.
+    pub fn track(&mut self, path: &Path) {
+        self.keys.insert(path.to_path_buf(), canon(path));
+    }
+
     /// Startup: replay a sequence of events into a fresh map.
     pub fn replay(events: impl IntoIterator<Item = Event>) -> Self {
         let mut this = Self::default();
@@ -222,10 +237,13 @@ impl AgentStates {
 
     /// The live agent for a workspace `path`, canonicalized to match the `cwd`
     /// keys so the two sides of the join compare equal. Default (`Absent`,
-    /// `Unknown`) if the log has no events for it.
+    /// `Unknown`) if the log has no events for it. A [`track`](Self::track)ed
+    /// path reuses its memoised key, so a per-frame lookup is a hash probe
+    /// rather than a syscall.
     pub fn agent_for(&self, path: &Path) -> Agent {
+        let key = self.keys.get(path).cloned().unwrap_or_else(|| canon(path));
         self.states
-            .get(&canon(path))
+            .get(&key)
             .map(|tracked| tracked.agent)
             .unwrap_or_default()
     }
@@ -455,6 +473,62 @@ mod tests {
         let states = AgentStates::default();
         assert_eq!(
             states.agent_for(Path::new("/w/never")).state,
+            AgentState::Absent
+        );
+    }
+
+    #[test]
+    fn a_tracked_path_reuses_its_canonical_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let mut states = AgentStates::default();
+        states.track(&link);
+        states.apply(&Event {
+            name: "UserPromptSubmit".to_string(),
+            cwd: real.to_string_lossy().into_owned(),
+            transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
+        });
+        assert_eq!(states.agent_for(&link).state, AgentState::Working);
+
+        // The key is resolved once: retargeting the link does not re-resolve it
+        // under the TUI's feet, so the join stays on the workspace it saw.
+        let other = tmp.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&other, &link).unwrap();
+        assert_eq!(states.agent_for(&link).state, AgentState::Working);
+
+        // Re-tracking (what a workspace-set change does) picks up the move.
+        states.track(&link);
+        assert_eq!(states.agent_for(&link).state, AgentState::Absent);
+    }
+
+    #[test]
+    fn tracking_a_path_leaves_untracked_lookups_correct() {
+        let mut states = AgentStates::default();
+        states.track(Path::new("/w/tracked"));
+        states.apply(&Event {
+            name: "UserPromptSubmit".to_string(),
+            cwd: "/w/untracked".to_string(),
+            transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
+        });
+        // An untracked path still resolves through the fallback canonicalisation.
+        assert_eq!(
+            states.agent_for(Path::new("/w/untracked")).state,
+            AgentState::Working
+        );
+        assert_eq!(
+            states.agent_for(Path::new("/w/tracked")).state,
             AgentState::Absent
         );
     }

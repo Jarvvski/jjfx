@@ -9,7 +9,6 @@ use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::attention::Attention;
 use crate::engine::{WorkerSnapshot, WorkerStatus};
-use crate::render::graph;
 use crate::render::state::RenderState;
 use crate::render::style::{
     agent_color, agent_glyph, agent_label, attention_color, behind_color, display_path,
@@ -34,17 +33,19 @@ pub(crate) struct HomeView<'a> {
     pub selected: Option<&'a str>,
     pub idle_collapsed: bool,
     pub tick: u64,
-    pub graph: Option<&'a crate::graph::Graph>,
     pub title: String,
 }
 
 /// Draw the Attention-grouped list plus its header and footer. The only mutable
-/// input is the renderer's own cursor state.
+/// input is the renderer's own cursor state. `world_lines` is the already-laid-
+/// out world pane (computed by the caller's layout pass) - the pane draws it as
+/// given rather than recomputing the graph layout.
 pub(crate) fn draw(
     frame: &mut Frame,
     view: &HomeView<'_>,
     state: &RenderState,
     footer: Paragraph<'_>,
+    world_lines: Vec<Line<'static>>,
 ) {
     let [header, body, footer_area] = Layout::vertical([
         Constraint::Length(2),
@@ -65,8 +66,8 @@ pub(crate) fn draw(
     // The optional world-graph pane under the list: content-sized, capped at
     // half the body, and dropped entirely when the body is too short to split
     // usefully (the list stays readable - graceful degradation).
-    let world_lines = (state.world.is_some() && body.height / 2 >= MIN_WORLD_PANE_HEIGHT)
-        .then(|| graph::world_lines(view.graph, view.selected, body.width));
+    let world_lines =
+        (state.world.is_some() && body.height / 2 >= MIN_WORLD_PANE_HEIGHT).then_some(world_lines);
     let world_areas = world_lines.as_ref().map(|lines| {
         let h = (lines.len() as u16).saturating_add(2).min(body.height / 2);
         Layout::vertical([Constraint::Min(0), Constraint::Length(h)]).areas(body)
@@ -342,12 +343,11 @@ mod tests {
             selected: Some("feature"),
             idle_collapsed: false,
             tick: 0,
-            graph: None,
             title: "jjfx - 1 workspace(s)".to_string(),
         };
         let state = RenderState::default();
         let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
-        term.draw(|frame| draw(frame, &view, &state, Paragraph::new("")))
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), Vec::new()))
             .unwrap();
         let text = term.backend().to_string();
         assert!(text.contains("jjfx - 1 workspace(s)"), "{text}");
@@ -366,16 +366,17 @@ mod tests {
             selected: Some("feature"),
             idle_collapsed: false,
             tick: 0,
-            graph: None,
             title: "jjfx".to_string(),
         };
         let state = RenderState {
             world: Some(crate::viewport::Viewport::default()),
             ..RenderState::default()
         };
-        // Three rows total leaves no half-body for the pane; it must be dropped.
+        // Three rows total leaves no half-body for the pane; it must be dropped
+        // even though the caller laid out lines for it.
         let mut term = Terminal::new(TestBackend::new(120, 4)).unwrap();
-        term.draw(|frame| draw(frame, &view, &state, Paragraph::new("")))
+        let lines = vec![Line::from("graph content")];
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), lines))
             .unwrap();
         let text = term.backend().to_string();
         assert!(text.contains("feature"), "{text}");

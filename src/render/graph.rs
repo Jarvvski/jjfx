@@ -312,13 +312,9 @@ pub(crate) fn world_lines(
 }
 
 /// Draw the full-screen world graph: a title, the bordered graph scrolled to
-/// `viewport`, and the scroll hint. Geometry is refreshed before draw.
-pub(crate) fn draw_world(
-    frame: &mut Frame,
-    graph: Option<&graph::Graph>,
-    selected: Option<&str>,
-    viewport: &Viewport,
-) {
+/// `viewport`, and the scroll hint. The graph lines are laid out by the
+/// caller's geometry pass and passed in, so the layout runs once per frame.
+pub(crate) fn draw_world(frame: &mut Frame, lines: Vec<Line<'static>>, viewport: &Viewport) {
     let [title, body, footer] = Layout::vertical([
         Constraint::Length(1),
         Constraint::Min(0),
@@ -339,7 +335,6 @@ pub(crate) fn draw_world(
         title,
     );
 
-    let lines = world_lines(graph, selected, body.width);
     frame.render_widget(
         Paragraph::new(lines)
             .block(

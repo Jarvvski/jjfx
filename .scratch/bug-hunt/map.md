@@ -142,6 +142,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [25](issues/25-consolidate-state-write-and-lock-helpers.md) - one atomic
   write/lock helper.
 - [26](issues/26-tui-per-frame-work-and-agent-state-cache.md) - T7.
+  **resolved** - idle ticker gating, one graph layout per frame, and a
+  canonicalised agent-path memo.
 - [27](issues/27-terminal-restore-on-signal-and-input-resilience.md) - T8, T9.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
 - [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).

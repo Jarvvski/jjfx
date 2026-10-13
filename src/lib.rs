@@ -36,6 +36,7 @@ mod workspace_list;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use ratatui::crossterm::event;
@@ -226,8 +227,11 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx.clone());
 
-    // Animation ticker -> Msg::Tick, driving the working-glyph bounce.
-    spawn_animation_ticker(tx.clone());
+    // Animation ticker -> Msg::Tick, driving the working-glyph bounce. The
+    // shared gate is republished by the event loop after every batch, so an
+    // idle TUI emits no ticks (and does no per-tick work at all).
+    let animating = Arc::new(AtomicBool::new(false));
+    spawn_animation_ticker(tx.clone(), Arc::clone(&animating));
 
     let terminal: Arc<dyn terminal::Terminal> = Arc::from(Box::new(terminal::KittyTerminal::new(
         &config.terminal,
@@ -269,6 +273,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         &runtime,
         work_tx,
         worker_tx,
+        &animating,
     )
     .await;
     let restore_result = session.restore();
@@ -294,8 +299,10 @@ async fn event_loop(
     runtime: &Runtime,
     work_tx: UnboundedSender<()>,
     worker_tx: UnboundedSender<()>,
+    animating: &AtomicBool,
 ) -> anyhow::Result<()> {
     terminal.draw(|f| app.render(f))?;
+    animating.store(app.is_animating(), Ordering::Relaxed);
 
     while let Some(first) = rx.recv().await {
         // Drain everything already queued, then act once: input events in order,
@@ -340,6 +347,9 @@ async fn event_loop(
         if needs_redraw {
             terminal.draw(|f| app.render(f))?;
         }
+        // Publish the animation gate after every batch: the ticker keeps
+        // sending only while something on screen is actually moving.
+        animating.store(app.is_animating(), Ordering::Relaxed);
     }
     Ok(())
 }
@@ -405,11 +415,18 @@ fn spawn_worker_pool_poller(
     });
 }
 
-fn spawn_animation_ticker(tx: UnboundedSender<Msg>) {
+/// Send [`Msg::Tick`] every 150ms while something on screen is animating. The
+/// gate is a shared flag the event loop republishes after each batch, so an
+/// idle TUI (nothing working, nothing pending) emits no ticks and the loop
+/// stays parked on its message channel instead of waking ~7 times a second.
+fn spawn_animation_ticker(tx: UnboundedSender<Msg>, animating: Arc<AtomicBool>) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(150));
         loop {
             interval.tick().await;
+            if !animating.load(Ordering::Relaxed) {
+                continue;
+            }
             if tx.send(Msg::Tick).is_err() {
                 break;
             }
@@ -427,4 +444,36 @@ fn spawn_input_reader(tx: UnboundedSender<Msg>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// The gate is the whole point of the ticker: idle means silent. The
+    /// timeouts are generous multiples of the 150ms interval so a busy CI box
+    /// cannot turn a scheduling delay into a false failure.
+    #[tokio::test]
+    async fn animation_ticker_is_silent_until_something_animates() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Msg>();
+        let animating = Arc::new(AtomicBool::new(false));
+        spawn_animation_ticker(tx, Arc::clone(&animating));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(600), rx.recv())
+                .await
+                .is_err(),
+            "an idle ticker must not emit ticks"
+        );
+
+        animating.store(true, Ordering::Relaxed);
+        assert!(
+            matches!(
+                tokio::time::timeout(Duration::from_millis(600), rx.recv()).await,
+                Ok(Some(Msg::Tick))
+            ),
+            "ticks must resume once something animates"
+        );
+    }
 }

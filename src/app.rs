@@ -3,6 +3,7 @@
 //! redraws (the engine shape from the PRD).
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Span;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -439,6 +440,7 @@ impl App {
             tick: 0,
             should_quit: false,
         };
+        app.track_agent_paths();
         app.ensure_selection();
         app
     }
@@ -581,12 +583,11 @@ impl App {
         }
     }
 
-    /// Advance the working-glyph animation one frame. Returns whether anything
-    /// on screen is actually animating - the workspace list is visible and some
-    /// agent is mid-turn - so the event loop can skip the redraw for every
-    /// other tick instead of repainting an idle screen ~7 times a second.
-    pub fn animate(&mut self) -> bool {
-        self.tick = self.tick.wrapping_add(1);
+    /// Whether anything on screen is animating - the workspace list is visible
+    /// and some agent is mid-turn, a workspace command is pending, or a Worker
+    /// is busy. The event loop mirrors this into the ticker's gate, so an idle
+    /// TUI emits no ticks at all and does no per-tick work.
+    pub(crate) fn is_animating(&self) -> bool {
         matches!(self.mode, Mode::Normal | Mode::Help(_))
             && (self.pending_workspace.is_some()
                 || self
@@ -600,6 +601,15 @@ impl App {
                         .iter()
                         .any(|worker| worker.status() == WorkerStatus::Busy)
                 }))
+    }
+
+    /// Advance the working-glyph animation one frame. Returns whether anything
+    /// on screen is actually animating (see [`App::is_animating`]) so the event
+    /// loop can skip the redraw for every other tick instead of repainting an
+    /// idle screen ~7 times a second.
+    pub fn animate(&mut self) -> bool {
+        self.tick = self.tick.wrapping_add(1);
+        self.is_animating()
     }
 
     /// Fold a freshly-loaded diff into the detail view, if it is still open for
@@ -2209,10 +2219,27 @@ impl App {
 
     fn after_store_changed(&mut self) {
         self.restore_pending_deletion();
+        self.track_agent_paths();
         self.ensure_selection();
         // The cache/op-log changed on disk (new commits, fetch, workspace edits);
         // refresh the graph if a graph-bearing view is open.
         self.refresh_graph_if_visible();
+    }
+
+    /// Remember each workspace's canonical agent join key, so the per-frame and
+    /// per-tick agent lookups become hash probes instead of `canonicalize`
+    /// syscalls. Called wherever the workspace set (or a workspace's path)
+    /// changes.
+    fn track_agent_paths(&mut self) {
+        let paths: Vec<PathBuf> = self
+            .store
+            .workspaces()
+            .iter()
+            .filter_map(|w| w.path.clone())
+            .collect();
+        for path in paths {
+            self.agents.track(&path);
+        }
     }
 
     /// Point the selection at a real, currently-selectable workspace, falling
@@ -2251,7 +2278,10 @@ impl App {
     /// Render the active view from a read-only view model; all scroll/cursor
     /// geometry is refreshed by [`App::prepare_layout`] first.
     pub fn render(&mut self, frame: &mut Frame) {
-        self.prepare_layout(frame.area());
+        // The world-graph layout is computed once here and handed to whichever
+        // renderer draws it, so a frame never runs it twice (the geometry pass
+        // and the draw used to each call `world_lines`).
+        let world_lines = self.prepare_layout(frame.area());
 
         if matches!(&self.mode, Mode::Pool(PoolMode::SendInput { .. })) {
             self.render_send_editor(frame);
@@ -2270,12 +2300,7 @@ impl App {
             return;
         }
         if matches!(base_mode, Mode::Graph) {
-            render::graph::draw_world(
-                frame,
-                self.graph.as_ref(),
-                self.list.selected(),
-                &self.render.graph_viewport,
-            );
+            render::graph::draw_world(frame, world_lines, &self.render.graph_viewport);
             if matches!(self.mode, Mode::Help(_)) {
                 render::help::draw(frame, GRAPH_BINDINGS);
             }
@@ -2291,7 +2316,7 @@ impl App {
 
         let view = self.home_view();
         let footer = self.footer();
-        render::home::draw(frame, &view, &self.render, footer);
+        render::home::draw(frame, &view, &self.render, footer, world_lines);
 
         if matches!(self.mode, Mode::Help(_)) {
             render::help::draw(frame, NORMAL_BINDINGS);
@@ -2299,9 +2324,11 @@ impl App {
     }
 
     /// Refresh render geometry before a pure draw: reconcile the selection and
-    /// resize the world/graph viewports to the frame. Kept separate so `draw`
-    /// never mutates `App` state.
-    fn prepare_layout(&mut self, area: Rect) {
+    /// resize the world/graph viewports to the frame. Returns the world-graph
+    /// lines for the current view so the renderer draws the layout computed
+    /// here instead of running it a second time; empty when the view has no
+    /// graph.
+    fn prepare_layout(&mut self, area: Rect) -> Vec<Line<'static>> {
         self.ensure_selection();
         let base_mode = match &self.mode {
             Mode::Help(previous) => previous.as_ref(),
@@ -2311,30 +2338,32 @@ impl App {
             Mode::Graph => {
                 let body_w = area.width.saturating_sub(4);
                 let body_h = area.height.saturating_sub(2);
-                let total =
-                    render::graph::world_lines(self.graph.as_ref(), self.list.selected(), body_w)
-                        .len() as u16;
+                let lines =
+                    render::graph::world_lines(self.graph.as_ref(), self.list.selected(), body_w);
                 self.render
                     .graph_viewport
-                    .resize(body_h.saturating_sub(2), total);
+                    .resize(body_h.saturating_sub(2), lines.len() as u16);
+                lines
             }
-            Mode::Pool(_) | Mode::Detail(_) => {}
+            Mode::Pool(_) | Mode::Detail(_) => Vec::new(),
             _ => {
                 if self.render.world.is_some() {
                     let body_w = area.width.saturating_sub(4);
                     let body_h = area.height.saturating_sub(3);
-                    let total = render::graph::world_lines(
+                    let lines = render::graph::world_lines(
                         self.graph.as_ref(),
                         self.list.selected(),
                         body_w,
-                    )
-                    .len() as u16;
+                    );
                     if body_h / 2 >= MIN_WORLD_PANE_HEIGHT
                         && let Some(vp) = &mut self.render.world
                     {
-                        let h = total.saturating_add(2).min(body_h / 2);
-                        vp.resize(h.saturating_sub(2), total);
+                        let h = (lines.len() as u16).saturating_add(2).min(body_h / 2);
+                        vp.resize(h.saturating_sub(2), lines.len() as u16);
                     }
+                    lines
+                } else {
+                    Vec::new()
                 }
             }
         }
@@ -2373,7 +2402,6 @@ impl App {
             selected: self.list.selected(),
             idle_collapsed: self.list.idle_collapsed(),
             tick: self.tick,
-            graph: self.graph.as_ref(),
             title,
         }
     }
@@ -6154,5 +6182,32 @@ mod tests {
             session_id: None,
         }));
         assert!(!app.animate());
+    }
+
+    #[test]
+    fn is_animating_reports_the_gate_without_advancing_the_frame() {
+        let mut app = app_with(&["feat"]);
+        let frame = app.tick;
+        assert!(!app.is_animating());
+        assert_eq!(
+            app.tick, frame,
+            "reading the gate must not advance the frame"
+        );
+
+        for name in ["SessionStart", "UserPromptSubmit"] {
+            app.handle(Msg::AgentEvent(agent::Event {
+                name: name.to_string(),
+                cwd: "/wt/feat".to_string(),
+                transcript_path: None,
+                jjfx_event_version: None,
+                agent_kind: None,
+                session_id: None,
+            }));
+        }
+        assert!(app.is_animating());
+        assert_eq!(
+            app.tick, frame,
+            "reading the gate must not advance the frame"
+        );
     }
 }

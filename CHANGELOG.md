@@ -35,6 +35,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - The TUI no longer does needless work every frame and every tick:
+  an idle screen stops emitting animation ticks (it used to wake ~7 times a
+  second and re-canonicalise every workspace path), the world graph is laid out
+  once per frame instead of twice, and agent lookups are hash probes rather than
+  a `canonicalize` syscall per workspace. (fix)
+
 - 2026-10-13 - Workspace names are quoted wherever they are interpolated into a
   jj revset, so a name containing a space or a revset metacharacter (`my work`)
   no longer fails to parse - which read as "no chain", left `behind` at 0, and
