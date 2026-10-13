@@ -154,12 +154,14 @@ impl Runtime {
         let repo_root = self.repo_root.clone();
         tokio::spawn(async move {
             let load_ws = workspace.clone();
-            let files = tokio::task::spawn_blocking(move || diff::load(&repo_root, &load_ws))
-                .await
-                .unwrap_or_default();
+            let result = tokio::task::spawn_blocking(move || {
+                diff::load(&repo_root, &load_ws).map_err(|error| format!("{error:#}"))
+            })
+            .await
+            .unwrap_or_else(|error| Err(format!("diff read task failed: {error}")));
             let _ = tx.send(Msg::DiffLoaded {
                 ws: workspace,
-                files,
+                result,
             });
         });
     }

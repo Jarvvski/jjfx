@@ -280,8 +280,12 @@ pub enum Msg {
         result: Result<(), String>,
         store: Option<Store>,
     },
-    /// The diff for a workspace finished loading (ticket 10).
-    DiffLoaded { ws: String, files: Vec<FileDiff> },
+    /// The diff for a workspace finished loading (ticket 10); `Err` carries jj's
+    /// error text, so a failed read shows an error rather than an empty diff.
+    DiffLoaded {
+        ws: String,
+        result: Result<Vec<FileDiff>, String>,
+    },
     /// The commit graph finished loading from jj-lib (ticket 11).
     GraphLoaded(graph::Graph),
     /// A footer status message's expiry timer fired. Carries the generation it
@@ -489,7 +493,7 @@ impl App {
                 result,
                 store,
             } => self.on_workspace_deletion_completed(operation, workspace, result, store),
-            Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
+            Msg::DiffLoaded { ws, result } => self.on_diff_loaded(ws, result),
             Msg::GraphLoaded(graph) => {
                 self.graph_notice = graph.notice.clone();
                 self.graph = Some(graph);
@@ -627,12 +631,16 @@ impl App {
     }
 
     /// Fold a freshly-loaded diff into the detail view, if it is still open for
-    /// the same workspace (the user may have backed out or switched meanwhile).
-    fn on_diff_loaded(&mut self, ws: String, files: Vec<FileDiff>) {
+    /// the same workspace (the user may have backed out or switched meanwhile). A
+    /// failed read shows the error in place of the file list.
+    fn on_diff_loaded(&mut self, ws: String, result: Result<Vec<FileDiff>, String>) {
         if let Mode::Detail(d) = &mut self.mode
             && d.workspace() == ws
         {
-            d.loaded(files);
+            match result {
+                Ok(files) => d.loaded(files),
+                Err(error) => d.failed(error),
+            }
         }
     }
 
@@ -5934,9 +5942,24 @@ mod tests {
         app.mode = Mode::Detail(Detail::loading(ws.to_string()));
         app.handle(Msg::DiffLoaded {
             ws: ws.to_string(),
-            files: detail_files(),
+            result: Ok(detail_files()),
         });
         app
+    }
+
+    #[test]
+    fn a_failed_diff_read_is_shown_as_an_error_not_an_empty_diff() {
+        let mut app = app_with(&["default", "feat"]);
+        app.list.select("feat");
+        app.mode = Mode::Detail(Detail::loading("feat".to_string()));
+        app.handle(Msg::DiffLoaded {
+            ws: "feat".to_string(),
+            result: Err("jj diff: boom".to_string()),
+        });
+        match &app.mode {
+            Mode::Detail(d) => assert_eq!(d.error(), Some("jj diff: boom")),
+            _ => panic!("expected Detail mode"),
+        }
     }
 
     #[tokio::test]

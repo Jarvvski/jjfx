@@ -56,12 +56,12 @@ pub struct FileDiff {
     pub lines: Vec<DiffLine>,
 }
 
-/// Read and parse the diff from the mainline base to `<ws>@`. Returns an empty
-/// vec on any jj failure or when the workspace matches trunk. Blocking - call it
-/// from `spawn_blocking`, never the render task.
-pub fn load(repo_root: &Path, ws: &str) -> Vec<FileDiff> {
+/// Read and parse the diff from the mainline base to `<ws>@`. Returns an error
+/// when jj could not be read - an empty diff and a failed read must not look the
+/// same. Blocking - call it from `spawn_blocking`, never the render task.
+pub fn load(repo_root: &Path, ws: &str) -> anyhow::Result<Vec<FileDiff>> {
     let trunk = trunk::as_revset();
-    match jj_read(
+    let out = jj_read(
         repo_root,
         &[
             "diff",
@@ -71,10 +71,8 @@ pub fn load(repo_root: &Path, ws: &str) -> Vec<FileDiff> {
             &format!("{}@", crate::jj::revset_symbol(ws)),
             "--git",
         ],
-    ) {
-        Some(out) => parse(&out),
-        None => Vec::new(),
-    }
+    )?;
+    Ok(parse(&out))
 }
 
 /// Parse git-format diff text into per-file entries. Anything before the first
@@ -306,10 +304,11 @@ pub fn fuzzy_match(query: &str, text: &str) -> bool {
     true
 }
 
-/// Run a read-only jj command, stdout on success or `None`. `--ignore-working-copy`
-/// keeps it a pure read (never snapshot - that would churn commits, ADR 0006).
-fn jj_read(repo_root: &Path, args: &[&str]) -> Option<String> {
-    crate::jj::read_at_repo(repo_root, args).ok()
+/// Run a read-only jj command, stdout on success or a typed error on failure.
+/// `--ignore-working-copy` keeps it a pure read (never snapshot - that would
+/// churn commits, ADR 0006).
+fn jj_read(repo_root: &Path, args: &[&str]) -> anyhow::Result<String> {
+    crate::jj::read_at_repo(repo_root, args)
 }
 
 #[cfg(test)]

@@ -32,6 +32,9 @@ pub struct Detail {
     ws: String,
     loading: bool,
     files: Vec<FileDiff>,
+    /// Set when the diff read failed. A failed read is shown as an error, never
+    /// as an empty diff (which would read as "no changes from trunk").
+    error: Option<String>,
     focus: DetailFocus,
     /// Cursor into the *filtered* file list.
     selected: usize,
@@ -54,6 +57,7 @@ impl Detail {
             ws,
             loading: true,
             files: Vec::new(),
+            error: None,
             focus: DetailFocus::Files,
             selected: 0,
             filter: String::new(),
@@ -73,6 +77,12 @@ impl Detail {
         &self.filter
     }
 
+    #[cfg(test)]
+    /// The diff read error, if the last load failed - a seam for app-level tests.
+    pub(crate) fn error(&self) -> Option<&str> {
+        self.error.as_deref()
+    }
+
     /// Whether the file filter owns printable keys right now. The `?` help
     /// shortcut must yield to it, but only while it is focused: in the diff pane
     /// `?` is not filter input and must still open help.
@@ -84,6 +94,17 @@ impl Detail {
     pub fn loaded(&mut self, files: Vec<FileDiff>) {
         self.files = files;
         self.loading = false;
+        self.error = None;
+        self.resync();
+    }
+
+    /// Fold a failed diff read into the view: stop loading and show the error in
+    /// place of the file list, rather than an empty diff that reads as "no
+    /// changes".
+    pub fn failed(&mut self, error: String) {
+        self.files = Vec::new();
+        self.loading = false;
+        self.error = Some(error);
         self.resync();
     }
 
@@ -204,6 +225,18 @@ impl Detail {
             return;
         }
 
+        if let Some(error) = &self.error {
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    format!(" diff failed: {error}"),
+                    Style::default().add_modifier(Modifier::DIM),
+                ))
+                .block(block),
+                area,
+            );
+            return;
+        }
+
         let filtered = self.filtered();
         if filtered.is_empty() {
             let msg = if self.files.is_empty() {
@@ -289,7 +322,13 @@ impl Detail {
         let Some(fi) = fi else {
             // Nothing to show: keep the viewport height current (nothing to scroll).
             self.viewport.resize(inner_h, 0);
-            let msg = if self.loading { " loading…" } else { "" };
+            let msg = if let Some(error) = &self.error {
+                format!(" diff failed: {error}")
+            } else if self.loading {
+                " loading…".to_string()
+            } else {
+                String::new()
+            };
             frame.render_widget(
                 Paragraph::new(Span::styled(
                     msg,
@@ -432,6 +471,19 @@ mod tests {
         // A highlighter is armed for the selection (lazy - it highlights on the
         // first render, not here).
         assert!(d.hl.is_some());
+    }
+
+    #[test]
+    fn failed_records_the_error_and_a_later_load_clears_it() {
+        let mut d = Detail::loading("feat".to_string());
+        d.failed("jj diff: boom".to_string());
+        // Not an empty diff - the view is in its error state.
+        assert!(!d.loading);
+        assert!(d.files.is_empty());
+        assert_eq!(d.error(), Some("jj diff: boom"));
+
+        d.loaded(sample_files());
+        assert_eq!(d.error(), None);
     }
 
     #[test]
