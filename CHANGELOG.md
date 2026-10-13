@@ -48,6 +48,16 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A jj read failure no longer reads as a plausible success. `tidy`,
+  `tidyws` and `lift` treated a broken revset as "nothing to do" (the count
+  returned 0 on any failure); a broken repository read as "no workspaces"; a
+  failed read reported "0 behind"; a failed diff showed as an empty diff; and a
+  failed push could read as a successful no-op. Each is now a typed error, and
+  the work list shows an unknown row rather than a plausible zero. jj semantics
+  are classified from machine-readable state (jj templates, `jj log --count`, the
+  Git-format diff, and remote-bookmark snapshots) instead of jj's English CLI
+  text. (fix)
+
 - 2026-10-13 - The Worker Pool growth prompt states the growth ("Grow pool by
   3?") rather than a size it did not match: it printed `idle + shortfall`, but
   the pool grows by the shortfall from its *current* size, so a 4-worker pool

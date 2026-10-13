@@ -136,6 +136,12 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 ### Phase 3 - improvements
 
 - [21](issues/21-typed-jj-access-layer.md) - one jj seam with typed outcomes.
+  **resolved** - jj semantics are classified from machine-readable state (jj
+  templates, `jj log --count`, the Git-format diff, remote-bookmark snapshots)
+  and a jj failure is a typed error, not a silent zero/empty; `parse_diff_stat`
+  and the `"Nothing changed."` sniff are gone. One documented exception:
+  `forge::config_value` still folds a jj error into "unset", because
+  `jj config get` exits 1 for both cases (verified directly).
 - [22](issues/22-quote-refs-and-validate-workspace-names.md) - I6.
   **resolved** - `jj::revset_symbol` quotes every revset/diff builder, and the
   workspace list is read via `stringify(name)` so a quoted name still matches
