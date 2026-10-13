@@ -1576,6 +1576,22 @@ fn reserve_batch_locked(
     allow_partial: bool,
     excluded: &DispatchExclusions,
 ) -> Result<ReservationsOutcome, StateError> {
+    // One Ticket must not occupy two Workers. Each input below reserves a
+    // *distinct* Worker, so a batch naming the same Ticket twice would run it
+    // twice. A duplicate is a caller bug, so reject the batch outright rather
+    // than silently doubling (or dropping) it.
+    let mut seen = BTreeSet::new();
+    for input in &inputs {
+        if let Ok(id) = TicketId::parse(input.ticket.clone())
+            && !seen.insert(id.clone())
+        {
+            return Err(StateError::new(
+                "reserve",
+                "Worker Pool",
+                format!("duplicate Ticket {id} in one Dispatch batch"),
+            ));
+        }
+    }
     let default_profile = if inputs.iter().any(|input| input.profile.is_none()) {
         match configured_pool_profile(pool) {
             Ok(profile) => Some(profile),

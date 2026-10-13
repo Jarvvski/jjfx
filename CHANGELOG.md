@@ -35,6 +35,10 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A Ticket can no longer be dispatched twice: Ready Ticket
+  discovery drops a repeated Ticket with a diagnostic, and a Dispatch batch
+  naming the same Ticket twice is rejected before any Worker is reserved. (fix)
+
 - 2026-10-13 - The lifecycle event log is now read line-by-line and lossily, so
   one torn line (a rotation slice cut mid-character) no longer wipes every
   agent's state. The tailer starts from the replay's own offset, so a hook line

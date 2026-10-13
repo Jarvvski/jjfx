@@ -1,48 +1,58 @@
 # Deduplicate Ticket ids before reserving capacity
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
 ## Problem
 
-Duplicate Ticket ids are never deduplicated, so one Ticket can be dispatched
+Duplicate Ticket ids were never deduplicated, so one Ticket could be dispatched
 twice:
 
-- `reserve_batch_locked` (`state.rs:1601-1652`) selects a distinct Worker per
-  input with no id dedup.
-- `direct_dispatch.rs:209-225` and discovery (`ticket.rs:699-719`) do not dedup
-  either.
-
-A batch `["ENG-1","ENG-1"]`, or a provider returning the same Ready Ticket
-twice, reserves two Workers and launches two Runs for one Ticket; both outcomes
-report `ENG-1`.
-
-A related raw-vs-parsed gap: `ticket.rs:732-788` keys `child_counts` on the raw
-id but `candidates` on the parsed `TicketId`, so two raw ids that parse equal
-but differ as strings (whitespace is permitted by `validate_component`,
-`state.rs:172-184`) are neither flagged nor merged - the second silently
-overwrites the first and drops its diagnostics.
+- `ready_tickets` discovery pushed every parsed Ticket, so a provider returning
+  the same Ready Ticket twice produced two Tickets.
+- `reserve_batch_locked` selects a *distinct* Worker per input with no id dedup,
+  so a batch `["ENG-1", "ENG-1"]` reserved two Workers and launched two Runs for
+  one Ticket, with both outcomes reporting `ENG-1`.
 
 ## Fix
 
-Dedup by parsed `TicketId` at both the discovery boundary and the batch
-boundary, and reject duplicates with a diagnostic rather than silently
-double-dispatching.
+Dedup at both boundaries:
+
+- **Discovery** (`ticket.rs`): `ready_tickets` keeps the first occurrence of a
+  parsed `TicketId` and reports each repeat as a `"duplicate Ticket"` diagnostic,
+  so the caller never receives two Tickets for one id.
+- **Batch** (`state.rs`): `reserve_batch_locked` parses each input's Ticket id and
+  rejects the whole batch with a typed `StateError` on the first repeat. A
+  duplicate is a caller bug, and rejecting the batch outright is the non-silent
+  behaviour the ticket asks for; no new `ReservationsOutcome` variant was needed,
+  which keeps the churn (and the exhaustive matches) small.
+
+Internal callers are unaffected: orchestration claims one Ticket at a time and
+`group.ready()` is already keyed by unique ids.
+
+## The "raw vs parsed" note in the original ticket
+
+The ticket also flagged `dependency_graph`, where `child_counts` keys on the raw
+id but `candidates` on the parsed `TicketId`. That collision is **not
+reachable**: `TicketId::parse` does not normalise (`validate_component` only
+validates and stores the raw string), so two raw ids that parse equal are
+byte-identical, and `child_counts` already rejects byte-identical duplicates
+before they reach `candidates`. Left as-is rather than adding unreachable code.
 
 ## Commits
 
-1. Dedup + diagnostic at discovery (`ticket.rs`).
-2. Dedup + diagnostic at reserve/batch (`state.rs`, `direct_dispatch.rs`).
-3. Tests: duplicate ids produce one reservation and one diagnostic.
-4. CHANGELOG entry `(fix)`.
+1. `Reject duplicate Tickets at discovery and batch reservation` - both
+   boundaries, two tests, and a CHANGELOG `(fix)`.
 
 ## Acceptance Criteria
 
-- [ ] A duplicate Ticket id produces exactly one Reservation and one Run.
-- [ ] The duplicate is reported, not silently dropped.
-- [ ] `mise run check` is green.
+- [x] A duplicate Ticket id produces exactly one Reservation and one Run.
+- [x] The duplicate is reported, not silently dropped.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
 - Changing the CLI's accepted input shape.
+- `validate_component` accepting ids with trailing `.`/`/` (a filename-shape
+  concern, tracked with the workspace-name validation work in ticket 22).

@@ -850,6 +850,34 @@ fn ready_ticket_discovery_returns_typed_tickets_matching_the_filter() {
 }
 
 #[test]
+fn ready_ticket_discovery_reports_a_repeated_ticket_once() {
+    // A provider that returns the same Ready Ticket twice must not hand the
+    // caller two Tickets to dispatch: that would reserve two Workers for one
+    // Ticket. The repeat becomes a diagnostic instead.
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"tickets":[
+            {"id":"AMBA-42","title":"Ship typed discovery","status":"Todo","labels":["ready-for-agent"]},
+            {"id":"AMBA-42","title":"Ship typed discovery","status":"Todo","labels":["ready-for-agent"]}
+        ]}"#,
+    ));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+
+    assert_eq!(tickets.tickets().len(), 1);
+    assert_eq!(tickets.tickets()[0].id().as_str(), "AMBA-42");
+    assert_eq!(tickets.diagnostics().len(), 1);
+    assert_eq!(tickets.diagnostics()[0].subject(), "AMBA-42");
+    assert_eq!(tickets.diagnostics()[0].reason(), "duplicate Ticket");
+}
+
+#[test]
 fn ticket_values_preserve_valid_linear_identity_and_relationships() {
     let id = TicketId::parse("AMBA-42").expect("Ticket ID");
     let ticket = Ticket::new(

@@ -720,9 +720,22 @@ where
         let payload: RawReadyTickets = self.query_payload(&request)?;
         let mut tickets = Vec::with_capacity(payload.tickets.len());
         let mut diagnostics = Vec::new();
+        let mut seen = BTreeSet::new();
         for raw in payload.tickets {
             match ready_ticket(raw, &filter.label, &filter.status) {
-                Ok(ticket) => tickets.push(ticket),
+                Ok(ticket) => {
+                    // A provider can return the same Ready Ticket twice. Keep it
+                    // once and report the repeat, rather than letting the caller
+                    // dispatch one Ticket onto two Workers.
+                    if !seen.insert(ticket.id().clone()) {
+                        diagnostics.push(DiscoveryDiagnostic::new(
+                            ticket.id().as_str(),
+                            "duplicate Ticket",
+                        ));
+                        continue;
+                    }
+                    tickets.push(ticket);
+                }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
         }

@@ -61,7 +61,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T7 | TUI | M | S | per-tick `canonicalize` and duplicate graph/row projection per frame | 26 |
 | I6 | work | M-L | S | workspace names interpolated unquoted into revsets | 22 |
 | I7 | workspace | M-L | S | two divergent ad-hoc workspace path rules (CLI vs TUI) | 23 |
-| I9 | dispatch | M-L | S | duplicate Ticket ids are never deduped -> double dispatch | 13 |
+| I9 | dispatch | M-L | S | duplicate Ticket ids are never deduped -> double dispatch | 13 (fixed) |
 | I10 | run log | L-M | S | any invalid cost line turns a successful Run into a failure | 28 |
 | C7 | process | L-M | S | a recycled PID keeps a Worker `busy` forever | 07 |
 | D6 | attention | L | ? | a newer local/pushed change masks a changes-requested PR (stacked work) | 28 |
@@ -112,6 +112,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [12](issues/12-fence-untrusted-ticket-content.md) - I8.
   **resolved** - fenced + slug validation.
 - [13](issues/13-deduplicate-dispatch-tickets.md) - I9.
+  **resolved** - deduped at discovery and at batch reservation.
 - [14](issues/14-single-source-branch-prefix.md) - D2.
   **resolved** - resolution matches on the Ticket id.
 - [15](issues/15-live-occupancy-exclusions.md) - D4.

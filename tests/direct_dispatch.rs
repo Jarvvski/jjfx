@@ -841,6 +841,38 @@ fn direct_dispatch_preserves_primary_and_release_conflict_without_clobbering_new
 }
 
 #[test]
+fn a_batch_naming_one_ticket_twice_is_rejected_before_reserving_any_worker() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(2).expect("capacity"))
+        .expect("grow Worker Pool");
+    let dispatch = repository.direct_dispatch();
+    let request =
+        DirectDispatchRequest::new(ticket("ENG-501", "Dispatch me once"), RunMode::Foreground);
+
+    let error = dispatch
+        .dispatch(&[request.clone(), request])
+        .expect_err("a duplicate Ticket must not reserve two Workers");
+
+    assert!(
+        error.to_string().contains("duplicate Ticket ENG-501"),
+        "unexpected error: {error}"
+    );
+    let snapshot = repository.worker_pool().snapshot();
+    assert!(
+        snapshot
+            .workers()
+            .iter()
+            .all(|worker| worker.status() == WorkerStatus::Idle),
+        "a rejected batch must reserve nothing"
+    );
+}
+
+#[test]
 fn direct_dispatch_releases_its_reservation_after_identity_failure() {
     let (_temporary_directory, repository) = local_repository();
     configure_jj_identity(&repository);
