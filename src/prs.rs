@@ -55,11 +55,20 @@ fn query(slug: &str, filter: &[&str]) -> Result<Vec<Pr>, String> {
     serde_json::from_str(out.stdout()).map_err(|e| e.to_string())
 }
 
-/// Every PR in the repo (all states, up to 100), for overlaying work state onto
-/// the workspace list. Returns an empty list on any failure, so a missing `gh`,
-/// no auth, or no network degrades to "no PR info" rather than crashing.
-pub fn list(slug: &str) -> Vec<Pr> {
-    query(slug, &["--limit", "100"]).unwrap_or_default()
+/// The most Pull Requests one `gh pr list` read fetches. A repository with more
+/// than this many reports only the newest; the read that decides one workspace's
+/// state ([`find`]) is scoped to its own branch and unaffected.
+const LIST_LIMIT: &str = "100";
+
+/// Every PR in the repo (all states, up to [`LIST_LIMIT`]), for overlaying work
+/// state onto the workspace list.
+///
+/// Surfaces `gh` failures rather than degrading to an empty list: "no Pull
+/// Requests" and "Pull Request state unavailable" are different facts, and only
+/// the caller can decide how to render the second (a Workspace whose PR merged
+/// looks `Pushed` without it).
+pub fn list(slug: &str) -> Result<Vec<Pr>, String> {
+    query(slug, &["--limit", LIST_LIMIT])
 }
 
 /// The PR for one branch: an open one wins, else a merged one; closed-unmerged

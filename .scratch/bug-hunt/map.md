@@ -49,7 +49,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 (fixed) |
 | D4 | dispatch | M | S | orchestration freezes occupancy exclusions for the whole run (violates ADR-0011) | 15 (fixed) |
 | D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 (fixed) |
-| I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 29 |
+| I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 29 (fixed) |
 | I3 | forge | M | S | conflict detection only inspects `@`; a lower-commit conflict welds and pushes | 10 (fixed) |
 | I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 (fixed) |
 | I5 | store | M | S | `default` workspace pinned to the current workspace when launched from a secondary workspace | 11 (fixed) |
@@ -140,6 +140,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [27](issues/27-terminal-restore-on-signal-and-input-resilience.md) - T8, T9.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
 - [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).
+  **resolved** - a failed PR read yields `Unknown`, not `Pushed`.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.

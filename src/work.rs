@@ -112,7 +112,12 @@ impl WorkState {
 /// adapter substitutes exactly the facts that vary in production.
 pub(crate) trait WorkReads {
     /// Every PR reported for the repository, in one read.
-    fn pull_requests(&self) -> Vec<crate::prs::Pr>;
+    ///
+    /// A failure must stay distinguishable from an empty list: a Workspace whose
+    /// Pull Request has merged looks `Pushed` when the read fails, so reporting
+    /// that as "no Pull Requests" would silently mark it as still needing a
+    /// forge.
+    fn pull_requests(&self) -> Result<Vec<crate::prs::Pr>, String>;
     /// One Workspace's own change chain (`trunk..<ws>@`), tip first. `None` on a
     /// read failure, rendered as [`WorkState::Unknown`].
     fn chain(&self, workspace: &str) -> Option<Chain>;
@@ -139,12 +144,14 @@ impl SystemWorkReads {
 }
 
 impl WorkReads for SystemWorkReads {
-    fn pull_requests(&self) -> Vec<crate::prs::Pr> {
-        crate::jj::derive_repo_slug(&self.repo_root)
-            .ok()
-            .flatten()
-            .map(|slug| crate::prs::list(&slug))
-            .unwrap_or_default()
+    fn pull_requests(&self) -> Result<Vec<crate::prs::Pr>, String> {
+        match crate::jj::derive_repo_slug(&self.repo_root) {
+            // Not a GitHub Repository: there is nothing to read, and that is not a
+            // failure.
+            Ok(None) => Ok(Vec::new()),
+            Ok(Some(slug)) => crate::prs::list(&slug),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     fn chain(&self, workspace: &str) -> Option<Chain> {
@@ -171,7 +178,13 @@ impl WorkReads for SystemWorkReads {
 /// *heads* that commit owns it, and a base nobody uniquely heads is owned by
 /// none.
 pub fn snapshot(reads: &dyn WorkReads, workspaces: &[String]) -> HashMap<String, Work> {
-    let prs = reads.pull_requests();
+    // A failed Pull Request read is not "no Pull Requests": it means
+    // classification cannot tell a pushed commit from one with an open or merged
+    // Pull Request, so it must not claim the former.
+    let (prs, prs_known) = match reads.pull_requests() {
+        Ok(prs) => (prs, true),
+        Err(_) => (Vec::new(), false),
+    };
 
     let chains: Vec<(String, Option<Chain>)> = workspaces
         .iter()
@@ -190,7 +203,7 @@ pub fn snapshot(reads: &dyn WorkReads, workspaces: &[String]) -> HashMap<String,
                         .iter()
                         .filter(|c| ownership.owns(name, c))
                         .collect();
-                    classify(reads, name, &owned, &prs)
+                    classify(reads, name, &owned, &prs, prs_known)
                 }
             };
             let work = Work {
@@ -284,6 +297,7 @@ fn classify(
     ws: &str,
     owned: &[&ChainCommit],
     prs: &[crate::prs::Pr],
+    prs_known: bool,
 ) -> WorkState {
     match overlay(owned, prs) {
         // Fill in the line delta, measured from the base of the owned line (its
@@ -293,6 +307,10 @@ fn classify(
             let (added, removed) = reads.line_delta(ws, base).unwrap_or((0, 0));
             WorkState::Dirty { added, removed }
         }
+        // Without a Pull Request read, a pushed commit may already have an open
+        // or merged Pull Request. Say the state is unknown rather than claiming it
+        // still needs a forge.
+        WorkState::Pushed if !prs_known => WorkState::Unknown,
         other => other,
     }
 }
@@ -799,6 +817,8 @@ mod tests {
     #[derive(Default)]
     struct FakeWorkReads {
         prs: Vec<crate::prs::Pr>,
+        /// When set, the Pull Request read fails instead of returning `prs`.
+        prs_failed: bool,
         chains: HashMap<String, Option<Chain>>,
         behind: HashMap<String, u32>,
         deltas: HashMap<String, (u32, u32)>,
@@ -807,8 +827,11 @@ mod tests {
     }
 
     impl WorkReads for FakeWorkReads {
-        fn pull_requests(&self) -> Vec<crate::prs::Pr> {
-            self.prs.clone()
+        fn pull_requests(&self) -> Result<Vec<crate::prs::Pr>, String> {
+            if self.prs_failed {
+                return Err("gh pr list: not authenticated".to_owned());
+            }
+            Ok(self.prs.clone())
         }
 
         fn chain(&self, workspace: &str) -> Option<Chain> {
@@ -924,5 +947,52 @@ mod tests {
                 removed: 2,
             }
         );
+    }
+
+    #[test]
+    fn a_failed_pull_request_read_is_unknown_not_pushed() {
+        // A pushed commit with no Pull Request read might already be open or
+        // merged. Reporting `Pushed` would claim it still needs a forge.
+        let pushed = || FakeWorkReads {
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![cc("tip", false, &["other"], true, true)]),
+            )]),
+            ..FakeWorkReads::default()
+        };
+
+        // No Pull Requests, read successfully: genuinely still pushed.
+        assert_eq!(
+            snapshot(&pushed(), &["feat".to_string()])["feat"].state,
+            WorkState::Pushed
+        );
+
+        // The read failed: the same chain must not claim `Pushed`.
+        let failed = FakeWorkReads {
+            prs_failed: true,
+            ..pushed()
+        };
+        assert_eq!(
+            snapshot(&failed, &["feat".to_string()])["feat"].state,
+            WorkState::Unknown
+        );
+    }
+
+    #[test]
+    fn a_failed_pull_request_read_keeps_a_local_dirty_state() {
+        // A local-only change is `Dirty` with or without Pull Request knowledge,
+        // so a failed read must not throw that away.
+        let fake = FakeWorkReads {
+            prs_failed: true,
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![cc("tip", false, &[], false, true)]),
+            )]),
+            ..FakeWorkReads::default()
+        };
+
+        let work = snapshot(&fake, &["feat".to_string()]);
+
+        assert!(matches!(work["feat"].state, WorkState::Dirty { .. }));
     }
 }

@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A failed `gh pr list` is no longer reported as "no Pull
+  Requests". The read now surfaces the failure, and a pushed Workspace whose
+  Pull Request state cannot be read shows as unknown instead of claiming it
+  still needs a forge. A local-only change stays dirty. (fix)
+
 - 2026-10-13 - Dispatch occupancy is now a live query: the orchestration runner
   asks a provider for the excluded Worker Workspaces on every claim, so a
   Workspace a human opens (or closes) while a Dispatch Group is running changes
