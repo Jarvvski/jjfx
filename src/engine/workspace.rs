@@ -462,6 +462,14 @@ where
     }
 
     let path = ad_hoc_workspace_path(root, name);
+    let base = path
+        .parent()
+        .ok_or_else(|| AdHocWorkspaceError::new("workspace path has no parent"))?;
+    // jj does not create missing parents, and the shared base directory may not
+    // exist yet on a fresh repository.
+    fs::create_dir_all(base).map_err(|error| {
+        AdHocWorkspaceError::new(format!("create workspace directory: {error}"))
+    })?;
     let existed_before = path.exists();
     if let Err(error) =
         add_workspace_with_revision(root, name, &path, revision, repository.colocate())
@@ -524,14 +532,12 @@ pub(crate) fn remove_ad_hoc(
     }
 }
 
-/// The on-disk path for a new ad hoc Workspace before it exists: a jjfx-compatible
-/// sibling of the repository root, `<parent>/<repo>-<name>`.
+/// The on-disk path for a new ad hoc Workspace before it exists: the shared
+/// sibling base directory used by Workers and the CLI, so the TUI's pending
+/// tombstone and the CLI's `Workspaces::path` can never disagree. Resolves to
+/// `<parent>/<repo>-workspaces/<name>`, or `$JJ_WS_DIR/<name>` when set.
 pub fn ad_hoc_workspace_path(root: &Path, name: &str) -> PathBuf {
-    let base = root
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("repo");
-    root.parent().unwrap_or(root).join(format!("{base}-{name}"))
+    workspace_base(root).join(name)
 }
 
 /// The provisioned Workspace backing one Worker.

@@ -141,6 +141,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   workspace list is read via `stringify(name)` so a quoted name still matches
   the ws-cache. (A second root cause: the `name` symbol template.)
 - [23](issues/23-unify-ad-hoc-workspace-paths.md) - I7.
+  **resolved** - `ad_hoc_workspace_path` delegates to the shared `workspace_base`,
+  so TUI create, CLI add, and Worker provisioning agree; existing workspaces are
+  cache-preserved and keep their real paths.
 - [24](issues/24-jj-lib-jj-version-compat-check.md) - version coupling.
 - [25](issues/25-consolidate-state-write-and-lock-helpers.md) - one atomic
   write/lock helper.

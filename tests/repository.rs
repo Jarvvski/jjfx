@@ -160,15 +160,9 @@ fn refresh_preserves_cached_paths_for_ad_hoc_workspaces() {
     let workspace = repository
         .create_ad_hoc_workspace("feature")
         .expect("ad hoc workspace should be created");
-    let root = repository.root();
     assert_eq!(
         workspace.path(),
-        root.with_file_name(format!(
-            "{}-feature",
-            root.file_name()
-                .expect("repository directory should have a name")
-                .to_string_lossy()
-        ))
+        repository.workspaces().base_dir().join("feature")
     );
 
     let snapshot = repository
@@ -259,14 +253,7 @@ fn creates_and_removes_an_ad_hoc_workspace_through_the_shared_repository() {
     let workspace = repository
         .create_ad_hoc_workspace(" feat ")
         .expect("Ad Hoc Workspace should be created");
-    let expected_path = repository.root().with_file_name(format!(
-        "{}-feat",
-        repository
-            .root()
-            .file_name()
-            .expect("repository name")
-            .to_string_lossy()
-    ));
+    let expected_path = repository.workspaces().base_dir().join("feat");
 
     assert_eq!(workspace.name(), "feat");
     assert_eq!(workspace.path(), expected_path);
@@ -290,6 +277,40 @@ fn creates_and_removes_an_ad_hoc_workspace_through_the_shared_repository() {
             .lines()
             .any(|line| line.starts_with("feat\t"))
     );
+}
+
+#[test]
+fn cli_add_and_tui_create_place_workspaces_in_the_same_base_directory() {
+    let (_temporary_directory, repository) = local_repository();
+    let base_dir = repository.workspaces().base_dir();
+
+    let WorkspaceAddOutcome::Created(cli) = repository
+        .workspaces()
+        .add("cli-feature", None)
+        .expect("CLI Workspace should be added")
+    else {
+        panic!("CLI Workspace should be created");
+    };
+    let tui = repository
+        .create_ad_hoc_workspace("tui-feature")
+        .expect("TUI Ad Hoc Workspace should be created");
+
+    // One rule for both frontends: each lands directly under the shared
+    // `<repo>-workspaces` base directory, exactly as Workers do.
+    assert_eq!(cli.path(), base_dir.join("cli-feature"));
+    assert_eq!(tui.path(), base_dir.join("tui-feature"));
+    assert_eq!(
+        cli.path().parent(),
+        tui.path().parent(),
+        "CLI add and TUI create must share one Workspace base directory"
+    );
+
+    repository
+        .remove_ad_hoc_workspace(cli.name(), Some(cli.path()))
+        .expect("CLI Workspace should be removed");
+    repository
+        .remove_ad_hoc_workspace(tui.name(), Some(tui.path()))
+        .expect("TUI Ad Hoc Workspace should be removed");
 }
 
 #[test]
@@ -494,10 +515,7 @@ fn ad_hoc_workspaces_run_repository_lifecycle_hooks() {
     repository
         .remove_ad_hoc_workspace(workspace.name(), Some(workspace.path()))
         .expect("Ad Hoc Workspace should be removed");
-    let teardown_path = root
-        .parent()
-        .expect("temporary repository should have a parent")
-        .join(&teardown_marker);
+    let teardown_path = repository.workspaces().base_dir().join(&teardown_marker);
     assert_eq!(
         fs::read_to_string(teardown_path)
             .expect("teardown hook should run")
@@ -598,14 +616,7 @@ fn workspace_setup_failure_rolls_back_the_tui_workspace_and_runs_teardown() {
         "#!/bin/sh\nprintf '%s\\n' \"$PWD\" > .jjfx-setup-started\nexit 23\n",
         &teardown,
     );
-    let expected_path = repository.root().with_file_name(format!(
-        "{}-feature",
-        repository
-            .root()
-            .file_name()
-            .expect("temporary repository should have a name")
-            .to_string_lossy()
-    ));
+    let expected_path = repository.workspaces().base_dir().join("feature");
 
     let error = repository
         .create_ad_hoc_workspace("feature")
@@ -618,13 +629,9 @@ fn workspace_setup_failure_rolls_back_the_tui_workspace_and_runs_teardown() {
         assert!(!cache.lines().any(|line| line.starts_with("feature\\t")));
     }
     assert_eq!(
-        fs::read_to_string(
-            root.parent()
-                .expect("temporary repository should have a parent")
-                .join(&teardown_marker)
-        )
-        .expect("teardown hook should run during rollback")
-        .trim(),
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run during rollback")
+            .trim(),
         expected_path.to_string_lossy()
     );
 }
@@ -731,13 +738,9 @@ fn failed_tui_teardown_still_removes_the_workspace_and_reports_the_error() {
     assert!(!workspace_names(root).contains(&"feature".to_owned()));
     assert!(!workspace.path().exists());
     assert_eq!(
-        fs::read_to_string(
-            root.parent()
-                .expect("temporary repository should have a parent")
-                .join(&teardown_marker)
-        )
-        .expect("teardown hook should run")
-        .trim(),
+        fs::read_to_string(repository.workspaces().base_dir().join(&teardown_marker))
+            .expect("teardown hook should run")
+            .trim(),
         workspace.path().to_string_lossy()
     );
 }

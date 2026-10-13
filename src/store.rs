@@ -455,6 +455,7 @@ mod tests {
     fn create_jj_failure_preserves_loaded_store() {
         let repo = test_local_repo("create-jj-failure");
         let path = new_workspace_path(&repo, "feat");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let mut store = Store::load(&repo);
         let before = store.workspaces().to_vec();
 
@@ -467,7 +468,10 @@ mod tests {
         assert!(format!("{error:#}").contains("already exists"));
         assert_eq!(store.workspaces(), before);
         let fresh = Store::load(&repo);
-        assert_eq!(fresh.workspace("feat").unwrap().path, None);
+        assert_eq!(
+            fresh.workspace("feat").unwrap().path.as_deref(),
+            Some(path.as_path())
+        );
 
         std::fs::remove_dir_all(&path).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
@@ -564,7 +568,10 @@ mod tests {
 
         assert_eq!(created.name(), "feat");
         assert_eq!(created.path(), expected_path);
-        assert_eq!(store.workspace("feat").unwrap().path, None);
+        assert_eq!(
+            store.workspace("feat").unwrap().path.as_deref(),
+            Some(expected_path.as_path())
+        );
 
         std::fs::remove_dir_all(&expected_path).unwrap();
         std::fs::remove_dir_all(&repo).unwrap();
@@ -574,7 +581,7 @@ mod tests {
     fn delete_jj_failure_continues_filesystem_cleanup() {
         let repo = test_local_repo("delete-jj-failure");
         let path = new_workspace_path(&repo, "ghost");
-        std::fs::create_dir(&path).unwrap();
+        std::fs::create_dir_all(&path).unwrap();
         write_cache(
             &repo,
             &[

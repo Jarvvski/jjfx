@@ -35,6 +35,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Creating a Workspace from the TUI now uses the same on-disk rule
+  as the CLI and the Worker Pool - `<parent>/<repo>-workspaces/<name>`, or
+  `$JJ_WS_DIR/<name>` when that is set. It previously used
+  `<parent>/<repo>-<name>`, so the same operation landed in two different places
+  depending on which frontend ran it. Existing Workspaces keep their real paths
+  (they are cache-preserved), so only newly created ones move. (fix)
+
 - 2026-10-13 - A diff longer than 65 535 lines scrolls to its end again. The
   diff and world-graph viewports recorded the content length as a `u16`, so the
   line count wrapped: a 70 000-line file could only be scrolled to line 4 464,
