@@ -518,7 +518,7 @@ fn unavailable_log_returns_a_path_aware_io_error() {
 }
 
 #[test]
-fn semantic_result_failure_returns_a_path_aware_parse_error() {
+fn a_negative_claude_cost_is_dropped_without_failing_the_run() {
     let directory = tempdir().expect("temporary directory should be created");
     let path = directory.path().join("worker.log");
     fs::write(
@@ -531,25 +531,36 @@ fn semantic_result_failure_returns_a_path_aware_parse_error() {
     .expect("Run log should be written");
     let log = RunLog::new(&path, AgentRuntime::Claude);
 
-    let error = log
+    let result = log
         .final_result()
-        .expect_err("a negative Run cost should fail");
+        .expect("a negative Run cost should not fail the Run")
+        .expect("the terminal result should be present");
 
-    match error {
-        RunLogError::Parse {
-            path: error_path,
-            source:
-                RunLogParseError::InvalidCost {
-                    runtime: AgentRuntime::Claude,
-                    value,
-                },
-        } => {
-            assert_eq!(error_path, path);
-            assert_eq!(value, "-0.01");
-        }
-        RunLogError::Parse { source, .. } => panic!("unexpected parse error: {source}"),
-        RunLogError::Io { source, .. } => panic!("unexpected I/O error: {source}"),
-    }
+    assert_eq!(result.conclusion(), &RunConclusion::Succeeded);
+    assert_eq!(result.cost(), None);
+}
+
+#[test]
+fn an_out_of_range_claude_cost_is_dropped_without_failing_the_run() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("worker.log");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"total_cost_usd":1e30}"#,
+            "\n",
+        ),
+    )
+    .expect("Run log should be written");
+    let log = RunLog::new(&path, AgentRuntime::Claude);
+
+    let result = log
+        .final_result()
+        .expect("an out-of-range Run cost should not fail the Run")
+        .expect("the terminal result should be present");
+
+    assert_eq!(result.conclusion(), &RunConclusion::Succeeded);
+    assert_eq!(result.cost(), None);
 }
 
 #[test]
@@ -1191,18 +1202,20 @@ fn pi_unknown_records_are_ignored_but_malformed_records_are_typed() {
             ..
         }
     ));
-    let error = parser
+    let events = parser
         .parse_line(
             r#"{"type":"message_end","message":{"role":"assistant","stopReason":"stop","usage":{"cost":{"total":-1}}}}"#,
         )
-        .expect_err("negative Pi cost should be classified");
-    assert!(matches!(
-        error,
-        RunLogParseError::InvalidCost {
-            runtime: AgentRuntime::Pi,
-            ..
-        }
-    ));
+        .expect("a negative Pi cost should be dropped, not classified");
+    let result = events
+        .iter()
+        .find_map(|event| match event {
+            RunLogEvent::Result(result) => Some(result),
+            RunLogEvent::Activity(_) => None,
+        })
+        .expect("a negative Pi cost should still yield a terminal result");
+    assert_eq!(result.conclusion(), &RunConclusion::Succeeded);
+    assert_eq!(result.cost(), None);
 }
 
 #[test]

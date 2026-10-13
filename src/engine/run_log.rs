@@ -539,14 +539,6 @@ pub enum RunLogParseError {
         #[source]
         source: serde_json::Error,
     },
-    /// A provider reported a cost outside the supported non-negative range.
-    #[error("invalid {runtime:?} Run cost: {value}")]
-    InvalidCost {
-        /// Runtime that reported the invalid cost.
-        runtime: AgentRuntime,
-        /// Provider value that could not be represented in micro-USD.
-        value: String,
-    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -1061,35 +1053,27 @@ fn pi_result(message: &PiMessage) -> Result<RunResult, RunLogParseError> {
     };
     if let Some(usage) = message.usage.as_ref() {
         result = result.with_usage(usage.normalized());
-        if let Some(cost) = parse_pi_cost(usage.cost.as_ref())? {
+        if let Some(cost) = parse_pi_cost(usage.cost.as_ref()) {
             result = result.with_cost(cost);
         }
     }
     Ok(result)
 }
 
-fn parse_pi_cost(cost: Option<&PiCost>) -> Result<Option<RunCost>, RunLogParseError> {
-    let Some(cost) = cost else {
-        return Ok(None);
-    };
-    let Some(value) = cost.total.as_ref() else {
-        return Ok(None);
-    };
+/// Decodes a Pi-reported cost, or `None` when the provider value is unusable.
+///
+/// An unusable cost means "no cost reported", never "the Run failed".
+fn parse_pi_cost(cost: Option<&PiCost>) -> Option<RunCost> {
+    let cost = cost?;
+    let value = cost.total.as_ref()?;
     let number = value
         .as_f64()
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .ok_or_else(|| RunLogParseError::InvalidCost {
-            runtime: AgentRuntime::Pi,
-            value: value.to_string(),
-        })?;
+        .filter(|value| value.is_finite() && *value >= 0.0)?;
     let micro_usd = (number * 1_000_000.0).round();
     if micro_usd > u64::MAX as f64 {
-        return Err(RunLogParseError::InvalidCost {
-            runtime: AgentRuntime::Pi,
-            value: value.to_string(),
-        });
+        return None;
     }
-    Ok(Some(RunCost::from_micro_usd(micro_usd as u64)))
+    Some(RunCost::from_micro_usd(micro_usd as u64))
 }
 
 fn summarize_pi_result(value: Option<&Value>) -> Option<String> {
@@ -1506,28 +1490,26 @@ fn parse_claude_result(event: ClaudeEvent) -> Result<RunLogEvent, RunLogParseErr
     if let Some(turns) = event.num_turns {
         result = result.with_turns(turns);
     }
-    if let Some(cost) = event.total_cost_usd {
-        result = result.with_cost(parse_claude_cost(&cost)?);
+    if let Some(cost) = event.total_cost_usd
+        && let Some(cost) = parse_claude_cost(&cost)
+    {
+        result = result.with_cost(cost);
     }
     Ok(RunLogEvent::Result(result))
 }
 
-fn parse_claude_cost(cost: &Number) -> Result<RunCost, RunLogParseError> {
+/// Decodes a Claude-reported cost, or `None` when the provider value is unusable.
+///
+/// An unusable cost means "no cost reported", never "the Run failed".
+fn parse_claude_cost(cost: &Number) -> Option<RunCost> {
     let value = cost
         .as_f64()
-        .filter(|value| value.is_finite() && *value >= 0.0)
-        .ok_or_else(|| RunLogParseError::InvalidCost {
-            runtime: AgentRuntime::Claude,
-            value: cost.to_string(),
-        })?;
+        .filter(|value| value.is_finite() && *value >= 0.0)?;
     let micro_usd = (value * 1_000_000.0).round();
     if micro_usd > u64::MAX as f64 {
-        return Err(RunLogParseError::InvalidCost {
-            runtime: AgentRuntime::Claude,
-            value: cost.to_string(),
-        });
+        return None;
     }
-    Ok(RunCost::from_micro_usd(micro_usd as u64))
+    Some(RunCost::from_micro_usd(micro_usd as u64))
 }
 
 /// Token usage normalized across Agent Runtime providers.
