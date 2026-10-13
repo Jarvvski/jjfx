@@ -42,7 +42,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 |
 | T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 |
 | I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 |
-| C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 |
+| C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 (fixed) |
 | C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 |
 | C5 | state | M | S | `detached_cleanup_markers` aborts on any malformed `.cleanup` filename | 20 |
 | C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 |
@@ -99,6 +99,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [07](issues/07-durable-run-identity.md) - C2, C7.
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
 - [09](issues/09-order-cleanup-marker-after-manifest.md) - C3.
+  **resolved** - manifest-first ordering.
 
 ### Phase 2 - medium
 

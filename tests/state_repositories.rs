@@ -1,9 +1,10 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use jjfx::engine::{
-    CommitOutcome, DispatchGroupState, Expected, Loaded, PoolState, Repository, StateChange,
-    TicketId, WorkerId, WorkerState,
+    CommitOutcome, DispatchGroupState, Expected, Loaded, PoolCapacity, PoolState, Repository,
+    StateChange, TicketId, WireStatus, WireTimestamp, WorkerId, WorkerState,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -235,4 +236,56 @@ fn unknown_json_number_spelling_survives_a_worker_mutation() {
         .expect("commit");
     let written = fs::read_to_string(path).expect("written Worker");
     assert!(written.contains("1.2300e+100"), "written state: {written}");
+}
+
+#[test]
+fn a_failed_pool_shrink_leaves_no_cleanup_marker_on_a_member() {
+    let (temp, repository) = repository();
+    let first = WorkerId::parse("worker-01").expect("Worker");
+    let second = WorkerId::parse("worker-02").expect("Worker");
+    repository
+        .state_store()
+        .pool()
+        .commit(
+            Expected::Missing,
+            StateChange::Replace(PoolState::new(
+                2,
+                "owner/repo",
+                vec![first.clone(), second.clone()],
+                WireTimestamp::new("2026-08-04T12:00:00Z"),
+            )),
+        )
+        .expect("create pool");
+    for worker in [&first, &second] {
+        repository
+            .state_store()
+            .worker(worker.clone())
+            .commit(
+                Expected::Missing,
+                StateChange::Replace(WorkerState::new(WireStatus::new("idle"))),
+            )
+            .expect("idle Worker");
+    }
+
+    // Make `.jj` read-only so the Pool manifest's atomic write cannot create its
+    // temporary file, while `.jj/pool` (the cleanup-marker directory) stays
+    // writable. Only the manifest write fails.
+    let jj = temp.path().join(".jj");
+    let original = fs::metadata(&jj).expect("metadata").permissions();
+    let mut read_only = original.clone();
+    read_only.set_mode(0o555);
+    fs::set_permissions(&jj, read_only).expect("make .jj read-only");
+
+    let result = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"));
+
+    fs::set_permissions(&jj, original).expect("restore .jj permissions");
+
+    assert!(result.is_err(), "the failed manifest write must surface");
+    let marker = temp.path().join(".jj/pool/worker-02.cleanup");
+    assert!(
+        !marker.exists(),
+        "a Pool member must never carry a cleanup marker after a failed shrink"
+    );
 }

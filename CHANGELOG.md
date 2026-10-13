@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Resizing the Worker Pool down no longer risks stranding a Worker.
+  The cleanup marker is now written after the Pool manifest, so a failed manifest
+  write cannot leave a member carrying a marker that made every later Run on it
+  fail to start. (fix)
+
 - 2026-10-13 - A Dispatch Group whose dependency fails now reaches a terminal
   state instead of being watched forever. A `Failed` Sub-issue no longer leaves
   its dependents permanently `pending`, so `jjfx dispatch`/`orchestrate` and the

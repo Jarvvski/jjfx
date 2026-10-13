@@ -992,13 +992,19 @@ impl StateStore {
                     return Ok(PoolMembershipOutcome::Busy { workers: busy });
                 }
                 for worker in &selected {
-                    write_cleanup_marker(&self.root, worker, subject)?;
                     pool.names.remove(worker);
                 }
                 pool.workers.truncate(requested);
                 pool.size = i64::try_from(requested)
                     .map_err(|_| StateError::new("resize", subject, "size is too large"))?;
                 write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                // Mark the detached Workers *after* the manifest. A partial write
+                // must never leave a Pool member carrying a cleanup marker: that
+                // member would fail `persist_reserved_pid` forever, so no Run
+                // could start on it.
+                for worker in &selected {
+                    write_cleanup_marker(&self.root, worker, subject)?;
+                }
                 Ok(PoolMembershipOutcome::Changed {
                     capacity: requested,
                     removed: selected,
@@ -1042,12 +1048,14 @@ impl StateStore {
                         workers: vec![requested.clone()],
                     });
                 }
-                write_cleanup_marker(&self.root, requested, subject)?;
                 pool.workers.remove(index);
                 pool.names.remove(requested);
                 pool.size = i64::try_from(pool.workers.len())
                     .map_err(|_| StateError::new("remove", subject, "size is too large"))?;
                 write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                // As in `shrink_pool`: mark the detached Worker only after the
+                // manifest, so a failed write cannot strand a member.
+                write_cleanup_marker(&self.root, requested, subject)?;
                 Ok(PoolMembershipOutcome::Changed {
                     capacity: pool.workers.len(),
                     removed: vec![requested.clone()],
