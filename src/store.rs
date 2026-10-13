@@ -332,11 +332,20 @@ mod tests {
         std::fs::write(repo.join(".jj").join("ws-cache"), body).unwrap();
     }
 
+    /// A sibling of the unique `test_local_repo` directory, named from that
+    /// directory so concurrent test runs never share a path.
+    fn sibling(repo: &Path, tag: &str) -> PathBuf {
+        repo.with_file_name(format!(
+            "{}-{tag}",
+            repo.file_name().unwrap().to_string_lossy()
+        ))
+    }
+
     #[test]
     fn load_orders_cache_workspaces_and_pins_default_to_repo_root() {
         let repo = test_local_repo("load-cache");
-        let alpha = repo.with_file_name("alpha-workspace");
-        let zeta = repo.with_file_name("zeta-workspace");
+        let alpha = sibling(&repo, "alpha-workspace");
+        let zeta = sibling(&repo, "zeta-workspace");
         std::fs::create_dir_all(&alpha).unwrap();
         std::fs::create_dir_all(&zeta).unwrap();
         write_cache(
@@ -397,7 +406,7 @@ mod tests {
     #[test]
     fn load_represents_jj_only_workspace_without_path() {
         let repo = test_local_repo("load-jj-only");
-        let path = repo.with_file_name("orphan-workspace");
+        let path = sibling(&repo, "orphan-workspace");
         jj::add_workspace(&repo, "orphan", &path).unwrap();
 
         let store = Store::load(&repo);
