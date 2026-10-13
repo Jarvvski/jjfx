@@ -35,6 +35,14 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - The atomic-replacement and file-lock primitives are now one
+  implementation (`engine/atomic.rs`) instead of two divergent copies in the
+  state repository and the Worker Workspace cache. The ws-cache write now
+  honours the documented contract: a uniquely named temporary file at mode
+  `0644`, synced and renamed, and removed if it fails - it previously used a
+  predictable `ws-cache.<pid>.<thread>.tmp` that leaked on failure and could
+  collide between processes. (fix)
+
 - 2026-10-13 - The TUI no longer does needless work every frame and every tick:
   an idle screen stops emitting animation ticks (it used to wake ~7 times a
   second and re-canonicalise every workspace path), the world graph is laid out

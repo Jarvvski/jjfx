@@ -5,15 +5,14 @@
 //! Dispatch, compatible persistence, and terminal formatting behind one seam.
 
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::File;
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use rustix::fs::{FlockOperation, flock};
-
 use thiserror::Error;
 
+use crate::engine::atomic::{self, LockOutcome};
 use crate::engine::pool::current_timestamp;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
@@ -1056,28 +1055,16 @@ impl OrchestrationRunner {
     }
 
     fn acquire_lock(&self, parent: &TicketId) -> Result<File, OrchestrationError> {
-        let directory = self.repository.root().join(".jj/pool");
-        fs::create_dir_all(&directory)
-            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
-        let path = directory.join(format!(
+        let path = self.repository.root().join(".jj/pool").join(format!(
             "orchestrate-{}.lock",
             parent.as_str().to_ascii_lowercase()
         ));
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
-        match flock(&file, FlockOperation::NonBlockingLockExclusive) {
-            Ok(()) => Ok(file),
-            Err(error) if error == rustix::io::Errno::WOULDBLOCK => {
-                Err(OrchestrationError::AlreadyRunning {
-                    parent: parent.clone(),
-                })
-            }
-            Err(error) => Err(OrchestrationError::Execution(error.to_string())),
+        match atomic::try_lock_exclusive(&path) {
+            Ok(LockOutcome::Acquired(file)) => Ok(file),
+            Ok(LockOutcome::Busy) => Err(OrchestrationError::AlreadyRunning {
+                parent: parent.clone(),
+            }),
+            Err(error) => Err(OrchestrationError::Execution(error.source().to_string())),
         }
     }
 

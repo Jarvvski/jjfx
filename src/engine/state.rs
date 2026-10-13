@@ -1,22 +1,22 @@
 //! Compatible Workspace Dispatch state repositories.
 //!
-//! This module is the only place that knows state paths, sidecar locks, JSON
-//! codecs, and atomic replacement. Callers load typed values and commit them
-//! with an opaque exact-byte revision; no caller code runs while a lock is held.
+//! This module is the only place that knows state paths, sidecar lock paths,
+//! and JSON codecs. Callers load typed values and commit them with an opaque
+//! exact-byte revision; no caller code runs while a lock is held. Atomic
+//! replacement and locking are delegated to [`super::atomic`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io;
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
-use rustix::fs::{FlockOperation, flock};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
-use tempfile::NamedTempFile;
 use thiserror::Error;
 
+use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::{AgentRuntimeProfile, DispatchExclusions, Repository};
 
 const POOL_PATH: &str = ".jj/pool.json";
@@ -2083,19 +2083,14 @@ fn with_locks<T>(
     paths.dedup();
     let mut files = Vec::with_capacity(paths.len());
     for path in &paths {
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|error| StateError::new("create lock directory for", subject, error))?;
-        }
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(|error| StateError::new("open lock for", subject, error))?;
-        flock(&file, FlockOperation::LockExclusive)
-            .map_err(|error| StateError::new("lock", subject, error))?;
+        let file = atomic::lock_exclusive(path).map_err(|error| {
+            let operation = match &error {
+                LockError::CreateDirectory(_) => "create lock directory for",
+                LockError::Open(_) => "open lock for",
+                LockError::Lock(_) => "lock",
+            };
+            StateError::new(operation, subject, error.source())
+        })?;
         files.push(file);
     }
     operation()
@@ -2105,36 +2100,25 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T, subject: &str) -> Result<(
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| StateError::new("serialize", subject, error))?;
     bytes.push(b'\n');
-    let parent = path
-        .parent()
-        .ok_or_else(|| StateError::new("replace", subject, "state path has no parent"))?;
-    fs::create_dir_all(parent)
-        .map_err(|error| StateError::new("create state directory for", subject, error))?;
-    let mut temporary = NamedTempFile::new_in(parent)
-        .map_err(|error| StateError::new("create temporary file for", subject, error))?;
-    temporary
-        .as_file()
-        .set_permissions(fs::Permissions::from_mode(0o644))
-        .map_err(|error| StateError::new("set temporary permissions for", subject, error))?;
-    temporary
-        .write_all(&bytes)
-        .map_err(|error| StateError::new("write", subject, error))?;
-    temporary
-        .flush()
-        .map_err(|error| StateError::new("flush", subject, error))?;
-    temporary
-        .as_file()
-        .sync_all()
-        .map_err(|error| StateError::new("sync", subject, error))?;
-    temporary
-        .into_temp_path()
-        .persist(path)
-        .map_err(|error| StateError::new("replace", subject, error.error))?;
-    Ok(())
+    atomic::write_atomic_bytes(path, &bytes).map_err(|error| match &error {
+        AtomicWriteError::MissingParent => {
+            StateError::new("replace", subject, "state path has no parent")
+        }
+        AtomicWriteError::CreateDirectory(source) => {
+            StateError::new("create state directory for", subject, source)
+        }
+        AtomicWriteError::CreateTemporary(source) => {
+            StateError::new("create temporary file for", subject, source)
+        }
+        AtomicWriteError::SetPermissions(source) => {
+            StateError::new("set temporary permissions for", subject, source)
+        }
+        AtomicWriteError::Write(source) => StateError::new("write", subject, source),
+        AtomicWriteError::Flush(source) => StateError::new("flush", subject, source),
+        AtomicWriteError::Sync(source) => StateError::new("sync", subject, source),
+        AtomicWriteError::Rename(source) => StateError::new("replace", subject, source),
+    })
 }
-
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 fn validate_pool(pool: &PoolState) -> Result<(), String> {
     if pool.size < 0 {

@@ -878,13 +878,21 @@ fn provisioning_rejects_a_claimed_worker_without_touching_it() {
 #[test]
 fn provisioning_compensates_when_cache_projection_fails() {
     let (_temporary_directory, repository) = local_repository();
-    let thread = format!("{:?}", std::thread::current().id());
-    let temporary_cache = repository.root().join(format!(
-        ".jj/ws-cache.{}.{}.tmp",
-        std::process::id(),
-        thread
-    ));
-    fs::create_dir(&temporary_cache).expect("cache temporary collision should be created");
+    let root = repository.root().to_path_buf();
+    // The shared atomic-write helper names its temporary file uniquely, so a
+    // fixed-path collision can no longer fail the write. Fail only the cache
+    // step instead: give the Worker state write its directory and lock sidecar,
+    // then let the setup hook take write permission off `.jj` so the cache's
+    // temporary file cannot be created. The teardown hook restores it so
+    // compensation can finish.
+    fs::create_dir_all(root.join(".jj/pool")).expect("pool directory should be created");
+    fs::write(root.join(".jj/ws-cache.lock"), "").expect("cache lock sidecar should be created");
+    let jj = root.join(".jj");
+    install_lifecycle_hooks_with_scripts(
+        &root,
+        &format!("#!/bin/sh\nchmod 0555 {}\n", jj.display()),
+        &format!("#!/bin/sh\nchmod 0755 {}\n", jj.display()),
+    );
     let worker = WorkerId::parse("worker-01").expect("Worker ID should be valid");
 
     let error = repository

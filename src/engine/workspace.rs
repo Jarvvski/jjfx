@@ -1,15 +1,15 @@
 //! Repository-owned Worker Workspace lifecycle operations.
 
 use std::env;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::OnceLock;
 
-use rustix::fs::{FlockOperation, flock};
 use thiserror::Error;
 
+use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, WorkerState};
 
 const CACHE_PATH: &str = ".jj/ws-cache";
@@ -583,28 +583,22 @@ pub(crate) fn lock_worker_operation(
     repository: &Repository,
     worker: &WorkerId,
 ) -> Result<WorkspaceOperationGuard, WorkerWorkspaceError> {
-    let pool = repository.root().join(".jj/pool");
-    fs::create_dir_all(&pool).map_err(|error| {
-        WorkerWorkspaceError::new(format!("create Worker operation lock directory: {error}"))
-    })?;
-    let path = pool.join(format!("{worker}.workspace.lock"));
-    let lock = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|error| {
-            WorkerWorkspaceError::new(format!(
-                "open Worker operation lock {}: {error}",
-                path.display()
-            ))
-        })?;
-    flock(&lock, FlockOperation::LockExclusive).map_err(|error| {
-        WorkerWorkspaceError::new(format!(
-            "lock Worker operation sidecar {}: {error}",
+    let path = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.workspace.lock"));
+    let lock = atomic::lock_exclusive(&path).map_err(|error| match error {
+        LockError::CreateDirectory(source) => {
+            WorkerWorkspaceError::new(format!("create Worker operation lock directory: {source}"))
+        }
+        LockError::Open(source) => WorkerWorkspaceError::new(format!(
+            "open Worker operation lock {}: {source}",
             path.display()
-        ))
+        )),
+        LockError::Lock(source) => WorkerWorkspaceError::new(format!(
+            "lock Worker operation sidecar {}: {source}",
+            path.display()
+        )),
     })?;
     Ok(WorkspaceOperationGuard { _lock: lock })
 }
@@ -1355,15 +1349,15 @@ fn with_cache_lock<T>(
     operation: impl FnOnce() -> Result<T, WorkerWorkspaceError>,
 ) -> Result<T, WorkerWorkspaceError> {
     let path = root.join(CACHE_LOCK_PATH);
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(path)
-        .map_err(|error| WorkerWorkspaceError::new(format!("open ws-cache lock: {error}")))?;
-    file.lock()
-        .map_err(|error| WorkerWorkspaceError::new(format!("lock ws-cache: {error}")))?;
+    let _lock = atomic::lock_exclusive(&path).map_err(|error| match error {
+        LockError::CreateDirectory(source) => {
+            WorkerWorkspaceError::new(format!("create ws-cache lock directory: {source}"))
+        }
+        LockError::Open(source) => {
+            WorkerWorkspaceError::new(format!("open ws-cache lock: {source}"))
+        }
+        LockError::Lock(source) => WorkerWorkspaceError::new(format!("lock ws-cache: {source}")),
+    })?;
     operation()
 }
 
@@ -1389,14 +1383,6 @@ fn read_cache(path: &Path) -> Result<Vec<(String, PathBuf)>, WorkerWorkspaceErro
 }
 
 fn write_cache(path: &Path, entries: &[(String, PathBuf)]) -> Result<(), WorkerWorkspaceError> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| WorkerWorkspaceError::new("write ws-cache: path has no parent"))?;
-    fs::create_dir_all(parent).map_err(|error| {
-        WorkerWorkspaceError::new(format!("create ws-cache directory: {error}"))
-    })?;
-    let thread = format!("{:?}", std::thread::current().id());
-    let temporary = parent.join(format!("ws-cache.{}.{}.tmp", std::process::id(), thread));
     let mut text = String::new();
     for (name, workspace_path) in entries {
         text.push_str(name);
@@ -1404,14 +1390,24 @@ fn write_cache(path: &Path, entries: &[(String, PathBuf)]) -> Result<(), WorkerW
         text.push_str(&workspace_path.to_string_lossy());
         text.push('\n');
     }
-    fs::write(&temporary, text.as_bytes()).map_err(|error| {
-        WorkerWorkspaceError::new(format!("write ws-cache temporary file: {error}"))
-    })?;
-    fs::rename(&temporary, path).map_err(|error| {
-        let _ = fs::remove_file(&temporary);
-        WorkerWorkspaceError::new(format!("replace ws-cache: {error}"))
-    })?;
-    Ok(())
+    atomic::write_atomic_bytes(path, text.as_bytes()).map_err(|error| match error {
+        AtomicWriteError::MissingParent => {
+            WorkerWorkspaceError::new("write ws-cache: path has no parent")
+        }
+        AtomicWriteError::CreateDirectory(source) => {
+            WorkerWorkspaceError::new(format!("create ws-cache directory: {source}"))
+        }
+        AtomicWriteError::CreateTemporary(source)
+        | AtomicWriteError::SetPermissions(source)
+        | AtomicWriteError::Write(source)
+        | AtomicWriteError::Flush(source)
+        | AtomicWriteError::Sync(source) => {
+            WorkerWorkspaceError::new(format!("write ws-cache temporary file: {source}"))
+        }
+        AtomicWriteError::Rename(source) => {
+            WorkerWorkspaceError::new(format!("replace ws-cache: {source}"))
+        }
+    })
 }
 
 fn rollback_provisioning(

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+mod atomic;
 mod direct_dispatch;
 mod dispatch_group;
 mod dispatch_prompt;

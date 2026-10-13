@@ -141,6 +141,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [24](issues/24-jj-lib-jj-version-compat-check.md) - version coupling.
 - [25](issues/25-consolidate-state-write-and-lock-helpers.md) - one atomic
   write/lock helper.
+  **resolved** - `engine/atomic.rs` holds `write_atomic_bytes` +
+  `lock_exclusive`/`try_lock_exclusive`; the ws-cache write now conforms to the
+  documented contract (unique temp name, mode 0644, cleaned up on failure).
 - [26](issues/26-tui-per-frame-work-and-agent-state-cache.md) - T7.
   **resolved** - idle ticker gating, one graph layout per frame, and a
   canonicalised agent-path memo.
