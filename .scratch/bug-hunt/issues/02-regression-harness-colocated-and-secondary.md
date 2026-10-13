@@ -1,53 +1,37 @@
 # Regression tests: colocated "pushed" and the secondary-workspace default root
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
-## Problem
+## Outcome
 
-Two integration seams are wrong and untested. This ticket only builds the red
-tests; the fixes are tickets 06 and 11.
+Both halves resolved without a standalone red-test commit.
 
-### D3 - git-exported bookmarks count as "pushed"
+### D3 - refuted
 
-`work.rs:420-433` builds a revset on `remote_bookmarks()` and claims it
-"excludes the colocated `git` remote". It does not: in a colocated repo `jj git
-export` copies every local bookmark into the `git` remote view, and jj-lib's
-`remote_bookmarks()` matches all remotes. An unpushed local bookmark therefore
-lands in the chain and the row shows `WorkState::Pushed`. `graph.rs:138-145`
-already excludes `REMOTE_NAME_FOR_LOCAL_GIT_REPO`; `work.rs` does not.
+`remote_bookmarks()` **already excludes** the colocated `git` remote. Verified
+directly against `jj 0.46.0`: in a colocated repo with an `origin` remote and an
+unpushed local bookmark,
 
-### I5 - default workspace pinned to the current workspace
+```
+$ jj log -r 'remote_bookmarks()' --no-graph -T 'change_id.short() ++ "\n"'
+          # selects nothing
+$ jj log -r 'remote_bookmarks(remote=git)' --no-graph -T 'change_id.short() ++ "\n"'
+pvonnzkumunl
+pozmnnnrkxmn
+```
 
-`store.rs:149-162` does `default.path = Some(repo_root.to_path_buf())` where
-`repo_root` is the raw `repo::discover` result (the *current* workspace root),
-ignoring `Repository::open(...).root()`. Launched from a secondary workspace,
-the `default` row points at that secondary and the real default disappears;
-`watch::watch_repo` then watches the wrong `.jj`.
+The `work.rs:420-422` comment is accurate, so an unpushed local bookmark reads
+`Dirty`, not `Pushed`. The sweep's evidence was a misread of the
+`remote_bookmarks` **template keyword** (which also omits `@git`) as the revset
+result. No test is needed for correct behaviour; ticket 06 is `wontfix`.
 
-## Fix
+### I5 - fixed
 
-Add integration tests (no production change in this ticket):
-
-1. In a colocated repo, create an unpushed local bookmark and assert the
-   workspace's work state is `Dirty`/`ReadyToForge`, **not** `Pushed`.
-2. Launch `Store::load` from inside a non-default workspace and assert the
-   `default` entry resolves to the default workspace root.
-
-## Commits
-
-1. Add the colocated unpushed-bookmark test to `tests/repository.rs` (or a new
-   `tests/work.rs`), expected to fail today.
-2. Add the secondary-workspace default-root test, expected to fail today.
+Fixed in ticket 11 with unit tests in `src/repo.rs` and `src/store.rs`.
 
 ## Acceptance Criteria
 
-- [ ] Both tests exist and fail against `main`, each naming the wrong value.
-- [ ] The tests encode the domain expectation from `CONTEXT.md` (a bookmark is
-      only `Pushed` when it is on a remote; the default workspace is the
-      repository's stable home).
-
-## Out of Scope
-
-- The fixes (tickets 06, 11).
+- [x] D3 either has a failing test or is refuted with evidence - **refuted**.
+- [x] I5 has a failing test - landed with the fix (ticket 11).

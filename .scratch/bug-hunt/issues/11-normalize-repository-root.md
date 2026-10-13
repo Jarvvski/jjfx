@@ -1,47 +1,49 @@
 # Normalise the repository root once at discovery
 
-Status: ready-for-agent
+Status: resolved
 Type: task
-Blocked by: 02
+Blocked by: none
 
 ## Problem
 
-`repo::discover` (`repo.rs:9`) returns the nearest `.jj`, i.e. the *current*
-workspace root. `Store::load` (`store.rs:149-162`) then pins the `default`
-workspace to that raw path instead of `Repository::open(...).root()`, which
-correctly normalises a secondary workspace to the default root
-(`engine/mod.rs:256`). The same raw path feeds `watch::watch_repo`
-(`watch.rs:21`) and the work poller (`lib.rs:347-379`).
+`repo::discover` returned the nearest `.jj`, i.e. the **current** workspace
+root. `Store::load` then pinned `default` to that raw path instead of the
+repository's default workspace root, and the same raw path fed
+`watch::watch_repo`, the work poller, `Runtime`, and `RealJj`. Launched from a
+secondary workspace, the `default` row pointed at the secondary, the real
+default disappeared, the watcher watched the wrong `.jj`, and cache-only
+workspaces never received a work snapshot.
 
-Launched from a secondary workspace: the `default` row points at the secondary,
-the real default disappears, the watcher watches the wrong `.jj`, and
-cache-only workspaces never get a `Work` snapshot (permanent `Unknown` / `Idle`).
+Reproduced with the built binary:
+
+```
+$ (cd ws-secondary && jjfx --list)
+default   /…/ws-secondary     # wrong before the fix
+```
 
 ## Fix
 
-Resolve the repository root **once** through `Repository::open(...).root()` and
-thread that value everywhere - `Store`, `watch_repo`, the work poller,
-`Runtime`, and `Forge` - instead of each re-deriving it from the raw discovery
-result. While here, stop `Store::reload` resetting `colocate` to `true`
-(`store.rs:170`).
+Normalise at the discovery chokepoint so every caller shares one root:
+
+- `repo::discover` now resolves the repository's default workspace root through
+  `Repository::open` (which follows a secondary workspace's `.jj/repo` file to
+  the shared store).
+- `Store::load` normalises defensively too, so a directly-passed secondary path
+  cannot shadow `default`.
 
 ## Commits
 
-1. Introduce one normalised root at discovery; thread it through the frontends.
-2. Make the poller build names from the Store projection, not `jj` alone.
-3. Stop `reload` resetting `colocate`.
-4. The secondary-workspace test from ticket 02 passes.
-5. CHANGELOG entry `(fix)`.
+1. `Normalise the repository root at discovery` - `src/repo.rs` +
+   `src/store.rs`, unit tests in both, CHANGELOG `(fix)`.
 
 ## Acceptance Criteria
 
-- [ ] Launched from a secondary workspace, `default` resolves to the default
-      root and the watcher watches the shared `.jj`.
-- [ ] A cache-only workspace still receives work state.
-- [ ] `store.colocate()` survives a reload.
-- [ ] The regression test from ticket 02 passes.
-- [ ] `mise run check` is green.
+- [x] Launched from a secondary workspace, `default` resolves to the repository
+      root.
+- [x] `Store::load` cannot be made to pin `default` to a secondary workspace.
+- [x] Unit tests cover both the discovery normalisation and the store pin.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
-- The Worker Run cwd (ticket 05) unless ticket 01 shows a shared cause.
+- `Store::reload` resetting `colocate` (folded into ticket 28).

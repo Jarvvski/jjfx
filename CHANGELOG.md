@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Running `jjfx` from a secondary Jujutsu workspace no longer
+  shadows the `default` workspace. The repository root is now normalised to the
+  default workspace at discovery, so `default` always points at the repository
+  and the store, filesystem watcher, and work poller all agree. (fix)
+
 ## [0.52.1] - 2026-10-12
 
 ### Added

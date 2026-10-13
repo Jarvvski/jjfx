@@ -1,41 +1,32 @@
 # Exclude git-exported bookmarks from the "pushed" work state
 
-Status: ready-for-agent
+Status: wontfix
 Type: task
-Blocked by: 02
+Blocked by: none
 
-## Problem
+## Outcome
 
-In a colocated repository (jjfx's default, ADR-0010) `jj git export` copies
-every local bookmark into the `git` remote view, and jj-lib's
-`remote_bookmarks()` matches all remotes. `work.rs:420-433` assumes the
-colocated `git` remote is excluded, so an unpushed local bookmark makes the
-chain commit look `pushed` and the row reports `WorkState::Pushed`. A user can
-believe a branch is published when it is not.
+**Refuted - not a bug.** `remote_bookmarks()` already excludes the colocated
+`git` remote, so `work.rs:420-433` does exactly what its comment claims.
 
-`graph.rs:138-145` already excludes `REMOTE_NAME_FOR_LOCAL_GIT_REPO` for the
-immutable set; the same exclusion is missing from the work query.
+Evidence (`jj 0.46.0`, colocated repo, `origin` remote configured, an unpushed
+local bookmark present):
 
-## Fix
+```
+$ jj log -r 'remote_bookmarks()' --no-graph -T 'change_id.short() ++ "\n"'
+          # selects nothing - the unpushed bookmark is only on @git
+$ jj log -r 'remote_bookmarks(remote=git)' --no-graph -T 'change_id.short() ++ "\n"'
+pvonnzkumunl
+pozmnnnrkxmn
+```
 
-Restrict the work revset to real remotes (exclude the local `git` remote), the
-same way `graph.rs` does. Confirm against `jj 0.46.0` that the fixed revset
-returns only `origin` (and other true remotes).
+An unpushed local bookmark therefore reads `Dirty`, and only a bookmark on a
+real remote reads `Pushed`. The original sweep misread the
+`remote_bookmarks` **template keyword** (which also omits `@git` when listing a
+selected commit) as the revset's selection.
 
-## Commits
+## Follow-up
 
-1. Fix the revset in `work.rs`; add the colocated unpushed-bookmark test from
-   ticket 02 as the permanent regression.
-2. CHANGELOG entry `(fix)`.
-
-## Acceptance Criteria
-
-- [ ] An unpushed local bookmark in a colocated repo reports `Dirty`
-      (or `ReadyToForge`), never `Pushed`.
-- [ ] A genuinely pushed bookmark still reports `Pushed`.
-- [ ] The regression test from ticket 02 passes.
-- [ ] `mise run check` is green.
-
-## Out of Scope
-
-- Changing the `WorkState` model or Attention mapping.
+None. If jj ever changes this default, `work.rs` would need an explicit
+`remote_bookmarks(remote=...)` filter - but that is a future jj upgrade concern,
+covered by the version-coupling ticket (24).

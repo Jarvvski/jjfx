@@ -132,8 +132,14 @@ impl Store {
     /// as pathless so the TUI will not target a working copy that is not there. A
     /// broken repository degrades to just the default rather than crashing the TUI.
     pub(crate) fn load(repo_root: &Path) -> Self {
-        let entries = Repository::open(repo_root)
-            .ok()
+        let repository = Repository::open(repo_root).ok();
+        // Normalize to the repository's default workspace root: a secondary
+        // workspace passed in must not shadow `default` (ADR 0008).
+        let root = repository.as_ref().map_or_else(
+            || repo_root.to_path_buf(),
+            |repository| repository.root().to_path_buf(),
+        );
+        let entries = repository
             .and_then(|repository| repository.workspaces().projection().ok())
             .map(|snapshot| snapshot.entries().to_vec())
             .unwrap_or_default();
@@ -146,17 +152,16 @@ impl Store {
             .collect();
         // The default Workspace is always visible, its path authoritative at the
         // repository root (ADR 0008).
-        let root = repo_root.to_path_buf();
         match workspaces
             .iter_mut()
             .find(|workspace| workspace.name == DEFAULT_WORKSPACE)
         {
-            Some(default) => default.path = Some(root),
+            Some(default) => default.path = Some(root.clone()),
             None => workspaces.insert(
                 0,
                 Workspace {
                     name: DEFAULT_WORKSPACE.to_owned(),
-                    path: Some(root),
+                    path: Some(root.clone()),
                 },
             ),
         }
@@ -165,7 +170,7 @@ impl Store {
                 .cmp(&(right.name != DEFAULT_WORKSPACE, &right.name))
         });
         Store {
-            repo_root: repo_root.to_path_buf(),
+            repo_root: root,
             workspaces,
             colocate: true,
         }
@@ -367,6 +372,30 @@ mod tests {
         std::fs::remove_dir_all(&alpha).unwrap();
         std::fs::remove_dir_all(&zeta).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn load_from_a_secondary_workspace_pins_default_to_the_repository_root() {
+        let tmp = std::env::temp_dir().join(format!("jjfx-store-secondary-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let default = tmp.join("repo");
+        let secondary = tmp.join("ws-secondary");
+        // The default workspace owns the store; a secondary workspace points its
+        // `.jj/repo` file at it (exactly what `jj workspace add` writes).
+        std::fs::create_dir_all(default.join(".jj/repo")).unwrap();
+        std::fs::create_dir_all(secondary.join(".jj")).unwrap();
+        std::fs::write(secondary.join(".jj/repo"), "../../repo/.jj/repo").unwrap();
+
+        let store = Store::load(&secondary);
+
+        let expected = default.canonicalize().unwrap();
+        assert_eq!(store.repo_root(), expected.as_path());
+        assert_eq!(
+            store.workspace(DEFAULT_WORKSPACE).unwrap().path.as_deref(),
+            Some(expected.as_path())
+        );
+
+        std::fs::remove_dir_all(&tmp).unwrap();
     }
 
     #[test]

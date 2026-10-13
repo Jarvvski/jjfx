@@ -20,6 +20,7 @@ Confidence key:
 
 - **verified** - read in source by the lead.
 - **sweep** - from a subsystem sweep; needs a failing test to confirm.
+- **refuted** - a sweep finding checked and disproved.
 - **suspicion** - a design/intent question, not yet a defect.
 
 Guardrails to add while hunting: enable the clippy `unwrap_used` /
@@ -35,7 +36,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | --- | --- | --- | --- | --- | --- |
 | W1 | dispatch | H | report | Worker Run inherits the caller's cwd, not its Workspace | 01, 05 |
 | D1 | dispatch | H | V | A failed Sub-issue never unblocks dependents; the group never terminates and `run` polls forever | 03, 04 |
-| D3 | work | H | S | git-exported bookmarks count as "pushed" | 02, 06 |
+| D3 | work | - | refuted | git-exported bookmarks count as "pushed" - `remote_bookmarks()` already excludes `@git` | 06 |
 | C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 03, 08 |
 | C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
 | T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 |
@@ -51,7 +52,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 10 |
 | I3 | forge | M | S | conflict detection only inspects `@`; a lower-commit conflict welds and pushes | 10 |
 | I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 |
-| I5 | store | M | S | `default` workspace pinned to the current workspace when launched from a secondary workspace | 02, 11 |
+| I5 | store | M | S | `default` workspace pinned to the current workspace when launched from a secondary workspace | 11 (fixed) |
 | I8 | dispatch | M | S | untrusted Linear text injected verbatim into prompts | 12 |
 | T3 | events | M | S | one invalid UTF-8 byte wipes all startup agent state | 19 |
 | T4 | events | M | S | replay/tailer offset race drops events | 19 |
@@ -82,7 +83,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   test landed.
 - [02](issues/02-regression-harness-colocated-and-secondary.md) - task:
   regression tests for colocated "pushed" (D3) and the secondary-workspace
-  default root (I5).
+  default root (I5). **resolved** - D3 refuted, I5 tested with its fix.
 - [03](issues/03-regression-harness-liveness-and-op-race.md) - task:
   regression tests for the failed-dependency loop (D1) and the Reset/`send` race
   (C1).
@@ -93,6 +94,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [05](issues/05-fix-worker-run-working-directory.md) - W1 (blocked by 01).
   **needs-info** - no reproducible jjfx defect; recurrence diagnostic recorded.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
+  **wontfix** - refuted.
 - [07](issues/07-durable-run-identity.md) - C2, C7.
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
 - [09](issues/09-order-cleanup-marker-after-manifest.md) - C3.
@@ -101,6 +103,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 
 - [10](issues/10-forge-failure-and-push-correctness.md) - I1, I2, I3, I4.
 - [11](issues/11-normalize-repository-root.md) - I5 (blocked by 02).
+  **resolved** - root normalised at discovery.
 - [12](issues/12-fence-untrusted-ticket-content.md) - I8.
 - [13](issues/13-deduplicate-dispatch-tickets.md) - I9.
 - [14](issues/14-single-source-branch-prefix.md) - D2.
@@ -122,6 +125,12 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [26](issues/26-tui-per-frame-work-and-agent-state-cache.md) - T7.
 - [27](issues/27-terminal-restore-on-signal-and-input-resilience.md) - T8, T9.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
+
+- The sweep finding D3 (git-exported bookmarks counted as "pushed") is
+  **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
+  The sweep misread the `remote_bookmarks` template keyword as the revset
+  result. Verified with `jj 0.46.0` on a colocated repo with an unpushed
+  bookmark. This is why every sweep finding is tested before it is fixed.
 
 ## Decisions so far
 
