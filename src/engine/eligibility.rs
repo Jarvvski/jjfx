@@ -9,6 +9,8 @@
 //! terminal itself.
 
 use std::collections::BTreeSet;
+use std::fmt;
+use std::sync::Arc;
 
 use crate::engine::{Repository, WorkerId};
 
@@ -34,6 +36,45 @@ impl DispatchExclusions {
     /// Returns whether nothing is excluded.
     pub fn is_empty(&self) -> bool {
         self.workers.is_empty()
+    }
+}
+
+/// A live source of [`DispatchExclusions`].
+///
+/// The orchestration runner asks the provider for the current exclusions on
+/// every claim rather than holding a snapshot, so a Worker Workspace a human
+/// opens - or closes - while a Dispatch Group is running changes the very next
+/// decision (ADR-0011: "Occupied is a view of live terminal state"). The
+/// frontend still computes the set; the engine never inspects the terminal.
+#[derive(Clone)]
+pub struct ExclusionsProvider(Arc<dyn Fn() -> Result<DispatchExclusions, String> + Send + Sync>);
+
+impl ExclusionsProvider {
+    /// Creates a provider from a closure that recomputes the exclusion set.
+    pub fn new(
+        provider: impl Fn() -> Result<DispatchExclusions, String> + Send + Sync + 'static,
+    ) -> Self {
+        Self(Arc::new(provider))
+    }
+
+    /// Creates a provider that always returns the same set, for callers that only
+    /// have a snapshot.
+    pub fn fixed(exclusions: DispatchExclusions) -> Self {
+        Self::new(move || Ok(exclusions.clone()))
+    }
+
+    /// Returns the current exclusion set, or why it could not be determined.
+    ///
+    /// A frontend that cannot query the terminal fails closed here: the caller
+    /// refuses to dispatch rather than risk colliding with a human.
+    pub fn current(&self) -> Result<DispatchExclusions, String> {
+        (self.0)()
+    }
+}
+
+impl fmt::Debug for ExclusionsProvider {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ExclusionsProvider")
     }
 }
 

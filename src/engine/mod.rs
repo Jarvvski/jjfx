@@ -38,7 +38,7 @@ pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
     DispatchPromptError,
 };
-pub use eligibility::{DispatchExclusions, reconcile_occupancy};
+pub use eligibility::{DispatchExclusions, ExclusionsProvider, reconcile_occupancy};
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
 };

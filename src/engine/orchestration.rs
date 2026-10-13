@@ -19,11 +19,11 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
     DirectDispatchRequest, DirectDispatchSuccess, DispatchExclusions, DispatchGroup,
     DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions,
-    DispatchGroupProgress, DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded,
-    ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision,
-    SubIssueStatus, Ticket, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
-    TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
-    WorkspaceRestoration,
+    DispatchGroupProgress, DispatchGroupState, DispatchGroupStatusCounts, ExclusionsProvider,
+    Expected, Loaded, ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode,
+    StateChange, StateRevision, SubIssueStatus, Ticket, TicketDetails, TicketDiscovery, TicketId,
+    TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId,
+    WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -663,15 +663,25 @@ fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
 
 struct LiveExecution {
     repository: Repository,
-    exclusions: DispatchExclusions,
+    exclusions: ExclusionsProvider,
 }
 
 impl LiveExecution {
-    fn new(repository: Repository, exclusions: DispatchExclusions) -> Self {
+    fn new(repository: Repository, exclusions: ExclusionsProvider) -> Self {
         Self {
             repository,
             exclusions,
         }
+    }
+
+    /// The Workers excluded from Dispatch right now.
+    ///
+    /// Re-queried per claim, not cached: a Workspace a human opened (or closed)
+    /// since the last claim must change this decision (ADR-0011).
+    fn current_exclusions(&self) -> Result<DispatchExclusions, OrchestrationError> {
+        self.exclusions
+            .current()
+            .map_err(OrchestrationError::Execution)
     }
 }
 
@@ -767,10 +777,11 @@ impl OrchestrationExecution for LiveExecution {
         &mut self,
         request: &DirectDispatchRequest,
     ) -> Result<Option<Self::Claim>, OrchestrationError> {
+        let exclusions = self.current_exclusions()?;
         match self
             .repository
             .direct_dispatch()
-            .with_exclusions(self.exclusions.clone())
+            .with_exclusions(exclusions)
             .reserve(request)
         {
             Ok(claim) => Ok(Some(claim)),
@@ -815,19 +826,24 @@ impl OrchestrationExecution for LiveExecution {
 #[derive(Debug, Clone)]
 pub struct OrchestrationRunner {
     repository: Repository,
-    exclusions: DispatchExclusions,
+    exclusions: ExclusionsProvider,
 }
 
 impl OrchestrationRunner {
     pub(crate) fn new(repository: Repository) -> Self {
         Self {
             repository,
-            exclusions: DispatchExclusions::default(),
+            exclusions: ExclusionsProvider::fixed(DispatchExclusions::default()),
         }
     }
 
-    /// Excludes the given Worker Workspaces from first-idle selection.
-    pub fn with_exclusions(mut self, exclusions: DispatchExclusions) -> Self {
+    /// Excludes Worker Workspaces from first-idle selection through a live source.
+    ///
+    /// The provider is consulted on every claim, so a Workspace a human opens (or
+    /// closes) while the group runs changes the next decision rather than the
+    /// run's opening snapshot. Pass [`ExclusionsProvider::fixed`] for callers
+    /// that only have a set.
+    pub fn with_exclusions(mut self, exclusions: ExclusionsProvider) -> Self {
         self.exclusions = exclusions;
         self
     }
@@ -884,7 +900,11 @@ impl OrchestrationRunner {
         let reservation = match self
             .repository
             .direct_dispatch()
-            .with_exclusions(self.exclusions.clone())
+            .with_exclusions(
+                self.exclusions
+                    .current()
+                    .map_err(OrchestrationError::Execution)?,
+            )
             .reserve(&placeholder)
         {
             Ok(reservation) => reservation,
@@ -1105,9 +1125,13 @@ impl OrchestrationRunner {
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, VecDeque};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use crate::engine::{DispatchGroupOptions, DispatchGroupState, SubIssueState, WireStatus};
+    use crate::engine::{
+        DispatchGroupOptions, DispatchGroupState, PoolState, SubIssueState, WireStatus, WorkerState,
+    };
 
     struct FakeClaim {
         worker: WorkerId,
@@ -1705,5 +1729,124 @@ mod tests {
             events.first(),
             Some(OrchestrationEvent::Completed { ticket, .. }) if ticket.as_str() == "ENG-101"
         ));
+    }
+
+    /// A real Repository whose Worker Pool holds `workers`, all idle.
+    ///
+    /// Claiming only reserves - it never launches - so `LiveExecution` can be
+    /// exercised against real state without an Agent Runtime.
+    fn install_idle_pool(repository: &Repository, workers: &[WorkerId]) {
+        repository
+            .state_store()
+            .pool()
+            .commit(
+                Expected::Missing,
+                StateChange::Replace(PoolState::new(
+                    i64::try_from(workers.len()).expect("Pool size"),
+                    "owner/repo",
+                    workers.to_vec(),
+                    WireTimestamp::new("2026-08-04T12:00:00Z"),
+                )),
+            )
+            .expect("save Worker Pool");
+        for worker in workers {
+            repository
+                .state_store()
+                .worker(worker.clone())
+                .commit(
+                    Expected::Missing,
+                    StateChange::Replace(WorkerState::new(WireStatus::new("idle"))),
+                )
+                .expect("save idle Worker");
+        }
+    }
+
+    #[test]
+    fn live_execution_re_queries_occupancy_on_every_claim() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        std::fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(directory.path()).expect("open repository");
+        let first = WorkerId::parse("worker-01").expect("Worker");
+        let second = WorkerId::parse("worker-02").expect("Worker");
+        install_idle_pool(&repository, &[first.clone(), second.clone()]);
+
+        // Nothing is occupied on the first claim; by the second - as if a human
+        // had opened both Workspaces in a terminal mid-run - both are. A runner
+        // holding the opening snapshot would still reserve `second` here.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let exclusions = ExclusionsProvider::new({
+            let calls = Arc::clone(&calls);
+            let occupied = vec![first.clone(), second.clone()];
+            move || {
+                let call = calls.fetch_add(1, Ordering::SeqCst);
+                Ok(if call == 0 {
+                    DispatchExclusions::default()
+                } else {
+                    DispatchExclusions::new(occupied.clone())
+                })
+            }
+        });
+        let mut execution = LiveExecution::new(repository.clone(), exclusions);
+        let request = DirectDispatchRequest::new(
+            Ticket::new(
+                TicketId::parse("ENG-101").expect("Ticket"),
+                TicketTitle::parse("Foundation").expect("Ticket title"),
+                TicketStatus::parse("Todo").expect("Ticket status"),
+            ),
+            RunMode::Background,
+        );
+
+        let claim = execution
+            .claim(&request)
+            .expect("first claim")
+            .expect("an idle Worker");
+        assert_eq!(claim.worker_id(), &first);
+        assert!(
+            execution.claim(&request).expect("second claim").is_none(),
+            "a Worker occupied after the run started must not be dispatched to"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_fixed_provider_keeps_the_opening_snapshot() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        std::fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(directory.path()).expect("open repository");
+        let first = WorkerId::parse("worker-01").expect("Worker");
+        let second = WorkerId::parse("worker-02").expect("Worker");
+        install_idle_pool(&repository, &[first.clone(), second.clone()]);
+
+        // The contrast case: a caller that only has a set gets that set for every
+        // claim, so both Workers are still reserved.
+        let mut execution = LiveExecution::new(
+            repository.clone(),
+            ExclusionsProvider::fixed(DispatchExclusions::default()),
+        );
+        let request = DirectDispatchRequest::new(
+            Ticket::new(
+                TicketId::parse("ENG-101").expect("Ticket"),
+                TicketTitle::parse("Foundation").expect("Ticket title"),
+                TicketStatus::parse("Todo").expect("Ticket status"),
+            ),
+            RunMode::Background,
+        );
+
+        assert_eq!(
+            execution
+                .claim(&request)
+                .expect("first claim")
+                .expect("an idle Worker")
+                .worker_id(),
+            &first
+        );
+        assert_eq!(
+            execution
+                .claim(&request)
+                .expect("second claim")
+                .expect("a second idle Worker")
+                .worker_id(),
+            &second
+        );
     }
 }

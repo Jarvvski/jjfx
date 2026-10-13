@@ -117,6 +117,27 @@ impl std::fmt::Debug for RealWorkspaceDispatch {
     }
 }
 
+/// The Workers excluded from Dispatch right now, or why they cannot be known.
+///
+/// Fails closed when the terminal cannot be queried: with no way to tell which
+/// Workspaces are open, Dispatch is refused rather than risking a collision with
+/// a human. A frontend with no terminal excludes nothing.
+fn live_exclusions(
+    repository: &crate::engine::Repository,
+    terminal: Option<&std::sync::Arc<dyn crate::terminal::Terminal>>,
+) -> Result<DispatchExclusions, String> {
+    let Some(terminal) = terminal else {
+        return Ok(DispatchExclusions::default());
+    };
+    let open = terminal.open_workspaces().map_err(|error| {
+        format!(
+            "cannot determine which Worker Workspaces are open ({error}); \
+             refusing to dispatch"
+        )
+    })?;
+    Ok(crate::engine::reconcile_occupancy(repository, &open))
+}
+
 fn configured_ticket_query(
     repository: &crate::engine::Repository,
     runtime: AgentRuntime,
@@ -171,16 +192,24 @@ impl RealWorkspaceDispatch {
         &self,
         repository: &crate::engine::Repository,
     ) -> Result<DispatchExclusions, String> {
-        let Some(terminal) = self.terminal.as_ref() else {
-            return Ok(DispatchExclusions::default());
-        };
-        let open = terminal.open_workspaces().map_err(|error| {
-            format!(
-                "cannot determine which Worker Workspaces are open ({error}); \
-                     refusing to dispatch"
-            )
-        })?;
-        Ok(crate::engine::reconcile_occupancy(repository, &open))
+        live_exclusions(repository, self.terminal.as_ref())
+    }
+
+    /// A live exclusion source for the orchestration runner.
+    ///
+    /// The runner asks it per claim, so a Workspace a human opens (or closes)
+    /// while the group runs changes the next decision instead of the run's
+    /// opening snapshot (ADR-0011).
+    fn exclusions_provider(&self) -> crate::engine::ExclusionsProvider {
+        let root = self.repository_root.clone();
+        let colocate = self.colocate;
+        let terminal = self.terminal.clone();
+        crate::engine::ExclusionsProvider::new(move || {
+            let repository = crate::engine::Repository::open(&root)
+                .map(|repository| repository.with_colocate(colocate))
+                .map_err(|error| error.to_string())?;
+            live_exclusions(&repository, terminal.as_ref())
+        })
     }
 
     fn repository(&self) -> Result<crate::engine::Repository, String> {
@@ -411,7 +440,6 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
     ) -> Result<(), String> {
         let repository = self.repository()?;
-        let exclusions = self.exclusions(&repository)?;
         let id = TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?;
         let pool = repository.worker_pool().snapshot();
         let profile = pool.pool().and_then(|pool| pool.profile()).cloned();
@@ -434,7 +462,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
         let runner = repository
             .orchestration_runner()
-            .with_exclusions(exclusions);
+            .with_exclusions(self.exclusions_provider());
         let preparation = runner
             .prepare(&request, &parent_ticket, &discovery)
             .map_err(|error| error.to_string())?;

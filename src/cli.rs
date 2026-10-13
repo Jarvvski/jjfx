@@ -1332,6 +1332,32 @@ fn dispatch_exclusions(
     Ok(crate::engine::reconcile_occupancy(repository, &open))
 }
 
+/// A live occupancy source for the orchestration runner.
+///
+/// Unlike [`dispatch_exclusions`], which snapshots the open Workspaces once, the
+/// provider re-queries on every claim so mid-run tab changes are honoured
+/// (ADR-0011). `--force` dispatches regardless of occupancy, so it has nothing
+/// to re-query.
+fn exclusions_provider(
+    repository: &Repository,
+    force: bool,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+) -> crate::engine::ExclusionsProvider {
+    if force {
+        return crate::engine::ExclusionsProvider::fixed(DispatchExclusions::default());
+    }
+    let repository = repository.clone();
+    crate::engine::ExclusionsProvider::new(move || {
+        let open = open_workspaces().map_err(|error| {
+            format!(
+                "cannot determine which Worker Workspaces are open ({error}); \
+                 re-run with --force to dispatch anyway"
+            )
+        })?;
+        Ok(crate::engine::reconcile_occupancy(&repository, &open))
+    })
+}
+
 /// Fetch a Ticket's details to inline into the Dispatch prompt, failing before
 /// any Pool or Workspace mutation when the runtime cannot reach the tracker.
 ///
@@ -1664,7 +1690,9 @@ fn orchestrate_command(
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     let id = TicketId::parse(parent.to_owned())?;
-    let exclusions = dispatch_exclusions(repository, force, open_workspaces)?;
+    // The runner re-queries occupancy per claim, so a Workspace a human opens or
+    // closes while the group runs changes the next decision (ADR-0011).
+    let exclusions = exclusions_provider(repository, force, open_workspaces);
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the

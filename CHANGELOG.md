@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Dispatch occupancy is now a live query: the orchestration runner
+  asks a provider for the excluded Worker Workspaces on every claim, so a
+  Workspace a human opens (or closes) while a Dispatch Group is running changes
+  the next decision instead of the run's opening snapshot (ADR-0011). (fix)
+
 - 2026-10-13 - A `.cleanup` marker whose name is not a valid Worker id no longer
   aborts cleanup discovery, which previously broke Pool resize and destroy for
   every Worker because of one junk file. (fix)
