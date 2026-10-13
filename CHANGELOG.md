@@ -35,6 +35,10 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A `.cleanup` marker whose name is not a valid Worker id no longer
+  aborts cleanup discovery, which previously broke Pool resize and destroy for
+  every Worker because of one junk file. (fix)
+
 - 2026-10-13 - A Ticket can no longer be dispatched twice: Ready Ticket
   discovery drops a repeated Ticket with a diagnostic, and a Dispatch batch
   naming the same Ticket twice is rejected before any Worker is reserved. (fix)

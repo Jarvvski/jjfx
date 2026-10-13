@@ -1082,10 +1082,13 @@ impl StateStore {
             let Some(worker) = name.strip_suffix(CLEANUP_SUFFIX) else {
                 continue;
             };
-            workers.push(
-                WorkerId::parse(worker)
-                    .map_err(|error| StateError::new("discover cleanup", "Worker Pool", error))?,
-            );
+            // A marker whose stem is not a valid Worker id cannot name a Pool
+            // member, so there is nothing to clean up. Skipping it keeps one junk
+            // file from failing discovery - and with it every resize and destroy.
+            let Ok(worker) = WorkerId::parse(worker) else {
+                continue;
+            };
+            workers.push(worker);
         }
         workers.sort();
         Ok(workers)

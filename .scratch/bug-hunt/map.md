@@ -43,9 +43,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 (fixed) |
 | I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 (fixed) |
 | C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 (fixed) |
-| C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 |
-| C5 | state | M | S | `detached_cleanup_markers` aborts on any malformed `.cleanup` filename | 20 |
-| C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 |
+| C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 (decision needed) |
+| C5 | state | M | S | `detached_cleanup_markers` aborts on any malformed `.cleanup` filename | 20 (fixed) |
+| C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 (test strategy needed) |
 | D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 (fixed) |
 | D4 | dispatch | M | S | orchestration freezes occupancy exclusions for the whole run (violates ADR-0011) | 15 |
 | D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 (fixed) |
@@ -124,6 +124,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
   **resolved** - lossy line reader, replay offset, in-tailer rotation.
 - [20](issues/20-workspace-cleanup-robustness.md) - C4, C5, C6.
+  **partial** - C5 fixed; C4 needs a terminal/job-control decision, C6 needs a
+  way to test a SIGKILL-surviving group.
 
 ### Phase 3 - improvements
 

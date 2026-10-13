@@ -268,6 +268,27 @@ fn destroy_is_idempotent_for_a_missing_or_empty_pool() {
 }
 
 #[test]
+fn destroy_ignores_a_cleanup_marker_that_cannot_name_a_worker() {
+    let (_temporary_directory, repository) = local_repository_with_origin();
+    repository
+        .worker_pool()
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
+        .expect("grow");
+    // A junk file ending in the cleanup suffix whose stem is not a valid Worker
+    // id (it is empty). It cannot name a Pool member, so it must not abort
+    // discovery and with it the whole destroy.
+    let junk = repository.root().join(".jj/pool").join(".cleanup");
+    fs::write(&junk, []).expect("junk cleanup marker");
+
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("destroy must ignore an unparseable cleanup marker");
+
+    assert!(repository.worker_pool().snapshot().is_missing());
+}
+
+#[test]
 fn destroy_removes_worker_workspaces_state_and_cache_entries() {
     let (_temporary_directory, repository) = local_repository_with_origin();
     let grown = repository
