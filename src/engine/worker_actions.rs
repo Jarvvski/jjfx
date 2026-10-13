@@ -369,6 +369,13 @@ impl WorkerActions {
     /// Rebases the Worker's bookmark onto `main` and pushes it.
     pub fn rebase(&self, worker: &WorkerId) -> Result<RebaseOutcome, WorkerActionError> {
         let (branch, workspace) = self.branch_and_workspace(worker)?;
+        // A rebase rewrites the working copy, so serialise it with preparation
+        // and Reset restoration like every other Workspace operation.
+        let _operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
+            .map_err(|source| WorkerActionError::WorkspaceOperation {
+                worker: worker.clone(),
+                detail: source.to_string(),
+            })?;
         self.commands
             .rebase(&workspace, &branch)
             .map_err(|detail| WorkerActionError::Command {
@@ -583,6 +590,16 @@ impl WorkerActions {
         fresh_system_prompt: Option<String>,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
+        // Serialise against Workspace preparation and Reset restoration. Acquiring
+        // the lock blocks until any in-flight restoration has finished, so a
+        // Follow-up never starts editing a working copy that is still being
+        // rewritten. The guard is released once the Run's process has started:
+        // holding it for the whole Run would stop Reset from interrupting it.
+        let operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
+            .map_err(|source| WorkerActionError::WorkspaceOperation {
+            worker: worker.clone(),
+            detail: source.to_string(),
+        })?;
         let snapshot = self.repository.worker_pool().snapshot();
         let worker_snapshot =
             snapshot
@@ -626,13 +643,19 @@ impl WorkerActions {
         }
         let execution = match mode {
             RunMode::Foreground => FollowUpExecution::Foreground(
-                self.supervisor
-                    .run_reserved_foreground(reservation, invocation)?,
+                self.supervisor.run_reserved_foreground_with_handoff(
+                    reservation,
+                    invocation,
+                    move || drop(operation),
+                )?,
             ),
-            RunMode::Background => FollowUpExecution::Background(Box::new(
-                self.supervisor
-                    .run_reserved_background(reservation, invocation)?,
-            )),
+            RunMode::Background => {
+                let execution = self
+                    .supervisor
+                    .run_reserved_background(reservation, invocation)?;
+                drop(operation);
+                FollowUpExecution::Background(Box::new(execution))
+            }
         };
         Ok(FollowUpOutcome {
             worker: worker.clone(),

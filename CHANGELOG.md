@@ -35,6 +35,10 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - `send`, `review`, and `rebase` now take the Worker's
+  Workspace-operation lock, matching Dispatch and Reset. A Follow-up can no
+  longer start editing a working copy that a Reset is still restoring. (fix)
+
 - 2026-10-13 - Resuming a Dispatch Group no longer rewrites a stacked
   dependency onto `main` when the operator's `jj user.name` is not `adam`.
   Branch resolution now matches on the Ticket id instead of a hardcoded

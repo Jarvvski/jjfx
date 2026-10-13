@@ -1,5 +1,5 @@
 use std::env;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -11,6 +11,7 @@ use jjfx::engine::{
     Loaded, PaneLayout, PoolCapacity, Repository, RunMode, RunReset, StateChange, WireAgent,
     WireStatus, WireTimestamp, WorkerActions, WorkerId, WorkspaceRestoration,
 };
+use rustix::fs::{FlockOperation, flock};
 use rustix::process::{
     Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
 };
@@ -110,6 +111,74 @@ fn send_any_uses_the_first_idle_worker_and_reports_its_identity() {
     assert_eq!(
         fs::read_to_string(result).expect("Send-any result"),
         format!("worker={idle}; completed=true")
+    );
+}
+
+/// A Follow-up must take the Worker's Workspace-operation lock, so it can never
+/// start a Run in a Workspace a Reset is still restoring.
+#[test]
+fn send_waits_for_the_workspace_operation_lock() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+
+    let bin = temporary_directory.path().join("lock-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nexit 0\n",
+    );
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("runtime PATH");
+
+    // Hold the same sidecar lock `lock_worker_operation` uses, across processes.
+    let lock_path = repository
+        .root()
+        .join(format!(".jj/pool/{worker}.workspace.lock"));
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock directory");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("operation lock file");
+    flock(&lock_file, FlockOperation::LockExclusive).expect("hold operation lock");
+
+    let result = temporary_directory.path().join("lock-result");
+    let mut child = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "send_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Send helper should start");
+
+    thread::sleep(Duration::from_millis(400));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "a Follow-up must wait for the Worker's Workspace operation lock"
+    );
+
+    drop(lock_file);
+    let output = child.wait_with_output().expect("helper output");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fs::read_to_string(&result)
+            .expect("Send result")
+            .contains("completed=true"),
+        "the Follow-up should complete once the lock is released"
     );
 }
 

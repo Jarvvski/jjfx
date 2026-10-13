@@ -37,7 +37,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | W1 | dispatch | H | report | Worker Run inherits the caller's cwd, not its Workspace | 01, 05 |
 | D1 | dispatch | H | V | A failed Sub-issue never unblocks dependents; the group never terminates and `run` polls forever | 04 (fixed) |
 | D3 | work | - | refuted | git-exported bookmarks count as "pushed" - `remote_bookmarks()` already excludes `@git` | 06 |
-| C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 03, 08 |
+| C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 08 (fixed) |
 | C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
 | T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 |
 | T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 (fixed) |
@@ -98,6 +98,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   **wontfix** - refuted.
 - [07](issues/07-durable-run-identity.md) - C2, C7.
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
+  **resolved** - Follow-ups and rebases take the lock.
 - [09](issues/09-order-cleanup-marker-after-manifest.md) - C3.
   **resolved** - manifest-first ordering.
 

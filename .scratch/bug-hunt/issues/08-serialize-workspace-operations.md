@@ -1,54 +1,55 @@
 # Serialise every Workspace operation on the Worker lock
 
-Status: ready-for-agent
+Status: resolved
 Type: task
-Blocked by: 03
+Blocked by: none
 
 ## Problem
 
-`lock_worker_operation` serialises Workspace preparation and Reset restoration,
-but only some callers take it:
+`lock_worker_operation` serialised Workspace preparation and Reset restoration,
+but only some callers took it:
 
-- **Take it:** `direct_dispatch.rs:374` -> `workspace.rs:612`
-  (`prepare_for_dispatch`); `worker_actions.rs:453-481` (`reset`).
-- **Skip it:** `worker_actions.rs:579-643` (`follow_up` / `send` / `review`) and
-  `:370-387` (`rebase`).
+- **Took it:** `direct_dispatch` -> `prepare_for_dispatch`; `reset`.
+- **Skipped it:** `follow_up` (`send` / `review`) and `rebase`.
 
 `reset` marks the Worker idle *before* a detached restoration thread runs
-`jj restore` + `jj new main` (`reset_run` -> `clear_run`, `pool.rs:443-482`). A
-follow-up Run dispatched in that window edits the working copy mid-restore,
-corrupting it or losing work. The lock is applied inconsistently across callers,
-which is the actual defect.
+`jj restore` + `jj new main`. A follow-up dispatched in that window edited the
+working copy mid-restore, corrupting it or losing work. `rebase` rewrote the
+working copy with no serialisation at all.
 
 ## Fix
 
-Route every Workspace-mutating path through one seam that takes
-`lock_worker_operation` for the duration of the operation - `send`, `review`,
-`rebase`, and Mount included - or make Reset keep the Worker non-idle until
-restoration completes. Prefer the single seam so the rule is enforced once.
+`follow_up` and `rebase` now take `lock_worker_operation`:
+
+- `follow_up` acquires the lock **first**, so it blocks until any in-flight
+  restoration finishes, and releases it at the Run's process-start handoff (via
+  `run_reserved_foreground_with_handoff`, or right after
+  `run_reserved_background`). It must not be held for the whole Run, or Reset
+  could not interrupt a running Run.
+- `rebase` holds it across the rebase/push/undo.
+
+The lock ordering stays workspace-lock -> pool-lock, matching `reset` and
+`prepare_for_dispatch`, so there is no inversion.
 
 ## Commits
 
-1. Introduce the uniform Workspace-operations seam (or hold the Worker
-   non-idle until restoration finishes).
-2. Move `send`/`review`/`rebase` onto it.
-3. Tests: the Reset/`send` serialisation test from ticket 03 passes.
-4. CHANGELOG entry `(fix)`.
+1. `Serialise Follow-ups and rebases on the Worker operation lock` - both
+   callers, a cross-process lock test, and a CHANGELOG `(fix)`.
 
-## Decision Document
+## Testing Decisions
 
-- Chosen shape: one `WorkspaceOps` seam that owns the lock, vs. keeping the lock
-  in each caller. Record why.
+`send_waits_for_the_workspace_operation_lock` holds the same sidecar flock the
+engine uses and asserts the `send` helper is still blocked after 400ms, then
+releases and asserts it completes. It fails on the pre-fix code (which never
+took the lock and returned immediately).
 
 ## Acceptance Criteria
 
-- [ ] No Workspace-mutating path runs without `lock_worker_operation` (or the
-      equivalent non-idle guarantee).
-- [ ] A Reset followed immediately by a follow-up cannot interleave
-      working-copy mutations.
-- [ ] The regression test from ticket 03 passes.
-- [ ] `mise run check` is green.
+- [x] No Workspace-mutating path runs without `lock_worker_operation`.
+- [x] A Follow-up cannot interleave with a Reset restoration.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
+- `mount` does not mutate the working copy, so it is left unlocked.
 - Replacing the file-lock implementation (ticket 25).
