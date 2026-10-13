@@ -152,16 +152,44 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   thread; the panic hook is installed before the terminal is touched; a failed
   input read is retried when interrupted and surfaced otherwise.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
+  **triaged** - T10c fixed; I10, I11a/b/c and T10a scheduled; C8 and T10b
+  refuted; D6-D9 escalated to 31-34.
 - [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).
   **resolved** - a failed PR read yields `Unknown`, not `Pushed`.
 - [30](issues/30-background-store-reload.md) - the `Store::reload` half of 17.
   **resolved** - reloaded via `Effect::ReloadStore`.
+- [31](issues/31-attention-precedence-on-stacked-work.md) - D6, split out of 28.
+  **ready-for-human** - which rule wins for a changes-requested PR with newer
+  work stacked above it.
+- [32](issues/32-mixed-merged-and-unmerged-blockers.md) - D7, split out of 28.
+  **ready-for-human** - the PR base for a mix of merged and unmerged blockers.
+- [33](issues/33-non-todo-dependencies-unblock.md) - D8, split out of 28.
+  **ready-for-human** - whether an `In Progress` dependency satisfies dependents.
+- [34](issues/34-claude-result-usage.md) - D9, split out of 28.
+  **ready-for-human** - whether a Claude `result` event's usage populates the
+  Run result.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
   The sweep misread the `remote_bookmarks` template keyword as the revset
   result. Verified with `jj 0.46.0` on a colocated repo with an unpushed
   bookmark. This is why every sweep finding is tested before it is fixed.
+
+- The sweep finding C8 (case-collision on Dispatch Group files) is **refuted**:
+  tickets come from Linear (canonical uppercase `TEAM-NUMBER`) with no
+  file-based discovery, the lowercasing is *mandated* by the wsg compatibility
+  contract (`docs/wsg-compatibility-contract.md:58,111`) and pinned by
+  `tests/state_repositories.rs:93-113`, and APFS is case-insensitive so the
+  filenames collide with or without the lowercase. Only a confusing fail-closed
+  error remains when the *same* ticket is entered with inconsistent casing.
+
+- The sweep finding T10b (help over the task editor hides it and drops paste) is
+  **refuted** as a user-facing bug: `Help(Box::new(Pool(SendInput)))` is
+  unreachable, because `on_key` returns into the editor before the `?` handler
+  that is the only constructor of `Mode::Help`, and
+  `pool_send_editor_submits_a_prompt_without_blocking_input` pins that. The
+  three direct `SendInput` comparisons are a latent inconsistency with
+  `pool_mode()`; recorded as optional hardening in ticket 28.
 
 ## Decisions so far
 
