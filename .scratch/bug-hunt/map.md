@@ -120,8 +120,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [16](issues/16-persist-group-before-reset.md) - D5.
   **resolved** - persist-before-reset in the retry path.
 - [17](issues/17-move-blocking-work-off-ui-thread.md) - T1, T6.
-  **resolved** - tab opens and tidy sweeps run as effects; `Jj` moved to the
-  runtime. `Store::reload` split to 30.
+  **resolved** - tab opens, tidy sweeps, and `Store::reload` (ticket 30) all run
+  as effects; `Jj` moved from the App to the runtime.
 - [18](issues/18-help-overlay-in-detail-and-graph.md) - T2.
   **resolved** - overlay drawn over Detail/Graph.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.

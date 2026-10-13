@@ -1,27 +1,24 @@
 # Move blocking work off the TUI thread
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
 ## Progress (2026-10-13)
 
-**T1 and T6 are fixed.** T1's terminal `is_open`/`open`/`focus` and T6's
-`tidy`/`tidyws` now run through the `Effect` / `spawn_blocking` seam:
+**T1, T6, and `Store::reload` are all fixed.** The three blocking paths from the
+problem statement now run through the `Effect` / `spawn_blocking` seam, so
+`App::handle` performs no subprocess and no sleep:
 
-- New effects `OpenWorkspace { name, path, focus, created }` and
-  `Tidy { kind }`, reported as `Msg::WorkspaceOpened` / `Msg::Tidied`.
+- T1: `Effect::OpenWorkspace` -> `Msg::WorkspaceOpened`.
+- T6: `Effect::Tidy { kind }` -> `Msg::Tidied`.
+- `Store::reload`: `Effect::ReloadStore` -> `Msg::StoreReloaded` (ticket 30,
+  which was split out of this ticket and has since landed).
 - The `Jj` seam moved from `App` to `Runtime` (the owner of blocking work), so
   the App no longer holds a `Jj` at all and `App::new` lost that parameter.
   `Jj` is now `Send + Sync` so an `Arc<dyn Jj>` can cross into a blocking worker.
 - The App's terminal field went too: the only remaining production user was the
   dispatch controller, built in `App::new`.
-
-**`Store::reload` is split into ticket 30.** It is the third blocking path in
-this ticket (`Store::load` -> `jj workspace list`), but backgrounding it changes
-*when* the UI reflects disk state - it becomes eventually consistent, and
-`Msg::Reload`/`App::reload` call sites and their tests all shift. That deserves
-its own change and tests rather than being folded in here.
 
 ## Problem
 
@@ -56,12 +53,10 @@ Everything else in the codebase deliberately routes blocking work through
 
 ## Acceptance Criteria
 
-- [x] No subprocess or `sleep` runs on the UI thread for T1 and T6.
-- [x] The TUI stays responsive during open/focus/tidy.
-- [ ] `Store::reload` still runs on the UI thread (ticket 30).
+- [x] No subprocess or `sleep` runs on the UI thread.
+- [x] The TUI stays responsive during open/focus/tidy/reload.
 - [x] `mise run check` is green.
 
 ## Out of Scope
 
 - The per-frame work in ticket 26.
-- `Store::reload` (ticket 30).
