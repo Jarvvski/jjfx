@@ -1,6 +1,6 @@
 # Miscellaneous low-severity fixes
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -212,6 +212,51 @@ ticket's own framing are recorded there: D6's rule is masked only when a newer
 non-empty change is stacked above the PR (not unreachable in general), and no
 test locks in D9's omission - the cited tests omit `usage` from their input
 entirely.
+
+## Outcome (2026-10-13)
+
+**Resolved.** Five focused commits, one per scheduled item, plus the T10c fix
+committed separately during triage. The owner authorised the I10 API break
+explicitly.
+
+- `Drop unusable provider costs instead of failing a successful Run` -
+  `parse_claude_cost`/`parse_pi_cost` return `Option<RunCost>` and drop an
+  unusable value; the public `RunLogParseError::InvalidCost` variant is removed.
+  "No terminal event at all -> failed" is kept for Claude/Pi, and the
+  OpenCode-only fallback special case was deliberately not generalised. The two
+  tests that encoded the defect were rewritten to assert the cost is dropped and
+  the outcome unaffected, and a new test pins an out-of-range cost. Pre-fix red
+  captured for the negative-Claude, out-of-range-Claude, and negative-Pi cases.
+- `State the worker-pool growth in the capacity prompt` - the prompt now prints
+  `shortage.gap()` ("Grow pool by 3?"); pre-fix red showed
+  `Resize pool to 5?`.
+- `Treat a missing config base directory as no user config` - `config_path()`
+  returns `Option<PathBuf>` and `load()` falls back to defaults; an empty `HOME`
+  is filtered like the XDG branch already was. Only caller is `load()`. Tested
+  via a child process with `env_clear()` (edition-2024 env mutation is
+  `unsafe`, which is forbidden crate-wide). Pre-fix red:
+  `Some(".config/jjfx/config.toml")` vs `None`.
+- `Keep the runtime colocate setting on the post-deletion store` - the one-line
+  `.with_colocate(colocate)` on the post-deletion `Store::load`, matching the
+  `create_workspace`/`reload_store` pattern.
+- `Forward ? to the worker alias and diff filter buffers` - the intercept yields
+  to those two buffers.
+
+**Landing correction (orchestrator).** The T10a commit as first written excluded
+the whole `Mode::Detail`, which made the detail help overlay **unreachable**:
+the file list consumes `?` for the filter and the diff pane then ignored it,
+even though `help_overlay_renders_over_detail_and_graph` asserts help is meant to
+render over Detail. The ticket's own wording ("the diff *filter*") caused the
+over-application. Corrected before landing: `?` yields only while
+`Detail::filter_is_focused()`, so the diff pane still opens help. Squashed into
+the T10a commit, with `question_mark_opens_help_when_the_diff_pane_has_focus`
+pinning it alongside the two buffer tests.
+
+**Environmental note:** two flakes appeared under the concurrent-agent build
+load - `worker_pool::stale_reservation_...` (the fixed 10s helper deadline, now
+filed as ticket 35) and `store::tests::load_represents_jj_only_workspace_without_path`
+(a fixed sibling `orphan-workspace` path colliding across concurrent runs). Both
+passed in isolation.
 
 ## Out of Scope
 

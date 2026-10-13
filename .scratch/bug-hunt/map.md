@@ -158,8 +158,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   thread; the panic hook is installed before the terminal is touched; a failed
   input read is retried when interrupted and surfaced otherwise.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
-  **triaged** - T10c fixed; I10, I11a/b/c and T10a scheduled; C8 and T10b
-  refuted; D6-D9 escalated to 31-34.
+  **resolved** - T10c fixed at triage; I10 (with the authorised API break), I11a,
+  I11b, I11c, and T10a landed as five focused commits; C8 and T10b refuted;
+  D6-D9 escalated to 31-34.
 - [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).
   **resolved** - a failed PR read yields `Unknown`, not `Pushed`.
 - [30](issues/30-background-store-reload.md) - the `Store::reload` half of 17.

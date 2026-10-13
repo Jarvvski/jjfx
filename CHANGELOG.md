@@ -33,7 +33,32 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Changed
 
+- 2026-10-13 - A provider-reported Run cost that jjfx cannot represent (negative,
+  non-finite, or out of range) is dropped instead of failing the Run. It
+  previously finalised a *successful* Run as `failed` with "Process exited
+  unexpectedly", which fed orchestration retries. `RunLogParseError::InvalidCost`
+  is removed. (break)
+
 ### Fixed
+
+- 2026-10-13 - The Worker Pool growth prompt states the growth ("Grow pool by
+  3?") rather than a size it did not match: it printed `idle + shortfall`, but
+  the pool grows by the shortfall from its *current* size, so a 4-worker pool
+  with 2 idle and 5 tickets was promised as "Resize pool to 5" and became 7.
+  (fix)
+
+- 2026-10-13 - A missing config base directory now means "no user config" rather
+  than a relative `.config/jjfx/config.toml` resolved against the process CWD,
+  which let a repository plant the user's config. An empty `HOME` is treated the
+  same way. (fix)
+
+- 2026-10-13 - The store handed to the UI after a Workspace deletion keeps the
+  configured colocation setting instead of defaulting it back to on. (fix)
+
+- 2026-10-13 - `?` can be typed into the worker alias and the diff filter. It
+  used to open the help overlay from every mode, so neither buffer could contain
+  a question mark; the diff *pane* still opens help, so the detail bindings stay
+  reachable. (fix)
 
 - 2026-10-13 - Creating a Workspace from the TUI now uses the same on-disk rule
   as the CLI and the Worker Pool - `<parent>/<repo>-workspaces/<name>`, or
