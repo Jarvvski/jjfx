@@ -117,14 +117,20 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
             } else {
                 ""
             };
+            let blocked = if counts.blocked() > 0 {
+                format!("  blocked: {}", counts.blocked())
+            } else {
+                String::new()
+            };
             lines.push(dim_line(&format!(
-                " Dispatch Group {}  runtime: {}  waves: {}  done: {}  failed: {}  skipped: {}{}",
+                " Dispatch Group {}  runtime: {}  waves: {}  done: {}  failed: {}  skipped: {}{}{}",
                 progress.parent(),
                 progress.runtime().as_str(),
                 progress.maximum_wave(),
                 counts.done(),
                 counts.failed(),
                 counts.skipped(),
+                blocked,
                 terminal
             )));
             if !progress.ready().is_empty() {

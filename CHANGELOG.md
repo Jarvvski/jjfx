@@ -35,6 +35,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A Dispatch Group whose dependency fails now reaches a terminal
+  state instead of being watched forever. A `Failed` Sub-issue no longer leaves
+  its dependents permanently `pending`, so `jjfx dispatch`/`orchestrate` and the
+  TUI stop polling a group that can make no further progress, and the summary
+  and Pool view report the unreachable Sub-issues as `blocked`. (fix)
+
 - 2026-10-13 - Running `jjfx` from a secondary Jujutsu workspace no longer
   shadows the `default` workspace. The repository root is now normalised to the
   default workspace at discovery, so `default` always points at the repository

@@ -1737,10 +1737,11 @@ fn render_orchestration_event(event: &OrchestrationEvent) {
         OrchestrationEvent::Terminal(summary) => {
             let counts = summary.counts();
             eprintln!(
-                "Orchestration complete: {} done, {} failed, {} skipped",
+                "Orchestration complete: {} done, {} failed, {} skipped, {} blocked",
                 counts.done(),
                 counts.failed(),
-                counts.skipped()
+                counts.skipped(),
+                counts.blocked()
             );
         }
     }

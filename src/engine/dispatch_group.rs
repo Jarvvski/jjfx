@@ -119,6 +119,7 @@ pub struct DispatchGroupStatusCounts {
     done: usize,
     failed: usize,
     skipped: usize,
+    blocked: usize,
 }
 
 impl DispatchGroupStatusCounts {
@@ -135,6 +136,12 @@ impl DispatchGroupStatusCounts {
     /// Returns the number of skipped Sub-issues.
     pub const fn skipped(self) -> usize {
         self.skipped
+    }
+
+    /// Returns the number of Pending Sub-issues that can never become ready
+    /// because a dependency failed (or the graph is otherwise unsatisfiable).
+    pub const fn blocked(self) -> usize {
+        self.blocked
     }
 }
 
@@ -521,17 +528,73 @@ impl DispatchGroup {
         )))
     }
 
-    /// Returns whether every Sub-issue is terminal.
+    /// Returns whether the group is quiescent: no Sub-issue is running and none
+    /// can become ready.
+    ///
+    /// A Pending Sub-issue blocked by a terminal-but-unsatisfied dependency (a
+    /// `Failed` blocker) can never become ready, so the group is terminal even
+    /// though that Sub-issue never reached a terminal status. Treating only
+    /// all-terminal groups as terminal left the runner polling such a group
+    /// forever.
     pub fn is_terminal(&self) -> bool {
-        self.state
-            .sub_issues
-            .values()
-            .all(|issue| status_of(issue).is_terminal())
+        self.ready().is_empty()
+            && !self
+                .state
+                .sub_issues
+                .values()
+                .any(|issue| status_of(issue) == SubIssueStatus::Dispatched)
     }
 
-    /// Counts done, failed, and skipped Sub-issues.
+    /// Counts Pending Sub-issues that can never become ready.
+    ///
+    /// A Pending Sub-issue is reachable when every direct Blocker is reachable:
+    /// `Done`/`Skipped` satisfy a dependency, `Dispatched` is in flight, and
+    /// `Failed` never satisfies. Unreachable Pending Sub-issues - including any
+    /// caught in a cycle - are reported as blocked.
+    fn blocked_count(&self) -> usize {
+        let mut reachable: BTreeSet<TicketId> = self
+            .state
+            .sub_issues
+            .iter()
+            .filter(|(_, issue)| {
+                matches!(
+                    status_of(issue),
+                    SubIssueStatus::Done | SubIssueStatus::Skipped | SubIssueStatus::Dispatched
+                )
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        loop {
+            let mut progressed = false;
+            for (id, issue) in &self.state.sub_issues {
+                if reachable.contains(id) || status_of(issue) != SubIssueStatus::Pending {
+                    continue;
+                }
+                if issue
+                    .blocked_by
+                    .iter()
+                    .all(|blocker| reachable.contains(blocker))
+                {
+                    reachable.insert(id.clone());
+                    progressed = true;
+                }
+            }
+            if !progressed {
+                break;
+            }
+        }
+        self.state
+            .sub_issues
+            .iter()
+            .filter(|(id, issue)| {
+                status_of(issue) == SubIssueStatus::Pending && !reachable.contains(*id)
+            })
+            .count()
+    }
+
+    /// Counts done, failed, skipped, and permanently blocked Sub-issues.
     pub fn status_counts(&self) -> DispatchGroupStatusCounts {
-        self.state.sub_issues.values().fold(
+        let mut counts = self.state.sub_issues.values().fold(
             DispatchGroupStatusCounts::default(),
             |mut counts, issue| {
                 match status_of(issue) {
@@ -542,7 +605,9 @@ impl DispatchGroup {
                 }
                 counts
             },
-        )
+        );
+        counts.blocked = self.blocked_count();
+        counts
     }
 
     /// Projects a data-only progress read model from this validated group.

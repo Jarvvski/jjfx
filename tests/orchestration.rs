@@ -108,6 +108,54 @@ fn progress_projects_a_persisted_group_and_reports_absence() {
 }
 
 #[test]
+fn a_group_with_a_failed_blocker_terminates_instead_of_polling_forever() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-08-04T12:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    group.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Sub-issue"),
+        SubIssueState::new("Failed", WireStatus::new("failed"), Vec::new()),
+    );
+    group.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Sub-issue"),
+        SubIssueState::new(
+            "Dependent",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Sub-issue")],
+        ),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent.clone())
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save group");
+
+    // A bounded cycle budget turns a liveness bug into a failure, not a hang:
+    // before the fix the runner returned `PollingExhausted` for this group.
+    let summary = repository
+        .orchestration_runner()
+        .run(
+            &OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude),
+            &OrchestrationOptions::new()
+                .with_poll_interval(std::time::Duration::ZERO)
+                .with_max_cycles(3),
+            |_| {},
+        )
+        .expect("a group with a failed blocker must reach a terminal state");
+
+    assert_eq!(summary.parent(), &parent);
+    assert_eq!(summary.counts().failed(), 1);
+    assert_eq!(summary.counts().blocked(), 1);
+}
+
+#[test]
 fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     let directory = TempDir::new().expect("temporary repository");
     let output = Command::new("jj")

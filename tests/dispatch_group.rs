@@ -324,6 +324,95 @@ fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_b
 }
 
 #[test]
+fn a_failed_blocker_makes_the_group_terminal_with_dependents_blocked() {
+    let mut failed_state = state();
+    failed_state.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Ticket"),
+        SubIssueState::new("Failed", WireStatus::new("failed"), Vec::new()),
+    );
+    failed_state.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Ticket"),
+        SubIssueState::new(
+            "Dependent",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Ticket")],
+        ),
+    );
+    failed_state.sub_issues.insert(
+        TicketId::parse("ENG-103").expect("Ticket"),
+        SubIssueState::new(
+            "Downstream",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-102").expect("Ticket")],
+        ),
+    );
+    let group = DispatchGroup::from_state(failed_state).expect("Dispatch Group");
+
+    assert!(group.ready().is_empty());
+    assert!(
+        group.is_terminal(),
+        "a group whose only remaining work is unreachable must terminate"
+    );
+    let counts = group.status_counts();
+    assert_eq!(counts.failed(), 1);
+    assert_eq!(
+        counts.blocked(),
+        2,
+        "the direct dependent and its downstream are both permanently blocked"
+    );
+}
+
+#[test]
+fn a_diamond_whose_root_fails_blocks_every_dependent() {
+    let mut failed_state = state();
+    for (id, status, blockers) in [
+        ("ENG-101", "failed", vec![]),
+        ("ENG-102", "pending", vec!["ENG-101"]),
+        ("ENG-103", "pending", vec!["ENG-101"]),
+        ("ENG-104", "pending", vec!["ENG-102", "ENG-103"]),
+    ] {
+        failed_state.sub_issues.insert(
+            TicketId::parse(id).expect("Ticket"),
+            SubIssueState::new(
+                id,
+                WireStatus::new(status),
+                blockers
+                    .into_iter()
+                    .map(|blocker| TicketId::parse(blocker).expect("Blocker"))
+                    .collect(),
+            ),
+        );
+    }
+    let group = DispatchGroup::from_state(failed_state).expect("Dispatch Group");
+
+    assert!(group.is_terminal());
+    assert_eq!(group.status_counts().blocked(), 3);
+}
+
+#[test]
+fn a_group_still_running_is_not_terminal() {
+    let mut running = state();
+    let mut dispatched = SubIssueState::new("Running", WireStatus::new("dispatched"), Vec::new());
+    dispatched.worker = Some(WorkerId::parse("worker-01").expect("Worker"));
+    dispatched.dispatched_at = Some(WireTimestamp::new("2026-08-04T12:00:00Z"));
+    running
+        .sub_issues
+        .insert(TicketId::parse("ENG-101").expect("Ticket"), dispatched);
+    running.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Ticket"),
+        SubIssueState::new(
+            "Dependent",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Ticket")],
+        ),
+    );
+    let group = DispatchGroup::from_state(running).expect("Dispatch Group");
+
+    assert!(!group.is_terminal(), "in-flight work keeps the group open");
+    assert_eq!(group.status_counts().blocked(), 0);
+}
+
+#[test]
 fn lifecycle_events_dispatch_and_complete_a_ticket_with_a_branch() {
     let mut group = group_from_response(
         r#"{"sub_issues":[{"id":"ENG-101","title":"Build","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,

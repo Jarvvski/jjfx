@@ -35,7 +35,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | ID | Area | Sev | Conf | Finding | Ticket |
 | --- | --- | --- | --- | --- | --- |
 | W1 | dispatch | H | report | Worker Run inherits the caller's cwd, not its Workspace | 01, 05 |
-| D1 | dispatch | H | V | A failed Sub-issue never unblocks dependents; the group never terminates and `run` polls forever | 03, 04 |
+| D1 | dispatch | H | V | A failed Sub-issue never unblocks dependents; the group never terminates and `run` polls forever | 04 (fixed) |
 | D3 | work | - | refuted | git-exported bookmarks count as "pushed" - `remote_bookmarks()` already excludes `@git` | 06 |
 | C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 03, 08 |
 | C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
@@ -91,6 +91,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 ### Phase 1 - high severity
 
 - [04](issues/04-terminate-group-on-failed-dependency.md) - D1.
+  **resolved** - quiescence + `blocked` count.
 - [05](issues/05-fix-worker-run-working-directory.md) - W1 (blocked by 01).
   **needs-info** - no reproducible jjfx defect; recurrence diagnostic recorded.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
