@@ -97,6 +97,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
   **wontfix** - refuted.
 - [07](issues/07-durable-run-identity.md) - C2, C7.
+  **ready-for-human** - needs a decision (new dep / unsafe / accept risk).
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
   **resolved** - Follow-ups and rebases take the lock.
 - [09](issues/09-order-cleanup-marker-after-manifest.md) - C3.
@@ -146,7 +147,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   documented improvement.
 - PID-as-identity is acknowledged in the contract ("liveness hints, not Run
   identity", `:147`). The fix (ticket 07) is a durable Run token, **not** a
-  change to the frozen Worker document.
+  change to the frozen Worker document. **Ticket 07 is `ready-for-human`:** the
+  current kill paths already only signal process *groups*, so the residual risk
+  is narrow; a full fix needs a process start time, which is not reachable
+  without a new dependency or `unsafe` on macOS. Awaiting an owner decision.
 - Two findings are test-encoded current behaviour - non-todo dependency statuses
   unblocking (D8), and Claude usage omission (D9). Confirm intent before
   changing; both live in ticket 28.
