@@ -41,7 +41,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
 | T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 |
 | T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 (fixed) |
-| I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 |
+| I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 (fixed) |
 | C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 (fixed) |
 | C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 |
 | C5 | state | M | S | `detached_cleanup_markers` aborts on any malformed `.cleanup` filename | 20 |
@@ -49,9 +49,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 (fixed) |
 | D4 | dispatch | M | S | orchestration freezes occupancy exclusions for the whole run (violates ADR-0011) | 15 |
 | D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 |
-| I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 10 |
-| I3 | forge | M | S | conflict detection only inspects `@`; a lower-commit conflict welds and pushes | 10 |
-| I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 |
+| I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 29 |
+| I3 | forge | M | S | conflict detection only inspects `@`; a lower-commit conflict welds and pushes | 10 (fixed) |
+| I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 (fixed) |
 | I5 | store | M | S | `default` workspace pinned to the current workspace when launched from a secondary workspace | 11 (fixed) |
 | I8 | dispatch | M | S | untrusted Linear text injected verbatim into prompts | 12 (fixed) |
 | T3 | events | M | S | one invalid UTF-8 byte wipes all startup agent state | 19 |
@@ -105,7 +105,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 
 ### Phase 2 - medium
 
-- [10](issues/10-forge-failure-and-push-correctness.md) - I1, I2, I3, I4.
+- [10](issues/10-forge-failure-handling.md) - I1, I3, I4.
+  **resolved** - typed push outcome, chain-wide conflict check, surfaced PR context.
 - [11](issues/11-normalize-repository-root.md) - I5 (blocked by 02).
   **resolved** - root normalised at discovery.
 - [12](issues/12-fence-untrusted-ticket-content.md) - I8.
@@ -132,6 +133,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [26](issues/26-tui-per-frame-work-and-agent-state-cache.md) - T7.
 - [27](issues/27-terminal-restore-on-signal-and-input-resilience.md) - T8, T9.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
+- [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.

@@ -35,6 +35,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Forge no longer reports failures as clean skips: a failed
+  `jj git push` fails the Push step (with jj's own message) instead of reading as
+  "nothing to push", a weld that buries a conflict below `@` stops the pipeline
+  before pushing, and a failed `gh` default-branch lookup is surfaced instead of
+  reading as "no origin remote". (fix)
+
 - 2026-10-13 - Dispatch prompts now inline untrusted Linear Ticket text (title,
   description, and blocker titles) inside a labelled data fence, with control
   characters stripped and length capped, and the Repository slug is validated to

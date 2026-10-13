@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::cmd::cmd;
+use crate::cmd::{Run, cmd};
 use crate::config::ForgeConfig;
 
 mod pull_requests;
@@ -73,6 +73,21 @@ pub(crate) enum Status {
     Ok,
     /// The step did nothing useful (nothing to push, weld hit conflicts, ...).
     Skipped,
+}
+
+/// The outcome of one `jj git push`.
+///
+/// A non-zero exit is a *failure*, never "nothing to push": the no-op marker is
+/// only meaningful on a zero exit. Conflating the two is how a stale remote used
+/// to look like a successful forge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PushOutcome {
+    /// Revisions moved to the remote.
+    Pushed,
+    /// jj exited zero and reported there was nothing to push.
+    Nothing,
+    /// The push failed; carries jj's own message.
+    Failed(String),
 }
 
 /// A workspace to forge: its name and the directory whose `@` the revsets target.
@@ -175,7 +190,7 @@ trait JjAdapter: Send + Sync {
         Ok(false)
     }
     fn weld(&self, dir: &Path) -> Result<bool, String>;
-    fn push(&self, dir: &Path) -> Result<bool, String>;
+    fn push(&self, dir: &Path) -> Result<PushOutcome, String>;
 
     fn origin_slug(&self) -> Result<Option<String>, String> {
         Ok(None)
@@ -311,13 +326,16 @@ impl JjAdapter for SystemJj {
     }
 
     fn has_conflict(&self, dir: &Path) -> Result<bool, String> {
+        // The whole mutable chain, not just `@`: a weld can bury a conflict in a
+        // lower commit while `@` stays clean, and pushing that chain would push
+        // broken commits.
         cmd("jj")
             .current_dir(dir)
             .args([
                 "--ignore-working-copy",
                 "log",
                 "-r",
-                "@ & conflicts()",
+                "(::@ ~ trunk()) & conflicts()",
                 "--no-graph",
                 "-T",
                 "\"x\"",
@@ -336,13 +354,13 @@ impl JjAdapter for SystemJj {
             .map_err(|error| error.to_string())
     }
 
-    fn push(&self, dir: &Path) -> Result<bool, String> {
-        cmd("jj")
+    fn push(&self, dir: &Path) -> Result<PushOutcome, String> {
+        let run = cmd("jj")
             .current_dir(dir)
             .args(["git", "push", "--revisions", PUSH_REVS])
             .run()
-            .map(|run| pushed_something(run.ok(), run.stdout(), run.stderr()))
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        Ok(push_outcome(&run))
     }
 
     fn origin_slug(&self) -> Result<Option<String>, String> {
@@ -589,21 +607,21 @@ fn run_pipeline(
         return;
     }
 
-    let pull_request_context = if config.pull_requests {
+    // A failed `gh` or jj lookup must not read as "no origin remote": that is
+    // how a broken Pull Request step used to look like a clean skip.
+    let pull_request_context: Result<Option<PullRequestContext>, String> = if config.pull_requests {
         match jj.origin_slug() {
-            Ok(Some(slug)) => {
-                github
-                    .default_branch(&slug)
-                    .ok()
-                    .map(|default_branch| PullRequestContext {
-                        slug,
-                        default_branch,
-                    })
-            }
-            Ok(None) | Err(_) => None,
+            Ok(Some(slug)) => github.default_branch(&slug).map(|default_branch| {
+                Some(PullRequestContext {
+                    slug,
+                    default_branch,
+                })
+            }),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
         }
     } else {
-        None
+        Ok(None)
     };
 
     for (target, state) in targets.iter().zip(&mut progress) {
@@ -630,21 +648,57 @@ fn run_pipeline(
             );
         }
 
+        // A rebase that produced a conflict still exits zero, so re-check the
+        // chain: pushing a conflicted chain would push broken commits and open a
+        // Pull Request over them.
+        if jj.has_conflict(&target.dir).unwrap_or_default() {
+            state.active = false;
+            state.reason = Some("working copy has conflicts".into());
+            publish_progress(tx, target, state, Some("working copy has conflicts".into()));
+            continue;
+        }
+
         state.set(Step::Push, Status::Running);
         publish_progress(tx, target, state, None);
-        let pushed = jj.push(&target.dir).unwrap_or_default();
-        if pushed {
-            succeed_step(tx, target, state, Step::Push);
-        } else {
-            skip_step(tx, target, state, Step::Push, "push: nothing to push");
+        let push = jj.push(&target.dir).unwrap_or_else(PushOutcome::Failed);
+        let push_failed = match push {
+            PushOutcome::Pushed => {
+                succeed_step(tx, target, state, Step::Push);
+                false
+            }
+            PushOutcome::Nothing => {
+                skip_step(tx, target, state, Step::Push, "push: nothing to push");
+                false
+            }
+            PushOutcome::Failed(detail) => {
+                let reason = if detail.is_empty() {
+                    "push: push failed".to_string()
+                } else {
+                    format!("push: {detail}")
+                };
+                skip_step(tx, target, state, Step::Push, &reason);
+                true
+            }
+        };
+        if push_failed {
+            // The remote was not updated; a Pull Request opened now would point
+            // at stale commits.
+            state.active = false;
+            let retained = (!state.clean_success()).then(|| state.clone());
+            let _ = tx.send(Update::Finished {
+                workspace: target.name.clone(),
+                progress: retained,
+            });
+            continue;
         }
 
         state.set(Step::PullRequest, Status::Running);
         publish_progress(tx, target, state, None);
         if config.pull_requests {
             let reason = match pull_request_context.as_ref() {
-                None => Some("pr: no origin remote".to_string()),
-                Some(context) => match jj.changes(&target.dir) {
+                Err(error) => Some(format!("pr: {error}")),
+                Ok(None) => Some("pr: no origin remote".to_string()),
+                Ok(Some(context)) => match jj.changes(&target.dir) {
                     Ok(changes) => {
                         match pull_requests::submit(context, changes, config.draft, github) {
                             pull_requests::Outcome::Did => None,
@@ -710,10 +764,25 @@ fn publish_progress(
     });
 }
 
-/// A push did real work only if it exited zero and did not report the jj no-op
-/// marker on either captured stream.
-fn pushed_something(ok: bool, stdout: &str, stderr: &str) -> bool {
-    ok && !stdout.contains(NOTHING_CHANGED) && !stderr.contains(NOTHING_CHANGED)
+/// Classifies one `jj git push` run.
+///
+/// A non-zero exit is a failure even when jj's output also mentions the no-op
+/// marker; only a zero exit with no marker counts as real work.
+fn push_outcome(run: &Run) -> PushOutcome {
+    if !run.ok() {
+        let stderr = run.stderr().trim();
+        let message = if stderr.is_empty() {
+            run.stdout().trim()
+        } else {
+            stderr
+        };
+        return PushOutcome::Failed(message.to_string());
+    }
+    if run.stdout().contains(NOTHING_CHANGED) || run.stderr().contains(NOTHING_CHANGED) {
+        PushOutcome::Nothing
+    } else {
+        PushOutcome::Pushed
+    }
 }
 
 #[cfg(test)]
@@ -733,8 +802,8 @@ mod tests {
             Ok(true)
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
-            Ok(true)
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
         }
     }
 
@@ -753,7 +822,7 @@ mod tests {
             panic!("weld must not run after fetch failure")
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
             panic!("push must not run after fetch failure")
         }
     }
@@ -773,7 +842,7 @@ mod tests {
             panic!("weld must not run while the signing key is locked")
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
             panic!("push must not run while the signing key is locked")
         }
     }
@@ -803,9 +872,9 @@ mod tests {
             Ok(true)
         }
 
-        fn push(&self, dir: &Path) -> Result<bool, String> {
+        fn push(&self, dir: &Path) -> Result<PushOutcome, String> {
             assert!(dir.ends_with("clean"));
-            Ok(true)
+            Ok(PushOutcome::Pushed)
         }
     }
 
@@ -820,8 +889,8 @@ mod tests {
             Ok(true)
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
-            Ok(false)
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Nothing)
         }
     }
 
@@ -836,8 +905,8 @@ mod tests {
             Ok(false)
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
-            Ok(true)
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
         }
     }
 
@@ -852,8 +921,8 @@ mod tests {
             Ok(true)
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
-            Ok(true)
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
         }
 
         fn origin_slug(&self) -> Result<Option<String>, String> {
@@ -897,8 +966,8 @@ mod tests {
             Ok(true)
         }
 
-        fn push(&self, _dir: &Path) -> Result<bool, String> {
-            Ok(true)
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
         }
 
         fn origin_slug(&self) -> Result<Option<String>, String> {
@@ -920,6 +989,67 @@ mod tests {
                     description: "Top change\n\nTop body\n".to_string(),
                 },
             ])
+        }
+    }
+
+    struct PushFails;
+
+    impl JjAdapter for PushFails {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Failed(
+                "remote rejected the update".to_string(),
+            ))
+        }
+    }
+
+    struct WeldIntroducesConflict {
+        welded: Mutex<bool>,
+    }
+
+    impl JjAdapter for WeldIntroducesConflict {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn has_conflict(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(*self.welded.lock().expect("weld flag is not poisoned"))
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            *self.welded.lock().expect("weld flag is not poisoned") = true;
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            panic!("a chain that weld left conflicted must not be pushed")
+        }
+    }
+
+    struct BrokenGitHub;
+
+    impl GitHubAdapter for BrokenGitHub {
+        fn default_branch(&self, _slug: &str) -> Result<String, String> {
+            Err("gh: not authenticated".to_string())
+        }
+
+        fn find(&self, _slug: &str, _head: &str) -> Result<Option<PullRequest>, String> {
+            panic!("a failed default-branch lookup must not query Pull Requests")
+        }
+
+        fn create(&self, _request: NewPullRequest) -> Result<PullRequest, String> {
+            panic!("a failed default-branch lookup must not create Pull Requests")
+        }
+
+        fn edit(&self, _slug: &str, _number: u64, _body: &str, _base: &str) -> Result<(), String> {
+            panic!("a failed default-branch lookup must not edit Pull Requests")
         }
     }
 
@@ -1346,6 +1476,130 @@ mod tests {
                 progress: Some(progress),
             }) if workspace == "feat"
                 && status(progress, Step::Push) == Status::Skipped
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_push_is_reported_and_does_not_open_a_pull_request() {
+        let forge = Forge::with_github(
+            ForgeConfig {
+                pull_requests: true,
+                draft: true,
+            },
+            Arc::new(PushFails),
+            Arc::new(UnlockedGpg),
+            Arc::new(RepositoryGitHub),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::Push) == Status::Skipped
+                && progress.reason() == Some("push: remote rejected the update")
+                && notice == "push: remote rejected the update"
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                workspace,
+                progress: Some(progress),
+            }) if workspace == "feat"
+                && status(progress, Step::Push) == Status::Skipped
+                && status(progress, Step::PullRequest) == Status::Pending
+        ));
+    }
+
+    #[tokio::test]
+    async fn conflict_introduced_by_weld_stops_the_pipeline_before_push() {
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            Arc::new(WeldIntroducesConflict {
+                welded: Mutex::new(false),
+            }),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && !progress.active()
+                && progress.reason() == Some("working copy has conflicts")
+                && notice == "working copy has conflicts"
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            }) if workspace == "feat"
+                && !progress.active()
+                && status(progress, Step::Weld) == Status::Ok
+                && status(progress, Step::Push) == Status::Pending
+                && status(progress, Step::PullRequest) == Status::Pending
+                && notice == "working copy has conflicts"
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_pull_request_context_is_reported_not_silently_skipped() {
+        let forge = Forge::with_github(
+            ForgeConfig {
+                pull_requests: true,
+                draft: true,
+            },
+            Arc::new(StackedChangesJj),
+            Arc::new(UnlockedGpg),
+            Arc::new(BrokenGitHub),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::PullRequest) == Status::Skipped
+                && progress.reason() == Some("pr: gh: not authenticated")
+                && notice == "pr: gh: not authenticated"
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                workspace,
+                progress: Some(progress),
+            }) if workspace == "feat"
+                && status(progress, Step::PullRequest) == Status::Skipped
         ));
     }
 
