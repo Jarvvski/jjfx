@@ -48,7 +48,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 |
 | D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 (fixed) |
 | D4 | dispatch | M | S | orchestration freezes occupancy exclusions for the whole run (violates ADR-0011) | 15 |
-| D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 |
+| D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 (fixed) |
 | I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 29 |
 | I3 | forge | M | S | conflict detection only inspects `@`; a lower-commit conflict welds and pushes | 10 (fixed) |
 | I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 (fixed) |
@@ -116,6 +116,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   **resolved** - resolution matches on the Ticket id.
 - [15](issues/15-live-occupancy-exclusions.md) - D4.
 - [16](issues/16-persist-group-before-reset.md) - D5.
+  **resolved** - persist-before-reset in the retry path.
 - [17](issues/17-move-blocking-work-off-ui-thread.md) - T1, T6.
 - [18](issues/18-help-overlay-in-detail-and-graph.md) - T2.
   **resolved** - overlay drawn over Detail/Graph.

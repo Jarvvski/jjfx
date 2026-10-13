@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A failed Dispatch Group retry now persists the group before
+  resetting the Worker, matching the Done path. A save conflict can no longer
+  leave a cleared Worker against a `dispatched` group, which made a restarted
+  parent unrecoverable with `WorkerTicketMismatch`. (fix)
+
 - 2026-10-13 - Forge no longer reports failures as clean skips: a failed
   `jj git push` fails the Push step (with jj's own message) instead of reading as
   "nothing to push", a weld that buries a conflict below `@` stops the pipeline

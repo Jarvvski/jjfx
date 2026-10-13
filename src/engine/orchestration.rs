@@ -463,7 +463,6 @@ fn run_with_execution<E: OrchestrationExecution>(
                 execution.reset_worker(&worker)?;
             }
             WorkerStatus::Failed if retries < 1 => {
-                execution.reset_worker(&worker)?;
                 let _retry_required = group.apply(DispatchGroupEvent::Failed {
                     ticket: ticket.clone(),
                     worker: worker.clone(),
@@ -474,6 +473,12 @@ fn run_with_execution<E: OrchestrationExecution>(
                     worker: worker.clone(),
                 })?;
                 revision = execution.save_group(&revision, &group)?;
+                // Persist before the side effect, like the Done path above: if
+                // this save conflicts, the Worker must still be bound to its
+                // Ticket, or a restart would fail reconciliation with a cleared
+                // Worker against a `dispatched` group and the parent could never
+                // be resumed.
+                execution.reset_worker(&worker)?;
                 observer(OrchestrationEvent::Retrying {
                     ticket,
                     worker,
@@ -1526,7 +1531,7 @@ mod tests {
     }
 
     #[test]
-    fn first_failed_run_resets_before_persisting_one_retry() {
+    fn first_failed_run_persists_one_retry_before_resetting_the_worker() {
         let request = OrchestrationRequest::new(
             TicketId::parse("ENG-100").expect("Parent Ticket"),
             AgentRuntime::Claude,
@@ -1541,8 +1546,8 @@ mod tests {
             execution.calls,
             vec![
                 "workers".to_owned(),
-                "reset:worker-01".to_owned(),
                 "save:r0:ENG-101:pending".to_owned(),
+                "reset:worker-01".to_owned(),
                 "claim:ENG-101".to_owned(),
             ]
         );
@@ -1563,7 +1568,42 @@ mod tests {
     }
 
     #[test]
-    fn reset_failure_leaves_the_first_failed_run_dispatched() {
+    fn retry_save_conflict_leaves_the_worker_bound_and_the_group_resumable() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::failed_attempt(0);
+        execution.fail_next_save();
+        let mut events = Vec::new();
+
+        let error = run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect_err("a stale retry write must stop the run");
+
+        assert!(matches!(error, OrchestrationError::ConcurrentChange { .. }));
+        // The Worker must not be reset before the group is durable: the group
+        // still says `dispatched` and the Worker still holds the Ticket, so a
+        // restart reconciles cleanly instead of hitting WorkerTicketMismatch.
+        assert_eq!(
+            execution.calls,
+            vec!["workers".to_owned(), "save:r0:ENG-101:pending".to_owned()]
+        );
+        assert_eq!(
+            execution
+                .group
+                .state()
+                .sub_issues
+                .get(&TicketId::parse("ENG-101").expect("Ticket"))
+                .expect("failed Ticket")
+                .status
+                .as_str(),
+            "dispatched"
+        );
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn reset_failure_after_a_durable_retry_stops_the_run() {
         let request = OrchestrationRequest::new(
             TicketId::parse("ENG-100").expect("Parent Ticket"),
             AgentRuntime::Claude,
@@ -1578,19 +1618,22 @@ mod tests {
         assert!(matches!(error, OrchestrationError::Execution(_)));
         assert_eq!(
             execution.calls,
-            vec!["workers".to_owned(), "reset:worker-01".to_owned()]
+            vec![
+                "workers".to_owned(),
+                "save:r0:ENG-101:pending".to_owned(),
+                "reset:worker-01".to_owned(),
+            ]
         );
-        assert_eq!(
-            execution
-                .group
-                .state()
-                .sub_issues
-                .get(&TicketId::parse("ENG-101").expect("Ticket"))
-                .expect("failed Ticket")
-                .status
-                .as_str(),
-            "dispatched"
-        );
+        // The retry is already durable, so a restart resumes from `pending`
+        // rather than failing reconciliation on a cleared Worker.
+        let issue = execution
+            .group
+            .state()
+            .sub_issues
+            .get(&TicketId::parse("ENG-101").expect("Ticket"))
+            .expect("failed Ticket");
+        assert_eq!(issue.status.as_str(), "pending");
+        assert_eq!(issue.retries, 1);
         assert!(events.is_empty());
     }
 
