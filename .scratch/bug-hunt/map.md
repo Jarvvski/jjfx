@@ -179,6 +179,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   helper-subprocess deadlines, found while landing 03/23/28.
   **ready-for-agent** - a red gate that isn't a regression; test infrastructure
   only, no product defect behind it.
+- [36](issues/36-fixed-sibling-paths-collide.md) - fixed sibling paths in
+  `store.rs` tests, found while landing 28.
+  **ready-for-agent** - the same class as 35 (the suite is not robust when the
+  machine is busy) but a different mechanism: isolation, not deadlines.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
