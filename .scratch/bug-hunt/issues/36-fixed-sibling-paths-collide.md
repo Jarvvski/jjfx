@@ -1,6 +1,6 @@
 # Fixed sibling paths collide across concurrent test runs
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -65,3 +65,26 @@ the same defect.
 ## Out of Scope
 
 - The deadline/flake class in ticket 35.
+
+## Outcome (2026-10-13)
+
+**Resolved.** `44b230` - `Isolate store test workspace siblings from the unique
+repo directory`.
+
+A `sibling(repo, tag)` test helper derives each workspace directory from the
+unique `test_local_repo` path (`<temp>/jjfx-store-{tag}-{pid}-{nonce}-{name}`),
+following the existing `app.rs:5507` shape. Assertions untouched - only the path
+became unique.
+
+Evidence: pre-fix, four concurrent suites over 12 rounds failed **39 of 48**
+invocations on exactly the two affected tests; post-fix, **132 invocations across
+three concurrency configurations failed 0**, including while pre-fix suites beside
+them were failing 16 of 30 - i.e. the old fixed paths were being actively clobbered
+at the same moment the new ones were not.
+
+Sweep: `with_file_name` has no other sites, and every other temp-dir helper
+(`ui_state.rs`, `events.rs`, `repo.rs`, `jj.rs`, `work.rs`, `engine/workspace.rs`)
+is already process-unique. A few rely on pid-only uniqueness (no nonce), which is
+safe for concurrent processes on one host.
+
+No changelog entry: test infrastructure, nothing user-visible.

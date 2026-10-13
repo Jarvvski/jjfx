@@ -145,6 +145,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   so TUI create, CLI add, and Worker provisioning agree; existing workspaces are
   cache-preserved and keep their real paths.
 - [24](issues/24-jj-lib-jj-version-compat-check.md) - version coupling.
+  **resolved** - a `jj` on `PATH` that differs from the `jj-lib` target is surfaced
+  (world graph, TUI footer, CLI stderr) instead of silently degrading; the target
+  is a source constant asserted against `Cargo.toml` by a test.
 - [25](issues/25-consolidate-state-write-and-lock-helpers.md) - one atomic
   write/lock helper.
   **resolved** - `engine/atomic.rs` holds `write_atomic_bytes` +
@@ -177,12 +180,16 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   Run result.
 - [35](issues/35-load-sensitive-helper-deadlines.md) - the test suite's fixed
   helper-subprocess deadlines, found while landing 03/23/28.
-  **ready-for-agent** - a red gate that isn't a regression; test infrastructure
-  only, no product defect behind it.
+  **resolved** - one shared `HELPER_LIVENESS_TIMEOUT` (120s) in
+  `tests/support/mod.rs`, documented as a hang guard; the helper exceeded the old
+  10s budget in 10 of 12 measured runs, so the budget was the defect, not the
+  code. No changelog entry: nothing user-visible.
 - [36](issues/36-fixed-sibling-paths-collide.md) - fixed sibling paths in
   `store.rs` tests, found while landing 28.
-  **ready-for-agent** - the same class as 35 (the suite is not robust when the
-  machine is busy) but a different mechanism: isolation, not deadlines.
+  **resolved** - siblings derive from the unique repo directory via a `sibling`
+  helper; 39/48 invocations failed pre-fix under concurrency, 132/132 passed
+  after. Same class as 35 but a different mechanism: isolation, not deadlines.
+  No changelog entry: nothing user-visible.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.

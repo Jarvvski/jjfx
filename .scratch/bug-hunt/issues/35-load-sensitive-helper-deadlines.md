@@ -1,6 +1,6 @@
 # Helper-subprocess deadlines in the test suite are load-sensitive
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -85,3 +85,27 @@ every site listed above, and `worker_pool.rs:108` (5s) guards the sibling
 
 - Product behaviour. This ticket changes test infrastructure only; the evidence
   above shows no product defect behind the timeouts.
+
+## Outcome (2026-10-13)
+
+**Resolved.** `24dcce` - `Share one liveness budget for helper-subprocess
+deadlines in tests`.
+
+Option 1: one `HELPER_LIVENESS_TIMEOUT = 120s` in the new `tests/support/mod.rs`,
+documented as a guard against a *hang* rather than a statement of expected
+duration, with the 1.3s-CPU-vs-7-48s-wall measurement inline so a future reader
+does not "tidy" it back down. Progress-based liveness (option 2) was rejected as
+plumbing across ~59 spawn sites for a benefit this load does not demand.
+
+Evidence: the named flaking test 12/12 green; direct measurement of its helper
+showed **10 of 12 runs exceeded the old 10s deadline**, so the old budget would
+have failed 10/12 - the budget was the defect, not the code. Forcing the constant
+to 1s fails the test in 1.02s, so the guard is still live rather than merely
+removed.
+
+Deliberately left alone: `ticket_discovery.rs`'s `TIMEOUT`/`BUDGET` are
+*behavioural assertions* (the product timeout under test, sized against a 30s
+sleeping helper), not liveness guards - raising them would have broken the
+`expect_err` the test exists to make.
+
+No changelog entry: test infrastructure, nothing user-visible.

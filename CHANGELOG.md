@@ -22,6 +22,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Added
 
+- 2026-10-13 - A `jj` on `PATH` whose major/minor differs from the `jj-lib`
+  version jjfx reads the store with is now reported instead of silently
+  degrading: a warning line atop the world graph, a TUI footer warning, and a
+  `warning:` on stderr for CLI repository commands. `jj-lib`'s target version is
+  pinned in source and asserted against `Cargo.toml` by a test, so the check
+  cannot rot when the dependency is bumped. (add)
+
 - Worker Dispatch keeps a Workspace that is open in a terminal out of Worker
   selection: an occupied Worker is no longer treated as idle, and Dispatch
   refuses it (implicit first-idle selection skips it, and an explicitly chosen
