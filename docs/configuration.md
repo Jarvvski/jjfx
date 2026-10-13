@@ -60,6 +60,14 @@ Where jjfx opens workspace session tabs and how it builds them.
 | `layouts` | `{}` | Named pane layouts a tab can use, keyed by name. See below. |
 | `layout_by_display` | unset | Which named layout to build for each display condition. See below. |
 
+`listen_on` is also how jjfx tells which Workspaces are open: Dispatch and `send`
+skip (or refuse) a Worker whose tab is open, because an open Workspace is not
+idle capacity. When the target cannot be queried - unset and no inherited
+`KITTY_LISTEN_ON`, or a configured socket that is not running - jjfx fails closed
+rather than guess, and names `--force` as the override. Point `listen_on` at the
+kitty that hosts your Workspaces so an agent or script dispatching from another
+terminal sees the same tabs you do.
+
 ### Named pane layouts
 
 A layout is an ordered plan of panes. The first entry is the tab's own window;

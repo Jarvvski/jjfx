@@ -22,6 +22,15 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Added
 
+- Worker Dispatch keeps a Workspace that is open in a terminal out of Worker
+  selection: an occupied Worker is no longer treated as idle, and Dispatch
+  refuses it (implicit first-idle selection skips it, and an explicitly chosen
+  occupied Worker is rejected). `jjfx dispatch` and `send` fail closed when they
+  cannot see the open tabs, and `--force` overrides the check. `review` is exempt
+  so a waiting Worker can still be told to address its pull request. The Pool
+  view marks open Workspaces and the Dispatch preview flags an open target, and
+  jjfx records the occupied Workers in `.jj/pool/in-use.json`. (add)
+
 ### Changed
 
 ### Fixed

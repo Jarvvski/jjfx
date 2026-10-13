@@ -7,10 +7,11 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError,
-    AgentRuntimeProfile, CompletedRun, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
-    DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
-    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketDetails, TicketId, TicketStatus,
-    TicketTitle, WorkerId, WorkerPoolError, WorkerWorkspaceError,
+    AgentRuntimeProfile, CompletedRun, DeliveryContract, DispatchBudget, DispatchExclusions,
+    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, Repository,
+    RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError, Ticket,
+    TicketDetails, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError,
+    WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -185,12 +186,25 @@ impl DirectDispatchRequest {
 #[derive(Debug, Clone)]
 pub struct DirectDispatch {
     repository: Repository,
+    exclusions: DispatchExclusions,
 }
 
 impl DirectDispatch {
     /// Opens Direct Dispatch for one Repository.
     pub fn new(repository: Repository) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            exclusions: DispatchExclusions::default(),
+        }
+    }
+
+    /// Excludes the given Worker Workspaces from selection for this operation.
+    ///
+    /// Frontends derive the set from live terminal state (open tabs); the
+    /// coordinator never inspects the terminal itself.
+    pub fn with_exclusions(mut self, exclusions: DispatchExclusions) -> Self {
+        self.exclusions = exclusions;
+        self
     }
 
     /// Reserves capacity for one request using its deterministic target.
@@ -210,6 +224,7 @@ impl DirectDispatch {
             worker,
             request.ticket().id().as_str(),
             profile,
+            &self.exclusions,
         )?)
     }
 
@@ -237,7 +252,10 @@ impl DirectDispatch {
                 )
             })
             .collect::<Vec<_>>();
-        let reservations = self.repository.worker_pool().reserve_targeted(&targets)?;
+        let reservations = self
+            .repository
+            .worker_pool()
+            .reserve_targeted(&targets, &self.exclusions)?;
         Ok(self.dispatch_claimed(
             requests,
             reservations.into_iter().enumerate().collect(),
@@ -271,10 +289,11 @@ impl DirectDispatch {
                 )
             })
             .collect::<Vec<_>>();
-        let reservations = self
-            .repository
-            .worker_pool()
-            .grow_and_reserve_targeted(&targets, approved_additional)?;
+        let reservations = self.repository.worker_pool().grow_and_reserve_targeted(
+            &targets,
+            approved_additional,
+            &self.exclusions,
+        )?;
         Ok(self.dispatch_claimed(
             requests,
             reservations.into_iter().enumerate().collect(),
@@ -310,7 +329,7 @@ impl DirectDispatch {
         let available = self
             .repository
             .worker_pool()
-            .reserve_available_targeted(&targets)?;
+            .reserve_available_targeted(&targets, &self.exclusions)?;
         let partial = !available.unavailable.is_empty();
         Ok(self.dispatch_claimed(requests, available.claimed, available.unavailable, partial))
     }

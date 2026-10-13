@@ -71,7 +71,13 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         args.first().map(String::as_str),
         Some("help" | "-h" | "--help")
     ) {
-        return cli::run(args, launch, terminal_settings, colocate_setting);
+        return cli::run(
+            args,
+            launch,
+            terminal_settings,
+            colocate_setting,
+            open_workspaces,
+        );
     }
 
     // `jjfx hooks [install|status]` is global - it manages ~/.claude/settings.json
@@ -89,6 +95,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             launch,
             terminal_settings,
             colocate_setting,
+            open_workspaces,
         );
     }
     if args.first().map(String::as_str) == Some("tui") {
@@ -119,7 +126,13 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    cli::run(args, launch, terminal_settings, colocate_setting)
+    cli::run(
+        args,
+        launch,
+        terminal_settings,
+        colocate_setting,
+        open_workspaces,
+    )
 }
 
 /// Resolve the terminal settings a `mount` invocation needs: the first-pane
@@ -138,6 +151,24 @@ pub fn terminal_settings() -> anyhow::Result<crate::engine::TerminalSettings> {
         first_pane_command: config.first_pane_command(),
         layout,
     })
+}
+
+/// Lists the workspace tabs currently open in the terminal jjfx drives.
+///
+/// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so
+/// `dispatch` can keep a Workspace that is open in a terminal out of Worker
+/// selection. It is loaded lazily - only a `dispatch` invocation reads jjfx's
+/// config file - and fails when the terminal cannot be queried, so the caller
+/// can fail closed.
+pub fn open_workspaces() -> anyhow::Result<std::collections::BTreeSet<String>> {
+    use crate::terminal::Terminal as _;
+    let config = config::load()?;
+    let terminal = terminal::KittyTerminal::new(
+        &config.terminal,
+        config.agent_command(),
+        config.first_pane_command(),
+    );
+    terminal.open_workspaces()
 }
 
 /// The `colocate` setting the CLI uses when creating workspaces. Read lazily -

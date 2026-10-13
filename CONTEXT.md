@@ -125,6 +125,18 @@ The execution-capacity lifecycle of a Worker: **idle** (available), **busy**
 before capacity is available again. Separate from the Agent and Work lifecycles.
 _Avoid_: worker state
 
+**Occupied**:
+A Worker Workspace that is currently open in a terminal. An Occupied Worker is
+not idle capacity for Dispatch even when its Worker Status is idle. Recorded in
+jjfx's durable in-use marker and reconciled against the terminal's open tabs.
+_Avoid_: in-use (for the state), attached, mounted (a Mount is one way to occupy)
+
+**Dispatch Eligibility**:
+Whether a Worker may be selected for a new Run: a Pool member whose Worker
+Status is idle and that is not Occupied. Only Pool Workspaces are ever
+dispatch-eligible.
+_Avoid_: availability, dispatchable
+
 **Run**:
 One execution attempt by an Agent Runtime in a Worker Workspace. A Run is
 shorter-lived than an Agent Session, which may continue across Runs.

@@ -354,7 +354,9 @@ impl App {
     ) -> Self {
         let dispatch_tx = tx.clone();
         let dispatch = WorkspaceDispatchController::new(
-            RealWorkspaceDispatch::new(store.repo_root()).with_colocate(store.colocate()),
+            RealWorkspaceDispatch::new(store.repo_root())
+                .with_colocate(store.colocate())
+                .with_terminal(Arc::clone(&terminal)),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
             },
@@ -957,6 +959,11 @@ impl App {
                         self.mode = Mode::Pool(PoolMode::View {
                             selected: Some(worker),
                         });
+                    } else if self.worker_is_occupied(&worker) {
+                        self.set_status("Worker is open; Send is unavailable".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View {
+                            selected: Some(worker),
+                        });
                     } else {
                         self.mode = Mode::Pool(PoolMode::SendInput {
                             worker: Some(worker.clone()),
@@ -966,7 +973,7 @@ impl App {
                     }
                 }
                 KeyCode::Char('S') => {
-                    if self.has_idle_worker() {
+                    if self.has_eligible_worker() {
                         self.mode = Mode::Pool(PoolMode::SendInput {
                             worker: None,
                             selected,
@@ -1180,9 +1187,11 @@ impl App {
                     } else if tickets.len() == 1
                         && selected
                             .as_deref()
-                            .is_none_or(|worker| !self.worker_is_idle(worker))
+                            .is_none_or(|worker| !self.worker_is_eligible(worker))
                     {
-                        self.set_status("Select an idle Worker before Dispatch".to_string());
+                        self.set_status(
+                            "Select an idle, non-open Worker before Dispatch".to_string(),
+                        );
                         self.mode = Mode::Pool(PoolMode::TicketInput { buffer, selected });
                     } else {
                         self.mode = Mode::Pool(PoolMode::DispatchPreview { tickets, selected });
@@ -1269,12 +1278,12 @@ impl App {
             .is_some_and(|worker| worker.status() != WorkerStatus::Busy)
     }
 
-    fn has_idle_worker(&self) -> bool {
+    fn has_eligible_worker(&self) -> bool {
         self.pool.worker_pool.as_ref().is_some_and(|snapshot| {
-            snapshot
-                .workers()
-                .iter()
-                .any(|worker| worker.status() == WorkerStatus::Idle)
+            snapshot.workers().iter().any(|worker| {
+                worker.status() == WorkerStatus::Idle
+                    && !snapshot.is_occupied(worker.worker_id().as_str())
+            })
         })
     }
 
@@ -1514,6 +1523,19 @@ impl App {
                     .find(|worker| worker.worker_id().as_str() == worker_id)
             })
             .is_some_and(|worker| worker.status() == WorkerStatus::Idle)
+    }
+
+    /// Whether a Worker is open in a terminal, so not eligible capacity.
+    fn worker_is_occupied(&self, worker_id: &str) -> bool {
+        self.pool
+            .worker_pool
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.is_occupied(worker_id))
+    }
+
+    /// Whether a Worker is idle and not open in a terminal.
+    fn worker_is_eligible(&self, worker_id: &str) -> bool {
+        self.worker_is_idle(worker_id) && !self.worker_is_occupied(worker_id)
     }
 
     fn pool_worker_after(&self, selected: Option<&str>, delta: isize) -> Option<String> {
@@ -2545,11 +2567,18 @@ mod tests {
         closed: Arc<Mutex<Vec<String>>>,
         existing: Arc<Mutex<Vec<String>>>,
         open_error: Arc<Mutex<Option<String>>>,
+        query_error: Arc<Mutex<Option<String>>>,
     }
 
     impl Terminal for FakeTerminal {
         fn is_open(&self, name: &str) -> bool {
             self.existing.lock().unwrap().iter().any(|n| n == name)
+        }
+        fn open_workspaces(&self) -> anyhow::Result<std::collections::BTreeSet<String>> {
+            if let Some(error) = self.query_error.lock().unwrap().clone() {
+                anyhow::bail!(error);
+            }
+            Ok(self.existing.lock().unwrap().iter().cloned().collect())
         }
         fn open(&self, name: &str, _path: &Path, focus: bool) -> anyhow::Result<()> {
             self.opened.lock().unwrap().push((name.to_string(), focus));
@@ -3286,6 +3315,76 @@ mod tests {
         app.handle(press(KeyCode::Esc));
         assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
         assert_eq!(app.pool.active_operation, None);
+    }
+
+    /// A one-Worker Pool whose only Worker is recorded as open in a terminal.
+    fn occupied_pool_snapshot() -> crate::engine::WorkerPoolSnapshot {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let repository = crate::engine::Repository::open(temp.path()).unwrap();
+        repository
+            .state_store()
+            .in_use()
+            .mark(&crate::engine::WorkerId::parse("worker-01").unwrap())
+            .unwrap();
+        repository.read_worker_pool_snapshot()
+    }
+
+    #[test]
+    fn an_open_worker_is_not_eligible_for_dispatch() {
+        let mut app = app_with(&["default", "worker-01"]);
+        app.pool.worker_pool = Some(occupied_pool_snapshot());
+
+        // Idle capacity is recorded, but the open Workspace is not eligible.
+        assert!(app.worker_is_idle("worker-01"));
+        assert!(app.worker_is_occupied("worker-01"));
+        assert!(!app.worker_is_eligible("worker-01"));
+        assert!(!app.has_eligible_worker());
+
+        // A single-Ticket Dispatch targeting the open Worker is refused before
+        // the preview.
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+        app.handle(press(KeyCode::Char('d')));
+        for character in "ENG-1".chars() {
+            app.handle(press(KeyCode::Char(character)));
+        }
+        app.handle(press(KeyCode::Enter));
+
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::TicketInput { .. })));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Select an idle, non-open Worker before Dispatch")
+        );
+    }
+
+    #[test]
+    fn an_open_worker_refuses_send() {
+        let mut app = app_with(&["default", "worker-01"]);
+        app.pool.worker_pool = Some(occupied_pool_snapshot());
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        app.handle(press(KeyCode::Char('s')));
+
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("Worker is open; Send is unavailable")
+        );
     }
 
     #[test]

@@ -13,6 +13,7 @@ fn main() {
         jjfx::launch,
         jjfx::terminal_settings,
         jjfx::colocate_setting,
+        jjfx::open_workspaces,
     );
     if let Err(error) = result {
         eprintln!("{error}");

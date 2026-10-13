@@ -64,6 +64,12 @@ jjfx dispatch AMBA-42      # hand a ticket to an idle Worker
 jjfx status                # WORKER  NAME  STATUS  TICKET  ELAPSED
 ```
 
+jjfx will not dispatch into a Workspace you have open in a terminal - an open
+Worker is not idle capacity, so it is skipped (or refused, if you name it). When
+jjfx cannot see the terminal at all (a headless or off-kitty run) it fails closed
+rather than risk a collision; add `--force` to dispatch anyway. `send` follows
+the same rule; `review` is exempt.
+
 Run `jjfx colocation enable` first so every Worker gets a working `.git`, which
 tools such as `gh stack` need.
 

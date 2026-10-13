@@ -53,6 +53,9 @@ Dispatch runs **in the background** by default; `--fg` runs it in the foreground
 | `--provider P` / `--model M` | Override the pool profile for this dispatch |
 | `--budget <usd>` | Cap spend for this dispatch (Pi rejects it) |
 | `--no-orchestrate` | Dispatch each ticket directly, skipping Parent orchestration |
+| `--force` | Dispatch even to a Worker whose Workspace is open (see below) |
+
+**jjfx will not dispatch into a Workspace you have open in a terminal.** A Worker whose tab is open is not idle capacity, so jjfx skips it (implicit selection) or refuses it (an explicit Worker). When jjfx cannot see the terminal at all - a headless or off-kitty run - it cannot tell which Workspaces are open and **fails closed**, printing a message that names `--force`. Add `--force` to dispatch anyway. An agent running inside the terminal jjfx drives (or with `terminal.listen_on` configured) sees the open tabs, so it needs no flag and will correctly leave your open Workspaces alone.
 
 A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues as a Dispatch Group in dependency order and reports each one's progress, rather than handing the Parent itself to one Worker.
 
@@ -79,6 +82,8 @@ jjfx review worker-01                             # address its PR review commen
 jjfx mount worker-01                              # open the Worker in kitty (m)
 ```
 
+`send` obeys the same rule as Dispatch: it refuses a Worker whose Workspace is open, and fails closed when jjfx cannot see the terminal (add `--force`). `review` is exempt - it is how you tell a waiting Worker to address its pull request - so it works even while its Workspace is open.
+
 **Done when** the follow-up Run finishes and the Worker is `idle` or `done` again.
 
 ### 6. Land
@@ -104,5 +109,6 @@ jjfx pool destroy          # tear down the pool
 
 - **Dispatch real tickets.** Never invent an id; jjfx reads the Parent's sub-issues and each Worker's ticket back from the tracker.
 - **Never merge.** Dispatch produces pull requests; landing them is the user's call.
+- **Leave open Workspaces alone.** jjfx will not dispatch to (or `send` into) a Workspace that is open in a terminal. If a headless run reports it cannot see the terminal, re-run with `--force`; otherwise do not force past a Workspace a human is using.
 - **Set the runtime deliberately.** The pool profile is repository state that survives a restart — set it with `jjfx pool profile`, not per dispatch, unless the user asks for a one-off `--provider`/`--model` override.
 - **Pi is stricter.** Pi rejects `--budget` and needs the pinned adapter plus a Linear MCP server; its setup failures are reported as errors, never a fallback to another runtime. The jjfx repo documents the Pi specifics in `docs/pi-workers.md`.

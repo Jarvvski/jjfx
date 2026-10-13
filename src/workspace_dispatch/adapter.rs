@@ -8,6 +8,8 @@
 
 use super::*;
 
+use crate::engine::DispatchExclusions;
+
 /// The blocking port behind the controller seam: one capability surface the
 /// controller runs off the App task. Production fills it with
 /// [`RealWorkspaceDispatch`]; tests substitute a recording adapter.
@@ -94,11 +96,25 @@ fn orchestration_notice(event: &crate::engine::OrchestrationEvent) -> Option<Str
 }
 
 /// The production adapter over the shared Repository-owned Pool module.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct RealWorkspaceDispatch {
     repository_root: PathBuf,
     /// Whether new Workspaces are colocated with Git (jjfx's `colocate`).
     colocate: bool,
+    /// The multiplexer jjfx drives, used to keep Workspaces that are open in a
+    /// terminal out of Worker selection. `None` (tests) excludes nothing.
+    terminal: Option<std::sync::Arc<dyn crate::terminal::Terminal>>,
+}
+
+impl std::fmt::Debug for RealWorkspaceDispatch {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RealWorkspaceDispatch")
+            .field("repository_root", &self.repository_root)
+            .field("colocate", &self.colocate)
+            .field("terminal", &self.terminal.is_some())
+            .finish()
+    }
 }
 
 fn configured_ticket_query(
@@ -127,6 +143,7 @@ impl RealWorkspaceDispatch {
         Self {
             repository_root: repository_root.into(),
             colocate: true,
+            terminal: None,
         }
     }
 
@@ -134,6 +151,36 @@ impl RealWorkspaceDispatch {
     pub fn with_colocate(mut self, colocate: bool) -> Self {
         self.colocate = colocate;
         self
+    }
+
+    /// Supplies the multiplexer used to detect Workspaces open in a terminal.
+    pub fn with_terminal(
+        mut self,
+        terminal: std::sync::Arc<dyn crate::terminal::Terminal>,
+    ) -> Self {
+        self.terminal = Some(terminal);
+        self
+    }
+
+    /// The Workers excluded from Dispatch because their Workspace is open.
+    ///
+    /// Fails closed when the terminal cannot be queried: with no way to tell
+    /// which Workspaces are open, Dispatch is refused rather than risking a
+    /// collision with a human. A test adapter with no terminal excludes nothing.
+    fn exclusions(
+        &self,
+        repository: &crate::engine::Repository,
+    ) -> Result<DispatchExclusions, String> {
+        let Some(terminal) = self.terminal.as_ref() else {
+            return Ok(DispatchExclusions::default());
+        };
+        let open = terminal.open_workspaces().map_err(|error| {
+            format!(
+                "cannot determine which Worker Workspaces are open ({error}); \
+                     refusing to dispatch"
+            )
+        })?;
+        Ok(crate::engine::reconcile_occupancy(repository, &open))
     }
 
     fn repository(&self) -> Result<crate::engine::Repository, String> {
@@ -149,6 +196,9 @@ impl RealWorkspaceDispatch {
         strategy: DispatchStrategy,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
         let repository = self.repository().map_err(WorkspaceDispatchError::Failed)?;
+        let exclusions = self
+            .exclusions(&repository)
+            .map_err(WorkspaceDispatchError::Failed)?;
         let snapshot = repository.worker_pool().snapshot();
         let profile = snapshot
             .pool()
@@ -173,7 +223,7 @@ impl RealWorkspaceDispatch {
                 })
             })
             .collect::<Result<Vec<_>, WorkspaceDispatchError>>()?;
-        let dispatcher = repository.direct_dispatch();
+        let dispatcher = repository.direct_dispatch().with_exclusions(exclusions);
         let result = match strategy {
             DispatchStrategy::Complete => dispatcher.dispatch(&requests),
             DispatchStrategy::ApprovedGrowth(additional) => {
@@ -236,7 +286,16 @@ impl RealWorkspaceDispatch {
             .map(|worker| WorkerId::parse(worker.to_owned()))
             .transpose()
             .map_err(|error| error.to_string())?;
-        let actions = crate::engine::WorkerActions::new(repository);
+        let actions = match action {
+            // A follow-up prompt must not be injected into a Workspace a human
+            // is sitting in. `review` is exempt: it is how a waiting Worker is
+            // told to address its pull request.
+            WorkerActionKind::Send => {
+                let exclusions = self.exclusions(&repository)?;
+                crate::engine::WorkerActions::new(repository).with_exclusions(exclusions)
+            }
+            WorkerActionKind::Review => crate::engine::WorkerActions::new(repository),
+        };
         let outcome = match action {
             WorkerActionKind::Send => {
                 let prompt = prompt.ok_or_else(|| "Send prompt cannot be missing".to_owned())?;
@@ -277,7 +336,16 @@ impl RealWorkspaceDispatch {
 
 impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     fn refresh(&self) -> Result<WorkerPoolSnapshot, String> {
-        Ok(self.repository()?.worker_pool().reconcile_runs())
+        let repository = self.repository()?;
+        // Refresh the durable in-use marker from the live terminal so the Pool
+        // view reflects which Workspaces are open. Best effort: a failed query
+        // leaves the marker as it was rather than failing the refresh.
+        if let Some(terminal) = self.terminal.as_ref()
+            && let Ok(open) = terminal.open_workspaces()
+        {
+            let _ = crate::engine::reconcile_occupancy(&repository, &open);
+        }
+        Ok(repository.worker_pool().reconcile_runs())
     }
 
     fn resize(&self, capacity: usize) -> Result<PoolMutationResult, String> {
@@ -343,6 +411,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
     ) -> Result<(), String> {
         let repository = self.repository()?;
+        let exclusions = self.exclusions(&repository)?;
         let id = TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?;
         let pool = repository.worker_pool().snapshot();
         let profile = pool.pool().and_then(|pool| pool.profile()).cloned();
@@ -363,7 +432,9 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .clone();
         let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
         let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
-        let runner = repository.orchestration_runner();
+        let runner = repository
+            .orchestration_runner()
+            .with_exclusions(exclusions);
         let preparation = runner
             .prepare(&request, &parent_ticket, &discovery)
             .map_err(|error| error.to_string())?;

@@ -6,7 +6,10 @@ use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use jjfx::engine::{AgentRuntime, Repository, SnapshotDiagnosticKind, WorkerStatus};
+use jjfx::engine::{
+    AgentRuntime, DirectDispatchError, DirectDispatchRequest, DispatchExclusions, Repository,
+    RunMode, SnapshotDiagnosticKind, TicketId, WorkerId, WorkerPoolError, WorkerStatus,
+};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -2009,4 +2012,79 @@ fn worker_without_agent_remains_readable() {
         .cloned()
         .expect("legacy Worker");
     assert_eq!(worker.agent_runtime(), None);
+}
+
+#[test]
+fn reserve_refuses_a_worker_excluded_as_occupied() {
+    let (_temp, repository) = repository_with_pool();
+    let exclusions = DispatchExclusions::new([WorkerId::parse("worker-01").expect("worker id")]);
+    let dispatcher = repository.direct_dispatch().with_exclusions(exclusions);
+    let request = DirectDispatchRequest::for_ticket_id(
+        TicketId::parse("ENG-1").expect("ticket id"),
+        RunMode::Background,
+    )
+    .expect("request")
+    .to_worker(WorkerId::parse("worker-01").expect("worker id"));
+
+    let error = dispatcher
+        .reserve(&request)
+        .expect_err("an occupied Worker is refused");
+    assert!(matches!(
+        error,
+        DirectDispatchError::WorkerPool(WorkerPoolError::WorkerNotEligible { .. })
+    ));
+}
+
+#[test]
+fn dispatch_reports_capacity_when_the_only_idle_worker_is_excluded() {
+    let (_temp, repository) = repository_with_pool();
+    let exclusions = DispatchExclusions::new([WorkerId::parse("worker-01").expect("worker id")]);
+    let dispatcher = repository.direct_dispatch().with_exclusions(exclusions);
+    let request = DirectDispatchRequest::for_ticket_id(
+        TicketId::parse("ENG-2").expect("ticket id"),
+        RunMode::Background,
+    )
+    .expect("request");
+
+    let error = dispatcher
+        .dispatch(&[request])
+        .expect_err("no eligible idle Worker");
+    assert!(matches!(
+        error,
+        DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(_))
+    ));
+}
+
+#[test]
+fn occupancy_marker_round_trips_through_the_state_store() {
+    let (_temp, repository) = repository_with_pool();
+    let in_use = repository.state_store().in_use();
+    let worker = WorkerId::parse("worker-01").expect("worker id");
+
+    assert!(in_use.marked().expect("marked").is_empty());
+    in_use.mark(&worker).expect("mark occupied");
+    assert!(in_use.marked().expect("marked").contains(&worker));
+    in_use.clear(&worker).expect("clear occupied");
+    assert!(in_use.marked().expect("marked").is_empty());
+}
+
+#[test]
+fn reconcile_occupancy_excludes_only_open_pool_members() {
+    use std::collections::BTreeSet;
+
+    let (_temp, repository) = repository_with_pool();
+    let open = BTreeSet::from(["worker-01".to_owned(), "unrelated".to_owned()]);
+
+    let exclusions = jjfx::engine::reconcile_occupancy(&repository, &open);
+
+    assert!(exclusions.contains(&WorkerId::parse("worker-01").expect("worker id")));
+    // A pool member that is not open stays eligible.
+    assert!(!exclusions.contains(&WorkerId::parse("worker-02").expect("worker id")));
+    // A non-member is never excluded, however it is titled.
+    assert!(!exclusions.contains(&WorkerId::parse("unrelated").expect("worker id")));
+    // The durable marker is reconciled to what was observed.
+    assert_eq!(
+        repository.state_store().in_use().marked().expect("marked"),
+        BTreeSet::from([WorkerId::parse("worker-01").expect("worker id")])
+    );
 }

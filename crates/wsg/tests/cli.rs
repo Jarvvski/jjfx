@@ -159,7 +159,7 @@ fn pi_dispatch_all_reports_missing_helper_without_reserving_a_worker() {
     set_pool_runtime(&repository, AgentRuntime::Pi);
 
     let output = Command::new(binary)
-        .args(["dispatch", "--all"])
+        .args(["dispatch", "--all", "--force"])
         .current_dir(directory.path())
         .env("JJFX_PI_LINEAR_HELPER", "")
         .output()
@@ -196,7 +196,7 @@ fn pi_dispatch_all_uses_the_configured_discovery_helper_before_reservation() {
     );
 
     let output = Command::new(binary)
-        .args(["dispatch", "--all"])
+        .args(["dispatch", "--all", "--force"])
         .current_dir(directory.path())
         .env("JJFX_PI_LINEAR_HELPER", &helper)
         .output()
@@ -750,4 +750,40 @@ fn no_arguments_report_read_only_pool_capabilities_inside_a_repository() {
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("wsg dispatch"));
     assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn dispatch_fails_closed_when_the_terminal_cannot_be_queried() {
+    let binary = env!("CARGO_BIN_EXE_wsg");
+    let directory = local_repository();
+    // An empty config home means no `terminal.listen_on`, so the only terminal
+    // jjfx could query is the inherited KITTY_LISTEN_ON - which we remove.
+    let config_home = tempfile::tempdir().expect("config home");
+
+    let output = Command::new(binary)
+        .args(["dispatch", "ENG-1", "--no-orchestrate"])
+        .current_dir(directory.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        // With no terminal to query, jjfx cannot tell which Worker Workspaces are
+        // open, so Dispatch must refuse rather than risk a collision.
+        .env_remove("KITTY_LISTEN_ON")
+        .output()
+        .expect("wsg should run");
+
+    assert!(!output.status.success());
+    let diagnostic = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        diagnostic.contains("--force"),
+        "fail-closed Dispatch should point at --force: {diagnostic}"
+    );
+
+    // --force skips the query, so the fail-closed diagnostic is gone.
+    let forced = Command::new(binary)
+        .args(["dispatch", "ENG-1", "--no-orchestrate", "--force"])
+        .current_dir(directory.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .env_remove("KITTY_LISTEN_ON")
+        .output()
+        .expect("wsg should run");
+    assert!(!String::from_utf8_lossy(&forced.stderr).contains("--force to dispatch anyway"));
 }

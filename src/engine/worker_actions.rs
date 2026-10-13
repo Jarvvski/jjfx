@@ -14,8 +14,8 @@ use crate::engine::runtime::pi_interactive_command;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, Repository, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
-    WorkerStatus, resolve_agent_session_for_runtime,
+    CompletedRun, DispatchExclusions, Repository, RunLog, RunSupervisor, RunSupervisorError,
+    WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -232,6 +232,7 @@ pub struct WorkerActions {
     model: Option<AgentModel>,
     first_pane_command: Vec<String>,
     layout: PaneLayout,
+    exclusions: DispatchExclusions,
 }
 
 impl WorkerActions {
@@ -244,7 +245,18 @@ impl WorkerActions {
             model: None,
             first_pane_command: Vec::new(),
             layout: PaneLayout::builtin(),
+            exclusions: DispatchExclusions::default(),
         }
+    }
+
+    /// Excludes the given Worker Workspaces from Follow-up selection.
+    ///
+    /// A Worker whose Workspace is open in a terminal is not a valid target for
+    /// `send`; `review` deliberately ignores this so a waiting Worker can still
+    /// be told to address its pull request.
+    pub fn with_exclusions(mut self, exclusions: DispatchExclusions) -> Self {
+        self.exclusions = exclusions;
+        self
     }
 
     /// Supplies the provider-aware model profile used by Worker actions.
@@ -282,6 +294,12 @@ impl WorkerActions {
         prompt: impl Into<String>,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
+        if self.exclusions.contains(worker) {
+            return Err(WorkerPoolError::WorkerNotEligible {
+                worker: worker.clone(),
+            }
+            .into());
+        }
         let prompt = prompt.into();
         self.follow_up(
             worker,
@@ -304,6 +322,7 @@ impl WorkerActions {
             .iter()
             .filter(|worker| worker.status() == WorkerStatus::Idle)
             .map(|worker| worker.worker_id().clone())
+            .filter(|worker| !self.exclusions.contains(worker))
             .collect::<Vec<_>>();
         let system_prompt = send_system_prompt(&repository_slug(&self.repository));
 
@@ -420,6 +439,9 @@ impl WorkerActions {
             &self.first_pane_command,
             &self.layout,
         )?;
+        // Record the Worker as occupied so Dispatch treats its open tab as
+        // unavailable. Best-effort: a failed marker write must not fail Mount.
+        let _ = self.repository.state_store().in_use().mark(worker);
         Ok(MountOutcome {
             runtime,
             session,

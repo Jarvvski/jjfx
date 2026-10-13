@@ -17,12 +17,13 @@ use thiserror::Error;
 use crate::engine::pool::current_timestamp;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
-    DirectDispatchRequest, DirectDispatchSuccess, DispatchGroup, DispatchGroupBuildOptions,
-    DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions, DispatchGroupProgress,
-    DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded, ParentTicket, Repository,
-    RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket,
-    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent,
-    WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    DirectDispatchRequest, DirectDispatchSuccess, DispatchExclusions, DispatchGroup,
+    DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions,
+    DispatchGroupProgress, DispatchGroupState, DispatchGroupStatusCounts, Expected, Loaded,
+    ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision,
+    SubIssueStatus, Ticket, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
+    TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
+    WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -648,11 +649,15 @@ fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
 
 struct LiveExecution {
     repository: Repository,
+    exclusions: DispatchExclusions,
 }
 
 impl LiveExecution {
-    fn new(repository: Repository) -> Self {
-        Self { repository }
+    fn new(repository: Repository, exclusions: DispatchExclusions) -> Self {
+        Self {
+            repository,
+            exclusions,
+        }
     }
 }
 
@@ -748,7 +753,12 @@ impl OrchestrationExecution for LiveExecution {
         &mut self,
         request: &DirectDispatchRequest,
     ) -> Result<Option<Self::Claim>, OrchestrationError> {
-        match self.repository.direct_dispatch().reserve(request) {
+        match self
+            .repository
+            .direct_dispatch()
+            .with_exclusions(self.exclusions.clone())
+            .reserve(request)
+        {
             Ok(claim) => Ok(Some(claim)),
             Err(DirectDispatchError::WorkerPool(
                 WorkerPoolError::NoIdleWorkers { .. } | WorkerPoolError::CapacityShortage(_),
@@ -791,11 +801,21 @@ impl OrchestrationExecution for LiveExecution {
 #[derive(Debug, Clone)]
 pub struct OrchestrationRunner {
     repository: Repository,
+    exclusions: DispatchExclusions,
 }
 
 impl OrchestrationRunner {
     pub(crate) fn new(repository: Repository) -> Self {
-        Self { repository }
+        Self {
+            repository,
+            exclusions: DispatchExclusions::default(),
+        }
+    }
+
+    /// Excludes the given Worker Workspaces from first-idle selection.
+    pub fn with_exclusions(mut self, exclusions: DispatchExclusions) -> Self {
+        self.exclusions = exclusions;
+        self
     }
 
     /// Returns the Repository root owned by this runner.
@@ -847,7 +867,12 @@ impl OrchestrationRunner {
             Some(details) => placeholder.with_ticket_details(details.clone()),
             None => placeholder,
         };
-        let reservation = match self.repository.direct_dispatch().reserve(&placeholder) {
+        let reservation = match self
+            .repository
+            .direct_dispatch()
+            .with_exclusions(self.exclusions.clone())
+            .reserve(&placeholder)
+        {
             Ok(reservation) => reservation,
             Err(error) => return Err(OrchestrationError::Execution(error.to_string())),
         };
@@ -980,7 +1005,7 @@ impl OrchestrationRunner {
         request: &OrchestrationRequest,
         observer: &mut impl FnMut(OrchestrationEvent),
     ) -> Result<Option<OrchestrationSummary>, OrchestrationError> {
-        let mut execution = LiveExecution::new(self.repository.clone());
+        let mut execution = LiveExecution::new(self.repository.clone(), self.exclusions.clone());
         run_with_execution(request, &mut execution, observer)?;
         let loaded = execution.load_group(request.parent())?;
         if loaded.group.is_terminal() {
@@ -1030,7 +1055,7 @@ impl OrchestrationRunner {
         mut observer: impl FnMut(OrchestrationEvent),
     ) -> Result<OrchestrationSummary, OrchestrationError> {
         let _lock = self.acquire_lock(request.parent())?;
-        let mut execution = LiveExecution::new(self.repository.clone());
+        let mut execution = LiveExecution::new(self.repository.clone(), self.exclusions.clone());
         execution.load_group(request.parent())?;
         observer(OrchestrationEvent::Started {
             parent: request.parent().clone(),

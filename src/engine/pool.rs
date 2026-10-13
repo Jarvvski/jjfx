@@ -9,9 +9,9 @@ use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 use thiserror::Error;
 
 use crate::engine::{
-    AgentRuntime, AgentRuntimeProfile, CommitOutcome, Expected, Loaded, PoolState, Repository,
-    RunConclusion, RunResult, StateChange, StateError, StateRevision, WireStatus, WireTimestamp,
-    WorkerId, WorkerState, WorkerWorkspaceError,
+    AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
+    PoolState, Repository, RunConclusion, RunResult, StateChange, StateError, StateRevision,
+    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -269,6 +269,8 @@ pub enum WorkerPoolError {
     WorkerNotInPool { worker: WorkerId },
     #[error("Worker {worker} is not idle")]
     WorkerNotIdle { worker: WorkerId },
+    #[error("Worker {worker} is open in a terminal and not eligible for Dispatch")]
+    WorkerNotEligible { worker: WorkerId },
     #[error("Worker {worker} state is missing")]
     WorkerStateMissing { worker: WorkerId },
     #[error("Worker {worker} changed before its Reservation could be released")]
@@ -539,7 +541,7 @@ impl WorkerPool {
 
     /// Reserves the first idle Worker for `ticket` in pool order.
     pub fn reserve(&self, ticket: impl Into<String>) -> Result<Reservation, WorkerPoolError> {
-        self.reserve_inner(None, ticket.into(), None)
+        self.reserve_inner(None, ticket.into(), None, &DispatchExclusions::default())
     }
 
     pub(crate) fn reserve_profiled(
@@ -547,8 +549,9 @@ impl WorkerPool {
         requested: Option<WorkerId>,
         ticket: impl Into<String>,
         profile: AgentRuntimeProfile,
+        excluded: &DispatchExclusions,
     ) -> Result<Reservation, WorkerPoolError> {
-        self.reserve_inner(requested, ticket.into(), Some(profile))
+        self.reserve_inner(requested, ticket.into(), Some(profile), excluded)
     }
 
     /// Atomically reserves one idle Worker per Ticket in input order.
@@ -563,12 +566,13 @@ impl WorkerPool {
             .iter()
             .map(|ticket| (ticket.as_ref().to_owned(), None, None))
             .collect::<Vec<_>>();
-        self.reserve_targeted(&requests)
+        self.reserve_targeted(&requests, &DispatchExclusions::default())
     }
 
     pub(crate) fn reserve_targeted(
         &self,
         requests: &[(String, Option<WorkerId>, Option<AgentRuntimeProfile>)],
+        excluded: &DispatchExclusions,
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
         let inputs = requests
             .iter()
@@ -582,7 +586,11 @@ impl WorkerPool {
                 })
             })
             .collect::<Result<Vec<_>, WorkerPoolError>>()?;
-        match self.repository.state_store().reserve_workers(inputs)? {
+        match self
+            .repository
+            .state_store()
+            .reserve_workers(inputs, excluded)?
+        {
             crate::engine::state::ReservationsOutcome::Reserved {
                 workers,
                 unavailable,
@@ -609,6 +617,9 @@ impl WorkerPool {
             crate::engine::state::ReservationsOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
             }
+            crate::engine::state::ReservationsOutcome::WorkerNotEligible { worker } => {
+                Err(WorkerPoolError::WorkerNotEligible { worker })
+            }
             crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
             }
@@ -618,6 +629,7 @@ impl WorkerPool {
     pub(crate) fn reserve_available_targeted(
         &self,
         requests: &[(String, Option<WorkerId>, Option<AgentRuntimeProfile>)],
+        excluded: &DispatchExclusions,
     ) -> Result<AvailableReservations, WorkerPoolError> {
         let inputs = requests
             .iter()
@@ -634,7 +646,7 @@ impl WorkerPool {
         match self
             .repository
             .state_store()
-            .reserve_available_workers(inputs)?
+            .reserve_available_workers(inputs, excluded)?
         {
             crate::engine::state::ReservationsOutcome::Reserved {
                 workers,
@@ -675,6 +687,9 @@ impl WorkerPool {
             crate::engine::state::ReservationsOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
             }
+            crate::engine::state::ReservationsOutcome::WorkerNotEligible { worker } => {
+                Err(WorkerPoolError::WorkerNotEligible { worker })
+            }
         }
     }
 
@@ -692,15 +707,20 @@ impl WorkerPool {
             .iter()
             .map(|ticket| (ticket.as_ref().to_owned(), None, None))
             .collect::<Vec<_>>();
-        self.grow_and_reserve_targeted(&requests, approved_additional)
+        self.grow_and_reserve_targeted(
+            &requests,
+            approved_additional,
+            &DispatchExclusions::default(),
+        )
     }
 
     pub(crate) fn grow_and_reserve_targeted(
         &self,
         requests: &[(String, Option<WorkerId>, Option<AgentRuntimeProfile>)],
         approved_additional: usize,
+        excluded: &DispatchExclusions,
     ) -> Result<Vec<Reservation>, WorkerPoolError> {
-        let shortage = match self.reserve_targeted(requests) {
+        let shortage = match self.reserve_targeted(requests, excluded) {
             Ok(reservations) => return Ok(reservations),
             Err(WorkerPoolError::CapacityShortage(shortage)) => shortage,
             Err(error) => return Err(error),
@@ -758,6 +778,7 @@ impl WorkerPool {
             current.revision().clone(),
             next,
             inputs,
+            excluded,
         );
         let result = match outcome {
             Ok(crate::engine::state::GrowReservationsOutcome::Reserved(reserved)) => Ok(reserved
@@ -798,7 +819,12 @@ impl WorkerPool {
         worker: WorkerId,
         ticket: impl Into<String>,
     ) -> Result<Reservation, WorkerPoolError> {
-        self.reserve_inner(Some(worker), ticket.into(), None)
+        self.reserve_inner(
+            Some(worker),
+            ticket.into(),
+            None,
+            &DispatchExclusions::default(),
+        )
     }
 
     /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
@@ -840,6 +866,7 @@ impl WorkerPool {
         requested: Option<WorkerId>,
         ticket: String,
         profile: Option<AgentRuntimeProfile>,
+        excluded: &DispatchExclusions,
     ) -> Result<Reservation, WorkerPoolError> {
         let started_at = current_timestamp()?;
         let outcome = self.repository.state_store().reserve_worker(
@@ -848,6 +875,7 @@ impl WorkerPool {
             started_at,
             ticket.to_lowercase(),
             profile,
+            excluded,
         )?;
         match outcome {
             crate::engine::state::ReservationOutcome::Reserved {
@@ -871,6 +899,9 @@ impl WorkerPool {
             }
             crate::engine::state::ReservationOutcome::WorkerNotIdle { worker } => {
                 Err(WorkerPoolError::WorkerNotIdle { worker })
+            }
+            crate::engine::state::ReservationOutcome::WorkerNotEligible { worker } => {
+                Err(WorkerPoolError::WorkerNotEligible { worker })
             }
             crate::engine::state::ReservationOutcome::InvalidAgentRuntime { value } => {
                 Err(WorkerPoolError::InvalidAgentRuntime { value })
@@ -1627,6 +1658,8 @@ pub struct WorkerPoolSnapshot {
     pool: Option<PoolSnapshot>,
     workers: Vec<WorkerSnapshot>,
     diagnostics: Vec<SnapshotDiagnostic>,
+    /// Worker Workspaces jjfx currently records as open in a terminal.
+    occupied: BTreeSet<WorkerId>,
 }
 impl WorkerPoolSnapshot {
     pub fn pool(&self) -> Option<&PoolSnapshot> {
@@ -1643,6 +1676,16 @@ impl WorkerPoolSnapshot {
     pub fn diagnostics(&self) -> &[SnapshotDiagnostic] {
         &self.diagnostics
     }
+    /// Returns the Workers recorded as open in a terminal.
+    pub fn occupied(&self) -> &BTreeSet<WorkerId> {
+        &self.occupied
+    }
+    /// Reports whether `worker_id` is currently open in a terminal.
+    pub fn is_occupied(&self, worker_id: &str) -> bool {
+        self.occupied
+            .iter()
+            .any(|worker| worker.as_str() == worker_id)
+    }
     pub fn is_missing(&self) -> bool {
         self.pool.is_none()
             && self
@@ -1656,6 +1699,9 @@ impl Repository {
     /// Reads the existing Go-compatible Worker Pool without changing any file.
     pub fn read_worker_pool_snapshot(&self) -> WorkerPoolSnapshot {
         let state = self.state_store();
+        // The in-use marker is jjfx-owned presentation state, read without
+        // touching the terminal; the frontend reconciles it against open tabs.
+        let occupied = state.in_use().marked().unwrap_or_default();
         let mut diagnostics = Vec::new();
         let pool = match state.pool().load() {
             Ok(Loaded::Missing) => {
@@ -1669,6 +1715,7 @@ impl Repository {
                     pool: None,
                     workers: Vec::new(),
                     diagnostics,
+                    occupied,
                 };
             }
             Ok(Loaded::Present(versioned)) => versioned.value,
@@ -1683,6 +1730,7 @@ impl Repository {
                     pool: None,
                     workers: Vec::new(),
                     diagnostics,
+                    occupied,
                 };
             }
         };
@@ -1741,6 +1789,7 @@ impl Repository {
             pool: Some(snapshot),
             workers,
             diagnostics,
+            occupied,
         }
     }
 }

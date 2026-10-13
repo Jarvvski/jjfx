@@ -19,6 +19,13 @@ Group profile remains authoritative after restart, so an explicitly selected Pi
 Run never falls back to Claude or Codex. Invalid or incomplete Pi setup fails
 before Pool, Reservation, assignment, or Workspace mutation.
 
+Dispatch also respects **eligibility**: a Worker whose Workspace is open in a
+terminal is not selected, and an explicitly named open Worker is refused. When
+jjfx cannot see the terminal at all (a headless or off-kitty run, such as a Pi
+dispatch driven by an agent or script) it cannot tell which Workspaces are open,
+so it fails closed - pass `--force` to dispatch anyway. `send` follows the same
+rule; `review` is exempt.
+
 The jjfx Pool view displays the selected runtime for Pool capability, Workers,
 Dispatch outcomes, orchestration progress, sessions, activity, failures, and
 terminal results. It deliberately omits provider/model values and Pi adapter

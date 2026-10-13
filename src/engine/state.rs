@@ -17,13 +17,15 @@ use serde_json::Value;
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
-use crate::engine::{AgentRuntimeProfile, Repository};
+use crate::engine::{AgentRuntimeProfile, DispatchExclusions, Repository};
 
 const POOL_PATH: &str = ".jj/pool.json";
 const POOL_DIRECTORY: &str = ".jj/pool";
 const POOL_LOCK: &str = ".jj/pool/.dispatch.lock";
 const DESTROY_MARKER: &str = ".jj/pool/.destroying";
 const CLEANUP_SUFFIX: &str = ".cleanup";
+const IN_USE_PATH: &str = ".jj/pool/in-use.json";
+const IN_USE_LOCK: &str = ".jj/pool/.in-use.lock";
 
 type Extensions = BTreeMap<String, Value>;
 
@@ -297,6 +299,19 @@ impl WorkerState {
     }
 }
 
+/// The set of Worker Workspaces jjfx currently considers in use (open in a
+/// terminal).
+///
+/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
+/// Worker documents so their shape is preserved. A compatibility peer ignores
+/// it; a missing or unreadable file means "nothing known to be in use".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InUseState {
+    /// Worker identifiers whose Workspaces are currently occupied.
+    #[serde(default)]
+    pub workers: BTreeSet<WorkerId>,
+}
+
 /// One Sub-issue entry in a Dispatch Group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubIssueState {
@@ -524,6 +539,9 @@ pub(crate) enum ReservationOutcome {
     WorkerNotIdle {
         worker: WorkerId,
     },
+    WorkerNotEligible {
+        worker: WorkerId,
+    },
     InvalidAgentRuntime {
         value: String,
     },
@@ -557,6 +575,9 @@ pub(crate) enum ReservationsOutcome {
         worker: WorkerId,
     },
     WorkerNotIdle {
+        worker: WorkerId,
+    },
+    WorkerNotEligible {
         worker: WorkerId,
     },
     InvalidAgentRuntime {
@@ -636,6 +657,11 @@ pub struct DispatchGroupStateRepository {
     root: PathBuf,
     parent: TicketId,
 }
+/// The jjfx-owned Occupancy (in-use) state repository.
+#[derive(Debug, Clone)]
+pub struct InUseStateRepository {
+    root: PathBuf,
+}
 
 impl Repository {
     /// Opens the compatible state repository facade.
@@ -665,6 +691,13 @@ impl StateStore {
         DispatchGroupStateRepository {
             root: self.root.clone(),
             parent,
+        }
+    }
+
+    /// Opens the jjfx-owned Occupancy (in-use) state repository.
+    pub fn in_use(&self) -> InUseStateRepository {
+        InUseStateRepository {
+            root: self.root.clone(),
         }
     }
 
@@ -1203,6 +1236,7 @@ impl StateStore {
         expected: StateRevision<PoolState>,
         next: PoolState,
         inputs: Vec<ReservationInput>,
+        excluded: &DispatchExclusions,
     ) -> Result<GrowReservationsOutcome, StateError> {
         let pool_subject = "Worker Pool";
         with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
@@ -1241,29 +1275,31 @@ impl StateStore {
                 if loaded.revision() != &expected {
                     return Ok(GrowReservationsOutcome::Conflict);
                 }
-                let reserved = match reserve_batch_locked(&self.root, &next, inputs, false)? {
-                    ReservationsOutcome::Reserved {
-                        workers,
-                        unavailable,
-                    } => {
-                        debug_assert!(unavailable.is_empty());
-                        workers
-                    }
-                    ReservationsOutcome::NoIdle { available } => {
-                        return Ok(GrowReservationsOutcome::NoIdle { available });
-                    }
-                    ReservationsOutcome::WorkerNotInPool { worker }
-                    | ReservationsOutcome::WorkerNotIdle { worker } => {
-                        return Err(StateError::new(
-                            "grow and reserve",
-                            pool_subject,
-                            format!("unexpected targeted Worker {worker}"),
-                        ));
-                    }
-                    ReservationsOutcome::InvalidAgentRuntime { value } => {
-                        return Ok(GrowReservationsOutcome::InvalidAgentRuntime { value });
-                    }
-                };
+                let reserved =
+                    match reserve_batch_locked(&self.root, &next, inputs, false, excluded)? {
+                        ReservationsOutcome::Reserved {
+                            workers,
+                            unavailable,
+                        } => {
+                            debug_assert!(unavailable.is_empty());
+                            workers
+                        }
+                        ReservationsOutcome::NoIdle { available } => {
+                            return Ok(GrowReservationsOutcome::NoIdle { available });
+                        }
+                        ReservationsOutcome::WorkerNotInPool { worker }
+                        | ReservationsOutcome::WorkerNotIdle { worker }
+                        | ReservationsOutcome::WorkerNotEligible { worker } => {
+                            return Err(StateError::new(
+                                "grow and reserve",
+                                pool_subject,
+                                format!("unexpected targeted Worker {worker}"),
+                            ));
+                        }
+                        ReservationsOutcome::InvalidAgentRuntime { value } => {
+                            return Ok(GrowReservationsOutcome::InvalidAgentRuntime { value });
+                        }
+                    };
                 if let Err(primary) = write_atomic(&self.root.join(POOL_PATH), &next, pool_subject)
                 {
                     let rollback_failures = reserved
@@ -1306,21 +1342,24 @@ impl StateStore {
     pub(crate) fn reserve_workers(
         &self,
         inputs: Vec<ReservationInput>,
+        excluded: &DispatchExclusions,
     ) -> Result<ReservationsOutcome, StateError> {
-        self.reserve_workers_inner(inputs, false)
+        self.reserve_workers_inner(inputs, false, excluded)
     }
 
     pub(crate) fn reserve_available_workers(
         &self,
         inputs: Vec<ReservationInput>,
+        excluded: &DispatchExclusions,
     ) -> Result<ReservationsOutcome, StateError> {
-        self.reserve_workers_inner(inputs, true)
+        self.reserve_workers_inner(inputs, true, excluded)
     }
 
     fn reserve_workers_inner(
         &self,
         inputs: Vec<ReservationInput>,
         allow_partial: bool,
+        excluded: &DispatchExclusions,
     ) -> Result<ReservationsOutcome, StateError> {
         let pool_subject = "Worker Pool";
         with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
@@ -1358,7 +1397,7 @@ impl StateStore {
                             ));
                         }
                     };
-                reserve_batch_locked(&self.root, &pool, inputs, allow_partial)
+                reserve_batch_locked(&self.root, &pool, inputs, allow_partial, excluded)
             })
         })
     }
@@ -1374,6 +1413,7 @@ impl StateStore {
         started_at: WireTimestamp,
         branch_name: String,
         profile: Option<AgentRuntimeProfile>,
+        excluded: &DispatchExclusions,
     ) -> Result<ReservationOutcome, StateError> {
         let pool_subject = "Worker Pool";
         with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
@@ -1418,6 +1458,13 @@ impl StateStore {
                         worker: requested.clone(),
                     });
                 }
+                if let Some(requested) = requested
+                    && excluded.contains(requested)
+                {
+                    return Ok(ReservationOutcome::WorkerNotEligible {
+                        worker: requested.clone(),
+                    });
+                }
                 let profile = match profile {
                     Some(profile) => profile,
                     None => match configured_pool_profile(&pool) {
@@ -1438,6 +1485,10 @@ impl StateStore {
                 let mut available = 0;
                 let mut selected = None;
                 for worker in candidates {
+                    if excluded.contains(&worker) {
+                        // An occupied Worker is not eligible capacity.
+                        continue;
+                    }
                     let path = self
                         .root
                         .join(POOL_DIRECTORY)
@@ -1515,6 +1566,7 @@ fn reserve_batch_locked(
     pool: &PoolState,
     inputs: Vec<ReservationInput>,
     allow_partial: bool,
+    excluded: &DispatchExclusions,
 ) -> Result<ReservationsOutcome, StateError> {
     let default_profile = if inputs.iter().any(|input| input.profile.is_none()) {
         match configured_pool_profile(pool) {
@@ -1541,7 +1593,7 @@ fn reserve_batch_locked(
     }
     let available = workers
         .iter()
-        .filter(|(_, state)| state.status.as_str() == "idle")
+        .filter(|(worker, state)| state.status.as_str() == "idle" && !excluded.contains(worker))
         .count();
     let mut selected = BTreeSet::new();
     let mut assignments = Vec::with_capacity(inputs.len());
@@ -1549,27 +1601,42 @@ fn reserve_batch_locked(
     for (index, input) in inputs.into_iter().enumerate() {
         let selection = match input.requested_worker.as_ref() {
             Some(requested) => match workers.iter().find(|(worker, _)| worker == requested) {
+                None => {
+                    if !allow_partial {
+                        return Ok(ReservationsOutcome::WorkerNotInPool {
+                            worker: requested.clone(),
+                        });
+                    }
+                    None
+                }
+                Some((worker, _)) if excluded.contains(worker) => {
+                    if !allow_partial {
+                        return Ok(ReservationsOutcome::WorkerNotEligible {
+                            worker: worker.clone(),
+                        });
+                    }
+                    None
+                }
                 Some((worker, state))
                     if state.status.as_str() == "idle" && !selected.contains(worker) =>
                 {
                     Some((worker.clone(), state.clone()))
                 }
-                Some((worker, _)) if !allow_partial => {
-                    return Ok(ReservationsOutcome::WorkerNotIdle {
-                        worker: worker.clone(),
-                    });
+                Some((worker, _)) => {
+                    if !allow_partial {
+                        return Ok(ReservationsOutcome::WorkerNotIdle {
+                            worker: worker.clone(),
+                        });
+                    }
+                    None
                 }
-                None if !allow_partial => {
-                    return Ok(ReservationsOutcome::WorkerNotInPool {
-                        worker: requested.clone(),
-                    });
-                }
-                Some(_) | None => None,
             },
             None => workers
                 .iter()
                 .find(|(worker, state)| {
-                    state.status.as_str() == "idle" && !selected.contains(worker)
+                    state.status.as_str() == "idle"
+                        && !selected.contains(worker)
+                        && !excluded.contains(worker)
                 })
                 .map(|(worker, state)| (worker.clone(), state.clone())),
         };
@@ -1712,6 +1779,78 @@ repository_methods!(
     |s: &WorkerStateRepository| format!("Worker {}", s.worker),
     validate_worker
 );
+repository_methods!(
+    InUseStateRepository,
+    InUseState,
+    |s: &InUseStateRepository| s.root.join(IN_USE_PATH),
+    |s: &InUseStateRepository| vec![s.root.join(IN_USE_LOCK)],
+    |_s: &InUseStateRepository| "Worker Occupancy".to_owned(),
+    validate_in_use
+);
+
+impl InUseStateRepository {
+    /// Returns the Worker ids currently marked in use, treating absence as empty.
+    pub fn marked(&self) -> Result<BTreeSet<WorkerId>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.workers),
+            Loaded::Missing => Ok(BTreeSet::new()),
+        }
+    }
+
+    /// Adds one Worker to the in-use set.
+    pub fn mark(&self, worker: &WorkerId) -> Result<(), StateError> {
+        self.update(|workers| {
+            workers.insert(worker.clone());
+        })
+    }
+
+    /// Removes one Worker from the in-use set.
+    pub fn clear(&self, worker: &WorkerId) -> Result<(), StateError> {
+        self.update(|workers| {
+            workers.remove(worker);
+        })
+    }
+
+    /// Replaces the in-use set wholesale, for reconciliation against the terminal.
+    ///
+    /// A no-op when the set is unchanged, so a periodic reconcile does not
+    /// rewrite the marker on every refresh.
+    pub fn replace(&self, workers: BTreeSet<WorkerId>) -> Result<(), StateError> {
+        let subject = "Worker Occupancy";
+        with_locks(&[self.root.join(IN_USE_LOCK)], subject, || {
+            let current = match load_state(&self.root.join(IN_USE_PATH), subject, &validate_in_use)?
+            {
+                Loaded::Present(versioned) => versioned.value.workers,
+                Loaded::Missing => BTreeSet::new(),
+            };
+            if current == workers {
+                return Ok(());
+            }
+            self.write(workers, subject)
+        })
+    }
+
+    fn update(&self, edit: impl FnOnce(&mut BTreeSet<WorkerId>)) -> Result<(), StateError> {
+        let subject = "Worker Occupancy";
+        with_locks(&[self.root.join(IN_USE_LOCK)], subject, || {
+            let mut workers =
+                match load_state(&self.root.join(IN_USE_PATH), subject, &validate_in_use)? {
+                    Loaded::Present(versioned) => versioned.value.workers,
+                    Loaded::Missing => BTreeSet::new(),
+                };
+            edit(&mut workers);
+            self.write(workers, subject)
+        })
+    }
+
+    fn write(&self, workers: BTreeSet<WorkerId>, subject: &str) -> Result<(), StateError> {
+        write_atomic(
+            &self.root.join(IN_USE_PATH),
+            &InUseState { workers },
+            subject,
+        )
+    }
+}
 
 impl WorkerStateRepository {
     /// Reports whether Pool membership removal left a durable cleanup marker.
@@ -1987,6 +2126,10 @@ fn validate_worker(worker: &WorkerState) -> Result<(), String> {
     if worker.status.as_str().is_empty() {
         return Err("Worker status must not be empty".to_owned());
     }
+    Ok(())
+}
+fn validate_in_use(_state: &InUseState) -> Result<(), String> {
+    // Worker ids are validated on deserialization; there is nothing else to check.
     Ok(())
 }
 fn validate_dispatch_group_for(

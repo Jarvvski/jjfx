@@ -10,6 +10,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::engine::{
     AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
+    WorkerPoolSnapshot, WorkerStatus,
 };
 use crate::pool_session::PoolSession;
 use crate::render::style::dim_line;
@@ -72,9 +73,16 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
             } else {
                 "·"
             };
+            // An open Workspace is not eligible capacity, so surface it beside
+            // the capacity status rather than replacing it.
+            let open = if snapshot.is_occupied(worker.worker_id().as_str()) {
+                "  [open]"
+            } else {
+                ""
+            };
             let line = if body.width < 55 {
                 format!(
-                    " {marker} {}  {}  runtime: {}  ticket:{}",
+                    " {marker} {}  {}  runtime: {}  ticket:{}{open}",
                     worker.worker_id(),
                     worker.status().as_str(),
                     worker
@@ -84,7 +92,7 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                 )
             } else {
                 format!(
-                    " {marker} {}  {:<7} {}  runtime: {}  {}",
+                    " {marker} {}  {:<7} {}  runtime: {}  {}{open}",
                     worker.worker_id(),
                     worker.status().as_str(),
                     worker.alias(),
@@ -167,10 +175,14 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
             PoolPane::DispatchPreview { tickets, selected } => {
                 lines.push(dim_line(" Dispatch preview:"));
                 for ticket in *tickets {
-                    let target = if tickets.len() == 1 {
-                        selected.unwrap_or("no Worker")
-                    } else {
-                        "first idle Worker"
+                    let target = match (tickets.len(), selected) {
+                        (1, Some(worker)) if snapshot.is_occupied(worker) => {
+                            format!("{worker} (open - not eligible)")
+                        }
+                        (1, Some(worker)) => (*worker).to_owned(),
+                        (1, None) => first_eligible_worker(snapshot)
+                            .map_or_else(|| "no eligible Worker".to_owned(), ToOwned::to_owned),
+                        _ => "first eligible idle Worker".to_owned(),
                     };
                     lines.push(Line::from(format!("  ? {ticket} -> {target}")));
                 }
@@ -281,6 +293,18 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
     frame.render_widget(footer, footer_area);
 }
 
+/// The first Worker Dispatch would select: idle and not open in a terminal.
+fn first_eligible_worker(snapshot: &WorkerPoolSnapshot) -> Option<&str> {
+    snapshot
+        .workers()
+        .iter()
+        .find(|worker| {
+            worker.status() == WorkerStatus::Idle
+                && !snapshot.is_occupied(worker.worker_id().as_str())
+        })
+        .map(|worker| worker.worker_id().as_str())
+}
+
 fn worker_activity_line(activity: &RunActivity) -> String {
     let detail = match activity.kind() {
         RunActivityKind::SessionStarted => "session started".to_owned(),
@@ -321,5 +345,111 @@ fn worker_result_line(result: &RunResult) -> String {
     match result.conclusion() {
         RunConclusion::Succeeded => "succeeded".to_owned(),
         RunConclusion::Failed { message } => format!("failed: {message}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{Repository, WorkerId};
+    use crate::pool_session::PoolSession;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    /// A one-Worker Pool snapshot, optionally recorded as open in a terminal.
+    fn snapshot(occupied: bool) -> WorkerPoolSnapshot {
+        let temp = tempfile::tempdir().expect("temp repository");
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).expect("pool directory");
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
+        )
+        .expect("pool state");
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .expect("worker state");
+        let repository = Repository::open(temp.path()).expect("repository");
+        if occupied {
+            repository
+                .state_store()
+                .in_use()
+                .mark(&WorkerId::parse("worker-01").expect("worker id"))
+                .expect("mark open");
+        }
+        repository.read_worker_pool_snapshot()
+    }
+
+    fn render(session: &PoolSession, pane: PoolPane<'_>, selected: Option<&str>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
+        let view = PoolView {
+            session,
+            pane,
+            selected_worker: selected,
+        };
+        terminal
+            .draw(|frame| draw(frame, &view, Paragraph::new("")))
+            .expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn the_worker_list_marks_an_open_workspace() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot(true)),
+            ..PoolSession::default()
+        };
+        let text = render(&session, PoolPane::View, Some("worker-01"));
+        assert!(text.contains("[open]"), "expected an open marker: {text}");
+    }
+
+    #[test]
+    fn the_dispatch_preview_flags_an_open_target() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot(true)),
+            ..PoolSession::default()
+        };
+        let tickets = ["ENG-1".to_owned()];
+        let text = render(
+            &session,
+            PoolPane::DispatchPreview {
+                tickets: &tickets,
+                selected: Some("worker-01"),
+            },
+            Some("worker-01"),
+        );
+        assert!(
+            text.contains("(open - not eligible)"),
+            "expected the preview to flag the open Worker: {text}"
+        );
+    }
+
+    #[test]
+    fn the_dispatch_preview_names_the_first_eligible_worker() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot(false)),
+            ..PoolSession::default()
+        };
+        let tickets = ["ENG-1".to_owned()];
+        let text = render(
+            &session,
+            PoolPane::DispatchPreview {
+                tickets: &tickets,
+                selected: None,
+            },
+            None,
+        );
+        assert!(
+            text.contains("ENG-1 -> worker-01"),
+            "expected the eligible Worker in the preview: {text}"
+        );
     }
 }

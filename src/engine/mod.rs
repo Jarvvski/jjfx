@@ -13,6 +13,7 @@ use thiserror::Error;
 mod direct_dispatch;
 mod dispatch_group;
 mod dispatch_prompt;
+mod eligibility;
 mod layout;
 mod orchestration;
 mod pool;
@@ -37,6 +38,7 @@ pub use dispatch_prompt::{
     DeliveryContract, DispatchBudget, DispatchPromptBuilder, DispatchPromptContext,
     DispatchPromptError,
 };
+pub use eligibility::{DispatchExclusions, reconcile_occupancy};
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
 };
@@ -63,9 +65,10 @@ pub use runtime::{
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
-    Expected, IdentifierError, Loaded, PoolState, PoolStateRepository, StateChange, StateError,
-    StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
-    WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
+    Expected, IdentifierError, InUseState, InUseStateRepository, Loaded, PoolState,
+    PoolStateRepository, StateChange, StateError, StateRevision, StateStore, SubIssueState,
+    TicketId, Versioned, WireAgent, WireStatus, WireTimestamp, WorkerId, WorkerState,
+    WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,

@@ -9,11 +9,11 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, AgentRuntimeQuery, CapacityShortage,
     CleanDecision, DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome,
-    DirectDispatchRequest, DispatchBudget, FollowUpExecution, OrchestrationEvent,
-    PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, Repository,
-    RunActivity, RunActivityKind, RunMode, TerminalSettings, TicketDetails, TicketDiscovery,
-    TicketId, TicketQuery, TicketStatus, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
-    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
+    DirectDispatchRequest, DispatchBudget, DispatchExclusions, FollowUpExecution,
+    OrchestrationEvent, PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity,
+    ReadyTicketFilter, Repository, RunActivity, RunActivityKind, RunMode, TerminalSettings,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, WireAgent, WorkerActions,
+    WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
 };
 
 pub const HELP: &str = concat!(
@@ -52,9 +52,9 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " pool destroy              Tear down all workers and remove pool\n\nDispatch and sessions:\n  ",
     env!("CARGO_PKG_NAME"),
-    " dispatch <TICKET>...     Dispatch Tickets (d; --provider/--model)\n  ",
+    " dispatch <TICKET>...     Dispatch Tickets (d; --provider/--model/--force)\n  ",
     env!("CARGO_PKG_NAME"),
-    " send <worker> <prompt>   Send a Follow-up (s)\n  ",
+    " send <worker> <prompt>   Send a Follow-up (s; --force)\n  ",
     env!("CARGO_PKG_NAME"),
     " review <worker>          Address PR review comments (rev)\n  ",
     env!("CARGO_PKG_NAME"),
@@ -107,6 +107,7 @@ pub enum Command {
         worker: String,
         prompt: String,
         mode: RunMode,
+        force: bool,
     },
     Review {
         worker: String,
@@ -134,6 +135,7 @@ pub enum Command {
         parent: String,
         provider: Option<String>,
         model: Option<String>,
+        force: bool,
     },
     Pool(PoolCommand),
 }
@@ -156,6 +158,7 @@ pub struct DispatchArgs {
     pub budget: Option<u32>,
     pub label: String,
     pub no_orchestrate: bool,
+    pub force: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -468,12 +471,14 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     let mut budget = None;
     let mut label = "ready-for-agent".to_owned();
     let mut no_orchestrate = false;
+    let mut force = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--fg" | "--bg" => parse_mode(&args[index], &mut mode)?,
             "--all" => all = true,
             "--no-orchestrate" => no_orchestrate = true,
+            "--force" => force = true,
             "--provider" | "--model" | "--label" | "--budget" => {
                 let option = args[index].as_str();
                 let value = args
@@ -526,15 +531,18 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         budget,
         label,
         no_orchestrate,
+        force,
     }))
 }
 
 fn parse_send(args: &[String]) -> Result<Command> {
     let mut values = Vec::new();
     let mut mode = None;
+    let mut force = false;
     for argument in args {
         match argument.as_str() {
             "--fg" | "--bg" => parse_mode(argument, &mut mode)?,
+            "--force" => force = true,
             value if value.starts_with('-') => bail!("unknown option for send: {value}"),
             value => values.push(value.to_owned()),
         }
@@ -543,13 +551,14 @@ fn parse_send(args: &[String]) -> Result<Command> {
         bail!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
-            " send <worker> <prompt> [--fg|--bg]"
+            " send <worker> <prompt> [--fg|--bg] [--force]"
         ));
     }
     Ok(Command::Send {
         worker: values.remove(0),
         prompt: values.remove(0),
         mode: mode.unwrap_or(RunMode::Background),
+        force,
     })
 }
 
@@ -603,9 +612,15 @@ fn parse_orchestrate(args: &[String]) -> Result<Command> {
     };
     let mut provider = None;
     let mut model = None;
+    let mut force = false;
     let mut index = 1;
     while index < args.len() {
         let option = args[index].as_str();
+        if option == "--force" {
+            force = true;
+            index += 1;
+            continue;
+        }
         let destination = match option {
             "--provider" => &mut provider,
             "--model" => &mut model,
@@ -624,6 +639,7 @@ fn parse_orchestrate(args: &[String]) -> Result<Command> {
         parent: parent.clone(),
         provider,
         model,
+        force,
     })
 }
 
@@ -642,6 +658,7 @@ pub fn run(
     launch: fn(PathBuf) -> Result<()>,
     terminal_settings: fn() -> Result<TerminalSettings>,
     colocate: fn() -> Result<bool>,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
@@ -659,12 +676,22 @@ pub fn run(
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
         Command::Clean => clean_command(&repository(colocate)?)?,
         Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
-        Command::Dispatch(args) => dispatch_command(&repository(colocate)?, &args)?,
+        Command::Dispatch(args) => {
+            dispatch_command(&repository(colocate)?, &args, open_workspaces)?
+        }
         Command::Send {
             worker,
             prompt,
             mode,
-        } => send_command(&repository(colocate)?, &worker, &prompt, mode)?,
+            force,
+        } => send_command(
+            &repository(colocate)?,
+            &worker,
+            &prompt,
+            mode,
+            force,
+            open_workspaces,
+        )?,
         Command::Review { worker, mode } => review_command(&repository(colocate)?, &worker, mode)?,
         Command::Logs { worker } => logs_command(&repository(colocate)?, &worker)?,
         Command::Mount { worker } => {
@@ -678,11 +705,14 @@ pub fn run(
             parent,
             provider,
             model,
+            force,
         } => orchestrate_command(
             &repository(colocate)?,
             &parent,
             provider.as_deref(),
             model.as_deref(),
+            force,
+            open_workspaces,
         )?,
         Command::Pool(command) => pool_command(&repository(colocate)?, command)?,
     }
@@ -1176,7 +1206,11 @@ fn configured_ticket_query(repository: &Repository, runtime: AgentRuntime) -> Ag
     }
 }
 
-fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> {
+fn dispatch_command(
+    repository: &Repository,
+    args: &DispatchArgs,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+) -> Result<()> {
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
 
     // A single Ticket with orchestration enabled fetches its own details before
@@ -1188,6 +1222,8 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
                 &args.tickets[0],
                 args.provider.as_deref(),
                 args.model.as_deref(),
+                args.force,
+                open_workspaces,
             );
         }
         let executable = std::env::current_exe()?;
@@ -1198,6 +1234,9 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
         }
         if let Some(model) = args.model.as_deref() {
             command.args(["--model", model]);
+        }
+        if args.force {
+            command.arg("--force");
         }
         command
             .stdin(std::process::Stdio::null())
@@ -1212,6 +1251,7 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
         return Ok(());
     }
 
+    let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
 
@@ -1244,7 +1284,7 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
                 Ok(request)
             })
             .collect::<Result<Vec<_>>>()?;
-        let result = dispatch_with_capacity_prompt(repository, &requests)?;
+        let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
         render_dispatch_result(&result, requests.len(), true);
         return Ok(());
     }
@@ -1267,9 +1307,29 @@ fn dispatch_command(repository: &Repository, args: &DispatchArgs) -> Result<()> 
             Ok(request)
         })
         .collect::<Result<Vec<_>>>()?;
-    let result = dispatch_with_capacity_prompt(repository, &requests)?;
+    let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
     render_dispatch_result(&result, requests.len(), false);
     Ok(())
+}
+
+/// The Workers excluded from Dispatch because their Workspace is open in a
+/// terminal, or an error when the terminal cannot be queried.
+///
+/// Fails closed: if jjfx cannot see which Workspaces are open it refuses to
+/// dispatch rather than risk colliding with a human. `--force` skips the query
+/// and dispatches with no exclusions.
+fn dispatch_exclusions(
+    repository: &Repository,
+    force: bool,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+) -> Result<DispatchExclusions> {
+    if force {
+        return Ok(DispatchExclusions::default());
+    }
+    let open = open_workspaces().context(
+        "cannot determine which Worker Workspaces are open; re-run with --force to dispatch anyway",
+    )?;
+    Ok(crate::engine::reconcile_occupancy(repository, &open))
 }
 
 /// Fetch a Ticket's details to inline into the Dispatch prompt, failing before
@@ -1295,8 +1355,11 @@ fn fetch_ticket_details<Q: TicketQuery>(
 fn dispatch_with_capacity_prompt(
     repository: &Repository,
     requests: &[DirectDispatchRequest],
+    exclusions: &DispatchExclusions,
 ) -> Result<crate::engine::DirectDispatchResult> {
-    let dispatcher = repository.direct_dispatch();
+    let dispatcher = repository
+        .direct_dispatch()
+        .with_exclusions(exclusions.clone());
     match dispatcher.dispatch(requests) {
         Ok(result) => Ok(result),
         Err(DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(shortage))) => {
@@ -1371,10 +1434,20 @@ fn render_dispatch_result(
     }
 }
 
-fn send_command(repository: &Repository, value: &str, prompt: &str, mode: RunMode) -> Result<()> {
+fn send_command(
+    repository: &Repository,
+    value: &str,
+    prompt: &str,
+    mode: RunMode,
+    force: bool,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+) -> Result<()> {
     let worker = normalize_worker(value)?;
+    let exclusions = dispatch_exclusions(repository, force, open_workspaces)?;
     eprintln!("Sending to {worker}...");
-    let outcome = WorkerActions::new(repository.clone()).send(&worker, prompt, mode)?;
+    let outcome = WorkerActions::new(repository.clone())
+        .with_exclusions(exclusions)
+        .send(&worker, prompt, mode)?;
     eprintln!("Agent Runtime: {}", outcome.runtime());
     render_session(outcome.session());
     if let FollowUpExecution::Background(run) = outcome.execution() {
@@ -1587,8 +1660,11 @@ fn orchestrate_command(
     parent: &str,
     provider: Option<&str>,
     model: Option<&str>,
+    force: bool,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     let id = TicketId::parse(parent.to_owned())?;
+    let exclusions = dispatch_exclusions(repository, force, open_workspaces)?;
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the
@@ -1604,7 +1680,9 @@ fn orchestrate_command(
         .ticket()
         .clone();
     let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
-    let runner = repository.orchestration_runner();
+    let runner = repository
+        .orchestration_runner()
+        .with_exclusions(exclusions);
     let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;
     render_orchestration_event(&OrchestrationEvent::Started {
         parent: id.clone(),
@@ -1760,6 +1838,7 @@ mod tests {
                 budget: Some(12),
                 label: "ready-for-agent".to_owned(),
                 no_orchestrate: true,
+                force: false,
             })
         );
     }
@@ -1917,8 +1996,28 @@ mod tests {
                 worker: "worker-1".to_owned(),
                 prompt: "follow up".to_owned(),
                 mode: RunMode::Foreground,
+                force: false,
             }
         );
+    }
+
+    #[test]
+    fn dispatch_and_send_accept_force() {
+        let dispatch = parse(&args(&[
+            "dispatch",
+            "AMBA-42",
+            "--no-orchestrate",
+            "--force",
+        ]))
+        .expect("dispatch --force should parse");
+        assert!(matches!(
+            dispatch,
+            Command::Dispatch(DispatchArgs { force: true, .. })
+        ));
+
+        let send = parse(&args(&["send", "worker-1", "go", "--force"]))
+            .expect("send --force should parse");
+        assert!(matches!(send, Command::Send { force: true, .. }));
     }
 
     #[test]
@@ -1951,6 +2050,7 @@ mod tests {
                 budget: None,
                 label: "needs-review".to_owned(),
                 no_orchestrate: false,
+                force: false,
             })
         );
     }
@@ -1968,6 +2068,7 @@ mod tests {
                 budget: None,
                 label: "ready-for-agent".to_owned(),
                 no_orchestrate: true,
+                force: false,
             })
         );
         assert_eq!(

@@ -11,6 +11,7 @@
 //! with `kitten @ --to <socket>`, launching that instance via a configured
 //! `launch_command` when it isn't yet reachable.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Duration;
 
@@ -164,6 +165,12 @@ fn open_steps(layout: &PaneLayout, command_for: impl Fn(PaneRole) -> Vec<String>
 pub trait Terminal: Send + Sync {
     /// Is a tab for this workspace currently open?
     fn is_open(&self, name: &str) -> bool;
+    /// Every workspace name with a tab currently open, in one query.
+    ///
+    /// Unlike [`Terminal::is_open`] this surfaces a failed query as an error so
+    /// callers that must fail closed (Dispatch eligibility) can tell "no tabs"
+    /// apart from "cannot see the tabs".
+    fn open_workspaces(&self) -> anyhow::Result<BTreeSet<String>>;
     /// Open a tab for the workspace rooted at `path` using the layout selected
     /// for the current display. `focus` lands on the layout's focus pane (the
     /// agent when it has one); otherwise the tab is built without the target
@@ -327,16 +334,13 @@ impl KittyTerminal {
 
 impl Terminal for KittyTerminal {
     fn is_open(&self, name: &str) -> bool {
-        let title = tab_title(name);
-        let Ok(tree) = self.ls() else {
-            return false;
-        };
-        tree.as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|osw| osw.get("tabs").and_then(Value::as_array))
-            .flatten()
-            .any(|tab| tab.get("title").and_then(Value::as_str) == Some(title.as_str()))
+        self.open_workspaces()
+            .map(|names| names.contains(name))
+            .unwrap_or(false)
+    }
+
+    fn open_workspaces(&self) -> anyhow::Result<BTreeSet<String>> {
+        Ok(tab_names(&self.ls()?))
     }
 
     fn open(&self, name: &str, path: &Path, focus: bool) -> anyhow::Result<()> {
@@ -490,6 +494,22 @@ fn is_pid_socket(base_name: &str, name: &str) -> bool {
         Some(pid) => !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
+}
+
+/// The workspace names with an open tab in a `kitten @ ls` tree. Both jjfx's own
+/// `jjfx:<name>` titles and the bare `<name>` titles used by Worker Mount are
+/// recognised, so a worker's mounted tab is not mistaken for absent.
+fn tab_names(tree: &Value) -> BTreeSet<String> {
+    tree.as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|os_window| os_window.get("tabs")?.as_array())
+        .flatten()
+        .filter_map(|tab| tab.get("title").and_then(Value::as_str))
+        .map(|title| title.strip_prefix(TAB_PREFIX).unwrap_or(title))
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 /// The tab titled `title` in a `kitten @ ls` tree, if it exists.
@@ -989,6 +1009,35 @@ mod tests {
             window_with_command(&tree, "jjfx:untagged", &agent_command),
             None
         );
+    }
+
+    #[test]
+    fn tab_names_accept_prefixed_and_bare_titles() {
+        let tree: Value = serde_json::from_str(
+            r#"
+            [
+              {
+                "tabs": [
+                  { "title": "jjfx:feat" },
+                  { "title": "worker-abc" },
+                  { "title": "jjfx:" },
+                  { "title": "zsh" }
+                ]
+              }
+            ]
+            "#,
+        )
+        .expect("ls fixture parses");
+
+        let names = tab_names(&tree);
+        assert!(names.contains("feat"));
+        // A Worker Mount titles its tab with the bare worker id (no prefix).
+        assert!(names.contains("worker-abc"));
+        // An unrelated user tab is reported too; callers intersect with pool
+        // membership, so this is harmless.
+        assert!(names.contains("zsh"));
+        // The empty name from a bare `jjfx:` title is dropped.
+        assert_eq!(names.len(), 3);
     }
 
     #[test]
