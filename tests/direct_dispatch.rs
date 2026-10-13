@@ -20,6 +20,10 @@ use jjfx::engine::{
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
+use support::HELPER_LIVENESS_TIMEOUT;
+
 const HELPER_REPOSITORY: &str = "WSG_DIRECT_DISPATCH_REPOSITORY";
 const HELPER_RESULT: &str = "WSG_DIRECT_DISPATCH_RESULT";
 const HELPER_CAPTURE: &str = "WSG_DIRECT_DISPATCH_CAPTURE";
@@ -668,7 +672,7 @@ fn production_direct_dispatch_helper() {
     .expect("capture Go-compatible busy state");
     fs::write(env::var_os(HELPER_RELEASE).expect("background release"), [])
         .expect("release background Runtime");
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     loop {
         let snapshot = repository.worker_pool().snapshot();
         let status = snapshot

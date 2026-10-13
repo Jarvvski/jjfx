@@ -15,6 +15,10 @@ use jjfx::engine::{
 use rustix::fs::{FlockOperation, flock};
 use tempfile::TempDir;
 
+mod support;
+
+use support::HELPER_LIVENESS_TIMEOUT;
+
 const MODE: &str = "WSG_RUST_STATE_HELPER_MODE";
 const LOCK: &str = "WSG_RUST_STATE_HELPER_LOCK";
 const READY: &str = "WSG_RUST_STATE_HELPER_READY";
@@ -132,7 +136,7 @@ fn outcome_name<T>(outcome: CommitOutcome<T>) -> &'static str {
 }
 
 fn wait_for_helper_release(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while !path.exists() {
         assert!(Instant::now() < deadline, "timed out waiting for release");
         thread::sleep(Duration::from_millis(10));
@@ -147,7 +151,7 @@ fn repository() -> (TempDir, Repository) {
 }
 
 fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -159,7 +163,7 @@ fn wait_for(path: &Path) {
 }
 
 fn wait_for_child(child: &mut ChildGuard) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     loop {
         let process = child.0.as_mut().expect("child process");
         if let Some(status) = process.try_wait().expect("child status") {
@@ -301,7 +305,7 @@ fn an_independent_rust_process_serializes_pool_commits() {
     }
     assert!(
         receiver
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(HELPER_LIVENESS_TIMEOUT)
             .expect("commit completed")
             .is_ok()
     );
@@ -345,7 +349,7 @@ fn an_independent_rust_process_serializes_worker_commits() {
     }
     assert!(
         receiver
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(HELPER_LIVENESS_TIMEOUT)
             .expect("commit completed")
             .is_ok()
     );
@@ -391,7 +395,7 @@ fn an_independent_rust_process_serializes_dispatch_group_commits() {
     }
     assert!(
         receiver
-            .recv_timeout(Duration::from_secs(3))
+            .recv_timeout(HELPER_LIVENESS_TIMEOUT)
             .expect("commit completed")
             .is_ok()
     );
@@ -507,7 +511,7 @@ fn rust_commits_wait_for_each_go_lock_when_configured() {
         }
         assert!(
             receiver
-                .recv_timeout(Duration::from_secs(3))
+                .recv_timeout(HELPER_LIVENESS_TIMEOUT)
                 .expect("Rust commit completed")
                 .is_ok()
         );

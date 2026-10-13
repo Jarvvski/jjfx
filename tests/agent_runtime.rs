@@ -18,6 +18,10 @@ use rustix::process::{
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
+use support::HELPER_LIVENESS_TIMEOUT;
+
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "WSG_AGENT_RUNTIME_HELPER_PATH";
 const HELPER_RESULT: &str = "WSG_AGENT_RUNTIME_HELPER_RESULT";
@@ -1090,7 +1094,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
         .parse()
         .expect("numeric runtime PID");
     let pid = Pid::from_raw(pid).expect("runtime PID");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -1104,7 +1108,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
         .parse::<i32>()
         .expect("numeric descendant PID");
     let descendant_pid = Pid::from_raw(descendant_pid).expect("descendant PID");
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while test_kill_process(descendant_pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -3168,7 +3172,7 @@ fn unix_pid(pid: u32) -> Pid {
 }
 
 fn wait_for_file(path: &std::path::Path) {
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while !path.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }

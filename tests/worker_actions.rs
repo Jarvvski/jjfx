@@ -17,6 +17,10 @@ use rustix::process::{
 };
 use tempfile::TempDir;
 
+mod support;
+
+use support::HELPER_LIVENESS_TIMEOUT;
+
 const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
 const HELPER_WORKER: &str = "WSG_ACTION_WORKER";
 const HELPER_RESULT: &str = "WSG_ACTION_RESULT";
@@ -1948,7 +1952,7 @@ fn read_pid(path: &Path) -> u32 {
 }
 
 fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -1960,7 +1964,7 @@ fn wait_for_file(path: &Path) {
 }
 
 fn wait_for_process_exit(pid: u32) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while test_kill_process(unix_pid(pid)).is_ok() {
         assert!(Instant::now() < deadline, "process {pid} did not exit");
         thread::sleep(Duration::from_millis(10));

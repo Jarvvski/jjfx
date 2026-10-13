@@ -13,6 +13,10 @@ use jjfx::engine::{
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod support;
+
+use support::HELPER_LIVENESS_TIMEOUT;
+
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
 fn fixture(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).expect("fixture")
@@ -105,7 +109,7 @@ fn destroy_live_process_helper() {
 }
 
 fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -232,7 +236,7 @@ fn stale_reservation_cannot_persist_a_pid_after_destroy_detaches_membership() {
         .env("PATH", path)
         .spawn()
         .expect("spawn stale Reservation helper");
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().expect("helper status") {
             assert!(
