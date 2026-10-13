@@ -1402,10 +1402,10 @@ fn dispatch_with_capacity_prompt(
 
 fn growth_question(shortage: CapacityShortage) -> String {
     format!(
-        "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Resize pool to {}? [Y/n] ",
+        "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Grow pool by {}? [Y/n] ",
         shortage.available(),
         shortage.requested(),
-        shortage.available() + shortage.gap()
+        shortage.gap()
     )
 }
 
@@ -2060,7 +2060,7 @@ mod tests {
         let shortage = CapacityShortage::new(5, 2);
         assert_eq!(
             growth_question(shortage),
-            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Resize pool to 5? [Y/n] "
+            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Grow pool by 3? [Y/n] "
         );
     }
 
