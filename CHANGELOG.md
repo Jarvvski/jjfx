@@ -35,6 +35,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - A diff longer than 65 535 lines scrolls to its end again. The
+  diff and world-graph viewports recorded the content length as a `u16`, so the
+  line count wrapped: a 70 000-line file could only be scrolled to line 4 464,
+  and a file of exactly 65 536 lines could not be scrolled at all. The offset
+  arithmetic saturates now as well, so the degenerate zero-height pane can no
+  longer overflow it. (fix)
+
 - 2026-10-13 - The terminal is restored when jjfx is killed by a signal. SIGINT,
   SIGTERM, and SIGHUP used to terminate the TUI with the alternate screen and
   raw mode still active, leaving the shell echoing nothing until `reset`. The

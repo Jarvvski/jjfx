@@ -343,7 +343,7 @@ pub(crate) fn draw_world(frame: &mut Frame, lines: Vec<Line<'static>>, viewport:
                     .border_style(pane_border(true))
                     .title(" commit graph "),
             )
-            .scroll((viewport.scroll(), 0)),
+            .scroll((viewport.scroll() as u16, 0)),
         body,
     );
 

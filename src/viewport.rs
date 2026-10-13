@@ -8,26 +8,30 @@
 /// persisted top line. Every movement clamps against [`Viewport::max_scroll`],
 /// so the last content line can always be brought just into view and no
 /// further.
+///
+/// These are `usize`, not `u16`: a diff or graph can exceed `u16::MAX` lines,
+/// and truncating the content length silently strands everything past the
+/// truncated total out of reach of `jump_bottom`.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Viewport {
     /// Top visible line.
-    scroll: u16,
+    scroll: usize,
     /// Inner height at the last render.
-    height: u16,
+    height: usize,
     /// Total content lines at the last render.
-    total: u16,
+    total: usize,
 }
 
 impl Viewport {
     /// The current top line, for feeding the render offset.
-    pub fn scroll(&self) -> u16 {
+    pub fn scroll(&self) -> usize {
         self.scroll
     }
 
     /// Record the geometry seen at render time and pull `scroll` back into
     /// range, so a shrunk viewport or a shorter document can never leave the
     /// offset stranded past the end.
-    pub fn resize(&mut self, height: u16, total: u16) {
+    pub fn resize(&mut self, height: usize, total: usize) {
         self.height = height;
         self.total = total;
         self.scroll = self.scroll.min(self.max_scroll());
@@ -36,19 +40,19 @@ impl Viewport {
     /// Update just the content length - the viewport height is unchanged - and
     /// re-clamp. Used when the content behind the viewport swaps for something of
     /// a different length between renders (the diff pane changing files).
-    pub fn set_total(&mut self, total: u16) {
+    pub fn set_total(&mut self, total: usize) {
         self.total = total;
         self.scroll = self.scroll.min(self.max_scroll());
     }
 
     /// The furthest `scroll` may travel so the last line still shows.
-    fn max_scroll(&self) -> u16 {
+    fn max_scroll(&self) -> usize {
         self.total.saturating_sub(self.height)
     }
 
     /// Scroll one line toward the end.
     pub fn line_down(&mut self) {
-        self.scroll = (self.scroll + 1).min(self.max_scroll());
+        self.scroll = self.scroll.saturating_add(1).min(self.max_scroll());
     }
 
     /// Scroll one line toward the start.
@@ -58,7 +62,10 @@ impl Viewport {
 
     /// Scroll a full viewport toward the end.
     pub fn page_down(&mut self) {
-        self.scroll = (self.scroll + self.height).min(self.max_scroll());
+        self.scroll = self
+            .scroll
+            .saturating_add(self.height)
+            .min(self.max_scroll());
     }
 
     /// Scroll a full viewport toward the start.
@@ -68,7 +75,10 @@ impl Viewport {
 
     /// Scroll half a viewport toward the end (a `Ctrl-d`-style nudge).
     pub fn half_page_down(&mut self) {
-        self.scroll = (self.scroll + self.height / 2).min(self.max_scroll());
+        self.scroll = self
+            .scroll
+            .saturating_add(self.height / 2)
+            .min(self.max_scroll());
     }
 
     /// Scroll half a viewport toward the start (a `Ctrl-u`-style nudge).
@@ -179,5 +189,20 @@ mod tests {
         // The document shrinks under the offset; resize must reel it back in.
         v.resize(4, 10);
         assert_eq!(v.scroll(), 6, "resize clamps a now-out-of-range offset");
+    }
+
+    /// The degenerate pane the offset arithmetic has to survive: a zero-height
+    /// viewport at the very end of a maximal document. Stepping past the end must
+    /// clamp, not overflow.
+    #[test]
+    fn stepping_clamps_in_a_zero_height_viewport_at_the_offset_ceiling() {
+        let mut v = Viewport::default();
+        v.resize(0, usize::MAX);
+        v.jump_bottom();
+        assert_eq!(v.scroll(), usize::MAX);
+        v.line_down();
+        assert_eq!(v.scroll(), usize::MAX, "line_down must saturate");
+        v.page_down();
+        assert_eq!(v.scroll(), usize::MAX, "page_down must saturate");
     }
 }

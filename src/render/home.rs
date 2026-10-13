@@ -108,7 +108,7 @@ pub(crate) fn draw(
                         .border_style(pane_border(false))
                         .title(" world "),
                 )
-                .scroll((vp.scroll(), 0)),
+                .scroll((vp.scroll() as u16, 0)),
             world_area,
         );
     }

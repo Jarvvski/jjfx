@@ -2356,7 +2356,7 @@ impl App {
                     render::graph::world_lines(self.graph.as_ref(), self.list.selected(), body_w);
                 self.render
                     .graph_viewport
-                    .resize(body_h.saturating_sub(2), lines.len() as u16);
+                    .resize(body_h.saturating_sub(2) as usize, lines.len());
                 lines
             }
             Mode::Pool(_) | Mode::Detail(_) => Vec::new(),
@@ -2373,7 +2373,7 @@ impl App {
                         && let Some(vp) = &mut self.render.world
                     {
                         let h = (lines.len() as u16).saturating_add(2).min(body_h / 2);
-                        vp.resize(h.saturating_sub(2), lines.len() as u16);
+                        vp.resize(h.saturating_sub(2) as usize, lines.len());
                     }
                     lines
                 } else {

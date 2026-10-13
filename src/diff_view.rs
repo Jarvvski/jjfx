@@ -100,7 +100,7 @@ impl Detail {
         }
         // Reset to the top and retarget the viewport at the newly-selected file's
         // line count, so scrolling clamps correctly even before the next render.
-        let total = self.current().map(|f| f.lines.len()).unwrap_or(0) as u16;
+        let total = self.current().map(|f| f.lines.len()).unwrap_or(0);
         self.viewport.jump_top();
         self.viewport.set_total(total);
         // A fresh lazy highlighter for the new file; it highlights nothing until
@@ -275,7 +275,7 @@ impl Detail {
 
         let Some(fi) = fi else {
             // Nothing to show: keep the viewport height current (nothing to scroll).
-            self.viewport.resize(inner_h as u16, 0);
+            self.viewport.resize(inner_h, 0);
             let msg = if self.loading { " loading…" } else { "" };
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -291,8 +291,8 @@ impl Detail {
         // Record the geometry and clamp scroll to the file's line count (known
         // without highlighting).
         let total = self.files[fi].lines.len();
-        self.viewport.resize(inner_h as u16, total as u16);
-        let start = (self.viewport.scroll() as usize).min(total);
+        self.viewport.resize(inner_h, total);
+        let start = self.viewport.scroll().min(total);
         let end = (start + inner_h).min(total);
 
         let Some(hl) = self.hl.as_mut() else {
@@ -359,6 +359,8 @@ fn elide_left(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
     use crate::diff::{DiffLine, LineKind};
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::from(code)
@@ -459,6 +461,41 @@ mod tests {
         assert!(!d.on_key(key(KeyCode::Left)));
         assert_eq!(d.focus, DetailFocus::Files);
         assert_eq!(d.viewport.scroll(), 0);
+    }
+
+    /// A diff longer than `u16::MAX` lines must still scroll to its end. The
+    /// render records the content length in the viewport, and when that was a
+    /// `u16` the count wrapped: a 70 000-line file capped the offset at 4 424,
+    /// leaving everything past line 4 464 unreachable.
+    #[test]
+    fn a_diff_longer_than_u16_max_still_scrolls_to_its_end() {
+        let lines = (0..70_000)
+            .map(|n| DiffLine {
+                kind: LineKind::Added,
+                text: format!("+line {n}"),
+            })
+            .collect();
+        let mut d = Detail::loading("feat".to_string());
+        d.loaded(vec![FileDiff {
+            path: "big.txt".to_string(),
+            added: 70_000,
+            removed: 0,
+            lines,
+        }]);
+
+        // Record the geometry exactly as the real render does, in a 40-row pane.
+        let mut terminal = Terminal::new(TestBackend::new(120, 42)).expect("test terminal");
+        terminal
+            .draw(|frame| d.render_diff(frame, frame.area()))
+            .expect("diff pane should render");
+
+        d.on_key(key(KeyCode::Right));
+        d.on_key(key(KeyCode::Char('G')));
+        assert_eq!(
+            d.viewport.scroll(),
+            70_000 - 40,
+            "the last line of a 70 000-line diff must be reachable"
+        );
     }
 
     #[test]
