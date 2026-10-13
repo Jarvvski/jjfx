@@ -162,6 +162,33 @@ const POOL_BINDINGS: &[(&str, &str)] = &[
     ("Back", "q / esc"),
 ];
 
+/// Diff-detail keybindings shown by the `?` help overlay. The viewer owns these
+/// keys ([`crate::diff_view`]); the overlay must be reachable from it too.
+const DETAIL_BINDINGS: &[(&str, &str)] = &[
+    ("Scroll down", "j / ↓"),
+    ("Scroll up", "k / ↑"),
+    ("Half page down", "ctrl-d"),
+    ("Half page up", "ctrl-u"),
+    ("Next file", "l / → / tab"),
+    ("Previous file", "h / ←"),
+    ("Go to first", "g"),
+    ("Go to last", "G"),
+    ("Close", "esc"),
+    ("Toggle this help", "?"),
+];
+
+/// Full-screen world-graph keybindings shown by the `?` help overlay.
+const GRAPH_BINDINGS: &[(&str, &str)] = &[
+    ("Move down", "j / ↓"),
+    ("Move up", "k / ↑"),
+    ("Go to first", "g"),
+    ("Go to last", "G"),
+    ("Page down", "PgDn"),
+    ("Page up", "PgUp"),
+    ("Back", "q / esc / W"),
+    ("Toggle this help", "?"),
+];
+
 /// The identity of the single workspace whose setup hook is running.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingWorkspace {
@@ -2172,6 +2199,9 @@ impl App {
         };
         if matches!(base_mode, Mode::Detail(_)) {
             self.render_detail(frame);
+            if matches!(self.mode, Mode::Help(_)) {
+                render::help::draw(frame, DETAIL_BINDINGS);
+            }
             return;
         }
         if matches!(base_mode, Mode::Graph) {
@@ -2181,6 +2211,9 @@ impl App {
                 self.list.selected(),
                 &self.render.graph_viewport,
             );
+            if matches!(self.mode, Mode::Help(_)) {
+                render::help::draw(frame, GRAPH_BINDINGS);
+            }
             return;
         }
         if matches!(base_mode, Mode::Pool(_)) {
@@ -2895,6 +2928,35 @@ mod tests {
     }
 
     #[test]
+    fn help_overlay_renders_over_detail_and_graph() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        // `?` opens the overlay from any mode, so it must be drawn over Detail
+        // and Graph too, not just Normal and Pool.
+        for base in [
+            Mode::Detail(Detail::loading("feat".to_owned())),
+            Mode::Graph,
+        ] {
+            let mut app = app_with(&["default", "feat"]);
+            app.mode = Mode::Help(Box::new(base));
+            let mut term = Terminal::new(TestBackend::new(80, 24)).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+            let text: String = term
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|c| c.symbol())
+                .collect();
+            assert!(
+                text.contains("Keybindings"),
+                "the help overlay must be drawn over every base mode"
+            );
+        }
+    }
+
+    #[test]
     fn help_overlay_clamps_to_a_tiny_terminal() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -2921,6 +2983,8 @@ mod tests {
             NORMAL_BINDINGS
                 .iter()
                 .chain(POOL_BINDINGS)
+                .chain(DETAIL_BINDINGS)
+                .chain(GRAPH_BINDINGS)
                 .all(|(label, key)| !label.is_empty() && !key.is_empty())
         );
     }

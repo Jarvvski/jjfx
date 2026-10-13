@@ -40,7 +40,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 03, 08 |
 | C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
 | T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 |
-| T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 |
+| T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 (fixed) |
 | I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 |
 | C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 (fixed) |
 | C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 |
@@ -113,6 +113,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [16](issues/16-persist-group-before-reset.md) - D5.
 - [17](issues/17-move-blocking-work-off-ui-thread.md) - T1, T6.
 - [18](issues/18-help-overlay-in-detail-and-graph.md) - T2.
+  **resolved** - overlay drawn over Detail/Graph.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
 - [20](issues/20-workspace-cleanup-robustness.md) - C4, C5, C6.
 

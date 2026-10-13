@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Pressing `?` over the diff-detail or full-screen graph view now
+  shows the keybindings overlay instead of freezing the view. The overlay was
+  opened from those modes but never drawn, and it swallowed every key until it
+  was dismissed. (fix)
+
 - 2026-10-13 - Resizing the Worker Pool down no longer risks stranding a Worker.
   The cleanup marker is now written after the Pool manifest, so a failed manifest
   write cannot leave a member carrying a marker that made every later Run on it
