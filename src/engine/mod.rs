@@ -83,6 +83,7 @@ pub use worker_actions::{
     RebaseOutcome, ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs,
     WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
+pub use workspace::jj_lib_compat_notice;
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, WorkerWorkspace,
     WorkerWorkspaceError, WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry,

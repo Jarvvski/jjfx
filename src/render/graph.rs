@@ -298,17 +298,33 @@ pub(crate) fn render_graph_pane(
 }
 
 /// The world graph's rendered lines with loading/empty placeholders - shared by
-/// the full-screen view and the inline home pane.
+/// the full-screen view and the inline home pane. A `jj`/`jj-lib` version
+/// mismatch leads with a warning line so a degraded (empty or partial) graph
+/// reads as degraded rather than silently empty.
 pub(crate) fn world_lines(
     graph: Option<&graph::Graph>,
     selected: Option<&str>,
     width: u16,
 ) -> Vec<Line<'static>> {
-    match graph {
+    let mut lines = match graph {
         Some(g) if !g.chains.is_empty() => world_graph_lines(g, selected, now_millis(), width),
         Some(_) => vec![dim_line(" (no workspaces)")],
         None => vec![dim_line(" loading…")],
+    };
+    if let Some(notice) = graph.and_then(|g| g.notice.as_deref()) {
+        lines.insert(0, notice_line(notice, width));
     }
+    lines
+}
+
+/// The version-mismatch warning rendered atop the world graph.
+fn notice_line(notice: &str, width: u16) -> Line<'static> {
+    Line::from(Span::styled(
+        elide_right(&format!(" ! {notice}"), width as usize),
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 /// Draw the full-screen world graph: a title, the bordered graph scrolled to
@@ -354,4 +370,55 @@ pub(crate) fn draw_world(frame: &mut Frame, lines: Vec<Line<'static>>, viewport:
         )),
         footer,
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A graph carrying (or not) a version notice; empty otherwise, so the
+    /// degraded "no workspaces" branch is what renders.
+    fn graph_with_notice(notice: Option<&str>) -> graph::Graph {
+        graph::Graph {
+            nodes: BTreeMap::new(),
+            trunk_id: None,
+            chains: vec![],
+            notice: notice.map(str::to_string),
+        }
+    }
+
+    fn text(lines: &[Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn world_lines_surfaces_a_version_notice_not_a_silent_empty_graph() {
+        let g = graph_with_notice(Some("jj 0.45 on PATH differs from the jj-lib target 0.46"));
+        let rendered = text(&world_lines(Some(&g), None, 80));
+        assert!(
+            rendered.contains("differs from the jj-lib target"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn world_lines_without_a_notice_is_unchanged() {
+        let g = graph_with_notice(None);
+        let rendered = text(&world_lines(Some(&g), None, 80));
+        assert!(rendered.contains("(no workspaces)"), "{rendered}");
+        assert!(
+            !rendered.contains("differs from the jj-lib target"),
+            "{rendered}"
+        );
+    }
 }

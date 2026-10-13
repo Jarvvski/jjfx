@@ -375,6 +375,11 @@ pub struct App {
     /// The last-loaded commit graph (ticket 11), shared by the world view and the
     /// per-workspace strip in the detail view. `None` until first loaded.
     graph: Option<graph::Graph>,
+    /// A persistent footer warning about the graph's environment - currently a
+    /// `jj`/`jj-lib` version mismatch, which degrades the store read. Seeded at
+    /// startup and refreshed from each [`graph::Graph::notice`] on load, so a
+    /// mismatched `jj` is visible rather than silently misreading the store.
+    graph_notice: Option<String>,
     /// Render-owned scroll/cursor state: the list cursor, the inline world pane
     /// (enabled while `Some`), and the full-screen graph scroll. Kept apart from
     /// domain state so rendering is a pure function of the view model.
@@ -434,6 +439,7 @@ impl App {
             effects: Vec::new(),
             mode: Mode::Normal,
             graph: None,
+            graph_notice: None,
             render: RenderState {
                 world: world_pane.then(Viewport::default),
                 ..RenderState::default()
@@ -484,7 +490,10 @@ impl App {
                 store,
             } => self.on_workspace_deletion_completed(operation, workspace, result, store),
             Msg::DiffLoaded { ws, files } => self.on_diff_loaded(ws, files),
-            Msg::GraphLoaded(graph) => self.graph = Some(graph),
+            Msg::GraphLoaded(graph) => {
+                self.graph_notice = graph.notice.clone();
+                self.graph = Some(graph);
+            }
             Msg::StatusExpired(generation) => {
                 if generation == self.status_gen {
                     self.status = None;
@@ -641,6 +650,14 @@ impl App {
     fn pin_status(&mut self, msg: String) {
         self.status_gen += 1;
         self.status = Some(msg);
+    }
+
+    /// Seed a persistent warning about the graph's environment (a `jj`/`jj-lib`
+    /// version mismatch), shown in the footer until a later graph load replaces
+    /// it. Used at startup, before the first load, so the notice is visible even
+    /// when that load fails.
+    pub(crate) fn set_graph_notice(&mut self, notice: String) {
+        self.graph_notice = Some(notice);
     }
 
     /// Project one already-folded Forge snapshot into presentation state.
@@ -2648,16 +2665,24 @@ impl App {
                     format!(" {msg} "),
                     Style::default().fg(Color::Yellow),
                 )),
-                (None, None, None) => Paragraph::new(Span::styled(
-                    if self.pool.worker_pool.is_some() {
-                        " wsg pool  ·  p manage  j/k move  ? help  q quit "
-                    } else if self.render.world.is_some() {
-                        " j/k move  J/K scroll world  ? help  q quit "
-                    } else {
-                        " j/k move  PgUp/PgDn top/bottom  ? help  q quit "
-                    },
-                    Style::default().add_modifier(Modifier::DIM),
-                )),
+                // A version mismatch persists past any transient status, so it
+                // outranks the key hints until the graph reloads clean.
+                (None, None, None) => match &self.graph_notice {
+                    Some(notice) => Paragraph::new(Span::styled(
+                        format!(" ! {notice} "),
+                        Style::default().fg(Color::Yellow),
+                    )),
+                    None => Paragraph::new(Span::styled(
+                        if self.pool.worker_pool.is_some() {
+                            " wsg pool  ·  p manage  j/k move  ? help  q quit "
+                        } else if self.render.world.is_some() {
+                            " j/k move  J/K scroll world  ? help  q quit "
+                        } else {
+                            " j/k move  PgUp/PgDn top/bottom  ? help  q quit "
+                        },
+                        Style::default().add_modifier(Modifier::DIM),
+                    )),
+                },
             },
             // Help draws its own overlay; the footer stays on the slim hint.
             Mode::Help(_) => Paragraph::new(Span::styled(
@@ -3419,6 +3444,36 @@ mod tests {
         assert!(text.contains("setting up 'feat' ("), "{text}");
         assert!(text.contains("compiling backend"), "{text}");
         assert!(!text.contains("stale output"), "{text}");
+    }
+
+    #[test]
+    fn graph_loaded_adopts_the_version_notice() {
+        let mut app = app_with(&["default"]);
+        let mut g = sample_graph();
+        g.notice = Some("jj mismatch".to_string());
+        app.handle(Msg::GraphLoaded(g));
+        assert_eq!(app.graph_notice.as_deref(), Some("jj mismatch"));
+    }
+
+    #[test]
+    fn footer_surfaces_a_graph_version_notice() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut app = app_with(&["default"]);
+        app.set_graph_notice(
+            "jj 0.45 on PATH differs from the jj-lib target 0.46; update jj".to_string(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("differs from the jj-lib target"), "{text}");
     }
 
     #[tokio::test]
@@ -5976,6 +6031,7 @@ mod tests {
                     child: Some("f2".to_string()),
                 },
             ],
+            notice: None,
         }
     }
 

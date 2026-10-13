@@ -720,6 +720,11 @@ pub fn run(
 }
 
 fn repository(colocate: fn() -> Result<bool>) -> Result<Repository> {
+    // A `jj`/`jj-lib` mismatch warns on every repo command: jjfx is
+    // version-coupled to jj, so a differing binary can make its reads wrong.
+    if let Some(notice) = crate::engine::jj_lib_compat_notice() {
+        eprintln!("warning: {notice}");
+    }
     // New workspaces follow jjfx's `colocate` setting, read lazily so only
     // commands that touch a repository pay for it; a broken config is a loud
     // error, exactly as it is in the TUI.

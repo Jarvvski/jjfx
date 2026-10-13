@@ -1029,6 +1029,38 @@ impl std::fmt::Display for JjVersion {
     }
 }
 
+/// The jj major/minor version `jj-lib` targets - the on-disk store format it
+/// reads (ADR 0007). Kept equal to `Cargo.toml`'s `jj-lib` pin by
+/// `jj_lib_target_tracks_the_cargo_pin`, so it cannot silently drift from the
+/// dependency it describes.
+const JJ_LIB_TARGET: JjVersion = JjVersion {
+    major: 0,
+    minor: 46,
+};
+
+/// A warning when the `jj` on `PATH` does not match [`JJ_LIB_TARGET`], the
+/// version whose store format jj-lib reads. `None` on a match, and `None` when
+/// `jj` cannot be probed at all (a missing or broken jj surfaces its own error
+/// on the CLI paths that need it, so it is not a mismatch to report here).
+///
+/// Public because the shared CLI router (also compiled into the `wsg`
+/// compatibility binary) resolves the engine through `crate::engine`.
+pub fn jj_lib_compat_notice() -> Option<String> {
+    compat_notice(jj_version())
+}
+
+/// The pure comparison behind [`jj_lib_compat_notice`]: `Some(message)` only
+/// when a probed version differs from the jj-lib target.
+fn compat_notice(found: Option<JjVersion>) -> Option<String> {
+    let found = found?;
+    (found != JJ_LIB_TARGET).then(|| {
+        format!(
+            "jj {found} on PATH differs from the jj-lib target {JJ_LIB_TARGET}; \
+             jjfx reads the store with jj-lib and may misread it - install jj {JJ_LIB_TARGET}"
+        )
+    })
+}
+
 /// The jj version jjfx is driving, probed once per process. `None` when `jj
 /// --version` cannot be read; callers then assume the current flag behavior so
 /// a missing or broken jj surfaces its own error rather than a version guess.
@@ -1517,6 +1549,39 @@ mod tests {
             Some(JjVersion { major: 1, minor: 2 })
         );
         assert_eq!(JjVersion::parse("nonsense"), None);
+    }
+
+    #[test]
+    fn jj_lib_compat_notice_fires_only_on_a_mismatch() {
+        // A match, and a jj that cannot be probed, are both silent.
+        assert_eq!(compat_notice(Some(JJ_LIB_TARGET)), None);
+        assert_eq!(compat_notice(None), None);
+
+        let mismatched = JjVersion {
+            major: JJ_LIB_TARGET.major,
+            minor: JJ_LIB_TARGET.minor + 1,
+        };
+        let notice = compat_notice(Some(mismatched)).expect("a mismatch must warn");
+        assert!(notice.contains(&mismatched.to_string()), "{notice}");
+        assert!(notice.contains(&JJ_LIB_TARGET.to_string()), "{notice}");
+    }
+
+    /// `JJ_LIB_TARGET` must track `Cargo.toml`'s `jj-lib` pin, or a dependency
+    /// bump would leave the compat check comparing against a stale version with
+    /// nothing to catch it. Reading the manifest here (rather than a build
+    /// script) keeps the check dependency-free while still failing on drift.
+    #[test]
+    fn jj_lib_target_tracks_the_cargo_pin() {
+        let manifest: toml::Value =
+            toml::from_str(include_str!("../../Cargo.toml")).expect("Cargo.toml is valid TOML");
+        let pin = manifest["dependencies"]["jj-lib"]
+            .as_str()
+            .expect("Cargo.toml pins jj-lib");
+        assert_eq!(
+            JjVersion::parse(pin).expect("the jj-lib pin is a version"),
+            JJ_LIB_TARGET,
+            "JJ_LIB_TARGET must track the jj-lib pin in Cargo.toml"
+        );
     }
 
     #[test]

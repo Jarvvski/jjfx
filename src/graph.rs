@@ -78,6 +78,11 @@ pub struct Graph {
     pub trunk_id: Option<String>,
     /// One chain per workspace, `default` first then alphabetical.
     pub chains: Vec<Chain>,
+    /// A warning about the environment this graph was read in - currently a
+    /// `jj`/`jj-lib` version mismatch ([`crate::engine::jj_lib_compat_notice`]).
+    /// `None` when the read was clean, so a mismatched `jj` degrades to a
+    /// visible notice rather than a silently empty or partial graph.
+    pub notice: Option<String>,
 }
 
 impl Graph {
@@ -201,7 +206,12 @@ pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
         }
     }
 
-    Ok(build(&loaded, &bookmarks, &wc, &immutable, &trunk_id))
+    let mut graph = build(&loaded, &bookmarks, &wc, &immutable, &trunk_id);
+    // A `jj`/`jj-lib` version mismatch degrades this store read; carry the
+    // notice on the graph so the TUI can surface it instead of rendering the
+    // result as if it were trustworthy.
+    graph.notice = crate::engine::jj_lib_compat_notice();
+    Ok(graph)
 }
 
 /// Depth caps: bounded so a pathological repo never stalls the read. The
@@ -262,6 +272,7 @@ fn build(
         trunk_id: loaded.contains_key(trunk_id).then(|| trunk_id.hex()),
         chains,
         nodes,
+        notice: None,
     }
 }
 
@@ -641,6 +652,7 @@ mod tests {
             nodes,
             trunk_id: Some(trunk_id.to_string()),
             chains: vec![],
+            notice: None,
         }
     }
 

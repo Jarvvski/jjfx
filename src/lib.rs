@@ -264,6 +264,12 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         ui.world_pane,
         tx,
     );
+    // A `jj`/`jj-lib` version mismatch degrades the graph read. Surface it up
+    // front, before the first load, so it is visible even if that load errors
+    // and never sends `GraphLoaded`.
+    if let Some(notice) = crate::engine::jj_lib_compat_notice() {
+        app.set_graph_notice(notice);
+    }
     // A persisted-on world pane needs its first graph load requested here (the
     // load is otherwise only triggered by the toggle keys).
     app.set_idle_collapsed(ui.idle_collapsed);
