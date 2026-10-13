@@ -1,6 +1,6 @@
 # Unify the ad-hoc workspace path rule
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 

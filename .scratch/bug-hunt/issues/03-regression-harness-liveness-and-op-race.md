@@ -1,6 +1,6 @@
 # Regression tests: failed-dependency liveness and the Reset/`send` race
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
