@@ -299,6 +299,9 @@ pub enum Msg {
         kind: TidyKind,
         result: Result<usize, String>,
     },
+    /// A background Workspace-list projection finished. The App swaps its store
+    /// for this one, so the list is eventually consistent with disk.
+    StoreReloaded(Store),
 }
 
 /// Which tidy sweep a [`Msg::Tidied`] reports.
@@ -348,6 +351,10 @@ pub struct App {
     lift_failures: Vec<String>,
     /// The single new workspace whose configured command is still running.
     pending_workspace: Option<PendingWorkspace>,
+    /// A Workspace the App just created whose tab is not open yet. The existence
+    /// check waits for the fresh projection, so this carries the intent across
+    /// the asynchronous reload.
+    pending_created_open: Option<(String, std::path::PathBuf)>,
     /// The single workspace whose persistent deletion is running in a blocking
     /// worker. Its tombstone remains visible until completion.
     pending_deletion: Option<PendingDeletion>,
@@ -415,6 +422,7 @@ impl App {
             lift_done: 0,
             lift_failures: Vec::new(),
             pending_workspace: None,
+            pending_created_open: None,
             pending_deletion: None,
             quit_after_deletion: false,
             setup_output: None,
@@ -453,6 +461,7 @@ impl App {
                 result,
             } => self.on_workspace_opened(name, created, result),
             Msg::Tidied { kind, result } => self.on_tidied(kind, result),
+            Msg::StoreReloaded(store) => self.on_store_reloaded(store),
             Msg::WorkspaceSetupOutput {
                 workspace,
                 stream,
@@ -1762,8 +1771,6 @@ impl App {
         }
         self.pending_workspace = None;
         self.setup_output = None;
-        self.store.reload();
-        self.after_store_changed();
         let PendingWorkspace { name, path, .. } = workspace;
 
         if let Err(error) = result {
@@ -1782,8 +1789,22 @@ impl App {
                 }
             };
             self.set_status(status);
+            self.reload();
             return;
         }
+        // Whether the Workspace survived setup can only be judged against a fresh
+        // projection, which arrives asynchronously. Record the intent and let
+        // `Msg::StoreReloaded` open the tab.
+        self.pending_created_open = Some((name, path));
+        self.reload();
+    }
+
+    /// Open the tab for a Workspace the App just created, now that the fresh
+    /// projection can say whether it survived setup.
+    fn open_pending_created_workspace(&mut self) {
+        let Some((name, path)) = self.pending_created_open.take() else {
+            return;
+        };
         let still_exists = self
             .store
             .workspace(&name)
@@ -2171,10 +2192,19 @@ impl App {
     }
 
     /// Re-reconcile from disk; the selection follows its workspace by name.
+    ///
+    /// The projection shells out to jj and the watcher fires this on every
+    /// repository change, so it runs as an effect and lands as
+    /// [`Msg::StoreReloaded`].
     fn reload(&mut self) {
-        self.store.reload();
-        self.restore_pending_deletion();
+        self.emit(Effect::ReloadStore);
+    }
+
+    /// A background Workspace-list projection finished.
+    fn on_store_reloaded(&mut self, store: Store) {
+        self.store = store;
         self.after_store_changed();
+        self.open_pending_created_workspace();
     }
 
     fn after_store_changed(&mut self) {
@@ -3295,27 +3325,40 @@ mod tests {
         assert!(!text.contains("stale output"), "{text}");
     }
 
-    #[test]
-    fn completed_on_create_does_not_open_a_missing_workspace_path() {
+    #[tokio::test]
+    async fn completed_on_create_does_not_open_a_missing_workspace_path() {
         let fake = FakeTerminal::default();
-        let mut app = app_with_terminal(&["default", "feat"], Box::new(fake.clone()));
+        let (mut app, runtime, mut rx) = app_with_store_channel_and_jj(
+            store_for(&["default", "feat"]),
+            Box::new(fake.clone()),
+            Box::new(FakeJj::default()),
+        );
         let path = PathBuf::from("/jjfx-test-path-that-does-not-exist/feat");
         let started_at = Instant::now();
-        app.store.workspace("feat").unwrap();
         app.pending_workspace = Some(PendingWorkspace {
             name: "feat".to_string(),
             path: path.clone(),
             started_at,
         });
 
-        app.handle(Msg::WorkspaceSetupCompleted {
-            workspace: PendingWorkspace {
-                name: "feat".to_string(),
-                path,
-                started_at,
+        handle(
+            &mut app,
+            &runtime,
+            Msg::WorkspaceSetupCompleted {
+                workspace: PendingWorkspace {
+                    name: "feat".to_string(),
+                    path,
+                    started_at,
+                },
+                result: Ok(()),
             },
-            result: Ok(()),
-        });
+        );
+        // The existence check is judged against the fresh projection, so it runs
+        // when that lands rather than against the stale store.
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::StoreReloaded(_))
+        })
+        .await;
 
         assert!(fake.opened.lock().unwrap().is_empty());
         assert!(app.pending_workspace.is_none());
@@ -4799,6 +4842,15 @@ mod tests {
     }
 
     #[test]
+    fn reload_is_requested_as_an_effect_not_run_in_the_fold() {
+        let mut app = app_with(&["default"]);
+        // A synchronous reload would shell out to `jj workspace list` here; the
+        // fold must only ask for the fresh projection.
+        let effects = app.handle(Msg::Reload);
+        assert!(matches!(effects.as_slice(), [Effect::ReloadStore]));
+    }
+
+    #[test]
     fn capital_t_confirms_before_tidy_and_esc_cancels() {
         let mut app = app_with(&["default"]);
         app.handle(press(KeyCode::Char('T')));
@@ -4975,8 +5027,8 @@ mod tests {
             result: Ok(true),
         });
         assert!(matches!(
-            effects.as_slice(),
-            [Effect::Lift { job: LiftJob::Workspace(ws) }] if ws == "feat"
+            effects.last(),
+            Some(Effect::Lift { job: LiftJob::Workspace(ws) }) if ws == "feat"
         ));
         assert_eq!(app.status.as_deref(), Some("lifting feat…"));
 

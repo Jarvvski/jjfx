@@ -1,6 +1,6 @@
 # Move `Store::reload` off the UI thread
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -8,42 +8,64 @@ Blocked by: none
 
 `Store::load` opens the Repository and projects `jj workspace list`
 (`repository.workspaces().projection()`), so it shells out. `Store::reload`
-calls it, and every `App::reload()` plus the `Msg::Reload` branch of the event
-loop calls that **inside the fold**:
+called it, and every `App::reload()` plus the `Msg::Reload` branch of the event
+loop called that **inside the fold**:
 
 - `Msg::Reload` is set by the filesystem watcher, so every `jj` command a user or
-  an agent runs triggers a `jj workspace list` subprocess on the UI thread.
-- `App::reload()` has five call sites (after create/delete/lift/tidy), each
+  an agent ran triggered a `jj workspace list` subprocess on the UI thread.
+- `App::reload()` had five call sites (after create/delete/lift/tidy), each
   blocking the fold.
 
-This is the remaining path from ticket 17's problem statement. It was split out
-because the fix changes *when* the UI reflects disk state: today a reload is
-synchronous and immediately visible, and afterwards it is eventually consistent
-(the store swaps when the background load reports back).
+This was the remaining path from ticket 17's problem statement.
 
 ## Fix
 
-Route the load through the effect seam:
+Routed the load through the effect seam:
 
 1. `Effect::ReloadStore`; the runtime runs `Store::load` on `spawn_blocking` and
-   reports `Msg::StoreReloaded(Box<Store>)`.
+   reports `Msg::StoreReloaded(Store)`.
 2. `Msg::Reload` and `App::reload()` request the effect instead of loading.
-3. The `Msg::StoreReloaded` handler replaces the store, calls
-   `after_store_changed()`, and redraws.
-4. Keep the selection and any pending tombstone stable across the swap - the
-   existing `restore_pending_deletion`/`ensure_selection` calls are the seam.
+3. `on_store_reloaded` swaps the store in, calls `after_store_changed()`, and
+   redraws.
+
+The event loop already collapses a burst of watcher events into one
+`Msg::Reload`, so the batching property is preserved.
+
+`Store::reload` was deleted: its only callers were `Store::create` and
+`Store::delete`, which now reconcile inline. `Store::create` and `Store::delete`
+are test-only paths, so leaving a `pub(crate) fn reload` behind was dead code.
+
+## The create-then-open path
+
+`on_workspace_setup_completed` used to reload synchronously and then check
+`self.store.workspace(&name)` to decide whether the Workspace had survived setup
+before opening its tab. With an asynchronous reload the stale store would always
+fail that check and the tab would never open.
+
+The check now runs when the fresh projection lands: the App records
+`pending_created_open: Option<(String, PathBuf)>` and
+`on_store_reloaded` performs the existence check and then opens the tab (or
+reports "setup finished after the workspace disappeared"). The semantics are
+unchanged; only *when* the check runs moved.
+
+## Commits
+
+1. `Re-project the Workspace list on a background worker` - the effect, the
+   message, the deferred create-then-open check, two tests, and a CHANGELOG
+   `(fix)`.
 
 ## Acceptance Criteria
 
-- [ ] No `jj` subprocess runs on the UI thread for a reload.
-- [ ] A burst of watcher events collapses into one reload (the event loop already
-      batches `Msg::Reload`; keep that property).
-- [ ] The list still reflects a create/delete/tidy promptly.
-- [ ] `mise run check` is green.
+- [x] No `jj` subprocess runs on the UI thread for a reload.
+- [x] A burst of watcher events still collapses into one reload (unchanged: the
+      event loop batches `Msg::Reload` before folding it).
+- [x] The list still reflects a create/delete/tidy promptly; the create tests now
+      drive the reload and assert the tab opens from the fresh projection.
+- [x] `mise run check` is green.
 
 ## Notes
 
-- `Store` must be `Send` to cross the channel; it holds paths and plain data, so
-  this should already hold.
-- Tests that fold `Msg::Reload` and assert `app.store` synchronously will need to
-  drive the effect and await `Msg::StoreReloaded`.
+- `Msg::StoreReloaded` carries the store unboxed, matching the existing
+  `WorkspaceDeletionCompleted { store: Option<Store> }` variant.
+- `reload_is_requested_as_an_effect_not_run_in_the_fold` asserts the fold only
+  asks for the projection.

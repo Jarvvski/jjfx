@@ -224,7 +224,8 @@ impl Store {
             self.colocate,
             |_, _| {},
         )?;
-        self.reload();
+        let repo_root = self.repo_root.clone();
+        *self = Self::load(&repo_root);
         Ok(created)
     }
 
@@ -272,21 +273,16 @@ impl Store {
         new_workspace_path(&self.repo_root, name)
     }
 
-    /// Reconcile the Store from jj and the ws-cache mirror.
-    pub(crate) fn reload(&mut self) {
-        let repo_root = self.repo_root.clone();
-        *self = Self::load(&repo_root);
-    }
-
     /// Forget a workspace in jj, clean up its guarded directory and cache entry,
-    /// then reload the authoritative state from its live sources.
+    /// then reconcile the authoritative state from its live sources.
     #[cfg(test)]
     pub(crate) fn delete(&mut self, name: &str) -> anyhow::Result<()> {
         let path = self
             .workspace(name)
             .and_then(|workspace| workspace.path.clone());
         Self::delete_persisted(&self.repo_root, name, path.as_deref())?;
-        self.reload();
+        let repo_root = self.repo_root.clone();
+        *self = Self::load(&repo_root);
         Ok(())
     }
 

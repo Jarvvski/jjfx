@@ -144,6 +144,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).
   **resolved** - a failed PR read yields `Unknown`, not `Pushed`.
 - [30](issues/30-background-store-reload.md) - the `Store::reload` half of 17.
+  **resolved** - reloaded via `Effect::ReloadStore`.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.

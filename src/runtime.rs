@@ -54,6 +54,12 @@ pub(crate) enum Effect {
     },
     /// Run a remote fetch and report [`Msg::Fetched`].
     Fetch,
+    /// Re-project the Workspace list from disk and report
+    /// [`Msg::StoreReloaded`].
+    ///
+    /// The projection shells out to `jj workspace list`, and the watcher fires
+    /// this on every repository change, so it must not run in the fold.
+    ReloadStore,
     /// Run one queued lift (a single workspace or all of them) and report
     /// [`Msg::Lifted`].
     Lift { job: LiftJob },
@@ -123,6 +129,7 @@ impl Runtime {
                 created,
             } => self.open_workspace(name, path, focus, created),
             Effect::Fetch => self.fetch(),
+            Effect::ReloadStore => self.reload_store(),
             Effect::Lift { job } => self.lift(job),
             Effect::Tidy { kind } => self.tidy(kind),
             Effect::StartForge { targets } => self.start_forge(targets),
@@ -315,6 +322,30 @@ impl Runtime {
                 kind,
                 result: result.map_err(|e| format!("{e:#}")),
             });
+        });
+    }
+
+    /// Re-project the Workspace list on a blocking worker.
+    ///
+    /// `Store::load` opens the Repository and runs `jj workspace list`, so it may
+    /// never run in the fold. The fresh projection replaces the App's store when
+    /// it reports back, which is why the list is eventually - not instantly -
+    /// consistent with disk.
+    fn reload_store(&self) {
+        let tx = self.tx.clone();
+        let repo_root = self.repo_root.clone();
+        let colocate = self.colocate;
+        tokio::spawn(async move {
+            let loaded = tokio::task::spawn_blocking(move || {
+                Store::load(&repo_root).with_colocate(colocate)
+            })
+            .await;
+            // `Store::load` degrades internally rather than failing, so a join
+            // error means it panicked. Keep the current store and let the next
+            // watcher event try again.
+            if let Ok(store) = loaded {
+                let _ = tx.send(Msg::StoreReloaded(store));
+            }
         });
     }
 

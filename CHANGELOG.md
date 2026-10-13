@@ -35,6 +35,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - The Workspace list is re-projected on a background worker. The
+  filesystem watcher fires a reload on every repository change and the
+  projection shells out to `jj workspace list`, so a reload no longer blocks the
+  input fold. The store swap is now eventually consistent, and the
+  create-then-open path waits for the fresh projection to decide whether the
+  Workspace survived setup. (fix)
+
 - 2026-10-13 - Opening or focusing a Workspace tab, and the `t`/`T` tidy sweeps,
   now run as background effects instead of inside the input fold. A slow
   `kitten @ ls` (which can sleep ~5s while a target starts) or a `jj rebase` no
