@@ -182,6 +182,82 @@ fn send_waits_for_the_workspace_operation_lock() {
     );
 }
 
+/// A Rebase rewrites the Worker's working copy, so it must take the same
+/// Workspace-operation lock a Reset holds while restoring. Without it a Rebase
+/// can edit a working copy that is still mid-restore.
+#[test]
+fn rebase_waits_for_the_workspace_operation_lock() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("rebase-lock.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("rebase-lock-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    let command_script =
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n";
+    write_executable(&bin.join("jj"), command_script);
+    write_executable(&bin.join("gh"), command_script);
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    // Hold the same sidecar lock `lock_worker_operation` uses, across processes.
+    let lock_path = repository
+        .root()
+        .join(format!(".jj/pool/{worker}.workspace.lock"));
+    fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock directory");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .expect("operation lock file");
+    flock(&lock_file, FlockOperation::LockExclusive).expect("hold operation lock");
+
+    let capture = temporary_directory.path().join("rebase-lock-commands");
+    let result = temporary_directory.path().join("rebase-lock-result");
+    let mut child = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "repository")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("Rebase helper should start");
+
+    thread::sleep(Duration::from_millis(400));
+    assert!(
+        child.try_wait().expect("try_wait").is_none(),
+        "a Rebase must wait for the Worker's Workspace operation lock"
+    );
+
+    drop(lock_file);
+    let output = child.wait_with_output().expect("helper output");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("command capture"),
+        concat!(
+            "jj rebase -b owner/eng-301-action -d main\n",
+            "jj git push -b owner/eng-301-action\n",
+            "gh -R owner/repo pr view owner/eng-301-action --web\n"
+        )
+    );
+}
+
 #[test]
 fn dismiss_removes_an_idle_worker_and_reduces_pool_capacity() {
     let (_temporary_directory, repository) = local_repository();

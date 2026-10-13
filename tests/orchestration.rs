@@ -155,6 +155,60 @@ fn a_group_with_a_failed_blocker_terminates_instead_of_polling_forever() {
     assert_eq!(summary.counts().blocked(), 1);
 }
 
+/// The runner's own advance step must observe a group whose only blocker has
+/// terminally failed as terminal, so `run` cannot poll it forever.
+///
+/// The bounded loop is the point: before the fix `advance_once` returned `None`
+/// for every cycle, and the loop fails by *observation* (the group is still
+/// non-terminal after the budget) rather than by a `max_cycles` timeout or a
+/// hang.
+#[test]
+fn advance_once_observes_a_failed_blocker_group_as_terminal() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let mut group = DispatchGroupState::new(
+        parent.clone(),
+        WireTimestamp::new("2026-08-04T12:00:00Z"),
+        "owner/repo",
+        DispatchGroupOptions::new(""),
+    );
+    group.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Sub-issue"),
+        SubIssueState::new("Failed", WireStatus::new("failed"), Vec::new()),
+    );
+    group.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Sub-issue"),
+        SubIssueState::new(
+            "Dependent",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Sub-issue")],
+        ),
+    );
+    repository
+        .state_store()
+        .dispatch_group(parent.clone())
+        .commit(Expected::Missing, StateChange::Replace(group))
+        .expect("save group");
+
+    let runner = repository.orchestration_runner();
+    let request = OrchestrationRequest::new(parent.clone(), AgentRuntime::Claude);
+    let mut observed = None;
+    for _ in 0..8 {
+        if let Some(summary) = runner.advance_once(&request, |_| {}).expect("advance") {
+            observed = Some(summary);
+            break;
+        }
+    }
+
+    let summary = observed
+        .expect("a group whose only remaining work is unreachable must be observed as terminal");
+    assert_eq!(summary.parent(), &parent);
+    assert_eq!(summary.counts().failed(), 1);
+    assert_eq!(summary.counts().blocked(), 1);
+}
+
 #[test]
 fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     let directory = TempDir::new().expect("temporary repository");

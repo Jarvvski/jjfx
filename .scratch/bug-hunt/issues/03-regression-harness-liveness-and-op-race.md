@@ -46,9 +46,46 @@ Add integration tests (no production change in this ticket):
 
 ## Acceptance Criteria
 
-- [ ] Both tests exist and fail against `main` without hanging.
-- [ ] The liveness test fails by *observation* (non-terminal after N cycles),
+- [x] Both tests exist and fail against `main` without hanging.
+- [x] The liveness test fails by *observation* (non-terminal after N cycles),
       not by timeout.
+
+## Outcome (2026-10-13)
+
+**Resolved, tests-only** (`jj diff -- src` is empty). One commit,
+`Guard failed-blocker liveness and Rebase serialisation with regression tests`.
+
+Both fixes had already landed, so the tests are green on the current tree - the
+ticket's "builds the red tests" framing predates them. Each test was therefore
+proved real by **temporarily reverting the fix it guards** and capturing the red
+output:
+
+- `tests/orchestration.rs::advance_once_observes_a_failed_blocker_group_as_terminal`
+  persists a group whose blocker is `Failed` with a `pending` dependent, then
+  calls the runner's `advance_once` in a bounded 8-cycle loop. It fails by
+  observation (still non-terminal after the budget), not by `max_cycles` or a
+  hang. Reverting `DispatchGroup::is_terminal` to `values().all(is_terminal)`
+  makes it fail in 0.06s with
+  `a group whose only remaining work is unreachable must be observed as terminal`.
+  This complements the existing `run`-based test by pinning the runner's own
+  advance step.
+- `tests/worker_actions.rs::rebase_waits_for_the_workspace_operation_lock` holds
+  the `.jj/pool/<worker>.workspace.lock` sidecar in-process, spawns the
+  `repository_action_helper` subprocess running `rebase`, asserts it is still
+  blocked after 400ms, then asserts success and the exact
+  `jj rebase` / `jj git push` / `gh pr view` order. Removing
+  `lock_worker_operation` from `follow_up` and `rebase` fails both this test and
+  the existing `send_waits_for_the_workspace_operation_lock`, so ticket 08's fix
+  is now guarded on both halves - previously only `follow_up` was.
+
+**Deliberately not added:** a reset-then-`send` ordering test. The reset
+restoration thread resolves `jj` through the shared process PATH, so it cannot be
+slowed deterministically without racing parallel tests; `follow_up`'s lock (which
+is what that scenario reduces to) is already asserted, and reproven red above.
+
+**Residual risk:** the rebase test has a 400ms blocked-window, mirroring the
+existing send test's convention. Under heavy concurrent load it may need a re-run
+in isolation.
 
 ## Out of Scope
 

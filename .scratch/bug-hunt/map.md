@@ -87,6 +87,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [03](issues/03-regression-harness-liveness-and-op-race.md) - task:
   regression tests for the failed-dependency loop (D1) and the Reset/`send` race
   (C1).
+  **resolved** - tests-only; both guards proved red by reverting the fix they
+  pin (04's quiescence predicate, 08's operation lock on the `rebase` half).
 
 ### Phase 1 - high severity
 
