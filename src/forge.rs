@@ -312,7 +312,7 @@ impl JjAdapter for SystemJj {
         // The whole mutable chain, not just `@`: a weld can bury a conflict in a
         // lower commit while `@` stays clean, and pushing that chain would push
         // broken commits.
-        cmd("jj")
+        let run = cmd("jj")
             .current_dir(dir)
             .args([
                 "--ignore-working-copy",
@@ -324,17 +324,23 @@ impl JjAdapter for SystemJj {
                 "\"x\"",
             ])
             .run()
-            .map(|run| run.ok() && !run.stdout().is_empty())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if !run.ok() {
+            return Err(format!("jj log (conflicts): {}", run.stderr().trim()));
+        }
+        Ok(!run.stdout().is_empty())
     }
 
     fn weld(&self, dir: &Path) -> Result<bool, String> {
-        cmd("jj")
+        let run = cmd("jj")
             .current_dir(dir)
             .args(["rebase", "--skip-emptied", "-s", WELD_SRC, "-d", "trunk()"])
             .run()
-            .map(|run| run.ok())
-            .map_err(|error| error.to_string())
+            .map_err(|error| error.to_string())?;
+        if !run.ok() {
+            return Err(format!("jj rebase: {}", run.stderr().trim()));
+        }
+        Ok(true)
     }
 
     fn push(&self, dir: &Path) -> Result<PushOutcome, String> {
@@ -604,36 +610,28 @@ fn run_pipeline(
     };
 
     for (target, state) in targets.iter().zip(&mut progress) {
-        let has_conflict = jj.has_conflict(&target.dir).unwrap_or_default();
-        if has_conflict {
-            state.active = false;
-            state.reason = Some("working copy has conflicts".into());
-            publish_progress(tx, target, state, Some("working copy has conflicts".into()));
+        if stop_on_conflicts(tx, target, state, jj.has_conflict(&target.dir)) {
             continue;
         }
 
         state.set(Step::Weld, Status::Running);
         publish_progress(tx, target, state, None);
-        let welded = jj.weld(&target.dir).unwrap_or_default();
-        if welded {
-            succeed_step(tx, target, state, Step::Weld);
-        } else {
-            skip_step(
+        match jj.weld(&target.dir) {
+            Ok(true) => succeed_step(tx, target, state, Step::Weld),
+            Ok(false) => skip_step(
                 tx,
                 target,
                 state,
                 Step::Weld,
                 "weld: weld skipped (conflicts?)",
-            );
+            ),
+            Err(error) => skip_step(tx, target, state, Step::Weld, &format!("weld: {error}")),
         }
 
         // A rebase that produced a conflict still exits zero, so re-check the
         // chain: pushing a conflicted chain would push broken commits and open a
         // Pull Request over them.
-        if jj.has_conflict(&target.dir).unwrap_or_default() {
-            state.active = false;
-            state.reason = Some("working copy has conflicts".into());
-            publish_progress(tx, target, state, Some("working copy has conflicts".into()));
+        if stop_on_conflicts(tx, target, state, jj.has_conflict(&target.dir)) {
             continue;
         }
 
@@ -728,6 +726,27 @@ fn skip_step(
     progress.set(step, Status::Skipped);
     progress.reason = Some(reason.to_string());
     publish_progress(tx, target, progress, Some(reason.to_string()));
+}
+
+/// Stop one target before push when its chain has conflicts, or when the
+/// conflict check itself failed. Pushing a conflicted chain would push broken
+/// commits, and a failed check must not read as "clean". Returns `true` when the
+/// target was stopped (the caller `continue`s to the next target).
+fn stop_on_conflicts(
+    tx: &UnboundedSender<Update>,
+    target: &Target,
+    state: &mut Progress,
+    check: Result<bool, String>,
+) -> bool {
+    let reason = match check {
+        Ok(false) => return false,
+        Ok(true) => "working copy has conflicts".to_string(),
+        Err(error) => format!("conflict check failed: {error}"),
+    };
+    state.active = false;
+    state.reason = Some(reason.clone());
+    publish_progress(tx, target, state, Some(reason));
+    true
 }
 
 fn publish_progress(
@@ -991,8 +1010,43 @@ mod tests {
         }
     }
 
-    struct BrokenGitHub;
+    struct ConflictCheckFails;
 
+    impl JjAdapter for ConflictCheckFails {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn has_conflict(&self, _dir: &Path) -> Result<bool, String> {
+            Err("jj log (conflicts): boom".to_string())
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            panic!("weld must not run when the conflict check failed")
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            panic!("push must not run when the conflict check failed")
+        }
+    }
+
+    struct WeldErrors;
+
+    impl JjAdapter for WeldErrors {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Err("jj rebase: boom".to_string())
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
+        }
+    }
+
+    struct BrokenGitHub;
     impl GitHubAdapter for BrokenGitHub {
         fn default_branch(&self, _slug: &str) -> Result<String, String> {
             Err("gh: not authenticated".to_string())
@@ -1559,6 +1613,72 @@ mod tests {
             }) if workspace == "feat"
                 && status(progress, Step::PullRequest) == Status::Skipped
         ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_conflict_check_is_reported_and_does_not_push() {
+        // A broken conflict read must not read as "clean" and carry on to push.
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            Arc::new(ConflictCheckFails),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && !progress.active()
+                && progress.reason() == Some("conflict check failed: jj log (conflicts): boom")
+                && notice == "conflict check failed: jj log (conflicts): boom"
+        )));
+        assert!(!updates.iter().any(|update| matches!(
+            update,
+            Update::Finished { workspace, .. } if workspace == "feat"
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_failed_weld_is_reported_not_silently_skipped() {
+        // A jj rebase failure must surface its error, not read as a conflict skip.
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            Arc::new(WeldErrors),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::Weld) == Status::Skipped
+                && progress.reason() == Some("weld: jj rebase: boom")
+                && notice == "weld: jj rebase: boom"
+        )));
     }
 
     #[tokio::test]

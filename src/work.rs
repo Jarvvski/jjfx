@@ -121,8 +121,9 @@ pub(crate) trait WorkReads {
     /// One Workspace's own change chain (`trunk..<ws>@`), tip first. `None` on a
     /// read failure, rendered as [`WorkState::Unknown`].
     fn chain(&self, workspace: &str) -> Option<Chain>;
-    /// How far trunk has advanced past the Workspace's base.
-    fn behind(&self, workspace: &str) -> u32;
+    /// How far trunk has advanced past the Workspace's base. `Err` when jj could
+    /// not be read - a failed read must not report "0 behind".
+    fn behind(&self, workspace: &str) -> Result<u32, String>;
     /// Insertions/deletions from the base of the owned line to the Workspace's
     /// `@`. `base` is the deepest owned commit's change id, or `None` when the
     /// line reaches the trunk revset itself. `Err` when jj could not be read -
@@ -159,8 +160,8 @@ impl WorkReads for SystemWorkReads {
         read_chain(&self.repo_root, workspace)
     }
 
-    fn behind(&self, workspace: &str) -> u32 {
-        behind(&self.repo_root, workspace)
+    fn behind(&self, workspace: &str) -> Result<u32, String> {
+        behind(&self.repo_root, workspace).map_err(|error| error.to_string())
     }
 
     fn line_delta(&self, workspace: &str, base: Option<&str>) -> Result<(u32, u32), String> {
@@ -208,9 +209,14 @@ pub fn snapshot(reads: &dyn WorkReads, workspaces: &[String]) -> HashMap<String,
                     classify(reads, name, &owned, &prs, prs_known)
                 }
             };
-            let work = Work {
-                state,
-                behind: reads.behind(name),
+            let work = match reads.behind(name) {
+                Ok(behind) => Work { state, behind },
+                // A failed behind read must not report "0 behind": degrade the
+                // row to unknown so the failure is visible, not a plausible zero.
+                Err(_) => Work {
+                    state: WorkState::Unknown,
+                    behind: 0,
+                },
             };
             (name.clone(), work)
         })
@@ -272,11 +278,10 @@ impl<'a> Ownership<'a> {
 /// `behind` measures against a possibly stale `origin/main` while `classify`
 /// measures against local `main`, so a workspace can read `clean` yet be several
 /// commits behind by the same base the dirty/clean check uses. Zero when the
-/// workspace sits on the trunk tip, and zero on any jj read failure (degrade,
-/// don't crash).
-fn behind(repo_root: &Path, ws: &str) -> u32 {
+/// workspace sits on the trunk tip; a jj failure is a typed error, never a zero.
+fn behind(repo_root: &Path, ws: &str) -> anyhow::Result<u32> {
     let trunk = crate::trunk::as_revset();
-    jj(
+    let out = crate::jj::read_at_repo(
         repo_root,
         &[
             "log",
@@ -286,9 +291,8 @@ fn behind(repo_root: &Path, ws: &str) -> u32 {
             "-T",
             "\"x\\n\"",
         ],
-    )
-    .map(|out| out.lines().filter(|l| !l.is_empty()).count() as u32)
-    .unwrap_or(0)
+    )?;
+    Ok(out.lines().filter(|l| !l.is_empty()).count() as u32)
 }
 
 /// Classify one workspace from the commits it owns: overlay a matching PR, else
@@ -774,6 +778,8 @@ mod tests {
         prs_failed: bool,
         chains: HashMap<String, Option<Chain>>,
         behind: HashMap<String, u32>,
+        /// When set, the behind read fails instead of returning a count.
+        behind_failed: bool,
         deltas: HashMap<String, (u32, u32)>,
         /// When set, `line_delta` answers only for this base change id.
         delta_base: Option<String>,
@@ -793,8 +799,11 @@ mod tests {
             self.chains.get(workspace).cloned().unwrap_or(None)
         }
 
-        fn behind(&self, workspace: &str) -> u32 {
-            self.behind.get(workspace).copied().unwrap_or(0)
+        fn behind(&self, workspace: &str) -> Result<u32, String> {
+            if self.behind_failed {
+                return Err("jj log: boom".to_owned());
+            }
+            Ok(self.behind.get(workspace).copied().unwrap_or(0))
         }
 
         fn line_delta(&self, workspace: &str, base: Option<&str>) -> Result<(u32, u32), String> {
@@ -857,6 +866,28 @@ mod tests {
         let fake = FakeWorkReads::default();
         let work = snapshot(&fake, &["gone".to_string()]);
         assert_eq!(work["gone"].state, WorkState::Unknown);
+    }
+
+    #[test]
+    fn a_failed_behind_read_is_unknown_not_zero_behind() {
+        // A failed behind read must not claim "0 behind" - that is the silent
+        // zero this ticket removes. The row degrades to unknown instead.
+        let fake = FakeWorkReads {
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![cc("tip", false, &[], false, true)]),
+            )]),
+            behind_failed: true,
+            ..FakeWorkReads::default()
+        };
+
+        assert_eq!(
+            snapshot(&fake, &["feat".to_string()])["feat"],
+            Work {
+                state: WorkState::Unknown,
+                behind: 0,
+            }
+        );
     }
 
     #[test]
