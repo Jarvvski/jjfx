@@ -33,13 +33,13 @@ mod work;
 mod workspace_dispatch;
 mod workspace_list;
 
-use std::io::Write;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
-use ratatui::crossterm::event;
+use ratatui::crossterm::event::{self, Event};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use crate::app::{App, Msg};
@@ -53,6 +53,16 @@ pub mod test_support {
     pub fn panic_after_tui_init() -> ! {
         let _session = crate::tui::Session::enter().expect("test PTY should enter");
         panic!("intentional terminal restoration test panic");
+    }
+
+    /// Enter the terminal and hold it, for an external PTY signal test. The
+    /// process stays in raw mode on the alternate screen until the test signals
+    /// it, so the handler's restoration is the only thing that can clean up.
+    pub fn block_after_tui_init() -> ! {
+        let _session = crate::tui::Session::enter().expect("test PTY should enter");
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
     }
 }
 
@@ -434,13 +444,52 @@ fn spawn_animation_ticker(tx: UnboundedSender<Msg>, animating: Arc<AtomicBool>) 
     });
 }
 
+/// What the input reader does with one `event::read()` outcome.
+#[derive(Debug, PartialEq, Eq)]
+enum ReadStep {
+    /// Forward the event to the app.
+    Forward(Event),
+    /// The read was interrupted - typically a signal arriving mid-read. The
+    /// event is still pending, so retrying loses nothing.
+    Retry,
+    /// The read failed for good. The reader cannot recover in-process, so the
+    /// app is told instead of the thread dying silently.
+    Fatal(String),
+}
+
+fn classify_read(result: io::Result<Event>) -> ReadStep {
+    match result {
+        Ok(event) => ReadStep::Forward(event),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => ReadStep::Retry,
+        Err(error) => ReadStep::Fatal(error.to_string()),
+    }
+}
+
 /// Read terminal events on a dedicated OS thread (crossterm reads block) and
 /// forward them to the async loop. The thread exits when the channel closes.
+///
+/// A read error must not silently end the thread: the TUI keeps rendering, so
+/// an input-dead session looks exactly like a frozen one. Transient errors are
+/// retried and a fatal one is surfaced as [`Msg::InputFailed`].
+///
+/// The thread is deliberately never joined. It is parked in a blocking
+/// `event::read()`, so joining would hang until the next keypress; the thread
+/// either exits on its own when the receiver is dropped or dies with the
+/// process, and it holds no state worth flushing.
 fn spawn_input_reader(tx: UnboundedSender<Msg>) {
     std::thread::spawn(move || {
-        while let Ok(ev) = event::read() {
-            if tx.send(Msg::Input(ev)).is_err() {
-                break;
+        loop {
+            match classify_read(event::read()) {
+                ReadStep::Forward(event) => {
+                    if tx.send(Msg::Input(event)).is_err() {
+                        return;
+                    }
+                }
+                ReadStep::Retry => continue,
+                ReadStep::Fatal(message) => {
+                    let _ = tx.send(Msg::InputFailed(message));
+                    return;
+                }
             }
         }
     });
@@ -475,5 +524,24 @@ mod tests {
             ),
             "ticks must resume once something animates"
         );
+    }
+
+    /// A signal arriving mid-read must not kill the reader: the event is still
+    /// pending, so that read is retried rather than treated as fatal. Anything
+    /// else is surfaced, because the thread cannot recover in-process.
+    #[test]
+    fn an_interrupted_read_is_retried_and_a_fatal_one_is_surfaced() {
+        assert_eq!(
+            classify_read(Err(io::Error::from(io::ErrorKind::Interrupted))),
+            ReadStep::Retry
+        );
+
+        // A fatal error keeps its own reason, so the footer can show it.
+        let error = io::Error::from(io::ErrorKind::PermissionDenied);
+        let reason = error.to_string();
+        assert_eq!(classify_read(Err(error)), ReadStep::Fatal(reason));
+
+        let event = Event::FocusGained;
+        assert_eq!(classify_read(Ok(event.clone())), ReadStep::Forward(event));
     }
 }

@@ -238,6 +238,10 @@ impl LiftJob {
 pub enum Msg {
     /// A terminal input event (key, resize, ...).
     Input(Event),
+    /// The terminal input reader stopped for good; `String` is the error text.
+    /// Input cannot be recovered in-process, so the app reports it rather than
+    /// leaving a UI that still redraws but never responds to a key again.
+    InputFailed(String),
     /// The repo changed on disk; re-reconcile the store.
     Reload,
     /// A Claude Code hook event, appended to the global log (ADR 0004).
@@ -450,6 +454,7 @@ impl App {
     pub fn handle(&mut self, msg: Msg) -> Vec<Effect> {
         match msg {
             Msg::Input(event) => self.on_input(event),
+            Msg::InputFailed(message) => self.on_input_failed(message),
             Msg::Reload => self.reload(),
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
             Msg::WorkSnapshot(work) => self.work = work,
@@ -719,6 +724,15 @@ impl App {
     /// How far the workspace is behind `trunk()`, `0` until the first snapshot.
     fn behind(&self, w: &Workspace) -> u32 {
         self.work.get(&w.name).map(|wk| wk.behind).unwrap_or(0)
+    }
+
+    /// The terminal input reader stopped for good. Input cannot be recovered
+    /// in-process, so the footer pins the reason: without it a dead reader is
+    /// indistinguishable from a UI that simply ignores keys.
+    fn on_input_failed(&mut self, message: String) {
+        self.pin_status(format!(
+            "terminal input failed: {message}; restart to restore keys"
+        ));
     }
 
     fn on_input(&mut self, event: Event) {
@@ -5133,6 +5147,19 @@ mod tests {
             app.handle(press(KeyCode::Char('u'))).as_slice(),
             [Effect::Fetch]
         ));
+    }
+
+    #[test]
+    fn a_dead_input_reader_pins_a_status_instead_of_failing_silently() {
+        let mut app = app_with(&["default"]);
+        app.handle(Msg::InputFailed("bad file descriptor".to_string()));
+        assert_eq!(
+            app.status.as_deref(),
+            Some("terminal input failed: bad file descriptor; restart to restore keys")
+        );
+        // Pinned, not expiring: the condition cannot clear itself, so a message
+        // that timed out would leave the user with a UI that silently ignores keys.
+        assert!(app.take_effects().is_empty());
     }
 
     #[test]

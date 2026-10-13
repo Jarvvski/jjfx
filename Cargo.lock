@@ -1891,6 +1891,7 @@ dependencies = [
  "sapling-renderdag",
  "serde",
  "serde_json",
+ "signal-hook",
  "syntect",
  "tempfile",
  "thiserror 2.0.18",

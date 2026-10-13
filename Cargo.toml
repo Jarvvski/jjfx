@@ -53,6 +53,12 @@ jiff = "0.2"
 getrandom = "0.4"
 rustix = { version = "1", features = ["fs", "process"] }
 tempfile = "3"
+# Restores the terminal when a fatal signal (SIGINT/SIGTERM/SIGHUP) would
+# otherwise kill the process with the alternate screen and raw mode still
+# active. `unsafe` is forbidden crate-wide and `restore()` is not
+# async-signal-safe, so the signal is delivered to a thread instead of handled
+# in place. Not a new build dependency: crossterm already pulls signal-hook in.
+signal-hook = "0.3"
 thiserror = "2"
 ratatui = "0.29"
 ratatui-textarea = "0.8"

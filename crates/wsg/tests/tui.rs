@@ -59,6 +59,123 @@ fn panic_helper() {
 }
 
 #[test]
+#[ignore = "interactive PTY test; run `mise run test-deep`"]
+fn sigterm_in_the_shared_tui_restores_the_terminal() {
+    assert_signal_restores_the_terminal("TERM");
+}
+
+#[test]
+#[ignore = "interactive PTY test; run `mise run test-deep`"]
+fn sigint_in_the_shared_tui_restores_the_terminal() {
+    assert_signal_restores_the_terminal("INT");
+}
+
+#[test]
+#[ignore = "interactive PTY test; run `mise run test-deep`"]
+fn sighup_in_the_shared_tui_restores_the_terminal() {
+    assert_signal_restores_the_terminal("HUP");
+}
+
+/// Every signal whose default action would strand the terminal must restore it.
+/// One case per signal pins the registered list, not merely the mechanism.
+fn assert_signal_restores_the_terminal(signal: &str) {
+    let pty = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("PTY should open");
+    let mut command = CommandBuilder::new(std::env::current_exe().expect("test binary path"));
+    command.args(["--exact", "signal_helper", "--nocapture"]);
+    command.env("JJFX_SIGNAL_HELPER", "1");
+    let mut child = pty
+        .slave
+        .spawn_command(command)
+        .expect("signal helper should spawn in the PTY");
+    drop(pty.slave);
+    drop(pty.master.take_writer().expect("PTY writer should open"));
+    let process_id = child
+        .process_id()
+        .expect("signal helper should have a process id");
+
+    // Read incrementally so the signal lands *after* the alternate screen is
+    // entered (signalling first would prove nothing), and drain until the helper
+    // has restored and exited.
+    let mut reader = pty
+        .master
+        .try_clone_reader()
+        .expect("PTY reader should open");
+    let (chunk_tx, chunk_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
+        let mut buffer = [0u8; 4096];
+        loop {
+            match std::io::Read::read(&mut reader, &mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => {
+                    if chunk_tx.send(buffer[..read].to_vec()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    let mut output = Vec::new();
+    let mut signalled = false;
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        match chunk_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(chunk) => output.extend_from_slice(&chunk),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        }
+        let text = String::from_utf8_lossy(&output);
+        if !signalled && text.contains("\u{1b}[?1049h") {
+            signalled = true;
+            let status = Command::new("kill")
+                .args([&format!("-{signal}"), &process_id.to_string()])
+                .status()
+                .expect("kill should run");
+            assert!(
+                status.success(),
+                "SIG{signal} should be delivered to the helper"
+            );
+        }
+        if signalled && text.contains("\u{1b}[?1049l") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the helper never restored the terminal: {text}"
+        );
+    }
+
+    let status = child.wait().expect("signal helper should exit");
+    let output = String::from_utf8_lossy(&output).into_owned();
+    assert!(
+        output.contains("\u{1b}[?1049h"),
+        "the helper should have entered the alternate screen: {output}"
+    );
+    assert!(
+        output.contains("\u{1b}[?1049l"),
+        "SIG{signal} should leave the alternate screen: {output}"
+    );
+    assert!(
+        !status.success(),
+        "SIG{signal} should terminate the helper, not exit cleanly: {status:?}"
+    );
+}
+
+#[test]
+fn signal_helper() {
+    if std::env::var_os("JJFX_SIGNAL_HELPER").is_some() {
+        jjfx::test_support::block_after_tui_init();
+    }
+}
+
+#[test]
 fn jjfx_without_arguments_prints_cli_help() {
     let output = Command::new(jjfx_binary())
         .output()

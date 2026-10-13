@@ -35,6 +35,18 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - The terminal is restored when jjfx is killed by a signal. SIGINT,
+  SIGTERM, and SIGHUP used to terminate the TUI with the alternate screen and
+  raw mode still active, leaving the shell echoing nothing until `reset`. The
+  panic hook is now installed before the terminal is touched too, so a panic
+  during setup is restored as well. (fix)
+
+- 2026-10-13 - A failed terminal input read no longer kills the input reader
+  silently. An interrupted read (a signal arriving mid-read) is retried, and any
+  other failure pins a footer message saying input has stopped - previously the
+  thread exited on the first error and the UI kept redrawing while ignoring
+  every key. (fix)
+
 - 2026-10-13 - The atomic-replacement and file-lock primitives are now one
   implementation (`engine/atomic.rs`) instead of two divergent copies in the
   state repository and the Worker Workspace cache. The ws-cache write now
