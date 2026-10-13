@@ -35,6 +35,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Workspace names are quoted wherever they are interpolated into a
+  jj revset, so a name containing a space or a revset metacharacter (`my work`)
+  no longer fails to parse - which read as "no chain", left `behind` at 0, and
+  made `lift` a silent no-op. The workspace list is also read through
+  `stringify(name)`, so a name that needs quoting comes back raw instead of
+  already-quoted and still matches its ws-cache entry. (fix)
+
 - 2026-10-13 - The Workspace list is re-projected on a background worker. The
   filesystem watcher fires a reload on every repository change and the
   projection shells out to `jj workspace list`, so a reload no longer blocks the

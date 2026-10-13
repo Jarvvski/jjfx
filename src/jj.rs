@@ -67,12 +67,19 @@ fn slug_from_url(url: &str) -> Option<String> {
 }
 
 /// Workspace names jj knows in this repo, via
-/// `jj workspace list -T 'name ++ "\n"'`. `--ignore-working-copy` keeps it a
-/// pure read (no snapshot, no commit churn). Returns an empty list on any
-/// failure - the skeleton degrades to the ws-cache + derived default rather than
-/// erroring, and the caller cannot surface errors from inside the alt-screen.
+/// `jj workspace list -T 'stringify(name) ++ "\n"'`. `stringify` is required
+/// because `name` is a symbol: jj renders a name that needs quoting (`my work`)
+/// with its quotes, and a caller wants the raw name jj and the ws-cache agree on.
+/// `--ignore-working-copy` keeps it a pure read (no snapshot, no commit churn).
+/// Returns an empty list on any failure - the skeleton degrades to the ws-cache +
+/// derived default rather than erroring, and the caller cannot surface errors
+/// from inside the alt-screen.
 pub fn workspace_names(repo_root: &Path) -> Vec<String> {
-    let out = read_at_repo(repo_root, &["workspace", "list", "-T", "name ++ \"\\n\""]).ok();
+    let out = read_at_repo(
+        repo_root,
+        &["workspace", "list", "-T", "stringify(name) ++ \"\\n\""],
+    )
+    .ok();
 
     out.into_iter()
         .flat_map(|s| {
@@ -112,12 +119,31 @@ const TIDYWS_SRC: &str =
 /// and never the current `@`. Ported from the `tidy` alias.
 const TIDY_REVSET: &str = "mutable() & empty() & description(exact:'') ~ @ ~ bookmarks() ~ tags()";
 
+/// A workspace or ref name as a jj revset symbol: double-quoted and escaped so a
+/// name containing spaces or revset metacharacters cannot be read as revset
+/// syntax. jj accepts a quoted string wherever it accepts a symbol, so
+/// `"my work"@` names the same working copy `my work@` would if it parsed at all.
+/// Only backslash and double quote need escaping - jj permits both inside a
+/// workspace name, and every other character is literal in a string.
+pub(crate) fn revset_symbol(name: &str) -> String {
+    let mut symbol = String::with_capacity(name.len() + 2);
+    symbol.push('"');
+    for character in name.chars() {
+        if matches!(character, '"' | '\\') {
+            symbol.push('\\');
+        }
+        symbol.push(character);
+    }
+    symbol.push('"');
+    symbol
+}
+
 /// Source revset for lifting one workspace's own stack: the root(s) of its mutable
 /// chain reachable from `<ws>@`. `-s` on this moves the whole stack, so it adapts
 /// to shape on its own - a lone empty `@`, or a multi-commit stack - without
 /// choosing between `-r`/`-s`.
 fn lift_src(ws: &str) -> String {
-    format!("roots(mutable() & mine() & ::{ws}@)")
+    format!("roots(mutable() & mine() & ::{}@)", revset_symbol(ws))
 }
 
 /// Repository-maintenance mutations behind the App's existing test seam. Unlike
@@ -278,5 +304,90 @@ mod tests {
             Some("Jarvvski/jjfx")
         );
         assert_eq!(slug_from_url("nonsense"), None);
+    }
+
+    #[test]
+    fn revset_symbol_quotes_names_that_are_not_bare_symbols() {
+        // A bare identifier still round-trips quoted, and a name with a space or
+        // revset metacharacter can no longer break out of the revset.
+        assert_eq!(revset_symbol("feat"), "\"feat\"");
+        assert_eq!(revset_symbol("my work"), "\"my work\"");
+        assert_eq!(revset_symbol("a(b)"), "\"a(b)\"");
+        // jj permits the quote characters themselves inside a workspace name.
+        assert_eq!(revset_symbol("a\"b"), "\"a\\\"b\"");
+        assert_eq!(revset_symbol("a\\b"), "\"a\\\\b\"");
+    }
+
+    #[test]
+    fn lift_src_quotes_the_workspace_name() {
+        assert_eq!(
+            lift_src("my work"),
+            "roots(mutable() & mine() & ::\"my work\"@)"
+        );
+    }
+
+    /// A throwaway non-colocated jj repository for the real-jj read tests.
+    fn temp_repo(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        let repo =
+            std::env::temp_dir().join(format!("jjfx-jj-{tag}-{}-{nonce}", std::process::id()));
+        let status = std::process::Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
+            .arg(&repo)
+            .status()
+            .expect("jj should be installed");
+        assert!(status.success(), "jj git init should succeed");
+        repo
+    }
+
+    #[test]
+    fn workspace_names_returns_the_raw_name_not_the_quoted_symbol() {
+        // `name` in `workspace list` is a symbol, so jj renders a name needing
+        // quoting (`my work`) with quotes. The caller wants the raw name jj and
+        // the ws-cache agree on.
+        let repo = temp_repo("names");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        let workspace = root
+            .parent()
+            .expect("temporary repository should have a parent")
+            .join(format!(
+                "{}-ws",
+                root.file_name()
+                    .expect("temporary repository should have a name")
+                    .to_string_lossy()
+            ));
+        let status = std::process::Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "workspace",
+                "add",
+                "--name",
+                "my work",
+                "--no-colocate",
+            ])
+            .arg(&workspace)
+            .current_dir(&root)
+            .status()
+            .expect("jj workspace add should run");
+        assert!(status.success(), "jj workspace add should succeed");
+
+        let names = workspace_names(&root);
+        assert!(
+            names.iter().any(|name| name == "my work"),
+            "workspace_names must return the raw name, got {names:?}"
+        );
+
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }

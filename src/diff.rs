@@ -63,7 +63,14 @@ pub fn load(repo_root: &Path, ws: &str) -> Vec<FileDiff> {
     let trunk = trunk::as_revset();
     match jj_read(
         repo_root,
-        &["diff", "--from", &trunk, "--to", &format!("{ws}@"), "--git"],
+        &[
+            "diff",
+            "--from",
+            &trunk,
+            "--to",
+            &format!("{}@", crate::jj::revset_symbol(ws)),
+            "--git",
+        ],
     ) {
         Some(out) => parse(&out),
         None => Vec::new(),

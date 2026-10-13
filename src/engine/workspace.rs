@@ -1126,10 +1126,12 @@ fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError>
 /// List workspace names through an explicit template. The default
 /// `jj workspace list` output is version-coupled (0.44 added workspace roots,
 /// 0.46 added template labels and unreachable paths), so read the `name` field
-/// directly rather than splitting the human-readable line.
+/// directly rather than splitting the human-readable line. `name` is a symbol,
+/// so it is `stringify`d: jj renders a name needing quoting (`my work`) with its
+/// quotes, and every caller here compares against the raw name.
 fn workspace_names(root: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
     let output = Command::new("jj")
-        .args(["workspace", "list", "-T", "name ++ \"\\n\""])
+        .args(["workspace", "list", "-T", "stringify(name) ++ \"\\n\""])
         .current_dir(root)
         .output()
         .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace list: {error}")))?;
@@ -1601,6 +1603,25 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         cleanup_failed_create(&root, "feat", &path, true);
         assert!(path.exists(), "pre-existing directory must be preserved");
+
+        std::fs::remove_dir_all(&path).ok();
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn workspace_names_returns_raw_names_for_names_needing_quoting() {
+        // `name` in the template is a symbol, so jj would render `my work` with
+        // its quotes; the facade compares against the raw name.
+        let repo = temp_repo("raw-names");
+        let root = repo.canonicalize().unwrap();
+        let path = sibling(&root, "my work");
+        add_workspace_with_revision(&root, "my work", &path, None, false).unwrap();
+
+        let names = workspace_names(&root).unwrap();
+        assert!(
+            names.iter().any(|name| name == "my work"),
+            "workspace_names must return the raw name, got {names:?}"
+        );
 
         std::fs::remove_dir_all(&path).ok();
         std::fs::remove_dir_all(&repo).ok();

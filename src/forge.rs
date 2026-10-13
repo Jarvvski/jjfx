@@ -392,9 +392,10 @@ impl JjAdapter for SystemJj {
             .rev()
             .filter(|bookmark| seen.insert(bookmark.clone()))
             .map(|bookmark| {
+                let revset = crate::jj::revset_symbol(&bookmark);
                 let description = crate::jj::read_in_dir(
                     dir,
-                    &["log", "-r", &bookmark, "--no-graph", "-T", "description"],
+                    &["log", "-r", &revset, "--no-graph", "-T", "description"],
                 )
                 .map_err(|error| error.to_string())?;
                 Ok(Change {

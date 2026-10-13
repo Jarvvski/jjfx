@@ -134,6 +134,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 
 - [21](issues/21-typed-jj-access-layer.md) - one jj seam with typed outcomes.
 - [22](issues/22-quote-refs-and-validate-workspace-names.md) - I6.
+  **resolved** - `jj::revset_symbol` quotes every revset/diff builder, and the
+  workspace list is read via `stringify(name)` so a quoted name still matches
+  the ws-cache. (A second root cause: the `name` symbol template.)
 - [23](issues/23-unify-ad-hoc-workspace-paths.md) - I7.
 - [24](issues/24-jj-lib-jj-version-compat-check.md) - version coupling.
 - [25](issues/25-consolidate-state-write-and-lock-helpers.md) - one atomic

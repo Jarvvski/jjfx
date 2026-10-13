@@ -279,7 +279,7 @@ fn behind(repo_root: &Path, ws: &str) -> u32 {
         &[
             "log",
             "-r",
-            &format!("::({trunk}) ~ ::{ws}@"),
+            &format!("::({trunk}) ~ ::{}@", crate::jj::revset_symbol(ws)),
             "--no-graph",
             "-T",
             "\"x\\n\"",
@@ -420,7 +420,7 @@ pub(crate) struct Chain {
 /// real-remote bookmark. `None` on any jj failure.
 fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
     let trunk = crate::trunk::as_revset();
-    let chain = format!("({trunk})..{ws}@");
+    let chain = format!("({trunk})..{}@", crate::jj::revset_symbol(ws));
 
     // Per-commit, newest first: "E"/"N", change id, comma-joined local bookmarks.
     let out = jj(
@@ -492,7 +492,14 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
 fn diff_loc(repo_root: &Path, from: &str, ws: &str) -> Option<(u32, u32)> {
     let out = jj(
         repo_root,
-        &["diff", "--from", from, "--to", &format!("{ws}@"), "--stat"],
+        &[
+            "diff",
+            "--from",
+            from,
+            "--to",
+            &format!("{}@", crate::jj::revset_symbol(ws)),
+            "--stat",
+        ],
     )?;
     parse_diff_stat(&out)
 }
@@ -994,5 +1001,107 @@ mod tests {
         let work = snapshot(&fake, &["feat".to_string()]);
 
         assert!(matches!(work["feat"].state, WorkState::Dirty { .. }));
+    }
+
+    /// A throwaway non-colocated jj repository for the real-jj read tests.
+    fn temp_repo(tag: &str) -> std::path::PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        let repo =
+            std::env::temp_dir().join(format!("jjfx-work-{tag}-{}-{nonce}", std::process::id()));
+        let status = std::process::Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
+            .arg(&repo)
+            .status()
+            .expect("jj should be installed");
+        assert!(status.success(), "jj git init should succeed");
+        repo
+    }
+
+    /// Add a Workspace named `name` to `root`, returning its directory. The
+    /// directory is scoped to the repository so concurrent tests cannot collide.
+    fn add_workspace(root: &Path, name: &str) -> std::path::PathBuf {
+        let path = root
+            .parent()
+            .expect("temporary repository should have a parent")
+            .join(format!(
+                "{}-{}",
+                root.file_name()
+                    .expect("temporary repository should have a name")
+                    .to_string_lossy(),
+                name.replace([' ', '(', ')'], "_")
+            ));
+        let status = std::process::Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "workspace",
+                "add",
+                "--name",
+                name,
+                "--no-colocate",
+            ])
+            .arg(&path)
+            .current_dir(root)
+            .status()
+            .expect("jj workspace add should run");
+        assert!(status.success(), "jj workspace add should succeed");
+        path
+    }
+
+    #[test]
+    fn workspace_names_with_spaces_and_parens_still_read_their_chain() {
+        // jj rejects `::my work@` and `::a(b)@` as revsets, so an unquoted name
+        // used to make the chain read fail and the Workspace read `Unknown`.
+        let repo = temp_repo("chain");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        let reads = SystemWorkReads::new(root.clone());
+        let created: Vec<_> = ["my work", "a(b)"]
+            .into_iter()
+            .map(|name| {
+                let path = add_workspace(&root, name);
+                assert!(
+                    reads.chain(name).is_some(),
+                    "workspace {name:?} must still resolve its chain"
+                );
+                path
+            })
+            .collect();
+
+        for path in created {
+            std::fs::remove_dir_all(&path).ok();
+        }
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn a_space_named_workspace_is_not_unknown_through_the_read_port() {
+        // The shape the work poller reads: one Workspace whose name needs
+        // quoting must classify, not degrade to `Unknown`.
+        let repo = temp_repo("snapshot");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        let workspace = add_workspace(&root, "my work");
+
+        let work = snapshot(
+            &SystemWorkReads::new(root.clone()),
+            &["my work".to_string()],
+        );
+
+        assert_ne!(
+            work["my work"].state,
+            WorkState::Unknown,
+            "a workspace name with a space must not read as Unknown"
+        );
+
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
