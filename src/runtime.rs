@@ -12,12 +12,12 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::app::{LiftJob, Msg, PendingWorkspace, STATUS_TTL};
+use crate::app::{LiftJob, Msg, PendingWorkspace, STATUS_TTL, TidyKind};
 use crate::config::ForgeConfig;
 use crate::diff;
 use crate::forge::{self, Target};
 use crate::graph;
-use crate::jj;
+use crate::jj::{self, Jj};
 use crate::store::{Store, Workspace, WorkspaceCreateError};
 use crate::terminal::Terminal;
 use crate::workspace_dispatch::OperationId;
@@ -38,11 +38,28 @@ pub(crate) enum Effect {
         workspace: Workspace,
         operation: OperationId,
     },
+    /// Focus the Workspace's terminal tab, opening one when it has none, and
+    /// report [`Msg::WorkspaceOpened`].
+    ///
+    /// The decision itself needs a terminal query, so it runs beside the
+    /// subprocess rather than inside the fold.
+    OpenWorkspace {
+        name: String,
+        path: PathBuf,
+        focus: bool,
+        /// Whether the App opened this tab as part of creating the Workspace, so
+        /// a failure reads as "created, but the tab failed" rather than a bare
+        /// open error.
+        created: bool,
+    },
     /// Run a remote fetch and report [`Msg::Fetched`].
     Fetch,
     /// Run one queued lift (a single workspace or all of them) and report
     /// [`Msg::Lifted`].
     Lift { job: LiftJob },
+    /// Run one `tidy`/`tidyws` sweep (jj takes the repo lock) and report
+    /// [`Msg::Tidied`].
+    Tidy { kind: TidyKind },
     /// Run the forge pipeline for these targets, streaming [`Msg::Forge`].
     StartForge { targets: Vec<Target> },
     /// Append a full failure (with context) to the on-disk setup-error log so a
@@ -55,6 +72,9 @@ pub(crate) struct Runtime {
     tx: UnboundedSender<Msg>,
     repo_root: PathBuf,
     terminal: Arc<dyn Terminal>,
+    /// The blocking jj seam. Every mutation it performs holds the repo lock, so
+    /// it is only ever called from a blocking worker, never from the fold.
+    jj: Arc<dyn Jj>,
     forge: forge::Forge,
     /// Whether new workspaces are colocated with Git (jjfx's `colocate`).
     colocate: bool,
@@ -71,6 +91,7 @@ impl Runtime {
         forge: ForgeConfig,
         colocate: bool,
         terminal: Arc<dyn Terminal>,
+        jj: Arc<dyn Jj>,
         failure_log: Option<PathBuf>,
     ) -> Self {
         Self {
@@ -79,6 +100,7 @@ impl Runtime {
             repo_root,
             colocate,
             terminal,
+            jj,
             failure_log,
         }
     }
@@ -94,8 +116,15 @@ impl Runtime {
                 workspace,
                 operation,
             } => self.delete_workspace(workspace, operation),
+            Effect::OpenWorkspace {
+                name,
+                path,
+                focus,
+                created,
+            } => self.open_workspace(name, path, focus, created),
             Effect::Fetch => self.fetch(),
             Effect::Lift { job } => self.lift(job),
+            Effect::Tidy { kind } => self.tidy(kind),
             Effect::StartForge { targets } => self.start_forge(targets),
             Effect::RecordFailure { context, message } => {
                 if let Some(path) = &self.failure_log {
@@ -234,6 +263,56 @@ impl Runtime {
             .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
             let _ = tx.send(Msg::Lifted {
                 job,
+                result: result.map_err(|e| format!("{e:#}")),
+            });
+        });
+    }
+
+    /// Focus or open a Workspace's terminal tab on a blocking worker.
+    ///
+    /// `is_open`/`open`/`focus` all shell out to the multiplexer and `open` can
+    /// sleep while it waits for a target, so none of it may run in the fold.
+    fn open_workspace(&self, name: String, path: PathBuf, focus: bool, created: bool) {
+        let tx = self.tx.clone();
+        let terminal = Arc::clone(&self.terminal);
+        tokio::spawn(async move {
+            let opened = name.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                if terminal.is_open(&opened) {
+                    if focus {
+                        terminal.focus(&opened)
+                    } else {
+                        Ok(())
+                    }
+                } else {
+                    terminal.open(&opened, &path, focus)
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+            let _ = tx.send(Msg::WorkspaceOpened {
+                name,
+                created,
+                result: result.map_err(|e| format!("{e:#}")),
+            });
+        });
+    }
+
+    /// Run one `tidy`/`tidyws` sweep on a blocking worker (jj takes the repo
+    /// lock, so it must never run on the render loop), then report
+    /// [`Msg::Tidied`].
+    fn tidy(&self, kind: TidyKind) {
+        let tx = self.tx.clone();
+        let jj = Arc::clone(&self.jj);
+        tokio::spawn(async move {
+            let result = tokio::task::spawn_blocking(move || match kind {
+                TidyKind::Workspaces => jj.tidyws(),
+                TidyKind::Abandon => jj.tidy(),
+            })
+            .await
+            .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+            let _ = tx.send(Msg::Tidied {
+                kind,
                 result: result.map_err(|e| format!("{e:#}")),
             });
         });

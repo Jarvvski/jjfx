@@ -20,7 +20,6 @@ use crate::diff_view::Detail;
 use crate::engine::{WorkerPoolSnapshot, WorkerStatus};
 use crate::forge::{self, Target};
 use crate::graph;
-use crate::jj;
 use crate::pool_session::{PoolSession, PoolUpdate};
 use crate::render;
 use crate::render::home::{HomeRowKind, HomeView};
@@ -287,6 +286,28 @@ pub enum Msg {
     /// The animation ticker fired; advance the working-glyph frame
     /// ([`App::animate`]).
     Tick,
+    /// A background terminal open/focus finished. `created` marks a tab opened as
+    /// part of creating the Workspace, so a failure can say so.
+    WorkspaceOpened {
+        name: String,
+        created: bool,
+        result: Result<(), String>,
+    },
+    /// A background `tidy`/`tidyws` sweep finished; `result` carries how many
+    /// changes or Workspaces it matched, or jj's error text.
+    Tidied {
+        kind: TidyKind,
+        result: Result<usize, String>,
+    },
+}
+
+/// Which tidy sweep a [`Msg::Tidied`] reports.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TidyKind {
+    /// The non-destructive `tidyws` sweep: reset idle empties onto trunk.
+    Workspaces,
+    /// The destructive `tidy` sweep: abandon junk empty changes.
+    Abandon,
 }
 
 /// How long a transient footer status message stays before expiring.
@@ -338,13 +359,6 @@ pub struct App {
     /// Effects requested during the current fold. [`App::handle`] drains them so
     /// the runtime performs exactly the work the fold asked for.
     effects: Vec<Effect>,
-    /// The multiplexer jjfx drives for workspace tabs (behind a trait so kitty is
-    /// swappable - ticket 07). Shared so a background delete can close its tab
-    /// without taking ownership of the App's terminal adapter.
-    terminal: Arc<dyn Terminal>,
-    /// The jj mutations the destructive verbs perform, behind a trait so they are
-    /// testable against a fake (like `terminal`), rather than shelling out inline.
-    jj: Box<dyn jj::Jj>,
     mode: Mode,
     /// The last-loaded commit graph (ticket 11), shared by the world view and the
     /// per-workspace strip in the detail view. `None` until first loaded.
@@ -375,7 +389,6 @@ impl App {
         store: Store,
         agents: agent::AgentStates,
         terminal: Arc<dyn Terminal>,
-        jj: Box<dyn jj::Jj>,
         world_pane: bool,
         tx: UnboundedSender<Msg>,
     ) -> Self {
@@ -406,8 +419,6 @@ impl App {
             quit_after_deletion: false,
             setup_output: None,
             effects: Vec::new(),
-            terminal,
-            jj,
             mode: Mode::Normal,
             graph: None,
             render: RenderState {
@@ -436,6 +447,12 @@ impl App {
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
             Msg::Lifted { job, result } => self.on_lifted(job, result),
+            Msg::WorkspaceOpened {
+                name,
+                created,
+                result,
+            } => self.on_workspace_opened(name, created, result),
+            Msg::Tidied { kind, result } => self.on_tidied(kind, result),
             Msg::WorkspaceSetupOutput {
                 workspace,
                 stream,
@@ -1678,20 +1695,15 @@ impl App {
             self.set_status(format!("no path known for '{}'", w.name));
             return;
         };
-        let result = if self.terminal.is_open(&w.name) {
-            if focus {
-                self.terminal.focus(&w.name)
-            } else {
-                Ok(())
-            }
-        } else {
-            self.terminal.open(&w.name, &path, focus)
-        };
-        if let Err(e) = result {
-            self.set_status(format!("open failed: {e}"));
-        }
+        // Opening or focusing shells out to the multiplexer and can sleep while a
+        // target starts, so it runs as an effect rather than in the fold.
+        self.emit(Effect::OpenWorkspace {
+            name: w.name.clone(),
+            path,
+            focus,
+            created: false,
+        });
     }
-
     /// `d`: confirm before deleting; the default workspace is undeletable.
     fn begin_delete_selected(&mut self) {
         self.status = None;
@@ -1806,16 +1818,45 @@ impl App {
     }
 
     fn open_created_workspace(&mut self, name: &str, path: &std::path::Path) {
-        match self.terminal.open(name, path, true) {
-            Ok(()) => self.set_status(format!("created '{name}'")),
-            Err(error) => {
-                self.emit(Effect::RecordFailure {
-                    context: format!("open workspace '{name}'"),
-                    message: error.to_string(),
-                });
-                self.set_status(format!("created '{name}', tab failed: {error}"));
-            }
+        // The tab is opened off the fold; `Msg::WorkspaceOpened` reports a failure
+        // back as "created, but the tab failed".
+        self.set_status(format!("created '{name}'"));
+        self.emit(Effect::OpenWorkspace {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            focus: true,
+            created: true,
+        });
+    }
+
+    /// A background terminal open/focus finished.
+    fn on_workspace_opened(&mut self, name: String, created: bool, result: Result<(), String>) {
+        let Err(error) = result else {
+            return;
+        };
+        if created {
+            self.emit(Effect::RecordFailure {
+                context: format!("open workspace '{name}'"),
+                message: error.clone(),
+            });
+            self.set_status(format!("created '{name}', tab failed: {error}"));
+        } else {
+            self.set_status(format!("open failed: {error}"));
         }
+    }
+
+    /// A background `tidy`/`tidyws` sweep finished.
+    fn on_tidied(&mut self, kind: TidyKind, result: Result<usize, String>) {
+        let msg = match (kind, result) {
+            (TidyKind::Workspaces, Ok(0)) => "tidyws: nothing to reset".to_string(),
+            (TidyKind::Workspaces, Ok(n)) => format!("tidyws: reset {n} workspace(s) onto trunk"),
+            (TidyKind::Workspaces, Err(e)) => format!("tidyws failed: {e}"),
+            (TidyKind::Abandon, Ok(0)) => "tidy: nothing to abandon".to_string(),
+            (TidyKind::Abandon, Ok(n)) => format!("tidy: abandoned {n} junk empty change(s)"),
+            (TidyKind::Abandon, Err(e)) => format!("tidy failed: {e}"),
+        };
+        self.set_status(msg);
+        self.reload();
     }
 
     /// Start deleting a workspace without taking the App task off the event
@@ -1882,13 +1923,10 @@ impl App {
         if self.refuse_while_configuring() {
             return;
         }
-        let msg = match self.jj.tidyws() {
-            Ok(0) => "tidyws: nothing to reset".to_string(),
-            Ok(n) => format!("tidyws: reset {n} workspace(s) onto trunk"),
-            Err(e) => format!("tidyws failed: {e}"),
-        };
-        self.set_status(msg);
-        self.reload();
+        // jj takes the repo lock, so the sweep runs as an effect.
+        self.emit(Effect::Tidy {
+            kind: TidyKind::Workspaces,
+        });
     }
 
     /// `T`: confirm before the destructive `tidy` sweep.
@@ -1903,13 +1941,10 @@ impl App {
     /// Abandon junk empties across the repo (mutable, empty, undescribed,
     /// unbookmarked, untagged, never `@`), after confirmation.
     fn tidy(&mut self) {
-        let msg = match self.jj.tidy() {
-            Ok(0) => "tidy: nothing to abandon".to_string(),
-            Ok(n) => format!("tidy: abandoned {n} junk empty change(s)"),
-            Err(e) => format!("tidy failed: {e}"),
-        };
-        self.set_status(msg);
-        self.reload();
+        // jj takes the repo lock, so the sweep runs as an effect.
+        self.emit(Effect::Tidy {
+            kind: TidyKind::Abandon,
+        });
     }
 
     /// `r`: queue the selected workspace's stack onto trunk (local rebase, no
@@ -2587,6 +2622,7 @@ mod tests {
     use crate::runtime::Runtime;
     use crate::store::Workspace;
     use crate::workspace_dispatch::{RecordingAdapter, WorkerCommandResult, WorkerSessionOutcome};
+    use crate::{jj, terminal::Terminal};
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
@@ -2601,6 +2637,9 @@ mod tests {
         existing: Arc<Mutex<Vec<String>>>,
         open_error: Arc<Mutex<Option<String>>>,
         query_error: Arc<Mutex<Option<String>>>,
+        /// How long `open` blocks before recording, standing in for kitty's
+        /// `ensure_ready` subprocesses and its launch sleep.
+        open_delay: Arc<Mutex<Option<Duration>>>,
     }
 
     impl Terminal for FakeTerminal {
@@ -2614,6 +2653,11 @@ mod tests {
             Ok(self.existing.lock().unwrap().iter().cloned().collect())
         }
         fn open(&self, name: &str, _path: &Path, focus: bool) -> anyhow::Result<()> {
+            // Record only after the delay, so a test can observe the in-flight
+            // window the way a real slow `kitten @ ls` produces it.
+            if let Some(delay) = *self.open_delay.lock().unwrap() {
+                std::thread::sleep(delay);
+            }
             self.opened.lock().unwrap().push((name.to_string(), focus));
             if let Some(error) = self.open_error.lock().unwrap().clone() {
                 anyhow::bail!(error);
@@ -2675,14 +2719,18 @@ mod tests {
     }
 
     fn app_with_terminal(names: &[&str], terminal: Box<dyn Terminal>) -> App {
-        app_full(names, terminal, Box::new(FakeJj::default()))
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        App::new(
+            store_for(names),
+            agent::AgentStates::default(),
+            terminal.into(),
+            false,
+            tx,
+        )
     }
 
-    fn app_with_jj(names: &[&str], jj: Box<dyn jj::Jj>) -> App {
-        app_full(names, Box::new(FakeTerminal::default()), jj)
-    }
-
-    fn app_full(names: &[&str], terminal: Box<dyn Terminal>, jj: Box<dyn jj::Jj>) -> App {
+    /// A Store projection holding `names`, for tests that never touch disk.
+    fn store_for(names: &[&str]) -> Store {
         let workspaces = names
             .iter()
             .map(|n| Workspace {
@@ -2690,15 +2738,17 @@ mod tests {
                 path: Some(PathBuf::from(format!("/wt/{n}"))),
             })
             .collect();
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        App::new(
-            Store::from_workspaces_for_test(PathBuf::from("/repo"), workspaces),
-            agent::AgentStates::default(),
-            terminal.into(),
-            jj,
-            false,
-            tx,
-        )
+        Store::from_workspaces_for_test(PathBuf::from("/repo"), workspaces)
+    }
+
+    /// An App plus the Runtime that executes its effects, with a `Jj` the test can
+    /// inspect: the tidy sweeps now run as effects, so their fake must live on the
+    /// runtime rather than the App.
+    fn app_with_jj(
+        names: &[&str],
+        jj: Box<dyn jj::Jj>,
+    ) -> (App, Runtime, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+        app_with_store_channel_and_jj(store_for(names), Box::new(FakeTerminal::default()), jj)
     }
 
     /// An App plus the Runtime that executes its effects, sharing one message
@@ -2706,6 +2756,14 @@ mod tests {
     fn app_with_store_and_channel(
         store: Store,
         terminal: Box<dyn Terminal>,
+    ) -> (App, Runtime, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
+        app_with_store_channel_and_jj(store, terminal, Box::new(FakeJj::default()))
+    }
+
+    fn app_with_store_channel_and_jj(
+        store: Store,
+        terminal: Box<dyn Terminal>,
+        jj: Box<dyn jj::Jj>,
     ) -> (App, Runtime, tokio::sync::mpsc::UnboundedReceiver<Msg>) {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let terminal: Arc<dyn Terminal> = terminal.into();
@@ -2715,16 +2773,10 @@ mod tests {
             ForgeConfig::default(),
             store.colocate(),
             Arc::clone(&terminal),
+            Arc::from(jj),
             None,
         );
-        let app = App::new(
-            store,
-            agent::AgentStates::default(),
-            terminal,
-            Box::new(FakeJj::default()),
-            false,
-            tx,
-        );
+        let app = App::new(store, agent::AgentStates::default(), terminal, false, tx);
         (app, runtime, rx)
     }
 
@@ -2732,6 +2784,27 @@ mod tests {
     fn handle(app: &mut App, runtime: &Runtime, msg: Msg) {
         for effect in app.handle(msg) {
             runtime.execute(effect);
+        }
+    }
+
+    /// Fold messages until `done` matches one, executing the effects each requests
+    /// so a full background request/response cycle completes.
+    async fn handle_until(
+        app: &mut App,
+        runtime: &Runtime,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+        done: impl Fn(&Msg) -> bool,
+    ) {
+        loop {
+            let message = tokio::time::timeout(WAIT_BUDGET, rx.recv())
+                .await
+                .expect("background work completes")
+                .expect("completion message arrives");
+            let matched = done(&message);
+            handle(app, runtime, message);
+            if matched {
+                return;
+            }
         }
     }
 
@@ -2762,19 +2835,25 @@ mod tests {
 
     async fn handle_setup_completion(
         app: &mut App,
+        runtime: &Runtime,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
-        loop {
-            let message = tokio::time::timeout(WAIT_BUDGET, rx.recv())
-                .await
-                .expect("setup hook completes")
-                .expect("completion message arrives");
-            let completed = matches!(message, Msg::WorkspaceSetupCompleted { .. });
-            app.handle(message);
-            if completed {
-                break;
-            }
-        }
+        handle_until(app, runtime, rx, |message| {
+            matches!(message, Msg::WorkspaceSetupCompleted { .. })
+        })
+        .await;
+    }
+
+    /// Wait for the background tab open that creating a Workspace triggers.
+    async fn handle_created_open(
+        app: &mut App,
+        runtime: &Runtime,
+        rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
+    ) {
+        handle_until(app, runtime, rx, |message| {
+            matches!(message, Msg::WorkspaceOpened { .. })
+        })
+        .await;
     }
 
     async fn handle_workspace_deletion_completion(
@@ -3029,8 +3108,8 @@ mod tests {
     fn configuring_workspace_blocks_mutations_that_could_touch_it() {
         let fake_jj = FakeJj::default();
         let fake_terminal = FakeTerminal::default();
-        let mut app = app_full(
-            &["default", "feat"],
+        let (mut app, _runtime, _rx) = app_with_store_channel_and_jj(
+            store_for(&["default", "feat"]),
             Box::new(fake_terminal.clone()),
             Box::new(fake_jj.clone()),
         );
@@ -3069,20 +3148,58 @@ mod tests {
         assert_eq!(*fake_jj.tidy_calls.lock().unwrap(), 0);
     }
 
-    #[test]
-    fn enter_focuses_existing_tab_and_o_opens_background() {
+    #[tokio::test]
+    async fn a_slow_tab_open_does_not_block_input() {
+        let fake = FakeTerminal::default();
+        *fake.open_delay.lock().unwrap() = Some(Duration::from_millis(500));
+        let (mut app, runtime, mut rx) = app_with_store_channel_and_jj(
+            store_for(&["default", "feat"]),
+            Box::new(fake.clone()),
+            Box::new(FakeJj::default()),
+        );
+
+        handle(&mut app, &runtime, press(KeyCode::Down));
+        handle(&mut app, &runtime, press(KeyCode::Char('o')));
+        // The tab is still opening (the fake sleeps), yet the next key was folded
+        // and the row moved: the fold never waited on the multiplexer.
+        handle(&mut app, &runtime, press(KeyCode::Up));
+        assert_eq!(app.list.selected(), Some("default"));
+        assert!(fake.opened.lock().unwrap().is_empty());
+
+        // And the open still completes.
+        handle_created_open(&mut app, &runtime, &mut rx).await;
+        assert_eq!(
+            fake.opened.lock().unwrap().as_slice(),
+            &[("feat".to_string(), false)]
+        );
+    }
+
+    #[tokio::test]
+    async fn enter_focuses_existing_tab_and_o_opens_background() {
         let fake = FakeTerminal::default();
         // Pretend "default"'s tab already exists.
         fake.existing.lock().unwrap().push("default".to_string());
-        let mut app = app_with_terminal(&["default", "feat"], Box::new(fake.clone()));
+        let (mut app, runtime, mut rx) = app_with_store_channel_and_jj(
+            store_for(&["default", "feat"]),
+            Box::new(fake.clone()),
+            Box::new(FakeJj::default()),
+        );
 
         // enter on an existing tab -> focus, no new open.
-        app.handle(press(KeyCode::Enter));
+        handle(&mut app, &runtime, press(KeyCode::Enter));
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::WorkspaceOpened { .. })
+        })
+        .await;
         assert!(fake.opened.lock().unwrap().is_empty());
 
         // o on a not-yet-open workspace -> background open (focus=false).
-        app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Char('o')));
+        handle(&mut app, &runtime, press(KeyCode::Down));
+        handle(&mut app, &runtime, press(KeyCode::Char('o')));
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::WorkspaceOpened { .. })
+        })
+        .await;
         assert_eq!(
             fake.opened.lock().unwrap().as_slice(),
             &[("feat".to_string(), false)]
@@ -4693,7 +4810,20 @@ mod tests {
     }
 
     #[test]
-    fn tidyws_resets_idle_empties_and_reports_the_count() {
+    fn tidyws_requests_the_sweep_as_an_effect() {
+        // jj takes the repo lock, so the sweep must not run inside the fold.
+        let mut app = app_with(&["default"]);
+        let effects = app.handle(press(KeyCode::Char('t')));
+        assert!(matches!(
+            effects.as_slice(),
+            [Effect::Tidy {
+                kind: TidyKind::Workspaces
+            }]
+        ));
+    }
+
+    #[tokio::test]
+    async fn tidyws_reports_the_count_from_the_background_sweep() {
         let fake = FakeJj {
             outcome: FakeOutcome {
                 tidyws_n: 3,
@@ -4701,8 +4831,13 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
-        app.handle(press(KeyCode::Char('t')));
+        let (mut app, runtime, mut rx) = app_with_jj(&["default"], Box::new(fake.clone()));
+        handle(&mut app, &runtime, press(KeyCode::Char('t')));
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::Tidied { .. })
+        })
+        .await;
+
         assert_eq!(*fake.tidyws_calls.lock().unwrap(), 1);
         assert_eq!(
             app.status.as_deref(),
@@ -4710,17 +4845,22 @@ mod tests {
         );
     }
 
-    #[test]
-    fn tidyws_reports_nothing_to_reset_when_no_match() {
+    #[tokio::test]
+    async fn tidyws_reports_nothing_to_reset_when_no_match() {
         let fake = FakeJj::default(); // tidyws_n defaults to 0
-        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
-        app.handle(press(KeyCode::Char('t')));
+        let (mut app, runtime, mut rx) = app_with_jj(&["default"], Box::new(fake.clone()));
+        handle(&mut app, &runtime, press(KeyCode::Char('t')));
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::Tidied { .. })
+        })
+        .await;
+
         assert_eq!(*fake.tidyws_calls.lock().unwrap(), 1);
         assert_eq!(app.status.as_deref(), Some("tidyws: nothing to reset"));
     }
 
-    #[test]
-    fn tidy_runs_only_after_confirmation_and_reports_the_count() {
+    #[tokio::test]
+    async fn tidy_runs_only_after_confirmation_and_reports_the_count() {
         let fake = FakeJj {
             outcome: FakeOutcome {
                 tidy_n: 2,
@@ -4728,11 +4868,16 @@ mod tests {
             },
             ..Default::default()
         };
-        let mut app = app_with_jj(&["default"], Box::new(fake.clone()));
-        app.handle(press(KeyCode::Char('T')));
+        let (mut app, runtime, mut rx) = app_with_jj(&["default"], Box::new(fake.clone()));
+        handle(&mut app, &runtime, press(KeyCode::Char('T')));
         // The prompt is up but nothing has been abandoned yet.
         assert_eq!(*fake.tidy_calls.lock().unwrap(), 0);
-        app.handle(press(KeyCode::Char('y')));
+        handle(&mut app, &runtime, press(KeyCode::Char('y')));
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::Tidied { .. })
+        })
+        .await;
+
         assert_eq!(*fake.tidy_calls.lock().unwrap(), 1);
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(
@@ -5071,7 +5216,8 @@ mod tests {
 
         assert!(terminal.opened.lock().unwrap().is_empty());
         assert_eq!(app.status.as_deref(), Some("setting up 'feat'..."));
-        handle_setup_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &runtime, &mut rx).await;
+        handle_created_open(&mut app, &runtime, &mut rx).await;
 
         assert_eq!(
             terminal.opened.lock().unwrap().as_slice(),
@@ -5107,7 +5253,8 @@ mod tests {
         let path = pending_path(&app);
         wait_for_directory(&path, &mut rx).await;
         std::fs::write(path.join("setup-release"), "").unwrap();
-        handle_setup_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &runtime, &mut rx).await;
+        handle_created_open(&mut app, &runtime, &mut rx).await;
 
         assert_eq!(
             terminal.opened.lock().unwrap().as_slice(),
@@ -5142,7 +5289,7 @@ mod tests {
         let path = pending_path(&app);
         wait_for_directory(&path, &mut rx).await;
         std::fs::write(path.join("setup-release"), "").unwrap();
-        handle_setup_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &runtime, &mut rx).await;
 
         std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
@@ -5157,7 +5304,7 @@ mod tests {
             app_with_store_and_channel(Store::load(&repo), Box::new(terminal.clone()));
 
         submit_new_workspace(&mut app, &runtime, "feat");
-        handle_setup_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &runtime, &mut rx).await;
 
         assert!(app.store.workspace("feat").is_none());
         assert!(app.pending_workspace.is_none());
@@ -5179,7 +5326,8 @@ mod tests {
             app_with_store_and_channel(Store::load(&repo), Box::new(terminal));
 
         submit_new_workspace(&mut app, &runtime, "feat");
-        handle_setup_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &runtime, &mut rx).await;
+        handle_created_open(&mut app, &runtime, &mut rx).await;
 
         assert_eq!(
             app.status.as_deref(),
@@ -5205,7 +5353,7 @@ mod tests {
             app_with_store_and_channel(store, Box::new(terminal.clone()));
 
         submit_new_workspace(&mut app, &runtime, "feat");
-        handle_setup_completion(&mut app, &mut rx).await;
+        handle_setup_completion(&mut app, &runtime, &mut rx).await;
 
         let status = app.status.as_deref().unwrap();
         assert!(status.starts_with("could not create 'feat':"), "{status}");
@@ -5249,12 +5397,13 @@ mod tests {
         std::fs::remove_dir_all(&repo).unwrap();
     }
 
-    #[test]
-    fn unrelated_workspace_actions_remain_available_during_delete() {
+    #[tokio::test]
+    async fn unrelated_workspace_actions_remain_available_during_delete() {
         let terminal = FakeTerminal::default();
-        let mut app = app_with_terminal(
-            &["default", "deleting", "other"],
+        let (mut app, runtime, mut rx) = app_with_store_channel_and_jj(
+            store_for(&["default", "deleting", "other"]),
             Box::new(terminal.clone()),
+            Box::new(FakeJj::default()),
         );
         let workspace = app.store.workspace("deleting").unwrap().clone();
         app.pending_deletion = Some(PendingDeletion {
@@ -5262,9 +5411,13 @@ mod tests {
             workspace,
         });
 
-        app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Down));
-        app.handle(press(KeyCode::Enter));
+        handle(&mut app, &runtime, press(KeyCode::Down));
+        handle(&mut app, &runtime, press(KeyCode::Down));
+        handle(&mut app, &runtime, press(KeyCode::Enter));
+        handle_until(&mut app, &runtime, &mut rx, |msg| {
+            matches!(msg, Msg::WorkspaceOpened { .. })
+        })
+        .await;
 
         assert_eq!(app.list.selected(), Some("other"));
         assert_eq!(
@@ -5703,7 +5856,6 @@ mod tests {
             Store::from_workspaces_for_test(PathBuf::from("/repo"), vec![]),
             agent::AgentStates::default(),
             Arc::from(Box::new(FakeTerminal::default()) as Box<dyn Terminal>),
-            Box::new(FakeJj::default()),
             true,
             tx,
         );

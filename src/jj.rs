@@ -122,7 +122,7 @@ fn lift_src(ws: &str) -> String {
 
 /// Repository-maintenance mutations behind the App's existing test seam. Unlike
 /// the read paths, each surfaces jj's error text for footer presentation.
-pub trait Jj: Send {
+pub trait Jj: Send + Sync {
     /// Reset idle, empty, undescribed workspace working-copies onto the trunk base
     /// (`jj rebase -s <ws-empties> -d <trunk>`), returning how many matched. A
     /// no-op (returning 0) when nothing is eligible, so it never errors on an empty

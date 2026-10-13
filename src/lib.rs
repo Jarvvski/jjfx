@@ -240,13 +240,13 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         config.forge,
         config.colocate,
         Arc::clone(&terminal),
+        Arc::new(jj::RealJj::new(repo_root.clone())),
         Some(events::setup_error_log_path()),
     );
     let mut app = App::new(
         Store::load(&repo_root).with_colocate(config.colocate),
         initial_agents,
         terminal,
-        Box::new(jj::RealJj::new(repo_root.clone())),
         ui.world_pane,
         tx,
     );

@@ -35,6 +35,11 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Opening or focusing a Workspace tab, and the `t`/`T` tidy sweeps,
+  now run as background effects instead of inside the input fold. A slow
+  `kitten @ ls` (which can sleep ~5s while a target starts) or a `jj rebase` no
+  longer freezes the TUI. (fix)
+
 - 2026-10-13 - A failed `gh pr list` is no longer reported as "no Pull
   Requests". The read now surfaces the failure, and a pushed Workspace whose
   Pull Request state cannot be read shows as unknown instead of claiming it

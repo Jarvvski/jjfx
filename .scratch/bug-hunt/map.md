@@ -39,7 +39,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | D3 | work | - | refuted | git-exported bookmarks count as "pushed" - `remote_bookmarks()` already excludes `@git` | 06 |
 | C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 08 (fixed) |
 | C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
-| T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 |
+| T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 (fixed) |
 | T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 (fixed) |
 | I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 (fixed) |
 | C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 (fixed) |
@@ -57,7 +57,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T3 | events | M | S | one invalid UTF-8 byte wipes all startup agent state | 19 (fixed) |
 | T4 | events | M | S | replay/tailer offset race drops events | 19 (fixed) |
 | T5 | events | M | S | rotation only at startup; unbounded `events.jsonl` growth + rotation race | 19 (fixed, residual race documented) |
-| T6 | TUI | M | S | blocking `jj tidy`/`tidyws` on the UI thread | 17 |
+| T6 | TUI | M | S | blocking `jj tidy`/`tidyws` on the UI thread | 17 (fixed) |
 | T7 | TUI | M | S | per-tick `canonicalize` and duplicate graph/row projection per frame | 26 |
 | I6 | work | M-L | S | workspace names interpolated unquoted into revsets | 22 |
 | I7 | workspace | M-L | S | two divergent ad-hoc workspace path rules (CLI vs TUI) | 23 |
@@ -120,6 +120,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [16](issues/16-persist-group-before-reset.md) - D5.
   **resolved** - persist-before-reset in the retry path.
 - [17](issues/17-move-blocking-work-off-ui-thread.md) - T1, T6.
+  **resolved** - tab opens and tidy sweeps run as effects; `Jj` moved to the
+  runtime. `Store::reload` split to 30.
 - [18](issues/18-help-overlay-in-detail-and-graph.md) - T2.
   **resolved** - overlay drawn over Detail/Graph.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
@@ -141,6 +143,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [28](issues/28-misc-low-severity-fixes.md) - I10, C8, D6, D7, D8, D9, I11, T10.
 - [29](issues/29-distinguish-pr-read-failure.md) - I2 (split out of 10).
   **resolved** - a failed PR read yields `Unknown`, not `Pushed`.
+- [30](issues/30-background-store-reload.md) - the `Store::reload` half of 17.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
