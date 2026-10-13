@@ -16,8 +16,9 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
-use crate::cmd::{Run, cmd};
+use crate::cmd::cmd;
 use crate::config::ForgeConfig;
+use crate::jj::PushOutcome;
 
 mod pull_requests;
 
@@ -34,9 +35,6 @@ mod pull_requests;
 const WELD_SRC: &str = "roots(mutable() & mine() & ::@)";
 /// Push revisions: this workspace's chain, minus trunk and any conflicts.
 const PUSH_REVS: &str = "::@ ~ trunk() ~ conflicts()";
-/// jj prints this (exit 0) when a push had nothing to do - the signal that a
-/// push moved no revisions despite succeeding.
-const NOTHING_CHANGED: &str = "Nothing changed.";
 
 /// The four forge steps, in pipeline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,21 +71,6 @@ pub(crate) enum Status {
     Ok,
     /// The step did nothing useful (nothing to push, weld hit conflicts, ...).
     Skipped,
-}
-
-/// The outcome of one `jj git push`.
-///
-/// A non-zero exit is a *failure*, never "nothing to push": the no-op marker is
-/// only meaningful on a zero exit. Conflating the two is how a stale remote used
-/// to look like a successful forge.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum PushOutcome {
-    /// Revisions moved to the remote.
-    Pushed,
-    /// jj exited zero and reported there was nothing to push.
-    Nothing,
-    /// The push failed; carries jj's own message.
-    Failed(String),
 }
 
 /// A workspace to forge: its name and the directory whose `@` the revsets target.
@@ -355,12 +338,7 @@ impl JjAdapter for SystemJj {
     }
 
     fn push(&self, dir: &Path) -> Result<PushOutcome, String> {
-        let run = cmd("jj")
-            .current_dir(dir)
-            .args(["git", "push", "--revisions", PUSH_REVS])
-            .run()
-            .map_err(|error| error.to_string())?;
-        Ok(push_outcome(&run))
+        crate::jj::push(dir, PUSH_REVS).map_err(|error| error.to_string())
     }
 
     fn origin_slug(&self) -> Result<Option<String>, String> {
@@ -763,27 +741,6 @@ fn publish_progress(
         progress: progress.clone(),
         notice,
     });
-}
-
-/// Classifies one `jj git push` run.
-///
-/// A non-zero exit is a failure even when jj's output also mentions the no-op
-/// marker; only a zero exit with no marker counts as real work.
-fn push_outcome(run: &Run) -> PushOutcome {
-    if !run.ok() {
-        let stderr = run.stderr().trim();
-        let message = if stderr.is_empty() {
-            run.stdout().trim()
-        } else {
-            stderr
-        };
-        return PushOutcome::Failed(message.to_string());
-    }
-    if run.stdout().contains(NOTHING_CHANGED) || run.stderr().contains(NOTHING_CHANGED) {
-        PushOutcome::Nothing
-    } else {
-        PushOutcome::Pushed
-    }
 }
 
 #[cfg(test)]

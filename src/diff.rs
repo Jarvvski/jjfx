@@ -161,6 +161,15 @@ fn header_path(rest: &str) -> String {
     rest.strip_prefix("a/").unwrap_or(rest).to_string()
 }
 
+/// Total insertions/deletions across a parsed diff - the line delta the work
+/// list shows, summed from the Git-format diff rather than jj's English `--stat`
+/// summary.
+pub fn line_totals(files: &[FileDiff]) -> (u32, u32) {
+    files.iter().fold((0, 0), |(added, removed), file| {
+        (added + file.added, removed + file.removed)
+    })
+}
+
 /// A resumable, lazy highlighter for one file's diff. syntect's highlighter is
 /// stateful and must be fed lines top-down, so to show line N correctly lines
 /// `0..N` must already be highlighted - but no further. [`ensure`](Self::ensure)
@@ -378,6 +387,14 @@ index 3333333..4444444 100644
     fn empty_diff_yields_no_files() {
         assert!(parse("").is_empty());
         assert!(parse("   \n\n").is_empty());
+    }
+
+    #[test]
+    fn line_totals_sums_every_files_counts() {
+        // Matches `jj diff --stat`'s "2 files changed, 3 insertions(+), 2 deletions(-)"
+        // for SAMPLE, derived from the Git diff rather than the English summary.
+        assert_eq!(line_totals(&parse(SAMPLE)), (3, 2));
+        assert_eq!(line_totals(&[]), (0, 0));
     }
 
     #[test]

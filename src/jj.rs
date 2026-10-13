@@ -1,11 +1,19 @@
-//! Minimal jj reads via the CLI. The skeleton only needs the set of workspace
-//! *names* jj knows about; jj does not record each workspace's filesystem path
-//! (spike 02), so paths come from the ws-cache. Richer reads move to jj-lib in
-//! later epics (ADR 0007).
+//! The one jj access layer: every jj semantic jjfx reads is derived here, from a
+//! machine-readable source, and returned as a typed outcome.
+//!
+//! jj does not record each workspace's filesystem path (spike 02), so paths come
+//! from the ws-cache. Where a semantic needs jj state, this layer reads it through
+//! jj's template language (`-T`), a purpose-built flag (`--count`), or the Git
+//! diff format - never by scanning jj's English status prose. A jj failure is a
+//! typed error ([`anyhow::Result`]), never a silent empty/zero result: callers
+//! can always tell "jj said zero/none" from "jj could not be read". Richer reads
+//! move to jj-lib in later epics (ADR 0007).
 
 use std::path::{Path, PathBuf};
 
-use crate::cmd::cmd;
+use anyhow::Context;
+
+use crate::cmd::{Run, cmd};
 
 /// Run a read-only jj command against the repo, returning stdout on success. The
 /// single home for the read incantation: `--repository <repo_root>
@@ -71,24 +79,23 @@ fn slug_from_url(url: &str) -> Option<String> {
 /// because `name` is a symbol: jj renders a name that needs quoting (`my work`)
 /// with its quotes, and a caller wants the raw name jj and the ws-cache agree on.
 /// `--ignore-working-copy` keeps it a pure read (no snapshot, no commit churn).
-/// Returns an empty list on any failure - the skeleton degrades to the ws-cache +
-/// derived default rather than erroring, and the caller cannot surface errors
-/// from inside the alt-screen.
-pub fn workspace_names(repo_root: &Path) -> Vec<String> {
+/// A jj failure is a typed error, never an empty list: the caller must be able to
+/// tell "jj reports no workspaces" from "jj could not be read".
+pub fn workspace_names(repo_root: &Path) -> anyhow::Result<Vec<String>> {
     let out = read_at_repo(
         repo_root,
         &["workspace", "list", "-T", "stringify(name) ++ \"\\n\""],
-    )
-    .ok();
+    )?;
+    Ok(parse_workspace_names(&out))
+}
 
-    out.into_iter()
-        .flat_map(|s| {
-            s.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty())
-                .map(String::from)
-                .collect::<Vec<_>>()
-        })
+/// Split `jj workspace list` template output into the raw workspace names it
+/// emitted, one per line. Blank lines are dropped.
+fn parse_workspace_names(out: &str) -> Vec<String> {
+    out.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(String::from)
         .collect()
 }
 
@@ -181,7 +188,7 @@ impl RealJj {
 
 impl Jj for RealJj {
     fn tidyws(&self) -> anyhow::Result<usize> {
-        let n = count(&self.repo_root, TIDYWS_SRC);
+        let n = count(&self.repo_root, TIDYWS_SRC)?;
         if n == 0 {
             return Ok(0);
         }
@@ -201,7 +208,7 @@ impl Jj for RealJj {
     }
 
     fn tidy(&self) -> anyhow::Result<usize> {
-        let n = count(&self.repo_root, TIDY_REVSET);
+        let n = count(&self.repo_root, TIDY_REVSET)?;
         if n == 0 {
             return Ok(0);
         }
@@ -221,7 +228,7 @@ impl Jj for RealJj {
 /// method (the boxed trait object cannot move to a worker thread).
 pub fn lift(repo_root: &Path, ws: &str) -> anyhow::Result<bool> {
     let src = lift_src(ws);
-    if count(repo_root, &src) == 0 {
+    if count(repo_root, &src)? == 0 {
         return Ok(false);
     }
     let trunk = crate::trunk::as_revset();
@@ -237,7 +244,7 @@ pub fn lift(repo_root: &Path, ws: &str) -> anyhow::Result<bool> {
 /// `false` when there is nothing to lift. Blocking, like [`lift`].
 pub fn lift_all(repo_root: &Path) -> anyhow::Result<bool> {
     let src = "roots(mutable() & mine() & ::working_copies())";
-    if count(repo_root, src) == 0 {
+    if count(repo_root, src)? == 0 {
         return Ok(false);
     }
     let trunk = crate::trunk::as_revset();
@@ -258,17 +265,111 @@ pub fn fetch(repo_root: &Path) -> anyhow::Result<()> {
     run_mut(repo_root, &["git", "fetch"])
 }
 
-/// Count the revisions matching `revset` via a pure read (`--ignore-working-copy`,
-/// no snapshot). Zero on any failure - the caller then treats it as "nothing to
-/// do" rather than erroring.
-fn count(repo_root: &Path, revset: &str) -> usize {
-    read_at_repo(
-        repo_root,
-        &["log", "-r", revset, "--no-graph", "-T", "\"x\\n\""],
-    )
-    .ok()
-    .map(|s| s.lines().filter(|l| !l.is_empty()).count())
-    .unwrap_or(0)
+/// Count the revisions matching `revset`, via jj's own `--count` - a structured
+/// number, not a scraped line count. A jj failure is a typed error: a broken
+/// revset must never read as "nothing to do".
+fn count(repo_root: &Path, revset: &str) -> anyhow::Result<usize> {
+    let out = read_at_repo(repo_root, &["log", "-r", revset, "--count"])?;
+    parse_count(&out)
+}
+
+/// Parse the bare integer `jj log --count` prints. Any non-integer output is an
+/// error, not a zero: the count's *absence* must be distinguishable.
+fn parse_count(out: &str) -> anyhow::Result<usize> {
+    out.trim()
+        .parse()
+        .with_context(|| format!("parsing `jj log --count` output {out:?}"))
+}
+
+/// The outcome of one `jj git push`, classified from jj's remote-bookmark state
+/// rather than its English status line.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PushOutcome {
+    /// A remote bookmark moved, so the remote was updated.
+    Pushed,
+    /// jj exited zero and left every remote bookmark where it was.
+    Nothing,
+    /// The push failed; carries jj's own message.
+    Failed(String),
+}
+
+/// Push `revset` from `dir` (`jj git push --revisions`), classifying the result
+/// from the remote-bookmark state before and after it. A non-zero exit is a
+/// failure, never "nothing to push"; a successful push that moved no remote
+/// bookmark is [`PushOutcome::Nothing`]. This replaces sniffing jj's English
+/// `"Nothing changed."` line, which could not tell a no-op from a broken push.
+pub fn push(dir: &Path, revset: &str) -> anyhow::Result<PushOutcome> {
+    let before = remote_bookmark_snapshot(dir)?;
+    let run = cmd("jj")
+        .current_dir(dir)
+        .args(["git", "push", "--revisions", revset])
+        .run()?;
+    let after = run
+        .ok()
+        .then(|| remote_bookmark_snapshot(dir))
+        .transpose()?;
+    Ok(classify_push(&run, &before, after.as_deref()))
+}
+
+/// Classify one push from its captured run and the remote-bookmark snapshots
+/// taken before and after it (`None` when the push failed, so no after-read was
+/// made). Pure, so every outcome is unit-testable with a stub jj run.
+fn classify_push(run: &Run, before: &str, after: Option<&str>) -> PushOutcome {
+    if !run.ok() {
+        let stderr = run.stderr().trim();
+        let message = if stderr.is_empty() {
+            run.stdout().trim()
+        } else {
+            stderr
+        };
+        return PushOutcome::Failed(message.to_string());
+    }
+    if after == Some(before) {
+        PushOutcome::Nothing
+    } else {
+        PushOutcome::Pushed
+    }
+}
+
+/// The `(remote/name, commit-id)` pairs of every remote bookmark, as one
+/// canonical (sorted) string. Two snapshots compare equal iff jj's remote-tracked
+/// state is unchanged, which is how a push tells real work from a no-op without
+/// reading English. `commit_id` (not `change_id`) is the target: an amend moves a
+/// bookmark to a new commit id under the same change id, and that is a push.
+fn remote_bookmark_snapshot(dir: &Path) -> anyhow::Result<String> {
+    let out = read_in_dir(
+        dir,
+        &[
+            "log",
+            "-r",
+            "remote_bookmarks()",
+            "--no-graph",
+            "-T",
+            "remote_bookmarks.map(|b| b.remote() ++ \"/\" ++ b.name() ++ \" \" ++ commit_id).join(\"\\n\") ++ \"\\n\"",
+        ],
+    )?;
+    Ok(canonical_snapshot(&out))
+}
+
+/// Sort and trim a raw snapshot so two reads of the same state compare equal
+/// regardless of log ordering.
+fn canonical_snapshot(out: &str) -> String {
+    let mut lines: Vec<&str> = out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    lines.sort_unstable();
+    lines.join("\n")
+}
+
+/// Insertions/deletions from the `from` revset to the `to` revset, as a
+/// structured count. Reads the Git-format diff - a machine format - and sums its
+/// `+`/`-` lines, rather than parsing the English `--stat` summary
+/// ("3 files changed, 12 insertions(+), ..."). A jj failure is a typed error.
+pub fn diff_line_delta(repo_root: &Path, from: &str, to: &str) -> anyhow::Result<(u32, u32)> {
+    let out = read_at_repo(repo_root, &["diff", "--from", from, "--to", to, "--git"])?;
+    Ok(crate::diff::line_totals(&crate::diff::parse(&out)))
 }
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.
@@ -326,6 +427,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn parse_count_reads_a_bare_integer() {
+        assert_eq!(parse_count("0\n").expect("zero parses"), 0);
+        assert_eq!(parse_count("4\n").expect("four parses"), 4);
+        assert_eq!(parse_count("  12  ").expect("whitespace trims"), 12);
+    }
+
+    #[test]
+    fn parse_count_rejects_non_integer_output() {
+        // A count that is not a number must be an error, never a silent zero.
+        assert!(parse_count("not a number").is_err());
+        assert!(parse_count("").is_err());
+    }
+
+    #[test]
+    fn parse_workspace_names_trims_and_drops_blanks() {
+        assert_eq!(
+            parse_workspace_names("default\nmy work\n\n"),
+            vec!["default".to_string(), "my work".to_string()]
+        );
+        assert!(parse_workspace_names("\n  \n").is_empty());
+    }
+
+    #[test]
+    fn count_errors_on_a_broken_repository_instead_of_zero() {
+        // The silent-zero defect: a broken repo used to read as "nothing to do".
+        let broken = Path::new("/nonexistent/jjfx-no-such-repo");
+        assert!(count(broken, "all()").is_err());
+    }
+
+    #[test]
+    fn workspace_names_errors_on_a_broken_repository_instead_of_empty() {
+        // The sibling defect: a broken repo used to read as "no workspaces".
+        let broken = Path::new("/nonexistent/jjfx-no-such-repo");
+        assert!(workspace_names(broken).is_err());
+    }
+
+    #[test]
+    fn classify_push_reads_a_non_zero_exit_as_a_failure() {
+        // A non-zero exit is a failure even when the output also mentions a no-op
+        // marker: the old English sniff could not tell the two apart.
+        let run = Run::for_test(false, "Nothing changed.", "remote rejected the update");
+        assert_eq!(
+            classify_push(&run, "before", None),
+            PushOutcome::Failed("remote rejected the update".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_push_falls_back_to_stdout_when_stderr_is_empty() {
+        let run = Run::for_test(false, "boom", "");
+        assert_eq!(
+            classify_push(&run, "before", None),
+            PushOutcome::Failed("boom".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_push_reads_a_zero_exit_with_an_unchanged_snapshot_as_nothing() {
+        let run = Run::for_test(true, "Nothing changed.", "");
+        assert_eq!(
+            classify_push(&run, "origin/feat abc", Some("origin/feat abc")),
+            PushOutcome::Nothing
+        );
+    }
+
+    #[test]
+    fn classify_push_reads_a_moved_remote_bookmark_as_pushed() {
+        let run = Run::for_test(true, "", "");
+        assert_eq!(
+            classify_push(&run, "origin/feat abc", Some("origin/feat def")),
+            PushOutcome::Pushed
+        );
+        // A newly-created remote bookmark (before is empty) is also a push.
+        assert_eq!(
+            classify_push(&run, "", Some("origin/feat def")),
+            PushOutcome::Pushed
+        );
+    }
+
+    #[test]
+    fn canonical_snapshot_is_order_independent() {
+        assert_eq!(
+            canonical_snapshot("b 2\na 1\n\n"),
+            canonical_snapshot("a 1\nb 2\n")
+        );
+    }
+
+    #[test]
+    fn diff_line_delta_reads_the_git_diff_not_the_stat_summary() {
+        // The count must come from the Git diff, not jj's English `--stat`
+        // summary. `one\ntwo\n` -> `one\nTWO\nthree\n` is 2 insertions, 1
+        // deletion.
+        let repo = temp_repo("delta");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").expect("writing a.txt");
+        run_mut(&root, &["describe", "-m", "first"]).expect("describe snapshots the file");
+        run_mut(&root, &["new"]).expect("new commit");
+        std::fs::write(root.join("a.txt"), "one\nTWO\nthree\n").expect("writing a.txt");
+        run_mut(&root, &["describe", "-m", "second"]).expect("describe snapshots the change");
+
+        assert_eq!(
+            diff_line_delta(&root, "@-", "@").expect("the git diff reads"),
+            (2, 1)
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
     /// A throwaway non-colocated jj repository for the real-jj read tests.
     fn temp_repo(tag: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
@@ -381,7 +591,7 @@ mod tests {
             .expect("jj workspace add should run");
         assert!(status.success(), "jj workspace add should succeed");
 
-        let names = workspace_names(&root);
+        let names = workspace_names(&root).expect("workspace names read succeeds");
         assert!(
             names.iter().any(|name| name == "my work"),
             "workspace_names must return the raw name, got {names:?}"

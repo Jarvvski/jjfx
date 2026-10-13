@@ -197,8 +197,9 @@ impl Run {
     }
 
     /// Captured stderr, whether or not the run succeeded. jj writes its status
-    /// lines (e.g. "Nothing changed.") here, so callers that must tell a no-op
-    /// from real work read this even on a zero exit.
+    /// and error lines here, so a failed run can carry jj's own message. jjfx
+    /// never derives a semantic from this English text - the typed jj access
+    /// layer in `jj` classifies outcomes from machine-readable state instead.
     pub fn stderr(&self) -> &str {
         &self.stderr
     }
@@ -217,6 +218,21 @@ impl Run {
             Ok(self.stdout)
         } else {
             Err(anyhow!("{} failed: {}", self.label, self.stderr.trim()))
+        }
+    }
+}
+
+#[cfg(test)]
+impl Run {
+    /// A canned run, for tests that classify captured jj output without spawning
+    /// a subprocess - the stub jj the typed access layer's outcomes are exercised
+    /// against.
+    pub(crate) fn for_test(ok: bool, stdout: &str, stderr: &str) -> Self {
+        Self {
+            label: "jj (test)".to_string(),
+            ok,
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
         }
     }
 }

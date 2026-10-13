@@ -125,8 +125,9 @@ pub(crate) trait WorkReads {
     fn behind(&self, workspace: &str) -> u32;
     /// Insertions/deletions from the base of the owned line to the Workspace's
     /// `@`. `base` is the deepest owned commit's change id, or `None` when the
-    /// line reaches the trunk revset itself.
-    fn line_delta(&self, workspace: &str, base: Option<&str>) -> Option<(u32, u32)>;
+    /// line reaches the trunk revset itself. `Err` when jj could not be read -
+    /// a failed diff must not be reported as a zero delta.
+    fn line_delta(&self, workspace: &str, base: Option<&str>) -> Result<(u32, u32), String>;
 }
 
 /// The production adapter: jj CLI reads plus one `gh pr list` (ADR 0007).
@@ -162,11 +163,12 @@ impl WorkReads for SystemWorkReads {
         behind(&self.repo_root, workspace)
     }
 
-    fn line_delta(&self, workspace: &str, base: Option<&str>) -> Option<(u32, u32)> {
+    fn line_delta(&self, workspace: &str, base: Option<&str>) -> Result<(u32, u32), String> {
         let from = base
             .map(|change_id| format!("{change_id}-"))
             .unwrap_or_else(crate::trunk::as_revset);
-        diff_loc(&self.repo_root, &from, workspace)
+        let to = format!("{}@", crate::jj::revset_symbol(workspace));
+        crate::jj::diff_line_delta(&self.repo_root, &from, &to).map_err(|error| error.to_string())
     }
 }
 
@@ -304,8 +306,12 @@ fn classify(
         // deepest owned commit's parent) so a shared ancestor's diff is excluded.
         WorkState::Dirty { .. } => {
             let base = owned.last().map(|c| c.change_id.as_str());
-            let (added, removed) = reads.line_delta(ws, base).unwrap_or((0, 0));
-            WorkState::Dirty { added, removed }
+            match reads.line_delta(ws, base) {
+                Ok((added, removed)) => WorkState::Dirty { added, removed },
+                // A failed diff read must not claim a zero delta - report the
+                // state as unknown rather than a plausible-looking clean zero.
+                Err(_) => WorkState::Unknown,
+            }
         }
         // Without a Pull Request read, a pushed commit may already have an open
         // or merged Pull Request. Say the state is unknown rather than claiming it
@@ -488,46 +494,6 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
     Some(Chain { commits })
 }
 
-/// Insertions/deletions from `from` to `<ws>@`, parsed from `jj diff --stat`.
-fn diff_loc(repo_root: &Path, from: &str, ws: &str) -> Option<(u32, u32)> {
-    let out = jj(
-        repo_root,
-        &[
-            "diff",
-            "--from",
-            from,
-            "--to",
-            &format!("{}@", crate::jj::revset_symbol(ws)),
-            "--stat",
-        ],
-    )?;
-    parse_diff_stat(&out)
-}
-
-/// Parse the summary line of `--stat`, e.g.
-/// "3 files changed, 12 insertions(+), 4 deletions(-)". Either clause may be
-/// absent when there are none of that kind.
-fn parse_diff_stat(stat: &str) -> Option<(u32, u32)> {
-    let summary = stat.lines().last()?;
-    let mut added = 0;
-    let mut removed = 0;
-    for clause in summary.split(',') {
-        let clause = clause.trim();
-        if let Some(n) = clause
-            .strip_suffix(" insertions(+)")
-            .or(clause.strip_suffix(" insertion(+)"))
-        {
-            added = n.trim().parse().unwrap_or(0);
-        } else if let Some(n) = clause
-            .strip_suffix(" deletions(-)")
-            .or(clause.strip_suffix(" deletion(-)"))
-        {
-            removed = n.trim().parse().unwrap_or(0);
-        }
-    }
-    Some((added, removed))
-}
-
 /// Run a read-only jj command, returning stdout on success or `None` on any
 /// failure. `--ignore-working-copy` keeps it a pure read - jjfx must never
 /// snapshot the working copy (that would churn commits and ping its own watcher).
@@ -538,26 +504,6 @@ fn jj(repo_root: &Path, args: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn parse_stat_handles_both_clauses_and_singulars() {
-        assert_eq!(
-            parse_diff_stat("f | 1\n3 files changed, 12 insertions(+), 4 deletions(-)"),
-            Some((12, 4))
-        );
-        assert_eq!(
-            parse_diff_stat("1 file changed, 1 insertion(+)"),
-            Some((1, 0))
-        );
-        assert_eq!(
-            parse_diff_stat("1 file changed, 2 deletions(-)"),
-            Some((0, 2))
-        );
-        assert_eq!(
-            parse_diff_stat("0 files changed, 0 insertions(+), 0 deletions(-)"),
-            Some((0, 0))
-        );
-    }
 
     #[test]
     fn review_verdict_parses_gh_values() {
@@ -831,6 +777,8 @@ mod tests {
         deltas: HashMap<String, (u32, u32)>,
         /// When set, `line_delta` answers only for this base change id.
         delta_base: Option<String>,
+        /// When set, the diff read fails instead of returning a delta.
+        delta_failed: bool,
     }
 
     impl WorkReads for FakeWorkReads {
@@ -849,11 +797,14 @@ mod tests {
             self.behind.get(workspace).copied().unwrap_or(0)
         }
 
-        fn line_delta(&self, workspace: &str, base: Option<&str>) -> Option<(u32, u32)> {
-            if self.delta_base.as_deref() != base {
-                return None;
+        fn line_delta(&self, workspace: &str, base: Option<&str>) -> Result<(u32, u32), String> {
+            if self.delta_failed {
+                return Err("jj diff: boom".to_owned());
             }
-            self.deltas.get(workspace).copied()
+            if self.delta_base.as_deref() != base {
+                return Ok((0, 0));
+            }
+            Ok(self.deltas.get(workspace).copied().unwrap_or((0, 0)))
         }
     }
 
@@ -953,6 +904,25 @@ mod tests {
                 added: 7,
                 removed: 2,
             }
+        );
+    }
+
+    #[test]
+    fn a_failed_diff_read_is_unknown_not_a_zero_delta() {
+        // A failed diff read must not claim "dirty +0/-0": that is the silent
+        // zero this ticket removes. The state degrades to unknown instead.
+        let fake = FakeWorkReads {
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![cc("tip", false, &[], false, true)]),
+            )]),
+            delta_failed: true,
+            ..FakeWorkReads::default()
+        };
+
+        assert_eq!(
+            snapshot(&fake, &["feat".to_string()])["feat"].state,
+            WorkState::Unknown
         );
     }
 

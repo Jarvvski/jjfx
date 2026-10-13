@@ -373,6 +373,11 @@ async fn event_loop(
 /// Recompute the work-lifecycle snapshot on an interval and whenever nudged via
 /// `refresh_rx`, sending each result as [`Msg::WorkSnapshot`]. The jj/gh reads
 /// are blocking, so they run on `spawn_blocking`.
+///
+/// `jj::workspace_names` reports a typed error rather than an empty list when jj
+/// cannot be read. The poller cannot surface that from inside the alt-screen, so
+/// it degrades deliberately: it reuses the last good names so a transient failure
+/// does not blank the work list, and retries on the next tick.
 fn spawn_work_poller(
     repo_root: PathBuf,
     tx: UnboundedSender<Msg>,
@@ -380,20 +385,24 @@ fn spawn_work_poller(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+        let mut last_names: Vec<String> = Vec::new();
         loop {
             let root = repo_root.clone();
-            let snapshot = tokio::task::spawn_blocking(move || {
-                let mut names = jj::workspace_names(&root);
+            let previous = last_names.clone();
+            let polled = tokio::task::spawn_blocking(move || {
+                let mut names = jj::workspace_names(&root).unwrap_or(previous);
                 if !names.iter().any(|n| n == store::DEFAULT_WORKSPACE) {
                     names.push(store::DEFAULT_WORKSPACE.to_string());
                 }
-                work::snapshot(&work::SystemWorkReads::new(root), &names)
+                let snapshot = work::snapshot(&work::SystemWorkReads::new(root), &names);
+                (names, snapshot)
             })
             .await;
-            if let Ok(snapshot) = snapshot
-                && tx.send(Msg::WorkSnapshot(snapshot)).is_err()
-            {
-                break;
+            if let Ok((names, snapshot)) = polled {
+                last_names = names;
+                if tx.send(Msg::WorkSnapshot(snapshot)).is_err() {
+                    break;
+                }
             }
             tokio::select! {
                 _ = interval.tick() => {}
