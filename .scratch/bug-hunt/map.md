@@ -127,8 +127,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
   **resolved** - lossy line reader, replay offset, in-tailer rotation.
 - [20](issues/20-workspace-cleanup-robustness.md) - C4, C5, C6.
-  **partial** - C5 fixed; C4 needs a terminal/job-control decision, C6 needs a
-  way to test a SIGKILL-surviving group.
+  **ready-for-human** - C5 fixed; C4 needs a terminal/job-control decision, C6
+  needs a way to test a SIGKILL-surviving group. Reclassified from
+  `ready-for-agent`: both remaining items are decision-blocked, not work-blocked.
 
 ### Phase 3 - improvements
 

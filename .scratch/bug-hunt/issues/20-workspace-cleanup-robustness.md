@@ -1,8 +1,22 @@
 # Harden Workspace and process cleanup
 
-Status: ready-for-agent
+Status: ready-for-human
 Type: task
 Blocked by: none
+
+## Reclassified (2026-10-13)
+
+Moved from `ready-for-agent` to `ready-for-human`. C5 landed, and both remaining
+items are blocked on a decision rather than on work:
+
+- **C4** needs the owner to choose between three options (below). The correct one
+  requires `tcsetpgrp` around the foreground Run, which is a change to the CLI's
+  terminal handling, not a spawn flag.
+- **C6** needs a test strategy. Its failure mode requires a process group to
+  survive `SIGKILL`, which cannot be arranged deterministically, so the fix would
+  land unverified - which this effort does not do.
+
+Everything actionable in this ticket is done.
 
 ## Progress (2026-10-13)
 
