@@ -210,6 +210,7 @@ impl Runtime {
     fn delete_workspace(&self, workspace: Workspace, operation: OperationId) {
         let tx = self.tx.clone();
         let repo_root = self.repo_root.clone();
+        let colocate = self.colocate;
         let known_path = workspace.path.clone();
         let terminal = Arc::clone(&self.terminal);
         let workspace_name = workspace.name.clone();
@@ -221,7 +222,7 @@ impl Runtime {
                 let deletion =
                     Store::delete_persisted(&repo_root, &workspace_name, known_path.as_deref())
                         .map_err(|error| format!("{error:#}"));
-                let store = Store::load(&repo_root);
+                let store = Store::load(&repo_root).with_colocate(colocate);
                 (deletion, store)
             })
             .await;
@@ -359,5 +360,78 @@ impl Runtime {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    use tokio::sync::mpsc::unbounded_channel;
+
+    use crate::jj::RealJj;
+    use crate::store::test_local_repo;
+
+    /// A terminal double: deletion only closes a tab, which is a no-op here.
+    #[derive(Default)]
+    struct NoopTerminal;
+
+    impl Terminal for NoopTerminal {
+        fn is_open(&self, _name: &str) -> bool {
+            false
+        }
+
+        fn open_workspaces(&self) -> anyhow::Result<BTreeSet<String>> {
+            Ok(BTreeSet::new())
+        }
+
+        fn open(&self, _name: &str, _path: &Path, _focus: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn focus(&self, _name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn close(&self, _name: &str) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn deletion_reports_a_store_that_keeps_the_runtime_colocate_setting() {
+        let repo_root = test_local_repo("runtime-colocate");
+        let (tx, mut rx) = unbounded_channel();
+        let runtime = Runtime::new(
+            tx,
+            repo_root.clone(),
+            ForgeConfig::default(),
+            false,
+            Arc::new(NoopTerminal),
+            Arc::new(RealJj::new(repo_root.clone())),
+            None,
+        );
+
+        runtime.execute(Effect::DeleteWorkspace {
+            workspace: Workspace {
+                name: "absent".to_owned(),
+                path: None,
+            },
+            operation: 1,
+        });
+
+        let message = rx.recv().await.expect("deletion should report back");
+        let Msg::WorkspaceDeletionCompleted {
+            store: Some(store), ..
+        } = message
+        else {
+            panic!("expected a completed deletion with a store: {message:?}");
+        };
+        assert!(!store.colocate());
+
+        let _ = std::fs::remove_dir_all(repo_root);
     }
 }
