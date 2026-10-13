@@ -617,11 +617,17 @@ pub struct RepositoryIdentity(String);
 
 impl RepositoryIdentity {
     /// Validates an `owner/name` Repository slug.
+    ///
+    /// GitHub owner and repository names are restricted to
+    /// `[A-Za-z0-9._-]`, so nothing else is accepted. This keeps the slug safe
+    /// to interpolate into the `gh` command string in a Dispatch prompt.
     pub fn parse(value: impl Into<String>) -> Result<Self, TicketValueError> {
         let value = value.into().trim().to_owned();
         let mut parts = value.split('/');
-        if parts.next().is_none_or(str::is_empty)
-            || parts.next().is_none_or(str::is_empty)
+        let owner = parts.next().unwrap_or_default();
+        let name = parts.next().unwrap_or_default();
+        if !is_repository_component(owner)
+            || !is_repository_component(name)
             || parts.next().is_some()
         {
             return Err(TicketValueError::InvalidRepositoryIdentity(value));
@@ -633,6 +639,14 @@ impl RepositoryIdentity {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+}
+
+/// Whether a Repository slug component is a GitHub-legal owner or name.
+fn is_repository_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
+        })
 }
 
 /// A safely excluded discovery entry.

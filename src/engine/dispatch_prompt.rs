@@ -7,6 +7,31 @@ use crate::engine::{
     RepositoryIdentity, Ticket, TicketDetails,
 };
 
+/// Opening delimiter for untrusted tracker content inlined into a prompt.
+const UNTRUSTED_OPEN: &str = "<<<UNTRUSTED TICKET DATA";
+/// Closing delimiter. Stripped from the content so it cannot be forged.
+const UNTRUSTED_CLOSE: &str = "END UNTRUSTED TICKET DATA>>>";
+/// Cap on inlined untrusted characters, so a runaway Ticket cannot blow the
+/// prompt budget.
+const MAX_UNTRUSTED_CHARS: usize = 20_000;
+
+/// Renders untrusted tracker text as a labelled, delimited data block.
+///
+/// Ticket titles, descriptions, and blocker titles come from Linear and are not
+/// trusted: they may contain newlines, control characters, or instructions
+/// aimed at the agent. Stripping control characters, capping the length, and
+/// removing the closing delimiter keeps the text inside a region the agent is
+/// told to treat as data, never as instructions.
+fn untrusted_block(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .filter(|character| !character.is_control() || matches!(character, '\n' | '\t'))
+        .take(MAX_UNTRUSTED_CHARS)
+        .collect::<String>()
+        .replace(UNTRUSTED_CLOSE, "");
+    format!("{UNTRUSTED_OPEN}\n{}\n{UNTRUSTED_CLOSE}", cleaned.trim())
+}
+
 /// Delivery obligations supplied by a Dispatch caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryContract {
@@ -140,23 +165,23 @@ impl DispatchPromptBuilder {
         {
             system_prompt.push_str(&format!(
                 "\n\nSTACKED BRANCH: Your Workspace is based on prerequisite work:\n{}\n\nCRITICAL: Do NOT rebase onto main. Your changes build on the prerequisite branch or branches.",
-                dependency.description()
+                untrusted_block(dependency.description())
             ));
         }
         // When the Ticket body was fetched at dispatch time, inline it and make
         // every tracker interaction best-effort so a runtime without Linear
         // tools can still implement and deliver.
         let mut worker_prompt = format!(
-            "Implement Linear Ticket {}: {}.\n\n",
+            "Implement Linear Ticket {}.\n\nTICKET TITLE:\n{}\n\n",
             context.ticket.id(),
-            context.ticket.title().as_str(),
+            untrusted_block(context.ticket.title().as_str()),
         );
         if let Some(details) = context.ticket_details.as_ref() {
             worker_prompt.push_str("TICKET DETAILS:\n");
             if details.description().trim().is_empty() {
                 worker_prompt.push_str("(the tracker returned no description)\n");
             } else {
-                worker_prompt.push_str(details.description().trim());
+                worker_prompt.push_str(&untrusted_block(details.description()));
                 worker_prompt.push('\n');
             }
             worker_prompt.push_str(

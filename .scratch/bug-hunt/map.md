@@ -53,7 +53,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | I3 | forge | M | S | conflict detection only inspects `@`; a lower-commit conflict welds and pushes | 10 |
 | I4 | forge | M | S | `pushed_something` sniffs the English string `"Nothing changed."`; a failed push reads as no-op | 10 |
 | I5 | store | M | S | `default` workspace pinned to the current workspace when launched from a secondary workspace | 11 (fixed) |
-| I8 | dispatch | M | S | untrusted Linear text injected verbatim into prompts | 12 |
+| I8 | dispatch | M | S | untrusted Linear text injected verbatim into prompts | 12 (fixed) |
 | T3 | events | M | S | one invalid UTF-8 byte wipes all startup agent state | 19 |
 | T4 | events | M | S | replay/tailer offset race drops events | 19 |
 | T5 | events | M | S | rotation only at startup; unbounded `events.jsonl` growth + rotation race | 19 |
@@ -108,6 +108,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [11](issues/11-normalize-repository-root.md) - I5 (blocked by 02).
   **resolved** - root normalised at discovery.
 - [12](issues/12-fence-untrusted-ticket-content.md) - I8.
+  **resolved** - fenced + slug validation.
 - [13](issues/13-deduplicate-dispatch-tickets.md) - I9.
 - [14](issues/14-single-source-branch-prefix.md) - D2.
   **resolved** - resolution matches on the Ticket id.

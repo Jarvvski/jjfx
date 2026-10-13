@@ -35,6 +35,13 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Dispatch prompts now inline untrusted Linear Ticket text (title,
+  description, and blocker titles) inside a labelled data fence, with control
+  characters stripped and length capped, and the Repository slug is validated to
+  GitHub's character set. A Ticket can no longer smuggle instructions or a
+  forged fence terminator into the agent's prompt, nor inject shell syntax into
+  the interpolated `gh` command. (fix)
+
 - 2026-10-13 - `send`, `review`, and `rebase` now take the Worker's
   Workspace-operation lock, matching Dispatch and Reset. A Follow-up can no
   longer start editing a working copy that a Reset is still restoring. (fix)
