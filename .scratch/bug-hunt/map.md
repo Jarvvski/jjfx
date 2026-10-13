@@ -174,6 +174,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [34](issues/34-claude-result-usage.md) - D9, split out of 28.
   **ready-for-human** - whether a Claude `result` event's usage populates the
   Run result.
+- [35](issues/35-load-sensitive-helper-deadlines.md) - the test suite's fixed
+  helper-subprocess deadlines, found while landing 03/23/28.
+  **ready-for-agent** - a red gate that isn't a regression; test infrastructure
+  only, no product defect behind it.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
