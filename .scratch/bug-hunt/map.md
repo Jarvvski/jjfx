@@ -46,7 +46,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 |
 | C5 | state | M | S | `detached_cleanup_markers` aborts on any malformed `.cleanup` filename | 20 |
 | C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 |
-| D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 |
+| D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 (fixed) |
 | D4 | dispatch | M | S | orchestration freezes occupancy exclusions for the whole run (violates ADR-0011) | 15 |
 | D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 |
 | I2 | forge | M | S | PR read failures degrade to "no PRs"; `--limit 100` drops older PRs | 10 |
@@ -109,6 +109,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [12](issues/12-fence-untrusted-ticket-content.md) - I8.
 - [13](issues/13-deduplicate-dispatch-tickets.md) - I9.
 - [14](issues/14-single-source-branch-prefix.md) - D2.
+  **resolved** - resolution matches on the Ticket id.
 - [15](issues/15-live-occupancy-exclusions.md) - D4.
 - [16](issues/16-persist-group-before-reset.md) - D5.
 - [17](issues/17-move-blocking-work-off-ui-thread.md) - T1, T6.

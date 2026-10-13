@@ -631,7 +631,11 @@ fn revision_exists(root: &Path, revision: &str) -> bool {
 }
 
 fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
-    let prefix = format!("adam/{}-", ticket.as_str().to_ascii_lowercase());
+    // Match on the Ticket, not a hardcoded namespace. The branch prefix comes
+    // from the operator's `jj user.name`, which dispatch reads at dispatch time
+    // and which may change before a group is resumed; hardcoding it made the
+    // lookup miss and silently rewrite a stacked dependency onto `main`.
+    let ticket = ticket.as_str().to_ascii_lowercase();
     let output = Command::new("jj")
         .args(["bookmark", "list", "-T", "name ++ \"\\n\""])
         .current_dir(root)
@@ -643,7 +647,12 @@ fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
     String::from_utf8(output.stdout)
         .ok()?
         .lines()
-        .find(|name| name.starts_with(&prefix))
+        .find(|name| {
+            name.rsplit('/').next().is_some_and(|component| {
+                let component = component.to_ascii_lowercase();
+                component == ticket || component.starts_with(&format!("{ticket}-"))
+            })
+        })
         .map(str::to_owned)
 }
 

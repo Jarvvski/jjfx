@@ -35,6 +35,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-13 - Resuming a Dispatch Group no longer rewrites a stacked
+  dependency onto `main` when the operator's `jj user.name` is not `adam`.
+  Branch resolution now matches on the Ticket id instead of a hardcoded
+  namespace, so a dependent keeps its stacked base and its pull request is based
+  on the prerequisite rather than pulling the prerequisite's diff in. (fix)
+
 - 2026-10-13 - Pressing `?` over the diff-detail or full-screen graph view now
   shows the keybindings overlay instead of freezing the view. The overlay was
   opened from those modes but never drawn, and it swallowed every key until it

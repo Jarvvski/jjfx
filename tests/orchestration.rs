@@ -172,7 +172,7 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
         .expect("jj executable");
     assert!(output.status.success(), "jj commit failed: {output:?}");
     let output = Command::new("jj")
-        .args(["bookmark", "create", "adam/eng-101-foundation"])
+        .args(["bookmark", "create", "bob/eng-101-foundation"])
         .current_dir(directory.path())
         .output()
         .expect("jj executable");
@@ -188,7 +188,7 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
         DispatchGroupOptions::new(""),
     );
     let mut issue = SubIssueState::new("Foundation", WireStatus::new("done"), Vec::new());
-    issue.branch = Some("adam/eng-101-removed".to_owned());
+    issue.branch = Some("bob/eng-101-removed".to_owned());
     state.sub_issues.insert(ticket.clone(), issue);
     let store = repository.state_store().dispatch_group(parent.clone());
     assert!(matches!(
@@ -220,8 +220,8 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
             previous,
             current,
         } if actual.as_str() == "ENG-101"
-            && previous == "adam/eng-101-removed"
-            && current == "adam/eng-101-foundation"
+            && previous == "bob/eng-101-removed"
+            && current == "bob/eng-101-foundation"
     ));
     assert!(matches!(&events[2], OrchestrationEvent::Terminal(_)));
     assert_eq!(summary.parent(), &parent);
@@ -234,7 +234,7 @@ fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
         loaded.sub_issues[&TicketId::parse("ENG-101").expect("Ticket")]
             .branch
             .as_deref(),
-        Some("adam/eng-101-foundation")
+        Some("bob/eng-101-foundation")
     );
 }
 
