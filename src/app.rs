@@ -754,7 +754,17 @@ impl App {
             self.on_task_editor_key(key);
             return;
         }
-        if key.code == KeyCode::Char('?') && !matches!(self.mode, Mode::Help(_)) {
+        // A mode that would consume `?` as text keeps it; every other mode
+        // treats it as the help shortcut. The diff pane is the subtle case: its
+        // *filter* is a text buffer, but the pane itself is not, and `?` must
+        // still open help there or the detail bindings become unreachable (the
+        // files pane consumes `?` for the filter).
+        let question_mark_is_text = matches!(&self.mode, Mode::Pool(PoolMode::AliasInput { .. }))
+            || matches!(&self.mode, Mode::Detail(detail) if detail.filter_is_focused());
+        if key.code == KeyCode::Char('?')
+            && !matches!(self.mode, Mode::Help(_))
+            && !question_mark_is_text
+        {
             let previous = std::mem::replace(&mut self.mode, Mode::Normal);
             self.mode = Mode::Help(Box::new(previous));
             return;
@@ -3057,6 +3067,50 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_extends_the_worker_alias_instead_of_opening_help() {
+        let mut app = app_with(&["default"]);
+        app.mode = Mode::Pool(PoolMode::AliasInput {
+            worker: "worker-01".to_owned(),
+            buffer: String::new(),
+        });
+
+        app.handle(press(KeyCode::Char('?')));
+
+        let Mode::Pool(PoolMode::AliasInput { buffer, .. }) = &app.mode else {
+            panic!("help stole the alias input");
+        };
+        assert_eq!(buffer, "?");
+    }
+
+    #[test]
+    fn question_mark_extends_the_diff_filter_instead_of_opening_help() {
+        let mut app = app_with(&["default", "feat"]);
+        app.mode = Mode::Detail(Detail::loading("feat".to_owned()));
+
+        app.handle(press(KeyCode::Char('?')));
+
+        let Mode::Detail(detail) = &app.mode else {
+            panic!("help stole the diff filter");
+        };
+        assert_eq!(detail.filter(), "?");
+    }
+
+    #[test]
+    fn question_mark_opens_help_when_the_diff_pane_has_focus() {
+        let mut app = app_in_detail("feat");
+        // → moves focus from the file list into the diff pane, where `?` is not
+        // filter input. Without the shortcut here the detail bindings would be
+        // unreachable entirely, since the file list eats `?` for the filter.
+        app.handle(press(KeyCode::Right));
+        app.handle(press(KeyCode::Char('?')));
+
+        assert!(
+            matches!(app.mode, Mode::Help(_)),
+            "the diff pane must still reach the help overlay"
+        );
+    }
+
+    #[test]
     fn help_overlay_renders_a_bordered_box() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
@@ -3083,8 +3137,8 @@ mod tests {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
-        // `?` opens the overlay from any mode, so it must be drawn over Detail
-        // and Graph too, not just Normal and Pool.
+        // The overlay must be drawn over every base mode it can sit above,
+        // including Detail and Graph, not just Normal and Pool.
         for base in [
             Mode::Detail(Detail::loading("feat".to_owned())),
             Mode::Graph,

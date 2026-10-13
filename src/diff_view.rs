@@ -67,6 +67,19 @@ impl Detail {
         &self.ws
     }
 
+    #[cfg(test)]
+    /// The file filter typed so far - a seam for app-level key-routing tests.
+    pub(crate) fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    /// Whether the file filter owns printable keys right now. The `?` help
+    /// shortcut must yield to it, but only while it is focused: in the diff pane
+    /// `?` is not filter input and must still open help.
+    pub(crate) fn filter_is_focused(&self) -> bool {
+        self.focus == DetailFocus::Files
+    }
+
     /// Fold a freshly-read diff into the view and select the first file.
     pub fn loaded(&mut self, files: Vec<FileDiff>) {
         self.files = files;
