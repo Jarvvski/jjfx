@@ -721,7 +721,7 @@ impl App {
     /// no events for it.
     fn agent_of(&self, w: &Workspace) -> agent::Agent {
         w.path
-            .as_deref()
+            .present()
             .map(|p| self.agents.agent_for(p))
             .unwrap_or_default()
     }
@@ -1759,7 +1759,7 @@ impl App {
         if self.refuse_if_configuring(&w.name) {
             return;
         }
-        let Some(path) = w.path.clone() else {
+        let Some(path) = w.path.present().map(PathBuf::from) else {
             self.set_status(format!("no path known for '{}'", w.name));
             return;
         };
@@ -1867,7 +1867,7 @@ impl App {
         let still_exists = self
             .store
             .workspace(&name)
-            .and_then(|workspace| workspace.path.as_deref())
+            .and_then(|workspace| workspace.path.present())
             == Some(path.as_path())
             && path.is_dir();
         if !still_exists {
@@ -2212,8 +2212,8 @@ impl App {
             {
                 continue; // already forging
             }
-            match &w.path {
-                Some(dir) => targets.push(Target::new(w.name.clone(), dir.clone())),
+            match w.path.present() {
+                Some(dir) => targets.push(Target::new(w.name.clone(), PathBuf::from(dir))),
                 None => skipped_no_path = Some(w.name.clone()),
             }
         }
@@ -2284,7 +2284,7 @@ impl App {
             .store
             .workspaces()
             .iter()
-            .filter_map(|w| w.path.clone())
+            .filter_map(|w| w.path.present().map(PathBuf::from))
             .collect();
         for path in paths {
             self.agents.track(&path);
@@ -2735,7 +2735,7 @@ mod tests {
         CLAUDE_ORANGE, CODEX_CYAN, PI_VIOLET, agent_glyph, agent_label, working_frame,
     };
     use crate::runtime::Runtime;
-    use crate::store::Workspace;
+    use crate::store::{Workspace, WorkspacePath};
     use crate::workspace_dispatch::{RecordingAdapter, WorkerCommandResult, WorkerSessionOutcome};
     use crate::{jj, terminal::Terminal};
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
@@ -2850,7 +2850,7 @@ mod tests {
             .iter()
             .map(|n| Workspace {
                 name: n.to_string(),
-                path: Some(PathBuf::from(format!("/wt/{n}"))),
+                path: WorkspacePath::Present(PathBuf::from(format!("/wt/{n}"))),
             })
             .collect();
         Store::from_workspaces_for_test(PathBuf::from("/repo"), workspaces)
@@ -5449,9 +5449,15 @@ mod tests {
         );
         assert_eq!(app.status.as_deref(), Some("created 'feat'"));
         let fresh = Store::load(&repo);
-        let path = fresh.workspace("feat").unwrap().path.clone().unwrap();
+        let path = fresh
+            .workspace("feat")
+            .unwrap()
+            .path
+            .present()
+            .unwrap()
+            .to_path_buf();
         assert_eq!(
-            fresh.workspace("feat").unwrap().path.as_deref(),
+            fresh.workspace("feat").unwrap().path.present(),
             Some(path.as_path())
         );
 
@@ -5558,7 +5564,14 @@ mod tests {
             Some("created 'feat', tab failed: kitty unavailable")
         );
 
-        let path = app.store.workspace("feat").unwrap().path.clone().unwrap();
+        let path = app
+            .store
+            .workspace("feat")
+            .unwrap()
+            .path
+            .present()
+            .unwrap()
+            .to_path_buf();
         std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
@@ -5683,7 +5696,7 @@ mod tests {
             PathBuf::from("/repo"),
             vec![Workspace {
                 name: "replacement".to_string(),
-                path: Some(PathBuf::from("/wt/replacement")),
+                path: WorkspacePath::Present(PathBuf::from("/wt/replacement")),
             }],
         );
 
@@ -5741,7 +5754,7 @@ mod tests {
             PathBuf::from("/repo"),
             vec![Workspace {
                 name: "default".to_string(),
-                path: Some(PathBuf::from("/repo")),
+                path: WorkspacePath::Present(PathBuf::from("/repo")),
             }],
         );
         app.handle(Msg::WorkspaceDeletionCompleted {

@@ -48,13 +48,39 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
     repo.canonicalize().unwrap()
 }
 
-/// A single workspace. `path` is `None` when no usable path is known: jj knows
-/// the workspace but the ws-cache has no path for it, or the projected path's
-/// directory is absent.
+/// A single workspace. `path` records where the workspace's directory is, as
+/// far as the projection can tell: a recorded path whose directory is gone is
+/// [`WorkspacePath::Missing`] (the Workspace moved or was removed), while a
+/// derived path that never resolved is [`WorkspacePath::Unknown`] (jjfx never
+/// knew where it lived).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Workspace {
     pub(crate) name: String,
-    pub(crate) path: Option<PathBuf>,
+    pub(crate) path: WorkspacePath,
+}
+
+/// Where a Workspace's working copy is, and whether jjfx can use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WorkspacePath {
+    /// The path is known and its directory exists.
+    Present(PathBuf),
+    /// A recorded path whose directory is absent.
+    Missing(PathBuf),
+    /// No path is recorded and the naming convention did not resolve to a
+    /// directory, so jjfx does not know where this Workspace lives.
+    Unknown,
+}
+
+impl WorkspacePath {
+    /// The path when its directory exists. `None` for both a missing directory
+    /// and an unknown path, so callers that act on a working copy keep treating
+    /// every unusable path the same way.
+    pub(crate) fn present(&self) -> Option<&Path> {
+        match self {
+            WorkspacePath::Present(path) => Some(path),
+            WorkspacePath::Missing(_) | WorkspacePath::Unknown => None,
+        }
+    }
 }
 
 /// A newly-created workspace, whose path is always known because jjfx chose it.
@@ -129,7 +155,7 @@ impl Store {
     /// The read never writes the mirror; `default` is guaranteed present with its
     /// path pinned to the repository root (ADR 0008), every other entry keeps the
     /// path the mirror holds, and a Workspace whose directory is absent projects
-    /// as pathless so the TUI will not target a working copy that is not there. A
+    /// as unusable so the TUI will not target a working copy that is not there. A
     /// broken repository degrades to just the default rather than crashing the TUI.
     pub(crate) fn load(repo_root: &Path) -> Self {
         let repository = Repository::open(repo_root).ok();
@@ -147,7 +173,11 @@ impl Store {
             .into_iter()
             .map(|entry| Workspace {
                 name: entry.name().to_owned(),
-                path: (!entry.is_missing()).then(|| entry.path().to_path_buf()),
+                path: match (entry.is_missing(), entry.path_is_recorded()) {
+                    (false, _) => WorkspacePath::Present(entry.path().to_path_buf()),
+                    (true, true) => WorkspacePath::Missing(entry.path().to_path_buf()),
+                    (true, false) => WorkspacePath::Unknown,
+                },
             })
             .collect();
         // The default Workspace is always visible, its path authoritative at the
@@ -156,12 +186,12 @@ impl Store {
             .iter_mut()
             .find(|workspace| workspace.name == DEFAULT_WORKSPACE)
         {
-            Some(default) => default.path = Some(root.clone()),
+            Some(default) => default.path = WorkspacePath::Present(root.clone()),
             None => workspaces.insert(
                 0,
                 Workspace {
                     name: DEFAULT_WORKSPACE.to_owned(),
-                    path: Some(root.clone()),
+                    path: WorkspacePath::Present(root.clone()),
                 },
             ),
         }
@@ -279,7 +309,7 @@ impl Store {
     pub(crate) fn delete(&mut self, name: &str) -> anyhow::Result<()> {
         let path = self
             .workspace(name)
-            .and_then(|workspace| workspace.path.clone());
+            .and_then(|workspace| workspace.path.present().map(Path::to_path_buf));
         Self::delete_persisted(&self.repo_root, name, path.as_deref())?;
         let repo_root = self.repo_root.clone();
         *self = Self::load(&repo_root);
@@ -366,11 +396,11 @@ mod tests {
 
         assert_eq!(names, ["default", "alpha", "zeta"]);
         assert_eq!(
-            store.workspace(DEFAULT_WORKSPACE).unwrap().path.as_deref(),
+            store.workspace(DEFAULT_WORKSPACE).unwrap().path.present(),
             Some(repo.as_path())
         );
         assert_eq!(
-            store.workspace("alpha").unwrap().path.as_deref(),
+            store.workspace("alpha").unwrap().path.present(),
             Some(alpha.as_path())
         );
 
@@ -396,7 +426,7 @@ mod tests {
         let expected = default.canonicalize().unwrap();
         assert_eq!(store.repo_root(), expected.as_path());
         assert_eq!(
-            store.workspace(DEFAULT_WORKSPACE).unwrap().path.as_deref(),
+            store.workspace(DEFAULT_WORKSPACE).unwrap().path.present(),
             Some(expected.as_path())
         );
 
@@ -404,16 +434,47 @@ mod tests {
     }
 
     #[test]
-    fn load_represents_jj_only_workspace_without_path() {
+    fn load_reports_a_jj_only_workspace_whose_path_is_unknown() {
         let repo = test_local_repo("load-jj-only");
         let path = sibling(&repo, "orphan-workspace");
         jj::add_workspace(&repo, "orphan", &path).unwrap();
 
         let store = Store::load(&repo);
 
-        assert_eq!(store.workspace("orphan").unwrap().path, None);
+        // jj knows the name but records no path, and the naming convention does
+        // not resolve to a directory: jjfx never knew where this one lived.
+        assert_eq!(
+            store.workspace("orphan").unwrap().path,
+            WorkspacePath::Unknown
+        );
+        assert_eq!(store.workspace("orphan").unwrap().path.present(), None);
 
         std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
+    fn load_reports_a_recorded_path_whose_directory_is_gone_as_missing() {
+        let repo = test_local_repo("load-missing-dir");
+        let absent = sibling(&repo, "gone-workspace");
+        write_cache(
+            &repo,
+            &[
+                (DEFAULT_WORKSPACE, repo.as_path()),
+                ("gone", absent.as_path()),
+            ],
+        );
+
+        let store = Store::load(&repo);
+
+        // The cache records where this Workspace was, so its absent directory
+        // means it moved or was removed - not that the path is unknown.
+        assert_eq!(
+            store.workspace("gone").unwrap().path,
+            WorkspacePath::Missing(absent.clone())
+        );
+        assert_eq!(store.workspace("gone").unwrap().path.present(), None);
+
         std::fs::remove_dir_all(repo).unwrap();
     }
 
@@ -438,7 +499,12 @@ mod tests {
         let tui: BTreeSet<(String, Option<PathBuf>)> = store
             .workspaces()
             .iter()
-            .map(|workspace| (workspace.name.clone(), workspace.path.clone()))
+            .map(|workspace| {
+                (
+                    workspace.name.clone(),
+                    workspace.path.present().map(Path::to_path_buf),
+                )
+            })
             .collect();
         let cli: BTreeSet<(String, Option<PathBuf>)> = shared
             .entries()
@@ -452,7 +518,7 @@ mod tests {
             .collect();
         assert_eq!(tui, cli);
         assert_eq!(
-            store.workspace("feature").unwrap().path.as_deref(),
+            store.workspace("feature").unwrap().path.present(),
             Some(created.path())
         );
 
@@ -478,7 +544,7 @@ mod tests {
         assert_eq!(store.workspaces(), before);
         let fresh = Store::load(&repo);
         assert_eq!(
-            fresh.workspace("feat").unwrap().path.as_deref(),
+            fresh.workspace("feat").unwrap().path.present(),
             Some(path.as_path())
         );
 
@@ -549,12 +615,12 @@ mod tests {
         assert_eq!(created.name(), "feat");
         assert_eq!(created.path(), expected_path);
         assert_eq!(
-            store.workspace("feat").unwrap().path.as_deref(),
+            store.workspace("feat").unwrap().path.present(),
             Some(expected_path.as_path())
         );
         let fresh = Store::load(&repo);
         assert_eq!(
-            fresh.workspace("feat").unwrap().path.as_deref(),
+            fresh.workspace("feat").unwrap().path.present(),
             Some(expected_path.as_path())
         );
 
@@ -578,7 +644,7 @@ mod tests {
         assert_eq!(created.name(), "feat");
         assert_eq!(created.path(), expected_path);
         assert_eq!(
-            store.workspace("feat").unwrap().path.as_deref(),
+            store.workspace("feat").unwrap().path.present(),
             Some(expected_path.as_path())
         );
 
@@ -607,7 +673,7 @@ mod tests {
 
         assert!(format!("{error:#}").starts_with("delete failed:"));
         assert_eq!(
-            store.workspace("ghost").unwrap().path.as_deref(),
+            store.workspace("ghost").unwrap().path.present(),
             Some(path.as_path())
         );
         assert!(!path.exists());
@@ -648,7 +714,7 @@ mod tests {
         );
         assert!(repo.is_dir());
         assert_eq!(
-            store.workspace(DEFAULT_WORKSPACE).unwrap().path.as_deref(),
+            store.workspace(DEFAULT_WORKSPACE).unwrap().path.present(),
             Some(repo.as_path())
         );
 

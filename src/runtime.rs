@@ -213,7 +213,7 @@ impl Runtime {
         let tx = self.tx.clone();
         let repo_root = self.repo_root.clone();
         let colocate = self.colocate;
-        let known_path = workspace.path.clone();
+        let known_path = workspace.path.present().map(PathBuf::from);
         let terminal = Arc::clone(&self.terminal);
         let workspace_name = workspace.name.clone();
         tokio::spawn(async move {
@@ -375,7 +375,7 @@ mod tests {
     use tokio::sync::mpsc::unbounded_channel;
 
     use crate::jj::RealJj;
-    use crate::store::test_local_repo;
+    use crate::store::{WorkspacePath, test_local_repo};
 
     /// A terminal double: deletion only closes a tab, which is a no-op here.
     #[derive(Default)]
@@ -420,7 +420,7 @@ mod tests {
         runtime.execute(Effect::DeleteWorkspace {
             workspace: Workspace {
                 name: "absent".to_owned(),
-                path: None,
+                path: WorkspacePath::Unknown,
             },
             operation: 1,
         });

@@ -209,12 +209,13 @@ impl WorkspaceList {
 mod tests {
     use super::*;
     use crate::agent::{Agent, AgentState};
+    use crate::store::WorkspacePath;
     use std::path::PathBuf;
 
     fn ws(name: &str) -> Workspace {
         Workspace {
             name: name.to_string(),
-            path: Some(PathBuf::from(format!("/wt/{name}"))),
+            path: WorkspacePath::Present(PathBuf::from(format!("/wt/{name}"))),
         }
     }
 

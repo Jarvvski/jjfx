@@ -15,6 +15,7 @@ use crate::render::style::{
     elapsed_label, forge_spans, pane_border, work_color,
 };
 use crate::render::view::{HomeRow, RowMarker};
+use crate::store::WorkspacePath;
 
 /// Minimum rows (borders included) the inline world pane needs; when half the
 /// home body is shorter than this the pane is dropped so the list stays usable.
@@ -157,11 +158,15 @@ pub(crate) fn workspace_item(
     } else {
         String::new()
     };
-    let path = w
-        .path
-        .as_deref()
-        .map(display_path)
-        .unwrap_or_else(|| "(path unknown - not in ws-cache)".to_string());
+    // The path, or why there is none. A recorded path whose directory is gone
+    // says the Workspace moved or was removed; an unresolved derived path says
+    // jjfx never knew where it lived. Naming the two apart is the difference
+    // between "it was there" and "I have no idea where it is".
+    let path = match &w.path {
+        WorkspacePath::Present(path) => display_path(path),
+        WorkspacePath::Missing(path) => format!("(missing: {})", display_path(path)),
+        WorkspacePath::Unknown => "(path unknown)".to_string(),
+    };
     // A dim bullet marks every row; the selected row's bullet brightens as the
     // only structural cue, keeping the line otherwise calm.
     let bullet = if selected {
@@ -336,7 +341,7 @@ mod tests {
     fn draws_the_title_group_headers_and_workspace_names() {
         let ws = Workspace {
             name: "feature".to_string(),
-            path: None,
+            path: WorkspacePath::Present(std::path::PathBuf::from("/tmp/feature")),
         };
         let view = HomeView {
             rows: vec![
@@ -365,7 +370,7 @@ mod tests {
     fn a_too_short_body_drops_the_world_pane_but_keeps_the_list() {
         let ws = Workspace {
             name: "feature".to_string(),
-            path: None,
+            path: WorkspacePath::Present(std::path::PathBuf::from("/tmp/feature")),
         };
         let view = HomeView {
             rows: vec![HomeRowKind::Workspace(row(&ws, Attention::Idle))],
@@ -387,5 +392,37 @@ mod tests {
         let text = term.backend().to_string();
         assert!(text.contains("feature"), "{text}");
         assert!(!text.contains(" world "), "{text}");
+    }
+
+    #[test]
+    fn a_row_says_whether_a_path_is_missing_or_unknown() {
+        let missing = Workspace {
+            name: "gone".to_string(),
+            path: WorkspacePath::Missing(std::path::PathBuf::from("/tmp/gone-workspace")),
+        };
+        let unknown = Workspace {
+            name: "elsewhere".to_string(),
+            path: WorkspacePath::Unknown,
+        };
+        let view = HomeView {
+            rows: vec![
+                HomeRowKind::Workspace(row(&missing, Attention::Idle)),
+                HomeRowKind::Workspace(row(&unknown, Attention::Idle)),
+            ],
+            selected: None,
+            idle_collapsed: false,
+            tick: 0,
+            title: "jjfx".to_string(),
+        };
+        let state = RenderState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), Vec::new()))
+            .unwrap();
+        let text = term.backend().to_string();
+        // A recorded path whose directory is gone names the path it was at; an
+        // unresolved derived path admits jjfx does not know where it lives.
+        assert!(text.contains("(missing: /tmp/gone-workspace)"), "{text}");
+        assert!(text.contains("(path unknown)"), "{text}");
+        assert!(!text.contains("not in ws-cache"), "{text}");
     }
 }

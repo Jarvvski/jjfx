@@ -25,6 +25,12 @@ retired, so entries here are versioned by `jjfx` alone.
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
 
+## [Unreleased]
+
+### Fixed
+
+- Workspace rows now say why a path is unusable: a recorded path whose directory is gone names the path it was at, and a path jjfx never knew reads `(path unknown)`.
+
 ## [0.53.0] - 2026-10-14
 
 ### Added

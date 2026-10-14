@@ -137,7 +137,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         for w in store.workspaces() {
             let path = w
                 .path
-                .as_deref()
+                .present()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default();
             writeln!(out, "{}\t{}", w.name, path)?;

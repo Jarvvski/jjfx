@@ -104,6 +104,12 @@ pub enum CleanDecision {
 pub struct WorkspaceEntry {
     name: String,
     path: PathBuf,
+    /// Whether `path` was recorded in the compatible cache rather than derived
+    /// from the naming convention. A recorded path is authoritative - jjfx or
+    /// the shell tools wrote it for this Workspace - so its absence means the
+    /// Workspace moved or was removed. A derived path is only a guess, so its
+    /// absence means the path is simply not known.
+    path_is_recorded: bool,
 }
 
 impl WorkspaceEntry {
@@ -120,6 +126,14 @@ impl WorkspaceEntry {
     /// Reports whether the projected Workspace directory is absent.
     pub fn is_missing(&self) -> bool {
         !self.path.is_dir()
+    }
+
+    /// Reports whether the projected path is recorded in the cache rather than
+    /// derived from the naming convention. Callers use this to tell a Workspace
+    /// that moved or was removed (a recorded path whose directory is gone) from
+    /// one whose path jjfx never knew (a derived path that does not exist).
+    pub fn path_is_recorded(&self) -> bool {
+        self.path_is_recorded
     }
 }
 
@@ -194,7 +208,11 @@ impl Workspaces {
         let entries = read_cache(&cache)
             .map_err(|error| AdHocWorkspaceError::new(error.message))?
             .into_iter()
-            .map(|(name, path)| WorkspaceEntry { name, path })
+            .map(|(name, path)| WorkspaceEntry {
+                name,
+                path,
+                path_is_recorded: true,
+            })
             .collect();
         Ok(WorkspaceSnapshot { entries })
     }
@@ -206,6 +224,9 @@ impl Workspaces {
     /// preserved (jj does not record paths), a jj-only name falls back to the
     /// naming convention, and a cache-only name keeps its cached path. The
     /// default Workspace is always included and pinned to the repository root.
+    /// Each entry reports whether its path was recorded or derived
+    /// ([`WorkspaceEntry::path_is_recorded`]), so a caller can tell a Workspace
+    /// that moved from one whose path was never known.
     /// Use [`Workspaces::refresh`] to rebuild and persist the mirror.
     pub fn projection(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
         let names = workspace_names(self.repository.root())
@@ -216,22 +237,33 @@ impl Workspaces {
         entries.push(WorkspaceEntry {
             name: DEFAULT_WORKSPACE.to_owned(),
             path: self.repository.root().to_path_buf(),
+            path_is_recorded: true,
         });
         seen.insert(DEFAULT_WORKSPACE.to_owned());
         for name in names {
             if !seen.insert(name.clone()) {
                 continue;
             }
-            let path = cached
+            let (path, path_is_recorded) = cached
                 .iter()
                 .find(|(cached_name, _)| cached_name == &name)
-                .map(|(_, path)| path.clone())
-                .unwrap_or_else(|| self.path(&name));
-            entries.push(WorkspaceEntry { path, name });
+                .map_or_else(
+                    || (self.path(&name), false),
+                    |(_, path)| (path.clone(), true),
+                );
+            entries.push(WorkspaceEntry {
+                name,
+                path,
+                path_is_recorded,
+            });
         }
         for (name, path) in cached {
             if seen.insert(name.clone()) {
-                entries.push(WorkspaceEntry { path, name });
+                entries.push(WorkspaceEntry {
+                    name,
+                    path,
+                    path_is_recorded: true,
+                });
             }
         }
         Ok(WorkspaceSnapshot { entries })
