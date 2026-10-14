@@ -1,22 +1,29 @@
 # Changelog
 
-All notable changes to this project are documented here, newest first.
+All notable changes to this project are documented here, newest first, managed
+by [momo](https://github.com/Jarvvski/momo).
 
-Unreleased entries live under `## [Unreleased]` and end with a semver intent
-marker:
+Unreleased changes live under `## [Unreleased]`, grouped by kind:
 
-- `(break)` - an incompatible change
-- `(add)` - new functionality, backwards compatible
-- `(fix)` - a backwards-compatible bug fix
+- `### Breaking` - an incompatible change
+- `### Added` - new functionality, backwards compatible
+- `### Fixed` - a backwards-compatible bug fix
+
+Record a change with `momo break|add|fix "<description>"`; momo owns the heading
+and the section it lands in. `momo status` derives the next version from the
+unreleased changes and the latest tag, and the release workflow runs `momo
+release` then `momo tag`, so **do not bump the version by hand**.
 
 `jjfx` is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.52.0`
 means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises
-the patch. `mise run changelog-next` derives the next version from the highest
-marker in the unreleased set; the release workflow stamps the heading and moves
-the manifest version, so **do not bump the version by hand**.
+the patch. That is momo's zero-aware rule, and it matches the convention this
+project used before adopting momo.
 
 The `wsg` compatibility binary is frozen while the migration-era binary is
 retired, so entries here are versioned by `jjfx` alone.
+
+Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
+markers on their entries; they are preserved as history and carry no meaning now.
 
 ## [Unreleased]
 
@@ -26,14 +33,14 @@ retired, so entries here are versioned by `jjfx` alone.
   2026-08-19, and jjfx is now the authoritative home of both binaries. `wsg`
   users should move to **jjfx 0.52.1 or newer**, which builds the frozen
   `wsg 0.19.0` compatibility binary from this repository. Existing Go releases
-  stay available, but receive no new development. (add)
+  stay available, but receive no new development.
 
 - 2026-10-13 - A `jj` on `PATH` whose major/minor differs from the `jj-lib`
   version jjfx reads the store with is now reported instead of silently
   degrading: a warning line atop the world graph, a TUI footer warning, and a
   `warning:` on stderr for CLI repository commands. `jj-lib`'s target version is
   pinned in source and asserted against `Cargo.toml` by a test, so the check
-  cannot rot when the dependency is bumped. (add)
+  cannot rot when the dependency is bumped.
 
 - Worker Dispatch keeps a Workspace that is open in a terminal out of Worker
   selection: an occupied Worker is no longer treated as idle, and Dispatch
@@ -42,52 +49,52 @@ retired, so entries here are versioned by `jjfx` alone.
   cannot see the open tabs, and `--force` overrides the check. `review` is exempt
   so a waiting Worker can still be told to address its pull request. The Pool
   view marks open Workspaces and the Dispatch preview flags an open target, and
-  jjfx records the occupied Workers in `.jj/pool/in-use.json`. (add)
+  jjfx records the occupied Workers in `.jj/pool/in-use.json`.
 
-### Changed
+### Breaking
 
 - 2026-10-13 - A provider-reported Run cost that jjfx cannot represent (negative,
   non-finite, or out of range) is dropped instead of failing the Run. It
   previously finalised a *successful* Run as `failed` with "Process exited
   unexpectedly", which fed orchestration retries. `RunLogParseError::InvalidCost`
-  is removed. (break)
+  is removed.
 
 ### Fixed
 
-- 2026-10-14 - The terminal query no longer storms or blocks: `kitten @ ls` runs through a bounded, single-flighted query with a short cache, so a slow or stuck kitty yields an error within seconds instead of hanging, and concurrent callers share one in-flight query rather than spawning a process each. The fail-closed occupancy check still refuses dispatch when the terminal cannot be read. (fix)
+- 2026-10-14 - The terminal query no longer storms or blocks: `kitten @ ls` runs through a bounded, single-flighted query with a short cache, so a slow or stuck kitty yields an error within seconds instead of hanging, and concurrent callers share one in-flight query rather than spawning a process each. The fail-closed occupancy check still refuses dispatch when the terminal cannot be read.
 
-- 2026-10-14 - Stopping an opencode Run now stops its work: `reset` and Worker `destroy` interrupt the Run's session through the daemon instead of signalling a client process, and a Worker's liveness is decided from that session's outcome - or a provider terminal event in its Run log - rather than from a client pid that outlives it. Falls back to the existing process-group path whenever the API is unreachable or the session cannot be identified, and a Run that cannot record a session forgets the one a previous Run left behind, so a stale id can never finish the wrong Run. A `destroy` consults that session only when the Worker's Run is opencode, so claude, codex and pi always signal the Run's own process group. (fix)
+- 2026-10-14 - Stopping an opencode Run now stops its work: `reset` and Worker `destroy` interrupt the Run's session through the daemon instead of signalling a client process, and a Worker's liveness is decided from that session's outcome - or a provider terminal event in its Run log - rather than from a client pid that outlives it. Falls back to the existing process-group path whenever the API is unreachable or the session cannot be identified, and a Run that cannot record a session forgets the one a previous Run left behind, so a stale id can never finish the wrong Run. A `destroy` consults that session only when the Worker's Run is opencode, so claude, codex and pi always signal the Run's own process group.
 
-- 2026-10-14 - An opencode Run is anchored to its Worker Workspace explicitly: jjfx creates the session with that `location` and confirms what opencode stored before the Run starts, so a Run can no longer execute - and commit - in the wrong worktree. If the opencode API is unreachable the Run proceeds on the process cwd exactly as before, and an unreachable or older API never fails a Run. (fix)
+- 2026-10-14 - An opencode Run is anchored to its Worker Workspace explicitly: jjfx creates the session with that `location` and confirms what opencode stored before the Run starts, so a Run can no longer execute - and commit - in the wrong worktree. If the opencode API is unreachable the Run proceeds on the process cwd exactly as before, and an unreachable or older API never fails a Run.
 
-- 2026-10-14 - Every Run now owns its process group, so a failed foreground launch and a cross-process Reset end the whole agent tree instead of leaking descendants that keep writing to the Workspace. A foreground Run's terminal is handed to it and back by a wrapper inside its own group, so it can still read the terminal and Ctrl-C still reaches the agent. (fix)
+- 2026-10-14 - Every Run now owns its process group, so a failed foreground launch and a cross-process Reset end the whole agent tree instead of leaking descendants that keep writing to the Workspace. A foreground Run's terminal is handed to it and back by a wrapper inside its own group, so it can still read the terminal and Ctrl-C still reaches the agent.
 
-- 2026-10-14 - A recorded Run pid is treated as live only while it leads a process group, so a recycled pid can no longer keep a Worker `busy` forever or aim a Reset or destroy signal at an unrelated group. (fix)
+- 2026-10-14 - A recorded Run pid is treated as live only while it leads a process group, so a recycled pid can no longer keep a Worker `busy` forever or aim a Reset or destroy signal at an unrelated group.
 
-- 2026-10-14 - A Worker Reservation is released only once its untracked Run is confirmed gone; when the forced kill cannot confirm the exit the Worker stays busy instead of being reused while an agent may still be running. (fix)
+- 2026-10-14 - A Worker Reservation is released only once its untracked Run is confirmed gone; when the forced kill cannot confirm the exit the Worker stays busy instead of being reused while an agent may still be running.
 
 - 2026-10-14 - A change-requested Pull Request is no longer masked when newer
   work is stacked above it: the Workspace reads as `PrOpen { ChangesRequested }`
   and surfaces as needs-you, where it previously read as merely "ready to forge"
   and the change request was invisible. Approved and undecided PRs are still
-  masked by newer work. (fix)
+  masked by newer work.
 
 - 2026-10-14 - A dependent whose Blockers mix a merged one with a real stacked
   branch now bases its Pull Request on the first unmerged branch, rather than on
   whichever Blocker happened to sort first by ticket id. Previously a merged
   Blocker sorting first opened the dependent's PR against trunk, silently
-  swallowing an unmerged prerequisite's diff. (fix)
+  swallowing an unmerged prerequisite's diff.
 
 - 2026-10-14 - An in-flight Dependency (`In Progress`, `In Review`) no longer
   satisfies its dependents: a Dependency must be completed, delivered, or
   cross-repository before its dependents become eligible. A group waiting on one
   is a quiescent, visible stall rather than a silent premature dispatch. A
   terminal status that was never delivered (`Canceled`, `Duplicate`) blocks too,
-  as a `Failed` Dependency already did. (fix)
+  as a `Failed` Dependency already did.
 
 - 2026-10-14 - A Claude `result` event's reported `usage` now populates the Run
   result, matching Pi and Codex. It was previously dropped, so a Claude Run's
-  result carried duration, turns and cost but no usage. (fix)
+  result carried duration, turns and cost but no usage.
 
 - 2026-10-13 - A jj read failure no longer reads as a plausible success. `tidy`,
   `tidyws` and `lift` treated a broken revset as "nothing to do" (the count
@@ -97,52 +104,52 @@ retired, so entries here are versioned by `jjfx` alone.
   the work list shows an unknown row rather than a plausible zero. jj semantics
   are classified from machine-readable state (jj templates, `jj log --count`, the
   Git-format diff, and remote-bookmark snapshots) instead of jj's English CLI
-  text. (fix)
+  text.
 
 - 2026-10-13 - The Worker Pool growth prompt states the growth ("Grow pool by
   3?") rather than a size it did not match: it printed `idle + shortfall`, but
   the pool grows by the shortfall from its *current* size, so a 4-worker pool
   with 2 idle and 5 tickets was promised as "Resize pool to 5" and became 7.
-  (fix)
+
 
 - 2026-10-13 - A missing config base directory now means "no user config" rather
   than a relative `.config/jjfx/config.toml` resolved against the process CWD,
   which let a repository plant the user's config. An empty `HOME` is treated the
-  same way. (fix)
+  same way.
 
 - 2026-10-13 - The store handed to the UI after a Workspace deletion keeps the
-  configured colocation setting instead of defaulting it back to on. (fix)
+  configured colocation setting instead of defaulting it back to on.
 
 - 2026-10-13 - `?` can be typed into the worker alias and the diff filter. It
   used to open the help overlay from every mode, so neither buffer could contain
   a question mark; the diff *pane* still opens help, so the detail bindings stay
-  reachable. (fix)
+  reachable.
 
 - 2026-10-13 - Creating a Workspace from the TUI now uses the same on-disk rule
   as the CLI and the Worker Pool - `<parent>/<repo>-workspaces/<name>`, or
   `$JJ_WS_DIR/<name>` when that is set. It previously used
   `<parent>/<repo>-<name>`, so the same operation landed in two different places
   depending on which frontend ran it. Existing Workspaces keep their real paths
-  (they are cache-preserved), so only newly created ones move. (fix)
+  (they are cache-preserved), so only newly created ones move.
 
 - 2026-10-13 - A diff longer than 65 535 lines scrolls to its end again. The
   diff and world-graph viewports recorded the content length as a `u16`, so the
   line count wrapped: a 70 000-line file could only be scrolled to line 4 464,
   and a file of exactly 65 536 lines could not be scrolled at all. The offset
   arithmetic saturates now as well, so the degenerate zero-height pane can no
-  longer overflow it. (fix)
+  longer overflow it.
 
 - 2026-10-13 - The terminal is restored when jjfx is killed by a signal. SIGINT,
   SIGTERM, and SIGHUP used to terminate the TUI with the alternate screen and
   raw mode still active, leaving the shell echoing nothing until `reset`. The
   panic hook is now installed before the terminal is touched too, so a panic
-  during setup is restored as well. (fix)
+  during setup is restored as well.
 
 - 2026-10-13 - A failed terminal input read no longer kills the input reader
   silently. An interrupted read (a signal arriving mid-read) is retried, and any
   other failure pins a footer message saying input has stopped - previously the
   thread exited on the first error and the UI kept redrawing while ignoring
-  every key. (fix)
+  every key.
 
 - 2026-10-13 - The atomic-replacement and file-lock primitives are now one
   implementation (`engine/atomic.rs`) instead of two divergent copies in the
@@ -150,106 +157,106 @@ retired, so entries here are versioned by `jjfx` alone.
   honours the documented contract: a uniquely named temporary file at mode
   `0644`, synced and renamed, and removed if it fails - it previously used a
   predictable `ws-cache.<pid>.<thread>.tmp` that leaked on failure and could
-  collide between processes. (fix)
+  collide between processes.
 
 - 2026-10-13 - The TUI no longer does needless work every frame and every tick:
   an idle screen stops emitting animation ticks (it used to wake ~7 times a
   second and re-canonicalise every workspace path), the world graph is laid out
   once per frame instead of twice, and agent lookups are hash probes rather than
-  a `canonicalize` syscall per workspace. (fix)
+  a `canonicalize` syscall per workspace.
 
 - 2026-10-13 - Workspace names are quoted wherever they are interpolated into a
   jj revset, so a name containing a space or a revset metacharacter (`my work`)
   no longer fails to parse - which read as "no chain", left `behind` at 0, and
   made `lift` a silent no-op. The workspace list is also read through
   `stringify(name)`, so a name that needs quoting comes back raw instead of
-  already-quoted and still matches its ws-cache entry. (fix)
+  already-quoted and still matches its ws-cache entry.
 
 - 2026-10-13 - The Workspace list is re-projected on a background worker. The
   filesystem watcher fires a reload on every repository change and the
   projection shells out to `jj workspace list`, so a reload no longer blocks the
   input fold. The store swap is now eventually consistent, and the
   create-then-open path waits for the fresh projection to decide whether the
-  Workspace survived setup. (fix)
+  Workspace survived setup.
 
 - 2026-10-13 - Opening or focusing a Workspace tab, and the `t`/`T` tidy sweeps,
   now run as background effects instead of inside the input fold. A slow
   `kitten @ ls` (which can sleep ~5s while a target starts) or a `jj rebase` no
-  longer freezes the TUI. (fix)
+  longer freezes the TUI.
 
 - 2026-10-13 - A failed `gh pr list` is no longer reported as "no Pull
   Requests". The read now surfaces the failure, and a pushed Workspace whose
   Pull Request state cannot be read shows as unknown instead of claiming it
-  still needs a forge. A local-only change stays dirty. (fix)
+  still needs a forge. A local-only change stays dirty.
 
 - 2026-10-13 - Dispatch occupancy is now a live query: the orchestration runner
   asks a provider for the excluded Worker Workspaces on every claim, so a
   Workspace a human opens (or closes) while a Dispatch Group is running changes
-  the next decision instead of the run's opening snapshot (ADR-0011). (fix)
+  the next decision instead of the run's opening snapshot (ADR-0011).
 
 - 2026-10-13 - A `.cleanup` marker whose name is not a valid Worker id no longer
   aborts cleanup discovery, which previously broke Pool resize and destroy for
-  every Worker because of one junk file. (fix)
+  every Worker because of one junk file.
 
 - 2026-10-13 - A Ticket can no longer be dispatched twice: Ready Ticket
   discovery drops a repeated Ticket with a diagnostic, and a Dispatch batch
-  naming the same Ticket twice is rejected before any Worker is reserved. (fix)
+  naming the same Ticket twice is rejected before any Worker is reserved.
 
 - 2026-10-13 - The lifecycle event log is now read line-by-line and lossily, so
   one torn line (a rotation slice cut mid-character) no longer wipes every
   agent's state. The tailer starts from the replay's own offset, so a hook line
   appended during startup is neither lost nor replayed twice. The log is also
   rotated while the TUI runs, so a long-lived session bounds `events.jsonl`, and
-  a rotated shrink is skipped rather than re-emitted as duplicates. (fix)
+  a rotated shrink is skipped rather than re-emitted as duplicates.
 
 - 2026-10-13 - A failed Dispatch Group retry now persists the group before
   resetting the Worker, matching the Done path. A save conflict can no longer
   leave a cleared Worker against a `dispatched` group, which made a restarted
-  parent unrecoverable with `WorkerTicketMismatch`. (fix)
+  parent unrecoverable with `WorkerTicketMismatch`.
 
 - 2026-10-13 - Forge no longer reports failures as clean skips: a failed
   `jj git push` fails the Push step (with jj's own message) instead of reading as
   "nothing to push", a weld that buries a conflict below `@` stops the pipeline
   before pushing, and a failed `gh` default-branch lookup is surfaced instead of
-  reading as "no origin remote". (fix)
+  reading as "no origin remote".
 
 - 2026-10-13 - Dispatch prompts now inline untrusted Linear Ticket text (title,
   description, and blocker titles) inside a labelled data fence, with control
   characters stripped and length capped, and the Repository slug is validated to
   GitHub's character set. A Ticket can no longer smuggle instructions or a
   forged fence terminator into the agent's prompt, nor inject shell syntax into
-  the interpolated `gh` command. (fix)
+  the interpolated `gh` command.
 
 - 2026-10-13 - `send`, `review`, and `rebase` now take the Worker's
   Workspace-operation lock, matching Dispatch and Reset. A Follow-up can no
-  longer start editing a working copy that a Reset is still restoring. (fix)
+  longer start editing a working copy that a Reset is still restoring.
 
 - 2026-10-13 - Resuming a Dispatch Group no longer rewrites a stacked
   dependency onto `main` when the operator's `jj user.name` is not `adam`.
   Branch resolution now matches on the Ticket id instead of a hardcoded
   namespace, so a dependent keeps its stacked base and its pull request is based
-  on the prerequisite rather than pulling the prerequisite's diff in. (fix)
+  on the prerequisite rather than pulling the prerequisite's diff in.
 
 - 2026-10-13 - Pressing `?` over the diff-detail or full-screen graph view now
   shows the keybindings overlay instead of freezing the view. The overlay was
   opened from those modes but never drawn, and it swallowed every key until it
-  was dismissed. (fix)
+  was dismissed.
 
 - 2026-10-13 - Resizing the Worker Pool down no longer risks stranding a Worker.
   The cleanup marker is now written after the Pool manifest, so a failed manifest
   write cannot leave a member carrying a marker that made every later Run on it
-  fail to start. (fix)
+  fail to start.
 
 - 2026-10-13 - A Dispatch Group whose dependency fails now reaches a terminal
   state instead of being watched forever. A `Failed` Sub-issue no longer leaves
   its dependents permanently `pending`, so `jjfx dispatch`/`orchestrate` and the
   TUI stop polling a group that can make no further progress, and the summary
-  and Pool view report the unreachable Sub-issues as `blocked`. (fix)
+  and Pool view report the unreachable Sub-issues as `blocked`.
 
 - 2026-10-13 - Running `jjfx` from a secondary Jujutsu workspace no longer
   shadows the `default` workspace. The repository root is now normalised to the
   default workspace at discovery, so `default` always points at the repository
-  and the store, filesystem watcher, and work poller all agree. (fix)
+  and the store, filesystem watcher, and work poller all agree.
 
 ## [0.52.1] - 2026-10-12
 

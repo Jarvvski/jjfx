@@ -23,9 +23,11 @@ exclude = [
   ".claude/",
   ".github/",
   ".mise/",
+  ".momo/",
   ".pi-subagents/",
   ".scratch/",
   "crates/",
+  "momo.toml",
   # `rust-version` already states the toolchain floor; shipping the pin would
   # make `cargo install` download a specific toolchain instead.
   "rust-toolchain.toml",

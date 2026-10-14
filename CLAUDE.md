@@ -17,26 +17,17 @@ which the owner dispatches and which pushes its own bump commit and tag using
 `GITHUB_TOKEN`. That is owner-configured automation, not an agent push - do not
 "fix" it, and do not read it as licence to push yourself.
 
-**Versioning & changelog.** The version of record is `Cargo.toml`'s `version`
-field, and it is **release-owned**: only the release workflow moves it (via
-`mise run version-set`). Do not bump it by hand for an ordinary change.
+**Versioning & changelog.** Versioning and the changelog are momo's job (the CLI is pinned in `mise.toml`; see [`docs/releasing.md`](docs/releasing.md)). The version of record is the **latest tag** (`v<x.y.z>`), and it is **release-owned**: only the release workflow moves it (via `momo release`). Do not bump it by hand for an ordinary change.
 
-A user-visible change adds an entry under `## [Unreleased]` in `CHANGELOG.md`,
-newest first, ending with a semver intent marker:
+A user-visible change is recorded with momo, which owns the changelog heading and the section it lands in:
 
-- `(break)` - an incompatible change
-- `(add)` - new functionality, backwards compatible
-- `(fix)` - a backwards-compatible bug fix
+- `momo break "<description>"` - an incompatible change
+- `momo add "<description>"` - new functionality, backwards compatible
+- `momo fix "<description>"` - a backwards-compatible bug fix
 
-jjfx is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.52.0`
-means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises
-the patch. `mise run changelog-next` derives the next version from the highest
-marker present, and `mise run changelog-check` (part of `mise run check`)
-validates them. **Never bump to 1.0.0 (or any MAJOR) without the owner's
-explicit approval.** Skip pure internal refactors.
+`momo status` derives the next version from the unreleased changes and the latest tag. jjfx is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.52.0` means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises the patch - momo's zero-aware rule. **Never bump to 1.0.0 (or any MAJOR) without the owner's explicit approval.** Skip pure internal refactors.
 
-`crates/wsg` is frozen at its current version while the migration-era binary is
-retired; entries are versioned by `jjfx` alone.
+`crates/wsg` is frozen at its current version while the migration-era binary is retired; entries are versioned by `jjfx` alone.
 
 Releases are cut by dispatching `.github/workflows/release.yml` - see
 [`docs/releasing.md`](docs/releasing.md).
@@ -68,10 +59,9 @@ is the default scope for that agent session.
 
 **mise** owns tasks and the Rust pin (see `mise.toml`, `rust-toolchain.toml`). Use the tasks, don't hand-roll cargo:
 
-- `mise run check` - the pre-land gate: changelog markers + fmt + lint + build + test.
+- `mise run check` - the pre-land gate: changelog validation + fmt + lint + build + test.
 - `mise run run` / `build` / `test` / `fmt` / `lint` - individual steps.
-- `mise run changelog-next` / `changelog-stamp` / `changelog-check` / `changelog-notes` - the release changelog tooling.
-- `mise run version-set <version>` - move the release-owned manifest version.
+- `momo status` / `momo break|add|fix` / `momo release` / `momo tag` / `momo notes` - the versioning and changelog tooling (pinned in `mise.toml`).
 
 Rust edition 2024. `Cargo.lock` is committed (this is an app, not a library).
 

@@ -1,5 +1,8 @@
 [tools]
 rust = "1.97.1"
+# Versioning and changelog are momo's job (see docs/releasing.md). Pin the CLI
+# so `mise run check` and the release workflow resolve the same binary.
+"github:Jarvvski/momo" = "0.6.0"
 # jj-lib reads the on-disk .jj store directly, so jjfx is version-coupled to the
 # jj binary's store format (ADR 0007). Pin jj to the version jj-lib targets and
 # upgrade them in lockstep.
@@ -52,8 +55,10 @@ description = "Clippy across every workspace package, warnings as errors"
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.check]
-description = "changelog markers + fmt + lint + build + test + cleanup (the pre-land gate)"
+description = "changelog validation + fmt + lint + build + test + cleanup (the pre-land gate)"
 # JJFX_KEEP_TARGET skips the cleanup for callers that still need the build
 # cache afterwards - the release workflow builds archives straight after the
 # gate, and a cold cross-compile of the whole tree is pure waste.
-run = "trap 'status=$?; [ -n \"${JJFX_KEEP_TARGET:-}\" ] || cargo clean; exit \"$status\"' EXIT; mise run changelog-check && mise run fmt && mise run lint && mise run build && mise run test"
+# `momo status` is the changelog check: it fails on a changelog momo cannot read
+# (a duplicate Unreleased heading) and passes when nothing is unreleased.
+run = "trap 'status=$?; [ -n \"${JJFX_KEEP_TARGET:-}\" ] || cargo clean; exit \"$status\"' EXIT; momo status >/dev/null && mise run fmt && mise run lint && mise run build && mise run test"

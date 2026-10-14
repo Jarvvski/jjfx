@@ -1,8 +1,9 @@
 name: Release
 
-# Owner-controlled release, dispatched by hand. It derives the next version
-# from the unreleased CHANGELOG markers, bumps the manifest, stamps the
-# changelog, builds the release archives, publishes jjfx to crates.io, and cuts
+# Owner-controlled release, dispatched by hand. momo derives the next version
+# from the unreleased CHANGELOG entries and the latest tag, writes the
+# changelog, the version ledger and the manifest, and tags the release; this
+# workflow builds the release archives, publishes jjfx to crates.io, and cuts
 # the GitHub Release.
 #
 # `workflow_dispatch` only runs from the default branch, so this file has to be
@@ -15,11 +16,6 @@ name: Release
 on:
   workflow_dispatch:
     inputs:
-      bump:
-        description: "Version bump - auto derives it from the Unreleased markers"
-        type: choice
-        options: [auto, patch, minor, major]
-        default: auto
       dry_run:
         description: "Stop before building, committing, tagging, publishing, or releasing"
         type: boolean
@@ -42,7 +38,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The "already released?" guard needs the tags.
+          # momo reads the current version from the tags.
           fetch-depth: 0
       - uses: jdx/mise-action@v2
         with:
@@ -60,23 +56,13 @@ jobs:
 
       - name: Derive the next version
         id: version
-        env:
-          BUMP: ${{ inputs.bump }}
         run: |
           set -euo pipefail
-          base=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-
-          if [ "$BUMP" = auto ]; then
-            version=$(mise run changelog-next)
-          else
-            IFS=. read -r major minor patch <<<"$base"
-            case "$BUMP" in
-              major) major=$((major + 1)); minor=0; patch=0 ;;
-              minor) minor=$((minor + 1)); patch=0 ;;
-              patch) patch=$((patch + 1)) ;;
-            esac
-            version="$major.$minor.$patch"
+          if ! momo status --check >/dev/null 2>&1; then
+            echo "error: nothing unreleased - record a change with 'momo break|add|fix'" >&2
+            exit 1
           fi
+          version="$(momo status --version-only)"
 
           if git rev-parse -q --verify "refs/tags/v$version" >/dev/null; then
             echo "error: tag v$version already exists" >&2
@@ -88,18 +74,20 @@ jobs:
             exit 1
           fi
 
-          echo "base=$base bump=$BUMP -> $version"
+          echo "derived $version"
           echo "version=$version" >>"$GITHUB_OUTPUT"
 
-      - name: Bump the manifest and stamp the changelog
+      - name: Mint the release
+        # momo writes CHANGELOG.md, .momo/version and the Cargo.toml version
+        # scalar. It never touches Cargo.lock, so sync it here: `cargo publish
+        # --locked` fails outright on a stale workspace version entry.
         run: |
           set -euo pipefail
-          mise run version-set "${{ steps.version.outputs.version }}"
-          mise run changelog-stamp \
-            "${{ steps.version.outputs.version }}" "$(date -u +%Y-%m-%d)"
+          momo release
+          cargo metadata --format-version 1 >/dev/null
 
       - name: Verify the package without publishing
-        # The bump above is deliberately uncommitted at this point, so the
+        # The mint above is deliberately uncommitted at this point, so the
         # checkout is dirty by design; --allow-dirty packages exactly what the
         # commit below will record.
         run: cargo publish --dry-run --locked --allow-dirty
@@ -123,9 +111,11 @@ jobs:
           version="${{ steps.version.outputs.version }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add Cargo.toml Cargo.lock CHANGELOG.md
+          git add Cargo.toml Cargo.lock CHANGELOG.md .momo/version
           git commit -m "Release $version"
-          git tag "v$version"
+          # momo tags the version its ledger just minted, anchored to HEAD - the
+          # commit above.
+          momo tag
           git push origin "HEAD:${{ github.ref_name }}" "refs/tags/v$version"
 
       # Publish before creating the Release: a failed publish then leaves a tag
@@ -144,7 +134,7 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
-          mise run changelog-notes "$version" >RELEASE_NOTES.md
+          momo notes --output RELEASE_NOTES.md
           gh release create "v$version" \
             --title "v$version" \
             --notes-file RELEASE_NOTES.md \

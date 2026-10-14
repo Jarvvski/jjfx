@@ -37,7 +37,7 @@ Tooling is driven by [mise](https://mise.jdx.dev):
 | `mise run test-deep` | the suite plus interactive PTY tests that may take terminal focus |
 | `mise run fmt` | `cargo fmt --all` |
 | `mise run lint` | `cargo clippy --all-targets -- -D warnings` |
-| `mise run check` | the pre-land gate: changelog markers + fmt + lint + build + test |
+| `mise run check` | the pre-land gate: changelog validation + fmt + lint + build + test |
 | `mise run conformance` | Go/Rust `wsg` conformance (needs the Go oracle; see [`docs/wsg-conformance.md`](docs/wsg-conformance.md)) |
 | `mise run release` | bundle jjfx+wsg archives + sha256 into `dist/` |
 | `mise run install-candidate` | stage both binaries under a non-PATH prefix |

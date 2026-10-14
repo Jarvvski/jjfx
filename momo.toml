@@ -1,0 +1,6 @@
+# momo configuration.
+# Precedence: MOMO_* environment variables > this file > built-in defaults.
+recording = "changelog"
+changelog = "CHANGELOG.md"
+changes_dir = ".momo/changes"
+tag_prefix = "v"
