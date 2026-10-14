@@ -1,7 +1,7 @@
 # Epic D - Detail views
 
 Type: epic
-Status: tracking
+Status: done
 Milestone: v0.3
 
 ## Goal
@@ -39,3 +39,11 @@ parallel once their gates clear.
 - A commit graph renders from jj-lib data, highlights the selected workspace's
   chain, and updates on revision changes.
 - `mise run check` is green.
+
+## Outcome
+
+2026-10-14 - Complete. Tickets 10 and 11 are done: selecting a workspace shows
+its changed files and a syntect-highlighted diff from trunk with scroll and
+fuzzy filter and no `bat` process, and the commit graph renders from jj-lib data,
+highlights the selected workspace's chain, and updates on revision changes.
+`mise run check` is green.

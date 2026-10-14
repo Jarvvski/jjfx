@@ -285,12 +285,6 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 
 ## Fog
 
-- Whether the Worker cwd failure is jjfx or opencode's project-root detection
-  under colocated Git worktrees - **answered: neither, in isolation**; ticket 01
-  could not reproduce it. Awaiting reporter info (ticket 05).
-- Whether D8 (dependency statuses) and D9 (Claude usage) are intended
-  simplifications or oversights.
-- The exact liveness contract for a Dispatch Group that contains a terminal
-  failure: cancel, skip-with-reason, or fail-the-group (ticket 04 decides).
-- How much of the jj read path can move to `jj-lib` without breaking the
-  version coupling (ticket 21 / 24).
+- How much of the jj read path can move to `jj-lib` without breaking the version
+  coupling - still live, parked until the churn gate clears; tracked in
+  [`01-migrate-reads-to-jj-lib`](../jj-lib-reads/issues/01-migrate-reads-to-jj-lib.md).

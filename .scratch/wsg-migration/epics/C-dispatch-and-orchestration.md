@@ -1,7 +1,7 @@
 # Epic C - Dispatch and orchestration
 
 Type: epic
-Status: tracking
+Status: resolved
 
 ## Goal
 
@@ -37,3 +37,12 @@ Tickets 10 and 12 can proceed independently once their prerequisites are availab
 - Dispatch Waves progress in dependency order and retry a failed Run once.
 - A restarted orchestrator resumes persisted progress without duplicate launches.
 - `mise run check` is green.
+
+## Outcome
+
+2026-10-14 - Complete. Tickets 10 through 13 are resolved and every condition
+above holds: Rust discovers Ready Tickets and Parent dependencies through Claude
+Code or Codex; Direct Dispatch is atomic with concurrent pool mutation; Go-created
+Dispatch Groups round-trip unchanged; Dispatch Waves progress in dependency order
+and retry a failed Run once; and a restarted orchestrator resumes persisted
+progress without duplicate launches. `mise run check` is green.

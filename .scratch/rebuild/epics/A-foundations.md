@@ -1,7 +1,7 @@
 # Epic A - Foundations
 
 Type: epic
-Status: tracking
+Status: done
 Milestone: v0.1
 
 ## Goal
@@ -44,3 +44,11 @@ outcomes gate Epic B.
 - `jjfx` launches in a repo, lists workspaces, reconciles a shell-created
   workspace live, and quits with the terminal intact.
 - `mise run check` is green.
+
+## Outcome
+
+2026-10-14 - Complete. Tickets 01 through 03 are done: both spikes recorded their
+findings (`spike-01-hooks-findings.md`, `spike-02-jj-lib-findings.md`; ADR 0007
+stood unchanged), and the walking skeleton launches in a repo, lists workspaces,
+reconciles a shell-created workspace live, and quits with the terminal intact.
+`mise run check` is green.
