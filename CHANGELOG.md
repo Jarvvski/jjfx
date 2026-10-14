@@ -27,6 +27,10 @@ markers on their entries; they are preserved as history and carry no meaning now
 
 ## [Unreleased]
 
+### Breaking
+
+- Workspace existence and paths now come from jj rather than the ws-cache: each Workspace's recorded path is read from jj instead of guessed from a naming convention, and a name jj no longer reports is no longer listed as a Workspace.
+
 ### Fixed
 
 - Workspace rows now say why a path is unusable: a recorded path whose directory is gone names the path it was at, and a path jjfx never knew reads `(path unknown)`.

@@ -173,10 +173,10 @@ impl Store {
             .into_iter()
             .map(|entry| Workspace {
                 name: entry.name().to_owned(),
-                path: match (entry.is_missing(), entry.path_is_recorded()) {
-                    (false, _) => WorkspacePath::Present(entry.path().to_path_buf()),
-                    (true, true) => WorkspacePath::Missing(entry.path().to_path_buf()),
-                    (true, false) => WorkspacePath::Unknown,
+                path: match entry.path() {
+                    Some(path) if path.is_dir() => WorkspacePath::Present(path.to_path_buf()),
+                    Some(path) => WorkspacePath::Missing(path.to_path_buf()),
+                    None => WorkspacePath::Unknown,
                 },
             })
             .collect();
@@ -353,15 +353,6 @@ mod tests {
     use super::*;
     use crate::jj;
 
-    /// Write the compatible ws-cache byte format directly, as the bash tools do.
-    fn write_cache(repo: &Path, entries: &[(&str, &Path)]) {
-        let body: String = entries
-            .iter()
-            .map(|(name, path)| format!("{name}\t{}\n", path.display()))
-            .collect();
-        std::fs::write(repo.join(".jj").join("ws-cache"), body).unwrap();
-    }
-
     /// A sibling of the unique `test_local_repo` directory, named from that
     /// directory so concurrent test runs never share a path.
     fn sibling(repo: &Path, tag: &str) -> PathBuf {
@@ -372,20 +363,14 @@ mod tests {
     }
 
     #[test]
-    fn load_orders_cache_workspaces_and_pins_default_to_repo_root() {
-        let repo = test_local_repo("load-cache");
+    fn load_orders_jj_workspaces_and_pins_default_to_repo_root() {
+        let repo = test_local_repo("load-order");
         let alpha = sibling(&repo, "alpha-workspace");
         let zeta = sibling(&repo, "zeta-workspace");
-        std::fs::create_dir_all(&alpha).unwrap();
-        std::fs::create_dir_all(&zeta).unwrap();
-        write_cache(
-            &repo,
-            &[
-                ("zeta", zeta.as_path()),
-                (DEFAULT_WORKSPACE, Path::new("/stale/path")),
-                ("alpha", alpha.as_path()),
-            ],
-        );
+        // Created out of alphabetical order, at off-convention paths: the store
+        // takes the set and the paths from jj, and orders by name itself.
+        jj::add_workspace(&repo, "zeta", &zeta).unwrap();
+        jj::add_workspace(&repo, "alpha", &alpha).unwrap();
 
         let store = Store::load(&repo);
         let names: Vec<_> = store
@@ -434,44 +419,38 @@ mod tests {
     }
 
     #[test]
-    fn load_reports_a_jj_only_workspace_whose_path_is_unknown() {
-        let repo = test_local_repo("load-jj-only");
-        let path = sibling(&repo, "orphan-workspace");
-        jj::add_workspace(&repo, "orphan", &path).unwrap();
+    fn load_reads_a_jj_workspace_path_from_jj() {
+        let repo = test_local_repo("load-jj-path");
+        let path = sibling(&repo, "off-convention-workspace");
+        jj::add_workspace(&repo, "elsewhere", &path).unwrap();
 
         let store = Store::load(&repo);
 
-        // jj knows the name but records no path, and the naming convention does
-        // not resolve to a directory: jjfx never knew where this one lived.
+        // jj records where the Workspace is, so jjfx reads it instead of guessing
+        // from the naming convention - which points somewhere that never existed.
         assert_eq!(
-            store.workspace("orphan").unwrap().path,
-            WorkspacePath::Unknown
+            store.workspace("elsewhere").unwrap().path,
+            WorkspacePath::Present(path.clone())
         );
-        assert_eq!(store.workspace("orphan").unwrap().path.present(), None);
 
         std::fs::remove_dir_all(path).unwrap();
         std::fs::remove_dir_all(repo).unwrap();
     }
 
     #[test]
-    fn load_reports_a_recorded_path_whose_directory_is_gone_as_missing() {
+    fn load_reports_a_jj_workspace_whose_directory_is_gone_as_missing() {
         let repo = test_local_repo("load-missing-dir");
-        let absent = sibling(&repo, "gone-workspace");
-        write_cache(
-            &repo,
-            &[
-                (DEFAULT_WORKSPACE, repo.as_path()),
-                ("gone", absent.as_path()),
-            ],
-        );
+        let path = sibling(&repo, "gone-workspace");
+        jj::add_workspace(&repo, "gone", &path).unwrap();
+        std::fs::remove_dir_all(&path).unwrap();
 
         let store = Store::load(&repo);
 
-        // The cache records where this Workspace was, so its absent directory
-        // means it moved or was removed - not that the path is unknown.
+        // jj still reports the Workspace and records where it was, so its absent
+        // directory means it moved or was removed - not that the path is unknown.
         assert_eq!(
             store.workspace("gone").unwrap().path,
-            WorkspacePath::Missing(absent.clone())
+            WorkspacePath::Missing(path.clone())
         );
         assert_eq!(store.workspace("gone").unwrap().path.present(), None);
 
@@ -479,33 +458,20 @@ mod tests {
     }
 
     #[test]
-    fn refresh_does_not_record_a_derived_path_as_a_fact() {
-        let repo = test_local_repo("refresh-derived");
+    fn refresh_mirrors_the_paths_jj_records() {
+        let repo = test_local_repo("refresh-mirror");
         let path = sibling(&repo, "elsewhere-workspace");
         jj::add_workspace(&repo, "elsewhere", &path).unwrap();
 
         let repository = Repository::open(&repo).unwrap();
-        let snapshot = repository.workspaces().refresh().unwrap();
-        assert!(
-            snapshot
-                .entries()
-                .iter()
-                .any(|entry| entry.name() == "elsewhere" && !entry.path_is_recorded()),
-            "the projection still shows the jj-only Workspace"
-        );
+        repository.workspaces().refresh().unwrap();
 
-        // The mirror records only the paths jjfx knows, so the naming-convention
-        // guess for `elsewhere` is not written: persisting it would make the next
-        // read treat the guess as a fact.
+        // The mirror is written for the tools that read it, so it holds the path
+        // jj records - not a naming-convention guess.
         let cache = std::fs::read_to_string(repo.join(".jj/ws-cache")).unwrap();
-        assert!(!cache.contains("elsewhere"), "{cache}");
-
-        // So the Workspace still reads as unknown after a refresh, rather than
-        // as missing at a path it was never at.
-        let store = Store::load(&repo);
-        assert_eq!(
-            store.workspace("elsewhere").unwrap().path,
-            WorkspacePath::Unknown
+        assert!(
+            cache.contains(&format!("elsewhere\t{}", path.display())),
+            "{cache}"
         );
 
         std::fs::remove_dir_all(path).unwrap();
@@ -546,7 +512,10 @@ mod tests {
             .map(|entry| {
                 (
                     entry.name().to_owned(),
-                    (!entry.is_missing()).then(|| entry.path().to_path_buf()),
+                    entry
+                        .path()
+                        .filter(|path| path.is_dir())
+                        .map(Path::to_path_buf),
                 )
             })
             .collect();
@@ -689,16 +658,9 @@ mod tests {
     #[test]
     fn delete_jj_failure_continues_filesystem_cleanup() {
         let repo = test_local_repo("delete-jj-failure");
-        let path = new_workspace_path(&repo, "ghost");
-        std::fs::create_dir_all(&path).unwrap();
-        write_cache(
-            &repo,
-            &[
-                (DEFAULT_WORKSPACE, repo.as_path()),
-                ("ghost", path.as_path()),
-            ],
-        );
         let mut store = Store::load(&repo);
+        let created = store.create("ghost").unwrap();
+        let path = created.path().to_path_buf();
         let repo_state = repo.join(".jj").join("repo");
         let disabled_repo_state = repo.join(".jj").join("repo-disabled");
         std::fs::rename(&repo_state, &disabled_repo_state).unwrap();
@@ -710,10 +672,12 @@ mod tests {
             store.workspace("ghost").unwrap().path.present(),
             Some(path.as_path())
         );
-        assert!(!path.exists());
+        assert!(!path.exists(), "the directory is cleaned up regardless");
         std::fs::rename(&disabled_repo_state, &repo_state).unwrap();
+        // jj never forgot it, so jj - the source of truth for Workspaces - still
+        // reports it.
         let fresh = Store::load(&repo);
-        assert!(fresh.workspace("ghost").is_none());
+        assert!(fresh.workspace("ghost").is_some());
 
         std::fs::remove_dir_all(&repo).unwrap();
     }

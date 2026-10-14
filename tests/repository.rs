@@ -174,7 +174,7 @@ fn refresh_preserves_cached_paths_for_ad_hoc_workspaces() {
         .iter()
         .find(|entry| entry.name() == "feature")
         .expect("refreshed projection should include the ad hoc workspace");
-    assert_eq!(entry.path(), workspace.path());
+    assert_eq!(entry.path(), Some(workspace.path()));
 
     fs::remove_dir_all(workspace.path()).expect("ad hoc workspace should be removed");
 }

@@ -1,13 +1,13 @@
 //! The one jj access layer: every jj semantic jjfx reads is derived here, from a
 //! machine-readable source, and returned as a typed outcome.
 //!
-//! jj does not record each workspace's filesystem path (spike 02), so paths come
-//! from the ws-cache. Where a semantic needs jj state, this layer reads it through
-//! jj's template language (`-T`), a purpose-built flag (`--count`), or the Git
-//! diff format - never by scanning jj's English status prose. A jj failure is a
-//! typed error ([`anyhow::Result`]), never a silent empty/zero result: callers
-//! can always tell "jj said zero/none" from "jj could not be read". Richer reads
-//! move to jj-lib in later epics (ADR 0007).
+//! jj records a path for every named workspace, so jjfx reads both the name and
+//! the path from jj rather than guessing one. Where a semantic needs jj state,
+//! this layer reads it through jj's template language (`-T`), a purpose-built
+//! flag (`--count`), or the Git diff format - never by scanning jj's English
+//! status prose. A jj failure is a typed error ([`anyhow::Result`]), never a
+//! silent empty/zero result: callers can always tell "jj said zero/none" from
+//! "jj could not be read". Richer reads move to jj-lib in later epics (ADR 0007).
 
 use std::path::{Path, PathBuf};
 
@@ -74,28 +74,74 @@ fn slug_from_url(url: &str) -> Option<String> {
     ))
 }
 
-/// Workspace names jj knows in this repo, via
-/// `jj workspace list -T 'stringify(name) ++ "\n"'`. `stringify` is required
-/// because `name` is a symbol: jj renders a name that needs quoting (`my work`)
-/// with its quotes, and a caller wants the raw name jj and the ws-cache agree on.
-/// `--ignore-working-copy` keeps it a pure read (no snapshot, no commit churn).
-/// A jj failure is a typed error, never an empty list: the caller must be able to
-/// tell "jj reports no workspaces" from "jj could not be read".
-pub fn workspace_names(repo_root: &Path) -> anyhow::Result<Vec<String>> {
-    let out = read_at_repo(
-        repo_root,
-        &["workspace", "list", "-T", "stringify(name) ++ \"\\n\""],
-    )?;
-    Ok(parse_workspace_names(&out))
+/// A Workspace jj knows in this repo: its name and, when jj records one, its
+/// directory.
+///
+/// jj keeps a path per named Workspace (`.jj/repo/workspace_store`), and
+/// `jj workspace root --name <name>` reports it, so jjfx never has to guess one.
+/// The `default` Workspace is the exception: it is implicit, jj records no path
+/// for it, and its directory is the repository root (ADR 0008).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JjWorkspace {
+    /// The raw Workspace name jj and the ws-cache agree on.
+    pub name: String,
+    /// The recorded directory, when jj has one for this Workspace.
+    pub path: Option<PathBuf>,
 }
 
-/// Split `jj workspace list` template output into the raw workspace names it
-/// emitted, one per line. Blank lines are dropped.
-fn parse_workspace_names(out: &str) -> Vec<String> {
+/// Workspaces jj knows in this repo, via
+/// `jj workspace list -T 'stringify(name) ++ "\t" ++ root ++ "\n"'`.
+///
+/// `stringify(name)` is required because `name` is a symbol: jj renders a name
+/// that needs quoting (`my work`) with its quotes, and a caller wants the raw
+/// name jj and the ws-cache agree on. `root` is empty for the implicit `default`
+/// Workspace and a path for every other one. `--ignore-working-copy` keeps it a
+/// pure read (no snapshot, no commit churn). A jj failure is a typed error,
+/// never an empty list: the caller must be able to tell "jj reports no
+/// workspaces" from "jj could not be read".
+pub fn workspaces(repo_root: &Path) -> anyhow::Result<Vec<JjWorkspace>> {
+    let out = read_at_repo(
+        repo_root,
+        &[
+            "workspace",
+            "list",
+            "-T",
+            "stringify(name) ++ \"\\t\" ++ root ++ \"\\n\"",
+        ],
+    )?;
+    Ok(parse_workspaces(&out))
+}
+
+/// Workspace names jj knows in this repo.
+pub fn workspace_names(repo_root: &Path) -> anyhow::Result<Vec<String>> {
+    Ok(workspaces(repo_root)?
+        .into_iter()
+        .map(|workspace| workspace.name)
+        .collect())
+}
+
+/// Split `jj workspace list` template output into the Workspaces it emitted.
+///
+/// One line per Workspace, `name<TAB>path`, where the path is empty when jj
+/// records none. Only the first tab separates the two, so a path containing one
+/// is kept whole. Blank lines are dropped.
+fn parse_workspaces(out: &str) -> Vec<JjWorkspace> {
     out.lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(String::from)
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| match line.split_once('\t') {
+            Some((name, path)) if !path.is_empty() => JjWorkspace {
+                name: name.to_owned(),
+                path: Some(PathBuf::from(path)),
+            },
+            Some((name, _)) => JjWorkspace {
+                name: name.to_owned(),
+                path: None,
+            },
+            None => JjWorkspace {
+                name: line.to_owned(),
+                path: None,
+            },
+        })
         .collect()
 }
 
@@ -442,12 +488,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_workspace_names_trims_and_drops_blanks() {
+    fn parse_workspaces_drops_blanks_and_keeps_the_raw_name_and_path() {
         assert_eq!(
-            parse_workspace_names("default\nmy work\n\n"),
-            vec!["default".to_string(), "my work".to_string()]
+            parse_workspaces("default\t\nmy work\t/tmp/my work\n\n"),
+            vec![
+                JjWorkspace {
+                    name: "default".to_string(),
+                    path: None,
+                },
+                JjWorkspace {
+                    name: "my work".to_string(),
+                    path: Some(PathBuf::from("/tmp/my work")),
+                },
+            ]
         );
-        assert!(parse_workspace_names("\n  \n").is_empty());
+        assert!(parse_workspaces("\n  \n").is_empty());
     }
 
     #[test]

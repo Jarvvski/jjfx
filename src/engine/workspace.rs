@@ -99,17 +99,15 @@ pub enum CleanDecision {
     Declined,
 }
 
-/// A Workspace entry projected from jj and the compatible cache.
+/// A Workspace entry projected from jj.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEntry {
     name: String,
-    path: PathBuf,
-    /// Whether `path` was recorded in the compatible cache rather than derived
-    /// from the naming convention. A recorded path is authoritative - jjfx or
-    /// the shell tools wrote it for this Workspace - so its absence means the
-    /// Workspace moved or was removed. A derived path is only a guess, so its
-    /// absence means the path is simply not known.
-    path_is_recorded: bool,
+    /// The Workspace's directory, when jjfx knows it. jj records a path for
+    /// every named Workspace and the default Workspace is the repository root
+    /// (ADR 0008), so this is `None` only when jj reports a Workspace it has no
+    /// path for - reported as unknown rather than guessed at.
+    path: Option<PathBuf>,
 }
 
 impl WorkspaceEntry {
@@ -118,22 +116,9 @@ impl WorkspaceEntry {
         &self.name
     }
 
-    /// Returns the projected filesystem path.
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    /// Reports whether the projected Workspace directory is absent.
-    pub fn is_missing(&self) -> bool {
-        !self.path.is_dir()
-    }
-
-    /// Reports whether the projected path is recorded in the cache rather than
-    /// derived from the naming convention. Callers use this to tell a Workspace
-    /// that moved or was removed (a recorded path whose directory is gone) from
-    /// one whose path jjfx never knew (a derived path that does not exist).
-    pub fn path_is_recorded(&self) -> bool {
-        self.path_is_recorded
+    /// Returns the Workspace's directory, when jjfx knows it.
+    pub fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
     }
 }
 
@@ -191,23 +176,31 @@ impl Workspaces {
     }
 
     /// Resolves a Workspace name without requiring it to exist.
+    ///
+    /// A Workspace jj knows resolves to the path jj records for it; anything
+    /// else - including a name that does not exist yet - falls back to the
+    /// convention this repository creates new Workspaces at.
     pub fn path(&self, name: &str) -> PathBuf {
         if name == DEFAULT_WORKSPACE {
-            self.repository.root().to_path_buf()
-        } else {
-            self.base_dir().join(name)
+            return self.repository.root().to_path_buf();
         }
+        self.projection()
+            .ok()
+            .and_then(|snapshot| {
+                snapshot
+                    .entries()
+                    .iter()
+                    .find(|entry| entry.name() == name)
+                    .and_then(|entry| entry.path().map(Path::to_path_buf))
+            })
+            .unwrap_or_else(|| self.base_dir().join(name))
     }
 
     /// Reads the ordered Workspace projection, refreshing a missing or stale
     /// cache.
     ///
-    /// The returned projection is the union [`Workspaces::projection`] builds:
-    /// jj's live Workspace names, the mirror's recorded paths, and the derived
-    /// default. The only difference is that a missing or stale mirror is rebuilt
-    /// first. A read never invents a path - the mirror holds the paths jjfx
-    /// knows, and a Workspace whose path it never learned is reported as
-    /// unknown rather than at a guessed one.
+    /// The projection comes from jj either way; the refresh only keeps the
+    /// mirror current for the tools that read it.
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
         let cache = cache_path(self.repository.root());
         if !cache.is_file() || cache_is_stale(self.repository.root(), &cache) {
@@ -218,70 +211,44 @@ impl Workspaces {
 
     /// Reads the current Workspace projection without writing the mirror.
     ///
-    /// Existence is the union of jj's live Workspace names and the cache's
-    /// `name\tpath` entries (ADR 0006): a path already cached for a name is
-    /// preserved (jj does not record paths), a jj-only name falls back to the
-    /// naming convention, and a cache-only name keeps its cached path. The
-    /// default Workspace is always included and pinned to the repository root.
-    /// Each entry reports whether its path was recorded or derived
-    /// ([`WorkspaceEntry::path_is_recorded`]), so a caller can tell a Workspace
-    /// that moved from one whose path was never known.
-    /// Use [`Workspaces::refresh`] to rebuild and persist the mirror.
+    /// jj owns both halves: it reports every named Workspace and records each
+    /// one's path, and the default Workspace is pinned to the repository root
+    /// (ADR 0008). The compatible cache is not consulted - a name jj does not
+    /// report is not a Workspace, and a path jj does not record is not known -
+    /// so jjfx never invents a location. Use [`Workspaces::refresh`] to rebuild
+    /// the mirror for the tools that read it.
     pub fn projection(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
-        let names = workspace_names(self.repository.root())
-            .map_err(|error| AdHocWorkspaceError::new(error.message))?;
-        let cached = read_cache(&cache_path(self.repository.root())).unwrap_or_default();
-        let mut entries = Vec::with_capacity(names.len() + cached.len() + 1);
-        let mut seen = std::collections::HashSet::new();
+        let known = crate::jj::workspaces(self.repository.root())
+            .map_err(|error| AdHocWorkspaceError::new(format!("{error:#}")))?;
+        let mut entries = Vec::with_capacity(known.len() + 1);
         entries.push(WorkspaceEntry {
             name: DEFAULT_WORKSPACE.to_owned(),
-            path: self.repository.root().to_path_buf(),
-            path_is_recorded: true,
+            path: Some(self.repository.root().to_path_buf()),
         });
-        seen.insert(DEFAULT_WORKSPACE.to_owned());
-        for name in names {
-            if !seen.insert(name.clone()) {
+        let mut seen = std::collections::HashSet::from([DEFAULT_WORKSPACE.to_owned()]);
+        for workspace in known {
+            if !seen.insert(workspace.name.clone()) {
                 continue;
             }
-            let (path, path_is_recorded) = cached
-                .iter()
-                .find(|(cached_name, _)| cached_name == &name)
-                .map_or_else(
-                    || (self.path(&name), false),
-                    |(_, path)| (path.clone(), true),
-                );
             entries.push(WorkspaceEntry {
-                name,
-                path,
-                path_is_recorded,
+                name: workspace.name,
+                path: workspace.path,
             });
-        }
-        for (name, path) in cached {
-            if seen.insert(name.clone()) {
-                entries.push(WorkspaceEntry {
-                    name,
-                    path,
-                    path_is_recorded: true,
-                });
-            }
         }
         Ok(WorkspaceSnapshot { entries })
     }
 
     /// Rebuilds the compatible Workspace cache from the live projection.
     ///
-    /// The mirror records the paths jjfx knows, so only recorded entries are
-    /// written. A path that fell back to the naming convention is a guess, and
-    /// persisting it would make the next read treat the guess as a fact - which
-    /// is how a Workspace whose real path jjfx never learned ends up recorded at
-    /// the wrong one, and then reported as missing there.
+    /// The mirror exists for the tools that read it; jjfx reconciles from jj, so
+    /// nothing written here is read back. Only Workspaces with a known path can
+    /// be written, since the format is `name<TAB>path`.
     pub fn refresh(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
         let snapshot = self.projection()?;
         let cache_entries = snapshot
             .entries
             .iter()
-            .filter(|entry| entry.path_is_recorded)
-            .map(|entry| (entry.name.clone(), entry.path.clone()))
+            .filter_map(|entry| Some((entry.name.clone(), entry.path.clone()?)))
             .collect::<Vec<_>>();
         with_cache_lock(self.repository.root(), || {
             write_cache(&cache_path(self.repository.root()), &cache_entries)
@@ -318,9 +285,13 @@ impl Workspaces {
         }
         let snapshot = self.snapshot()?;
         if let Some(existing) = snapshot.entries.iter().find(|entry| entry.name == name) {
+            // jj records a path for every named Workspace, so this is known; the
+            // naming convention is only the fallback for a Workspace jj reports
+            // without one.
+            let path = existing.path.clone().unwrap_or_else(|| self.path(name));
             return Ok(WorkspaceAddOutcome::Existing(AdHocWorkspace {
                 name: name.to_owned(),
-                path: existing.path.clone(),
+                path,
             }));
         }
         let path = self.path(name);
@@ -1212,30 +1183,15 @@ pub(crate) fn git_remotes(root: &Path) -> std::io::Result<std::process::Output> 
 /// directly rather than splitting the human-readable line. `name` is a symbol,
 /// so it is `stringify`d: jj renders a name needing quoting (`my work`) with its
 /// quotes, and every caller here compares against the raw name.
+/// Workspace names jj knows, mapped to this module's error type.
+///
+/// The read itself lives in [`crate::jj`], the one jj access layer, so the
+/// projection and the lifecycle checks can never drift from it - which is how
+/// the projection once ended up snapshotting the working copy while every other
+/// read passed `--ignore-working-copy`.
 fn workspace_names(root: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
-    let output = Command::new("jj")
-        // A pure read. Without this, jj snapshots the working copy and writes
-        // under `.jj`, which fires the TUI's recursive `.jj` watcher and
-        // re-triggers this projection - a self-sustaining reload loop that
-        // storms `jj` and everything downstream of a reload. `jj::read_at_repo`
-        // is the same rule; the projection must never ping its own watcher.
-        .arg("--ignore-working-copy")
-        .args(["workspace", "list", "-T", "stringify(name) ++ \"\\n\""])
-        .current_dir(root)
-        .output()
-        .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace list: {error}")))?;
-    if !output.status.success() {
-        return Err(WorkerWorkspaceError::new(format!(
-            "run jj workspace list: {}",
-            command_error(&output)
-        )));
-    }
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .collect())
+    crate::jj::workspace_names(root)
+        .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace list: {error:#}")))
 }
 
 fn run_setup_hook<F>(workspace: &Path, on_output: F) -> Result<(), String>

@@ -780,7 +780,7 @@ fn path_command(repository: &Repository, name: &str) -> Result<()> {
                 .iter()
                 .find(|entry| entry.name() == name)
                 .or_else(|| entries.iter().find(|entry| entry.name() == prefixed))
-                .map(|entry| entry.path().to_path_buf())
+                .and_then(|entry| entry.path().map(PathBuf::from))
         })
         .unwrap_or_else(|| {
             let worker_path = workspaces.path(&prefixed);
@@ -839,16 +839,12 @@ fn list_command(repository: &Repository) -> Result<()> {
         return Ok(());
     }
     for entry in entries {
-        // Say which of the two problems an unusable path is: a recorded path
-        // whose directory is gone means the Workspace moved or was removed,
-        // while a path jjfx never knew is simply unknown. The default Workspace
-        // is pinned to the repository root, so it is never either.
-        let location = if entry.name() == "default" || !entry.is_missing() {
-            entry.path().display().to_string()
-        } else if entry.path_is_recorded() {
-            format!("{} (missing)", entry.path().display())
-        } else {
-            "(path unknown)".to_owned()
+        // Name the path when jjfx knows it, and say plainly when it is gone. An
+        // unknown path is never dressed up as a location.
+        let location = match entry.path() {
+            Some(path) if path.is_dir() => path.display().to_string(),
+            Some(path) => format!("{} (missing)", path.display()),
+            None => "(path unknown)".to_owned(),
         };
         println!("  {} ➜ {}", entry.name(), location);
     }
