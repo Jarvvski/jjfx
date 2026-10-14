@@ -3,7 +3,6 @@
 use std::collections::BTreeSet;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use jiff::{RoundMode, Timestamp, TimestampRound, Unit};
 use thiserror::Error;
@@ -1425,10 +1424,7 @@ fn worker_claimed(repository: &Repository, worker: &WorkerId) -> bool {
 }
 
 fn discover_gh_repo(repository: &Repository) -> Result<String, WorkerPoolError> {
-    let output = Command::new("jj")
-        .args(["git", "remote", "list"])
-        .current_dir(repository.root())
-        .output()
+    let output = crate::engine::workspace::git_remotes(repository.root())
         .map_err(|error| WorkerPoolError::RepositoryDiscovery(error.to_string()))?;
     if !output.status.success() {
         return Err(WorkerPoolError::RepositoryDiscovery(

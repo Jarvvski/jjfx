@@ -1155,6 +1155,19 @@ fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError>
     Ok(())
 }
 
+/// Read the repository's git remotes.
+///
+/// A pure read, so it must not snapshot the working copy: a snapshot churns
+/// commits and pings the TUI's watcher (ADR 0006). `jj::read_at_repo` is the
+/// same rule; this is the engine's own copy of that read.
+pub(crate) fn git_remotes(root: &Path) -> std::io::Result<std::process::Output> {
+    Command::new("jj")
+        .arg("--ignore-working-copy")
+        .args(["git", "remote", "list"])
+        .current_dir(root)
+        .output()
+}
+
 /// List workspace names through an explicit template. The default
 /// `jj workspace list` output is version-coupled (0.44 added workspace roots,
 /// 0.46 added template labels and unreachable paths), so read the `name` field
@@ -1718,6 +1731,27 @@ mod tests {
         assert_eq!(
             before, after,
             "workspace_names must not snapshot the working copy"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn git_remotes_does_not_snapshot_the_working_copy() {
+        // `jj git remote list` snapshots the working copy by default, so a
+        // dispatch identity check would commit the working copy as a side
+        // effect and ping the TUI's watcher (ADR 0006). The read must be pure.
+        let repo = temp_repo("pure-remotes");
+        let root = repo.canonicalize().unwrap();
+        std::fs::write(root.join("dirty.txt"), "unsnapshotted\n").unwrap();
+
+        let before = working_copy_commit(&root);
+        let _ = git_remotes(&root);
+        let after = working_copy_commit(&root);
+
+        assert_eq!(
+            before, after,
+            "git_remotes must not snapshot the working copy"
         );
 
         std::fs::remove_dir_all(&repo).ok();

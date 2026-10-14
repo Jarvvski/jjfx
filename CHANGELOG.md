@@ -258,6 +258,7 @@ markers on their entries; they are preserved as history and carry no meaning now
   default workspace at discovery, so `default` always points at the repository
   and the store, filesystem watcher, and work poller all agree.
 - The Workspace projection no longer snapshots the working copy, so the TUI stops re-triggering its own .jj watcher in a reload loop that stormed jj and kitten @ ls
+- Dispatch identity checks no longer snapshot the working copy: the engine's git-remote read is pure, so dispatching stops committing the working copy as a side effect
 
 ## [0.52.1] - 2026-10-12
 

@@ -587,10 +587,7 @@ impl DirectDispatch {
         let slug = match configured {
             Some(slug) => slug,
             None => {
-                let output = Command::new("jj")
-                    .args(["git", "remote", "list"])
-                    .current_dir(self.repository.root())
-                    .output()
+                let output = crate::engine::workspace::git_remotes(self.repository.root())
                     .map_err(|error| DirectDispatchError::Identity(error.to_string()))?;
                 if !output.status.success() {
                     return Err(DirectDispatchError::Identity(
