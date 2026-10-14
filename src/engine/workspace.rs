@@ -199,22 +199,21 @@ impl Workspaces {
         }
     }
 
-    /// Reads the ordered Workspace projection, refreshing a missing or stale cache.
+    /// Reads the ordered Workspace projection, refreshing a missing or stale
+    /// cache.
+    ///
+    /// The returned projection is the union [`Workspaces::projection`] builds:
+    /// jj's live Workspace names, the mirror's recorded paths, and the derived
+    /// default. The only difference is that a missing or stale mirror is rebuilt
+    /// first. A read never invents a path - the mirror holds the paths jjfx
+    /// knows, and a Workspace whose path it never learned is reported as
+    /// unknown rather than at a guessed one.
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
         let cache = cache_path(self.repository.root());
         if !cache.is_file() || cache_is_stale(self.repository.root(), &cache) {
             return self.refresh();
         }
-        let entries = read_cache(&cache)
-            .map_err(|error| AdHocWorkspaceError::new(error.message))?
-            .into_iter()
-            .map(|(name, path)| WorkspaceEntry {
-                name,
-                path,
-                path_is_recorded: true,
-            })
-            .collect();
-        Ok(WorkspaceSnapshot { entries })
+        self.projection()
     }
 
     /// Reads the current Workspace projection without writing the mirror.
@@ -270,11 +269,18 @@ impl Workspaces {
     }
 
     /// Rebuilds the compatible Workspace cache from the live projection.
+    ///
+    /// The mirror records the paths jjfx knows, so only recorded entries are
+    /// written. A path that fell back to the naming convention is a guess, and
+    /// persisting it would make the next read treat the guess as a fact - which
+    /// is how a Workspace whose real path jjfx never learned ends up recorded at
+    /// the wrong one, and then reported as missing there.
     pub fn refresh(&self) -> Result<WorkspaceSnapshot, AdHocWorkspaceError> {
         let snapshot = self.projection()?;
         let cache_entries = snapshot
             .entries
             .iter()
+            .filter(|entry| entry.path_is_recorded)
             .map(|entry| (entry.name.clone(), entry.path.clone()))
             .collect::<Vec<_>>();
         with_cache_lock(self.repository.root(), || {

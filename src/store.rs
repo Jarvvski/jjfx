@@ -479,6 +479,40 @@ mod tests {
     }
 
     #[test]
+    fn refresh_does_not_record_a_derived_path_as_a_fact() {
+        let repo = test_local_repo("refresh-derived");
+        let path = sibling(&repo, "elsewhere-workspace");
+        jj::add_workspace(&repo, "elsewhere", &path).unwrap();
+
+        let repository = Repository::open(&repo).unwrap();
+        let snapshot = repository.workspaces().refresh().unwrap();
+        assert!(
+            snapshot
+                .entries()
+                .iter()
+                .any(|entry| entry.name() == "elsewhere" && !entry.path_is_recorded()),
+            "the projection still shows the jj-only Workspace"
+        );
+
+        // The mirror records only the paths jjfx knows, so the naming-convention
+        // guess for `elsewhere` is not written: persisting it would make the next
+        // read treat the guess as a fact.
+        let cache = std::fs::read_to_string(repo.join(".jj/ws-cache")).unwrap();
+        assert!(!cache.contains("elsewhere"), "{cache}");
+
+        // So the Workspace still reads as unknown after a refresh, rather than
+        // as missing at a path it was never at.
+        let store = Store::load(&repo);
+        assert_eq!(
+            store.workspace("elsewhere").unwrap().path,
+            WorkspacePath::Unknown
+        );
+
+        std::fs::remove_dir_all(path).unwrap();
+        std::fs::remove_dir_all(repo).unwrap();
+    }
+
+    #[test]
     fn store_projection_agrees_with_the_shared_workspace_projection() {
         use crate::engine::WorkspaceAddOutcome;
         use std::collections::BTreeSet;

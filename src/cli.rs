@@ -839,12 +839,18 @@ fn list_command(repository: &Repository) -> Result<()> {
         return Ok(());
     }
     for entry in entries {
-        let missing = if entry.name() != "default" && entry.is_missing() {
-            " (missing)"
+        // Say which of the two problems an unusable path is: a recorded path
+        // whose directory is gone means the Workspace moved or was removed,
+        // while a path jjfx never knew is simply unknown. The default Workspace
+        // is pinned to the repository root, so it is never either.
+        let location = if entry.name() == "default" || !entry.is_missing() {
+            entry.path().display().to_string()
+        } else if entry.path_is_recorded() {
+            format!("{} (missing)", entry.path().display())
         } else {
-            ""
+            "(path unknown)".to_owned()
         };
-        println!("  {} ➜ {}{}", entry.name(), entry.path().display(), missing);
+        println!("  {} ➜ {}", entry.name(), location);
     }
     Ok(())
 }
