@@ -1009,15 +1009,33 @@ fn persist_pid_failure(
     background: BackgroundRun,
     primary: RunSupervisorError,
 ) -> Result<BackgroundRun, RunSupervisorError> {
-    let primary = match cleanup_untracked_run(background) {
-        Ok(()) => primary,
-        Err(source) => RunSupervisorError::PersistPidCleanup {
+    persist_pid_failure_with(reservation, background, primary, cleanup_untracked_run)
+}
+
+/// Orders an untracked Run's cleanup against its Reservation release.
+///
+/// The guarantee is that a Reservation is released only after its process group
+/// is actually gone. Its failure mode needs a process group to survive `SIGKILL`,
+/// which cannot be arranged deterministically, so the cleanup outcome is a
+/// parameter: a test injects the failure through this seam instead of arranging
+/// the impossible process state.
+fn persist_pid_failure_with(
+    reservation: &Reservation,
+    background: BackgroundRun,
+    primary: RunSupervisorError,
+    cleanup: impl FnOnce(BackgroundRun) -> io::Result<()>,
+) -> Result<BackgroundRun, RunSupervisorError> {
+    match cleanup(background) {
+        // The process group is gone, so the Worker may safely be released.
+        Ok(()) => release_after_failure(reservation, primary),
+        // The process group may still be alive: keep the Reservation so the
+        // Worker cannot be reused while an untracked agent may still be running.
+        Err(source) => Err(RunSupervisorError::PersistPidCleanup {
             worker: reservation.worker_id().clone(),
             primary: Box::new(primary),
             source,
-        },
-    };
-    release_after_failure(reservation, primary)
+        }),
+    }
 }
 
 fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
@@ -2188,4 +2206,99 @@ pub enum AgentRuntimeProbeError {
         /// Missing flag or capability name.
         capability: String,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::PathBuf;
+    use std::process::Command;
+
+    use crate::engine::{PoolCapacity, Repository, WorkerStatus};
+
+    /// A throwaway Jujutsu repository with one idle Worker, so the ordering test
+    /// owns a real Reservation rather than a stub.
+    fn reserved_worker() -> (tempfile::TempDir, Repository, crate::engine::WorkerId) {
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let status = Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
+            .arg(temporary.path())
+            .status()
+            .expect("jj should be installed");
+        assert!(status.success(), "jj git init should succeed");
+        let repository = Repository::open(temporary.path()).expect("repository");
+        let worker = repository
+            .worker_pool()
+            .resize_to(PoolCapacity::new(1).expect("capacity"))
+            .expect("Worker Workspace should be provisioned")
+            .added_workers()[0]
+            .clone();
+        (temporary, repository, worker)
+    }
+
+    /// A real background Run process the ordering test can own.
+    fn real_background_run(log_path: PathBuf) -> BackgroundRun {
+        let child = Command::new("sleep")
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .expect("background helper process");
+        BackgroundRun {
+            child,
+            runtime: AgentRuntime::Claude,
+            log_path,
+            completion: None,
+        }
+    }
+
+    /// A Reservation is released only after its process group is actually gone:
+    /// when cleanup cannot confirm exit, the Worker must stay `busy` rather than
+    /// become reusable while an untracked agent may still be running.
+    #[test]
+    fn a_reservation_survives_an_unconfirmed_untracked_cleanup() {
+        let (temporary, repository, worker) = reserved_worker();
+        let reservation = repository
+            .worker_pool()
+            .reserve_named(worker.clone(), "ENG-240")
+            .expect("Worker reservation");
+        let background = real_background_run(temporary.path().join("worker.log"));
+
+        let error = persist_pid_failure_with(
+            &reservation,
+            background,
+            RunSupervisorError::PersistPidMissing {
+                worker: worker.clone(),
+                pid: 1,
+            },
+            |background| {
+                // Real process: end its group so the test does not leak, then
+                // report the unconfirmed-cleanup outcome under test.
+                let _ = cleanup_untracked_run(background);
+                Err(io::Error::other("injected cleanup failure"))
+            },
+        )
+        .expect_err("an unconfirmed cleanup must surface the failure");
+
+        assert!(
+            matches!(error, RunSupervisorError::PersistPidCleanup { .. }),
+            "unexpected error: {error}"
+        );
+        let snapshot = repository.worker_pool().snapshot();
+        let worker = snapshot.worker(worker.as_str()).expect("reserved Worker");
+        assert_eq!(
+            worker.status(),
+            WorkerStatus::Busy,
+            "a Worker whose untracked Run cleanup failed must not be released"
+        );
+    }
 }
