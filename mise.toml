@@ -17,6 +17,12 @@ zig = "0.16.0"
 description = "Run the jjfx TUI"
 run = "cargo run --release -p jjfx -- tui"
 
+[tasks.dev]
+description = "Run the jjfx TUI from a debug build (fast rebuild loop)"
+# Debug renders slower than release, so `run` stays optimized for real use;
+# this is the loop to iterate in, where an edit costs ~2s instead of ~10s.
+run = "cargo run -p jjfx -- tui"
+
 [tasks.build]
 description = "Build every workspace package"
 run = "cargo build --release --workspace"
@@ -42,10 +48,10 @@ description = "Clippy across every workspace package, warnings as errors"
 run = "cargo clippy --workspace --all-targets -- -D warnings"
 
 [tasks.check]
-description = "changelog validation + fmt + lint + build + test + cleanup (the pre-land gate)"
-# JJFX_KEEP_TARGET skips the cleanup for callers that still need the build
-# cache afterwards - the release workflow builds archives straight after the
-# gate, and a cold cross-compile of the whole tree is pure waste.
+description = "changelog validation + fmt + lint + build + test (the pre-land gate)"
 # `momo status` is the changelog check: it fails on a changelog momo cannot read
 # (a duplicate Unreleased heading) and passes when nothing is unreleased.
-run = "trap 'status=$?; [ -n \"${JJFX_KEEP_TARGET:-}\" ] || cargo clean; exit \"$status\"' EXIT; momo status >/dev/null && mise run fmt && mise run lint && mise run build && mise run test"
+# The gate deliberately leaves the build cache intact: `cargo clean` here made
+# every following build a cold one (~45s of recompiling 343 crates) and bought
+# nothing on CI's ephemeral runners. Use `mise run clean-check` to drop artifacts.
+run = "momo status >/dev/null && mise run fmt && mise run lint && mise run build && mise run test"

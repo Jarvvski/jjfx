@@ -35,15 +35,18 @@ exclude = [
 [features]
 test-support = []
 
-# Keep local development and test artifacts small. Release builds are used by
-# the normal mise run/build tasks, while tests retain their separate profile.
+# `debug = 0` keeps local development and test artifacts small without slowing
+# the build (release builds are used by the normal mise run/build tasks, while
+# tests retain their separate profile). `incremental` stays on: it only affects
+# this crate's own recompiles, and it is what makes an edit-to-rebuild cycle
+# fast - turning it off made every `src/lib.rs` edit recompile the whole crate.
 [profile.dev]
 debug = 0
-incremental = false
+incremental = true
 
 [profile.test]
 debug = 0
-incremental = false
+incremental = true
 
 [dependencies]
 anyhow = "1"

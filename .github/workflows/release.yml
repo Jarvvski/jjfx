@@ -46,12 +46,9 @@ jobs:
           cache: false
       - uses: Swatinem/rust-cache@v2
 
-      # The canonical gate, before anything irreversible. JJFX_KEEP_TARGET
-      # keeps `cargo clean` from throwing away the build cache that the archive
-      # build below depends on.
+      # The canonical gate, before anything irreversible. It leaves the build
+      # cache in place, which the archive build below reuses.
       - name: Pre-land gate
-        env:
-          JJFX_KEEP_TARGET: "1"
         run: mise run check
 
       - name: Derive the next version
