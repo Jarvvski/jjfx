@@ -1,6 +1,6 @@
 # Set the Run's session directory explicitly
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -73,13 +73,27 @@ opencode returns.
 
 ## Acceptance Criteria
 
-- [ ] A Run's session is created with its Worker Workspace as `location`.
-- [ ] A Run driven from the wrong process cwd still executes in its Worker Workspace.
-- [ ] A mismatched `location` is detected and surfaced; an unreachable or older API
+- [x] A Run's session is created with its Worker Workspace as `location`.
+- [x] A Run driven from the wrong process cwd still executes in its Worker Workspace.
+- [x] A mismatched `location` is detected and surfaced; an unreachable or older API
       does not fail a Run.
-- [ ] The process-cwd path still works when the API is unavailable.
+- [x] The process-cwd path still works when the API is unavailable.
 
 ## Out of Scope
 
 - Fixing opencode's own directory handling (ticket 05 - upstream).
 - Stopping a Run (ticket 37).
+
+## Outcome (2026-10-14)
+
+Landed as `Anchor an opencode Run to its Worker Workspace through a created session`. No new dependency and no `unsafe`.
+
+`RunSupervisor::prepare_reserved_session` runs before the request is built and is a no-op for every runtime but opencode. For an opencode Run it calls `opencode_api::create_run_session` (built on ticket 39's `OpenCodeApi`, not a second client), which creates the session with `location.directory` = the Worker Workspace and the `title` jjfx already sets, then reads it back with `session.get` and compares the directory opencode actually stored - exact, with a `canonicalize` fallback for a symlinked spelling. The returned id is set on the invocation, so `opencode_command` adds `--session <id>` exactly as today, and the process cwd is still set as before.
+
+Three outcomes, as the ticket asked: **unavailable** (no executable, no server, older opencode, unparseable output) leaves the invocation unchanged and never fails a Run; a **server refusal** or a **mismatched anchor** fails the Run with `RunSupervisorError::OpenCodeSession` naming both directories, after the Reservation is released - the "do not commit into the wrong worktree" guard; and a session reported without a location, or a read-back that becomes unavailable, still drives the id it created.
+
+**Where the id lives** - the design point 37 depends on: a new jjfx-owned sidecar, `.jj/pool/sessions.json` (lock `.jj/pool/.sessions.lock`), mapping Worker to session id, exposed as `StateStore::sessions()` / `SessionStateRepository`. It reuses the existing atomic-write and lock machinery, is additive to the Go-compatible documents (which are frozen, so the id could not go there), and does not overload `in-use.json`, whose whole set is reconciled from the terminal. The id is recorded for both created and resumed sessions, and overwritten by the next Run on that Worker.
+
+Evidence: 7 unit tests over the `OpenCodeRunner` seam (create anchors and drives; blank title omitted; unavailable falls back; a refusal surfaces; a differing anchor fails naming both paths; a failed read-back still drives; a location-less session tolerated), a sidecar test in `tests/state_repositories.rs`, and 4 integration tests in `tests/agent_runtime.rs` against a fake `opencode` on `PATH`: a real reserved Run creates the session, drives it with `--session`, runs in the Workspace cwd and records the id; an unreachable API runs on cwd with no `--session` and records nothing; an anchor mismatch fails the Run, spawns nothing and releases the Worker; a resumed Run drives and records the existing id without creating another.
+
+Residual risk: a failure to *write* the sidecar fails the Run (fail-closed - an unstoppable Run is the hazard 37 addresses), which is jjfx-owned state rather than the opencode API; the id is not cleared on finalization, so a finished Run leaves it until the Worker's next Run overwrites it (deliberate - clearing would race a newer Run, and 37 gates on outcome); every opencode Run now costs one API round-trip before it starts, inheriting ticket 39's no-timeout residual; and the shapes were verified live against opencode v2.0.29, which stores the directory verbatim - hence the defensive canonical compare.

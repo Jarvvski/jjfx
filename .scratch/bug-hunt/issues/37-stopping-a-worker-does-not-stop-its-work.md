@@ -127,3 +127,5 @@ session id outright and the title matching above is no longer needed. Revised:
 The original choice is kept above for the record - it was right given what was known
 then, and its rejection of *minting* an id still stands: 38 creates a session and
 keeps the id opencode returns rather than inventing one.
+
+**38 landed (2026-10-14).** The session id is now recorded in a jjfx-owned sidecar, `.jj/pool/sessions.json` (lock `.jj/pool/.sessions.lock`), per Worker, exposed as `StateStore::sessions()` / `SessionStateRepository`; it is overwritten by the Worker's next Run and never cleared. So identification at teardown is: read that sidecar for the Worker, and treat the Run as finished on the session `outcome` (or a run-log result) rather than on the client pid. Title matching stays only as the fallback for a session jjfx did not create. Note the id is recorded *before* the Run starts, so unlike re-resolving from the run log it is available from the first moment.

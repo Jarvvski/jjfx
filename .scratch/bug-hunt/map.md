@@ -207,11 +207,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   by the id jjfx creates in 38; title matching is only a fallback. **Sequence: after
   07/20 and after 38** - it changes the same functions as 07/20 and builds on 38.
 - [38](issues/38-set-run-session-directory.md) - guard for the ticket 05 class.
-  **ready-for-agent** - decided 2026-10-14: create the Run's session via
-  `session.create` with `location.directory` = the Worker Workspace, then drive it
-  with `run --session <id>`. Verified by experiment that the session's `location`
-  wins over the process cwd, so jjfx stops inferring the directory. Also makes 37's
-  session identification simpler.
+  **resolved** - `session.create` with `location.directory` = the Worker Workspace,
+  read back and compared before the Run starts, then driven with `--session <id>`;
+  the id is recorded in a jjfx-owned sidecar (`.jj/pool/sessions.json`) for 37.
+  Unavailable API falls back to the process cwd and never fails a Run.
 - [39](issues/39-opencode-api-client.md) - shared prerequisite for 37 and 38.
   **resolved** - `src/engine/opencode_api.rs`: a typed, best-effort client over
   `opencode api` with an explicit unavailable-versus-rejected contract and an
