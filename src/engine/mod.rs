@@ -16,6 +16,7 @@ mod dispatch_group;
 mod dispatch_prompt;
 mod eligibility;
 mod layout;
+mod opencode_api;
 mod orchestration;
 mod pool;
 mod run_log;
@@ -42,6 +43,10 @@ pub use dispatch_prompt::{
 pub use eligibility::{DispatchExclusions, ExclusionsProvider, reconcile_occupancy};
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
+};
+pub use opencode_api::{
+    CommandOutput, ModelRef, NewSession, OpenCodeApi, OpenCodeError, OpenCodeRunner,
+    ProcessOpenCodeRunner, Session, SessionOutcome,
 };
 pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationPreparation,
