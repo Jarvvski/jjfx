@@ -74,9 +74,9 @@ pub use runtime::{
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
     Expected, IdentifierError, InUseState, InUseStateRepository, Loaded, PoolState,
-    PoolStateRepository, StateChange, StateError, StateRevision, StateStore, SubIssueState,
-    TicketId, Versioned, WireAgent, WireStatus, WireTimestamp, WorkerId, WorkerState,
-    WorkerStateRepository,
+    PoolStateRepository, SessionState, SessionStateRepository, StateChange, StateError,
+    StateRevision, StateStore, SubIssueState, TicketId, Versioned, WireAgent, WireStatus,
+    WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,

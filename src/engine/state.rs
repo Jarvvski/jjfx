@@ -26,6 +26,8 @@ const DESTROY_MARKER: &str = ".jj/pool/.destroying";
 const CLEANUP_SUFFIX: &str = ".cleanup";
 const IN_USE_PATH: &str = ".jj/pool/in-use.json";
 const IN_USE_LOCK: &str = ".jj/pool/.in-use.lock";
+const SESSION_PATH: &str = ".jj/pool/sessions.json";
+const SESSION_LOCK: &str = ".jj/pool/.sessions.lock";
 
 type Extensions = BTreeMap<String, Value>;
 
@@ -310,6 +312,21 @@ pub struct InUseState {
     /// Worker identifiers whose Workspaces are currently occupied.
     #[serde(default)]
     pub workers: BTreeSet<WorkerId>,
+}
+
+/// The Agent Runtime session each Worker's current Run drives.
+///
+/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
+/// Worker documents so their shape is preserved. jjfx records the session id an
+/// opencode Run created here so a later, different process can identify that
+/// Run's session - for example to interrupt it - without re-deriving it. A
+/// compatibility peer ignores it; a missing or unreadable file means "no
+/// session recorded".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionState {
+    /// Session identifier keyed by the Worker whose current Run drives it.
+    #[serde(default)]
+    pub sessions: BTreeMap<WorkerId, String>,
 }
 
 /// One Sub-issue entry in a Dispatch Group.
@@ -662,6 +679,11 @@ pub struct DispatchGroupStateRepository {
 pub struct InUseStateRepository {
     root: PathBuf,
 }
+/// The jjfx-owned Agent Runtime Session sidecar repository.
+#[derive(Debug, Clone)]
+pub struct SessionStateRepository {
+    root: PathBuf,
+}
 
 impl Repository {
     /// Opens the compatible state repository facade.
@@ -697,6 +719,13 @@ impl StateStore {
     /// Opens the jjfx-owned Occupancy (in-use) state repository.
     pub fn in_use(&self) -> InUseStateRepository {
         InUseStateRepository {
+            root: self.root.clone(),
+        }
+    }
+
+    /// Opens the jjfx-owned Agent Runtime Session sidecar repository.
+    pub fn sessions(&self) -> SessionStateRepository {
+        SessionStateRepository {
             root: self.root.clone(),
         }
     }
@@ -1814,6 +1843,14 @@ repository_methods!(
     |_s: &InUseStateRepository| "Worker Occupancy".to_owned(),
     validate_in_use
 );
+repository_methods!(
+    SessionStateRepository,
+    SessionState,
+    |s: &SessionStateRepository| s.root.join(SESSION_PATH),
+    |s: &SessionStateRepository| vec![s.root.join(SESSION_LOCK)],
+    |_s: &SessionStateRepository| "Worker Sessions".to_owned(),
+    validate_sessions
+);
 
 impl InUseStateRepository {
     /// Returns the Worker ids currently marked in use, treating absence as empty.
@@ -1876,6 +1913,45 @@ impl InUseStateRepository {
             &InUseState { workers },
             subject,
         )
+    }
+}
+
+impl SessionStateRepository {
+    /// Returns the session id recorded for `worker`, if any.
+    pub fn session(&self, worker: &WorkerId) -> Result<Option<String>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.sessions.get(worker).cloned()),
+            Loaded::Missing => Ok(None),
+        }
+    }
+
+    /// Records the session id `worker`'s current Run drives, replacing any prior one.
+    pub fn record(
+        &self,
+        worker: &WorkerId,
+        session_id: impl Into<String>,
+    ) -> Result<(), StateError> {
+        let session_id = session_id.into();
+        self.update(|sessions| {
+            sessions.insert(worker.clone(), session_id);
+        })
+    }
+
+    fn update(&self, edit: impl FnOnce(&mut BTreeMap<WorkerId, String>)) -> Result<(), StateError> {
+        let subject = "Worker Sessions";
+        with_locks(&[self.root.join(SESSION_LOCK)], subject, || {
+            let mut sessions =
+                match load_state(&self.root.join(SESSION_PATH), subject, &validate_sessions)? {
+                    Loaded::Present(versioned) => versioned.value.sessions,
+                    Loaded::Missing => BTreeMap::new(),
+                };
+            edit(&mut sessions);
+            write_atomic(
+                &self.root.join(SESSION_PATH),
+                &SessionState { sessions },
+                subject,
+            )
+        })
     }
 }
 
@@ -2141,6 +2217,11 @@ fn validate_worker(worker: &WorkerState) -> Result<(), String> {
 }
 fn validate_in_use(_state: &InUseState) -> Result<(), String> {
     // Worker ids are validated on deserialization; there is nothing else to check.
+    Ok(())
+}
+fn validate_sessions(_state: &SessionState) -> Result<(), String> {
+    // Worker ids are validated on deserialization and session ids are opaque
+    // strings; there is nothing else to check.
     Ok(())
 }
 fn validate_dispatch_group_for(

@@ -431,6 +431,75 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
     }
 }
 
+/// Creates the session a fresh opencode Run drives, anchored to `workspace`, and
+/// confirms opencode stored that anchor.
+///
+/// This is the whole point of the client for a Run: instead of relying on the
+/// spawned process's cwd to place the Run in its Worker Workspace, jjfx tells
+/// opencode where to run. The session is created with `workspace` as its
+/// `location.directory` and, once it exists, read back to confirm opencode did
+/// not put it somewhere else.
+///
+/// `Ok(Some(id))` is the session to drive. `Ok(None)` means the API is
+/// unavailable - no executable, no running server, an older opencode without
+/// these routes, or output this client cannot parse - and the caller must fall
+/// back to today's invocation rather than fail the Run. `Err` means opencode
+/// answered but the Run must not proceed: it refused to create the session, or
+/// it anchored the session somewhere other than `workspace`, which would let the
+/// Run commit into the wrong worktree.
+pub(crate) fn create_run_session<R: OpenCodeRunner>(
+    api: &OpenCodeApi<R>,
+    workspace: &Path,
+    title: Option<&str>,
+) -> Result<Option<String>, String> {
+    let mut request = NewSession::new(workspace);
+    if let Some(title) = title.filter(|title| !title.is_empty()) {
+        request = request.with_title(title);
+    }
+    let created = match api.create_session(&request) {
+        Ok(session) => session,
+        Err(error) if error.is_unavailable() => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "opencode refused to create the Run's session: {error}"
+            ));
+        }
+    };
+    let session_id = created.id().to_owned();
+    // Read the session back so the anchor opencode actually stored is checked,
+    // not merely echoed from the request.
+    match api.get_session(&session_id) {
+        Ok(session) => match session.directory() {
+            Some(directory) if !same_directory(directory, workspace) => Err(format!(
+                "opencode anchored the Run's session to {} instead of the Worker Workspace {}",
+                directory.display(),
+                workspace.display()
+            )),
+            // A session opencode reported without a location cannot be checked,
+            // and the assertion is best-effort: drive the session we created.
+            _ => Ok(Some(session_id)),
+        },
+        // The session exists and its id is known, so a failed read-back must not
+        // discard it: the assertion is best-effort.
+        Err(error) if error.is_unavailable() => Ok(Some(session_id)),
+        Err(error) => Err(format!(
+            "cannot confirm the Run's opencode session location: {error}"
+        )),
+    }
+}
+
+/// Whether two directories name the same location, tolerating a symlinked or
+/// otherwise non-canonical spelling on either side.
+fn same_directory(left: &Path, right: &Path) -> bool {
+    if left == right {
+        return true;
+    }
+    match (left.canonicalize(), right.canonicalize()) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
 #[derive(Deserialize)]
 struct SessionEnvelope {
     data: SessionInfo,
@@ -852,5 +921,132 @@ mod tests {
         assert!(!error.is_unavailable());
         assert_eq!(error.status(), None);
         assert!(error.to_string().contains("Session not found: ses_nope"));
+    }
+
+    fn session_body(id: &str, directory: &str) -> String {
+        format!(
+            r#"{{"data":{{"id":"{id}","projectID":"p","cost":0,
+            "tokens":{{"input":0,"output":0,"reasoning":0,"cache":{{"read":0,"write":0}}}},
+            "time":{{"created":1,"updated":1}},"location":{{"directory":"{directory}"}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn create_run_session_anchors_to_the_workspace_and_confirms_it() {
+        // The created session and the read-back both report the Worker Workspace.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w/new")),
+            ok(&session_body("ses_new", "/w/new")),
+        ]));
+
+        let session_id =
+            create_run_session(&api, Path::new("/w/new"), Some("pool:worker-01:ENG-42"))
+                .expect("creates")
+                .expect("drives the created session");
+
+        assert_eq!(session_id, "ses_new");
+
+        let calls = api.runner.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(&calls[0][..2], ["api", "session.create"]);
+        let body = calls[0]
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert_eq!(body["location"]["directory"], "/w/new");
+        assert_eq!(body["title"], "pool:worker-01:ENG-42");
+        assert_eq!(
+            calls[1],
+            vec!["api", "session.get", "--param", "sessionID=ses_new"]
+        );
+    }
+
+    #[test]
+    fn create_run_session_omits_a_blank_title() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w")),
+            ok(&session_body("ses_new", "/w")),
+        ]));
+
+        create_run_session(&api, Path::new("/w"), None).expect("creates");
+
+        let body = api.runner.calls()[0]
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert!(body.get("title").is_none());
+    }
+
+    #[test]
+    fn create_run_session_falls_back_when_the_api_is_unavailable() {
+        // No executable, no server, or an older opencode: the Run must fall back
+        // to today's process-cwd invocation rather than fail.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![Err(io::Error::from(
+            io::ErrorKind::NotFound,
+        ))]));
+
+        let session = create_run_session(&api, Path::new("/w"), Some("title")).expect("falls back");
+
+        assert_eq!(session, None);
+        assert_eq!(api.runner.calls().len(), 1);
+    }
+
+    #[test]
+    fn create_run_session_surfaces_a_server_refusal() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(
+            1,
+            "",
+            "HTTP 400 Bad Request\n",
+        )]));
+
+        let reason = create_run_session(&api, Path::new("/w"), None).expect_err("refused");
+
+        assert!(reason.contains("refused"), "{reason}");
+    }
+
+    #[test]
+    fn create_run_session_fails_when_the_anchor_differs() {
+        // opencode answered and put the session somewhere else: proceeding would
+        // let the Run commit into the wrong worktree.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w/new")),
+            ok(&session_body("ses_new", "/main")),
+        ]));
+
+        let reason =
+            create_run_session(&api, Path::new("/w/new"), None).expect_err("mismatch detected");
+
+        assert!(reason.contains("/main"), "{reason}");
+        assert!(reason.contains("/w/new"), "{reason}");
+    }
+
+    #[test]
+    fn create_run_session_drives_the_session_when_the_read_back_is_unavailable() {
+        // The session exists and its id is known; a failed read-back is
+        // best-effort and must not discard it.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w")),
+            failed(1, "", "no server"),
+        ]));
+
+        let session = create_run_session(&api, Path::new("/w"), None).expect("drives");
+
+        assert_eq!(session.as_deref(), Some("ses_new"));
+    }
+
+    #[test]
+    fn create_run_session_tolerates_a_session_without_a_reported_location() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(r#"{"data":{"id":"ses_new"}}"#),
+            ok(r#"{"data":{"id":"ses_new"}}"#),
+        ]));
+
+        let session = create_run_session(&api, Path::new("/w"), None).expect("drives");
+
+        assert_eq!(session.as_deref(), Some("ses_new"));
     }
 }

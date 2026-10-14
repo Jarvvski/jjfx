@@ -490,6 +490,78 @@ impl RunSupervisor {
         self.run_reserved_foreground_with_handoff(reservation, invocation, || {})
     }
 
+    /// Prepares an opencode Run's session before launch and records its id.
+    ///
+    /// A fresh opencode Run has its session created up front with the Worker
+    /// Workspace as its `location.directory`, so the Run is anchored to that
+    /// workspace rather than inferred from the spawned process's cwd. The id is
+    /// recorded in pool-owned sidecar state so a later, different process can
+    /// identify the Run's session.
+    ///
+    /// Everything else is returned unchanged: another runtime, or an opencode
+    /// whose API is unavailable, falls back to today's process-cwd invocation.
+    /// A Run that already carries a session id is a resume, and keeps it. A
+    /// reachable opencode that anchors the session anywhere other than the
+    /// Worker Workspace fails the Run rather than let it commit into the wrong
+    /// worktree.
+    fn prepare_reserved_session(
+        &self,
+        reservation: &Reservation,
+        invocation: AgentRuntimeInvocation,
+    ) -> Result<AgentRuntimeInvocation, RunSupervisorError> {
+        if reservation.agent_runtime() != AgentRuntime::OpenCode {
+            return Ok(invocation);
+        }
+        // A resumed session already exists; keep it, and record its id so a later
+        // process can still identify the Run's session.
+        if let Some(session_id) = invocation
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())
+        {
+            self.record_session(reservation, session_id)?;
+            return Ok(invocation);
+        }
+        let worker = reservation.worker_id();
+        let workspace =
+            crate::engine::workspace::worker_path(reservation.repository().root(), worker);
+        let session_id = match super::opencode_api::create_run_session(
+            &crate::engine::OpenCodeApi::new(),
+            &workspace,
+            invocation.name.as_deref(),
+        ) {
+            Ok(Some(session_id)) => session_id,
+            Ok(None) => return Ok(invocation),
+            Err(reason) => {
+                return Err(RunSupervisorError::OpenCodeSession {
+                    worker: worker.clone(),
+                    reason,
+                });
+            }
+        };
+        self.record_session(reservation, &session_id)?;
+        Ok(invocation.with_session_id(session_id))
+    }
+
+    /// Records the session id the Worker's current Run drives in pool-owned
+    /// sidecar state, so a later, different process can identify it.
+    fn record_session(
+        &self,
+        reservation: &Reservation,
+        session_id: &str,
+    ) -> Result<(), RunSupervisorError> {
+        let worker = reservation.worker_id();
+        reservation
+            .repository()
+            .state_store()
+            .sessions()
+            .record(worker, session_id)
+            .map_err(|source| RunSupervisorError::OpenCodeSession {
+                worker: worker.clone(),
+                reason: format!("cannot record the Run's session id: {source}"),
+            })
+    }
+
     pub(crate) fn run_reserved_foreground_with_handoff(
         &self,
         reservation: Reservation,
@@ -497,6 +569,10 @@ impl RunSupervisor {
         handoff: impl FnOnce(),
     ) -> Result<CompletedRun, RunSupervisorError> {
         let worker = reservation.worker_id().clone();
+        let invocation = match self.prepare_reserved_session(&reservation, invocation) {
+            Ok(invocation) => invocation,
+            Err(error) => return release_after_failure(&reservation, error),
+        };
         let request = reserved_request(&reservation, invocation);
         let mut persisted_revision = None;
         let outcome = match self.run_foreground_started(&request, |pid| {
@@ -541,6 +617,10 @@ impl RunSupervisor {
         invocation: AgentRuntimeInvocation,
     ) -> Result<BackgroundRun, RunSupervisorError> {
         let worker_id = reservation.worker_id().clone();
+        let invocation = match self.prepare_reserved_session(&reservation, invocation) {
+            Ok(invocation) => invocation,
+            Err(error) => return release_after_failure(&reservation, error),
+        };
         let request = reserved_request(&reservation, invocation);
         let mut background = match self.run_background(&request) {
             Ok(background) => background,
@@ -881,6 +961,18 @@ pub enum RunSupervisorError {
         /// The process creation error.
         #[source]
         source: io::Error,
+    },
+    /// The Run's opencode session could not be anchored to its Worker Workspace.
+    ///
+    /// Only a reachable opencode produces this: an unavailable API falls back to
+    /// the process-cwd invocation instead. Failing here stops a Run that would
+    /// otherwise commit into the wrong worktree.
+    #[error("cannot anchor Worker {worker}'s opencode session: {reason}")]
+    OpenCodeSession {
+        /// The Worker whose Run could not be prepared.
+        worker: WorkerId,
+        /// Why the Run must not proceed.
+        reason: String,
     },
     /// The terminal could not be handed to the Run's process group.
     #[error("cannot hand the terminal to the foreground Run: {source}")]

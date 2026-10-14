@@ -289,3 +289,46 @@ fn a_failed_pool_shrink_leaves_no_cleanup_marker_on_a_member() {
         "a Pool member must never carry a cleanup marker after a failed shrink"
     );
 }
+
+#[test]
+fn session_sidecar_records_reads_and_replaces_worker_sessions() {
+    let (temp, repository) = repository();
+    let sessions = repository.state_store().sessions();
+    let worker = WorkerId::parse("worker-01").expect("Worker ID");
+    let other = WorkerId::parse("worker-02").expect("Worker ID");
+
+    // A missing sidecar is an empty read surface, not an error.
+    assert_eq!(sessions.session(&worker).expect("read"), None);
+
+    sessions.record(&worker, "ses_one").expect("record");
+    assert_eq!(
+        sessions.session(&worker).expect("read").as_deref(),
+        Some("ses_one")
+    );
+
+    // Each Worker's session is independent.
+    sessions.record(&other, "ses_two").expect("record other");
+    assert_eq!(
+        sessions.session(&worker).expect("read").as_deref(),
+        Some("ses_one")
+    );
+    assert_eq!(
+        sessions.session(&other).expect("read").as_deref(),
+        Some("ses_two")
+    );
+
+    // A later Run replaces the Worker's recorded session.
+    sessions.record(&worker, "ses_three").expect("replace");
+    assert_eq!(
+        sessions.session(&worker).expect("read").as_deref(),
+        Some("ses_three")
+    );
+
+    // It is jjfx-owned sidecar state, not part of the Go-compatible documents.
+    let path = temp.path().join(".jj/pool/sessions.json");
+    let value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("session sidecar")).expect("JSON");
+    assert_eq!(value["sessions"]["worker-01"], "ses_three");
+    assert_eq!(value["sessions"]["worker-02"], "ses_two");
+    assert!(!temp.path().join(".jj/pool.json").exists());
+}

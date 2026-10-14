@@ -46,6 +46,9 @@ const HELPER_TERM: &str = "WSG_AGENT_RUNTIME_HELPER_TERM";
 const HELPER_LAUNCH: &str = "WSG_AGENT_RUNTIME_HELPER_LAUNCH";
 const HELPER_DESCENDANT: &str = "WSG_AGENT_RUNTIME_HELPER_DESCENDANT";
 const HELPER_PTY_SLAVE: &str = "WSG_AGENT_RUNTIME_HELPER_PTY_SLAVE";
+const HELPER_OPENCODE_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE";
+const HELPER_OPENCODE_GET_DIRECTORY: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY";
+const HELPER_OPENCODE_SESSION_ID: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_ID";
 
 #[test]
 fn pi_runtime_has_a_canonical_configured_and_persisted_identity() {
@@ -1879,6 +1882,314 @@ fn reserved_background_pi_run_uses_shared_pid_and_finalization_supervision() {
     assert_eq!(worker.exit_code(), Some(0));
     assert!(worker.pid().is_some());
     assert!(worker.completed_at().is_some());
+}
+
+/// A fake `opencode` that answers the session API and records what the Run drove.
+///
+/// `session.create` records the request body and reports `ses_test` anchored to
+/// the Worker Workspace; `session.get` reports it anchored to the directory in
+/// `WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`; `run` records its cwd and
+/// arguments.
+const OPENCODE_SESSION_SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.0.29'; exit 0 ;;
+  api)
+    case "$2" in
+      session.create)
+        printf '%s' "$4" > "__CREATE_BODY__"
+        printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
+        exit 0 ;;
+      session.get)
+        printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
+        exit 0 ;;
+    esac
+    exit 1 ;;
+  run)
+    { pwd; printf '%s\n' "$@"; } > "__RUN_ARGS__"
+    exit 0 ;;
+esac
+exit 1
+"#;
+
+/// A fake `opencode` whose API is unreachable, so the Run must fall back.
+const OPENCODE_UNAVAILABLE_SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.0.29'; exit 0 ;;
+  api) printf '%s\n' 'Error: Could not reach server' >&2; exit 1 ;;
+  run)
+    { pwd; printf '%s\n' "$@"; } > "__RUN_ARGS__"
+    exit 0 ;;
+esac
+exit 1
+"#;
+
+/// The repository, Worker, and paths one opencode Run session test needs.
+struct OpencodeSessionFixture {
+    _temporary_directory: TempDir,
+    repository: Repository,
+    worker_id: WorkerId,
+    workspace: PathBuf,
+    create_body: PathBuf,
+    run_args: PathBuf,
+    bin_directory: PathBuf,
+    result: PathBuf,
+}
+
+fn opencode_session_fixture() -> OpencodeSessionFixture {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let growth = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("Worker Workspace should be provisioned");
+    let worker_id = growth.added_workers()[0].clone();
+    // Configure the Pool for opencode so the Reservation selects it.
+    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = "opencode".into();
+    fs::write(&pool_path, serde_json::to_vec(&pool).expect("pool JSON")).expect("configured pool");
+    // The Worker Workspace is a sibling of the repository root, named after it.
+    let root = repository.root();
+    let workspace = root
+        .parent()
+        .expect("workspace base parent")
+        .join(format!(
+            "{}-workspaces",
+            root.file_name().expect("repository name").to_string_lossy()
+        ))
+        .join(worker_id.as_str());
+    let bin_directory = temporary_directory.path().join("bin");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    OpencodeSessionFixture {
+        create_body: temporary_directory.path().join("opencode-create-body"),
+        run_args: temporary_directory.path().join("opencode-run-args"),
+        result: temporary_directory.path().join("result"),
+        _temporary_directory: temporary_directory,
+        repository,
+        worker_id,
+        workspace,
+        bin_directory,
+    }
+}
+
+impl OpencodeSessionFixture {
+    fn write_opencode(&self, script: &str) {
+        write_executable(
+            &self.bin_directory.join("opencode"),
+            &script
+                .replace("__CREATE_BODY__", &self.create_body.display().to_string())
+                .replace("__RUN_ARGS__", &self.run_args.display().to_string()),
+        );
+    }
+
+    fn spawn_helper(&self, get_directory: &Path, session_id: Option<&str>) -> std::process::Output {
+        let mut helper = Command::new(env::current_exe().expect("test executable"));
+        helper
+            .args(["--exact", "opencode_run_session_helper", "--ignored"])
+            .env("PATH", runtime_path(&self.bin_directory))
+            .env(HELPER_OPENCODE_WORKSPACE, &self.workspace)
+            .env(HELPER_OPENCODE_GET_DIRECTORY, get_directory)
+            .env(HELPER_REPOSITORY, self.repository.root())
+            .env(HELPER_WORKER, self.worker_id.as_str())
+            .env(HELPER_RESULT, &self.result)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        if let Some(session_id) = session_id {
+            helper.env(HELPER_OPENCODE_SESSION_ID, session_id);
+        }
+        helper.output().expect("opencode session helper should run")
+    }
+
+    fn recorded_session(&self) -> Option<String> {
+        self.repository
+            .state_store()
+            .sessions()
+            .session(&self.worker_id)
+            .expect("read recorded session")
+    }
+
+    /// The cwd the fake `opencode run` saw, and the arguments it was given.
+    fn recorded_run(&self) -> (PathBuf, Vec<String>) {
+        let contents = fs::read_to_string(&self.run_args).expect("recorded opencode run");
+        let mut lines = contents.lines();
+        let cwd = PathBuf::from(lines.next().expect("recorded cwd"));
+        (cwd, lines.map(str::to_owned).collect())
+    }
+}
+
+#[test]
+fn opencode_run_creates_a_session_anchored_to_the_workspace_and_drives_it() {
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
+
+    let output = fixture.spawn_helper(&fixture.workspace, None);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "ok exit=Some(0)"
+    );
+
+    // The session was created with the Worker Workspace as its location.
+    let body: Value = serde_json::from_slice(
+        &fs::read(&fixture.create_body).expect("recorded session.create body"),
+    )
+    .expect("session.create body JSON");
+    assert_eq!(
+        body["location"]["directory"].as_str(),
+        Some(fixture.workspace.to_str().expect("workspace UTF-8"))
+    );
+    let expected_title = format!("pool:{}:ENG-42", fixture.worker_id);
+    assert_eq!(body["title"].as_str(), Some(expected_title.as_str()));
+
+    // The Run was driven with the created session, in the Worker Workspace.
+    let (cwd, arguments) = fixture.recorded_run();
+    assert_eq!(
+        cwd.canonicalize().expect("run cwd canonical"),
+        fixture
+            .workspace
+            .canonicalize()
+            .expect("workspace canonical")
+    );
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--session", "ses_test"]),
+        "the Run should drive the created session: {arguments:?}"
+    );
+
+    // The id survives for a later process to identify the Run's session.
+    assert_eq!(fixture.recorded_session().as_deref(), Some("ses_test"));
+}
+
+#[test]
+fn opencode_run_falls_back_when_the_session_api_is_unavailable() {
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_UNAVAILABLE_SCRIPT);
+
+    let output = fixture.spawn_helper(&fixture.workspace, None);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "ok exit=Some(0)"
+    );
+
+    // Today's invocation still runs, in the Worker Workspace, without a session.
+    let (cwd, arguments) = fixture.recorded_run();
+    assert_eq!(
+        cwd.canonicalize().expect("run cwd canonical"),
+        fixture
+            .workspace
+            .canonicalize()
+            .expect("workspace canonical")
+    );
+    assert!(
+        !arguments.iter().any(|argument| argument == "--session"),
+        "an unavailable API must not drive a session: {arguments:?}"
+    );
+    assert_eq!(fixture.recorded_session(), None);
+}
+
+#[test]
+fn opencode_run_resumes_and_records_an_existing_session() {
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
+
+    // A resumed Run already carries a session id: it must drive that session and
+    // record it, without creating another.
+    let output = fixture.spawn_helper(&fixture.workspace, Some("ses_existing"));
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "ok exit=Some(0)"
+    );
+
+    let (_, arguments) = fixture.recorded_run();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--session", "ses_existing"]),
+        "the Run should drive the resumed session: {arguments:?}"
+    );
+    assert_eq!(fixture.recorded_session().as_deref(), Some("ses_existing"));
+    assert!(
+        !fixture.create_body.exists(),
+        "a resume must not create another session"
+    );
+}
+
+#[test]
+fn opencode_run_fails_when_the_session_is_anchored_elsewhere() {
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
+
+    // opencode reports the session anchored to the repository, not the Workspace.
+    let elsewhere = fixture.repository.root().to_owned();
+    let output = fixture.spawn_helper(&elsewhere, None);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(&fixture.result).expect("helper result");
+    assert!(
+        result.contains("instead of the Worker Workspace"),
+        "the mismatch should fail the Run: {result}"
+    );
+
+    // The Run never spawned, nothing was recorded, and the Worker was released.
+    assert!(!fixture.run_args.exists(), "the Run must not start");
+    assert_eq!(fixture.recorded_session(), None);
+    let snapshot = fixture.repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(fixture.worker_id.as_str())
+        .expect("released Worker");
+    assert_eq!(worker.status(), WorkerStatus::Idle);
+}
+
+#[test]
+#[ignore]
+fn opencode_run_session_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id.clone(), "ENG-42")
+        .expect("Worker reservation");
+    let mut invocation =
+        AgentRuntimeInvocation::new("do the work").with_name(format!("pool:{worker_id}:ENG-42"));
+    if let Some(session_id) = env::var_os(HELPER_OPENCODE_SESSION_ID) {
+        invocation = invocation.with_session_id(session_id.to_string_lossy().into_owned());
+    }
+    let result = env::var_os(HELPER_RESULT).expect("result path");
+    match RunSupervisor::new().run_reserved_background(reservation, invocation) {
+        Ok(background) => {
+            let outcome = background.wait().expect("background Run should complete");
+            fs::write(result, format!("ok exit={:?}", outcome.exit_code())).expect("result");
+        }
+        Err(error) => {
+            fs::write(result, format!("err {error}")).expect("result");
+        }
+    }
 }
 
 #[test]
