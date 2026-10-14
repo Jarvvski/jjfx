@@ -1,6 +1,6 @@
 # Bug hunt: correctness and resilience sweep
 
-Status: closed (2026-10-14) - 39 resolved, 1 `wontfix` (06).
+Status: open (2026-10-14) - reopened for ticket 41, a new external report; 06 is `wontfix`.
 
 ## Notes
 
@@ -75,6 +75,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | I11 | mixed | L | S | wrong CLI capacity message; poller ignores the Store projection; `reload` resets `colocate`; `config_path` relative fallback | 28 |
 | T10 | TUI | L | S | `?` steals from text buffers; help-over-editor hides the editor; `viewport` `u16` truncation; `line_down` overflow | 28 |
 | T11 | TUI | H | report | `jjfx tui` floods the terminal with unbounded, un-deduplicated `kitten @ ls` subprocesses until kitty pegs a core | 40 (fixed) |
+| T12 | TUI | H | report | the recursive `.jj` watcher and a snapshotting Workspace projection form a self-sustaining reload loop that storms `jj` and everything downstream of a reload | 41 (fixed) |
 
 ## Tickets
 
@@ -219,6 +220,13 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   **resolved** - the terminal query is bounded (3s) and single-flighted with a 2s
   TTL, so a slow kitty can neither block unboundedly nor stack subprocesses. The
   stub-`kitten` regression test proves the pre-fix storm red (peak 16 → 1).
+
+- [41](issues/41-jj-reload-loop.md) - T12, the *primary* finding of the same
+  external report 40 was filed from; 40 fixed the symptom, this is the cause.
+  **resolved** - the Workspace projection passes `--ignore-working-copy`, so it
+  can no longer snapshot the working copy and ping its own watcher. The
+  regression test proves the snapshot red first. The report's secondary
+  recommendations (the bounded, cached `ls`) had already landed with 40.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
