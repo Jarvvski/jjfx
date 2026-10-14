@@ -38,8 +38,8 @@ cargo install jjfx
 ```
 
 That builds and installs the `jjfx` binary into Cargo's bin directory
-(`~/.cargo/bin`). To build from a clone instead - which also builds the `wsg`
-compatibility binary - see [`CONTRIBUTING.md`](CONTRIBUTING.md).
+(`~/.cargo/bin`). To build from a clone instead, see
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ### 3. Open the TUI
 
@@ -110,23 +110,17 @@ Run `jjfx help` for usage.
 - [`docs/adr/`](docs/adr/) - architecture decision records.
 - [`skills/jjfx-dispatch/`](skills/jjfx-dispatch/SKILL.md) - the agent skill that
   teaches a coding agent to dispatch work to Workers.
-- [`docs/wsg-compatibility-contract.md`](docs/wsg-compatibility-contract.md) -
-  the compatibility contract for the migration-era `wsg` target.
 - [Releasing](docs/releasing.md) - how a release is cut: the versioning model,
   the dispatch workflow, and recovery from a partial release.
 - [`CHANGELOG.md`](CHANGELOG.md) - what has landed.
 
 ## Status
 
-`jjfx` provides the CLI and an explicit interactive TUI entrypoint. The
-compatibility `wsg` target is still built and shipped as a frozen `0.19.0`, but
-it is no longer verified against the Go implementation: the migration-era
-conformance suite has been retired with the Go repository.
-
-The Go `wsg` project is **deprecated** - it was archived on 2026-08-19, and jjfx
-is the authoritative home of both binaries. `wsg` users should install jjfx
-0.52.1 or newer, which builds the frozen `wsg 0.19.0` compatibility binary from
-this repository. Existing Go releases stay available, but receive no new
+`jjfx` provides the CLI and an explicit interactive TUI entrypoint. It is the
+authoritative implementation: the Go `wsg` project is **deprecated** - it was
+archived on 2026-08-19 - and the `wsg` compatibility binary that briefly
+replaced it has been removed. `jjfx` is the only binary built and released from
+this repository. Existing Go `wsg` releases stay available, but receive no new
 development.
 
 ## Contributing

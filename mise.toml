@@ -21,22 +21,9 @@ run = "cargo run --release -p jjfx -- tui"
 description = "Build every workspace package"
 run = "cargo build --release --workspace"
 
-[tasks.wsg-test-install]
-description = "Install Rust wsg into an isolated repository-local target"
-run = "mkdir -p target/wsg-test-install/bin && cargo build -p wsg && cp target/debug/wsg target/wsg-test-install/bin/wsg"
-
 [tasks.test]
 description = "Run tests for every workspace package"
-# Build first: the wsg CLI/PTY tests run the `jjfx` binary by path, and
-# `cargo test` does not build another package's binary.
-run = "cargo build --workspace && cargo test --workspace"
-
-[tasks.test-deep]
-description = "Run the normal suite plus interactive PTY tests that may take terminal focus"
-run = [
-  { task = "test" },
-  "cargo test -p wsg --test tui -- --include-ignored --test-threads=1",
-]
+run = "cargo test --workspace"
 
 [tasks.clean-check]
 description = "Remove all Cargo artifacts after verification"

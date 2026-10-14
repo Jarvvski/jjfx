@@ -31,11 +31,11 @@ cannot resurrect one; a path jj does not record is not known, so jjfx reports it
 as unknown rather than guessing at the naming convention, which is now only the
 rule for where a *new* Workspace is created.
 
-The cache is still written, because the frozen `wsg` compatibility binary and
-the bash tools read it, but it is write-only as far as jjfx is concerned: a
-mirror in the strict sense. The naming convention never resolved a path again,
-which is what let a Workspace created outside it (`JJ_WS_DIR`, a script) be
-recorded at the wrong directory and then reported as missing there.
+The cache is still written for the shell tooling that reads it, but it is
+write-only as far as jjfx is concerned: a mirror in the strict sense. The naming
+convention never resolved a path again, which is what let a Workspace created
+outside it (`JJ_WS_DIR`, a script) be recorded at the wrong directory and then
+reported as missing there.
 
 Status: accepted - Workspace existence and paths read from jj; the cache is a
 write-only mirror

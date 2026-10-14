@@ -469,7 +469,7 @@ impl WorkerActions {
             let handle_worker = worker.clone();
             let thread_worker = worker.clone();
             let join = thread::Builder::new()
-                .name(format!("wsg-restore-{worker}"))
+                .name(format!("jjfx-restore-{worker}"))
                 .spawn(move || {
                     SystemCommands::restore_workspace(&thread_worker, &workspace, operation)
                 })

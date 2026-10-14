@@ -308,7 +308,7 @@ fn worker_detail_line(worker: &WorkerSnapshot, width: u16) -> Option<Line<'stati
     }
 
     Some(Line::from(vec![
-        Span::styled("  wsg ", Style::default().fg(Color::DarkGray)),
+        Span::styled("  pool ", Style::default().fg(Color::DarkGray)),
         Span::styled(fields.join("  "), Style::default().fg(Color::Cyan)),
     ]))
 }

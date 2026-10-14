@@ -22,8 +22,6 @@ mise run install    # release build, installed to ~/.cargo/bin/jjfx
 ```
 
 Without mise, `cargo install --path .` builds the same binary from the clone.
-`mise run install` also builds the `wsg` compatibility binary, which a bare
-`cargo install --path .` does not.
 
 ## Build and develop
 
@@ -33,13 +31,11 @@ Tooling is driven by [mise](https://mise.jdx.dev):
 | --- | --- |
 | `mise run run` | `cargo run --release -p jjfx -- tui` |
 | `mise run build` | `cargo build --release --workspace` |
-| `mise run test` | build the workspace, then `cargo test` |
-| `mise run test-deep` | the suite plus interactive PTY tests that may take terminal focus |
+| `mise run test` | `cargo test` for every workspace package |
 | `mise run fmt` | `cargo fmt --all` |
 | `mise run lint` | `cargo clippy --all-targets -- -D warnings` |
 | `mise run check` | the pre-land gate: changelog validation + fmt + lint + build + test |
-| `mise run release` | bundle jjfx+wsg archives + sha256 into `dist/` |
-| `mise run install-candidate` | stage both binaries under a non-PATH prefix |
+| `mise run release` | bundle jjfx archives + sha256 into `dist/` |
 
 Plain cargo works too:
 
@@ -55,7 +51,6 @@ cargo run -p jjfx -- pool list  # run a CLI command
 | Area | Path |
 | --- | --- |
 | CLI, TUI, and the engine | `src/`, with the absorbed former `wsg-core` under `src/engine/` |
-| The frozen compatibility binary | `crates/wsg/` |
 | Integration tests and fixtures | `tests/` |
 | Configuration reference | [`docs/configuration.md`](docs/configuration.md) |
 | Architecture decision records | [`docs/adr/`](docs/adr/) |

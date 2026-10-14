@@ -152,7 +152,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
 /// command, wrapped in the login interactive shell (empty when unconfigured),
 /// and the pane layout selected for the current display.
 ///
-/// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so
+/// `jjfx`'s entrypoint hands this to the shared CLI router so
 /// `mount` opens the same first pane and layout as the TUI. It is loaded lazily
 /// - only a `mount` invocation reads jjfx's config file.
 pub fn terminal_settings() -> anyhow::Result<crate::engine::TerminalSettings> {
@@ -168,7 +168,7 @@ pub fn terminal_settings() -> anyhow::Result<crate::engine::TerminalSettings> {
 
 /// Lists the workspace tabs currently open in the terminal jjfx drives.
 ///
-/// Binary adapters (`jjfx`, `wsg`) hand this to the shared CLI router so
+/// `jjfx`'s entrypoint hands this to the shared CLI router so
 /// `dispatch` can keep a Workspace that is open in a terminal out of Worker
 /// selection. It is loaded lazily - only a `dispatch` invocation reads jjfx's
 /// config file - and fails when the terminal cannot be queried, so the caller
@@ -193,8 +193,8 @@ pub fn colocate_setting() -> anyhow::Result<bool> {
 /// Launch the shared interactive jjfx TUI for a discovered repository.
 ///
 /// The launcher owns the runtime, watchers, pollers, App, and terminal
-/// lifecycle. Binary adapters keep versioning and command routing outside this
-/// seam, so `wsg` can enter exactly the same interactive implementation.
+/// lifecycle. The CLI keeps versioning and command routing outside this
+/// seam, so it enters exactly the same interactive implementation.
 pub fn launch(repo_root: PathBuf) -> anyhow::Result<()> {
     // Build the runtime explicitly so shutdown can abandon in-flight blocking
     // tasks. `#[tokio::main]` drops the runtime on return, and that drop joins

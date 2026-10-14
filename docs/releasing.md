@@ -41,9 +41,8 @@ momo status --version-only   # just the version
 changelog momo cannot read (a duplicate `## [Unreleased]` heading) and passes
 when nothing is unreleased.
 
-`crates/wsg` is frozen at its current version while the migration-era binary is
-retired, so a release versions `jjfx` alone. The archive name still reports
-wsg's version: `jjfx-0.53.0-wsg-0.19.0-<target>.tar.gz`.
+A release versions `jjfx` alone, and the archive name carries that version:
+`jjfx-0.53.0-<target>.tar.gz`.
 
 Entries released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers; they are history and carry no meaning.

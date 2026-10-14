@@ -2436,11 +2436,11 @@ impl App {
             .collect();
         let title = match &self.pool.worker_pool {
             Some(snapshot) if snapshot.diagnostics().is_empty() => format!(
-                "jjfx - {} workspace(s)  [wsg pool]",
+                "jjfx - {} workspace(s)  [pool]",
                 self.store.workspaces().len()
             ),
             Some(snapshot) => format!(
-                "jjfx - {} workspace(s)  [wsg pool, {} issue(s)]",
+                "jjfx - {} workspace(s)  [pool, {} issue(s)]",
                 self.store.workspaces().len(),
                 snapshot.diagnostics().len()
             ),
@@ -2682,7 +2682,7 @@ impl App {
                     )),
                     None => Paragraph::new(Span::styled(
                         if self.pool.worker_pool.is_some() {
-                            " wsg pool  ·  p manage  j/k move  ? help  q quit "
+                            " pool  ·  p manage  j/k move  ? help  q quit "
                         } else if self.render.world.is_some() {
                             " j/k move  J/K scroll world  ? help  q quit "
                         } else {
@@ -4997,7 +4997,7 @@ mod tests {
             .collect();
         assert!(text.contains("alpha"), "{text}");
         assert!(text.contains("ENG-101"), "{text}");
-        assert!(text.contains("wsg pool"), "{text}");
+        assert!(text.contains("[pool]"), "{text}");
     }
 
     #[test]

@@ -4,7 +4,7 @@
 # Usage:
 #   mise run release-smoke dist/<archive>.tar.gz
 #
-# Executes the archive's own binaries, so it only works for a host-target
+# Executes the archive's own binary, so it only works for a host-target
 # archive. Cross archives are produced but not smoke-tested here.
 set -euo pipefail
 
@@ -46,7 +46,7 @@ trap 'rm -rf "$work"' EXIT
 tar -C "$work" -xzf "$archive"
 
 # Archive layout.
-for f in bin/jjfx bin/wsg release-manifest.json LICENSE; do
+for f in bin/jjfx release-manifest.json LICENSE; do
   if [ ! -e "$work/$f" ]; then
     echo "error: archive missing $f" >&2
     exit 1
@@ -54,9 +54,9 @@ for f in bin/jjfx bin/wsg release-manifest.json LICENSE; do
 done
 echo "    layout ok"
 
-# Manifest records both independent versions and the target.
+# Manifest records the version and target.
 manifest="$work/release-manifest.json"
-for key in '"target"' '"jjfx"' '"wsg"' '"version"'; do
+for key in '"target"' '"jjfx"' '"version"'; do
   if ! grep -q "$key" "$manifest"; then
     echo "error: manifest missing $key" >&2
     exit 1
@@ -64,15 +64,10 @@ for key in '"target"' '"jjfx"' '"wsg"' '"version"'; do
 done
 echo "    manifest ok"
 
-# The host binaries must start and report their versions from outside a Repository.
+# The host binary must start and report its version from outside a Repository.
 jjfx_out=$(cd "$work" && ./bin/jjfx --version)
 case "$jjfx_out" in
   jjfx*) ;;
   *) echo "error: unexpected jjfx version output: $jjfx_out" >&2; exit 1 ;;
 esac
-wsg_out=$(cd "$work" && ./bin/wsg version)
-case "$wsg_out" in
-  wsg*) ;;
-  *) echo "error: unexpected wsg version output: $wsg_out" >&2; exit 1 ;;
-esac
-echo "    versions ok ($jjfx_out; $wsg_out)"
+echo "    versions ok ($jjfx_out)"

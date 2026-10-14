@@ -19,8 +19,8 @@ means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises
 the patch. That is momo's zero-aware rule, and it matches the convention this
 project used before adopting momo.
 
-The `wsg` compatibility binary is frozen while the migration-era binary is
-retired, so entries here are versioned by `jjfx` alone.
+Entries here are versioned by `jjfx` alone; it is the only binary this
+repository builds and releases.
 
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
@@ -30,6 +30,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Breaking
 
 - Workspace existence and paths now come from jj rather than the ws-cache: each Workspace's recorded path is read from jj instead of guessed from a naming convention, and a name jj no longer reports is no longer listed as a Workspace.
+- The `wsg` compatibility binary and its release archive are removed; `jjfx` is the only binary this repository builds and releases.
 
 ### Fixed
 
@@ -37,6 +38,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - A Worker Pool member whose Workspace directory is gone is now reported as a missing Workspace, instead of passing for a healthy idle Worker that can never be dispatched.
 - The `list` command distinguishes a recorded path whose directory is gone from a path jjfx never knew, instead of calling both missing.
 - Refreshing the workspace cache no longer records a naming-convention guess as if it were a known path, which could pin a Workspace to the wrong directory.
+- The TUI title and footer, the Worker detail label, and the emitted zsh completion now name `jjfx` instead of `wsg`.
 
 ## [0.53.0] - 2026-10-14
 

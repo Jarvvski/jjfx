@@ -2,7 +2,7 @@
 //! Pool, agent runtimes, run logs, tickets, and dispatch.
 //!
 //! Absorbed from the former `wsg-core` crate so `jjfx` ships as a single crate.
-//! Both binaries reach it through [`crate::engine`].
+//! The CLI reaches it through [`crate::engine`].
 
 use std::fs;
 use std::io;

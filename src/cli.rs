@@ -1075,8 +1075,7 @@ fn short_worker_id(worker_id: &str) -> &str {
 
 /// Machine-readable Pool status, including the failure fields the table omits.
 ///
-/// Encoded by hand because the shared CLI router is also compiled into the
-/// `wsg` compatibility binary, which does not depend on `serde_json`.
+/// Encoded by hand so the emitted field order is fixed.
 fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
     let mut out = String::from("[\n");
     for (index, worker) in snapshot.workers().iter().enumerate() {
@@ -1654,7 +1653,7 @@ fn completion_command(shell: &str) -> Result<()> {
     if shell != "zsh" {
         bail!("Unsupported shell: {shell} (supported: zsh)");
     }
-    print!("{}", ZSH_COMPLETION.replace("wsg", PROGRAM));
+    print!("{ZSH_COMPLETION}");
     Ok(())
 }
 
@@ -1793,25 +1792,25 @@ fn render_orchestration_event(event: &OrchestrationEvent) {
     }
 }
 
-const ZSH_COMPLETION: &str = r#"#compdef wsg
+const ZSH_COMPLETION: &str = r#"#compdef jjfx
 
-__wsg_workers() {
+__jjfx_workers() {
   local -a workers
-  workers=("${(@f)$(wsg __complete workers 2>/dev/null)}")
+  workers=("${(@f)$(jjfx __complete workers 2>/dev/null)}")
   _describe 'worker' workers
 }
-__wsg_non_busy_workers() {
+__jjfx_non_busy_workers() {
   local -a workers
-  workers=("${(@f)$(wsg __complete non-busy-workers 2>/dev/null)}")
+  workers=("${(@f)$(jjfx __complete non-busy-workers 2>/dev/null)}")
   _describe 'worker' workers
 }
-__wsg_workspaces() {
+__jjfx_workspaces() {
   local -a workspaces
-  workspaces=("${(@f)$(wsg __complete workspaces 2>/dev/null)}")
+  workspaces=("${(@f)$(jjfx __complete workspaces 2>/dev/null)}")
   _describe 'workspace' workspaces
 }
 
-_wsg() {
+_jjfx() {
   local -a commands
   commands=(
     'add:Create workspace' 'rm:Remove workspace' 'list:List workspaces'
@@ -1829,17 +1828,17 @@ _wsg() {
     command) _describe 'command' commands ;;
     args)
       case $words[1] in
-        rm|remove|path) _arguments '1:workspace:__wsg_workspaces' ;;
-        send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' '2:prompt:' ;;
-        review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__wsg_non_busy_workers' ;;
-        mount|m|reset|logs|log|rebase|rb|open-pr|pr) _arguments '1:worker:__wsg_workers' ;;
+        rm|remove|path) _arguments '1:workspace:__jjfx_workspaces' ;;
+        send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
+        review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
+        mount|m|reset|logs|log|rebase|rb|open-pr|pr) _arguments '1:worker:__jjfx_workers' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
   esac
 }
-compdef _wsg wsg
+compdef _jjfx jjfx
 "#;
 
 fn default_command(launch: fn(PathBuf) -> Result<()>) -> Result<()> {

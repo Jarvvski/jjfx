@@ -14,7 +14,7 @@ use crate::engine::{
     DispatchGroupState, SubIssueState, TicketId, WireStatus, WireTimestamp, WorkerId,
 };
 
-/// The five Sub-issue statuses persisted by Go wsg.
+/// The five Sub-issue statuses persisted in Dispatch Group state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubIssueStatus {
     /// Eligible for dispatch once its blockers are satisfied.

@@ -1052,8 +1052,8 @@ const JJ_LIB_TARGET: JjVersion = JjVersion {
 /// `jj` cannot be probed at all (a missing or broken jj surfaces its own error
 /// on the CLI paths that need it, so it is not a mismatch to report here).
 ///
-/// Public because the shared CLI router (also compiled into the `wsg`
-/// compatibility binary) resolves the engine through `crate::engine`.
+/// Public because the shared CLI router resolves the engine through
+/// `crate::engine`.
 pub fn jj_lib_compat_notice() -> Option<String> {
     compat_notice(jj_version())
 }
