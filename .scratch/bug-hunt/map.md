@@ -213,6 +213,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   with `run --session <id>`. Verified by experiment that the session's `location`
   wins over the process cwd, so jjfx stops inferring the directory. Also makes 37's
   session identification simpler.
+- [39](issues/39-opencode-api-client.md) - shared prerequisite for 37 and 38.
+  **ready-for-agent** - a typed, best-effort client over `opencode api` for
+  `session.create`/`get`/`list`/`interrupt`, so 37 and 38 become call-site changes
+  rather than two copies. Runs in parallel with 07/20 (no shared files).
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
