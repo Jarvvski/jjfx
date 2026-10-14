@@ -172,3 +172,7 @@ by the pinned adapter contract in `spike-01-contract-findings.md` and the
 automated fixtures under `fixtures/`. Pi support itself stays in the tree with
 its automated coverage - closing this ticket is a decision not to spend the manual
 session, not a decision to remove the runtime.
+
+Removing the runtime is tracked separately in
+[`remove-pi/01`](../remove-pi/issues/01-remove-pi.md), filed 2026-10-14 and
+deliberately not scheduled.
