@@ -24,6 +24,21 @@ impl TicketQuery for StaticQuery {
     }
 }
 
+/// Spawns a live process that leads its own process group, so a recorded PID
+/// built from it is a live Run under the group-based liveness probe.
+fn live_group_leader() -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    Command::new("sleep")
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .expect("live group leader helper")
+}
+
 fn install_idle_worker(repository: &Repository, worker: &WorkerId) {
     repository
         .state_store()
@@ -480,9 +495,12 @@ fn restart_does_not_duplicate_a_persisted_assignment_with_a_live_worker() {
         .pool()
         .commit(Expected::Missing, StateChange::Replace(pool.clone()))
         .expect("save pool");
+    // A recorded PID counts as a live Run only while it leads its own process
+    // group, so the "live worker" this test resumes is a real group leader.
+    let mut leader = live_group_leader();
     let mut worker_state = jjfx::engine::WorkerState::new(WireStatus::new("busy"));
     worker_state.ticket = Some(ticket.as_str().to_owned());
-    worker_state.pid = Some(std::process::id() as i64);
+    worker_state.pid = Some(leader.id() as i64);
     repository
         .state_store()
         .worker(worker.clone())
@@ -498,6 +516,8 @@ fn restart_does_not_duplicate_a_persisted_assignment_with_a_live_worker() {
             |event| events.push(event),
         )
         .expect("resume live assignment");
+    let _ = leader.kill();
+    let _ = leader.wait();
     assert!(result.is_none());
     assert!(events.is_empty());
     let loaded = match repository

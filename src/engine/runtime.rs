@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use rustix::process::{Pid, Signal, kill_process_group, test_kill_process_group};
+use rustix::process::{
+    Pid, Signal, getpgid, kill_process_group, test_kill_process, test_kill_process_group,
+};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -419,7 +421,11 @@ impl RunSupervisor {
             .current_dir(&request.workspace)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .stderr(Stdio::piped())
+            // A foreground Run owns its process group exactly like a background
+            // Run, so a failed launch and a cross-process Reset can end its whole
+            // tree with one group signal instead of leaking agent descendants.
+            .process_group(0);
         let mut child = command
             .spawn()
             .map_err(|source| RunSupervisorError::Spawn {
@@ -427,8 +433,7 @@ impl RunSupervisor {
                 source,
             })?;
         if let Err(error) = started(child.id()) {
-            let _ = child.kill();
-            let _ = child.wait();
+            let _ = terminate_foreground_run(&mut child);
             return Err(error);
         }
         let stdout = child.stdout.take().expect("foreground stdout was piped");
@@ -441,8 +446,7 @@ impl RunSupervisor {
         let (status, wait_error) = match child.wait() {
             Ok(status) => (Some(status), None),
             Err(source) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                let _ = terminate_foreground_run(&mut child);
                 (None, Some(source))
             }
         };
@@ -583,7 +587,7 @@ impl RunSupervisor {
         let Some(target) = pool.run_target(worker).map_err(reset)? else {
             return Ok(RunReset::AlreadyIdle);
         };
-        let terminated_pid = match target.pid().and_then(live_process_group) {
+        let terminated_pid = match target.pid().and_then(live_process_group_leader) {
             Some(pid) => {
                 terminate_process_group(pid, PROCESS_GROUP_GRACE).map_err(|source| {
                     RunSupervisorError::ResetCleanup {
@@ -608,18 +612,13 @@ impl RunSupervisor {
     /// Pool destruction uses this after atomically detaching membership. No
     /// state lock is held while the process group is signaled.
     pub(crate) fn terminate_recorded_process(&self, pid: u32) -> io::Result<()> {
-        let pid = i32::try_from(pid)
-            .ok()
-            .and_then(Pid::from_raw)
-            .ok_or_else(|| io::Error::other("recorded Run PID does not fit a Unix process ID"))?;
-        match test_kill_process_group(pid) {
-            Ok(()) => terminate_process_group(pid, PROCESS_GROUP_GRACE),
-            Err(error) if error == rustix::io::Errno::SRCH => Ok(()),
-            Err(error) => Err(io::Error::new(
-                error.kind(),
-                format!("cannot probe recorded process group {pid}: {error}"),
-            )),
-        }
+        // Only a live process-group leader is a Run to signal. A recycled PID
+        // that does not lead a group has no group with that id, so this returns
+        // without signalling anything.
+        let Some(pid) = live_process_group_leader(pid) else {
+            return Ok(());
+        };
+        terminate_process_group(pid, PROCESS_GROUP_GRACE)
     }
 
     /// Starts one Run detached from the caller's terminal.
@@ -1037,11 +1036,32 @@ fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
     }
 }
 
-/// Returns the process group for `pid` when at least one of its members is
-/// still present, so a Reset can report whether it actually signaled a Run.
-fn live_process_group(pid: u32) -> Option<Pid> {
+/// Ends a foreground Run that never reached supervision: signal its process
+/// group so no descendant survives, then reap the direct child.
+fn terminate_foreground_run(child: &mut Child) -> io::Result<()> {
+    let termination = i32::try_from(child.id())
+        .ok()
+        .and_then(Pid::from_raw)
+        .map_or(Ok(()), |pid| {
+            terminate_process_group(pid, PROCESS_GROUP_GRACE)
+        });
+    let reaped = child.wait().map(|_| ());
+    termination.and(reaped)
+}
+
+/// Returns the process group for `pid` only when `pid` is a live process-group
+/// leader.
+///
+/// A recorded PID is a liveness hint, not a Run identity. Requiring the PID to
+/// lead its own group closes the recycled-PID hazard for a PID that does not
+/// lead a group - there is no group with that id to signal - and keeps Reset and
+/// Worker reconciliation on one group-based probe.
+pub(crate) fn live_process_group_leader(pid: u32) -> Option<Pid> {
     let pid = i32::try_from(pid).ok().and_then(Pid::from_raw)?;
-    test_kill_process_group(pid).is_ok().then_some(pid)
+    if test_kill_process(pid).is_err() {
+        return None;
+    }
+    (getpgid(Some(pid)).ok()? == pid).then_some(pid)
 }
 
 fn terminate_process_group(pid: Pid, grace: Duration) -> io::Result<()> {

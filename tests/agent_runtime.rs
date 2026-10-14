@@ -2,6 +2,7 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::thread;
@@ -13,7 +14,8 @@ use jjfx::engine::{
     RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerId, WorkerStatus,
 };
 use rustix::process::{
-    Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
+    Pid, Signal, getpgid, kill_process, kill_process_group, test_kill_process,
+    test_kill_process_group,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -2578,6 +2580,313 @@ fn reset_run_and_dead_pid_reconciliation_agree_on_an_idle_worker() {
     assert_eq!(worker.error(), None);
 }
 
+/// A foreground Run must own its process group, so a cross-process Reset can
+/// terminate it even though it was launched by a different jjfx process.
+#[test]
+fn cross_process_reset_terminates_a_live_foreground_run() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+
+    let bin_directory = temporary_directory.path().join("bin");
+    let process = temporary_directory.path().join("process");
+    let descendant = temporary_directory.path().join("descendant");
+    let diagnostic = temporary_directory.path().join("diagnostic");
+    let exit = temporary_directory.path().join("exit");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(&bin_directory.join("claude"), STUBBORN_RUNTIME);
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "reset_run_foreground_helper", "--ignored"])
+        .env("PATH", runtime_path(&bin_directory))
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_PROCESS, &process)
+        .env(HELPER_DESCENDANT, &descendant)
+        .env(HELPER_DIAGNOSTIC, &diagnostic)
+        .env(HELPER_EXIT, &exit)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let child = helper.spawn().expect("foreground Reset helper");
+    wait_for_file(&process);
+    wait_for_file(&descendant);
+    let leader = read_pid(&process);
+    let descendant_pid = read_pid(&descendant);
+    wait_for_busy_pid(&repository, &worker_id, leader);
+
+    let reset = RunSupervisor::new()
+        .reset_run(&repository, &worker_id)
+        .expect("Reset should abandon the foreground Run");
+    let group_gone = test_kill_process_group(unix_pid(leader)).is_err();
+    let descendant_gone = test_kill_process(unix_pid(descendant_pid)).is_err();
+    if !group_gone || !descendant_gone {
+        // A surviving Run would otherwise outlive the test; end it directly so
+        // the assertions below report the defect instead of leaking processes.
+        let _ = kill_process(unix_pid(leader), Signal::KILL);
+        let _ = kill_process(unix_pid(descendant_pid), Signal::KILL);
+    }
+    let output = child.wait_with_output().expect("foreground helper output");
+
+    assert!(
+        matches!(reset, RunReset::Abandoned { terminated_pid } if terminated_pid == Some(leader)),
+        "a cross-process Reset must report the terminated foreground Run: {reset:?}"
+    );
+    assert!(
+        group_gone,
+        "the foreground Run's process group should be gone"
+    );
+    assert!(
+        descendant_gone,
+        "a cross-process Reset must terminate the foreground Run's descendants"
+    );
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot.worker(worker_id.as_str()).expect("reset Worker");
+    assert_eq!(worker.status(), WorkerStatus::Idle);
+    assert_eq!(worker.pid(), None);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// A foreground launch that fails before its PID is recorded must still remove
+/// the whole process group, not just the direct child.
+#[test]
+fn failed_foreground_launch_leaves_no_surviving_descendants() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+
+    let bin_directory = temporary_directory.path().join("bin");
+    let result = temporary_directory.path().join("result");
+    let process = temporary_directory.path().join("process");
+    let descendant = temporary_directory.path().join("descendant");
+    let diagnostic = temporary_directory.path().join("diagnostic");
+    let reserved = temporary_directory.path().join("reserved");
+    let proceed = temporary_directory.path().join("proceed");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    write_executable(&bin_directory.join("claude"), STUBBORN_RUNTIME);
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "reserved_foreground_run_helper", "--ignored"])
+        .env("PATH", runtime_path(&bin_directory))
+        .env(HELPER_REPOSITORY, temporary_directory.path())
+        .env(HELPER_WORKER, worker_id.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_PROCESS, &process)
+        .env(HELPER_DESCENDANT, &descendant)
+        .env(HELPER_DIAGNOSTIC, &diagnostic)
+        .env(HELPER_RESERVED, &reserved)
+        .env(HELPER_PROCEED, &proceed)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let child = helper.spawn().expect("foreground helper");
+
+    wait_for_file(&reserved);
+    // Replace the reserved Worker state with a FIFO so the PID persistence read
+    // blocks until the runtime has spawned its descendant - the launch then
+    // fails while the descendant is already running.
+    let worker_path = worker_state_path(temporary_directory.path(), &worker_id);
+    let state_store = repository.state_store().worker(worker_id.clone());
+    let loaded = match state_store.load().expect("reserved Worker state") {
+        jjfx::engine::Loaded::Present(versioned) => versioned,
+        jjfx::engine::Loaded::Missing => panic!("reserved Worker state should exist"),
+    };
+    let outcome = state_store
+        .commit(
+            Expected::Match(loaded.revision().clone()),
+            StateChange::Remove,
+        )
+        .expect("remove Worker state for the race");
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
+    let fifo_status = Command::new("mkfifo")
+        .arg(&worker_path)
+        .status()
+        .expect("mkfifo should be installed");
+    assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
+    fs::write(&proceed, []).expect("allow launch to continue");
+
+    wait_for_file(&process);
+    wait_for_file(&descendant);
+    let leader = read_pid(&process);
+    let descendant_pid = read_pid(&descendant);
+    fs::write(&worker_path, b"not-json").expect("release blocked Worker state read");
+    fs::remove_file(&worker_path).expect("remove Worker state FIFO");
+    fs::write(&worker_path, b"not-json").expect("preserve failed Worker state for release");
+
+    let output = child.wait_with_output().expect("foreground helper output");
+    let error = fs::read_to_string(&result).expect("foreground launch error");
+    let descendant_alive = test_kill_process(unix_pid(descendant_pid)).is_ok();
+    if descendant_alive {
+        let _ = kill_process(unix_pid(leader), Signal::KILL);
+        let _ = kill_process(unix_pid(descendant_pid), Signal::KILL);
+    }
+
+    assert!(error.contains("cannot persist PID"), "{error}");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !descendant_alive,
+        "a failed foreground launch must not leave a surviving descendant"
+    );
+    assert!(
+        test_kill_process_group(unix_pid(leader)).is_err(),
+        "the failed foreground Run's process group should be gone"
+    );
+}
+
+/// A recorded PID that is alive but does not lead a process group is not a Run
+/// identity: it must never be signalled, and the unrelated process must survive.
+#[test]
+fn reset_run_does_not_signal_a_recorded_pid_that_is_not_a_group_leader() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+    let mut unrelated = spawn_non_group_leader();
+    let pid = unrelated.id();
+    assert_ne!(
+        getpgid(Some(unix_pid(pid))).expect("live process group"),
+        unix_pid(pid),
+        "the helper process must not lead a process group"
+    );
+    write_worker_json(
+        &worker_state_path(temporary_directory.path(), &worker_id),
+        busy_run_state(pid, "ENG-230"),
+    );
+
+    let reset = RunSupervisor::new()
+        .reset_run(&repository, &worker_id)
+        .expect("Reset should abandon the Run");
+    let alive = test_kill_process(unix_pid(pid)).is_ok();
+    if alive {
+        let _ = kill_process(unix_pid(pid), Signal::KILL);
+    }
+    let _ = unrelated.wait();
+
+    assert!(
+        matches!(
+            reset,
+            RunReset::Abandoned {
+                terminated_pid: None
+            }
+        ),
+        "a PID that does not lead a group must not be signalled: {reset:?}"
+    );
+    assert!(alive, "the unrelated process must never be signalled");
+    let snapshot = repository.worker_pool().snapshot();
+    let worker = snapshot.worker(worker_id.as_str()).expect("reset Worker");
+    assert_eq!(worker.status(), WorkerStatus::Idle);
+}
+
+/// The recorded PID is the Run's leader. Once it is gone the recorded group id
+/// is a stale hint, so Reset must not signal whatever still answers to it.
+#[test]
+fn reset_run_does_not_signal_a_group_whose_recorded_leader_is_gone() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+    let descendant_path = temporary_directory.path().join("orphan-descendant");
+
+    // A leader that spawns a TERM-ignoring descendant and exits, leaving the
+    // descendant as the only member of the recorded process group.
+    let mut leader = Command::new("sh")
+        .arg("-c")
+        .arg("( trap '' TERM; while :; do sleep 0.05; done ) & echo $! > \"$1\"; exit 0")
+        .arg("sh")
+        .arg(&descendant_path)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("group leader helper");
+    let leader_pid = leader.id();
+    leader.wait().expect("group leader should exit");
+    wait_for_file(&descendant_path);
+    let descendant_pid = read_pid(&descendant_path);
+    assert!(
+        test_kill_process_group(unix_pid(leader_pid)).is_ok(),
+        "the descendant should keep the recorded process group alive"
+    );
+    assert!(
+        getpgid(Some(unix_pid(leader_pid))).is_err(),
+        "the recorded leader should be gone"
+    );
+    write_worker_json(
+        &worker_state_path(temporary_directory.path(), &worker_id),
+        busy_run_state(leader_pid, "ENG-231"),
+    );
+
+    let reset = RunSupervisor::new()
+        .reset_run(&repository, &worker_id)
+        .expect("Reset should abandon the Run");
+    let descendant_alive = test_kill_process(unix_pid(descendant_pid)).is_ok();
+    if descendant_alive {
+        let _ = kill_process_group(unix_pid(leader_pid), Signal::KILL);
+        let _ = kill_process(unix_pid(descendant_pid), Signal::KILL);
+    }
+
+    assert!(
+        matches!(
+            reset,
+            RunReset::Abandoned {
+                terminated_pid: None
+            }
+        ),
+        "a group whose recorded leader is gone must not be signalled: {reset:?}"
+    );
+    assert!(
+        descendant_alive,
+        "Reset must not signal a process group whose recorded leader is gone"
+    );
+}
+
+/// A recycled PID that is alive but does not lead a process group must not keep
+/// a Worker `busy` forever: reconciliation uses the same group-based probe.
+#[test]
+fn reconcile_runs_marks_a_busy_worker_failed_when_its_pid_is_not_a_group_leader() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+    let mut unrelated = spawn_non_group_leader();
+    let pid = unrelated.id();
+    assert_ne!(
+        getpgid(Some(unix_pid(pid))).expect("live process group"),
+        unix_pid(pid),
+        "the helper process must not lead a process group"
+    );
+    write_worker_json(
+        &worker_state_path(temporary_directory.path(), &worker_id),
+        busy_run_state(pid, "ENG-232"),
+    );
+
+    let snapshot = repository.worker_pool().reconcile_runs();
+    let alive = test_kill_process(unix_pid(pid)).is_ok();
+    if alive {
+        let _ = kill_process(unix_pid(pid), Signal::KILL);
+    }
+    let _ = unrelated.wait();
+
+    let worker = snapshot
+        .worker(worker_id.as_str())
+        .expect("reconciled Worker");
+    assert!(
+        alive,
+        "reconciliation must not signal a PID that does not lead a group"
+    );
+    assert_eq!(
+        worker.status(),
+        WorkerStatus::Failed,
+        "a recycled PID that does not lead a group must not strand a Worker busy"
+    );
+}
+
 #[test]
 #[ignore]
 fn reset_run_helper() {
@@ -2607,6 +2916,66 @@ fn reset_run_helper() {
         format!("exit={:?}", outcome.exit_code()),
     )
     .expect("abandoned Run outcome");
+}
+
+#[test]
+#[ignore]
+fn reset_run_foreground_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-231")
+        .expect("Worker reservation");
+    let completed = RunSupervisor::new()
+        .run_reserved_foreground(
+            reservation,
+            AgentRuntimeInvocation::new("reset foreground test"),
+        )
+        .expect("reserved foreground Run should complete");
+    fs::write(
+        env::var_os(HELPER_EXIT).expect("exit path"),
+        format!("exit={:?}", completed.exit_code()),
+    )
+    .expect("abandoned foreground outcome");
+}
+
+#[test]
+#[ignore]
+fn reserved_foreground_run_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let reservation = repository
+        .worker_pool()
+        .reserve_named(worker_id, "ENG-230")
+        .expect("Worker reservation");
+    if let Some(reserved) = env::var_os(HELPER_RESERVED) {
+        fs::write(reserved, []).expect("reservation barrier");
+        wait_for_file(&PathBuf::from(
+            env::var_os(HELPER_PROCEED).expect("proceed barrier"),
+        ));
+    }
+    let result = env::var_os(HELPER_RESULT).expect("result path");
+    match RunSupervisor::new().run_reserved_foreground(
+        reservation,
+        AgentRuntimeInvocation::new("reserved foreground test"),
+    ) {
+        Ok(completed) => fs::write(&result, format!("exit={:?}", completed.exit_code()))
+            .expect("foreground exit"),
+        Err(error) => fs::write(&result, error.to_string()).expect("foreground error"),
+    }
 }
 
 #[test]
@@ -3109,6 +3478,39 @@ fn dead_pid() -> u32 {
     let pid = exited.id();
     exited.wait().expect("dead PID helper should exit");
     pid
+}
+
+/// Spawns a live process that deliberately does not lead its own process group,
+/// so a plain liveness probe would treat it as a live Run while a group-based
+/// probe rejects it.
+fn spawn_non_group_leader() -> Child {
+    Command::new("sleep")
+        .arg("30")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("non-leader helper process")
+}
+
+/// Blocks until the Worker records `pid` for a busy Run, so a Reset in another
+/// process targets the launched Run rather than a reservation without a PID.
+fn wait_for_busy_pid(repository: &Repository, worker: &WorkerId, pid: u32) {
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    loop {
+        let recorded = matches!(
+            repository.worker_pool().snapshot().worker(worker.as_str()),
+            Some(snapshot) if snapshot.status() == WorkerStatus::Busy && snapshot.pid() == Some(pid)
+        );
+        if recorded {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "Worker {worker} never recorded the launched PID {pid}"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn initialize_repository(root: &std::path::Path) -> Repository {

@@ -356,7 +356,14 @@ impl WorkerPool {
         let Some(pid) = loaded.value.pid else {
             return Ok(());
         };
-        if loaded.value.status.as_str() != "busy" || process_is_alive_i64(pid) {
+        // The recorded PID is a liveness hint, so the Run counts as live only
+        // when it still leads its process group. A recycled PID that does not
+        // lead a group must not keep this Worker `busy` forever.
+        let run_is_live = u32::try_from(pid)
+            .ok()
+            .and_then(crate::engine::runtime::live_process_group_leader)
+            .is_some();
+        if loaded.value.status.as_str() != "busy" || run_is_live {
             return Ok(());
         }
 
@@ -1844,10 +1851,6 @@ fn worker_snapshot(
         process_alive: pid.map(process_is_alive),
         pid,
     })
-}
-
-fn process_is_alive_i64(pid: i64) -> bool {
-    u32::try_from(pid).ok().is_some_and(process_is_alive)
 }
 
 #[cfg(unix)]
