@@ -749,16 +749,23 @@ impl RunSupervisor {
     /// Terminates a persisted background Run without changing Worker state.
     ///
     /// Pool destruction uses this after atomically detaching membership. No
-    /// state lock is held while the process group is signaled. An opencode
-    /// Run's work is stopped through its session first, because its recorded
-    /// pid is only a daemon client.
+    /// state lock is held while the process group is signaled. Only an opencode
+    /// Run's work lives in the shared daemon, so only its recorded session is
+    /// consulted; any other runtime owns its work, and signalling its process
+    /// group is the whole stop. The sidecar that names a session is recorded and
+    /// cleared by opencode Runs alone, so a Worker that ran opencode and then a
+    /// different runtime can still carry a stale opencode id - gating on the
+    /// persisted runtime keeps that stale id from standing in for this Run.
     pub(crate) fn terminate_recorded_process(
         &self,
         repository: &Repository,
         worker: &WorkerId,
+        runtime: Option<AgentRuntime>,
         pid: u32,
     ) -> io::Result<()> {
-        if interrupt_opencode_run(repository, worker, None) {
+        if runtime == Some(AgentRuntime::OpenCode)
+            && interrupt_opencode_run(repository, worker, None)
+        {
             return Ok(());
         }
         // Only a live process-group leader is a Run to signal. A recycled PID

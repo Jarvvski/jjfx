@@ -646,7 +646,13 @@ pub(crate) enum PoolMembershipOutcome {
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum DetachedCleanupStatus {
     Ready,
-    Busy { pid: Option<u32> },
+    Busy {
+        pid: Option<u32>,
+        /// The runtime persisted for the Worker's current Run, so a destroy can
+        /// tell an opencode Run (stopped through its session) from one that owns
+        /// its own process group.
+        runtime: Option<crate::engine::AgentRuntime>,
+    },
     NotDetached,
 }
 
@@ -1156,6 +1162,11 @@ impl StateStore {
                     Loaded::Present(versioned) if versioned.value.status.as_str() == "busy" => {
                         Ok(DetachedCleanupStatus::Busy {
                             pid: versioned.value.pid.and_then(|pid| u32::try_from(pid).ok()),
+                            runtime: versioned
+                                .value
+                                .agent
+                                .as_ref()
+                                .and_then(crate::engine::AgentRuntime::parse),
                         })
                     }
                     Loaded::Present(_) | Loaded::Missing => Ok(DetachedCleanupStatus::Ready),

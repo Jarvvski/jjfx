@@ -1129,9 +1129,12 @@ impl WorkerPool {
                 }
             };
             match status {
-                crate::engine::state::DetachedCleanupStatus::Busy { pid: Some(pid) } => {
+                crate::engine::state::DetachedCleanupStatus::Busy {
+                    pid: Some(pid),
+                    runtime,
+                } => {
                     if let Err(error) = crate::engine::RunSupervisor::new()
-                        .terminate_recorded_process(&self.repository, worker, pid)
+                        .terminate_recorded_process(&self.repository, worker, runtime, pid)
                     {
                         residual.push(worker.clone());
                         failures.push(format!(
@@ -1140,7 +1143,7 @@ impl WorkerPool {
                         continue;
                     }
                 }
-                crate::engine::state::DetachedCleanupStatus::Busy { pid: None }
+                crate::engine::state::DetachedCleanupStatus::Busy { pid: None, .. }
                 | crate::engine::state::DetachedCleanupStatus::Ready => {}
                 crate::engine::state::DetachedCleanupStatus::NotDetached => continue,
             }

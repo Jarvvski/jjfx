@@ -2347,10 +2347,26 @@ impl OpencodeControlFixture {
     }
 
     fn run_helper_with(&self, action: &str, extra: &[(&str, &str)]) -> std::process::Output {
+        self.run_helper_with_path(action, extra, runtime_path(&self.bin_directory))
+    }
+
+    /// The same as [`Self::run_helper_with`], but with the caller's own `PATH`
+    /// behind the fixture bin so a destroy's Workspace teardown can still reach
+    /// the real `jj` the test harness runs on.
+    fn run_helper_with_tools(&self, action: &str) -> std::process::Output {
+        self.run_helper_with_path(action, &[], runtime_path_with_tools(&self.bin_directory))
+    }
+
+    fn run_helper_with_path(
+        &self,
+        action: &str,
+        extra: &[(&str, &str)],
+        path: std::ffi::OsString,
+    ) -> std::process::Output {
         let mut helper = Command::new(env::current_exe().expect("test executable"));
         helper
             .args(["--exact", "opencode_control_helper", "--ignored"])
-            .env("PATH", runtime_path(&self.bin_directory))
+            .env("PATH", path)
             .env(HELPER_OPENCODE_ACTION, action)
             .env(HELPER_REPOSITORY, self.repository.root())
             .env(HELPER_WORKER, self.worker_id.as_str())
@@ -2393,6 +2409,10 @@ fn opencode_control_helper() {
                 .expect("reconciled Worker");
             format!("{:?}", worker.status())
         }
+        Ok("destroy") => match repository.worker_pool().destroy() {
+            Ok(()) => "destroyed".to_owned(),
+            Err(error) => format!("err {error}"),
+        },
         other => panic!("unknown opencode control action {other:?}"),
     };
     fs::write(result, outcome).expect("result");
@@ -2437,6 +2457,47 @@ fn reset_run_interrupts_an_opencode_run_through_the_daemon() {
         .worker(fixture.worker_id.as_str())
         .expect("reset Worker");
     assert_eq!(worker.status(), WorkerStatus::Idle);
+}
+
+/// Destroying a non-opencode Worker whose stale opencode session is still
+/// recorded must not interrupt that session: the persisted Run runtime is not
+/// opencode, so the Run's own process group is signalled instead.
+#[test]
+fn destroy_signals_a_non_opencode_run_instead_of_interrupting_a_recorded_session() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    let mut leader = spawn_group_leader();
+    let pid = leader.id();
+    // Reap the leader as soon as the signal kills it: a zombie keeps its
+    // process group alive, and the fallback signal waits for the group to go.
+    let reaper = thread::spawn(move || {
+        let _ = leader.wait();
+    });
+    fixture.write_busy_worker("claude", pid, "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper_with_tools("destroy");
+    let destroyed = fs::read_to_string(&fixture.result).expect("helper result");
+    let group_gone = test_kill_process_group(unix_pid(pid)).is_err();
+    if !group_gone {
+        let _ = kill_process_group(unix_pid(pid), Signal::KILL);
+    }
+    let _ = reaper.join();
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(destroyed, "destroyed");
+    assert!(
+        !fixture.interrupt.exists(),
+        "a non-opencode Run must not interrupt the opencode session recorded for the Worker"
+    );
+    assert!(
+        group_gone,
+        "destroy must signal the Run's own process group"
+    );
 }
 
 /// When the session API is unreachable, stopping an opencode Worker falls back
@@ -4358,6 +4419,16 @@ fn runtime_path(bin_directory: &std::path::Path) -> std::ffi::OsString {
         PathBuf::from("/usr/bin").as_os_str(),
         PathBuf::from("/bin").as_os_str(),
     ])
+    .expect("runtime PATH")
+}
+
+/// The fixture bin ahead of the caller's own `PATH`, so a helper that tears a
+/// Workspace down can still reach the real `jj` on the test harness's path.
+fn runtime_path_with_tools(bin_directory: &std::path::Path) -> std::ffi::OsString {
+    let inherited = env::var_os("PATH").expect("PATH");
+    env::join_paths(
+        std::iter::once(bin_directory.to_path_buf()).chain(env::split_paths(&inherited)),
+    )
     .expect("runtime PATH")
 }
 
