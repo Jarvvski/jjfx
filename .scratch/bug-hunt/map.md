@@ -95,7 +95,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [04](issues/04-terminate-group-on-failed-dependency.md) - D1.
   **resolved** - quiescence + `blocked` count.
 - [05](issues/05-fix-worker-run-working-directory.md) - W1 (blocked by 01).
-  **needs-info** - no reproducible jjfx defect; recurrence diagnostic recorded.
+  **resolved** - closed as an upstream opencode session-directory defect, not a
+  jjfx one: not reproducible on opencode 2.0.27, and jjfx's cwd is correct in
+  v0.52.1's own tree. Finding 2 (an opencode Run is a daemon client) is carried
+  into 07.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
   **wontfix** - refuted.
 - [07](issues/07-durable-run-identity.md) - C2, C7.

@@ -90,3 +90,26 @@ Coupling: option 3 is only sound once **every** Run owns its process group.
 Background Runs already do; foreground Runs do not, deliberately, because they
 need the terminal's foreground group. That is exactly what 20/C4's decision
 delivers, so the two are implemented and landed together.
+
+## Note (2026-10-14): an opencode Run is a daemon client
+
+Recorded while closing ticket 05. `opencode run` **without** `--standalone` is a
+thin client of a long-lived shared background service (`opencode serve --service`),
+so the process jjfx spawns, records, and later signals is not the process doing the
+work. That is the mechanism behind the Worker-cwd report's second finding (killing
+the recorded `opencode run` pid did not stop the work).
+
+Consequences for this ticket and for 20:
+
+- pid-based liveness (`reconcile_worker`, `process_is_alive_i64`) and pid-based
+  teardown (`terminate_recorded_process`, `reset_run`) track a client, not the Run.
+- A durable Run identity therefore has to account for the recorded process possibly
+  not owning the work.
+- `opencode run --standalone` makes the run process host its own server, so the
+  spawned process owns the work and pid/process-group teardown becomes meaningful.
+  Cost: one server per Run instead of one shared. Caveat: confirm the flag exists in
+  every opencode version jjfx supports before relying on it.
+
+Verified 2026-10-14 on opencode 2.0.27: the session *directory* honours the process
+cwd in both modes, so this is about process ownership and teardown, not about the
+working directory.
