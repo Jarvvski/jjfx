@@ -250,9 +250,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   change to the frozen Worker document. **Decided 2026-10-14 (option 3):** the
   current kill paths already only signal process *groups*, so the residual risk is
   narrow - a recycled pid that does not lead a group yields `ESRCH` and kills
-  nothing. Group-based liveness closes the remaining case (a recycled pid that
-  *does* lead a group) with no new dependency and no `unsafe`, and is sound once
-  20/C4 gives every Run its own process group.
+  nothing. Group-based liveness closes the common case (a recycled pid that does
+  *not* lead a group) with no new dependency and no `unsafe`, and is sound once
+  20/C4 gives every Run its own process group. The residual - a recycled pid that
+  *does* lead a group - is narrowed, not closed.
 - Two findings were test-encoded current behaviour - non-todo dependency statuses
   unblocking (D8), and Claude usage omission (D9). **Both decided 2026-10-14**
   (tickets 33 and 34, option 1 each): in-flight statuses now block until

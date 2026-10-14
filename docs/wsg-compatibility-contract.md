@@ -150,6 +150,8 @@ an Agent Runtime in its own process group, probes liveness with signal 0, sends
 remains live. Rust uses safe standard-library and rustix interfaces for the
 same Unix behavior.
 
+jjfx reads that pid hint more conservatively than Go: it treats a recorded pid as live only while it leads its process group, so a recycled pid that does not lead one is neither signalled nor counted as a live Run.
+
 The compatibility CLI reserves stdout for machine-readable values and stderr
 for human messages. Help and version output succeed on stdout. Repository or
 state failures write contextual errors to stderr and return a non-zero status.

@@ -129,6 +129,6 @@ Landed with 20/C4 as `Give every Run its own process group and probe Runs by gro
 
 Evidence: `reconcile_runs_marks_a_busy_worker_failed_when_its_pid_is_not_a_group_leader` (red pre-fix - `Busy` where the domain expects `Failed`), `reset_run_does_not_signal_a_group_whose_recorded_leader_is_gone`, and `reset_run_does_not_signal_a_recorded_pid_that_is_not_a_group_leader` (pins the guard). `tests/orchestration.rs` recorded `std::process::id()` as a live Worker pid, which is not a group leader; it now records a real one - a deliberate consequence of the probe, not a workaround.
 
-Residual, accepted in the decision: a recycled pid that *also* leads a process group is still not distinguished. `getpgid` errors other than `ESRCH` (e.g. `EPERM`) are treated as "not a leader" rather than surfaced, which can only affect pids jjfx itself spawned.
+Residual, accepted in the decision: a recycled pid that *also* leads a process group is still not distinguished. The decision's rationale claimed group-based liveness *closed* that case; it narrows it rather than closing it - the check cannot tell a recycled group leader from the real one. `getpgid` errors other than `ESRCH` (e.g. `EPERM`) are treated as "not a leader" rather than surfaced, which can only affect pids jjfx itself spawned.
 
 Behaviour change: `reset_run`/`terminate_recorded_process` no longer signal a group whose recorded leader is gone, so Reset will not clean up a descendant left in a group whose leader already exited.
