@@ -1,6 +1,6 @@
 # Stopping a Worker does not stop its work
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: task
 Blocked by: none
 
@@ -85,3 +85,32 @@ path matters and any adoption needs a capability check rather than an assumption
 
 - The working-directory finding (ticket 05) - closed as an upstream opencode defect.
 - `--standalone` - rejected; see ticket 07's 2026-10-14 note.
+
+## Comments
+
+**Decided 2026-10-14.**
+
+- **Session identity - match by the `--title` jjfx already sets.** Find the Run's
+  session by intersecting `session.list`'s titles with `session.active`, matching
+  `pool:worker-<id>:<ticket>`. Rejected: re-resolving from the run log (a
+  just-started Run may not carry its id yet, so it needs a fallback anyway) and
+  minting the id up front (would mean minting ids in opencode's `^ses` namespace and
+  changing how sessions are created).
+  **Guard required:** never interrupt a stale session that merely shares the title.
+  Restrict the match to active sessions, and if the match is ambiguous, do nothing
+  rather than guess.
+- **Stop semantics.** `POST /api/session/{id}/interrupt` for an opencode Run.
+  pid/process-group signalling stays for the runtimes that own their work (claude,
+  codex, pi) and as the fallback when the API is unreachable.
+- **Liveness - session `outcome` or run-log result.** For an opencode Run a Worker is
+  finished when the session has an `outcome` or the run log has a result; the
+  pid/process-group liveness check is dropped for opencode, because the pid is only a
+  client. Rejected: `session.active` (measured over-reporting - eight-plus sessions
+  reported `running`, including idle interactive ones - so it would keep Workers
+  `busy` after they finished), and "both outcome *and* dead pid" (a client that
+  outlives its work would strand the Worker `busy`, which is the exact failure ticket
+  07 is about).
+
+**Sequencing.** This changes `reconcile_worker` (`src/engine/pool.rs`) and
+`terminate_recorded_process` / `reset_run` (`src/engine/runtime.rs`) - the same
+functions tickets 07 and 20 change - so it must land **after** them, not alongside.
