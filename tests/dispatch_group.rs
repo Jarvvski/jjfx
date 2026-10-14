@@ -688,6 +688,50 @@ fn dependency_context_preserves_blocker_branch_order_and_uses_the_first_as_pr_ba
 }
 
 #[test]
+fn dependency_context_skips_a_merged_blocker_when_choosing_the_pr_base() {
+    let mut group_state = state();
+    let mut merged = SubIssueState::new(
+        "Merged prerequisite",
+        WireStatus::new("skipped"),
+        Vec::new(),
+    );
+    merged.branch = Some("main".to_owned());
+    merged.skip_reason = Some("merged".to_owned());
+    group_state
+        .sub_issues
+        .insert(TicketId::parse("ENG-101").expect("Ticket"), merged);
+    let mut stacked =
+        SubIssueState::new("Unmerged prerequisite", WireStatus::new("done"), Vec::new());
+    stacked.branch = Some("adam/eng-102-api".to_owned());
+    group_state
+        .sub_issues
+        .insert(TicketId::parse("ENG-102").expect("Ticket"), stacked);
+    group_state.sub_issues.insert(
+        TicketId::parse("ENG-103").expect("Ticket"),
+        SubIssueState::new(
+            "Dependent",
+            WireStatus::new("pending"),
+            vec![
+                TicketId::parse("ENG-101").expect("Ticket"),
+                TicketId::parse("ENG-102").expect("Ticket"),
+            ],
+        ),
+    );
+    let group = DispatchGroup::from_state(group_state).expect("Dispatch Group");
+    let context = group
+        .dependency_context(&TicketId::parse("ENG-103").expect("Ticket"))
+        .expect("context query")
+        .expect("stacked context");
+    assert_eq!(context.base_revisions(), ["main", "adam/eng-102-api"]);
+    assert_eq!(
+        context.pull_request_base(),
+        "adam/eng-102-api",
+        "a merged blocker's `main` base must not swallow the unmerged prerequisite"
+    );
+    assert!(context.description().contains("ENG-102"));
+}
+
+#[test]
 fn dependency_context_rejects_a_ticket_outside_the_group() {
     let group = DispatchGroup::from_state(state()).expect("empty group");
     let error = group

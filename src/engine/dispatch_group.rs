@@ -503,9 +503,18 @@ impl DispatchGroup {
                     .and_then(|dependency| dependency.branch.clone())
             })
             .collect::<Vec<_>>();
-        if branches.is_empty() || branches.iter().all(|branch| branch == "main") {
+        // A merged blocker carries `branch = "main"`. Using it as the base would
+        // open the dependent's Pull Request against trunk and silently swallow an
+        // unmerged prerequisite's diff, so the base is the first blocker with a
+        // real stacked branch. An all-`main` (or empty) set has no stack to build
+        // on and yields no context.
+        let Some(pull_request_base) = branches
+            .iter()
+            .find(|branch| branch.as_str() != "main")
+            .cloned()
+        else {
             return Ok(None);
-        }
+        };
         let description = issue
             .blocked_by
             .iter()
@@ -522,9 +531,9 @@ impl DispatchGroup {
             .collect::<Vec<_>>()
             .join("\n");
         Ok(Some(DispatchDependencyContext::new(
-            branches.clone(),
+            branches,
             description,
-            branches[0].clone(),
+            pull_request_base,
         )))
     }
 
