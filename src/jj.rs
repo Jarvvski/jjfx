@@ -10,6 +10,7 @@
 //! "jj could not be read". Richer reads move to jj-lib in later epics (ADR 0007).
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::Context;
 
@@ -416,6 +417,21 @@ fn canonical_snapshot(out: &str) -> String {
 pub fn diff_line_delta(repo_root: &Path, from: &str, to: &str) -> anyhow::Result<(u32, u32)> {
     let out = read_at_repo(repo_root, &["diff", "--from", from, "--to", to, "--git"])?;
     Ok(crate::diff::line_totals(&crate::diff::parse(&out)))
+}
+
+/// Build a `jj` invocation for a command that may write.
+///
+/// Tests never sign: their commits are throwaway, and signing them made the
+/// suite depend on the developer's GPG key being unlocked. `cfg!(test)` covers
+/// this crate's own tests; `JJFX_TEST_SIGNING_OFF` covers integration tests,
+/// which compile the crate without `cfg(test)`. Every other build signs exactly
+/// as the user's config says.
+pub(crate) fn command() -> Command {
+    let mut command = Command::new("jj");
+    if cfg!(test) || std::env::var_os("JJFX_TEST_SIGNING_OFF").is_some() {
+        command.args(["--config", "signing.behavior=drop"]);
+    }
+    command
 }
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.

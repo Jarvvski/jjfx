@@ -5356,7 +5356,13 @@ mod tests {
         std::fs::create_dir_all(&hooks).unwrap();
         std::fs::write(hooks.join("setup.sh"), script).unwrap();
         let output = std::process::Command::new("jj")
-            .args(["file", "track", "root:.jjfx/setup.sh"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "file",
+                "track",
+                "root:.jjfx/setup.sh",
+            ])
             .current_dir(root)
             .output()
             .unwrap();
@@ -5382,7 +5388,15 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         let output = std::process::Command::new("jj")
-            .args(["bookmark", "set", "main", "-r", "@-"])
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "bookmark",
+                "set",
+                "main",
+                "-r",
+                "@-",
+            ])
             .current_dir(root)
             .output()
             .unwrap();

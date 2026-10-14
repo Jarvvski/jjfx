@@ -631,7 +631,7 @@ pub(crate) fn prepare_for_dispatch(
             path.display()
         )));
     }
-    let mut command = Command::new("jj");
+    let mut command = crate::jj::command();
     command.arg("new");
     if base_revisions.is_empty() {
         command.arg("main");
@@ -1123,7 +1123,7 @@ fn add_workspace_with_revision(
     revision: Option<&str>,
     colocate: bool,
 ) -> Result<(), WorkerWorkspaceError> {
-    let mut command = Command::new("jj");
+    let mut command = crate::jj::command();
     command.args(["workspace", "add", "--name", name]);
     if let Some(flag) = colocation_flag(root, colocate)? {
         command.arg(flag);
@@ -1150,7 +1150,7 @@ fn add_workspace_with_revision(
 /// separate Git step. (`jj workspace remove` is deliberately not used: it
 /// snapshots the working copy into a commit first, which is wrong for a delete.)
 fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError> {
-    let output = Command::new("jj")
+    let output = crate::jj::command()
         .args(["workspace", "forget", name])
         .current_dir(root)
         .output()
@@ -1170,7 +1170,7 @@ fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError>
 /// commits and pings the TUI's watcher (ADR 0006). `jj::read_at_repo` is the
 /// same rule; this is the engine's own copy of that read.
 pub(crate) fn git_remotes(root: &Path) -> std::io::Result<std::process::Output> {
-    Command::new("jj")
+    crate::jj::command()
         .arg("--ignore-working-copy")
         .args(["git", "remote", "list"])
         .current_dir(root)

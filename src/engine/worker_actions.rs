@@ -853,7 +853,7 @@ impl SystemCommands {
         operation: &'static str,
         arguments: &[&str],
     ) -> Result<(), WorkspaceRestorationError> {
-        let output = Command::new("jj")
+        let output = crate::jj::command()
             .args(arguments)
             .current_dir(workspace)
             .output()

@@ -228,20 +228,38 @@ fn advance_once_observes_a_failed_blocker_group_as_terminal() {
 fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     let directory = TempDir::new().expect("temporary repository");
     let output = Command::new("jj")
-        .args(["git", "init", "--colocate"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--colocate",
+        ])
         .arg(directory.path())
         .output()
         .expect("jj executable");
     assert!(output.status.success(), "jj init failed: {output:?}");
     fs::write(directory.path().join("README"), "foundation\n").expect("file");
     let output = Command::new("jj")
-        .args(["commit", "-m", "foundation"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "commit",
+            "-m",
+            "foundation",
+        ])
         .current_dir(directory.path())
         .output()
         .expect("jj executable");
     assert!(output.status.success(), "jj commit failed: {output:?}");
     let output = Command::new("jj")
-        .args(["bookmark", "create", "bob/eng-101-foundation"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "bookmark",
+            "create",
+            "bob/eng-101-foundation",
+        ])
         .current_dir(directory.path())
         .output()
         .expect("jj executable");

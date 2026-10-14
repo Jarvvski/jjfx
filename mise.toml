@@ -23,7 +23,11 @@ run = "cargo build --release --workspace"
 
 [tasks.test]
 description = "Run tests for every workspace package"
-run = "cargo test --workspace"
+# JJFX_TEST_SIGNING_OFF makes the engine's jj invocations pass
+# `--config signing.behavior=drop`. Integration tests compile the crate without
+# `cfg(test)`, so without it they would sign their throwaway commits and the
+# suite would depend on the developer's GPG key being unlocked.
+run = "JJFX_TEST_SIGNING_OFF=1 cargo test --workspace"
 
 [tasks.clean-check]
 description = "Remove all Cargo artifacts after verification"

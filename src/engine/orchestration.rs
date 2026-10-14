@@ -7,7 +7,6 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
-use std::process::Command;
 use std::time::Duration;
 
 use thiserror::Error;
@@ -618,7 +617,7 @@ fn revalidate_branches(root: &Path, group: &mut DispatchGroup) -> Vec<BranchRepa
 }
 
 fn revision_exists(root: &Path, revision: &str) -> bool {
-    Command::new("jj")
+    crate::jj::command()
         .args([
             "log",
             "-r",
@@ -640,7 +639,7 @@ fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
     // and which may change before a group is resumed; hardcoding it made the
     // lookup miss and silently rewrite a stacked dependency onto `main`.
     let ticket = ticket.as_str().to_ascii_lowercase();
-    let output = Command::new("jj")
+    let output = crate::jj::command()
         .args(["bookmark", "list", "-T", "name ++ \"\\n\""])
         .current_dir(root)
         .output()

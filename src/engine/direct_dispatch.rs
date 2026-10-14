@@ -1,6 +1,5 @@
 //! Coordinated Direct Dispatch requests and outcomes.
 
-use std::process::Command;
 use std::thread;
 
 use thiserror::Error;
@@ -611,7 +610,7 @@ impl DirectDispatch {
     }
 
     fn jj_config(&self, key: &'static str) -> Result<String, DirectDispatchError> {
-        let output = Command::new("jj")
+        let output = crate::jj::command()
             .args(["config", "get", key])
             .current_dir(self.repository.root())
             .output()

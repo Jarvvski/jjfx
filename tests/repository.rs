@@ -47,7 +47,7 @@ fn install_lifecycle_hooks_with_scripts(root: &Path, setup: &str, teardown: &str
 
     for file in ["root:.jjfx/setup.sh", "root:.jjfx/teardown.sh"] {
         let output = Command::new("jj")
-            .args(["file", "track", file])
+            .args(["--config", "signing.behavior=drop", "file", "track", file])
             .current_dir(root)
             .output()
             .expect("jj file track should run");
@@ -229,7 +229,14 @@ fn opens_a_secondary_workspace_at_the_default_workspace_root() {
     let (temporary_directory, repository) = local_repository();
     let secondary = temporary_directory.path().join("secondary-workspace");
     let output = Command::new("jj")
-        .args(["workspace", "add", "--name", "secondary"])
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "workspace",
+            "add",
+            "--name",
+            "secondary",
+        ])
         .arg(&secondary)
         .current_dir(repository.root())
         .output()
