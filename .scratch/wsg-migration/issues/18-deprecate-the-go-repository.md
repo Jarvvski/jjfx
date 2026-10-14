@@ -60,3 +60,33 @@ Dispatch, one Follow-up, and one Reset before announcing deprecation.
 ## Blocked by
 
 - issues/25-run-manual-acceptance-and-record-cutover-evidence.md
+
+## Comments
+
+**Scoped 2026-10-14.** Most of this ticket is already done, because the Go
+repository was archived on **2026-08-19** (commit `2da5674`, "Archive wsg and
+link jjfx"): `github.com/Jarvvski/wsg` reports `archived: true`, and its README
+carries a prominent "**Archived:** `wsg` is no longer maintained" notice
+pointing at jjfx. That satisfies steps 4 and 5.
+
+Done with this note: the jjfx-side release record (step 7). jjfx 0.52.1 is the
+**minimum replacement version** - it is jjfx's only published release
+(`gh release list -R Jarvvski/jjfx`), and it builds the frozen `wsg 0.19.0`
+compatibility binary from this repository alone. It is now recorded in jjfx's
+`CHANGELOG.md` and its README `## Status`. The Go project's own release notes
+**cannot** be updated: the repository is archived, so it is read-only on GitHub.
+
+Still owner-only: step 2 (confirm the released binaries open the existing Worker
+Pools and Dispatch Groups without destructive migration) and step 6 (any alias
+or local-installation change).
+
+**Open question blocking step 1.** The step asks to review "the conformance
+report, known differences, live-provider matrix, and release artifacts". The
+conformance report and accepted differences exist (`docs/wsg-conformance.md`,
+`docs/releasing.md`), but the *manual acceptance evidence* does not: ticket 25
+is `resolved` with every acceptance criterion ticked, yet it has no `## Outcome`
+section and neither repository contains a recorded evidence artifact (no
+checksums, tool versions, or matrix results). Either that evidence lives outside
+both repositories, or 25 was closed without recording it - in which case step 1
+is a formality rather than a check, and 25 should be revisited before this
+ticket is closed.

@@ -22,6 +22,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Added
 
+- 2026-10-14 - The Go `wsg` project is deprecated: it was archived on
+  2026-08-19, and jjfx is now the authoritative home of both binaries. `wsg`
+  users should move to **jjfx 0.52.1 or newer**, which builds the frozen
+  `wsg 0.19.0` compatibility binary from this repository. Existing Go releases
+  stay available, but receive no new development. (add)
+
 - 2026-10-13 - A `jj` on `PATH` whose major/minor differs from the `jj-lib`
   version jjfx reads the store with is now reported instead of silently
   degrading: a warning line atop the world graph, a TUI footer warning, and a

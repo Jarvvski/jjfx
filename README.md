@@ -123,6 +123,12 @@ Run `jjfx help` for usage.
 `jjfx` provides the CLI and an explicit interactive TUI entrypoint. The
 compatibility `wsg` target remains available for migration conformance.
 
+The Go `wsg` project is **deprecated** - it was archived on 2026-08-19, and jjfx
+is the authoritative home of both binaries. `wsg` users should install jjfx
+0.52.1 or newer, which builds the frozen `wsg 0.19.0` compatibility binary from
+this repository. Existing Go releases stay available, but receive no new
+development.
+
 ## Contributing
 
 Build instructions, the development task list, and where things live are in
