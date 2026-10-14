@@ -50,7 +50,7 @@ retired, so entries here are versioned by `jjfx` alone.
 
 - 2026-10-14 - The terminal query no longer storms or blocks: `kitten @ ls` runs through a bounded, single-flighted query with a short cache, so a slow or stuck kitty yields an error within seconds instead of hanging, and concurrent callers share one in-flight query rather than spawning a process each. The fail-closed occupancy check still refuses dispatch when the terminal cannot be read. (fix)
 
-- 2026-10-14 - Stopping an opencode Run now stops its work: `reset` and Worker `destroy` interrupt the Run's session through the daemon instead of signalling a client process, and a Worker's liveness is decided from that session's outcome rather than from a client pid that outlives it. Falls back to the existing process-group path whenever the API is unreachable or the session cannot be identified. (fix)
+- 2026-10-14 - Stopping an opencode Run now stops its work: `reset` and Worker `destroy` interrupt the Run's session through the daemon instead of signalling a client process, and a Worker's liveness is decided from that session's outcome - or a provider terminal event in its Run log - rather than from a client pid that outlives it. Falls back to the existing process-group path whenever the API is unreachable or the session cannot be identified. (fix)
 
 - 2026-10-14 - An opencode Run is anchored to its Worker Workspace explicitly: jjfx creates the session with that `location` and confirms what opencode stored before the Run starts, so a Run can no longer execute - and commit - in the wrong worktree. If the opencode API is unreachable the Run proceeds on the process cwd exactly as before, and an unreachable or older API never fails a Run. (fix)
 

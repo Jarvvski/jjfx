@@ -2271,6 +2271,11 @@ impl OpencodeControlFixture {
     /// Writes a busy Run for this Worker, so a stop or a reconciliation has
     /// something to act on.
     fn write_busy_worker(&self, agent: &str, pid: u32, ticket: &str) {
+        self.write_busy_worker_with_log(agent, pid, ticket, "/repo/.jj/pool/worker.log");
+    }
+
+    /// The same, with the Run log pointed somewhere a test can populate.
+    fn write_busy_worker_with_log(&self, agent: &str, pid: u32, ticket: &str, log_file: &str) {
         write_worker_json(
             &worker_state_path(self.repository.root(), &self.worker_id),
             serde_json::json!({
@@ -2280,12 +2285,19 @@ impl OpencodeControlFixture {
                 "pid": pid,
                 "started_at": "2026-07-30T10:00:00Z",
                 "completed_at": Value::Null,
-                "log_file": "/repo/.jj/pool/worker.log",
+                "log_file": log_file,
                 "branch_name": ticket.to_lowercase(),
                 "exit_code": Value::Null,
                 "error": Value::Null
             }),
         );
+    }
+
+    /// Writes a Run log beside the Worker state and returns its path.
+    fn write_run_log(&self, contents: &str) -> String {
+        let path = self.repository.root().join("worker.log");
+        fs::write(&path, contents).expect("run log");
+        path.display().to_string()
     }
 
     /// Records the session the Worker's Run drives, as ticket 38 would.
@@ -2484,6 +2496,32 @@ fn reconcile_runs_finishes_a_busy_opencode_worker_on_its_session_outcome() {
     assert_eq!(
         status, "Done",
         "a session with an outcome must finish the Run"
+    );
+}
+
+/// Liveness is `session outcome` *or* a Run-log result: a Run whose session is
+/// still open but whose log carries a provider terminal event is finished. An
+/// open session is not evidence of a running one - opencode reports a session
+/// as active while it is merely open - so the log result must not be ignored.
+#[test]
+fn reconcile_runs_finishes_a_busy_opencode_worker_on_a_run_log_result() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    let log = fixture.write_run_log("{\"type\":\"error\",\"error\":{\"message\":\"boom\"}}\n");
+    fixture.write_busy_worker_with_log("opencode", dead_pid(), "ENG-42", &log);
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("reconcile");
+    let status = fs::read_to_string(&fixture.result).expect("helper result");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        status, "Failed",
+        "a Run log with a provider terminal event must finish the Run even while its session is open"
     );
 }
 

@@ -257,7 +257,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   *not* lead a group) with no new dependency and no `unsafe`, and is sound once
   20/C4 gives every Run its own process group. The residual - a recycled pid that
   *does* lead a group - is narrowed, not closed. The Pool view's display probe was
-  aligned with it too, so the two cannot disagree about whether a Run is live.
+  aligned with it too, so the two agree for the runtimes whose PID owns the work;
+  an opencode Run is judged from its session instead (ticket 37), because its PID
+  is only a daemon client.
 - Two findings were test-encoded current behaviour - non-todo dependency statuses
   unblocking (D8), and Claude usage omission (D9). **Both decided 2026-10-14**
   (tickets 33 and 34, option 1 each): in-flight statuses now block until
@@ -267,6 +269,17 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   honours it, including in a colocated worktree. Ticket 05 is `needs-info` with
   a recurrence diagnostic; the leading untested variable is the reporter's
   `PATH` (`opencode` may be a wrapper).
+- The second local review pass (`6c62a5..main`: tickets 37, 38, 40) is
+  **applied**. Fixed: the duplicated session identification is now one
+  `identify_run_session` helper shared by the stop path and reconciliation; the
+  Run log is read once and its provider result finishes a Run even while the
+  session is still open - the decision's `outcome` *or* log-result, which an
+  open session was silently short-circuiting; the Pool view no longer labels an
+  opencode Worker "stale" on its dead client pid; the lock protocol lists the
+  sessions sidecar. Declined, with reasons: a `SessionId` newtype (the id is
+  opaque and only passed through), bundling `(worker, ticket)` (already carried
+  by `RunTarget` where it matters), and narrowing `create_run_session`'s error
+  to `OpenCodeError` (every caller only renders it).
 
 ## Fog
 

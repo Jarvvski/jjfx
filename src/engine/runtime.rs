@@ -1211,6 +1211,30 @@ fn recorded_pid(raw: u32) -> Option<Pid> {
     i32::try_from(raw).ok().and_then(Pid::from_raw)
 }
 
+/// Identifies the opencode session a Worker's Run drives, if it can be told.
+///
+/// The id ticket 38 recorded for the Worker is authoritative; only when nothing
+/// is recorded does this fall back to matching the Run title against the
+/// daemon's active sessions. Shared by the stop path and by Worker
+/// reconciliation, so the two always name the same session.
+pub(crate) fn identify_run_session(
+    api: &crate::engine::OpenCodeApi,
+    repository: &Repository,
+    worker: &WorkerId,
+    ticket: Option<&str>,
+) -> Option<String> {
+    let recorded = repository
+        .state_store()
+        .sessions()
+        .session(worker)
+        .ok()
+        .flatten();
+    let title = ticket
+        .filter(|ticket| !ticket.is_empty())
+        .map(|ticket| crate::engine::opencode_api::run_session_title(worker, ticket));
+    crate::engine::opencode_api::run_session_id(api, recorded.as_deref(), title.as_deref())
+}
+
 /// Stops an opencode Run through its daemon session, reporting whether the
 /// daemon confirmed it interrupted an active execution.
 ///
@@ -1223,18 +1247,7 @@ fn interrupt_opencode_run(
     ticket: Option<&str>,
 ) -> bool {
     let api = crate::engine::OpenCodeApi::new();
-    let recorded = repository
-        .state_store()
-        .sessions()
-        .session(worker)
-        .ok()
-        .flatten();
-    let title = ticket
-        .filter(|ticket| !ticket.is_empty())
-        .map(|ticket| crate::engine::opencode_api::run_session_title(worker, ticket));
-    let Some(session_id) =
-        crate::engine::opencode_api::run_session_id(&api, recorded.as_deref(), title.as_deref())
-    else {
+    let Some(session_id) = identify_run_session(&api, repository, worker, ticket) else {
         return false;
     };
     matches!(api.interrupt_session(&session_id), Ok(true))

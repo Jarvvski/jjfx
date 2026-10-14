@@ -416,23 +416,21 @@ impl WorkerPool {
     /// Anything else leaves the Worker `busy`, because a thin client that has
     /// exited says nothing about the work.
     fn opencode_run_result(&self, worker: &WorkerId, state: &WorkerState) -> Option<RunResult> {
+        let (log_result, log_source) = run_log_finalization(state, Some(AgentRuntime::OpenCode));
         match self.opencode_session_state(worker, state) {
-            // A session that is still open says the Run is still going, so the
-            // Run log is not even read.
-            RunSessionState::Running => None,
-            RunSessionState::Finished(outcome) => {
-                let (log_result, log_source) =
-                    run_log_finalization(state, Some(AgentRuntime::OpenCode));
-                Some(match log_source {
-                    // A provider terminal event carries more detail than the
-                    // bare outcome, so prefer it when the log has one.
-                    RunResultSource::Provider => log_result,
-                    RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
-                })
-            }
-            RunSessionState::Unavailable => {
-                let (log_result, log_source) =
-                    run_log_finalization(state, Some(AgentRuntime::OpenCode));
+            // The session reports a terminal outcome. A provider terminal event
+            // in the Run log carries more detail than the bare outcome, so
+            // prefer it when the log has one.
+            RunSessionState::Finished(outcome) => Some(match log_source {
+                RunResultSource::Provider => log_result,
+                RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
+            }),
+            // No outcome yet, or the session cannot be read. Only a provider
+            // terminal event in the Run log proves the Run ended: an *open*
+            // session is not evidence of a *running* one - opencode reports a
+            // session as active while it is merely open - so a log result still
+            // finishes the Worker, and anything less leaves it `busy`.
+            RunSessionState::Running | RunSessionState::Unavailable => {
                 matches!(log_source, RunResultSource::Provider).then_some(log_result)
             }
         }
@@ -441,22 +439,11 @@ impl WorkerPool {
     /// Consults the session the Worker's opencode Run drives.
     fn opencode_session_state(&self, worker: &WorkerId, state: &WorkerState) -> RunSessionState {
         let api = crate::engine::OpenCodeApi::new();
-        let recorded = self
-            .repository
-            .state_store()
-            .sessions()
-            .session(worker)
-            .ok()
-            .flatten();
-        let title = state
-            .ticket
-            .as_deref()
-            .filter(|ticket| !ticket.is_empty())
-            .map(|ticket| crate::engine::opencode_api::run_session_title(worker, ticket));
-        let Some(session_id) = crate::engine::opencode_api::run_session_id(
+        let Some(session_id) = crate::engine::runtime::identify_run_session(
             &api,
-            recorded.as_deref(),
-            title.as_deref(),
+            &self.repository,
+            worker,
+            state.ticket.as_deref(),
         ) else {
             return RunSessionState::Unavailable;
         };
@@ -1968,8 +1955,11 @@ fn worker_snapshot(
 
 /// Reports whether the recorded PID still leads a live process group.
 ///
-/// This is the same group-based probe Worker reconciliation uses, so the Pool
-/// view and reconciliation cannot disagree about whether a Run is live.
+/// This is the same group-based probe reconciliation uses for the runtimes
+/// whose work the PID owns (claude, codex, pi), so the Pool view and
+/// reconciliation agree for them. An opencode Run is judged from its session
+/// instead, because its recorded PID is only a daemon client - for opencode
+/// this probe answers about the client, not the work.
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
     crate::engine::runtime::live_process_group_leader(pid).is_some()

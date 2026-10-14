@@ -112,6 +112,10 @@ file inode.
 - Rust Workspace preparation and Reset restoration additionally serialize on
   `.jj/pool/<worker>.workspace.lock`. This additive operation lock is never a
   state lock and is not held by the Go compatibility peer.
+- Run sessions use `.jj/pool/.sessions.lock`. The sidecar
+  `.jj/pool/sessions.json` records the opencode session id of each Worker's
+  latest Run. It is jjfx-additive: the Go compatibility peer neither reads nor
+  writes it.
 
 A single-Worker mutation takes that Worker's lock. A Pool mutation takes the
 Pool lock. A Pool operation that also decides from Worker state takes the Pool

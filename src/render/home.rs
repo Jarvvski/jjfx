@@ -8,7 +8,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
 use crate::attention::Attention;
-use crate::engine::{WorkerSnapshot, WorkerStatus};
+use crate::engine::{AgentRuntime, WorkerSnapshot, WorkerStatus};
 use crate::render::state::RenderState;
 use crate::render::style::{
     agent_color, agent_glyph, agent_label, attention_color, behind_color, display_path,
@@ -257,7 +257,13 @@ pub(crate) fn workspace_item(
 /// ticket, and last activity. Idle unassigned Workers contribute nothing beyond
 /// the main row, so this returns `None` for them.
 fn worker_detail_line(worker: &WorkerSnapshot, width: u16) -> Option<Line<'static>> {
-    let status = if worker.status() == WorkerStatus::Busy && worker.has_dead_process() {
+    // A dead recorded PID means a stale Run only when the PID owns the work. An
+    // opencode Run's PID is just a daemon client, so a dead one says nothing
+    // about the work - that Worker is judged from its session instead.
+    let stale = worker.status() == WorkerStatus::Busy
+        && worker.has_dead_process()
+        && worker.agent_runtime() != Some(AgentRuntime::OpenCode);
+    let status = if stale {
         "stale"
     } else {
         worker.status().as_str()
