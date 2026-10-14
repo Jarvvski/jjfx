@@ -25,7 +25,7 @@ retired, so entries here are versioned by `jjfx` alone.
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
 
-## [Unreleased]
+## [0.53.0] - 2026-10-14
 
 ### Added
 
@@ -832,3 +832,6 @@ markers on their entries; they are preserved as history and carry no meaning now
   workspace's chain and diff against `trunk()` when it is a real commit, else the
   local `main`/`master`/`trunk` bookmark. Once main is pushed, `trunk()` wins and
   behaviour is unchanged.
+
+[0.53.0]: https://github.com/Jarvvski/jjfx/compare/v0.52.1...v0.53.0
+[0.52.1]: https://github.com/Jarvvski/jjfx/releases/tag/v0.52.1
