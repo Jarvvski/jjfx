@@ -48,14 +48,15 @@ CLI work and jjfx integration can proceed in parallel once their shared library 
 
 ## Outcome
 
-2026-10-14 - Complete. Tickets 14 through 25 are resolved: the Rust `wsg` binary
+2026-10-14 - Complete. Tickets 14 through 25 are closed: the Rust `wsg` binary
 restores the workspace, pool, dispatch and session CLI surfaces; Dispatch is
 integrated into jjfx with progress and logs; the TUI is shared and hardened; both
 binaries are packaged and released from jjfx; Go/Rust conformance passes; and the
 Go repository was archived on 2026-08-19 with jjfx as the authoritative home.
 
-The manual cutover evidence (ticket 25) was never recorded - see that ticket's
-Comments. It does not block, because jjfx does not consume the `wsg` binary: the
-dependency runs the other way, so `wsg` is a downstream compatibility binary and
-there is no jjfx behaviour left for a manual matrix to protect. `mise run check`
-is green.
+The manual cutover evidence (ticket 25) was never recorded and is closed
+`wontfix` - see that ticket's Comments. It does not block, because jjfx does not
+consume the `wsg` binary: the dependency runs the other way, so `wsg` is a
+downstream compatibility binary and there is no jjfx behaviour left for a manual
+matrix to protect. The conformance suite itself was retired on 2026-10-14 with
+the Go repository. `mise run check` is green.

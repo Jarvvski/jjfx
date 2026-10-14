@@ -1,6 +1,6 @@
 # Run manual acceptance and record wsg cutover evidence
 
-Status: resolved
+Status: wontfix
 
 ## Parent
 
@@ -53,14 +53,18 @@ candidate artifacts rather than an unreproducible development build.
 
 ## Acceptance Criteria
 
-- [x] The owner approves the conformance evidence and remaining differences.
-- [x] Released Rust binaries operate existing state without destructive
+None of these were met. The manual matrix was never run, so no evidence artifact
+exists (see Comments); they are left unticked rather than left claiming work that
+was not done.
+
+- [ ] The owner approves the conformance evidence and remaining differences.
+- [ ] Released Rust binaries operate existing state without destructive
       migration or reset.
-- [x] Installation guidance points to the staged jjfx bundle.
-- [x] Live provider and external-service checks pass or have explicitly
+- [ ] Installation guidance points to the staged jjfx bundle.
+- [ ] Live provider and external-service checks pass or have explicitly
       accepted documented differences.
-- [x] Existing Go `wsg` and `qwe` installation remain unchanged until approval.
-- [x] The evidence records artifact checksums, tool versions, results, cleanup,
+- [ ] Existing Go `wsg` and `qwe` installation remain unchanged until approval.
+- [ ] The evidence records artifact checksums, tool versions, results, cleanup,
       and unresolved blockers.
 
 ## Out of Scope
@@ -78,10 +82,12 @@ candidate artifacts rather than an unreproducible development build.
 
 ## Comments
 
-**Evidence gap recorded 2026-10-14.** Every acceptance criterion above is ticked,
-but no evidence artifact was ever recorded: this ticket has no `## Outcome`, and
+**Evidence gap recorded 2026-10-14.** Every acceptance criterion was ticked while
+no evidence artifact had ever been recorded: this ticket has no `## Outcome`, and
 neither this repository nor the Go one contains the claimed checksums, tool
 versions, or matrix results. The owner has confirmed there is nothing to find.
+The criteria are now unticked and the ticket is closed `wontfix`: the manual
+matrix is not going to be run, so it will not be met.
 
 Acceptance therefore rests on the automated conformance suite plus the verified
 fact that **jjfx does not consume the `wsg` binary at all** - the dependency runs

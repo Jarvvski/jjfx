@@ -103,7 +103,8 @@ The jjfx-side record is in `CHANGELOG.md` and the README `## Status`, naming
 **jjfx 0.52.1** as the minimum replacement version (jjfx's only published
 release).
 
-Acceptance rests on the automated conformance suite (`docs/wsg-conformance.md`),
-the archived state, and the verified fact that jjfx does not consume `wsg` - see
-the Comments above. Step 6 (an alias or local-installation change) was not
-needed: the `wsg` command name and existing Go releases are unchanged.
+Acceptance rests on the automated conformance suite (retired on 2026-10-14 with
+the Go repository), the archived state, and the verified fact that jjfx does not
+consume `wsg` - see the Comments above. Step 6 (an alias or local-installation
+change) was not needed: the `wsg` command name and existing Go releases are
+unchanged.
