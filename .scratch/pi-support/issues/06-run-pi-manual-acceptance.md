@@ -49,9 +49,10 @@ The matrix must cover both Pi's interactive lifecycle and Worker runtime:
    differences, and the exact manual matrix before touching a live workspace.
 2. Record the installed jjfx, Pi, Claude, Codex, jj, gh, terminal, and any
    discovery-helper versions plus artifact checksums and configuration sources.
-3. Verify `jjfx hooks status` and install behavior, then smoke-test Pi
-   interactive launch and lifecycle display without overwriting unrelated
-   provider configuration.
+3. Verify hook behavior (there is no `jjfx hooks status` command - hooks are
+   repository files; see `docs/workspace-hooks.md`) and install behavior, then
+   smoke-test Pi interactive launch and lifecycle display without overwriting
+   unrelated provider configuration.
 4. Run a controlled Pi fresh Dispatch, observe safe permissions and ticket
    inputs, inspect structured activity/result logs, and verify success and
    failure cleanup.
@@ -135,3 +136,26 @@ cleanup, and status for every matrix row.
 - issues/05-add-pi-interactive-lifecycle.md
 - issues/07-add-pi-direct-dispatch-profile.md
 - issues/08-complete-pi-dispatch-integration.md
+
+## Comments
+
+**Step 1 review done 2026-10-14.** The matrix, the candidate-artifact commands,
+the version and checksum captures, the reachable CLI surface, and the expected
+capability differences are recorded in
+[`manual-acceptance.md`](../manual-acceptance.md), which is blank and ready for
+the owner's session. That review corrected one thing in this ticket: `jjfx hooks
+status` is not a jjfx command (commit 3 above is fixed), so the matrix exercises
+hook *behaviour* instead of calling a status command.
+
+Confirmed reachable for the matrix: `mise run install-candidate` (stages both
+binaries under a non-PATH prefix and never touches the installed Go `wsg` or the
+`qwe` alias), `mise run release` / `release-smoke` for a checksummed bundle,
+`jjfx pool profile pi --provider --model`, the `JJFX_PI_LINEAR_HELPER`
+discovery protocol, and the fixed Pi tool policy in `docs/pi-workers.md`.
+
+The expected unsupported capabilities - per-tool approval popups, aggregate
+budget limits, a filesystem sandbox, and native Linear/MCP - are listed in the
+capability matrix in `spike-01-contract-findings.md`, so the session records
+them as accepted differences rather than discovering them as failures. The
+per-tool approval and budget choices must be *rejected* by jjfx, not silently
+weakened, and no capability gap may fall back to Claude or Codex.
