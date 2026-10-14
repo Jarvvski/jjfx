@@ -105,11 +105,11 @@ path matters and any adoption needs a capability check rather than an assumption
 - **Liveness - session `outcome` or run-log result.** For an opencode Run a Worker is
   finished when the session has an `outcome` or the run log has a result; the
   pid/process-group liveness check is dropped for opencode, because the pid is only a
-  client. Rejected: `session.active` (measured over-reporting - eight-plus sessions
-  reported `running`, including idle interactive ones - so it would keep Workers
-  `busy` after they finished), and "both outcome *and* dead pid" (a client that
-  outlives its work would strand the Worker `busy`, which is the exact failure ticket
-  07 is about).
+  client. Rejected: `session.active` (it reports a session as `running` while it is
+  *open*, not while it is *executing* - it listed eight-plus sessions and cannot
+  distinguish "finished" from "still open", so it would keep Workers `busy` after
+  they finished), and "both outcome *and* dead pid" (a client that outlives its work
+  would strand the Worker `busy`, which is the exact failure ticket 07 is about).
 
 **Sequencing.** This changes `reconcile_worker` (`src/engine/pool.rs`) and
 `terminate_recorded_process` / `reset_run` (`src/engine/runtime.rs`) - the same

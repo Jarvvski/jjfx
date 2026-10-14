@@ -206,6 +206,11 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   `--title` jjfx already sets, stop it with `session.interrupt`, and treat an
   opencode Run as finished on the session `outcome` or a run-log result rather than
   on the client pid. Must land **after** 07/20 - it changes the same functions.
+- [38](issues/38-assert-run-session-directory.md) - guard for the ticket 05 class.
+  **ready-for-human** - opencode's API exposes each session's
+  `location.directory`, so jjfx can notice a Run that landed outside its Worker
+  Workspace. Needs a decision on what to do on mismatch (warn, fail the Run, or
+  refuse to dispatch). Blocked by 37, which supplies the session identification.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
