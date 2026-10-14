@@ -76,6 +76,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T10 | TUI | L | S | `?` steals from text buffers; help-over-editor hides the editor; `viewport` `u16` truncation; `line_down` overflow | 28 |
 | T11 | TUI | H | report | `jjfx tui` floods the terminal with unbounded, un-deduplicated `kitten @ ls` subprocesses until kitty pegs a core | 40 (fixed) |
 | T12 | TUI | H | report | the recursive `.jj` watcher and a snapshotting Workspace projection form a self-sustaining reload loop that storms `jj` and everything downstream of a reload | 41 (fixed) |
+| T13 | process | L | verified | the engine's two `jj git remote list` identity reads also snapshot the working copy, committing it as a side effect of dispatching | 41 (fixed) |
 
 ## Tickets
 

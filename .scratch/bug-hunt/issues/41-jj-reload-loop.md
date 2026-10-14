@@ -137,3 +137,11 @@ want their own one-flag fix and a test.
 The remaining engine calls are all intentional mutations (`workspace add`,
 `workspace forget`, `new`, `git init`) or working-copy-independent reads
 (`--version`, `config get`), where a snapshot is either wanted or cannot happen.
+
+**Fixed 2026-10-14.** The two `jj git remote list` reads were extracted into one
+pure `engine::workspace::git_remotes` helper - which also removes the
+duplication, since `discover_gh_repo` and `repository_identity` each carried
+their own copy - and given `--ignore-working-copy`.
+`git_remotes_does_not_snapshot_the_working_copy` proves the snapshot red first
+(the working-copy commit id changed). So the engine's reads are now all pure, and
+this omission exists in exactly one place instead of three.
