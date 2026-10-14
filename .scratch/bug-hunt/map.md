@@ -1,6 +1,6 @@
 # Bug hunt: correctness and resilience sweep
 
-Status: open (2026-10-14) - reopened for ticket 41, a new external report; 06 is `wontfix`.
+Status: closed (2026-10-14) - 40 resolved, 1 `wontfix` (06).
 
 ## Notes
 

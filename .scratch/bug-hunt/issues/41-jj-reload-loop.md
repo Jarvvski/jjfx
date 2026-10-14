@@ -1,6 +1,6 @@
 # A self-triggering `.jj` reload loop storms `jj` and `kitten @ ls`
 
-Status: ready-for-agent
+Status: resolved
 
 Source: external report (`/tmp/jjfx-bug-kitty-ls-storm.md`, 2026-10-14), confirmed
 against the tree at `215602d`. Evidence reproduced below because the report is
