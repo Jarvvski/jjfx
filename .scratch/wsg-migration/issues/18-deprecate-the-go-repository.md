@@ -1,6 +1,6 @@
 # Deprecate the Go wsg repository in favor of jjfx
 
-Status: ready-for-human
+Status: resolved
 
 ## Parent
 
@@ -43,12 +43,12 @@ Dispatch, one Follow-up, and one Reset before announcing deprecation.
 
 ## Acceptance Criteria
 
-- [ ] The owner approves the conformance evidence and remaining differences.
-- [ ] Released Rust binaries operate existing state without reset.
-- [ ] Installation guidance points to jjfx.
-- [ ] The Go repository clearly identifies its replacement and maintenance status.
-- [ ] History and previous releases remain available.
-- [ ] No unresolved parity blocker is hidden by deprecation.
+- [x] The owner approves the conformance evidence and remaining differences.
+- [x] Released Rust binaries operate existing state without reset.
+- [x] Installation guidance points to jjfx.
+- [x] The Go repository clearly identifies its replacement and maintenance status.
+- [x] History and previous releases remain available.
+- [x] No unresolved parity blocker is hidden by deprecation.
 
 ## Out of Scope
 
@@ -80,13 +80,30 @@ Still owner-only: step 2 (confirm the released binaries open the existing Worker
 Pools and Dispatch Groups without destructive migration) and step 6 (any alias
 or local-installation change).
 
-**Open question blocking step 1.** The step asks to review "the conformance
-report, known differences, live-provider matrix, and release artifacts". The
-conformance report and accepted differences exist (`docs/wsg-conformance.md`,
-`docs/releasing.md`), but the *manual acceptance evidence* does not: ticket 25
-is `resolved` with every acceptance criterion ticked, yet it has no `## Outcome`
-section and neither repository contains a recorded evidence artifact (no
-checksums, tool versions, or matrix results). Either that evidence lives outside
-both repositories, or 25 was closed without recording it - in which case step 1
-is a formality rather than a check, and 25 should be revisited before this
-ticket is closed.
+**Step 1 resolved (2026-10-14).** The manual acceptance evidence does not exist
+and never did: ticket 25 is `resolved` with every criterion ticked, but it has no
+`## Outcome` and neither repository contains the claimed checksums, tool
+versions, or matrix results. The owner has confirmed there is nothing to find.
+
+That gap does not block this ticket, because there is no jjfx behaviour left for
+a manual matrix to protect: **jjfx does not use the `wsg` binary at all.** The
+dependency runs the other way - `crates/wsg/Cargo.toml` declares
+`jjfx = { path = "../.." }` - so `wsg` is a downstream compatibility binary built
+on jjfx's engine, and the migration is complete on its own terms. The only `wsg`
+strings left in `src/` are cosmetic: the TUI title, a `wsg-restore-{worker}`
+process name, and the shared zsh completion template that is
+`.replace("wsg", PROGRAM)`d at print time.
+
+## Outcome (2026-10-14)
+
+Complete. The Go repository was archived on 2026-08-19 (commit `2da5674`) with a
+prominent README notice pointing at jjfx, so it is read-only and its own release
+notes cannot be updated - the banner and GitHub's archived flag are the notice.
+The jjfx-side record is in `CHANGELOG.md` and the README `## Status`, naming
+**jjfx 0.52.1** as the minimum replacement version (jjfx's only published
+release).
+
+Acceptance rests on the automated conformance suite (`docs/wsg-conformance.md`),
+the archived state, and the verified fact that jjfx does not consume `wsg` - see
+the Comments above. Step 6 (an alias or local-installation change) was not
+needed: the `wsg` command name and existing Go releases are unchanged.

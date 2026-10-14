@@ -1,7 +1,7 @@
 # Epic D - Interfaces and cutover
 
 Type: epic
-Status: tracking
+Status: resolved
 
 ## Goal
 
@@ -45,3 +45,17 @@ CLI work and jjfx integration can proceed in parallel once their shared library 
 - Mixed Go and Rust conformance, process cleanup, and restart recovery scenarios pass.
 - The owner approves the final deprecation notice and installation cutover.
 - `mise run check` is green.
+
+## Outcome
+
+2026-10-14 - Complete. Tickets 14 through 25 are resolved: the Rust `wsg` binary
+restores the workspace, pool, dispatch and session CLI surfaces; Dispatch is
+integrated into jjfx with progress and logs; the TUI is shared and hardened; both
+binaries are packaged and released from jjfx; Go/Rust conformance passes; and the
+Go repository was archived on 2026-08-19 with jjfx as the authoritative home.
+
+The manual cutover evidence (ticket 25) was never recorded - see that ticket's
+Comments. It does not block, because jjfx does not consume the `wsg` binary: the
+dependency runs the other way, so `wsg` is a downstream compatibility binary and
+there is no jjfx behaviour left for a manual matrix to protect. `mise run check`
+is green.

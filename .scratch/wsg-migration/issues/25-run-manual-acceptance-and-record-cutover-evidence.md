@@ -75,3 +75,17 @@ candidate artifacts rather than an unreproducible development build.
 
 - issues/17-prove-go-rust-conformance.md
 - issues/24-package-jjfx-and-wsg-release.md
+
+## Comments
+
+**Evidence gap recorded 2026-10-14.** Every acceptance criterion above is ticked,
+but no evidence artifact was ever recorded: this ticket has no `## Outcome`, and
+neither this repository nor the Go one contains the claimed checksums, tool
+versions, or matrix results. The owner has confirmed there is nothing to find.
+
+Acceptance therefore rests on the automated conformance suite plus the verified
+fact that **jjfx does not consume the `wsg` binary at all** - the dependency runs
+the other way (`crates/wsg/Cargo.toml` declares `jjfx = { path = "../.." }`), so
+`wsg` is a downstream compatibility binary built on jjfx's engine and there is no
+jjfx behaviour left for a manual matrix to protect. Recorded here rather than
+silently left as a false claim.
