@@ -1152,9 +1152,7 @@ fn persist_pid_failure_with(
 }
 
 fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
-    let pid = i32::try_from(background.pid())
-        .ok()
-        .and_then(Pid::from_raw)
+    let pid = recorded_pid(background.pid())
         .ok_or_else(|| io::Error::other("background Run PID does not fit a Unix process ID"))?;
     let termination = terminate_process_group(pid, PROCESS_GROUP_GRACE);
     background.child.wait()?;
@@ -1170,14 +1168,16 @@ fn cleanup_untracked_run(mut background: BackgroundRun) -> io::Result<()> {
 /// Ends a foreground Run that never reached supervision: signal its process
 /// group so no descendant survives, then reap the direct child.
 fn terminate_foreground_run(child: &mut Child) -> io::Result<()> {
-    let termination = i32::try_from(child.id())
-        .ok()
-        .and_then(Pid::from_raw)
-        .map_or(Ok(()), |pid| {
-            terminate_process_group(pid, PROCESS_GROUP_GRACE)
-        });
+    let termination = recorded_pid(child.id()).map_or(Ok(()), |pid| {
+        terminate_process_group(pid, PROCESS_GROUP_GRACE)
+    });
     let reaped = child.wait().map(|_| ());
     termination.and(reaped)
+}
+
+/// Converts a recorded PID to a process-group id, or `None` when it cannot be one.
+fn recorded_pid(raw: u32) -> Option<Pid> {
+    i32::try_from(raw).ok().and_then(Pid::from_raw)
 }
 
 /// Returns the process group for `pid` only when `pid` is a live process-group
@@ -1188,7 +1188,7 @@ fn terminate_foreground_run(child: &mut Child) -> io::Result<()> {
 /// lead a group - there is no group with that id to signal - and keeps Reset and
 /// Worker reconciliation on one group-based probe.
 pub(crate) fn live_process_group_leader(pid: u32) -> Option<Pid> {
-    let pid = i32::try_from(pid).ok().and_then(Pid::from_raw)?;
+    let pid = recorded_pid(pid)?;
     if test_kill_process(pid).is_err() {
         return None;
     }
@@ -1725,7 +1725,7 @@ fn schema_accepts_string(schema: &serde_json::Value) -> bool {
 }
 
 fn terminate_profile_probe(child: &mut Child) {
-    if let Some(pid) = i32::try_from(child.id()).ok().and_then(Pid::from_raw) {
+    if let Some(pid) = recorded_pid(child.id()) {
         let _ = terminate_process_group(pid, PROCESS_GROUP_GRACE);
     } else {
         let _ = child.kill();

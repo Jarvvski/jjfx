@@ -1853,14 +1853,13 @@ fn worker_snapshot(
     })
 }
 
+/// Reports whether the recorded PID still leads a live process group.
+///
+/// This is the same group-based probe Worker reconciliation uses, so the Pool
+/// view and reconciliation cannot disagree about whether a Run is live.
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    use rustix::process::{Pid, test_kill_process};
-
-    i32::try_from(pid)
-        .ok()
-        .and_then(Pid::from_raw)
-        .is_some_and(|pid| test_kill_process(pid).is_ok())
+    crate::engine::runtime::live_process_group_leader(pid).is_some()
 }
 #[cfg(not(unix))]
 fn process_is_alive(_pid: u32) -> bool {

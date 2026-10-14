@@ -68,18 +68,24 @@ pub mod test_support {
 
 /// Run the jjfx binary's argument router.
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
-    // The hidden foreground wrapper is dispatched before anything else: it is
-    // spawned with an Agent command's own arguments, which must not be scanned as
-    // jjfx's. Like `--version` it needs no repository, so it also skips repo
-    // discovery - the Run's workspace need not be a jj repo.
-    if args.first().map(String::as_str) == Some(engine::WRAPPER_SUBCOMMAND) {
-        return cli::run(
+    // The four `cli::run` sites below differ only in the `args` they forward, so
+    // bind the shared dispatch once and call it at each.
+    let dispatch = |args: Vec<String>| {
+        cli::run(
             args,
             launch,
             terminal_settings,
             colocate_setting,
             open_workspaces,
-        );
+        )
+    };
+
+    // The hidden foreground wrapper is dispatched before anything else: it is
+    // spawned with an Agent command's own arguments, which must not be scanned as
+    // jjfx's. Like `--version` it needs no repository, so it also skips repo
+    // discovery - the Run's workspace need not be a jj repo.
+    if args.first().map(String::as_str) == Some(engine::WRAPPER_SUBCOMMAND) {
+        return dispatch(args);
     }
 
     // `--version`/`-V` prints "jjfx <version>" and exits before any repo or
@@ -96,13 +102,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         args.first().map(String::as_str),
         Some("help" | "-h" | "--help")
     ) {
-        return cli::run(
-            args,
-            launch,
-            terminal_settings,
-            colocate_setting,
-            open_workspaces,
-        );
+        return dispatch(args);
     }
 
     // `jjfx hooks [install|status]` is global - it manages ~/.claude/settings.json
@@ -115,13 +115,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // help, so scripts and shell completion never unexpectedly claim the
     // terminal.
     if args.is_empty() {
-        return cli::run(
-            vec!["help".to_owned()],
-            launch,
-            terminal_settings,
-            colocate_setting,
-            open_workspaces,
-        );
+        return dispatch(vec!["help".to_owned()]);
     }
     if args.first().map(String::as_str) == Some("tui") {
         if args.len() != 1 {
@@ -151,13 +145,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         return Ok(());
     }
 
-    cli::run(
-        args,
-        launch,
-        terminal_settings,
-        colocate_setting,
-        open_workspaces,
-    )
+    dispatch(args)
 }
 
 /// Resolve the terminal settings a `mount` invocation needs: the first-pane
