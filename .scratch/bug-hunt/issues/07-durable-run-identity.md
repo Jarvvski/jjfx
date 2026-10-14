@@ -1,6 +1,6 @@
 # Give every Run a durable identity token
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -63,11 +63,11 @@ foreground Runs, so C7 is coupled to C4 (ticket 20).
 
 ## Acceptance Criteria
 
-- [ ] The owner picks option 1, 2, or 3.
-- [ ] If 1 or 3: a recorded pid that has been recycled is never signalled, and a
+- [x] The owner picks option 1, 2, or 3.
+- [x] If 1 or 3: a recorded pid that has been recycled is never signalled, and a
       recycled pid no longer strands a Worker in `busy`.
-- [ ] No new field on the Go-compatible Worker document.
-- [ ] `mise run check` is green.
+- [x] No new field on the Go-compatible Worker document.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -120,3 +120,15 @@ Consequences for this ticket and for 20:
 Verified 2026-10-14 on opencode 2.0.27: the session *directory* honours the process
 cwd in both modes, so this is about process ownership and teardown, not about the
 working directory.
+
+## Outcome (2026-10-14)
+
+Landed with 20/C4 as `Give every Run its own process group and probe Runs by group leadership`, option 3 - group-based liveness, no new dependency and no `unsafe`.
+
+`live_process_group` became `live_process_group_leader`: a recorded pid counts as live only while it is alive *and* `getpgid(pid) == pid`, so a recycled pid that does not lead a group can no longer be signalled or strand a Worker. `reconcile_worker` (`src/engine/pool.rs`) uses that probe instead of `process_is_alive_i64`, which is gone.
+
+Evidence: `reconcile_runs_marks_a_busy_worker_failed_when_its_pid_is_not_a_group_leader` (red pre-fix - `Busy` where the domain expects `Failed`), `reset_run_does_not_signal_a_group_whose_recorded_leader_is_gone`, and `reset_run_does_not_signal_a_recorded_pid_that_is_not_a_group_leader` (pins the guard). `tests/orchestration.rs` recorded `std::process::id()` as a live Worker pid, which is not a group leader; it now records a real one - a deliberate consequence of the probe, not a workaround.
+
+Residual, accepted in the decision: a recycled pid that *also* leads a process group is still not distinguished. `getpgid` errors other than `ESRCH` (e.g. `EPERM`) are treated as "not a leader" rather than surfaced, which can only affect pids jjfx itself spawned.
+
+Behaviour change: `reset_run`/`terminate_recorded_process` no longer signal a group whose recorded leader is gone, so Reset will not clean up a descendant left in a group whose leader already exited.

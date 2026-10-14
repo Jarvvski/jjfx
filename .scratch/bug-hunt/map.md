@@ -38,14 +38,14 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | D1 | dispatch | H | V | A failed Sub-issue never unblocks dependents; the group never terminates and `run` polls forever | 04 (fixed) |
 | D3 | work | - | refuted | git-exported bookmarks count as "pushed" - `remote_bookmarks()` already excludes `@git` | 06 |
 | C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 08 (fixed) |
-| C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 |
+| C2 | process | H | S | PID reuse can TERM/KILL an unrelated process group on Reset/destroy | 07 (fixed) |
 | T1 | TUI | H | S | blocking kitty subprocess + ~5s sleep on the UI thread | 17 (fixed) |
 | T2 | TUI | H | S | help over Detail/Graph renders nothing yet swallows every key | 18 (fixed) |
 | I1 | forge | H | S | every `gh` failure is reinterpreted as "no origin remote" | 10 (fixed) |
 | C3 | state | M-H | S | `.cleanup` marker written before the pool manifest permanently blocks a Worker | 09 (fixed) |
-| C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 (decision needed) |
+| C4 | process | M | S | foreground launch failure kills only the direct child; foreground Runs aren't their own group | 20 (fixed) |
 | C5 | state | M | S | `detached_cleanup_markers` aborts on any malformed `.cleanup` filename | 20 (fixed) |
-| C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 (test strategy needed) |
+| C6 | process | M | S | `cleanup_untracked_run` can release a reservation while the group is alive | 20 (fixed) |
 | D2 | dispatch | M | V | branch repair hardcodes `adam/` while dispatch derives the prefix from `user.name` | 14 (fixed) |
 | D4 | dispatch | M | S | orchestration freezes occupancy exclusions for the whole run (violates ADR-0011) | 15 (fixed) |
 | D5 | dispatch | M | S | retry path resets the Worker before persisting the group; a save conflict strands it | 16 (fixed) |
@@ -63,7 +63,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | I7 | workspace | M-L | S | two divergent ad-hoc workspace path rules (CLI vs TUI) | 23 |
 | I9 | dispatch | M-L | S | duplicate Ticket ids are never deduped -> double dispatch | 13 (fixed) |
 | I10 | run log | L-M | S | any invalid cost line turns a successful Run into a failure | 28 |
-| C7 | process | L-M | S | a recycled PID keeps a Worker `busy` forever | 07 |
+| C7 | process | L-M | S | a recycled PID keeps a Worker `busy` forever | 07 (fixed) |
 | D6 | attention | L | ? | a newer local/pushed change masks a changes-requested PR (stacked work) | 28 |
 | D7 | dispatch | L | ? | mixed merged+unmerged blockers can set the PR base to `main` | 28 |
 | D8 | dispatch | L | ? | non-todo dependency statuses are skipped but unblock | 28 |
@@ -102,8 +102,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
   **wontfix** - refuted.
 - [07](issues/07-durable-run-identity.md) - C2, C7.
-  **ready-for-agent** - option 3: group-based liveness, no new dependency; landed
-  with 20/C4, which gives every Run its own process group.
+  **resolved** - option 3: group-based liveness (a recorded pid counts as live only
+  while it leads a process group), landed with 20/C4.
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
   **resolved** - Follow-ups and rebases take the lock.
 - [09](issues/09-order-cleanup-marker-after-manifest.md) - C3.
@@ -133,9 +133,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
   **resolved** - lossy line reader, replay offset, in-tailer rotation.
 - [20](issues/20-workspace-cleanup-robustness.md) - C4, C5, C6.
-  **ready-for-agent** - C5 fixed; C4 option 1 (own process group plus
-  `tcsetpgrp`, via rustix's dependency-free `termios` feature) and C6 verified by
-  injecting the cleanup outcome. Both decided 2026-10-14.
+  **resolved** - C5 fixed; C4 landed as own process group plus a child-side terminal
+  handback (no `unsafe`, no new crate), and C6 by injecting the cleanup outcome.
 
 ### Phase 3 - improvements
 

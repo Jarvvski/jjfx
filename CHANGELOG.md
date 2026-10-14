@@ -48,6 +48,12 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-14 - Every Run now owns its process group, so a failed foreground launch and a cross-process Reset end the whole agent tree instead of leaking descendants that keep writing to the Workspace. A foreground Run's terminal is handed to it and back by a wrapper inside its own group, so it can still read the terminal and Ctrl-C still reaches the agent. (fix)
+
+- 2026-10-14 - A recorded Run pid is treated as live only while it leads a process group, so a recycled pid can no longer keep a Worker `busy` forever or aim a Reset or destroy signal at an unrelated group. (fix)
+
+- 2026-10-14 - A Worker Reservation is released only once its untracked Run is confirmed gone; when the forced kill cannot confirm the exit the Worker stays busy instead of being reused while an agent may still be running. (fix)
+
 - 2026-10-14 - A change-requested Pull Request is no longer masked when newer
   work is stacked above it: the Workspace reads as `PrOpen { ChangesRequested }`
   and surfaces as needs-you, where it previously read as merely "ready to forge"

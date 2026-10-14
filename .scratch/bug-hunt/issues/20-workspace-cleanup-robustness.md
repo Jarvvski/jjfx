@@ -1,6 +1,6 @@
 # Harden Workspace and process cleanup
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -82,9 +82,9 @@ landing unverified.
 ## Acceptance Criteria
 
 - [x] A malformed `.cleanup` file does not break resize/destroy.
-- [ ] A failed foreground launch leaves no surviving descendants.
-- [ ] A cross-process Reset terminates a live foreground Run.
-- [ ] A reservation is never released while its process group is alive.
+- [x] A failed foreground launch leaves no surviving descendants.
+- [x] A cross-process Reset terminates a live foreground Run.
+- [x] A reservation is never released while its process group is alive.
 - [x] `mise run check` is green.
 
 ## Out of Scope
@@ -107,3 +107,19 @@ outcome.**
   deterministically testable (a process group cannot be made to survive
   `SIGKILL`), so the cleanup outcome becomes injectable and the four-line ordering
   is pinned through that seam rather than landing unverified.
+
+## Outcome (2026-10-14)
+
+All three items landed.
+
+**C5** was fixed earlier (`Ignore cleanup markers that cannot name a Worker`).
+
+**C4** - `Give every Run its own process group and probe Runs by group leadership` plus `Hand the terminal to a foreground Run and back from its own group`. Every Run is spawned with `process_group(0)`, and the two foreground failure paths end the whole group through `terminate_foreground_run` instead of `child.kill()`.
+
+The decision's option 1 needed more than `tcsetpgrp` from the supervisor: taking the terminal *back* from a background group raises `SIGTTOU`, and the only ways to suppress it (`SIG_IGN`, or blocking the signal) need `unsafe` or a new dependency - verified by experiment on macOS, and `rustix`'s signal APIs are Linux-only. So the terminal is handed back by the Run's own group instead: the supervisor spawns a hidden `jjfx __foreground` wrapper with `process_group(0)`, makes its group foreground, and the wrapper runs the Agent in that group, waits, then restores the captured group before exiting. Because the wrapper is the foreground group while it hands back, `SIGTTOU` is never raised, with no `unsafe` and no new crate.
+
+Evidence: `cross_process_reset_terminates_a_live_foreground_run` (red pre-fix - `terminated_pid: None`, the group was never signalled), `failed_foreground_launch_leaves_no_surviving_descendants` (red pre-fix - a surviving descendant), and `foreground_run_reads_the_terminal_and_returns_it`, a real-PTY test where the Agent reads the terminal (which stopped on `SIGTTIN` pre-fix) and the supervisor reads it again after the Run, asserting the hand-back and the exit code.
+
+**C6** - `Release a Reservation only after its untracked Run is gone`. `persist_pid_failure` is split into `persist_pid_failure_with(reservation, background, primary, cleanup)`; the Reservation is released only on `Ok`, and an unconfirmed cleanup returns `PersistPidCleanup` and keeps it. Evidence: `a_reservation_survives_an_unconfirmed_untracked_cleanup` (red pre-fix - `Idle` where the domain expects `Busy`), driving a real Repository, Worker Reservation and background process, injecting only the cleanup outcome through the seam.
+
+Costs and residual risk: the handover adds one wrapper process per tty foreground Run (transparent for the log and the exit code) and needs `rustix`'s `pty` and `stdio` features for the PTY test, which - because cargo unifies features - also build into production. A tty foreground Run now records the wrapper's pid (it leads the group) rather than the Agent's; it is still a live group leader, so Reset and `reconcile_worker` are unchanged. Ctrl-C reaches the Agent only, since the Run's group is the foreground group. The `wait_until_foreground` 10s deadline is a safety net and is untested; a failing PTY test leaves its helper processes behind. Verified on macOS only - `tcsetpgrp`/`SIGTTOU` are POSIX, but nothing was run on Linux.
