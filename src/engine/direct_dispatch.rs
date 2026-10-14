@@ -568,13 +568,12 @@ impl DirectDispatch {
         if let Some(details) = request.ticket_details() {
             context = context.with_ticket_details(details.clone());
         }
-        Ok(DispatchPromptBuilder::new()
-            .initial(context)?
-            .with_name(format!(
-                "pool:{}:{}",
+        Ok(DispatchPromptBuilder::new().initial(context)?.with_name(
+            crate::engine::opencode_api::run_session_title(
                 reservation.worker_id(),
-                request.ticket().id()
-            )))
+                request.ticket().id().as_str(),
+            ),
+        ))
     }
 
     fn repository_identity(&self) -> Result<RepositoryIdentity, DirectDispatchError> {

@@ -15,6 +15,7 @@
 //! [`OpenCodeRunner`] seam, so parsing and the unavailable path are covered
 //! without a live server.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -22,6 +23,8 @@ use std::process::Command;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::engine::WorkerId;
 
 /// The opencode executable looked up on `PATH`.
 const OPENCODE_EXECUTABLE: &str = "opencode";
@@ -404,6 +407,18 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
         })
     }
 
+    /// The ids of the sessions opencode currently reports as active
+    /// (`session.active`).
+    ///
+    /// "Active" means the session is open, not that it is executing: opencode
+    /// lists a session here while it waits for input too. It is a guard for the
+    /// title fallback in [`run_session_id`], not a liveness signal.
+    pub fn active_sessions(&self) -> Result<BTreeSet<String>, OpenCodeError> {
+        let raw = self.call(operation_args("session.active", &[], None))?;
+        parse_envelope::<ActiveSessionsEnvelope>(&raw, "session.active")
+            .map(|envelope| envelope.data.into_keys().collect())
+    }
+
     /// Interrupts a session's active execution (`session.interrupt`),
     /// reporting whether anything was actually interrupted.
     pub fn interrupt_session(&self, session_id: &str) -> Result<bool, OpenCodeError> {
@@ -488,6 +503,55 @@ pub(crate) fn create_run_session<R: OpenCodeRunner>(
     }
 }
 
+/// The `title` jjfx sets on a Run's session, so a session jjfx did not create
+/// can still be recognized by it.
+pub(crate) fn run_session_title(worker: &WorkerId, ticket: &str) -> String {
+    format!("pool:{worker}:{ticket}")
+}
+
+/// Identifies the opencode session a Worker's Run drives.
+///
+/// The id jjfx recorded when it created or resumed the Run's session is exact
+/// and is preferred. Only when nothing was recorded - a session jjfx did not
+/// create - does this fall back to matching the Run's title against the
+/// sessions opencode reports as active. The fallback refuses to guess: an
+/// absent or ambiguous match yields `None`, and an unreachable API yields
+/// `None` rather than an error.
+pub(crate) fn run_session_id<R: OpenCodeRunner>(
+    api: &OpenCodeApi<R>,
+    recorded: Option<&str>,
+    title: Option<&str>,
+) -> Option<String> {
+    if let Some(session_id) = recorded.filter(|session_id| !session_id.is_empty()) {
+        return Some(session_id.to_owned());
+    }
+    let title = title.filter(|title| !title.is_empty())?;
+    match_active_session_by_title(api, title).ok().flatten()
+}
+
+/// Matches `title` against the sessions opencode reports as active, returning
+/// the id only for a single unambiguous match.
+///
+/// A title is not a unique identity: a retried Run reuses it, and a finished
+/// session keeps it. Restricting the match to active sessions keeps a stale
+/// session out, and refusing an ambiguous match means a Run is never stopped
+/// by a guess.
+pub(crate) fn match_active_session_by_title<R: OpenCodeRunner>(
+    api: &OpenCodeApi<R>,
+    title: &str,
+) -> Result<Option<String>, OpenCodeError> {
+    let active = api.active_sessions()?;
+    let mut matches = api
+        .list_sessions()?
+        .into_iter()
+        .filter(|session| session.title() == Some(title) && active.contains(session.id()))
+        .map(|session| session.id().to_owned());
+    match (matches.next(), matches.next()) {
+        (Some(session_id), None) => Ok(Some(session_id)),
+        _ => Ok(None),
+    }
+}
+
 /// Whether two directories name the same location, tolerating a symlinked or
 /// otherwise non-canonical spelling on either side.
 fn same_directory(left: &Path, right: &Path) -> bool {
@@ -508,6 +572,11 @@ struct SessionEnvelope {
 #[derive(Deserialize)]
 struct SessionsEnvelope {
     data: Vec<SessionInfo>,
+}
+
+#[derive(Deserialize)]
+struct ActiveSessionsEnvelope {
+    data: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1048,5 +1117,103 @@ mod tests {
         let session = create_run_session(&api, Path::new("/w"), None).expect("drives");
 
         assert_eq!(session.as_deref(), Some("ses_new"));
+    }
+
+    #[test]
+    fn active_sessions_maps_the_payload_onto_ids() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(
+            r#"{"data":{"ses_a":{"type":"running"},"ses_b":{"type":"running"}}}"#,
+        )]));
+
+        let active = api.active_sessions().expect("parses");
+
+        assert_eq!(api.runner.calls(), vec![vec!["api", "session.active"]]);
+        assert_eq!(
+            active,
+            BTreeSet::from(["ses_a".to_owned(), "ses_b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn run_session_id_prefers_the_recorded_id_without_asking_the_api() {
+        // No canned replies: any API call would panic, proving the exact id wins.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![]));
+
+        let session = run_session_id(&api, Some("ses_recorded"), Some("pool:worker-01:ENG-42"));
+
+        assert_eq!(session.as_deref(), Some("ses_recorded"));
+        assert!(api.runner.calls().is_empty());
+    }
+
+    #[test]
+    fn run_session_id_falls_back_to_a_unique_active_title_match() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(r#"{"data":{"ses_live":{"type":"running"}}}"#),
+            ok(&sessions_titled(&["ses_live"], "pool:worker-01:ENG-42")),
+        ]));
+
+        let session = run_session_id(&api, None, Some("pool:worker-01:ENG-42"));
+
+        assert_eq!(session.as_deref(), Some("ses_live"));
+    }
+
+    #[test]
+    fn run_session_id_ignores_a_title_match_that_is_not_active() {
+        // A finished session keeps its title; interrupting it would be a stale
+        // action, so a title match must also be active.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(r#"{"data":{}}"#),
+            ok(&sessions_titled(&["ses_stale"], "pool:worker-01:ENG-42")),
+        ]));
+
+        let session = run_session_id(&api, None, Some("pool:worker-01:ENG-42"));
+
+        assert_eq!(session, None);
+    }
+
+    #[test]
+    fn run_session_id_refuses_an_ambiguous_title_match() {
+        // A retried Run reuses the title: two active matches must never be
+        // resolved by a guess.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(r#"{"data":{"ses_one":{"type":"running"},"ses_two":{"type":"running"}}}"#),
+            ok(&sessions_titled(
+                &["ses_one", "ses_two"],
+                "pool:worker-01:ENG-42",
+            )),
+        ]));
+
+        let session = run_session_id(&api, None, Some("pool:worker-01:ENG-42"));
+
+        assert_eq!(session, None);
+    }
+
+    #[test]
+    fn run_session_id_yields_nothing_when_the_api_is_unavailable() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(1, "", "no server")]));
+
+        let session = run_session_id(&api, None, Some("pool:worker-01:ENG-42"));
+
+        assert_eq!(session, None);
+    }
+
+    #[test]
+    fn run_session_id_yields_nothing_without_a_recorded_id_or_title() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![]));
+
+        assert_eq!(run_session_id(&api, None, None), None);
+        assert_eq!(run_session_id(&api, Some(""), Some("")), None);
+        assert!(api.runner.calls().is_empty());
+    }
+
+    fn sessions_titled(ids: &[&str], title: &str) -> String {
+        let entries = ids
+            .iter()
+            .map(|id| {
+                format!(r#"{{"id":"{id}","title":"{title}","location":{{"directory":"/w"}}}}"#)
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        format!(r#"{{"data":[{entries}]}}"#)
     }
 }

@@ -49,6 +49,10 @@ const HELPER_PTY_SLAVE: &str = "WSG_AGENT_RUNTIME_HELPER_PTY_SLAVE";
 const HELPER_OPENCODE_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE";
 const HELPER_OPENCODE_GET_DIRECTORY: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY";
 const HELPER_OPENCODE_SESSION_ID: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_ID";
+const HELPER_OPENCODE_ACTION: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_ACTION";
+const HELPER_OPENCODE_INTERRUPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_INTERRUPT";
+const HELPER_OPENCODE_UNAVAILABLE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE";
+const HELPER_OPENCODE_OUTCOME: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME";
 
 #[test]
 fn pi_runtime_has_a_canonical_configured_and_persisted_identity() {
@@ -2190,6 +2194,310 @@ fn opencode_run_session_helper() {
             fs::write(result, format!("err {error}")).expect("result");
         }
     }
+}
+
+/// A fake `opencode` that serves the session API for the stop and liveness
+/// paths. `session.interrupt` records the session it was asked to stop;
+/// `session.get` reports the outcome named by `..._OPENCODE_OUTCOME` (none by
+/// default, so the session looks open); `session.active`/`session.list` serve
+/// the title guard. Any API call fails when `..._OPENCODE_UNAVAILABLE` is set.
+const OPENCODE_CONTROL_SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.0.29'; exit 0 ;;
+  api)
+    if [ -n "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE" ]; then
+      printf '%s\n' 'Error: Could not reach server' >&2
+      exit 1
+    fi
+    case "$2" in
+      session.get)
+        if [ -n "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME" ]; then
+          printf '{"data":{"id":"ses_test","outcome":"%s"}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME"
+        else
+          printf '{"data":{"id":"ses_test"}}'
+        fi
+        exit 0 ;;
+      session.active)
+        printf '{"data":%s}' "${WSG_AGENT_RUNTIME_HELPER_OPENCODE_ACTIVE:-{}}"
+        exit 0 ;;
+      session.list)
+        printf '{"data":%s}' "${WSG_AGENT_RUNTIME_HELPER_OPENCODE_LIST:-[]}"
+        exit 0 ;;
+      session.interrupt)
+        printf '%s' "$4" > "__INTERRUPT__"
+        printf '{"interrupted":true}'
+        exit 0 ;;
+    esac
+    exit 1 ;;
+esac
+exit 1
+"#;
+
+/// The repository, Worker, and paths the stop and liveness tests need.
+struct OpencodeControlFixture {
+    _temporary_directory: TempDir,
+    repository: Repository,
+    worker_id: WorkerId,
+    bin_directory: PathBuf,
+    result: PathBuf,
+    interrupt: PathBuf,
+}
+
+fn opencode_control_fixture() -> OpencodeControlFixture {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+    let bin_directory = temporary_directory.path().join("bin");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    OpencodeControlFixture {
+        result: temporary_directory.path().join("result"),
+        interrupt: temporary_directory.path().join("interrupt"),
+        _temporary_directory: temporary_directory,
+        repository,
+        worker_id,
+        bin_directory,
+    }
+}
+
+impl OpencodeControlFixture {
+    fn write_opencode(&self) {
+        write_executable(
+            &self.bin_directory.join("opencode"),
+            &OPENCODE_CONTROL_SCRIPT
+                .replace("__INTERRUPT__", &self.interrupt.display().to_string()),
+        );
+    }
+
+    /// Writes a busy Run for this Worker, so a stop or a reconciliation has
+    /// something to act on.
+    fn write_busy_worker(&self, agent: &str, pid: u32, ticket: &str) {
+        write_worker_json(
+            &worker_state_path(self.repository.root(), &self.worker_id),
+            serde_json::json!({
+                "status": "busy",
+                "agent": agent,
+                "ticket": ticket,
+                "pid": pid,
+                "started_at": "2026-07-30T10:00:00Z",
+                "completed_at": Value::Null,
+                "log_file": "/repo/.jj/pool/worker.log",
+                "branch_name": ticket.to_lowercase(),
+                "exit_code": Value::Null,
+                "error": Value::Null
+            }),
+        );
+    }
+
+    /// Records the session the Worker's Run drives, as ticket 38 would.
+    fn record_session(&self, session_id: &str) {
+        self.repository
+            .state_store()
+            .sessions()
+            .record(&self.worker_id, session_id)
+            .expect("record session");
+    }
+
+    fn run_helper(&self, action: &str) -> std::process::Output {
+        self.run_helper_with(action, &[])
+    }
+
+    fn run_helper_with(&self, action: &str, extra: &[(&str, &str)]) -> std::process::Output {
+        let mut helper = Command::new(env::current_exe().expect("test executable"));
+        helper
+            .args(["--exact", "opencode_control_helper", "--ignored"])
+            .env("PATH", runtime_path(&self.bin_directory))
+            .env(HELPER_OPENCODE_ACTION, action)
+            .env(HELPER_REPOSITORY, self.repository.root())
+            .env(HELPER_WORKER, self.worker_id.as_str())
+            .env(HELPER_RESULT, &self.result)
+            .env(HELPER_OPENCODE_INTERRUPT, &self.interrupt)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (key, value) in extra {
+            helper.env(key, value);
+        }
+        helper.output().expect("opencode control helper should run")
+    }
+}
+
+/// Stops a Worker or reconciles its Run in a process whose `PATH` carries the
+/// fake `opencode`, so the API seam is exercised without a live server.
+#[test]
+#[ignore]
+fn opencode_control_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let result = env::var_os(HELPER_RESULT).expect("result path");
+    let outcome = match env::var(HELPER_OPENCODE_ACTION).as_deref() {
+        Ok("reset") => match RunSupervisor::new().reset_run(&repository, &worker_id) {
+            Ok(RunReset::Abandoned { terminated_pid }) => format!("abandoned {terminated_pid:?}"),
+            Ok(other) => format!("{other:?}"),
+            Err(error) => format!("err {error}"),
+        },
+        Ok("reconcile") => {
+            let snapshot = repository.worker_pool().reconcile_runs();
+            let worker = snapshot
+                .worker(worker_id.as_str())
+                .expect("reconciled Worker");
+            format!("{:?}", worker.status())
+        }
+        other => panic!("unknown opencode control action {other:?}"),
+    };
+    fs::write(result, outcome).expect("result");
+}
+
+/// Stopping an opencode Worker interrupts the session recorded for it instead
+/// of signalling the client process.
+#[test]
+fn reset_run_interrupts_an_opencode_run_through_the_daemon() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    let mut leader = spawn_group_leader();
+    let pid = leader.id();
+    fixture.write_busy_worker("opencode", pid, "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("reset");
+    let reset = fs::read_to_string(&fixture.result).expect("helper result");
+    let leader_alive = test_kill_process(unix_pid(pid)).is_ok();
+    if leader_alive {
+        let _ = kill_process(unix_pid(pid), Signal::KILL);
+    }
+    let _ = leader.wait();
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The stop went to the daemon session, not the client's process group.
+    assert_eq!(reset, "abandoned None");
+    assert_eq!(
+        fs::read_to_string(&fixture.interrupt).expect("recorded interrupt"),
+        "sessionID=ses_run"
+    );
+    assert!(
+        leader_alive,
+        "a daemon interrupt is the stop; the client process must not be signalled"
+    );
+    let snapshot = fixture.repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(fixture.worker_id.as_str())
+        .expect("reset Worker");
+    assert_eq!(worker.status(), WorkerStatus::Idle);
+}
+
+/// When the session API is unreachable, stopping an opencode Worker falls back
+/// to the process-group signal that still owns the client.
+#[test]
+fn reset_run_falls_back_to_the_process_group_when_the_session_api_is_unavailable() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    let mut leader = spawn_group_leader();
+    let pid = leader.id();
+    // Reap the leader as soon as the signal kills it: a zombie keeps its
+    // process group alive, and the fallback signal waits for the group to go.
+    let reaper = thread::spawn(move || {
+        let _ = leader.wait();
+    });
+    fixture.write_busy_worker("opencode", pid, "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper_with("reset", &[(HELPER_OPENCODE_UNAVAILABLE, "1")]);
+    let reset = fs::read_to_string(&fixture.result).expect("helper result");
+    let group_gone = test_kill_process_group(unix_pid(pid)).is_err();
+    if !group_gone {
+        let _ = kill_process_group(unix_pid(pid), Signal::KILL);
+    }
+    let _ = reaper.join();
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(reset, format!("abandoned Some({pid})"));
+    assert!(
+        group_gone,
+        "an unavailable API must fall back to the Run's process group"
+    );
+    assert!(
+        !fixture.interrupt.exists(),
+        "an unavailable API must not have interrupted a session"
+    );
+}
+
+/// A Worker whose opencode session is still open is not finished, even though
+/// its recorded client pid is already gone.
+#[test]
+fn reconcile_runs_keeps_a_busy_opencode_worker_busy_while_its_session_runs() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("opencode", dead_pid(), "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("reconcile");
+    let status = fs::read_to_string(&fixture.result).expect("helper result");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        status, "Busy",
+        "a Run whose session is still open must stay busy"
+    );
+}
+
+/// A Worker is finished on its session's outcome even while its client pid is
+/// still alive: the pid is only a daemon client.
+#[test]
+fn reconcile_runs_finishes_a_busy_opencode_worker_on_its_session_outcome() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    let mut leader = spawn_group_leader();
+    let pid = leader.id();
+    fixture.write_busy_worker("opencode", pid, "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper_with("reconcile", &[(HELPER_OPENCODE_OUTCOME, "succeeded")]);
+    let status = fs::read_to_string(&fixture.result).expect("helper result");
+    let leader_alive = test_kill_process(unix_pid(pid)).is_ok();
+    if leader_alive {
+        let _ = kill_process(unix_pid(pid), Signal::KILL);
+    }
+    let _ = leader.wait();
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        status, "Done",
+        "a session with an outcome must finish the Run"
+    );
+}
+
+/// Spawns a live process that leads its own process group, standing in for the
+/// client a background Run records.
+fn spawn_group_leader() -> Child {
+    Command::new("sleep")
+        .arg("30")
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("group leader helper process")
 }
 
 #[test]

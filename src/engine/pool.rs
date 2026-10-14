@@ -10,8 +10,9 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
-    PoolState, Repository, RunConclusion, RunResult, StateChange, StateError, StateRevision,
-    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
+    PoolState, Repository, RunConclusion, RunResult, RunResultSource, SessionOutcome, StateChange,
+    StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
+    WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -134,6 +135,7 @@ pub(crate) enum RunFinalization {
 /// apart from "a different Run now owns this Worker".
 pub(crate) struct RunTarget {
     revision: StateRevision<WorkerState>,
+    runtime: Option<AgentRuntime>,
     pid: Option<i64>,
     ticket: Option<String>,
     started_at: Option<WireTimestamp>,
@@ -144,11 +146,20 @@ impl RunTarget {
     fn new(state: &WorkerState, revision: StateRevision<WorkerState>) -> Self {
         Self {
             revision,
+            runtime: state.agent.as_ref().and_then(AgentRuntime::parse),
             pid: state.pid,
             ticket: state.ticket.clone(),
             started_at: state.started_at.clone(),
             log_file: state.log_file.clone(),
         }
+    }
+
+    pub(crate) fn runtime(&self) -> Option<AgentRuntime> {
+        self.runtime
+    }
+
+    pub(crate) fn ticket(&self) -> Option<&str> {
+        self.ticket.as_deref()
     }
 
     pub(crate) fn pid(&self) -> Option<u32> {
@@ -353,38 +364,39 @@ impl WorkerPool {
             Loaded::Missing => return Ok(()),
             Loaded::Present(versioned) => versioned,
         };
-        let Some(pid) = loaded.value.pid else {
-            return Ok(());
-        };
-        // The recorded PID is a liveness hint, so the Run counts as live only
-        // when it still leads its process group. A recycled PID that does not
-        // lead a group must not keep this Worker `busy` forever.
-        let run_is_live = u32::try_from(pid)
-            .ok()
-            .and_then(crate::engine::runtime::live_process_group_leader)
-            .is_some();
-        if loaded.value.status.as_str() != "busy" || run_is_live {
+        if loaded.value.status.as_str() != "busy" {
             return Ok(());
         }
+        let runtime = loaded.value.agent.as_ref().and_then(AgentRuntime::parse);
+        let result = if runtime == Some(AgentRuntime::OpenCode) {
+            // An opencode Run's recorded PID is only a daemon client, so it
+            // says nothing about whether the work is done: the Run is finished
+            // when its session has an outcome, or its log has a result.
+            match self.opencode_run_result(worker, &loaded.value) {
+                Some(result) => result,
+                // Still running, or its session cannot be told apart from a
+                // live one: never call the Worker finished on a guess.
+                None => return Ok(()),
+            }
+        } else {
+            let Some(pid) = loaded.value.pid else {
+                return Ok(());
+            };
+            // The recorded PID is a liveness hint, so the Run counts as live
+            // only when it still leads its process group. A recycled PID that
+            // does not lead a group must not keep this Worker `busy` forever.
+            let run_is_live = u32::try_from(pid)
+                .ok()
+                .and_then(crate::engine::runtime::live_process_group_leader)
+                .is_some();
+            if run_is_live {
+                return Ok(());
+            }
+            run_log_finalization(&loaded.value, runtime).0
+        };
 
         let revision = loaded.revision().clone();
         let mut state = loaded.value;
-        let result = state
-            .agent
-            .as_ref()
-            .and_then(AgentRuntime::parse)
-            .zip(state.log_file.as_deref())
-            .map_or_else(
-                || {
-                    crate::engine::run_log::unexpected_result(
-                        crate::engine::RunResultFallback::MissingTerminalEvent,
-                    )
-                },
-                |(runtime, path)| {
-                    crate::engine::run_log::result_for_finalization(Path::new(path), runtime)
-                },
-            )
-            .0;
         apply_run_result(&mut state, &result)?;
         match repository.commit(Expected::Match(revision), StateChange::Replace(state)) {
             Ok(CommitOutcome::Applied(_)) | Ok(CommitOutcome::Conflict(_)) => Ok(()),
@@ -392,6 +404,68 @@ impl WorkerPool {
                 worker: worker.clone(),
                 source,
             }),
+        }
+    }
+
+    /// The result an opencode Run finished with, or `None` while its session is
+    /// still running or cannot be consulted.
+    ///
+    /// The Run's work lives in the shared daemon, so the Run is finished only
+    /// on positive evidence: the session reports an `outcome`, or - when the
+    /// session cannot be read - the Run log has a provider terminal result.
+    /// Anything else leaves the Worker `busy`, because a thin client that has
+    /// exited says nothing about the work.
+    fn opencode_run_result(&self, worker: &WorkerId, state: &WorkerState) -> Option<RunResult> {
+        match self.opencode_session_state(worker, state) {
+            // A session that is still open says the Run is still going, so the
+            // Run log is not even read.
+            RunSessionState::Running => None,
+            RunSessionState::Finished(outcome) => {
+                let (log_result, log_source) =
+                    run_log_finalization(state, Some(AgentRuntime::OpenCode));
+                Some(match log_source {
+                    // A provider terminal event carries more detail than the
+                    // bare outcome, so prefer it when the log has one.
+                    RunResultSource::Provider => log_result,
+                    RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
+                })
+            }
+            RunSessionState::Unavailable => {
+                let (log_result, log_source) =
+                    run_log_finalization(state, Some(AgentRuntime::OpenCode));
+                matches!(log_source, RunResultSource::Provider).then_some(log_result)
+            }
+        }
+    }
+
+    /// Consults the session the Worker's opencode Run drives.
+    fn opencode_session_state(&self, worker: &WorkerId, state: &WorkerState) -> RunSessionState {
+        let api = crate::engine::OpenCodeApi::new();
+        let recorded = self
+            .repository
+            .state_store()
+            .sessions()
+            .session(worker)
+            .ok()
+            .flatten();
+        let title = state
+            .ticket
+            .as_deref()
+            .filter(|ticket| !ticket.is_empty())
+            .map(|ticket| crate::engine::opencode_api::run_session_title(worker, ticket));
+        let Some(session_id) = crate::engine::opencode_api::run_session_id(
+            &api,
+            recorded.as_deref(),
+            title.as_deref(),
+        ) else {
+            return RunSessionState::Unavailable;
+        };
+        match api.get_session(&session_id) {
+            Ok(session) => match session.outcome() {
+                Some(outcome) => RunSessionState::Finished(outcome.clone()),
+                None => RunSessionState::Running,
+            },
+            Err(_) => RunSessionState::Unavailable,
         }
     }
 
@@ -1069,8 +1143,8 @@ impl WorkerPool {
             };
             match status {
                 crate::engine::state::DetachedCleanupStatus::Busy { pid: Some(pid) } => {
-                    if let Err(error) =
-                        crate::engine::RunSupervisor::new().terminate_recorded_process(pid)
+                    if let Err(error) = crate::engine::RunSupervisor::new()
+                        .terminate_recorded_process(&self.repository, worker, pid)
                     {
                         residual.push(worker.clone());
                         failures.push(format!(
@@ -1407,6 +1481,45 @@ fn clear_run_fields(state: &mut WorkerState) {
     state.branch_name = None;
     state.exit_code = None;
     state.error = None;
+}
+
+/// What a Worker's opencode session says about its Run.
+enum RunSessionState {
+    /// The session has no outcome yet, so its Run is still executing.
+    Running,
+    /// The session finished with this outcome.
+    Finished(SessionOutcome),
+    /// The session could not be identified or read.
+    Unavailable,
+}
+
+/// The terminal result a Run log provides, or the compatible unexpected-exit
+/// fallback when the log cannot provide one.
+fn run_log_finalization(
+    state: &WorkerState,
+    runtime: Option<AgentRuntime>,
+) -> (RunResult, RunResultSource) {
+    runtime.zip(state.log_file.as_deref()).map_or_else(
+        || {
+            crate::engine::run_log::unexpected_result(
+                crate::engine::RunResultFallback::MissingTerminalEvent,
+            )
+        },
+        |(runtime, path)| crate::engine::run_log::result_for_finalization(Path::new(path), runtime),
+    )
+}
+
+/// The result implied by a session `outcome`, used when the Run log carries no
+/// provider terminal event of its own.
+fn opencode_outcome_result(outcome: &SessionOutcome) -> RunResult {
+    match outcome {
+        SessionOutcome::Succeeded => RunResult::succeeded(),
+        SessionOutcome::Failed => RunResult::failed("OpenCode session failed"),
+        SessionOutcome::Interrupted => RunResult::failed("OpenCode session interrupted"),
+        SessionOutcome::Unknown(outcome) => {
+            RunResult::failed(format!("OpenCode session ended: {outcome}"))
+        }
+    }
 }
 
 fn apply_run_result(state: &mut WorkerState, result: &RunResult) -> Result<(), WorkerPoolError> {

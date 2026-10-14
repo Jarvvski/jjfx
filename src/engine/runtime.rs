@@ -681,7 +681,33 @@ impl RunSupervisor {
         let Some(target) = pool.run_target(worker).map_err(reset)? else {
             return Ok(RunReset::AlreadyIdle);
         };
-        let terminated_pid = match target.pid().and_then(live_process_group_leader) {
+        let terminated_pid = self.stop_run(repository, worker, &target)?;
+        match pool.clear_run(worker, target).map_err(reset)? {
+            RunClearing::Cleared => Ok(RunReset::Abandoned { terminated_pid }),
+            RunClearing::AlreadyIdle => Ok(RunReset::AlreadyIdle),
+            RunClearing::Superseded => Ok(RunReset::Superseded),
+        }
+    }
+
+    /// Ends a Run's work, returning the process group that was terminated.
+    ///
+    /// An opencode Run's work runs in the shared daemon, not in the process
+    /// jjfx spawned, so it is stopped through its session - signalling the
+    /// client would leave the work running. Every other runtime owns its work,
+    /// and pid/process-group signalling is also the fallback when the daemon
+    /// cannot be reached or an older opencode lacks the route.
+    fn stop_run(
+        &self,
+        repository: &Repository,
+        worker: &WorkerId,
+        target: &crate::engine::pool::RunTarget,
+    ) -> Result<Option<u32>, RunSupervisorError> {
+        if target.runtime() == Some(AgentRuntime::OpenCode)
+            && interrupt_opencode_run(repository, worker, target.ticket())
+        {
+            return Ok(None);
+        }
+        match target.pid().and_then(live_process_group_leader) {
             Some(pid) => {
                 terminate_process_group(pid, PROCESS_GROUP_GRACE).map_err(|source| {
                     RunSupervisorError::ResetCleanup {
@@ -690,22 +716,27 @@ impl RunSupervisor {
                         source,
                     }
                 })?;
-                Some(pid.as_raw_nonzero().get().unsigned_abs())
+                Ok(Some(pid.as_raw_nonzero().get().unsigned_abs()))
             }
-            None => None,
-        };
-        match pool.clear_run(worker, target).map_err(reset)? {
-            RunClearing::Cleared => Ok(RunReset::Abandoned { terminated_pid }),
-            RunClearing::AlreadyIdle => Ok(RunReset::AlreadyIdle),
-            RunClearing::Superseded => Ok(RunReset::Superseded),
+            None => Ok(None),
         }
     }
 
     /// Terminates a persisted background Run without changing Worker state.
     ///
     /// Pool destruction uses this after atomically detaching membership. No
-    /// state lock is held while the process group is signaled.
-    pub(crate) fn terminate_recorded_process(&self, pid: u32) -> io::Result<()> {
+    /// state lock is held while the process group is signaled. An opencode
+    /// Run's work is stopped through its session first, because its recorded
+    /// pid is only a daemon client.
+    pub(crate) fn terminate_recorded_process(
+        &self,
+        repository: &Repository,
+        worker: &WorkerId,
+        pid: u32,
+    ) -> io::Result<()> {
+        if interrupt_opencode_run(repository, worker, None) {
+            return Ok(());
+        }
         // Only a live process-group leader is a Run to signal. A recycled PID
         // that does not lead a group has no group with that id, so this returns
         // without signalling anything.
@@ -1178,6 +1209,35 @@ fn terminate_foreground_run(child: &mut Child) -> io::Result<()> {
 /// Converts a recorded PID to a process-group id, or `None` when it cannot be one.
 fn recorded_pid(raw: u32) -> Option<Pid> {
     i32::try_from(raw).ok().and_then(Pid::from_raw)
+}
+
+/// Stops an opencode Run through its daemon session, reporting whether the
+/// daemon confirmed it interrupted an active execution.
+///
+/// Best-effort throughout: an unreachable or older opencode, an unidentified
+/// session, or a session that is not executing all report `false`, so the
+/// caller falls back to pid/process-group signalling rather than failing.
+fn interrupt_opencode_run(
+    repository: &Repository,
+    worker: &WorkerId,
+    ticket: Option<&str>,
+) -> bool {
+    let api = crate::engine::OpenCodeApi::new();
+    let recorded = repository
+        .state_store()
+        .sessions()
+        .session(worker)
+        .ok()
+        .flatten();
+    let title = ticket
+        .filter(|ticket| !ticket.is_empty())
+        .map(|ticket| crate::engine::opencode_api::run_session_title(worker, ticket));
+    let Some(session_id) =
+        crate::engine::opencode_api::run_session_id(&api, recorded.as_deref(), title.as_deref())
+    else {
+        return false;
+    };
+    matches!(api.interrupt_session(&session_id), Ok(true))
 }
 
 /// Returns the process group for `pid` only when `pid` is a live process-group
