@@ -105,10 +105,17 @@ Consequences for this ticket and for 20:
   teardown (`terminate_recorded_process`, `reset_run`) track a client, not the Run.
 - A durable Run identity therefore has to account for the recorded process possibly
   not owning the work.
-- `opencode run --standalone` makes the run process host its own server, so the
-  spawned process owns the work and pid/process-group teardown becomes meaningful.
-  Cost: one server per Run instead of one shared. Caveat: confirm the flag exists in
-  every opencode version jjfx supports before relying on it.
+- `opencode run --standalone` would make the run process host its own server, so the
+  spawned process would own the work and pid/process-group teardown would become
+  meaningful. **Owner decision (2026-10-14): do not adopt it.** One server per Run
+  multiplies CPU load across a pool, and a single shared server is preferred. So the
+  shared-daemon invocation stays exactly as it is.
+
+  Consequence: stopping a Run's work remains an **open problem** - the recorded pid
+  is a daemon client, so signalling it does not stop the work. Solving that needs a
+  different mechanism (e.g. asking the daemon to stop the session), and it is not in
+  scope for this ticket. C4/C7's process-group work still stands on its own: it makes
+  jjfx's own process tree (and any non-daemon runtime) correctly owned and killable.
 
 Verified 2026-10-14 on opencode 2.0.27: the session *directory* honours the process
 cwd in both modes, so this is about process ownership and teardown, not about the
