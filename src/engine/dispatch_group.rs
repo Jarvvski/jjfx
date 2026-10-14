@@ -25,7 +25,13 @@ pub enum SubIssueStatus {
     Done,
     /// Exhausted its retry policy after a failed Run.
     Failed,
-    /// Excluded from execution, including already delivered or cross-repository work.
+    /// Excluded from execution, including already delivered or cross-repository
+    /// work.
+    ///
+    /// Work jjfx must not dispatch is also persisted as `skipped`: in-flight work
+    /// owned outside jjfx (`In Progress`, `In Review`) and terminal work that was
+    /// never delivered (`Canceled`, `Duplicate`). Neither has been completed, so
+    /// neither satisfies downstream Dependencies - only a delivered skip does.
     Skipped,
 }
 
@@ -49,11 +55,6 @@ impl SubIssueStatus {
     /// Returns whether the status is terminal.
     pub const fn is_terminal(self) -> bool {
         !self.is_active()
-    }
-
-    /// Returns whether the status satisfies a downstream dependency.
-    pub const fn unblocks(self) -> bool {
-        matches!(self, Self::Done | Self::Skipped)
     }
 }
 
@@ -476,7 +477,7 @@ impl DispatchGroup {
                         self.state
                             .sub_issues
                             .get(blocker)
-                            .is_none_or(|dependency| status_of(dependency).unblocks())
+                            .is_none_or(satisfies_dependency)
                     }))
                 .then_some(id.clone())
             })
@@ -557,9 +558,11 @@ impl DispatchGroup {
     /// Counts Pending Sub-issues that can never become ready.
     ///
     /// A Pending Sub-issue is reachable when every direct Blocker is reachable:
-    /// `Done`/`Skipped` satisfy a dependency, `Dispatched` is in flight, and
-    /// `Failed` never satisfies. Unreachable Pending Sub-issues - including any
-    /// caught in a cycle - are reported as blocked.
+    /// `Done` and delivered/cross-repository `Skipped` Blockers satisfy a
+    /// dependency, `Dispatched` is in flight, and `Failed` and non-delivered
+    /// `Skipped` Blockers (in-flight or terminal without delivery) never satisfy
+    /// it. Unreachable Pending Sub-issues - including any caught in a cycle - are
+    /// reported as blocked.
     fn blocked_count(&self) -> usize {
         let mut reachable: BTreeSet<TicketId> = self
             .state
@@ -568,8 +571,8 @@ impl DispatchGroup {
             .filter(|(_, issue)| {
                 matches!(
                     status_of(issue),
-                    SubIssueStatus::Done | SubIssueStatus::Skipped | SubIssueStatus::Dispatched
-                )
+                    SubIssueStatus::Done | SubIssueStatus::Dispatched
+                ) || is_delivered_skip(issue)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -662,9 +665,7 @@ impl DispatchGroup {
             .state
             .sub_issues
             .iter()
-            .filter_map(|(id, issue)| {
-                (status_of(issue) == SubIssueStatus::Skipped).then_some(id.clone())
-            })
+            .filter_map(|(id, issue)| is_delivered_skip(issue).then_some(id.clone()))
             .collect::<std::collections::BTreeSet<_>>();
         let mut maximum = 0;
         loop {
@@ -673,7 +674,7 @@ impl DispatchGroup {
                 .sub_issues
                 .iter()
                 .filter_map(|(id, issue)| {
-                    if resolved.contains(id) || status_of(issue) == SubIssueStatus::Skipped {
+                    if resolved.contains(id) || is_delivered_skip(issue) {
                         return None;
                     }
                     issue
@@ -694,9 +695,9 @@ impl DispatchGroup {
 
     /// Returns the longest-path wave depth of every Sub-issue.
     ///
-    /// Skipped Sub-issues are wave 0, and a Sub-issue whose direct Blockers are
-    /// all skipped or absent is wave 1. Cycles cannot occur because construction
-    /// rejects them.
+    /// Delivered and cross-repository Skipped Sub-issues are wave 0, and a
+    /// Sub-issue whose direct Blockers are all resolved or absent is wave 1.
+    /// Cycles cannot occur because construction rejects them.
     pub fn waves(&self) -> BTreeMap<TicketId, usize> {
         let mut waves = BTreeMap::new();
         for ticket in self.state.sub_issues.keys() {
@@ -721,7 +722,7 @@ impl DispatchGroup {
         let Some(issue) = self.state.sub_issues.get(ticket) else {
             return 0;
         };
-        let wave = if status_of(issue) == SubIssueStatus::Skipped {
+        let wave = if is_delivered_skip(issue) {
             0
         } else {
             issue
@@ -873,6 +874,47 @@ fn is_merged_status(status: &str) -> bool {
     matches!(status.to_ascii_lowercase().as_str(), "merged" | "done")
 }
 
+/// Returns whether a Sub-issue satisfies the Dependency relationship of its
+/// dependents.
+///
+/// `Done` always satisfies. `Skipped` satisfies only when the work is already
+/// delivered (`merged`) or owned by another repository (`cross-repo`). A
+/// Sub-issue skipped because its Linear status is in flight (`In Progress`,
+/// `In Review`) or terminal without delivery (`Canceled`, `Duplicate`) was never
+/// completed, so it must not unblock its dependents even though jjfx never
+/// dispatches it.
+fn satisfies_dependency(issue: &SubIssueState) -> bool {
+    status_of(issue) == SubIssueStatus::Done || is_delivered_skip(issue)
+}
+
+/// Returns whether a Sub-issue was skipped for already delivered or
+/// cross-repository work rather than because it is in flight or terminally
+/// undelivered.
+///
+/// The compatible wire vocabulary is frozen at five Sub-issue statuses, so a
+/// Dependency jjfx must not dispatch is persisted as `skipped`; its `skip_reason`
+/// is what separates a delivered skip from one that still blocks its dependents.
+fn is_delivered_skip(issue: &SubIssueState) -> bool {
+    status_of(issue) == SubIssueStatus::Skipped
+        && is_delivered_skip_reason(issue.skip_reason.as_deref())
+}
+
+/// Returns whether a persisted `skip_reason` records delivered or
+/// cross-repository work.
+///
+/// Only `cross-repo` and merged/done statuses count as delivered. Every other
+/// reason - an in-flight status such as `In Progress`, or a terminal status that
+/// was never delivered such as `Canceled` or `Duplicate` - leaves the Sub-issue
+/// blocking its dependents. A missing reason comes from compatible state that
+/// predates this distinction and keeps the historic "a skipped Sub-issue
+/// satisfies its dependents" behaviour.
+fn is_delivered_skip_reason(reason: Option<&str>) -> bool {
+    match reason {
+        Some(reason) => reason.eq_ignore_ascii_case("cross-repo") || is_merged_status(reason),
+        None => true,
+    }
+}
+
 /// A pure Dispatch Group construction or transition error.
 #[derive(Debug, Error)]
 pub enum DispatchGroupError {
@@ -890,5 +932,47 @@ pub enum DispatchGroupError {
 impl fmt::Display for SubIssueStatus {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delivered_skip_reasons_are_cross_repository_merged_and_legacy_absent() {
+        for delivered in [
+            "cross-repo",
+            "Cross-Repo",
+            "merged",
+            "Merged",
+            "done",
+            "Done",
+        ] {
+            assert!(
+                is_delivered_skip_reason(Some(delivered)),
+                "{delivered:?} records delivered or cross-repository work"
+            );
+        }
+        assert!(
+            is_delivered_skip_reason(None),
+            "a missing reason predates the distinction and keeps satisfying its dependents"
+        );
+    }
+
+    #[test]
+    fn in_flight_and_terminal_undelivered_skip_reasons_do_not_count_as_delivered() {
+        for undelivered in [
+            "In Progress",
+            "In Review",
+            "Canceled",
+            "Cancelled",
+            "Duplicate",
+        ] {
+            assert!(
+                !is_delivered_skip_reason(Some(undelivered)),
+                "{undelivered:?} was never delivered, so it blocks its dependents"
+            );
+        }
     }
 }

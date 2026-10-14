@@ -297,7 +297,10 @@ fn ready_selection_waits_for_every_blocker_in_a_chain_and_diamond() {
 }
 
 #[test]
-fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_blocking() {
+fn ready_selection_treats_delivered_skipped_blockers_as_satisfied_but_failed_blockers_as_blocking()
+{
+    // Only a *delivered* skip (a `Merged` prerequisite) satisfies a dependent; an
+    // in-flight or terminal-undelivered skip blocks, which the tests below pin.
     let skipped = group_from_response(
         r#"{"sub_issues":[{"id":"ENG-101","title":"Merged","status":"Merged","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Ready","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
     );
@@ -321,6 +324,92 @@ fn ready_selection_treats_skipped_blockers_as_satisfied_but_failed_blockers_as_b
     );
     let failed = DispatchGroup::from_state(failed_state).expect("Dispatch Group");
     assert!(failed.ready().is_empty());
+}
+
+#[test]
+fn an_in_flight_blocker_does_not_unblock_its_dependent() {
+    let in_flight = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"In progress","status":"In Progress","blocked_by":[],"cross_repo":false},{"id":"ENG-102","title":"Dependent","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    assert!(
+        in_flight.ready().is_empty(),
+        "an in-flight Dependency has not been completed, so its dependent is not ready"
+    );
+    assert!(
+        in_flight.is_terminal(),
+        "a group stalled on an in-flight Dependency is quiescent"
+    );
+    assert_eq!(
+        in_flight.status_counts().blocked(),
+        1,
+        "the stall is visible: the dependent can never become ready"
+    );
+
+    let delivered = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Cross repository","status":"Todo","blocked_by":[],"cross_repo":true},{"id":"ENG-102","title":"Dependent","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
+    );
+    assert_eq!(
+        delivered.ready(),
+        [TicketId::parse("ENG-102").expect("Ticket")],
+        "cross-repository work is already delivered and still satisfies its Dependencies"
+    );
+}
+
+#[test]
+fn a_skipped_blocker_without_a_reason_keeps_satisfying_its_dependents() {
+    // Compatible state written before the delivered/in-flight distinction omits
+    // `skip_reason`; it keeps the historic "a skipped Sub-issue satisfies its
+    // dependents" behaviour.
+    let mut legacy = state();
+    legacy.sub_issues.insert(
+        TicketId::parse("ENG-101").expect("Ticket"),
+        SubIssueState::new("Legacy skip", WireStatus::new("skipped"), Vec::new()),
+    );
+    legacy.sub_issues.insert(
+        TicketId::parse("ENG-102").expect("Ticket"),
+        SubIssueState::new(
+            "Dependent",
+            WireStatus::new("pending"),
+            vec![TicketId::parse("ENG-101").expect("Ticket")],
+        ),
+    );
+    let group = DispatchGroup::from_state(legacy).expect("legacy group");
+    assert_eq!(
+        group.ready(),
+        [TicketId::parse("ENG-102").expect("Ticket")],
+        "a reason-less skip predates the distinction and still satisfies its dependents"
+    );
+    assert_eq!(group.status_counts().blocked(), 0);
+}
+
+#[test]
+fn a_terminal_undelivered_blocker_blocks_its_dependent_and_stalls_the_group() {
+    // `Canceled` and `Duplicate` are neither dispatchable nor merged/done nor
+    // cross-repository, so they are persisted as `skipped` with their raw status
+    // as the reason. They were never delivered, so - like `Failed` - they block
+    // their dependents and leave a quiescent, visible stall.
+    for terminal in ["Canceled", "Duplicate"] {
+        let response = format!(
+            r#"{{"sub_issues":[{{"id":"ENG-101","title":"{terminal}","status":"{terminal}","blocked_by":[],"cross_repo":false}},{{"id":"ENG-102","title":"Dependent","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}}]}}"#
+        );
+        let group = group_from_response(&response);
+        let blocker = &group.state().sub_issues[&TicketId::parse("ENG-101").expect("Ticket")];
+        assert_eq!(blocker.status.as_str(), "skipped");
+        assert_eq!(blocker.skip_reason.as_deref(), Some(terminal));
+        assert!(
+            group.ready().is_empty(),
+            "a {terminal} prerequisite was never delivered, so it blocks its dependent"
+        );
+        assert!(
+            group.is_terminal(),
+            "a group stalled on a {terminal} prerequisite is quiescent"
+        );
+        assert_eq!(
+            group.status_counts().blocked(),
+            1,
+            "the {terminal} stall is visible: the dependent can never become ready"
+        );
+    }
 }
 
 #[test]
