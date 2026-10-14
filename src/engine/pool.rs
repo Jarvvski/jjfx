@@ -343,11 +343,29 @@ impl WorkerPool {
         let before = self.snapshot();
         let mut diagnostics = Vec::new();
         for worker in before.workers() {
-            if let Err(error) = self.reconcile_worker(worker.worker_id()) {
+            let worker_id = worker.worker_id();
+            // A Pool member whose Worker Workspace directory is gone can never
+            // run: `prepare_for_dispatch` refuses it. Report that rather than let
+            // it pass for a healthy idle Worker, so a frontend can say so and an
+            // operator can dismiss it.
+            let workspace =
+                crate::engine::workspace::worker_path(self.repository.root(), worker_id);
+            if !workspace.is_dir() {
+                diagnostics.push(diagnostic(
+                    self.repository.root(),
+                    SnapshotDiagnosticKind::MissingWorkspace,
+                    Some(worker_id.clone()),
+                    format!(
+                        "Worker {worker_id} Workspace is missing at {}",
+                        workspace.display()
+                    ),
+                ));
+            }
+            if let Err(error) = self.reconcile_worker(worker_id) {
                 diagnostics.push(diagnostic(
                     self.repository.root(),
                     SnapshotDiagnosticKind::ReconciliationFailed,
-                    Some(worker.worker_id().clone()),
+                    Some(worker_id.clone()),
                     error,
                 ));
             }
@@ -1734,6 +1752,8 @@ pub enum SnapshotDiagnosticKind {
     MalformedPool,
     MissingWorker,
     MalformedWorker,
+    /// A Pool member whose Worker Workspace directory is absent.
+    MissingWorkspace,
     ReconciliationFailed,
 }
 

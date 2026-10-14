@@ -1,7 +1,7 @@
 use std::env;
 use std::fs;
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -158,6 +158,27 @@ fn local_repository_with_origin() -> (TempDir, Repository) {
     (temporary_directory, repository)
 }
 
+/// The Worker Workspace path the base-directory convention derives for `worker`.
+fn worker_workspace(root: &Path, worker: &str) -> PathBuf {
+    root.parent().expect("repository parent").join(format!(
+        "{}-workspaces/{worker}",
+        root.file_name().expect("repository name").to_string_lossy()
+    ))
+}
+
+/// Create the Worker Workspaces a provisioned Pool member is expected to have.
+///
+/// A real Pool - Go-created or jjfx-created - keeps each Worker Workspace beside
+/// the repository (`JJ_WS_DIR`, else `<repo>-workspaces/<worker>`; the Go tool
+/// uses the same convention). Reconciliation reports a member whose directory is
+/// absent as a missing Workspace, so a Pool fixture that means "provisioned"
+/// must lay them down.
+fn provision_workspaces(root: &Path, workers: &[&str]) {
+    for worker in workers {
+        fs::create_dir_all(worker_workspace(root, worker)).expect("Worker Workspace");
+    }
+}
+
 fn go_repository_with_pool() -> (TempDir, Repository) {
     let (temp, repository) = local_repository_with_origin();
     let pool = temp.path().join(".jj/pool");
@@ -167,14 +188,16 @@ fn go_repository_with_pool() -> (TempDir, Repository) {
         fixture("pool-workers.json"),
     )
     .expect("pool state");
-    for (id, name) in [
+    let members = [
         ("worker-01", "worker-idle-claude.json"),
         ("worker-02", "worker-busy-claude.json"),
         ("worker-03", "worker-done-codex.json"),
         ("worker-04", "worker-failed-codex.json"),
-    ] {
+    ];
+    for (id, name) in members {
         fs::write(pool.join(format!("{id}.json")), fixture(name)).expect("Worker state");
     }
+    provision_workspaces(temp.path(), &members.map(|(id, _)| id));
     (temp, repository)
 }
 
@@ -187,14 +210,16 @@ fn repository_with_pool() -> (TempDir, Repository) {
         fixture("pool-workers.json"),
     )
     .expect("pool state");
-    for (id, name) in [
+    let members = [
         ("worker-01", "worker-idle-claude.json"),
         ("worker-02", "worker-busy-claude.json"),
         ("worker-03", "worker-done-codex.json"),
         ("worker-04", "worker-failed-codex.json"),
-    ] {
+    ];
+    for (id, name) in members {
         fs::write(pool.join(format!("{id}.json")), fixture(name)).expect("Worker state");
     }
+    provision_workspaces(temp.path(), &members.map(|(id, _)| id));
     let repository = Repository::open(temp.path()).expect("repository");
     (temp, repository)
 }
@@ -1962,6 +1987,35 @@ fn reconcile_runs_continues_past_missing_and_malformed_workers() {
         diagnostic.worker_id().map(|id| id.as_str()) == Some("worker-04")
             && diagnostic.kind() == SnapshotDiagnosticKind::MalformedWorker
     }));
+}
+
+#[test]
+fn reconcile_runs_reports_a_pool_member_whose_workspace_is_gone() {
+    let (temp, repository) = repository_with_pool();
+    let worker = WorkerId::parse("worker-01").expect("Worker ID");
+    let workspace = worker_workspace(temp.path(), worker.as_str());
+    assert!(workspace.is_dir(), "the fixture provisions it");
+    fs::remove_dir_all(&workspace).expect("remove Worker Workspace");
+
+    let snapshot = repository.worker_pool().reconcile_runs();
+
+    // The member is still in the Pool, but it can never run: the snapshot must
+    // say so rather than present it as a healthy idle Worker.
+    assert!(snapshot.worker(worker.as_str()).is_some());
+    let diagnostic = snapshot
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.kind() == SnapshotDiagnosticKind::MissingWorkspace)
+        .expect("a missing Workspace diagnostic");
+    assert_eq!(
+        diagnostic.worker_id().map(|id| id.as_str()),
+        Some(worker.as_str())
+    );
+    assert!(
+        diagnostic.message().contains(worker.as_str()) && diagnostic.message().contains("missing"),
+        "{}",
+        diagnostic.message()
+    );
 }
 
 #[test]

@@ -30,6 +30,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Fixed
 
 - Workspace rows now say why a path is unusable: a recorded path whose directory is gone names the path it was at, and a path jjfx never knew reads `(path unknown)`.
+- A Worker Pool member whose Workspace directory is gone is now reported as a missing Workspace, instead of passing for a healthy idle Worker that can never be dispatched.
 
 ## [0.53.0] - 2026-10-14
 
