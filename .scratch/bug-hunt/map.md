@@ -73,6 +73,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T9 | TUI | L-M | S | input reader thread silently dies on the first read error | 27 |
 | I11 | mixed | L | S | wrong CLI capacity message; poller ignores the Store projection; `reload` resets `colocate`; `config_path` relative fallback | 28 |
 | T10 | TUI | L | S | `?` steals from text buffers; help-over-editor hides the editor; `viewport` `u16` truncation; `line_down` overflow | 28 |
+| T11 | TUI | H | report | `jjfx tui` floods the terminal with unbounded, un-deduplicated `kitten @ ls` subprocesses until kitty pegs a core | 40 |
 
 ## Tickets
 
@@ -215,6 +216,10 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   **resolved** - `src/engine/opencode_api.rs`: a typed, best-effort client over
   `opencode api` with an explicit unavailable-versus-rejected contract and an
   injectable runner seam. 12 tests, no live server; no dependency, no `unsafe`.
+- [40](issues/40-kitty-ls-storm.md) - T11, from an external report (2026-10-14).
+  **ready-for-agent** - decided 2026-10-14: bound the terminal query and single-flight
+  it with a short TTL, so a slow kitty can neither block unboundedly nor stack
+  subprocesses. The stub-`kitten` regression test proves the pre-fix storm red.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.
