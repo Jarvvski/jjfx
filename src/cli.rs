@@ -131,6 +131,9 @@ pub enum Command {
     InternalComplete {
         mode: String,
     },
+    InternalForeground {
+        arguments: Vec<String>,
+    },
     InternalOrchestrate {
         parent: String,
         provider: Option<String>,
@@ -239,6 +242,11 @@ pub fn parse(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|mode| Command::InternalComplete { mode }),
+        // Hidden: the wrapper the Run supervisor re-invokes inside a foreground
+        // Run's process group to hand the terminal back. See `engine::foreground`.
+        crate::engine::WRAPPER_SUBCOMMAND => Ok(Command::InternalForeground {
+            arguments: args[1..].to_vec(),
+        }),
         "__orchestrate" => parse_orchestrate(&args[1..]),
         "pool" => parse_pool(&args[1..]),
         unknown => bail!("Unknown command: {unknown}. Run '{PROGRAM} help' for usage."),
@@ -701,6 +709,9 @@ pub fn run(
         Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
         Command::InternalComplete { mode } => internal_complete_command(&mode)?,
+        Command::InternalForeground { arguments } => {
+            crate::engine::run_wrapper(&arguments)?;
+        }
         Command::InternalOrchestrate {
             parent,
             provider,

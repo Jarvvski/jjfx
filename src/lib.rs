@@ -68,6 +68,20 @@ pub mod test_support {
 
 /// Run the jjfx binary's argument router.
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {
+    // The hidden foreground wrapper is dispatched before anything else: it is
+    // spawned with an Agent command's own arguments, which must not be scanned as
+    // jjfx's. Like `--version` it needs no repository, so it also skips repo
+    // discovery - the Run's workspace need not be a jj repo.
+    if args.first().map(String::as_str) == Some(engine::WRAPPER_SUBCOMMAND) {
+        return cli::run(
+            args,
+            launch,
+            terminal_settings,
+            colocate_setting,
+            open_workspaces,
+        );
+    }
+
     // `--version`/`-V` prints "jjfx <version>" and exits before any repo or
     // terminal work, so it is safe to run outside a jj repo and without a TTY
     // (release/CI can smoke-test the built binary with it).

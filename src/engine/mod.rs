@@ -15,6 +15,7 @@ mod direct_dispatch;
 mod dispatch_group;
 mod dispatch_prompt;
 mod eligibility;
+mod foreground;
 mod layout;
 mod opencode_api;
 mod orchestration;
@@ -41,6 +42,7 @@ pub use dispatch_prompt::{
     DispatchPromptError,
 };
 pub use eligibility::{DispatchExclusions, ExclusionsProvider, reconcile_occupancy};
+pub use foreground::{FOREGROUND_WRAPPER_ENV, WRAPPER_SUBCOMMAND, run_wrapper};
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
 };

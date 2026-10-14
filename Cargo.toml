@@ -49,9 +49,11 @@ anyhow = "1"
 jiff = "0.2"
 # Absorbed with wsg-core (the crate is gone; its engine lives in src/engine):
 # the state store and worker pool need OS file/process primitives and atomic
-# temp files, and every engine error type is a thiserror enum.
+# temp files, and every engine error type is a thiserror enum. The foreground
+# Run handover needs terminal job control (`termios`), and the PTY test that
+# proves the handover needs `pty` and `stdio`.
 getrandom = "0.4"
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process", "pty", "stdio", "termios"] }
 tempfile = "3"
 # Restores the terminal when a fatal signal (SIGINT/SIGTERM/SIGHUP) would
 # otherwise kill the process with the alternate screen and raw mode still

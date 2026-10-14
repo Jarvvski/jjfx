@@ -410,21 +410,29 @@ impl RunSupervisor {
                 source,
             })?;
         let log = Arc::new(Mutex::new(log));
-        let mut command = request
+        let agent = request
             .runtime
             .command(&request.invocation, capabilities)
             .map_err(|source| RunSupervisorError::Command {
                 runtime: request.runtime,
                 source,
             })?;
+        // A foreground Run owns its process group exactly like a background Run,
+        // so a failed launch and a cross-process Reset can end its whole tree with
+        // one group signal instead of leaking agent descendants. Owning its own
+        // group moves the Run out of the terminal's foreground group, so the
+        // terminal is handed to the Run's group and handed back by the wrapper.
+        let handover = super::foreground::Handover::capture();
+        let mut command = match handover.as_ref() {
+            Some(handover) => super::foreground::wrapper_command(&agent, handover)
+                .map_err(|source| RunSupervisorError::TerminalHandover { source })?,
+            None => agent,
+        };
         command
             .current_dir(&request.workspace)
             .stdin(Stdio::inherit())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // A foreground Run owns its process group exactly like a background
-            // Run, so a failed launch and a cross-process Reset can end its whole
-            // tree with one group signal instead of leaking agent descendants.
             .process_group(0);
         let mut child = command
             .spawn()
@@ -432,6 +440,12 @@ impl RunSupervisor {
                 runtime: request.runtime,
                 source,
             })?;
+        if let Some(handover) = handover.as_ref()
+            && let Err(source) = handover.give_to(child.id())
+        {
+            let _ = terminate_foreground_run(&mut child);
+            return Err(RunSupervisorError::TerminalHandover { source });
+        }
         if let Err(error) = started(child.id()) {
             let _ = terminate_foreground_run(&mut child);
             return Err(error);
@@ -865,6 +879,13 @@ pub enum RunSupervisorError {
         /// The selected Agent Runtime.
         runtime: AgentRuntime,
         /// The process creation error.
+        #[source]
+        source: io::Error,
+    },
+    /// The terminal could not be handed to the Run's process group.
+    #[error("cannot hand the terminal to the foreground Run: {source}")]
+    TerminalHandover {
+        /// The terminal job-control error.
         #[source]
         source: io::Error,
     },

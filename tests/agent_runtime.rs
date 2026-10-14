@@ -1,10 +1,12 @@
 use std::env;
 use std::fs;
 use std::io::Write;
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{Receiver, channel};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +45,7 @@ const HELPER_DIAGNOSTIC: &str = "WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC";
 const HELPER_TERM: &str = "WSG_AGENT_RUNTIME_HELPER_TERM";
 const HELPER_LAUNCH: &str = "WSG_AGENT_RUNTIME_HELPER_LAUNCH";
 const HELPER_DESCENDANT: &str = "WSG_AGENT_RUNTIME_HELPER_DESCENDANT";
+const HELPER_PTY_SLAVE: &str = "WSG_AGENT_RUNTIME_HELPER_PTY_SLAVE";
 
 #[test]
 fn pi_runtime_has_a_canonical_configured_and_persisted_identity() {
@@ -1394,6 +1397,116 @@ fn foreground_run_truncates_existing_log() {
         fs::read_to_string(log).expect("foreground log"),
         "fresh output\n"
     );
+}
+
+#[test]
+fn foreground_run_reads_the_terminal_and_returns_it() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    // The Agent reads the terminal. While the Run sat in a background process
+    // group that read stopped on SIGTTIN, so the Run never finished. It exits
+    // non-zero so the wrapper's exit-code passthrough is covered too.
+    write_executable(
+        &bin_directory.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf 'agent-ready\\n'\nread line\nprintf 'agent-read:%s\\n' \"$line\"\nexit 7\n",
+    );
+
+    let pty = open_pty();
+    let slave = open_pty_slave(&pty.slave_path);
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args([
+            "--exact",
+            "foreground_terminal_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("PATH", runtime_path(&bin_directory))
+        .env(HELPER_WORKSPACE, &workspace)
+        .env(HELPER_LOG, &log)
+        .env(HELPER_PTY_SLAVE, &pty.slave_path)
+        // The supervisor re-invokes its own executable as the wrapper; this test
+        // binary is not that executable, so point it at the real one.
+        .env(
+            jjfx::engine::FOREGROUND_WRAPPER_ENV,
+            env!("CARGO_BIN_EXE_jjfx"),
+        )
+        .stdin(Stdio::from(slave.try_clone().expect("PTY slave stdin")))
+        .stdout(Stdio::from(slave.try_clone().expect("PTY slave stdout")))
+        .stderr(Stdio::from(slave));
+    let mut child = helper.spawn().expect("foreground helper");
+    let mut terminal = PtyOutput::drain(&pty.master);
+
+    // The Run owns its own process group, yet the Agent still reads the terminal.
+    terminal.wait_for("agent-ready");
+    rustix::io::write(&pty.master, b"input-value\n").expect("write to the terminal");
+    terminal.wait_for("agent-read:input-value");
+
+    // The supervisor is the terminal's foreground group again once the Run ends,
+    // and can read the terminal itself.
+    let report = terminal.wait_for("after-run");
+    let report = report
+        .lines()
+        .find(|line| line.contains("after-run"))
+        .expect("after-run report");
+    assert!(
+        report.contains("restored=true") && report.contains("exit=Some(7)"),
+        "the Run should hand the terminal back and report the Agent's exit: {report}"
+    );
+    rustix::io::write(&pty.master, b"input-after\n").expect("write after the Run");
+    terminal.wait_for("after-read:input-after");
+
+    let status = child.wait().expect("foreground helper");
+    assert!(
+        status.success(),
+        "foreground helper failed: {}",
+        terminal.buffer()
+    );
+}
+
+#[test]
+#[ignore]
+fn foreground_terminal_helper() {
+    // Become a session leader and acquire the PTY as the controlling terminal, so
+    // the Run's handover has a terminal to hand over.
+    rustix::process::setsid().expect("session leader");
+    let terminal = rustix::fs::open(
+        PathBuf::from(env::var_os(HELPER_PTY_SLAVE).expect("PTY slave path")),
+        rustix::fs::OFlags::RDWR,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("controlling terminal");
+    rustix::stdio::dup2_stdin(&terminal).expect("PTY stdin");
+    rustix::stdio::dup2_stdout(&terminal).expect("PTY stdout");
+    rustix::stdio::dup2_stderr(&terminal).expect("PTY stderr");
+
+    let workspace = PathBuf::from(env::var_os(HELPER_WORKSPACE).expect("Worker Workspace"));
+    let log = PathBuf::from(env::var_os(HELPER_LOG).expect("log path"));
+    let request = RunRequest::new(
+        AgentRuntime::Claude,
+        AgentRuntimeInvocation::new("foreground terminal test"),
+        workspace,
+        log,
+    );
+    let outcome = RunSupervisor::new()
+        .run_foreground(&request)
+        .expect("foreground Run should complete");
+    let restored =
+        rustix::termios::tcgetpgrp(std::io::stdin()).ok() == Some(rustix::process::getpgrp());
+    println!(
+        "after-run exit={:?} restored={restored}",
+        outcome.exit_code()
+    );
+
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .expect("read the terminal after the Run");
+    println!("after-read:{}", line.trim_end());
 }
 
 #[test]
@@ -3604,6 +3717,96 @@ fn command_args(command: &Command) -> Vec<String> {
                 .to_owned()
         })
         .collect()
+}
+
+/// A PTY opened for a test, with the slave path a helper needs to acquire it.
+struct TestPty {
+    master: OwnedFd,
+    slave_path: PathBuf,
+}
+
+fn open_pty() -> TestPty {
+    let master =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .expect("PTY master should open");
+    let slave_path = rustix::pty::ptsname(&master, Vec::new())
+        .expect("PTY slave name")
+        .into_string()
+        .expect("PTY slave name should be UTF-8");
+    rustix::pty::grantpt(&master).expect("PTY should grant the slave");
+    rustix::pty::unlockpt(&master).expect("PTY should unlock the slave");
+    TestPty {
+        master,
+        slave_path: PathBuf::from(slave_path),
+    }
+}
+
+/// Opens the slave without making it this process's controlling terminal: the
+/// helper acquires it, because a session leader that owns it is what gives the
+/// Run's handover a foreground group to restore.
+fn open_pty_slave(slave_path: &Path) -> OwnedFd {
+    rustix::fs::open(
+        slave_path,
+        rustix::fs::OFlags::RDWR | rustix::fs::OFlags::NOCTTY,
+        rustix::fs::Mode::empty(),
+    )
+    .expect("PTY slave should open")
+}
+
+/// Streams a PTY master on a background thread, so a test can wait for a marker
+/// with a deadline instead of blocking forever on a Run that stopped.
+struct PtyOutput {
+    receiver: Receiver<String>,
+    buffer: String,
+}
+
+impl PtyOutput {
+    fn drain(master: &OwnedFd) -> Self {
+        let reader = master.try_clone().expect("PTY master clone");
+        let (sender, receiver) = channel();
+        thread::spawn(move || {
+            let mut bytes = [0u8; 4096];
+            while let Ok(read) = rustix::io::read(&reader, &mut bytes) {
+                if read == 0 {
+                    break;
+                }
+                if sender
+                    .send(String::from_utf8_lossy(&bytes[..read]).into_owned())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            receiver,
+            buffer: String::new(),
+        }
+    }
+
+    fn wait_for(&mut self, marker: &str) -> String {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !self.buffer.contains(marker) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !remaining.is_zero(),
+                "the terminal never produced {marker:?}: {}",
+                self.buffer
+            );
+            match self.receiver.recv_timeout(remaining) {
+                Ok(text) => self.buffer.push_str(&text),
+                Err(error) => panic!(
+                    "the terminal never produced {marker:?} ({error}): {}",
+                    self.buffer
+                ),
+            }
+        }
+        self.buffer.clone()
+    }
+
+    fn buffer(&self) -> &str {
+        &self.buffer
+    }
 }
 
 fn write_executable(path: &std::path::Path, content: &str) {
