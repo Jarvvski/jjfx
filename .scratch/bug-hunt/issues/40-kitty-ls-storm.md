@@ -1,6 +1,6 @@
 # Bound and de-duplicate the terminal query
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -32,10 +32,10 @@ High. The host terminal (the visor) becomes unusable and a CPU core spins for th
 
 ## Acceptance Criteria
 
-- [ ] A terminal query cannot block without bound: a slow or stuck kitty yields an error within a bounded time.
-- [ ] Concurrent callers share one in-flight query and a recent result, so a slow kitty cannot stack subprocesses.
-- [ ] A regression test with a stub `kitten` that sleeps asserts at most one concurrent `ls` and a bounded call rate over a simulated refresh storm. (`tests/worker_actions.rs` already stubs `kitten` and sets `KITTY_LISTEN_ON` - the harness to extend.)
-- [ ] When the terminal is slow or unreachable, dispatch and the UI degrade gracefully - no unbounded block, no hot loop.
+- [x] A terminal query cannot block without bound: a slow or stuck kitty yields an error within a bounded time.
+- [x] Concurrent callers share one in-flight query and a recent result, so a slow kitty cannot stack subprocesses.
+- [x] A regression test with a stub `kitten` that sleeps asserts at most one concurrent `ls` and a bounded call rate over a simulated refresh storm. (`tests/worker_actions.rs` already stubs `kitten` and sets `KITTY_LISTEN_ON` - the harness to extend.)
+- [x] When the terminal is slow or unreachable, dispatch and the UI degrade gracefully - no unbounded block, no hot loop.
 
 ## Out of Scope
 
@@ -50,3 +50,15 @@ High. The host terminal (the visor) becomes unusable and a CPU core spins for th
 - **Single-flight + short TTL cache** in `KittyTerminal` for `kitten @ ls`, so concurrent callers (the poller, dispatch exclusions, `refresh`, the UI) share one in-flight query and reuse a recent result instead of each spawning a subprocess.
 - **Rejected for now:** a separate backoff/rate limiter (option 3) - de-duplication bounds the rate, so it would be redundant; and decoupling the query onto a snapshot thread (option 4) - larger, and 1 and 2 make it less urgent. Either can be revisited if the storm survives the fix.
 - The regression test in the acceptance criteria is **required, not optional**: it is this ticket's reproduction, and it must prove the pre-fix storm red.
+
+## Outcome (2026-10-14)
+
+Landed as `Bound and de-duplicate the terminal query`. No new dependency and no `unsafe`.
+
+**Bounding.** `Cmd::run_with_timeout` is a new method rather than a change to `Cmd::run`, so agent Runs and `jj` operations stay unbounded. It spawns with piped streams, drains both on reader threads (so a full pipe buffer cannot wedge it), polls `try_wait` against a deadline, and on timeout kills and reaps the child and *detaches* the readers - joining could wait on a surviving descendant holding the pipe, which would defeat the bound this exists to enforce. `KittyTerminal`'s query uses it with a 3s timeout; mutations (`launch`/`focus`/`close`) keep the unbounded `run`.
+
+**Single-flight and TTL.** `KittyTerminal` gained a `QueryCache` (`Mutex<QueryState>` + `Condvar`). The first caller with a stale cache becomes the leader and runs the query with the lock released; concurrent callers wait on the condvar and reuse the leader's result instead of spawning their own `kitten`. A completed outcome - success *or* failure - is reused for 2s, so a refresh storm collapses to about one spawn per TTL. A cached `Err` stays an `Err`, so the cache can never turn an unreadable terminal into `Ok`: `live_exclusions` still refuses dispatch, and a stale success can only *omit* a newly-opened workspace, never invent one.
+
+**Evidence.** `a_slow_terminal_query_is_single_flighted_and_rate_limited` runs a storm of 16 threads for 1.5s against a stub `kitten` that sleeps 1s and records each run, and asserts a peak of exactly one concurrent `ls` and at most 2 spawns in total. `a_stuck_terminal_query_times_out_instead_of_blocking` runs against a stub that sleeps 60s and asserts an error within the bound. Both were proven red against the pre-fix code: peak 16 concurrent `ls`, and a 60.2s block. The tests live in `src/terminal.rs` because `KittyTerminal` is private and the `tests/worker_actions.rs` harness stubs `kitten` for a path that never reaches it.
+
+Residual risk: a newly-opened workspace can be missed for up to the 2s TTL, and a cached failure delays recovery by up to the same - both far below the 15s poll interval, and a shorter TTL would trade them for less de-duplication. The timeout and TTL are module constants, not configurable.
