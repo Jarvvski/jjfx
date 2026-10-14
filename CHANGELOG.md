@@ -48,6 +48,8 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-14 - Stopping an opencode Run now stops its work: `reset` and Worker `destroy` interrupt the Run's session through the daemon instead of signalling a client process, and a Worker's liveness is decided from that session's outcome rather than from a client pid that outlives it. Falls back to the existing process-group path whenever the API is unreachable or the session cannot be identified. (fix)
+
 - 2026-10-14 - An opencode Run is anchored to its Worker Workspace explicitly: jjfx creates the session with that `location` and confirms what opencode stored before the Run starts, so a Run can no longer execute - and commit - in the wrong worktree. If the opencode API is unreachable the Run proceeds on the process cwd exactly as before, and an unreachable or older API never fails a Run. (fix)
 
 - 2026-10-14 - Every Run now owns its process group, so a failed foreground launch and a cross-process Reset end the whole agent tree instead of leaking descendants that keep writing to the Workspace. A foreground Run's terminal is handed to it and back by a wrapper inside its own group, so it can still read the terminal and Ctrl-C still reaches the agent. (fix)

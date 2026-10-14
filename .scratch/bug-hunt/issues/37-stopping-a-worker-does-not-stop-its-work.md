@@ -1,6 +1,6 @@
 # Stopping a Worker does not stop its work
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -76,10 +76,10 @@ path matters and any adoption needs a capability check rather than an assumption
 
 ## Acceptance Criteria
 
-- [ ] The chosen mechanism is recorded in `## Comments`.
-- [ ] Stopping a Worker stops its work, verified against a real daemon-hosted Run.
-- [ ] `jjfx pool list` does not report `idle` while a Run's work continues.
-- [ ] The pid/process-group path still works when the API is unavailable.
+- [x] The chosen mechanism is recorded in `## Comments`.
+- [x] Stopping a Worker stops its work, verified against a real daemon-hosted Run.
+- [x] `jjfx pool list` does not report `idle` while a Run's work continues.
+- [x] The pid/process-group path still works when the API is unavailable.
 
 ## Out of Scope
 
@@ -129,3 +129,21 @@ then, and its rejection of *minting* an id still stands: 38 creates a session an
 keeps the id opencode returns rather than inventing one.
 
 **38 landed (2026-10-14).** The session id is now recorded in a jjfx-owned sidecar, `.jj/pool/sessions.json` (lock `.jj/pool/.sessions.lock`), per Worker, exposed as `StateStore::sessions()` / `SessionStateRepository`; it is overwritten by the Worker's next Run and never cleared. So identification at teardown is: read that sidecar for the Worker, and treat the Run as finished on the session `outcome` (or a run-log result) rather than on the client pid. Title matching stays only as the fallback for a session jjfx did not create. Note the id is recorded *before* the Run starts, so unlike re-resolving from the run log it is available from the first moment.
+
+## Outcome (2026-10-14)
+
+Landed as `Stop an opencode Run through its session and reconcile by outcome`. No new dependency and no `unsafe`.
+
+**Stopping.** `RunSupervisor::stop_run` now decides how to end a Run: for an opencode Run it identifies the session and calls `session.interrupt` through ticket 39's client, and only a daemon-confirmed `{"interrupted":true}` counts as the stop. `terminate_recorded_process` (used by Worker `destroy`) tries the same daemon interrupt first. Everything else - the API unreachable or too old, no session identified, or `interrupted:false` - falls back to the existing `live_process_group_leader` + `terminate_process_group` path, and claude/codex/pi never take the daemon path at all.
+
+**Liveness.** `reconcile_worker` splits on the persisted runtime. For opencode it consults the session: an `outcome` means finished (using the run log's provider result when it has one, otherwise mapping the outcome); no outcome means still running, so the Worker stays `busy`; a session that cannot be read or identified falls back to the run log's provider terminal result, and otherwise stays `busy`. The pid/process-group probe is dropped for opencode, where the pid is only a daemon client; claude/codex/pi keep the exact previous probe.
+
+**Identification.** The exact id ticket 38 records in `.jj/pool/sessions.json` is used, with no API call. Only when nothing is recorded does `run_session_id` fall back to matching the Run title (`pool:<worker>:<ticket>`) against `session.list` restricted to `session.active`, and `match_active_session_by_title` returns an id only for exactly one match - none or ambiguous yields nothing, so a stale session sharing a title is never interrupted. The title format is now one helper, reused by direct dispatch.
+
+**Evidence.** 7 unit tests through the `OpenCodeRunner` seam (active-session parsing; a recorded id wins with no API call; a unique active title match; an inactive match ignored; an ambiguous match refused; unavailable yields nothing; no id and no title yields nothing) and 4 integration tests in `tests/agent_runtime.rs` against a fake `opencode` on `PATH`: reset interrupts the recorded session and does not signal the client; reset falls back to the process group when the API is unavailable; reconcile keeps a busy Worker busy while its session is open even with a dead pid; and reconcile finishes it on the session outcome even with a live client pid.
+
+**Verified live against opencode v2.0.29** (the acceptance criterion asks for a real daemon-hosted Run): a session was created and driven with `opencode run --session <id>` doing `sleep 300 && touch DONE`; `jjfx pool list` reported `busy`; the real stop path (`jjfx pool reset`) returned `{"interrupted":true}`, the `sleep 300` work was killed, the client exited on its own, `session.get` reported `outcome: "interrupted"`, no `DONE` marker was written, the Worker went idle, and the client pid was never signalled. Separately, a Run whose recorded pid *was* a live process-group leader reported `busy` while its session was open and `failed` after the session was interrupted directly through the API - so liveness follows the work, not the client.
+
+**Correction to ticket 38's report.** opencode v2.0.29 *does* expose `DELETE /api/session/{id}` (`session.remove`); the 38 report recorded the opposite. The probe sessions were deleted with it (all four now 404), so nothing was left behind. `session.remove` was not added to the client - out of scope here.
+
+Residual risk: the sidecar id is trusted as exact, per the decision. If a Run starts while the API is unavailable nothing is recorded and a *previous* Run's id lingers, so a later reconcile could read that stale session's outcome and finish the current Run early - for a stop this is benign (interrupting a finished session returns `false` and falls through), but for **liveness it is the hazard this ticket exists to remove**, and a staleness guard is the obvious follow-up. Reconcile now costs one API round-trip per busy opencode Worker on `pool list`/`dismiss`, inheriting ticket 39's no-timeout behaviour. A *successful* opencode Run emits no terminal log event, so with the API down and the owner gone the Worker stays `busy` - the ticket's deliberate trade-off, since a thin client that has exited says nothing about the work. `destroy`'s title fallback never fires (it has no ticket to match), so it relies on the sidecar id alone.

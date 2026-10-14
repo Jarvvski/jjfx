@@ -35,6 +35,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | ID | Area | Sev | Conf | Finding | Ticket |
 | --- | --- | --- | --- | --- | --- |
 | W1 | dispatch | H | report | Worker Run inherits the caller's cwd, not its Workspace | 01, 05 |
+| F2 | process | H | report | an opencode Run's recorded pid is a daemon client: stopping it does not stop the work, and it outlives the Run | 37 (fixed) |
 | D1 | dispatch | H | V | A failed Sub-issue never unblocks dependents; the group never terminates and `run` polls forever | 04 (fixed) |
 | D3 | work | - | refuted | git-exported bookmarks count as "pushed" - `remote_bookmarks()` already excludes `@git` | 06 |
 | C1 | concurrency | H | S | `send`/`review`/`rebase` skip the workspace-op lock; Reset's async restore races a new Run | 08 (fixed) |
@@ -202,11 +203,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   after. Same class as 35 but a different mechanism: isolation, not deadlines.
   No changelog entry: nothing user-visible.
 - [37](issues/37-stopping-a-worker-does-not-stop-its-work.md) - F2, split out of
-  05. **ready-for-agent** - decided 2026-10-14: stop a Run with
-  `session.interrupt`, and treat an opencode Run as finished on the session
-  `outcome` or a run-log result rather than on the client pid. Identify the session
-  by the id jjfx creates in 38; title matching is only a fallback. **Sequence: after
-  07/20 and after 38** - it changes the same functions as 07/20 and builds on 38.
+  05. **resolved** - stop through `session.interrupt` and reconcile on the session
+  `outcome`; identified by the id 38 records in the sidecar, with title matching
+  only as a guarded fallback. Verified live against a real daemon-hosted Run.
 - [38](issues/38-set-run-session-directory.md) - guard for the ticket 05 class.
   **resolved** - `session.create` with `location.directory` = the Worker Workspace,
   read back and compared before the Run starts, then driven with `--session <id>`;
