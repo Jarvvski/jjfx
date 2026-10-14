@@ -56,7 +56,9 @@ or **Ended** (session closed).
 The least-delivered state among a workspace's owned changes: **Clean** (no
 change from trunk), **Dirty** (local change), **Pushed** (bookmark on the
 remote), **PrOpen** (PR open, carrying a Review verdict), or **Merged**. A local
-change makes the workspace Dirty even when a lower change already has a PR.
+change makes the workspace Dirty even when a lower change already has a PR -
+unless that lower PR is open with changes requested, which still surfaces as
+PrOpen so a blocked stack reads as needs-you even while you add to it.
 **Unknown** records that jj or gh could not determine the state.
 
 **Review verdict**:
@@ -84,7 +86,9 @@ _Avoid_: branch
 The base-chained pull requests that publish a workspace's bookmarked changes.
 When one row represents the stack, it shows the lowest PR carrying the most
 blocking verdict: changes requested, review required, no decision, then
-approved.
+approved. An open changes-requested PR is always shown this way, even when newer
+local or pushed work is stacked above it; other verdicts are masked by that
+newer work.
 _Avoid_: branch stack
 
 **Forge**:

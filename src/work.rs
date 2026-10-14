@@ -327,8 +327,26 @@ fn classify(
 
 /// The pure overlay decision over a workspace's owned commits. The least
 /// delivered change wins: local content, then pushed, then an open PR, then
-/// merged. A `Dirty` result carries no line counts yet - [`classify`] fills it.
+/// merged - with one exception. A lower open **changes-requested** PR is never
+/// masked by newer local or pushed work stacked above it (ticket 31, ADR 0003):
+/// the PR is blocked on the human, so it must still surface as
+/// [`WorkState::PrOpen`] and reach `Attention::NeedsYou` rather than reading as
+/// merely "ready to forge". A `Dirty` result carries no line counts yet -
+/// [`classify`] fills it.
 fn overlay(owned: &[&ChainCommit], prs: &[crate::prs::Pr]) -> WorkState {
+    // Resolve the row's open PR up front: only a change request escapes the
+    // least-delivered rule, so an approved (or verdict-less) lower PR still
+    // yields Dirty/Pushed below.
+    let selected = select_open_pr(owned, prs);
+    if let Some((pr, verdict)) = selected
+        && verdict.is_changes_requested()
+    {
+        return WorkState::PrOpen {
+            number: pr.number,
+            verdict,
+        };
+    }
+
     if owned
         .iter()
         .any(|commit| !commit.empty && !commit.pushed && !represented_by_pr(commit, prs))
@@ -346,20 +364,6 @@ fn overlay(owned: &[&ChainCommit], prs: &[crate::prs::Pr]) -> WorkState {
         return WorkState::Pushed;
     }
 
-    let mut selected: Option<(&crate::prs::Pr, ReviewVerdict)> = None;
-    for commit in owned {
-        let Some(pr) = open_pr_for(commit, prs) else {
-            continue;
-        };
-        let verdict = ReviewVerdict::parse(pr.review.as_deref());
-        // `owned` is tip-first, so replacing a tied verdict selects the lower PR.
-        let replace = selected
-            .as_ref()
-            .is_none_or(|(_, current)| verdict.blocking_rank() >= current.blocking_rank());
-        if replace {
-            selected = Some((pr, verdict));
-        }
-    }
     if let Some((pr, verdict)) = selected {
         return WorkState::PrOpen {
             number: pr.number,
@@ -375,6 +379,29 @@ fn overlay(owned: &[&ChainCommit], prs: &[crate::prs::Pr]) -> WorkState {
     }
 
     WorkState::Clean
+}
+
+/// The open PR the row should report, if any: the lowest PR carrying the most
+/// blocking verdict across the owned commits. `owned` is tip-first, so a tied
+/// verdict replaces the current pick and selects the lower PR.
+fn select_open_pr<'a>(
+    owned: &[&ChainCommit],
+    prs: &'a [crate::prs::Pr],
+) -> Option<(&'a crate::prs::Pr, ReviewVerdict)> {
+    let mut selected: Option<(&'a crate::prs::Pr, ReviewVerdict)> = None;
+    for commit in owned {
+        let Some(pr) = open_pr_for(commit, prs) else {
+            continue;
+        };
+        let verdict = ReviewVerdict::parse(pr.review.as_deref());
+        let replace = selected
+            .as_ref()
+            .is_none_or(|(_, current)| verdict.blocking_rank() >= current.blocking_rank());
+        if replace {
+            selected = Some((pr, verdict));
+        }
+    }
+    selected
 }
 
 fn represented_by_pr(commit: &ChainCommit, prs: &[crate::prs::Pr]) -> bool {
@@ -715,6 +742,32 @@ mod tests {
         let prs = [reviewed_pr(10, "lower-branch", "APPROVED")];
 
         assert_eq!(overlay(&[&pushed, &lower], &prs), WorkState::Pushed);
+    }
+
+    #[test]
+    fn lower_changes_requested_pr_is_not_masked_by_stacked_work() {
+        // The one exception to "least delivered wins" (ticket 31, ADR 0003): a
+        // change-requested PR lower in the stack is blocked on the human, so the
+        // nudge must resurface even while newer work is stacked above it. The row
+        // must read `PrOpen { ChangesRequested }`, not "ready to forge".
+        let local = cc("local", false, &[], false, true);
+        let pushed = cc("pushed", false, &["pushed-branch"], true, true);
+        let lower = cc("lower", false, &["lower-branch"], true, false);
+        let prs = [reviewed_pr(10, "lower-branch", "CHANGES_REQUESTED")];
+        let changes = WorkState::PrOpen {
+            number: 10,
+            verdict: ReviewVerdict::ChangesRequested,
+        };
+
+        // A newer non-empty local commit above the blocked PR.
+        assert_eq!(overlay(&[&local, &lower], &prs), changes);
+        // A newer pushed commit above the blocked PR.
+        assert_eq!(overlay(&[&pushed, &lower], &prs), changes);
+        // The combined signal: a Waiting agent over that stack is needs-you.
+        assert_eq!(
+            crate::attention::derive(crate::agent::AgentState::Waiting, changes),
+            crate::attention::Attention::NeedsYou
+        );
     }
 
     #[test]
