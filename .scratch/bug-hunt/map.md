@@ -201,6 +201,11 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   helper; 39/48 invocations failed pre-fix under concurrency, 132/132 passed
   after. Same class as 35 but a different mechanism: isolation, not deadlines.
   No changelog entry: nothing user-visible.
+- [37](issues/37-stopping-a-worker-does-not-stop-its-work.md) - F2, split out of
+  05. **ready-for-human** - how to stop a daemon-hosted Run, and what a Worker's
+  liveness means when the recorded pid is only a client. opencode's server API has
+  `session.interrupt` and `session.active`; the design (identifying the session,
+  and the fallback path) needs a decision.
 
 - The sweep finding D3 (git-exported bookmarks counted as "pushed") is
   **refuted**: `remote_bookmarks()` already excludes the colocated `git` remote.

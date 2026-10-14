@@ -1,0 +1,87 @@
+# Stopping a Worker does not stop its work
+
+Status: ready-for-human
+Type: task
+Blocked by: none
+
+## Problem
+
+Split out of ticket 05 (the Worker-cwd report's second finding).
+
+`opencode run` without `--standalone` is a thin client of a long-lived shared
+background service (`opencode serve --service`), so the process jjfx spawns,
+records and later signals is **not** the process doing the work.
+
+Consequences:
+
+- `terminate_recorded_process` (`src/engine/runtime.rs:610`) and `reset_run`
+  (`:573`) signal a client. The work continues: the report observed a Worker's shell
+  tool call still running under the shared service minutes after the client was
+  killed, and that Worker went on to open pull requests.
+- `reconcile_worker` (`src/engine/pool.rs:350`) decides a Worker is finished from
+  `process_is_alive_i64(pid)` - the *client's* liveness - so `jjfx pool list` can
+  report a Worker `idle` while its work is still running.
+
+## Why not `--standalone`
+
+`opencode run --standalone` makes the run process host its own server, which fixes
+ownership directly. **Rejected by the owner (2026-10-14):** one server per Run
+multiplies CPU load across a pool, and a single shared server is preferred.
+
+## What opencode actually exposes
+
+The shared server's OpenAPI surface is reachable and has the primitives. Discovered
+with `opencode api GET /openapi.json` (spec version `0.0.1`, "Experimental HttpApi
+surface for selected instance routes"). None of the three are in the `experimental`
+namespace:
+
+| Operation | Route | Use here |
+|---|---|---|
+| `session.interrupt` | `POST /api/session/{sessionID}/interrupt` (optional `resume` query) | stop a running session |
+| `session.active` | `GET /api/session/active` → `{data: {"ses…": SessionActive}}` | what is actually running |
+| `session.get` | `GET /api/session/{sessionID}` | one session's state |
+
+So a Run can be stopped **through the daemon**, which keeps the single shared server
+the owner wants.
+
+## The design question
+
+Two things must change, and both need a decision before code moves.
+
+### 1. How does jjfx identify the Run's session at teardown time?
+
+jjfx already resolves a session id from the run log (`resolve_agent_session`,
+`src/engine/run_log.rs:92`) for resumption, and exposes it as
+`AgentSessionResolution` (`Fresh` / `Resumed { session_id }`) on the dispatch
+result. Candidates:
+
+- (a) **Re-resolve it from the run log at teardown.** Reuses the existing mechanism;
+  no new persisted state. Costs a log read.
+- (b) **Match against `session.active` by the `--title` jjfx already sets**
+  (`pool:worker-<id>:<ticket>`). No log read, but titles are not guaranteed unique.
+- (c) **Persist it in pool-owned sidecar state.** Explicit, but the Worker document
+  is frozen by `docs/wsg-compatibility-contract.md:66-72`, so it cannot go there.
+
+### 2. What does "stopping a Run" mean, and what is a Worker's liveness?
+
+- **Stop:** `session.interrupt` for an opencode Run. pid/process-group signalling
+  stays for runtimes that own their work (claude, codex, pi) and as the fallback when
+  the API is unreachable (server down, or an opencode without the route).
+- **Liveness:** `reconcile_worker` must not call a Worker finished while its session
+  is active. Either consult `session.active`/`session.get`, or keep pid-based
+  liveness only for the runtimes where the pid *is* the work.
+
+The API describes itself as experimental and is versioned `0.0.1`, so the fallback
+path matters and any adoption needs a capability check rather than an assumption.
+
+## Acceptance Criteria
+
+- [ ] The chosen mechanism is recorded in `## Comments`.
+- [ ] Stopping a Worker stops its work, verified against a real daemon-hosted Run.
+- [ ] `jjfx pool list` does not report `idle` while a Run's work continues.
+- [ ] The pid/process-group path still works when the API is unavailable.
+
+## Out of Scope
+
+- The working-directory finding (ticket 05) - closed as an upstream opencode defect.
+- `--standalone` - rejected; see ticket 07's 2026-10-14 note.
