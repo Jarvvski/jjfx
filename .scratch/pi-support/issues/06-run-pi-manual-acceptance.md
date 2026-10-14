@@ -1,6 +1,6 @@
 # Run Pi manual acceptance
 
-Status: ready-for-human
+Status: wontfix
 
 ## Parent
 
@@ -159,3 +159,16 @@ capability matrix in `spike-01-contract-findings.md`, so the session records
 them as accepted differences rather than discovering them as failures. The
 per-tool approval and budget choices must be *rejected* by jjfx, not silently
 weakened, and no capability gap may fall back to Claude or Codex.
+
+**Closed 2026-10-14 - `wontfix`.** The owner no longer uses Pi and runs opencode
+instead, so the manual acceptance matrix will not be run. Closed rather than
+resolved: none of the acceptance criteria above were met, and the prepared matrix
+in [`manual-acceptance.md`](../manual-acceptance.md) is superseded.
+
+This is an explicit accepted risk, not a silent one. The Pi capability
+differences (per-tool approval, aggregate budget, a filesystem sandbox, native
+Linear/MCP) stay unverified against a *real* Pi install; they remain covered only
+by the pinned adapter contract in `spike-01-contract-findings.md` and the
+automated fixtures under `fixtures/`. Pi support itself stays in the tree with
+its automated coverage - closing this ticket is a decision not to spend the manual
+session, not a decision to remove the runtime.

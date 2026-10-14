@@ -1,6 +1,7 @@
 # Pi manual acceptance - evidence
 
-Status: not started (matrix prepared 2026-10-14)
+Superseded 2026-10-14: ticket 06 is `wontfix` - the owner uses opencode now, so
+this matrix will not be run. Kept as the record of the step-1 review.
 
 Parent: `issues/06-run-pi-manual-acceptance.md`
 
