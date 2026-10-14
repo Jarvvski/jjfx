@@ -552,6 +552,7 @@ struct ClaudeEvent {
     duration_ms: Option<u64>,
     num_turns: Option<u64>,
     total_cost_usd: Option<Number>,
+    usage: Option<ClaudeUsage>,
     #[serde(default)]
     is_error: bool,
     #[serde(default)]
@@ -1484,6 +1485,9 @@ fn parse_claude_result(event: ClaudeEvent) -> Result<RunLogEvent, RunLogParseErr
         };
         RunResult::failed(message)
     };
+    if let Some(usage) = event.usage.as_ref() {
+        result = result.with_usage(usage.normalized());
+    }
     if let Some(duration_ms) = event.duration_ms {
         result = result.with_duration(Duration::from_millis(duration_ms));
     }

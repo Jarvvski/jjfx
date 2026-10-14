@@ -454,6 +454,38 @@ fn final_result_preserves_codex_usage() {
 }
 
 #[test]
+fn final_result_preserves_claude_usage() {
+    let directory = tempdir().expect("temporary directory should be created");
+    let path = directory.path().join("worker.log");
+    fs::write(
+        &path,
+        concat!(
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"done","duration_ms":2500,"num_turns":3,"total_cost_usd":0.125,"usage":{"input_tokens":150,"output_tokens":70,"cache_read_input_tokens":10,"cache_creation_input_tokens":5}}"#,
+            "\n",
+        ),
+    )
+    .expect("Run log should be written");
+    let log = RunLog::new(&path, AgentRuntime::Claude);
+
+    let result = log.final_result().expect("final result should be read");
+
+    assert_eq!(
+        result,
+        Some(
+            RunResult::succeeded()
+                .with_duration(Duration::from_millis(2_500))
+                .with_turns(3)
+                .with_cost(RunCost::from_micro_usd(125_000))
+                .with_usage(
+                    RunUsage::new(150, 70)
+                        .with_cached_input_tokens(10)
+                        .with_cache_write_input_tokens(5),
+                ),
+        )
+    );
+}
+
+#[test]
 fn final_result_returns_the_latest_terminal_result() {
     let directory = tempdir().expect("temporary directory should be created");
     let path = directory.path().join("worker.log");
