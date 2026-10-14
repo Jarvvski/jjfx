@@ -112,8 +112,6 @@ Run `jjfx help` for usage.
   teaches a coding agent to dispatch work to Workers.
 - [`docs/wsg-compatibility-contract.md`](docs/wsg-compatibility-contract.md) -
   the compatibility contract for the migration-era `wsg` target.
-- [wsg conformance](docs/wsg-conformance.md) - the migration-era Go/Rust
-  conformance suite, its invocation, and the accepted differences.
 - [Releasing](docs/releasing.md) - how a release is cut: the versioning model,
   the dispatch workflow, and recovery from a partial release.
 - [`CHANGELOG.md`](CHANGELOG.md) - what has landed.
@@ -121,7 +119,9 @@ Run `jjfx help` for usage.
 ## Status
 
 `jjfx` provides the CLI and an explicit interactive TUI entrypoint. The
-compatibility `wsg` target remains available for migration conformance.
+compatibility `wsg` target is still built and shipped as a frozen `0.19.0`, but
+it is no longer verified against the Go implementation: the migration-era
+conformance suite has been retired with the Go repository.
 
 The Go `wsg` project is **deprecated** - it was archived on 2026-08-19, and jjfx
 is the authoritative home of both binaries. `wsg` users should install jjfx

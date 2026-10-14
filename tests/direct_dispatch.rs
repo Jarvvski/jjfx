@@ -580,40 +580,6 @@ fn production_direct_dispatch_launches_foreground_and_background_fake_runtimes()
     assert!(compatible["pid"].as_u64().is_some_and(|pid| pid > 0));
     assert!(compatible["started_at"].is_string());
     assert!(compatible["log_file"].is_string());
-
-    if let Some(go_helper) = env::var_os("WSG_GO_TEST_BINARY") {
-        let go_result = temporary_directory.path().join("go-observed-worker.json");
-        let observed = Command::new(&go_helper)
-            .arg("-test.run")
-            .arg("^TestStateLockSubprocessHelper$")
-            .env("WSG_STATE_HELPER_MODE", "rewrite")
-            .env("WSG_STATE_HELPER_KIND", "worker")
-            .env("WSG_STATE_HELPER_STATE", &compatibility)
-            .env("WSG_STATE_HELPER_RESULT", &go_result)
-            .output()
-            .expect("run Go wsg typed Worker reader");
-        assert!(
-            observed.status.success(),
-            "Go wsg could not observe Rust-launched state: {}",
-            String::from_utf8_lossy(&observed.stderr)
-        );
-        let observed: Value =
-            serde_json::from_slice(&fs::read(go_result).expect("Go-observed Worker state"))
-                .expect("Go-observed Worker JSON");
-        assert_eq!(observed["status"], "busy");
-        assert_eq!(observed["ticket"], "ENG-501");
-
-        let reconciled = Command::new(go_helper)
-            .arg("-test.run")
-            .arg("^TestLoadLiveWorkerReconcilesDeadBusyWorker$")
-            .output()
-            .expect("run Go wsg reconciliation contract");
-        assert!(
-            reconciled.status.success(),
-            "Go wsg reconciliation contract failed: {}",
-            String::from_utf8_lossy(&reconciled.stderr)
-        );
-    }
 }
 
 #[test]
