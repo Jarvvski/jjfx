@@ -1163,6 +1163,12 @@ fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError>
 /// quotes, and every caller here compares against the raw name.
 fn workspace_names(root: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
     let output = Command::new("jj")
+        // A pure read. Without this, jj snapshots the working copy and writes
+        // under `.jj`, which fires the TUI's recursive `.jj` watcher and
+        // re-triggers this projection - a self-sustaining reload loop that
+        // storms `jj` and everything downstream of a reload. `jj::read_at_repo`
+        // is the same rule; the projection must never ping its own watcher.
+        .arg("--ignore-working-copy")
         .args(["workspace", "list", "-T", "stringify(name) ++ \"\\n\""])
         .current_dir(root)
         .output()
@@ -1692,5 +1698,46 @@ mod tests {
 
         std::fs::remove_dir_all(&path).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn workspace_names_does_not_snapshot_the_working_copy() {
+        // `jj workspace list` snapshots the working copy by default, and that
+        // snapshot writes under `.jj` - exactly what the TUI's recursive `.jj`
+        // watcher reacts to. A projection that snapshots therefore re-triggers
+        // its own reload, forever: the storm in ticket 41. The read must be
+        // pure, so a dirty working copy is left dirty.
+        let repo = temp_repo("pure-read");
+        let root = repo.canonicalize().unwrap();
+        std::fs::write(root.join("dirty.txt"), "unsnapshotted\n").unwrap();
+
+        let before = working_copy_commit(&root);
+        let _ = workspace_names(&root).unwrap();
+        let after = working_copy_commit(&root);
+
+        assert_eq!(
+            before, after,
+            "workspace_names must not snapshot the working copy"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The working-copy commit id, read without snapshotting it first.
+    fn working_copy_commit(root: &Path) -> String {
+        let output = Command::new("jj")
+            .args([
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                "@",
+                "--no-graph",
+                "-T",
+                "commit_id",
+            ])
+            .current_dir(root)
+            .output()
+            .expect("jj log");
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
     }
 }
