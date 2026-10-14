@@ -500,6 +500,9 @@ impl RunSupervisor {
     ///
     /// Everything else is returned unchanged: another runtime, or an opencode
     /// whose API is unavailable, falls back to today's process-cwd invocation.
+    /// An opencode Run that drives no session also forgets the session recorded
+    /// for the Worker's previous Run, so the sidecar never names a session that
+    /// is not the current Run's.
     /// A Run that already carries a session id is a resume, and keeps it. A
     /// reachable opencode that anchors the session anywhere other than the
     /// Worker Workspace fails the Run rather than let it commit into the wrong
@@ -531,7 +534,14 @@ impl RunSupervisor {
             invocation.name.as_deref(),
         ) {
             Ok(Some(session_id)) => session_id,
-            Ok(None) => return Ok(invocation),
+            Ok(None) => {
+                // The API is unreachable, so this Run drives no session. Forget
+                // the previous one rather than leave its id in place: a later
+                // reconcile would read that Run's outcome and finish this
+                // Worker while its work is still going.
+                self.forget_session(reservation)?;
+                return Ok(invocation);
+            }
             Err(reason) => {
                 return Err(RunSupervisorError::OpenCodeSession {
                     worker: worker.clone(),
@@ -559,6 +569,20 @@ impl RunSupervisor {
             .map_err(|source| RunSupervisorError::OpenCodeSession {
                 worker: worker.clone(),
                 reason: format!("cannot record the Run's session id: {source}"),
+            })
+    }
+
+    /// Forgets the session recorded for the Worker's previous Run.
+    fn forget_session(&self, reservation: &Reservation) -> Result<(), RunSupervisorError> {
+        let worker = reservation.worker_id();
+        reservation
+            .repository()
+            .state_store()
+            .sessions()
+            .clear(worker)
+            .map_err(|source| RunSupervisorError::OpenCodeSession {
+                worker: worker.clone(),
+                reason: format!("cannot forget the Run's session id: {source}"),
             })
     }
 

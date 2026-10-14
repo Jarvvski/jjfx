@@ -1933,11 +1933,26 @@ impl SessionStateRepository {
     ) -> Result<(), StateError> {
         let session_id = session_id.into();
         self.update(|sessions| {
-            sessions.insert(worker.clone(), session_id);
+            sessions.insert(worker.clone(), session_id.clone()) != Some(session_id)
         })
     }
 
-    fn update(&self, edit: impl FnOnce(&mut BTreeMap<WorkerId, String>)) -> Result<(), StateError> {
+    /// Forgets the session id recorded for `worker`, if any.
+    ///
+    /// A Worker whose current Run drives no session must record none: a stale id
+    /// left by a previous Run would let a later reader mistake that Run's
+    /// session for this one's - and finish this Worker on an outcome that was
+    /// never its own.
+    pub fn clear(&self, worker: &WorkerId) -> Result<(), StateError> {
+        self.update(|sessions| sessions.remove(worker).is_some())
+    }
+
+    /// Applies `edit` under the sidecar lock, writing only when it changed
+    /// something.
+    fn update(
+        &self,
+        edit: impl FnOnce(&mut BTreeMap<WorkerId, String>) -> bool,
+    ) -> Result<(), StateError> {
         let subject = "Worker Sessions";
         with_locks(&[self.root.join(SESSION_LOCK)], subject, || {
             let mut sessions =
@@ -1945,7 +1960,9 @@ impl SessionStateRepository {
                     Loaded::Present(versioned) => versioned.value.sessions,
                     Loaded::Missing => BTreeMap::new(),
                 };
-            edit(&mut sessions);
+            if !edit(&mut sessions) {
+                return Ok(());
+            }
             write_atomic(
                 &self.root.join(SESSION_PATH),
                 &SessionState { sessions },

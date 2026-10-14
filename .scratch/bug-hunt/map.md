@@ -279,7 +279,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   sessions sidecar. Declined, with reasons: a `SessionId` newtype (the id is
   opaque and only passed through), bundling `(worker, ticket)` (already carried
   by `RunTarget` where it matters), and narrowing `create_run_session`'s error
-  to `OpenCodeError` (every caller only renders it).
+  to `OpenCodeError` (every caller only renders it). The stale-id residual
+  reported with ticket 37 is now **closed**: a Run that drives no session
+  forgets the previous one, so the sidecar cannot finish the wrong Run.
 
 ## Fog
 

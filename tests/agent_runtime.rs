@@ -2014,6 +2014,16 @@ impl OpencodeSessionFixture {
             .expect("read recorded session")
     }
 
+    /// Records a session as a previous Run would have, so a later Run has a
+    /// stale one to forget.
+    fn record_session(&self, session_id: &str) {
+        self.repository
+            .state_store()
+            .sessions()
+            .record(&self.worker_id, session_id)
+            .expect("record session");
+    }
+
     /// The cwd the fake `opencode run` saw, and the arguments it was given.
     fn recorded_run(&self) -> (PathBuf, Vec<String>) {
         let contents = fs::read_to_string(&self.run_args).expect("recorded opencode run");
@@ -2101,6 +2111,29 @@ fn opencode_run_falls_back_when_the_session_api_is_unavailable() {
         "an unavailable API must not drive a session: {arguments:?}"
     );
     assert_eq!(fixture.recorded_session(), None);
+}
+
+/// A Run that drives no session must forget the one a previous Run recorded.
+/// Leaving it in place would let a later reconcile read that Run's outcome and
+/// finish this Worker while its work is still going.
+#[test]
+fn opencode_run_without_a_session_forgets_a_previously_recorded_one() {
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_UNAVAILABLE_SCRIPT);
+    fixture.record_session("ses_stale");
+
+    let output = fixture.spawn_helper(&fixture.workspace, None);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    assert_eq!(
+        fixture.recorded_session(),
+        None,
+        "a Run that drives no session must not leave a previous Run's session recorded"
+    );
 }
 
 #[test]
