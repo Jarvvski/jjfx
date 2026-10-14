@@ -202,10 +202,11 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   after. Same class as 35 but a different mechanism: isolation, not deadlines.
   No changelog entry: nothing user-visible.
 - [37](issues/37-stopping-a-worker-does-not-stop-its-work.md) - F2, split out of
-  05. **ready-for-agent** - decided 2026-10-14: identify the Run's session by the
-  `--title` jjfx already sets, stop it with `session.interrupt`, and treat an
-  opencode Run as finished on the session `outcome` or a run-log result rather than
-  on the client pid. Must land **after** 07/20 - it changes the same functions.
+  05. **ready-for-agent** - decided 2026-10-14: stop a Run with
+  `session.interrupt`, and treat an opencode Run as finished on the session
+  `outcome` or a run-log result rather than on the client pid. Identify the session
+  by the id jjfx creates in 38; title matching is only a fallback. **Sequence: after
+  07/20 and after 38** - it changes the same functions as 07/20 and builds on 38.
 - [38](issues/38-set-run-session-directory.md) - guard for the ticket 05 class.
   **ready-for-agent** - decided 2026-10-14: create the Run's session via
   `session.create` with `location.directory` = the Worker Workspace, then drive it

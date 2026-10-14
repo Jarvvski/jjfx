@@ -114,3 +114,16 @@ path matters and any adoption needs a capability check rather than an assumption
 **Sequencing.** This changes `reconcile_worker` (`src/engine/pool.rs`) and
 `terminate_recorded_process` / `reset_run` (`src/engine/runtime.rs`) - the same
 functions tickets 07 and 20 change - so it must land **after** them, not alongside.
+
+**Revision (2026-10-14, after ticket 38).** Ticket 38 has jjfx *create* the Run's
+session via `session.create` and keep the id opencode returns, so jjfx knows the
+session id outright and the title matching above is no longer needed. Revised:
+
+- **Identify the session by the id jjfx created in 38.** Title matching is retained
+  only as a fallback for a session jjfx did not create.
+- Liveness stays `session.outcome` or a run-log result, now looked up by that id.
+- **Sequence: 38 lands before 37**, both after 07/20.
+
+The original choice is kept above for the record - it was right given what was known
+then, and its rejection of *minting* an id still stands: 38 creates a session and
+keeps the id opencode returns rather than inventing one.
