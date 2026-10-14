@@ -1,6 +1,6 @@
 # Pull-request base for mixed merged and unmerged blockers
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: question
 Blocked by: none
 
@@ -75,3 +75,16 @@ No test covers a **mix**; the mixed case is untested.
 - [ ] The chosen rule is recorded in `## Comments`.
 - [ ] A test pins the mixed case, which is untested today.
 - [ ] If the code changes, `mise run check` is green.
+
+## Comments
+
+**Decision (2026-10-14): option 1 - first non-`main` branch.** When the direct
+blockers mix a merged one (`branch = "main"`) with a completed blocker carrying a
+real stacked branch, the base is the first blocker whose branch is not `main`.
+
+Rationale: it is the only option that fixes a silently wrong base. `branches[0]`,
+sorted by ticket id, let a merged blocker rebase the dependent onto trunk while a
+stacked prerequisite existed - so the dependent's PR would contain that
+prerequisite's unmerged diff, contradicting the same context's `description()`
+which already names the real branch. The "all branches are `main` -> `None`" guard
+is unchanged; the "first blocker" wording in wsg issue 12 is amended.

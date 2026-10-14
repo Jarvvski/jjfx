@@ -99,7 +99,8 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [06](issues/06-exclude-git-exported-bookmarks.md) - D3 (blocked by 02).
   **wontfix** - refuted.
 - [07](issues/07-durable-run-identity.md) - C2, C7.
-  **ready-for-human** - needs a decision (new dep / unsafe / accept risk).
+  **ready-for-agent** - option 3: group-based liveness, no new dependency; landed
+  with 20/C4, which gives every Run its own process group.
 - [08](issues/08-serialize-workspace-operations.md) - C1 (blocked by 03).
   **resolved** - Follow-ups and rebases take the lock.
 - [09](issues/09-order-cleanup-marker-after-manifest.md) - C3.
@@ -129,9 +130,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [19](issues/19-event-log-tolerance-and-tailing.md) - T3, T4, T5.
   **resolved** - lossy line reader, replay offset, in-tailer rotation.
 - [20](issues/20-workspace-cleanup-robustness.md) - C4, C5, C6.
-  **ready-for-human** - C5 fixed; C4 needs a terminal/job-control decision, C6
-  needs a way to test a SIGKILL-surviving group. Reclassified from
-  `ready-for-agent`: both remaining items are decision-blocked, not work-blocked.
+  **ready-for-agent** - C5 fixed; C4 option 1 (own process group plus
+  `tcsetpgrp`, via rustix's dependency-free `termios` feature) and C6 verified by
+  injecting the cleanup outcome. Both decided 2026-10-14.
 
 ### Phase 3 - improvements
 
@@ -175,15 +176,17 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [30](issues/30-background-store-reload.md) - the `Store::reload` half of 17.
   **resolved** - reloaded via `Effect::ReloadStore`.
 - [31](issues/31-attention-precedence-on-stacked-work.md) - D6, split out of 28.
-  **ready-for-human** - which rule wins for a changes-requested PR with newer
-  work stacked above it.
+  **ready-for-agent** - option 1: nudge wins, so a changes-requested PR outranks
+  work stacked above it; CONTEXT's least-delivered statement is amended.
 - [32](issues/32-mixed-merged-and-unmerged-blockers.md) - D7, split out of 28.
-  **ready-for-human** - the PR base for a mix of merged and unmerged blockers.
+  **ready-for-agent** - option 1: the first non-`main` branch, so a merged
+  blocker cannot silently rebase a dependent onto trunk.
 - [33](issues/33-non-todo-dependencies-unblock.md) - D8, split out of 28.
-  **ready-for-human** - whether an `In Progress` dependency satisfies dependents.
+  **ready-for-agent** - option 1: block until Done/Merged; in-flight statuses no
+  longer satisfy dependents.
 - [34](issues/34-claude-result-usage.md) - D9, split out of 28.
-  **ready-for-human** - whether a Claude `result` event's usage populates the
-  Run result.
+  **ready-for-agent** - option 1: populate the Run result's usage, matching Pi
+  and Codex.
 - [35](issues/35-load-sensitive-helper-deadlines.md) - the test suite's fixed
   helper-subprocess deadlines, found while landing 03/23/28.
   **resolved** - one shared `HELPER_LIVENESS_TIMEOUT` (120s) in
@@ -227,13 +230,16 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   documented improvement.
 - PID-as-identity is acknowledged in the contract ("liveness hints, not Run
   identity", `:147`). The fix (ticket 07) is a durable Run token, **not** a
-  change to the frozen Worker document. **Ticket 07 is `ready-for-human`:** the
-  current kill paths already only signal process *groups*, so the residual risk
-  is narrow; a full fix needs a process start time, which is not reachable
-  without a new dependency or `unsafe` on macOS. Awaiting an owner decision.
-- Two findings are test-encoded current behaviour - non-todo dependency statuses
-  unblocking (D8), and Claude usage omission (D9). Confirm intent before
-  changing; both live in ticket 28.
+  change to the frozen Worker document. **Decided 2026-10-14 (option 3):** the
+  current kill paths already only signal process *groups*, so the residual risk is
+  narrow - a recycled pid that does not lead a group yields `ESRCH` and kills
+  nothing. Group-based liveness closes the remaining case (a recycled pid that
+  *does* lead a group) with no new dependency and no `unsafe`, and is sound once
+  20/C4 gives every Run its own process group.
+- Two findings were test-encoded current behaviour - non-todo dependency statuses
+  unblocking (D8), and Claude usage omission (D9). **Both decided 2026-10-14**
+  (tickets 33 and 34, option 1 each): in-flight statuses now block until
+  Done/Merged, and Claude's result usage is populated to match Pi and Codex.
 - The Worker cwd report (W1) is **not reproducible** against `main` or
   `v0.52.1`: jjfx sets the Run cwd correctly (guard test added) and opencode
   honours it, including in a colocated worktree. Ticket 05 is `needs-info` with

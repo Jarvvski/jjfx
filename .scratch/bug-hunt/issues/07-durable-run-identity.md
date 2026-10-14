@@ -1,6 +1,6 @@
 # Give every Run a durable identity token
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: task
 Blocked by: none
 
@@ -72,3 +72,21 @@ foreground Runs, so C7 is coupled to C4 (ticket 20).
 ## Out of Scope
 
 - Changing the contract's "liveness hint" wording.
+
+## Comments
+
+**Decision (2026-10-14): option 3 - group-based liveness, no new dependency.**
+Before signalling, the recorded pid must be a live process-group *leader*, and
+`reconcile_worker` uses that same group-based probe instead of a plain
+process-liveness check.
+
+Rationale: the analysis shows both kill paths already signal only a process
+*group*, so a recycled pid that does not lead a group yields `ESRCH` and kills
+nothing; the residual hazard is a recycled pid that also happens to lead a group,
+and this closes it. Option 1 (`sysinfo`, or a crate-wide `unsafe` exception) is
+avoided; option 2 would leave the hazard documented but unfixed.
+
+Coupling: option 3 is only sound once **every** Run owns its process group.
+Background Runs already do; foreground Runs do not, deliberately, because they
+need the terminal's foreground group. That is exactly what 20/C4's decision
+delivers, so the two are implemented and landed together.

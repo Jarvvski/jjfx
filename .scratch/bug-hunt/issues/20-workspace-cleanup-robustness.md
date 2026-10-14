@@ -1,6 +1,6 @@
 # Harden Workspace and process cleanup
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: task
 Blocked by: none
 
@@ -90,3 +90,20 @@ landing unverified.
 ## Out of Scope
 
 - Durable Run identity (ticket 07).
+
+## Comments
+
+**Decision (2026-10-14): C4 option 1, and C6 verified by injecting the cleanup
+outcome.**
+
+- **C4 - own process group plus `tcsetpgrp`.** Foreground Runs are spawned with
+  `process_group(0)` and the terminal is handed to the child with `tcsetpgrp`,
+  taken back on exit. Verified feasible without `unsafe`: `rustix` 1.x exposes
+  safe `tcsetpgrp`/`tcgetpgrp` in `rustix::termios`, and its `termios` feature is
+  a bare `termios = []` with no dependencies - so this is one word added to an
+  existing dependency's feature list, not a new crate. This also makes group-based
+  liveness sound for *every* Run, which is what ticket 07 needs.
+- **C6 - inject the cleanup outcome.** The ordering guarantee is not
+  deterministically testable (a process group cannot be made to survive
+  `SIGKILL`), so the cleanup outcome becomes injectable and the four-line ordering
+  is pinned through that seam rather than landing unverified.

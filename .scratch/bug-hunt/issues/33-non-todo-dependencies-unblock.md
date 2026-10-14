@@ -1,6 +1,6 @@
 # Non-todo dependency statuses satisfy their dependents
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -77,3 +77,20 @@ directly asserted. A fix needs a new test at that combined scenario.
 - [ ] The chosen rule is recorded in `## Comments` (or in CONTEXT).
 - [ ] A test pins an in-flight blocker with a dependent.
 - [ ] If the code changes, `mise run check` is green.
+
+## Comments
+
+**Decision (2026-10-14): option 1 - block until Done/Merged.** `In Progress` and
+`In Review` dependencies no longer satisfy their dependents.
+
+Rationale: CONTEXT defines a Dependency as a Sub-issue that "**must be completed**"
+before another becomes eligible, wsg issue 12 names only Merged/Done as
+satisfying, and the code's own `Skipped` doc scopes skipping to "already delivered
+or cross-repository work" - `In Progress` is neither.
+
+Consequence accepted deliberately: a dependency owned by a human can now stall its
+group indefinitely. That is a quiescent, visible stall, consistent with the
+decision behind ticket 04 (no default `max_cycles`; quiescence is the terminal
+condition), so no timeout is added. Delivered and cross-repository skips must keep
+unblocking - the fix has to distinguish those from in-flight statuses rather than
+flipping `unblocks()`.

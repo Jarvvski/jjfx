@@ -1,6 +1,6 @@
 # Attention precedence when work is stacked above a change-requested PR
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: question
 Blocked by: none
 
@@ -80,3 +80,16 @@ No doc addresses the stacked case directly, which is why this is a question.
 - [ ] The chosen rule is recorded in `## Comments` (or in the doc it changes).
 - [ ] A test pins the stacked scenario that is untested today.
 - [ ] If the code changes, `mise run check` is green.
+
+## Comments
+
+**Decision (2026-10-14): option 1 - nudge wins.** A lower open changes-requested PR
+outranks a newer stacked change, so the Workspace still presents as
+`PrOpen { ChangesRequested }` and, with a Waiting agent, `NeedsYou`. Rationale: a
+blocked PR is the thing a human must act on, and stacking more work above it does
+not remove that.
+
+The masking stays for an **approved** (or verdict-less open) lower PR - the two
+existing `overlay_prefers_*` tests pin that and must keep passing. CONTEXT's
+least-delivered statement (`:56-59`, `:83-88`) must be amended to match; ADR 0003
+stands unchanged.

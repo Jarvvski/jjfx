@@ -1,6 +1,6 @@
 # Claude `result` events drop their reported usage
 
-Status: ready-for-human
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -69,3 +69,19 @@ does assert Codex usage.)
 - [ ] A test pins whichever behaviour is chosen - the current omission is
       untested, so either way this needs a new test.
 - [ ] If the code changes, `mise run check` is green.
+
+## Comments
+
+**Decision (2026-10-14): option 1 - populate it.** A Claude `result` event's
+reported `usage` populates the Run result.
+
+Rationale: Claude is the only runtime that drops it, while Pi (`run_log.rs:1055`)
+and Codex (`:1226`) already populate the Run result's usage, and CONTEXT defines a
+Run result as carrying usage "when reported" - which Claude's `result` event does.
+Additive: the per-message activity usage (`:1442`) stays.
+
+Noted while deciding, and relevant to expectations: `RunResult::usage()` is read
+**only by tests** today - `worker_result_line` renders just the conclusion, and
+nothing in the state or wire layer persists it. So this has no user-visible effect
+yet; it makes the struct match its documented contract and keeps the value
+available for whatever consumes it next.
