@@ -1,6 +1,6 @@
 # Claude `result` events drop their reported usage
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -65,10 +65,10 @@ does assert Codex usage.)
 
 ## Acceptance Criteria
 
-- [ ] The chosen rule is recorded in `## Comments` (or in CONTEXT).
-- [ ] A test pins whichever behaviour is chosen - the current omission is
+- [x] The chosen rule is recorded in `## Comments` (or in CONTEXT).
+- [x] A test pins whichever behaviour is chosen - the current omission is
       untested, so either way this needs a new test.
-- [ ] If the code changes, `mise run check` is green.
+- [x] If the code changes, `mise run check` is green.
 
 ## Comments
 
@@ -85,3 +85,19 @@ Noted while deciding, and relevant to expectations: `RunResult::usage()` is read
 nothing in the state or wire layer persists it. So this has no user-visible effect
 yet; it makes the struct match its documented contract and keeps the value
 available for whatever consumes it next.
+
+## Outcome (2026-10-14)
+
+**Resolved.** `ClaudeEvent` gained `usage: Option<ClaudeUsage>` and
+`parse_claude_result` calls `.with_usage(usage.normalized())`, mirroring Pi
+(`run_log.rs:1055`) and Codex (`:1226`). `ClaudeUsage::normalized()` was left alone
+and the per-message activity usage is untouched.
+
+`final_result_preserves_claude_usage` mirrors `final_result_preserves_codex_usage`
+and feeds the ticket's `result` line. Pre-fix red: `usage: None` vs
+`Some(RunUsage { input_tokens: 150, cached_input_tokens: 10,
+cache_write_input_tokens: 5, output_tokens: 70, reasoning_output_tokens: 0 })`.
+
+Noted at decision time and still true: `RunResult::usage()` is read only by tests
+today, so this has no user-visible effect yet - it makes the struct match CONTEXT's
+definition of a Run result and keeps the value available.

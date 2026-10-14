@@ -1,6 +1,6 @@
 # Pull-request base for mixed merged and unmerged blockers
 
-Status: ready-for-agent
+Status: resolved
 Type: question
 Blocked by: none
 
@@ -72,9 +72,9 @@ No test covers a **mix**; the mixed case is untested.
 
 ## Acceptance Criteria
 
-- [ ] The chosen rule is recorded in `## Comments`.
-- [ ] A test pins the mixed case, which is untested today.
-- [ ] If the code changes, `mise run check` is green.
+- [x] The chosen rule is recorded in `## Comments`.
+- [x] A test pins the mixed case, which is untested today.
+- [x] If the code changes, `mise run check` is green.
 
 ## Comments
 
@@ -88,3 +88,15 @@ stacked prerequisite existed - so the dependent's PR would contain that
 prerequisite's unmerged diff, contradicting the same context's `description()`
 which already names the real branch. The "all branches are `main` -> `None`" guard
 is unchanged; the "first blocker" wording in wsg issue 12 is amended.
+
+## Outcome (2026-10-14)
+
+**Resolved.** `dependency_context` selects `pull_request_base` as the first blocker
+whose branch is not `main` (`branches.iter().find(|branch| branch != "main")`). The
+all-`main` (or empty) guard is preserved by construction: `find` returns `None` and
+the function returns no context, exactly as the old `all(== "main")` check did. The
+full `base_revisions` list is unchanged - only the base skips a merged blocker.
+
+`dependency_context_skips_a_merged_blocker_when_choosing_the_pr_base` pins the
+mixed case (a `main` blocker plus `adam/eng-102-api`) and asserts both the preserved
+list and the corrected base.

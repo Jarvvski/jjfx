@@ -1,6 +1,6 @@
 # Non-todo dependency statuses satisfy their dependents
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -74,9 +74,9 @@ directly asserted. A fix needs a new test at that combined scenario.
 
 ## Acceptance Criteria
 
-- [ ] The chosen rule is recorded in `## Comments` (or in CONTEXT).
-- [ ] A test pins an in-flight blocker with a dependent.
-- [ ] If the code changes, `mise run check` is green.
+- [x] The chosen rule is recorded in `## Comments` (or in CONTEXT).
+- [x] A test pins an in-flight blocker with a dependent.
+- [x] If the code changes, `mise run check` is green.
 
 ## Comments
 
@@ -94,3 +94,29 @@ decision behind ticket 04 (no default `max_cycles`; quiescence is the terminal
 condition), so no timeout is added. Delivered and cross-repository skips must keep
 unblocking - the fix has to distinguish those from in-flight statuses rather than
 flipping `unblocks()`.
+
+## Outcome (2026-10-14)
+
+**Resolved.** `unblocks()` is removed from `SubIssueStatus` and replaced by
+`satisfies_dependency` / `is_delivered_skip` / `is_delivered_skip_reason`; `ready()`,
+`blocked_count()`, `maximum_wave_size()`, `waves()` and `wave_depth()` all move onto
+them. The five-value wire vocabulary (`docs/wsg-compatibility-contract.md:74-76`) is
+respected: an in-flight Dependency stays persisted as `skipped` so jjfx never
+dispatches it, and `skip_reason` is what separates it from a delivered skip.
+
+Tests: `an_in_flight_blocker_does_not_unblock_its_dependent` (`ready()` empty,
+`is_terminal()` true, `blocked()` visible, plus a cross-repo counter-case),
+`a_skipped_blocker_without_a_reason_keeps_satisfying_its_dependents` (the
+compatibility fallback for state predating this distinction), and
+`a_terminal_undelivered_blocker_blocks_its_dependent_and_stalls_the_group`.
+`ready_selection_treats_skipped_blockers_as_satisfied_...` was renamed to
+`..._delivered_skipped_...`, since only a delivered skip satisfies now.
+
+**Behaviour change the owner should know about.** A terminal status that was never
+delivered - `Canceled`, `Duplicate`, or any other non-dispatchable / non-merged /
+non-cross-repo value - now **blocks** its dependents, where the old code unblocked
+them. That follows from "block until Done/Merged", matches the existing `Failed`
+precedent, and yields a quiescent visible stall rather than dispatching work whose
+prerequisite was abandoned. If "cancelled means moot, proceed" is preferred it is a
+one-line change in `is_delivered_skip_reason`. The failure mode of an unrecognised
+future status (e.g. `Shipped`) is the same conservative block.

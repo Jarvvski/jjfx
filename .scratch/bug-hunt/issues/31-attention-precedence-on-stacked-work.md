@@ -1,6 +1,6 @@
 # Attention precedence when work is stacked above a change-requested PR
 
-Status: ready-for-agent
+Status: resolved
 Type: question
 Blocked by: none
 
@@ -77,9 +77,9 @@ No doc addresses the stacked case directly, which is why this is a question.
 
 ## Acceptance Criteria
 
-- [ ] The chosen rule is recorded in `## Comments` (or in the doc it changes).
-- [ ] A test pins the stacked scenario that is untested today.
-- [ ] If the code changes, `mise run check` is green.
+- [x] The chosen rule is recorded in `## Comments` (or in the doc it changes).
+- [x] A test pins the stacked scenario that is untested today.
+- [x] If the code changes, `mise run check` is green.
 
 ## Comments
 
@@ -93,3 +93,21 @@ The masking stays for an **approved** (or verdict-less open) lower PR - the two
 existing `overlay_prefers_*` tests pin that and must keep passing. CONTEXT's
 least-delivered statement (`:56-59`, `:83-88`) must be amended to match; ADR 0003
 stands unchanged.
+
+## Outcome (2026-10-14)
+
+**Resolved.** `overlay` resolves the row's open PR up front (extracted as
+`select_open_pr`) and returns `PrOpen { ChangesRequested }` before the
+`Dirty`/`Pushed` checks when the selected PR's verdict is changes-requested. Every
+other verdict falls through to the existing least-delivered masking, so the two
+APPROVED-PR tests are unchanged and act as the guard against over-applying.
+`derive` needed no change - it already maps `Waiting` + `PrOpen { ChangesRequested }`
+to `NeedsYou`.
+
+`lower_changes_requested_pr_is_not_masked_by_stacked_work` covers both the
+newer-local and newer-pushed variants plus the combined `derive` signal. Pre-fix
+red: `left: Dirty { added: 0, removed: 0 }`, `right: PrOpen { number: 10, verdict:
+ChangesRequested }`.
+
+CONTEXT was amended in both places that stated the least-delivered rule, naming the
+single exception; ADR 0003 already argued for the nudge, so it is unchanged.

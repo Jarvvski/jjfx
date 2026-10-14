@@ -48,6 +48,29 @@ retired, so entries here are versioned by `jjfx` alone.
 
 ### Fixed
 
+- 2026-10-14 - A change-requested Pull Request is no longer masked when newer
+  work is stacked above it: the Workspace reads as `PrOpen { ChangesRequested }`
+  and surfaces as needs-you, where it previously read as merely "ready to forge"
+  and the change request was invisible. Approved and undecided PRs are still
+  masked by newer work. (fix)
+
+- 2026-10-14 - A dependent whose Blockers mix a merged one with a real stacked
+  branch now bases its Pull Request on the first unmerged branch, rather than on
+  whichever Blocker happened to sort first by ticket id. Previously a merged
+  Blocker sorting first opened the dependent's PR against trunk, silently
+  swallowing an unmerged prerequisite's diff. (fix)
+
+- 2026-10-14 - An in-flight Dependency (`In Progress`, `In Review`) no longer
+  satisfies its dependents: a Dependency must be completed, delivered, or
+  cross-repository before its dependents become eligible. A group waiting on one
+  is a quiescent, visible stall rather than a silent premature dispatch. A
+  terminal status that was never delivered (`Canceled`, `Duplicate`) blocks too,
+  as a `Failed` Dependency already did. (fix)
+
+- 2026-10-14 - A Claude `result` event's reported `usage` now populates the Run
+  result, matching Pi and Codex. It was previously dropped, so a Claude Run's
+  result carried duration, turns and cost but no usage. (fix)
+
 - 2026-10-13 - A jj read failure no longer reads as a plausible success. `tidy`,
   `tidyws` and `lift` treated a broken revset as "nothing to do" (the count
   returned 0 on any failure); a broken repository read as "no workspaces"; a

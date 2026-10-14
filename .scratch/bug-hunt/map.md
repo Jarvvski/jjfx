@@ -176,17 +176,16 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [30](issues/30-background-store-reload.md) - the `Store::reload` half of 17.
   **resolved** - reloaded via `Effect::ReloadStore`.
 - [31](issues/31-attention-precedence-on-stacked-work.md) - D6, split out of 28.
-  **ready-for-agent** - option 1: nudge wins, so a changes-requested PR outranks
-  work stacked above it; CONTEXT's least-delivered statement is amended.
+  **resolved** - option 1: a changes-requested PR outranks work stacked above it;
+  `overlay` returns early only for a change request, and CONTEXT is amended.
 - [32](issues/32-mixed-merged-and-unmerged-blockers.md) - D7, split out of 28.
-  **ready-for-agent** - option 1: the first non-`main` branch, so a merged
-  blocker cannot silently rebase a dependent onto trunk.
+  **resolved** - option 1: the first non-`main` branch, so a merged blocker
+  cannot silently rebase a dependent onto trunk.
 - [33](issues/33-non-todo-dependencies-unblock.md) - D8, split out of 28.
-  **ready-for-agent** - option 1: block until Done/Merged; in-flight statuses no
-  longer satisfy dependents.
+  **resolved** - option 1: block until Done/Merged; in-flight and terminal
+  undelivered statuses no longer satisfy dependents, and `unblocks()` is gone.
 - [34](issues/34-claude-result-usage.md) - D9, split out of 28.
-  **ready-for-agent** - option 1: populate the Run result's usage, matching Pi
-  and Codex.
+  **resolved** - option 1: populate the Run result's usage, matching Pi and Codex.
 - [35](issues/35-load-sensitive-helper-deadlines.md) - the test suite's fixed
   helper-subprocess deadlines, found while landing 03/23/28.
   **resolved** - one shared `HELPER_LIVENESS_TIMEOUT` (120s) in
