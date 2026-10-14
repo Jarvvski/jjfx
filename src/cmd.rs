@@ -10,16 +10,22 @@
 //! both output streams. `.output()` closes stdin, so it cannot host that case.
 
 use std::ffi::OsStr;
+use std::io::Read;
 #[cfg(test)]
 use std::io::{BufRead, BufReader};
 use std::path::Path;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(test)]
 use std::sync::mpsc;
-#[cfg(test)]
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
+
+/// How often a bounded run re-checks whether its child has exited. Small enough
+/// that a query that finishes promptly is not delayed, large enough that the
+/// wait loop is not a busy spin.
+const BOUNDED_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
 /// A command builder that always captures output. Chain `arg`/`args`/
 /// `current_dir`/`env`, then finish with [`run`](Cmd::run).
@@ -106,6 +112,52 @@ impl Cmd {
         })
     }
 
+    /// Run to completion like [`run`](Cmd::run), but give up after `timeout`:
+    /// the child is killed and an error returned. Both streams are drained on
+    /// dedicated threads while the deadline is watched, so a child that fills a
+    /// pipe buffer cannot deadlock the wait.
+    ///
+    /// For the terminal query, which a stuck or overloaded kitty would otherwise
+    /// block without bound. Deliberately a separate method rather than a bound on
+    /// [`run`](Cmd::run): agent Runs and `jj` operations are legitimately long.
+    pub fn run_with_timeout(mut self, timeout: Duration) -> Result<Run> {
+        let mut child = self
+            .inner
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("running {}", self.label))?;
+        let stdout = child.stdout.take().context("capturing command stdout")?;
+        let stderr = child.stderr.take().context("capturing command stderr")?;
+        let stdout_reader = spawn_pipe_reader(stdout);
+        let stderr_reader = spawn_pipe_reader(stderr);
+
+        let deadline = Instant::now() + timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() >= deadline => {
+                    reap_killed(&mut child, stdout_reader, stderr_reader);
+                    return Err(anyhow!("{} did not finish within {timeout:?}", self.label));
+                }
+                Ok(None) => thread::sleep(BOUNDED_POLL_INTERVAL),
+                Err(source) => {
+                    reap_killed(&mut child, stdout_reader, stderr_reader);
+                    return Err(anyhow!("waiting for {}: {source}", self.label));
+                }
+            }
+        };
+        let stdout = finish_pipe(stdout_reader, "stdout")?;
+        let stderr = finish_pipe(stderr_reader, "stderr")?;
+        Ok(Run {
+            label: self.label,
+            ok: status.success(),
+            stdout,
+            stderr,
+        })
+    }
+
     #[cfg(test)]
     /// Run to completion while delivering complete output lines to `on_line`.
     /// Both streams remain captured in the returned [`Run`].
@@ -151,6 +203,41 @@ impl Cmd {
             stderr: stderr_text,
         })
     }
+}
+
+/// Drain a child pipe to EOF on its own thread, as lossy UTF-8. Reading
+/// concurrently with the wait is what keeps a full pipe buffer from wedging the
+/// child.
+fn spawn_pipe_reader<R: Read + Send + 'static>(mut pipe: R) -> thread::JoinHandle<Result<String>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        pipe.read_to_end(&mut bytes)?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+}
+
+/// Collect one drained pipe, mapping a panicked reader to an error.
+fn finish_pipe(reader: thread::JoinHandle<Result<String>>, name: &'static str) -> Result<String> {
+    reader
+        .join()
+        .map_err(|_| anyhow!("reading command {name} failed"))?
+}
+
+/// Kill a child that overran its deadline and reap it.
+///
+/// The pipe readers are detached rather than joined: joining waits for every
+/// holder of the child's stdout and stderr to close them, and a surviving
+/// descendant could postpone that indefinitely - which would defeat the very
+/// bound this exists to enforce. The threads end at EOF once the pipes close.
+fn reap_killed(
+    child: &mut Child,
+    stdout_reader: thread::JoinHandle<Result<String>>,
+    stderr_reader: thread::JoinHandle<Result<String>>,
+) {
+    let _ = child.kill();
+    let _ = child.wait();
+    drop(stdout_reader);
+    drop(stderr_reader);
 }
 
 #[cfg(test)]
@@ -246,6 +333,31 @@ mod tests {
         let run = cmd("printf").arg("hello").run().expect("printf spawns");
         assert!(run.ok());
         assert_eq!(run.stdout(), "hello");
+    }
+
+    #[test]
+    fn bounded_run_captures_a_prompt_command() {
+        let run = cmd("printf")
+            .arg("hello")
+            .run_with_timeout(Duration::from_secs(5))
+            .expect("printf finishes well within the bound");
+        assert!(run.ok());
+        assert_eq!(run.stdout(), "hello");
+    }
+
+    #[test]
+    fn bounded_run_kills_a_child_that_overruns_its_deadline() {
+        let started = Instant::now();
+        let error = cmd("sleep")
+            .arg("30")
+            .run_with_timeout(Duration::from_millis(200))
+            .expect_err("a child that overruns must be killed, not waited on");
+        assert!(error.to_string().contains("did not finish"), "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the bound must return promptly, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

@@ -13,7 +13,8 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::engine::{PaneLayout, PaneRole, SplitLocation};
 use anyhow::{Context, anyhow};
@@ -209,6 +210,11 @@ pub struct KittyTerminal {
     /// `JJFX_LAYOUT` override. Resolved per open so a display change is picked
     /// up without restarting.
     layout: LayoutSettings,
+    /// Single-flight, short-TTL cache for the `kitten @ ls` query. The terminal
+    /// is shared across threads (the worker-pool poller, Dispatch exclusions,
+    /// `refresh`, and the UI all reach it), so without this a slow kitty lets
+    /// every caller spawn its own `kitten` and the subprocesses stack.
+    query_cache: QueryCache,
 }
 
 /// How long to wait for a freshly-launched target to expose its socket, and how
@@ -216,6 +222,57 @@ pub struct KittyTerminal {
 /// hanging the UI indefinitely.
 const LAUNCH_PROBE_ATTEMPTS: u32 = 25;
 const LAUNCH_PROBE_INTERVAL: Duration = Duration::from_millis(200);
+
+/// The longest a single `kitten @ ls` may run before it is killed and reported
+/// as an error. A healthy kitty answers in milliseconds; the bound exists so a
+/// stuck or overloaded kitty yields an `Err` within a bounded time instead of
+/// blocking callers without limit.
+const LS_QUERY_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a completed `kitten @ ls` result is reused before a fresh query.
+/// Kept short and at or below [`LS_QUERY_TIMEOUT`]: the open set feeds
+/// Dispatch's fail-closed occupancy check, and a stale set can only *miss* a
+/// Workspace a human opened after the query - so the staleness window must stay
+/// far below a human's open-a-tab-then-dispatch reaction. It also caps the
+/// refresh storm at roughly one `kitten` spawn per TTL.
+const LS_CACHE_TTL: Duration = Duration::from_secs(2);
+
+/// A shared `kitten @ ls` outcome. The error is a rendered string because
+/// `anyhow::Error` is not `Clone` and every caller stringifies it anyway.
+type LsOutcome = Result<Value, String>;
+
+/// The single-flight, short-TTL cache behind [`KittyTerminal::ls`].
+///
+/// At most one query runs at a time. Callers that arrive while one is in flight
+/// wait for it and then reuse its result; callers within [`LS_CACHE_TTL`] of a
+/// completed query reuse that result without spawning anything. Failures are
+/// cached for the same window, which keeps Dispatch fail-closed: a terminal that
+/// cannot be queried keeps yielding `Err` (never a fabricated empty set) until
+/// the cache expires, at which point the query is retried.
+#[derive(Default)]
+struct QueryCache {
+    state: Mutex<QueryState>,
+    /// Signalled whenever an in-flight query completes, waking its waiters.
+    completed: Condvar,
+}
+
+#[derive(Default)]
+struct QueryState {
+    /// The last completed query and when it finished.
+    last: Option<(Instant, Arc<LsOutcome>)>,
+    /// Whether a query is running. Only one runs at a time.
+    querying: bool,
+}
+
+/// Rebuild a caller-owned result from a shared, cached outcome. A cached `Err`
+/// stays an `Err`, so the cache can never turn an unreadable terminal into a
+/// readable one.
+fn shared_outcome(outcome: &LsOutcome) -> anyhow::Result<Value> {
+    match outcome {
+        Ok(tree) => Ok(tree.clone()),
+        Err(message) => Err(anyhow!("{message}")),
+    }
+}
 
 impl KittyTerminal {
     /// Build from config plus the resolved agent and first-pane commands. Empty
@@ -232,6 +289,7 @@ impl KittyTerminal {
             agent_command,
             first_pane_command,
             layout: LayoutSettings::from_config(cfg),
+            query_cache: QueryCache::default(),
         }
     }
 
@@ -298,10 +356,58 @@ impl KittyTerminal {
         )
     }
 
-    /// Parse `kitten @ ls` into its JSON tree.
+    /// Parse `kitten @ ls` into its JSON tree, single-flighting concurrent
+    /// callers and reusing a recent result.
+    ///
+    /// Every caller shares one in-flight query rather than spawning its own
+    /// `kitten`, and a result younger than [`LS_CACHE_TTL`] is served directly.
+    /// The query itself is bounded by [`LS_QUERY_TIMEOUT`], so a stuck kitty
+    /// surfaces as an `Err` instead of blocking the caller forever.
     fn ls(&self) -> anyhow::Result<Value> {
-        let json = self.run(&["ls"])?;
-        serde_json::from_str(&json).context("parsing `kitten @ ls` output")
+        let mut state = self.query_cache.state.lock().expect("terminal query cache");
+        loop {
+            if let Some((at, outcome)) = state.last.as_ref()
+                && at.elapsed() < LS_CACHE_TTL
+            {
+                return shared_outcome(outcome);
+            }
+            if state.querying {
+                // Another caller already has a query in flight: wait for its
+                // result and re-check the cache rather than spawning a second
+                // `kitten`.
+                state = self
+                    .query_cache
+                    .completed
+                    .wait(state)
+                    .expect("terminal query cache");
+                continue;
+            }
+            // This caller becomes the single leader; run the query with the lock
+            // released so waiters are not blocked behind the subprocess.
+            state.querying = true;
+            drop(state);
+            let outcome = Arc::new(self.query_ls());
+            state = self.query_cache.state.lock().expect("terminal query cache");
+            state.querying = false;
+            state.last = Some((Instant::now(), Arc::clone(&outcome)));
+            self.query_cache.completed.notify_all();
+            return shared_outcome(&outcome);
+        }
+    }
+
+    /// Run one bounded `kitten @ ls` and parse it. The error is a rendered
+    /// string so the outcome can be shared across callers; it carries the
+    /// address, stderr, or the timeout reason.
+    fn query_ls(&self) -> LsOutcome {
+        let to = self.resolved_to().map_err(|error| error.to_string())?;
+        let json = cmd("kitten")
+            .args(kitten_argv(to.as_deref(), &["ls"]))
+            .run_with_timeout(LS_QUERY_TIMEOUT)
+            .context("running `kitten @ ls` - is kitty's remote control enabled?")
+            .and_then(|run| run.checked())
+            .map_err(|error| error.to_string())?;
+        serde_json::from_str(&json)
+            .map_err(|error| format!("parsing `kitten @ ls` output: {error}"))
     }
 
     /// `launch` a window and return the new window's id (kitty prints it to
@@ -586,7 +692,14 @@ fn regex_escape(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::TerminalConfig;
     use crate::engine::PanePlacement;
+    use std::env;
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+    use std::thread;
 
     #[test]
     fn tab_title_is_prefixed() {
@@ -1071,5 +1184,213 @@ mod tests {
         assert_eq!(title_match("feat"), "title:^jjfx:feat$");
         // A regex-special char in the name is escaped so the match stays literal.
         assert_eq!(title_match("a.b"), "title:^jjfx:a\\.b$");
+    }
+
+    // --- The terminal-query regression (ticket 40) -------------------------
+    //
+    // `KittyTerminal` is private to this crate and the integration harness in
+    // `tests/worker_actions.rs` stubs `kitten` for `WorkerActions::mount`, which
+    // shells out directly rather than through this type. The regression is
+    // therefore pinned here, next to the code under test, using the same
+    // subprocess-helper pattern as `workspace_dispatch` and `config`: a parent
+    // test runs the stub on `PATH` and the helper runs the storm in a child.
+
+    /// Environment the storm and timeout helpers read.
+    const STORM_ACTIVE_ENV: &str = "JJFX_TERMINAL_STORM_ACTIVE";
+    const STORM_CALLS_ENV: &str = "JJFX_TERMINAL_STORM_CALLS";
+    const STORM_THREADS_ENV: &str = "JJFX_TERMINAL_STORM_THREADS";
+    const STORM_DURATION_ENV: &str = "JJFX_TERMINAL_STORM_DURATION_MS";
+    const TIMEOUT_RESULT_ENV: &str = "JJFX_TERMINAL_TIMEOUT_RESULT";
+
+    /// How long the stub `kitten @ ls` sleeps. Below [`LS_CACHE_TTL`] so the
+    /// storm exercises de-duplication rather than the timeout.
+    const STUB_LS_SLEEP_SECONDS: u32 = 1;
+    /// A refresh storm wide enough that, without single-flight, every thread
+    /// would have a `kitten` in flight at once.
+    const STORM_THREADS: usize = 16;
+    /// Shorter than [`LS_CACHE_TTL`], so a healthy de-duplicating terminal
+    /// answers the whole storm from the first result.
+    const STORM_DURATION: Duration = Duration::from_millis(1500);
+
+    /// A slow kitty must never stack `kitten @ ls` subprocesses: concurrent
+    /// callers share one query, and a recent result is reused, so a refresh
+    /// storm spawns a couple of processes instead of one per caller.
+    #[test]
+    fn a_slow_terminal_query_is_single_flighted_and_rate_limited() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("stub bin directory");
+        write_executable(
+            &bin.join("kitten"),
+            &stub_kitten_script(STUB_LS_SLEEP_SECONDS),
+        );
+        let active = directory.path().join("active");
+        fs::create_dir(&active).expect("active directory");
+        let calls_path = directory.path().join("calls");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            env::var("PATH").expect("PATH is set")
+        );
+
+        let mut child = Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "--ignored",
+                "terminal::tests::terminal_query_storm_helper",
+            ])
+            .env("PATH", path)
+            .env("KITTY_LISTEN_ON", "unix:/tmp/jjfx-stub-kitty")
+            .env(STORM_ACTIVE_ENV, &active)
+            .env(STORM_CALLS_ENV, &calls_path)
+            .env(STORM_THREADS_ENV, STORM_THREADS.to_string())
+            .env(STORM_DURATION_ENV, STORM_DURATION.as_millis().to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("storm helper should start");
+
+        // Sample how many stub `kitten` processes are alive at once while the
+        // helper hammers the terminal.
+        let mut peak = 0usize;
+        loop {
+            peak = peak.max(fs::read_dir(&active).expect("active directory").count());
+            if child.try_wait().expect("helper status").is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        let output = child.wait_with_output().expect("helper output");
+        assert!(
+            output.status.success(),
+            "storm helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let calls = fs::read_to_string(&calls_path).map_or(0, |log| log.lines().count());
+        assert_eq!(
+            peak, 1,
+            "a slow kitty must never see more than one concurrent `kitten @ ls`"
+        );
+        assert!(
+            calls <= 2,
+            "a refresh storm must be rate-limited, but spawned {calls} `kitten @ ls`"
+        );
+    }
+
+    /// A kitty that never answers must yield an error within the bound rather
+    /// than blocking the caller forever.
+    #[test]
+    fn a_stuck_terminal_query_times_out_instead_of_blocking() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let bin = directory.path().join("bin");
+        fs::create_dir(&bin).expect("stub bin directory");
+        // `exec` makes the sleep the direct child, so the kill reaches it and no
+        // process is left running behind the test.
+        write_executable(&bin.join("kitten"), "#!/bin/sh\nexec sleep 60\n");
+        let result = directory.path().join("result");
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            env::var("PATH").expect("PATH is set")
+        );
+
+        let started = Instant::now();
+        let output = Command::new(env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "--ignored",
+                "terminal::tests::terminal_query_timeout_helper",
+            ])
+            .env("PATH", path)
+            .env("KITTY_LISTEN_ON", "unix:/tmp/jjfx-stub-kitty")
+            .env(TIMEOUT_RESULT_ENV, &result)
+            .stdin(Stdio::null())
+            .output()
+            .expect("timeout helper should run");
+        let elapsed = started.elapsed();
+
+        assert!(
+            output.status.success(),
+            "timeout helper failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(fs::read_to_string(&result).expect("timeout result"), "err");
+        assert!(
+            elapsed < LS_QUERY_TIMEOUT + Duration::from_secs(3),
+            "a stuck query must fail within its bound, took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore]
+    fn terminal_query_storm_helper() {
+        let terminal = shared_terminal();
+        let threads: usize = env::var(STORM_THREADS_ENV)
+            .expect("storm threads")
+            .parse()
+            .expect("storm threads are numeric");
+        let duration = Duration::from_millis(
+            env::var(STORM_DURATION_ENV)
+                .expect("storm duration")
+                .parse()
+                .expect("storm duration is numeric"),
+        );
+        let deadline = Instant::now() + duration;
+        thread::scope(|scope| {
+            for _ in 0..threads {
+                scope.spawn(|| {
+                    while Instant::now() < deadline {
+                        // The stub answers, so a query error here is a real one.
+                        assert!(terminal.open_workspaces().is_ok());
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn terminal_query_timeout_helper() {
+        let terminal = shared_terminal();
+        let outcome = if terminal.open_workspaces().is_ok() {
+            "ok"
+        } else {
+            "err"
+        };
+        fs::write(
+            env::var(TIMEOUT_RESULT_ENV).expect("timeout result path"),
+            outcome,
+        )
+        .expect("timeout result");
+    }
+
+    /// The terminal the helpers hammer: no explicit target, so `kitten` inherits
+    /// `KITTY_LISTEN_ON` from the environment (the stub ignores it).
+    fn shared_terminal() -> KittyTerminal {
+        KittyTerminal::new(&TerminalConfig::default(), Vec::new(), Vec::new())
+    }
+
+    /// A `kitten` stub whose `ls` records that it is running, sleeps, then
+    /// answers with an empty tree - a stand-in for a slow kitty.
+    fn stub_kitten_script(sleep_seconds: u32) -> String {
+        format!(
+            "#!/bin/sh\n\
+             : > \"${{{STORM_ACTIVE_ENV}}}/$$\"\n\
+             printf 'ls\\n' >> \"${{{STORM_CALLS_ENV}}}\"\n\
+             sleep {sleep_seconds}\n\
+             rm -f \"${{{STORM_ACTIVE_ENV}}}/$$\"\n\
+             printf '[]\\n'\n"
+        )
+    }
+
+    fn write_executable(path: &Path, contents: &str) {
+        fs::write(path, contents).expect("stub executable");
+        let mut permissions = fs::metadata(path)
+            .expect("stub executable metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions).expect("stub executable permissions");
     }
 }
