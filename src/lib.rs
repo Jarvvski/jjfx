@@ -260,7 +260,12 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     // Work-lifecycle poller: recompute the jj/gh work state periodically and on
     // demand, sending Msg::WorkSnapshot. `work_tx` nudges it when the repo changes.
     let (work_tx, work_rx) = mpsc::unbounded_channel::<()>();
-    spawn_work_poller(repo_root.clone(), tx.clone(), work_rx);
+    spawn_work_poller(
+        repo_root.clone(),
+        config.migrations.pattern.clone(),
+        tx.clone(),
+        work_rx,
+    );
 
     // Blocking terminal-input reader on its own thread -> Msg::Input.
     spawn_input_reader(tx.clone());
@@ -399,16 +404,20 @@ async fn event_loop(
     Ok(())
 }
 
-/// Recompute the work-lifecycle snapshot on an interval and whenever nudged via
-/// `refresh_rx`, sending each result as [`Msg::WorkSnapshot`]. The jj/gh reads
-/// are blocking, so they run on `spawn_blocking`.
+/// Recompute the work-lifecycle snapshot and the cross-workspace migration-order
+/// report on an interval and whenever nudged via `refresh_rx`, sending each as
+/// [`Msg::WorkSnapshot`] and [`Msg::MigrationReport`]. The jj/gh reads and the
+/// migration walk are blocking, so they run on `spawn_blocking`.
 ///
 /// `jj::workspace_names` reports a typed error rather than an empty list when jj
 /// cannot be read. The poller cannot surface that from inside the alt-screen, so
 /// it degrades deliberately: it reuses the last good names so a transient failure
-/// does not blank the work list, and retries on the next tick.
+/// does not blank the work list, and retries on the next tick. A failed migration
+/// read degrades the same way - to no notice rather than a false one; `jjfx check
+/// migrations` is the surface that reports a read error.
 fn spawn_work_poller(
     repo_root: PathBuf,
+    migrations_pattern: String,
     tx: UnboundedSender<Msg>,
     mut refresh_rx: mpsc::UnboundedReceiver<()>,
 ) {
@@ -418,18 +427,23 @@ fn spawn_work_poller(
         loop {
             let root = repo_root.clone();
             let previous = last_names.clone();
+            let pattern = migrations_pattern.clone();
             let polled = tokio::task::spawn_blocking(move || {
                 let mut names = jj::workspace_names(&root).unwrap_or(previous);
                 if !names.iter().any(|n| n == store::DEFAULT_WORKSPACE) {
                     names.push(store::DEFAULT_WORKSPACE.to_string());
                 }
-                let snapshot = work::snapshot(&work::SystemWorkReads::new(root), &names);
-                (names, snapshot)
+                let snapshot = work::snapshot(&work::SystemWorkReads::new(root.clone()), &names);
+                let migrations = crate::migrations::check(&root, &pattern).unwrap_or_default();
+                (names, snapshot, migrations)
             })
             .await;
-            if let Ok((names, snapshot)) = polled {
+            if let Ok((names, snapshot, migrations)) = polled {
                 last_names = names;
                 if tx.send(Msg::WorkSnapshot(snapshot)).is_err() {
+                    break;
+                }
+                if tx.send(Msg::MigrationReport(migrations)).is_err() {
                     break;
                 }
             }

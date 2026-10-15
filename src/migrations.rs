@@ -153,6 +153,24 @@ pub struct Report {
     findings: Vec<Finding>,
 }
 
+#[cfg(test)]
+impl Report {
+    /// A non-clean report with a single inversion, for tests that only need the
+    /// TUI's notice path exercised.
+    pub(crate) fn inversion_for_test() -> Self {
+        let place = |workspace: &str, path: &str| Placed {
+            workspace: workspace.to_owned(),
+            path: path.to_owned(),
+            version: Version::parse(path.rsplit('/').next().expect("a path has a file name"))
+                .expect("a version"),
+        };
+        analyse(vec![
+            place("ws-a", "db/migration/V189__a.sql"),
+            place("ws-b", "db/migration/V190__b.sql"),
+        ])
+    }
+}
+
 impl Report {
     /// The hazards, ordered by space.
     pub fn findings(&self) -> &[Finding] {
