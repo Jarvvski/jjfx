@@ -760,7 +760,6 @@ fn run_pipeline(
             }
         }
 
->>>>>>> conflict 1 of 1 ends
         state.set(Step::Push, Status::Running);
         publish_progress(tx, target, state, None);
         let push = jj.push(&target.dir).unwrap_or_else(PushOutcome::Failed);

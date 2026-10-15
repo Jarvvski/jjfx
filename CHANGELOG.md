@@ -46,6 +46,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Surface a stalled Run as stuck, and pace a Dispatch batch under an optional `[dispatch] max_concurrent` cap that holds the excess Tickets back
 - Show the Tickets a capped Dispatch held back in `jjfx status` and the Pool view, from jjfx's own `.jj/pool/waiting.json`
 - Surface a conflicted change chain as a needs-you Work state naming the commit that owns the conflict, and resolve it from the tool with `jjfx resolve <workspace>` (or `C` in the list)
+- Run the repo's own build check between Weld and Push, before the forge pushes: configure a command and timeout with `[checks]` (`command`, `enabled`, `timeout_secs`) and a change that does not build against merged trunk fails the Check step, naming the command and its output. With no check configured the pipeline is unchanged; a check that cannot run (missing command, timeout) fails loudly rather than passing silently.
 
 ### Fixed
 
