@@ -107,6 +107,7 @@ impl Cmd {
         Ok(Run {
             label: self.label,
             ok: out.status.success(),
+            code: out.status.code(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
@@ -153,6 +154,7 @@ impl Cmd {
         Ok(Run {
             label: self.label,
             ok: status.success(),
+            code: status.code(),
             stdout,
             stderr,
         })
@@ -199,6 +201,7 @@ impl Cmd {
         Ok(Run {
             label: self.label,
             ok: status.success(),
+            code: status.code(),
             stdout: stdout_text,
             stderr: stderr_text,
         })
@@ -268,6 +271,7 @@ fn spawn_output_reader<R: std::io::Read + Send + 'static>(
 pub struct Run {
     label: String,
     ok: bool,
+    code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -276,6 +280,13 @@ impl Run {
     /// Did the process exit zero?
     pub fn ok(&self) -> bool {
         self.ok
+    }
+
+    /// The process's exit code, when it exited normally. `None` when a signal
+    /// killed it. Lets a caller tell a shell's "command not found" (127) from a
+    /// command that ran and reported a failure.
+    pub fn code(&self) -> Option<i32> {
+        self.code
     }
 
     /// Captured stdout, whether or not the run succeeded.
@@ -318,6 +329,7 @@ impl Run {
         Self {
             label: "jj (test)".to_string(),
             ok,
+            code: ok.then_some(0),
             stdout: stdout.to_string(),
             stderr: stderr.to_string(),
         }

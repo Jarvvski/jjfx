@@ -548,6 +548,18 @@ impl Default for ChecksConfig {
 }
 
 impl ChecksConfig {
+    /// The command to run, or `None` when no check is configured or it is
+    /// disabled - the forge's no-op.
+    pub fn command(&self) -> Option<&str> {
+        if !self.enabled {
+            return None;
+        }
+        self.command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+    }
+
     /// Reject settings the check cannot run, so a bad config fails at startup
     /// rather than mid-forge.
     fn validate(&self) -> anyhow::Result<()> {

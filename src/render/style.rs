@@ -231,6 +231,11 @@ pub(crate) fn paused_glyph(kind: AgentKind) -> char {
 pub(crate) fn forge_spans(progress: &forge::Progress) -> Vec<Span<'static>> {
     let mut spans = vec![Span::styled("⚒ ", Style::default().fg(Color::Magenta))];
     for (step, status) in progress.steps() {
+        // A step that does not apply (no build check configured) is not drawn:
+        // an unconfigured repo's pipeline reads exactly as it did before.
+        if status == forge::Status::NotApplicable {
+            continue;
+        }
         spans.push(Span::styled(
             format!("{}{} ", forge_step_letter(step), forge_glyph(status)),
             Style::default().fg(forge_color(status)),
@@ -243,6 +248,7 @@ fn forge_step_letter(step: forge::Step) -> char {
     match step {
         forge::Step::Fetch => 'f',
         forge::Step::Weld => 'w',
+        forge::Step::Check => 'c',
         forge::Step::Push => 'p',
         forge::Step::PullRequest => 'r',
     }
@@ -255,6 +261,7 @@ fn forge_glyph(status: forge::Status) -> char {
         forge::Status::Running => '…',
         forge::Status::Ok => '✓',
         forge::Status::Skipped => '~',
+        forge::Status::NotApplicable => '-',
     }
 }
 
@@ -265,6 +272,7 @@ fn forge_color(status: forge::Status) -> Color {
         forge::Status::Running => Color::Cyan,
         forge::Status::Ok => Color::Green,
         forge::Status::Skipped => Color::Yellow,
+        forge::Status::NotApplicable => Color::DarkGray,
     }
 }
 
@@ -370,6 +378,47 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_forge_pipeline_draws_a_letter_per_step() {
+        let progress = forge::Progress::finished_for_test(
+            [
+                forge::Status::Ok,
+                forge::Status::Ok,
+                forge::Status::Ok,
+                forge::Status::Skipped,
+                forge::Status::Ok,
+            ],
+            "push: nothing to push",
+        );
+        assert_eq!(forge_row(&progress), "⚒ f✓ w✓ c✓ p~ r✓ ");
+    }
+
+    #[test]
+    fn a_step_that_does_not_apply_is_not_drawn() {
+        // An unconfigured repo draws the pipeline exactly as it did before the
+        // build check existed.
+        let progress = forge::Progress::finished_for_test(
+            [
+                forge::Status::Ok,
+                forge::Status::Ok,
+                forge::Status::NotApplicable,
+                forge::Status::Ok,
+                forge::Status::Ok,
+            ],
+            "",
+        );
+        assert_eq!(forge_row(&progress), "⚒ f✓ w✓ p✓ r✓ ");
+        assert_eq!(forge_glyph(forge::Status::NotApplicable), '-');
+    }
+
+    /// The compact forge row as plain text.
+    fn forge_row(progress: &forge::Progress) -> String {
+        forge_spans(progress)
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
 
     #[test]
     fn elide_right_keeps_the_head_with_an_ellipsis() {

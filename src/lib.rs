@@ -3,6 +3,7 @@
 mod agent;
 mod app;
 mod attention;
+mod checks;
 mod cli;
 mod cmd;
 mod config;
@@ -284,7 +285,11 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     let runtime = Runtime::new(
         tx.clone(),
         repo_root.clone(),
-        config.forge,
+        forge::Settings {
+            forge: config.forge,
+            // Cloned: `config` is still read for the App's dispatch settings below.
+            checks: config.checks.clone(),
+        },
         config.colocate,
         Arc::clone(&terminal),
         Arc::new(jj::RealJj::new(repo_root.clone())),
