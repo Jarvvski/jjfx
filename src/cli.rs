@@ -74,6 +74,8 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " open-pr <worker>         Open a Worker's Pull Request (pr)\n  ",
     env!("CARGO_PKG_NAME"),
+    " resolve <workspace>      Resolve a Workspace's conflicted commits (jj resolve)\n  ",
+    env!("CARGO_PKG_NAME"),
     " undo [<worker>] [--force] Undo the last jjfx mutation on a Worker (list when omitted)\n\nCompletion:\n  ",
     env!("CARGO_PKG_NAME"),
     " completion [zsh]         Print zsh completion\n\nChecks:\n  ",
@@ -139,6 +141,10 @@ pub enum Command {
     },
     OpenPullRequest {
         worker: String,
+    },
+    Resolve {
+        workspace: String,
+        tool: Option<String>,
     },
     Undo {
         workspace: Option<String>,
@@ -269,6 +275,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         )
         .map(|worker| Command::OpenPullRequest { worker }),
         "undo" => parse_undo(&args[1..]),
+        "resolve" => parse_resolve(&args[1..]),
         "completion" => parse_completion(&args[1..]),
         "check" => parse_check(&args[1..]),
         "__complete" => parse_worker_command(
@@ -406,6 +413,46 @@ fn parse_undo(args: &[String]) -> Result<Command> {
         }
     }
     Ok(Command::Undo { workspace, force })
+}
+
+/// Parse `resolve <workspace> [--tool <name>]`.
+///
+/// The Workspace may be a Worker in either spelling (`3` or `worker-3`) or any
+/// Workspace name. `--tool` is passed to `jj resolve`, including jj's built-in
+/// `:ours`/`:theirs` side pickers; without it the user's own merge tool runs.
+fn parse_resolve(args: &[String]) -> Result<Command> {
+    let mut workspace = None;
+    let mut tool = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--tool" | "-t" => {
+                let value = args.get(index + 1).ok_or_else(|| {
+                    anyhow::anyhow!(concat!(
+                        "Usage: ",
+                        env!("CARGO_PKG_NAME"),
+                        " resolve <workspace> [--tool <name>]"
+                    ))
+                })?;
+                tool = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with('-') => bail!("unknown option for resolve: {value}"),
+            value if workspace.is_none() => {
+                workspace = Some(value.to_owned());
+                index += 1;
+            }
+            value => bail!("unexpected argument for resolve: {value}"),
+        }
+    }
+    let workspace = workspace.ok_or_else(|| {
+        anyhow::anyhow!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " resolve <workspace> [--tool <name>]"
+        ))
+    })?;
+    Ok(Command::Resolve { workspace, tool })
 }
 
 /// Parse `pool list`/`ls`/`status`, which accepts `--json`.
@@ -797,6 +844,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Rebase { worker } => rebase_command(&repository(colocate)?, &worker)?,
         Command::Absorb { worker } => absorb_command(&repository(colocate)?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
+        Command::Resolve { workspace, tool } => {
+            resolve_command(&repository(colocate)?, &workspace, tool.as_deref())?
+        }
         Command::Undo { workspace, force } => {
             undo_command(&repository(colocate)?, workspace.as_deref(), force)?
         }
@@ -898,9 +948,16 @@ fn path_command(repository: &Repository, name: &str) -> Result<()> {
     // Dispatch and the Pool list use the short Worker id, while the Workspace
     // is named `worker-<id>`. Resolve either form against the real projection so
     // `path <short-id>` returns the directory that actually exists.
+    println!("{}", workspace_path(repository, name).display());
+    Ok(())
+}
+
+/// The directory a Workspace name or Worker id resolves to, against the real
+/// projection so a short Worker id (`3`) reaches the `worker-3` that exists.
+fn workspace_path(repository: &Repository, name: &str) -> PathBuf {
     let workspaces = repository.workspaces();
     let prefixed = format!("worker-{name}");
-    let path = workspaces
+    workspaces
         .projection()
         .ok()
         .and_then(|snapshot| {
@@ -918,9 +975,7 @@ fn path_command(repository: &Repository, name: &str) -> Result<()> {
             } else {
                 workspaces.path(name)
             }
-        });
-    println!("{}", path.display());
-    Ok(())
+        })
 }
 
 /// Transition this repository's Git colocation through jj. Enabling lets jjfx
@@ -1971,6 +2026,55 @@ fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resolve a Workspace's conflicted commits with `jj resolve`.
+///
+/// Interactive: the merge tool inherits this terminal, so a caller that has no
+/// terminal must open one first (the TUI opens a tab running this command).
+fn resolve_command(repository: &Repository, value: &str, tool: Option<&str>) -> Result<()> {
+    // The revset needs the Workspace's real name; a short Worker id (`3`) names
+    // `worker-3`, and any name jj already reports is used as it is.
+    let workspace = if crate::jj::workspace_names(repository.root())?
+        .iter()
+        .any(|name| name == value)
+    {
+        value.to_owned()
+    } else {
+        format!("worker-{value}")
+    };
+    let dir = workspace_path(repository, &workspace);
+    if !dir.is_dir() {
+        bail!(
+            "no Workspace directory for {workspace} at {}",
+            dir.display()
+        );
+    }
+
+    let before = crate::jj::conflicted_commits(repository.root(), &workspace)?;
+    if before.is_empty() {
+        eprintln!("{workspace} has no conflicts to resolve");
+        return Ok(());
+    }
+    eprintln!(
+        "resolving {} conflicted commit(s) on {workspace}: {}",
+        before.len(),
+        before.join(", ")
+    );
+
+    let resolved = crate::jj::resolve_chain(repository.root(), &dir, &workspace, tool)?;
+    let remaining = crate::jj::conflicted_commits(repository.root(), &workspace)?;
+    if remaining.is_empty() {
+        eprintln!("resolved {workspace}: {}", resolved.join(", "));
+        return Ok(());
+    }
+    // The merge tool exited without resolving everything - say exactly what is
+    // left rather than reporting a success that is not one.
+    bail!(
+        "{} conflicted commit(s) remain on {workspace}: {}",
+        remaining.len(),
+        remaining.join(", ")
+    )
+}
+
 /// Undo the last jjfx-initiated mutation on a Workspace, or list what can be
 /// undone when no Workspace is named.
 fn undo_command(repository: &Repository, workspace: Option<&str>, force: bool) -> Result<()> {
@@ -2229,9 +2333,9 @@ _jjfx() {
     'review:Address review comments' 'mount:Open Worker in kitty'
     'reset:Reset Worker' 'status:Show Pool status' 'logs:Follow Worker log'
     'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
+    'resolve:Resolve a Workspace conflict'
     'absorb:Fold Worker edits into base commits'
     'undo:Undo the last jjfx mutation' 'completion:Print shell completion' 'help:Show help'
-  )
   _arguments -C '1:command:->command' '*::arg:->args'
   case $state in
     command) _describe 'command' commands ;;
@@ -2241,6 +2345,7 @@ _jjfx() {
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
         mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
+        resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
@@ -2456,6 +2561,29 @@ mod tests {
             parse(&args(&["pr", "worker-1"])),
             Ok(Command::OpenPullRequest { .. })
         ));
+    }
+
+    #[test]
+    fn resolve_parser_takes_a_workspace_and_an_optional_tool() {
+        assert_eq!(
+            parse(&args(&["resolve", "worker-3"])).unwrap(),
+            Command::Resolve {
+                workspace: "worker-3".to_owned(),
+                tool: None,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["resolve", "3", "--tool", ":theirs"])).unwrap(),
+            Command::Resolve {
+                workspace: "3".to_owned(),
+                tool: Some(":theirs".to_owned()),
+            }
+        );
+        // The workspace is required: a bare `resolve` says how to call it.
+        assert!(parse(&args(&["resolve"])).is_err());
+        assert!(parse(&args(&["resolve", "--tool"])).is_err());
+        assert!(parse(&args(&["resolve", "--nope"])).is_err());
+        assert!(parse(&args(&["resolve", "a", "b"])).is_err());
     }
 
     #[test]

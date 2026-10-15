@@ -10,7 +10,7 @@
 //! "jj could not be read". Richer reads move to jj-lib in later epics (ADR 0007).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::Context;
 
@@ -88,6 +88,135 @@ pub fn operation_id(repo_root: &Path) -> anyhow::Result<String> {
 /// operation they are restoring to, or have warned that it will.
 pub fn restore_operation(repo_root: &Path, operation: &str) -> anyhow::Result<()> {
     run_mut(repo_root, &["op", "restore", operation])
+}
+
+/// The change ids of the commits on `workspace`'s own chain that hold an
+/// unresolved conflict, deepest first.
+///
+/// jj's `conflicts()` revset is the machine-readable source - the same one the
+/// forge's push gate uses. Deepest first is the order a resolve has to take: a
+/// conflict is recorded in the commit a rebase rewrote, and every commit above it
+/// merely inherits it, so resolving the owner clears the rest.
+pub fn conflicted_commits(repo_root: &Path, workspace: &str) -> anyhow::Result<Vec<String>> {
+    let trunk = crate::trunk::as_revset();
+    let revset = format!("(({trunk})..{}@) & conflicts()", revset_symbol(workspace));
+    let out = read_at_repo(
+        repo_root,
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\\n\"",
+        ],
+    )?;
+    let mut ids: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    // jj logs newest first; the conflict's owner is the deepest.
+    ids.reverse();
+    Ok(ids)
+}
+
+/// Resolve the conflicts in one revision with `jj resolve`, honouring the user's
+/// own merge tool. `tool` overrides it, including jj's built-in `:ours`/`:theirs`
+/// side pickers.
+///
+/// Interactive by design: the command inherits this process's stdin and stdout,
+/// so the merge tool runs where the caller is. Its stderr is captured instead, so
+/// a refusal jj explains on stderr reaches the caller as an error rather than
+/// being swallowed. Callers that cannot give it a terminal must open one first.
+pub fn resolve(dir: &Path, revision: &str, tool: Option<&str>) -> anyhow::Result<()> {
+    let mut args = vec!["resolve", "-r", revision];
+    if let Some(tool) = tool {
+        args.extend(["--tool", tool]);
+    }
+    let child = command()
+        .current_dir(dir)
+        .args(&args)
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running `jj resolve -r {revision}`"))?;
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("waiting for `jj resolve -r {revision}`"))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "jj resolve -r {revision} failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve every conflict on `workspace`'s chain, deepest first, returning the
+/// change ids it resolved.
+///
+/// The loop re-reads the chain after each resolve and stops as soon as the set
+/// stops shrinking, so a merge tool that exits without changing anything cannot
+/// spin.
+///
+/// A resolve rewrites a commit *below* the working copy, which leaves the
+/// Workspace's working copy stale, so it is brought up to date at the end. It is
+/// also brought up to date *before* the first resolve: a Workspace whose commits
+/// another Workspace's rebase rewrote is already stale, and jj refuses to resolve
+/// on a stale working copy. Both are no-ops on a current working copy, and the
+/// up-front one only runs when there is something to resolve, so a clean chain is
+/// left untouched.
+pub fn resolve_chain(
+    repo_root: &Path,
+    dir: &Path,
+    workspace: &str,
+    tool: Option<&str>,
+) -> anyhow::Result<Vec<String>> {
+    let mut remaining = conflicted_commits(repo_root, workspace)?;
+    if remaining.is_empty() {
+        return Ok(Vec::new());
+    }
+    update_stale(dir)?;
+
+    let mut resolved = Vec::new();
+    while let Some(deepest) = remaining.first().cloned() {
+        resolve(dir, &deepest, tool)?;
+        let after = conflicted_commits(repo_root, workspace)?;
+        if after.len() >= remaining.len() {
+            break;
+        }
+        resolved.push(deepest);
+        remaining = after;
+    }
+    if !resolved.is_empty() {
+        update_stale(dir)?;
+    }
+    Ok(resolved)
+}
+
+/// Bring a Workspace's working copy up to date after a command rewrote a commit
+/// below `@` (`jj workspace update-stale`).
+///
+/// A no-op on a working copy that is already current, which is why callers can
+/// run it unconditionally. Its stderr is captured rather than inherited: jj
+/// reports the no-op case there, and only a failure's text is worth surfacing.
+pub fn update_stale(dir: &Path) -> anyhow::Result<()> {
+    let output = command()
+        .current_dir(dir)
+        .args(["workspace", "update-stale"])
+        .stdin(Stdio::null())
+        .output()
+        .context("running `jj workspace update-stale`")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "jj workspace update-stale failed ({}): {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Derive the `owner/repo` slug from jj's `origin` remote URL. Every `gh` call
@@ -635,6 +764,136 @@ mod tests {
         assert_eq!(
             lift_src("my work"),
             "roots(mutable() & mine() & ::\"my work\"@)"
+        );
+    }
+
+    /// Run one jj command in `dir`, asserting it succeeds.
+    fn jj(dir: &Path, args: &[&str]) {
+        let output = command()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repository whose `ws-a` chain holds a real rebase conflict: `ws-a` and
+    /// `ws-b` each rewrite the same line from the shared base, then `ws-a` is
+    /// rebased onto `ws-b`. jj records the conflict in the commit and exits zero.
+    fn conflicted_repo(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+        let root = crate::store::test_local_repo(tag);
+        std::fs::write(root.join("f.txt"), "base\n").expect("write base file");
+        jj(&root, &["commit", "-m", "base"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let ws_a = root.with_extension("ws-a");
+        let ws_b = root.with_extension("ws-b");
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws-a",
+                "--no-colocate",
+                &ws_a.to_string_lossy(),
+            ],
+        );
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws-b",
+                "--no-colocate",
+                &ws_b.to_string_lossy(),
+            ],
+        );
+        std::fs::write(ws_a.join("f.txt"), "a\n").expect("write a");
+        jj(&ws_a, &["commit", "-m", "a change"]);
+        std::fs::write(ws_b.join("f.txt"), "b\n").expect("write b");
+        jj(&ws_b, &["commit", "-m", "b change"]);
+        jj(&root, &["rebase", "-s", "\"ws-a\"@-", "-d", "\"ws-b\"@-"]);
+        (root, ws_a)
+    }
+
+    #[test]
+    fn a_conflicted_chain_is_read_deepest_first_and_resolved_from_the_tool() {
+        let (root, ws_a) = conflicted_repo("jj-resolve");
+
+        let conflicted = conflicted_commits(&root, "ws-a").expect("conflict read");
+        // The conflict is recorded in the rewritten commit and inherited by the
+        // empty working copy above it, so the chain reports two conflicted
+        // commits for one conflict - and the owner, the deepest, comes first.
+        assert_eq!(conflicted.len(), 2, "one conflict, inherited once");
+        let owner = conflicted.first().expect("an owner").clone();
+
+        // The rebase ran from the repository root, so it rewrote `ws-a`'s commit
+        // without updating `ws-a`'s working copy: it is stale, and jj refuses to
+        // resolve on a stale working copy. The resolve brings it up to date
+        // first, and the read never cared (it is `--ignore-working-copy`).
+        let resolved = resolve_chain(&root, &ws_a, "ws-a", Some(":ours")).expect("resolve");
+
+        assert_eq!(resolved, vec![owner.clone()]);
+        assert!(
+            conflicted_commits(&root, "ws-a")
+                .expect("conflict read")
+                .is_empty(),
+            "the chain is clean once the owner is resolved"
+        );
+        // `:ours` is a one-sided pick - which side is jj's own semantics, not
+        // jjfx's - so the resolution is the whole file, not a conflict marker.
+        let content = std::fs::read_to_string(ws_a.join("f.txt")).expect("read resolved file");
+        assert!(
+            content == "a\n" || content == "b\n",
+            "a one-sided resolve must leave one side whole, got {content:?}"
+        );
+        // Resolving a commit below `@` leaves the Workspace's working copy stale;
+        // the resolve brings it up to date, so an ordinary read still works.
+        let log = command()
+            .current_dir(&ws_a)
+            .args(["--ignore-working-copy", "log", "-r", "@", "--no-graph"])
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            log.status.success(),
+            "the workspace must not be left stale: {}",
+            String::from_utf8_lossy(&log.stderr)
+        );
+    }
+
+    #[test]
+    fn updating_a_current_working_copy_is_a_no_op() {
+        let root = crate::store::test_local_repo("jj-update-stale");
+        std::fs::write(root.join("f.txt"), "base\n").expect("write base file");
+        jj(&root, &["commit", "-m", "base"]);
+
+        // Callers run this unconditionally, so the already-current case must be
+        // silent and successful rather than an error to work around.
+        update_stale(&root).expect("update-stale on a current working copy");
+    }
+
+    #[test]
+    fn resolving_a_clean_chain_reports_nothing_to_resolve() {
+        let root = crate::store::test_local_repo("jj-resolve-clean");
+        std::fs::write(root.join("f.txt"), "base\n").expect("write base file");
+        jj(&root, &["commit", "-m", "base"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+
+        assert!(
+            conflicted_commits(&root, "default")
+                .expect("conflict read")
+                .is_empty()
+        );
+        assert!(
+            resolve_chain(&root, &root, "default", None)
+                .expect("resolve")
+                .is_empty(),
+            "a clean chain resolves nothing rather than opening a merge tool"
         );
     }
 

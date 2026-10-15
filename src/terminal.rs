@@ -177,6 +177,13 @@ pub trait Terminal: Send + Sync {
     /// agent when it has one); otherwise the tab is built without the target
     /// taking focus.
     fn open(&self, name: &str, path: &Path, focus: bool) -> anyhow::Result<()>;
+    /// Open a one-pane tab titled `jjfx:<title>` that runs `command` in the
+    /// workspace rooted at `path`.
+    ///
+    /// For a command that needs a terminal of its own: the interactive conflict
+    /// resolve runs the user's own merge tool, which jjfx cannot host inside its
+    /// TUI. The tab lives as long as the command, so nothing is left behind.
+    fn run_command(&self, title: &str, path: &Path, command: &[String]) -> anyhow::Result<()>;
     /// Focus the workspace's existing tab.
     fn focus(&self, name: &str) -> anyhow::Result<()>;
     /// Close the workspace's tab if it exists (a no-op if it does not).
@@ -511,6 +518,23 @@ impl Terminal for KittyTerminal {
                 }
             }
         }
+        Ok(())
+    }
+
+    fn run_command(&self, title: &str, path: &Path, command: &[String]) -> anyhow::Result<()> {
+        // A tab can only be created once the target instance answers; launch it
+        // first if it is configured but not yet running.
+        self.ensure_ready()?;
+        let cwd_arg = format!("--cwd={}", path.to_string_lossy());
+        // One pane, tagged as the agent pane so focus lands in it: the tab exists
+        // for this command alone and goes away with it.
+        self.launch(&new_shell_tab_args(
+            &tab_title(title),
+            &cwd_arg,
+            true,
+            PaneRole::Agent,
+            command,
+        ))?;
         Ok(())
     }
 
