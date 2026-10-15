@@ -50,7 +50,9 @@ needs-you, working, ready-to-forge, or idle.
 The observed activity state of the agent in a workspace: **Absent** (no known
 live session), **Working** (a turn is in progress), **Waiting** (turn finished,
 awaiting the human), **NeedsAttention** (blocked on a permission or decision),
-or **Ended** (session closed).
+**QuotaBlocked** (the turn ended on a provider quota or billing wall, so it is
+blocked on capacity or account state rather than on a bug), or **Ended**
+(session closed).
 
 **Work lifecycle**:
 The least-delivered state among a workspace's owned changes: **Clean** (no

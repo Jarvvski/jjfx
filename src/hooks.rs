@@ -13,9 +13,10 @@ use serde_json::{Value, json};
 use crate::events;
 
 /// The lifecycle events the hook registers on for Claude Code - the
-/// deterministic set confirmed by spike 01. The same append command serves
-/// every one; the payload carries `hook_event_name`, so the fold discriminates,
-/// not the config.
+/// deterministic set confirmed by spike 01 plus the richer 2.x signals jjfx now
+/// folds (ADR 0002). The same append command serves every one; the payload
+/// carries `hook_event_name` (and, for the catch-alls, `notification_type` /
+/// `error`), so the fold discriminates, not the config.
 const CLAUDE_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
@@ -26,17 +27,35 @@ const CLAUDE_EVENTS: &[&str] = &[
     // completing afterwards is the observable "running again" signal that
     // clears needs-attention (see agent.rs). Chatty, but the log rotates.
     "PostToolUse",
+    // The catch-all notification stream; `notification_type` discriminates
+    // `agent_needs_input` from the rest (see agent.rs).
+    "Notification",
+    // A turn that ended on an API error; `error` discriminates a quota/billing
+    // wall (`rate_limit` / `billing_error`) from an ordinary failure.
+    "StopFailure",
+    // Live progress for long Runs: subagent spawn/finish, tool-batch
+    // resolution, and task/teammate transitions. Recorded, never a state move.
+    "SubagentStart",
+    "SubagentStop",
+    "PostToolBatch",
+    "TaskCreated",
+    "TaskCompleted",
+    "TeammateIdle",
 ];
 
 /// Codex supports the same event names and payload shape minus `SessionEnd`,
 /// so a closed codex session stays `waiting` after its final Stop rather than
-/// reaching `ended`.
+/// reaching `ended`. Codex's own `Interrupt` and subagent events are added
+/// alongside.
 const CODEX_EVENTS: &[&str] = &[
     "SessionStart",
     "UserPromptSubmit",
     "Stop",
     "PermissionRequest",
     "PostToolUse",
+    "Interrupt",
+    "SubagentStart",
+    "SubagentStop",
 ];
 
 /// One hooks file jjfx manages: whose it is, where it lives, and which
@@ -878,14 +897,38 @@ mod tests {
     }
 
     #[test]
-    fn codex_registers_every_claude_event_except_session_end() {
-        // Codex's hook set has no SessionEnd; everything else matches, so the
-        // same fold in agent.rs serves both logs.
+    fn codex_registers_its_shared_and_own_events() {
+        // Codex's hook set has no SessionEnd, so a closed codex session stays
+        // waiting rather than reaching ended; it adds its own Interrupt and the
+        // shared subagent events. The same fold in agent.rs serves both logs.
         assert!(!CODEX_EVENTS.contains(&"SessionEnd"));
+        assert!(CODEX_EVENTS.contains(&"Interrupt"));
+        assert!(CODEX_EVENTS.contains(&"SubagentStart"));
+        assert!(CODEX_EVENTS.contains(&"SubagentStop"));
+        // Everything else Codex registers is shared with Claude.
         for ev in CODEX_EVENTS {
+            if *ev == "Interrupt" {
+                continue;
+            }
             assert!(CLAUDE_EVENTS.contains(ev), "{ev} unknown to claude");
         }
-        assert_eq!(CODEX_EVENTS.len(), CLAUDE_EVENTS.len() - 1);
+    }
+
+    #[test]
+    fn claude_registers_the_richer_lifecycle_signals() {
+        // The catch-alls and progress events the fold now understands.
+        for ev in [
+            "Notification",
+            "StopFailure",
+            "SubagentStart",
+            "SubagentStop",
+            "PostToolBatch",
+            "TaskCreated",
+            "TaskCompleted",
+            "TeammateIdle",
+        ] {
+            assert!(CLAUDE_EVENTS.contains(&ev), "claude is missing {ev}");
+        }
     }
 
     #[test]

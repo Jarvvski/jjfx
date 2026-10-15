@@ -423,4 +423,107 @@ mod tests {
         assert_eq!(fs::read_to_string(&log).unwrap(), "one\ntwo\n");
         fs::remove_dir_all(&dir).unwrap();
     }
+
+    /// Append the exact single-line JSON a dumb hook would, the way the installed
+    /// `printf '%s\n' "$(cat)" >> events.jsonl` command does. This is the fake
+    /// hook emitter: no hook process, just the bytes it would write.
+    fn emit(file: &mut File, line: &str) {
+        file.write_all(line.as_bytes()).unwrap();
+        file.write_all(b"\n").unwrap();
+    }
+
+    #[test]
+    fn a_fake_hook_emitter_drives_the_lifecycle_and_attention_through_the_log() {
+        use crate::agent::{AgentKind, AgentState, AgentStates};
+        use crate::attention::{self, Attention};
+        use crate::work::WorkState;
+
+        let dir = scratch("fake-emitter");
+        let log = dir.join("events.jsonl");
+        let workspace = dir.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let cwd = workspace.to_string_lossy();
+
+        let mut file = File::create(&log).unwrap();
+        // A Claude session that starts, works, asks for input, resumes, then
+        // ends the turn on a rate-limit wall - with subagent/batch chatter mixed
+        // in to prove it never regresses the turn.
+        for line in [
+            format!(
+                r#"{{"session_id":"s1","transcript_path":"/u/.claude/projects/x/s.jsonl","cwd":"{cwd}","hook_event_name":"SessionStart"}}"#
+            ),
+            format!(
+                r#"{{"session_id":"s1","cwd":"{cwd}","hook_event_name":"UserPromptSubmit","prompt":"go"}}"#
+            ),
+            format!(
+                r#"{{"session_id":"s1","cwd":"{cwd}","hook_event_name":"SubagentStart","agent_type":"Explore"}}"#
+            ),
+            format!(r#"{{"session_id":"s1","cwd":"{cwd}","hook_event_name":"PostToolBatch"}}"#),
+            format!(
+                r#"{{"session_id":"s1","cwd":"{cwd}","hook_event_name":"Notification","notification_type":"agent_needs_input","message":"Claude needs your input"}}"#
+            ),
+        ] {
+            emit(&mut file, &line);
+        }
+        // The blocked agent sorts to the top of the list as needs-you.
+        let (events, _) = replay(&log);
+        let states = AgentStates::replay(events);
+        let agent = states.agent_for(&workspace);
+        assert_eq!(agent.state, AgentState::NeedsAttention);
+        assert_eq!(agent.kind, AgentKind::Claude);
+        assert_eq!(
+            attention::derive(agent.state, WorkState::Clean),
+            Attention::NeedsYou
+        );
+
+        // The approved tool resuming clears needs-attention back to Working, and
+        // the turn then ends on a rate-limit StopFailure: a distinct, visible
+        // quota block rather than a plain finished turn.
+        for line in [
+            format!(r#"{{"session_id":"s1","cwd":"{cwd}","hook_event_name":"PostToolUse"}}"#),
+            format!(
+                r#"{{"session_id":"s1","cwd":"{cwd}","hook_event_name":"StopFailure","error":"rate_limit","error_details":"429 Too Many Requests"}}"#
+            ),
+        ] {
+            emit(&mut file, &line);
+        }
+        let (events, _) = replay(&log);
+        let states = AgentStates::replay(events);
+        let agent = states.agent_for(&workspace);
+        assert_eq!(agent.state, AgentState::QuotaBlocked);
+        assert_eq!(
+            attention::derive(agent.state, WorkState::Clean),
+            Attention::NeedsYou
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fake_emitter_billing_failure_also_blocks_the_run() {
+        use crate::agent::{AgentState, AgentStates};
+
+        let dir = scratch("fake-emitter-billing");
+        let log = dir.join("events.jsonl");
+        let workspace = dir.join("ws");
+        fs::create_dir_all(&workspace).unwrap();
+        let cwd = workspace.to_string_lossy();
+
+        let mut file = File::create(&log).unwrap();
+        for line in [
+            format!(r#"{{"cwd":"{cwd}","hook_event_name":"SessionStart"}}"#),
+            format!(r#"{{"cwd":"{cwd}","hook_event_name":"UserPromptSubmit"}}"#),
+            format!(r#"{{"cwd":"{cwd}","hook_event_name":"StopFailure","error":"billing_error"}}"#),
+        ] {
+            emit(&mut file, &line);
+        }
+        assert_eq!(
+            AgentStates::replay(replay(&log).0)
+                .agent_for(&workspace)
+                .state,
+            AgentState::QuotaBlocked
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }

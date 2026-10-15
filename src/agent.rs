@@ -23,6 +23,10 @@ pub enum AgentState {
     Waiting,
     /// Blocked on a permission or decision dialog.
     NeedsAttention,
+    /// The turn ended on a quota or billing wall (`StopFailure:rate_limit` /
+    /// `billing_error`): the Run is blocked on provider capacity or account
+    /// state, not on a bug, so it must not be retried like an ordinary failure.
+    QuotaBlocked,
     /// The session closed.
     Ended,
 }
@@ -111,6 +115,14 @@ pub struct Event {
     /// Stable provider session identity carried by a jjfx-owned envelope.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Claude `Notification` type (`agent_needs_input`, `idle_prompt`, ...).
+    /// The `Notification` hook is a catch-all; this field is the discriminator.
+    #[serde(default)]
+    pub notification_type: Option<String>,
+    /// Claude `StopFailure` error type (`rate_limit`, `billing_error`, ...).
+    /// The `StopFailure` hook reports why a turn ended on an API error.
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 /// Parse one JSONL line into an [`Event`], or `None` for a blank/malformed line
@@ -133,13 +145,27 @@ pub fn parse_line(line: &str) -> Option<Event> {
     }
 }
 
-/// The event -> agent-state transition map confirmed in spike 01. Unknown events
-/// (the wider 2.x set jjfx does not model) leave the state unchanged.
-fn transition(current: AgentState, event: &str) -> AgentState {
+/// The event -> agent-state transition map confirmed in spike 01, extended with
+/// the richer 2.x signals (ADR 0002). Events whose meaning depends on a payload
+/// field (`Notification`, `StopFailure`) are dispatched first; the rest reduce on
+/// the event name alone. Unknown events (the wider 2.x set jjfx does not model)
+/// leave the state unchanged.
+fn transition(current: AgentState, event: &Event) -> AgentState {
+    match event.name.as_str() {
+        "Notification" => notification_transition(current, event.notification_type.as_deref()),
+        "StopFailure" => stop_failure_transition(event.error.as_deref()),
+        name => transition_by_name(current, name),
+    }
+}
+
+/// The name-only transition map. Kept separate so the payload-free events (and
+/// the tests that pin them) read exactly as before.
+fn transition_by_name(current: AgentState, event: &str) -> AgentState {
     match event {
         "SessionStart" => AgentState::Waiting,
         "UserPromptSubmit" => AgentState::Working,
         "Stop" | "StopFailure" => AgentState::Waiting,
+        "Interrupt" => AgentState::Waiting,
         "PermissionRequest" => AgentState::NeedsAttention,
         "SessionEnd" => AgentState::Ended,
         // No hook marks a permission dialog being resolved, but the approved
@@ -149,6 +175,29 @@ fn transition(current: AgentState, event: &str) -> AgentState {
             AgentState::Working
         }
         _ => current,
+    }
+}
+
+/// `Notification` is a catch-all keyed by its notification type. Only an explicit
+/// `agent_needs_input` is a genuine blocked-on-a-human signal; the other types
+/// (`permission_prompt`, `agent_completed`, `idle_prompt`, ...) are covered by
+/// the authoritative `PermissionRequest`/`Stop` events and leave the state alone.
+fn notification_transition(current: AgentState, notification_type: Option<&str>) -> AgentState {
+    match notification_type {
+        Some("agent_needs_input") => AgentState::NeedsAttention,
+        _ => current,
+    }
+}
+
+/// A `StopFailure` ends the turn on an API error. A quota or billing error is a
+/// distinct, non-retryable outcome: the Run is blocked on provider capacity or
+/// account state, so it must not be retried like an ordinary failure. Any other
+/// error (or none) is an ordinary finished turn, matching the original
+/// `StopFailure -> Waiting` mapping.
+fn stop_failure_transition(error: Option<&str>) -> AgentState {
+    match error {
+        Some("rate_limit" | "billing_error") => AgentState::QuotaBlocked,
+        _ => AgentState::Waiting,
     }
 }
 
@@ -220,7 +269,7 @@ impl AgentStates {
             }
         }
 
-        entry.agent.state = transition(entry.agent.state, &ev.name);
+        entry.agent.state = transition(entry.agent.state, ev);
         let kind = match ev.agent_kind.as_deref() {
             Some(name) => AgentKind::from_name(name),
             None => ev
@@ -332,6 +381,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         });
         assert_eq!(states.agent_for(Path::new("/w/a")).kind, AgentKind::Claude);
 
@@ -343,6 +394,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         });
         let agent = states.agent_for(Path::new("/w/a"));
         assert_eq!(agent.state, AgentState::Working);
@@ -356,6 +409,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         });
         assert_eq!(states.agent_for(Path::new("/w/a")).kind, AgentKind::Codex);
     }
@@ -430,21 +485,183 @@ mod tests {
     #[test]
     fn transitions_follow_the_spike_map() {
         use AgentState::*;
-        assert_eq!(transition(Absent, "SessionStart"), Waiting);
-        assert_eq!(transition(Waiting, "UserPromptSubmit"), Working);
-        assert_eq!(transition(Working, "Stop"), Waiting);
-        assert_eq!(transition(Working, "StopFailure"), Waiting);
-        assert_eq!(transition(Waiting, "PermissionRequest"), NeedsAttention);
-        assert_eq!(transition(Working, "SessionEnd"), Ended);
+        assert_eq!(transition_by_name(Absent, "SessionStart"), Waiting);
+        assert_eq!(transition_by_name(Waiting, "UserPromptSubmit"), Working);
+        assert_eq!(transition_by_name(Working, "Stop"), Waiting);
+        assert_eq!(transition_by_name(Working, "StopFailure"), Waiting);
+        assert_eq!(
+            transition_by_name(Waiting, "PermissionRequest"),
+            NeedsAttention
+        );
+        assert_eq!(transition_by_name(Working, "SessionEnd"), Ended);
         // A tool completing right after a permission dialog proves the dialog
         // was resolved and the turn resumed...
-        assert_eq!(transition(NeedsAttention, "PostToolUse"), Working);
-        assert_eq!(transition(NeedsAttention, "PostToolUseFailure"), Working);
+        assert_eq!(transition_by_name(NeedsAttention, "PostToolUse"), Working);
+        assert_eq!(
+            transition_by_name(NeedsAttention, "PostToolUseFailure"),
+            Working
+        );
         // ...but tool events never wake any other state.
-        assert_eq!(transition(Waiting, "PostToolUse"), Waiting);
-        assert_eq!(transition(Working, "PostToolUse"), Working);
+        assert_eq!(transition_by_name(Waiting, "PostToolUse"), Waiting);
+        assert_eq!(transition_by_name(Working, "PostToolUse"), Working);
         // An event jjfx does not model leaves the state untouched.
-        assert_eq!(transition(Working, "PreToolUse"), Working);
+        assert_eq!(transition_by_name(Working, "PreToolUse"), Working);
+    }
+
+    /// Parse a legacy Claude payload line and fold it into a fresh state, so the
+    /// transition is exercised through the same `parse_line` + `apply` seam the
+    /// tail uses rather than a hand-built `Event`.
+    fn fold(lines: &[&str]) -> Agent {
+        let states = AgentStates::replay(lines.iter().filter_map(|line| parse_line(line)));
+        states.agent_for(Path::new("/w/a"))
+    }
+
+    #[test]
+    fn notification_agent_needs_input_is_needs_attention() {
+        // The `Notification` catch-all is discriminated by `notification_type`,
+        // not the message text: only `agent_needs_input` is a real needs-you.
+        assert_eq!(
+            fold(&[
+                r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"Notification","notification_type":"agent_needs_input","message":"Claude needs your input"}"#,
+            ])
+            .state,
+            AgentState::NeedsAttention
+        );
+    }
+
+    #[test]
+    fn other_notification_types_do_not_disturb_the_state() {
+        // `agent_completed` / `idle_prompt` / `permission_prompt` are covered by
+        // the authoritative events, so they must not move the fold.
+        for notification_type in ["agent_completed", "idle_prompt", "permission_prompt"] {
+            let line = format!(
+                r#"{{"cwd":"/w/a","hook_event_name":"Notification","notification_type":"{notification_type}"}}"#
+            );
+            let agent = fold(&[
+                r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+                &line,
+            ]);
+            assert_eq!(
+                agent.state,
+                AgentState::Working,
+                "{notification_type} must leave Working untouched"
+            );
+        }
+    }
+
+    #[test]
+    fn quota_stop_failure_is_distinct_from_a_plain_failure() {
+        // A rate-limit/billing StopFailure is a quota wall, not a finished turn.
+        for error in ["rate_limit", "billing_error"] {
+            let line = format!(
+                r#"{{"cwd":"/w/a","hook_event_name":"StopFailure","error":"{error}","last_assistant_message":"API Error"}}"#
+            );
+            let agent = fold(&[
+                r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+                &line,
+            ]);
+            assert_eq!(
+                agent.state,
+                AgentState::QuotaBlocked,
+                "{error} must be a quota block"
+            );
+        }
+
+        // Any other StopFailure error stays an ordinary finished turn, and a
+        // payload without an error keeps the original mapping.
+        assert_eq!(
+            fold(&[
+                r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"StopFailure","error":"server_error"}"#,
+            ])
+            .state,
+            AgentState::Waiting
+        );
+        assert_eq!(
+            fold(&[
+                r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"StopFailure"}"#,
+            ])
+            .state,
+            AgentState::Waiting
+        );
+    }
+
+    #[test]
+    fn quota_block_recovers_on_the_next_turn_or_stop() {
+        let quota = [
+            r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"StopFailure","error":"rate_limit"}"#,
+        ];
+        assert_eq!(fold(&quota).state, AgentState::QuotaBlocked);
+
+        // A fresh prompt once the quota resets returns the agent to Working...
+        let mut resumed = quota.to_vec();
+        resumed.push(r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#);
+        assert_eq!(fold(&resumed).state, AgentState::Working);
+
+        // ...and a plain Stop settles it back to Waiting.
+        let mut stopped = quota.to_vec();
+        stopped.push(r#"{"cwd":"/w/a","hook_event_name":"Stop"}"#);
+        assert_eq!(fold(&stopped).state, AgentState::Waiting);
+    }
+
+    #[test]
+    fn subagent_and_batch_events_are_recorded_without_regressing_the_turn() {
+        // SubagentStart/Stop, PostToolBatch, TaskCreated/Completed, and
+        // TeammateIdle are carried in the log for progress, but the fold must not
+        // regress a Working or Waiting turn.
+        let working = [
+            r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"SubagentStart","agent_type":"Explore"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"PostToolBatch"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"TaskCreated"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"TaskCompleted"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"SubagentStop","agent_type":"Explore"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"TeammateIdle"}"#,
+        ];
+        assert_eq!(fold(&working).state, AgentState::Working);
+
+        let mut waiting = working.to_vec();
+        waiting.push(r#"{"cwd":"/w/a","hook_event_name":"Stop"}"#);
+        waiting.push(r#"{"cwd":"/w/a","hook_event_name":"SubagentStart"}"#);
+        waiting.push(r#"{"cwd":"/w/a","hook_event_name":"PostToolBatch"}"#);
+        assert_eq!(fold(&waiting).state, AgentState::Waiting);
+    }
+
+    #[test]
+    fn codex_interrupt_settles_to_waiting() {
+        assert_eq!(
+            fold(&[
+                r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+                r#"{"cwd":"/w/a","hook_event_name":"Interrupt"}"#,
+            ])
+            .state,
+            AgentState::Waiting
+        );
+    }
+
+    #[test]
+    fn legacy_lines_without_the_new_fields_still_parse() {
+        // Backward compatibility: an events.jsonl line written before the schema
+        // extension has neither `notification_type` nor `error`, and must fold
+        // exactly as it always did.
+        let agent = fold(&[
+            r#"{"cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"cwd":"/w/a","hook_event_name":"Stop"}"#,
+        ]);
+        assert_eq!(agent.state, AgentState::Waiting);
+        assert_eq!(agent.kind, AgentKind::Unknown);
     }
 
     #[test]
@@ -494,6 +711,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         });
         assert_eq!(states.agent_for(&link).state, AgentState::Working);
 
@@ -521,6 +740,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         });
         // An untracked path still resolves through the fallback canonicalisation.
         assert_eq!(
@@ -544,6 +765,8 @@ mod tests {
                 jjfx_event_version: None,
                 agent_kind: None,
                 session_id: None,
+                notification_type: None,
+                error: None,
             });
         }
         assert_eq!(

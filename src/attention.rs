@@ -52,8 +52,9 @@ impl Attention {
 pub fn derive(agent: AgentState, work: WorkState) -> Attention {
     // needs-you: a blocked agent, or a Waiting agent over a change-requested PR.
     // The second clause is what distinguishes a genuine needs-you from an idle
-    // Clean workspace whose agent merely finished its turn.
-    if agent == AgentState::NeedsAttention {
+    // Clean workspace whose agent merely finished its turn. A quota-blocked agent
+    // is blocked on provider capacity or billing, so it needs the human too.
+    if matches!(agent, AgentState::NeedsAttention | AgentState::QuotaBlocked) {
         return Attention::NeedsYou;
     }
     if agent == AgentState::Waiting
@@ -89,6 +90,20 @@ mod tests {
         // Even over pushed work, a blocked agent is needs-you.
         assert_eq!(
             derive(AgentState::NeedsAttention, WorkState::Pushed),
+            Attention::NeedsYou
+        );
+    }
+
+    #[test]
+    fn quota_blocked_agent_sorts_to_needs_you() {
+        // A rate-limited or billing-blocked agent needs the human, so it sorts
+        // to the top with the same priority as a permission block.
+        assert_eq!(
+            derive(AgentState::QuotaBlocked, WorkState::Clean),
+            Attention::NeedsYou
+        );
+        assert_eq!(
+            derive(AgentState::QuotaBlocked, WorkState::Pushed),
             Attention::NeedsYou
         );
     }

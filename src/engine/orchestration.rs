@@ -157,6 +157,16 @@ pub enum OrchestrationEvent {
         /// One-based next attempt number.
         attempt: u8,
     },
+    /// A Run hit a provider quota or billing wall and was parked instead of
+    /// retried, so the orchestration loop stops and a human can resume it.
+    QuotaBlocked {
+        /// Sub-issue whose Run hit the wall.
+        ticket: TicketId,
+        /// Worker that ran the Sub-issue.
+        worker: WorkerId,
+        /// Persisted failure context, when available.
+        detail: Option<String>,
+    },
     /// One ready Sub-issue was durably assigned and launched.
     Dispatched {
         /// Launched Sub-issue.
@@ -342,6 +352,10 @@ struct WorkerObservation {
     ticket: Option<String>,
     branch: Option<String>,
     error: Option<String>,
+    /// The Worker's workspace is in the quota-blocked agent lifecycle state
+    /// (`StopFailure:rate_limit` / `billing_error`), so a failed Run is a wait,
+    /// not a retry-now.
+    quota_blocked: bool,
 }
 
 struct LoadedOrchestration<R> {
@@ -461,6 +475,24 @@ fn run_with_execution<E: OrchestrationExecution>(
                 execution.reset_worker(&worker)?;
             }
             WorkerStatus::Failed if retries < 1 => {
+                if observation.quota_blocked {
+                    // A quota/billing wall is not the transient failure the
+                    // retry budget exists for: retrying now only hammers the
+                    // wall. Park the Ticket and stop; a human resumes it once
+                    // the wall clears.
+                    group.apply(DispatchGroupEvent::QuotaBlocked {
+                        ticket: ticket.clone(),
+                        worker: worker.clone(),
+                        at: execution.now()?,
+                    })?;
+                    revision = execution.save_group(&revision, &group)?;
+                    observer(OrchestrationEvent::QuotaBlocked {
+                        ticket,
+                        worker,
+                        detail: observation.error.clone(),
+                    });
+                    continue;
+                }
                 let _retry_required = group.apply(DispatchGroupEvent::Failed {
                     ticket: ticket.clone(),
                     worker: worker.clone(),
@@ -711,18 +743,33 @@ impl OrchestrationExecution for LiveExecution {
     }
 
     fn workers(&mut self) -> Result<Vec<WorkerObservation>, OrchestrationError> {
+        // The quota-blocked signal is the hook-driven agent lifecycle, not the
+        // Worker document: `StopFailure:rate_limit` / `billing_error` folds to
+        // `AgentState::QuotaBlocked` for the Worker's workspace, and that is the
+        // reliable "wait, do not retry" input for the loop below. Replay the
+        // shared log once per poll, matching each Worker by its workspace path.
+        let states =
+            crate::agent::AgentStates::replay(crate::events::replay(&crate::events::log_path()).0);
         Ok(self
             .repository
             .worker_pool()
             .reconcile_runs()
             .workers()
             .iter()
-            .map(|worker| WorkerObservation {
-                worker: worker.worker_id().clone(),
-                status: worker.status(),
-                ticket: worker.ticket().map(str::to_owned),
-                branch: worker.branch_name().map(str::to_owned),
-                error: worker.error().map(str::to_owned),
+            .map(|worker| {
+                let workspace = crate::engine::workspace::worker_path(
+                    self.repository.root(),
+                    worker.worker_id(),
+                );
+                WorkerObservation {
+                    worker: worker.worker_id().clone(),
+                    status: worker.status(),
+                    ticket: worker.ticket().map(str::to_owned),
+                    branch: worker.branch_name().map(str::to_owned),
+                    error: worker.error().map(str::to_owned),
+                    quota_blocked: states.agent_for(&workspace).state
+                        == crate::agent::AgentState::QuotaBlocked,
+                }
             })
             .collect())
     }
@@ -1172,6 +1219,7 @@ mod tests {
                     ticket: Some(blocker.as_str().to_owned()),
                     branch: Some("adam/eng-101-foundation".to_owned()),
                     error: None,
+                    quota_blocked: false,
                 }],
                 calls: Vec::new(),
                 fail_next_save: false,
@@ -1209,6 +1257,7 @@ mod tests {
                     ticket: Some(ticket.as_str().to_owned()),
                     branch: None,
                     error: Some("build failed".to_owned()),
+                    quota_blocked: false,
                 }],
                 calls: Vec::new(),
                 fail_next_save: false,
@@ -1299,6 +1348,15 @@ mod tests {
         fn fail_launch(&mut self, ticket: &str) {
             self.failed_launches
                 .insert(TicketId::parse(ticket).expect("failed launch Ticket"));
+        }
+
+        /// Marks the single observed Worker as quota-blocked, so its failed Run
+        /// is a wait rather than a retry.
+        fn mark_quota_blocked(mut self) -> Self {
+            if let Some(worker) = self.workers.first_mut() {
+                worker.quota_blocked = true;
+            }
+            self
         }
     }
 
@@ -1574,6 +1632,39 @@ mod tests {
                 OrchestrationEvent::Retrying { attempt: 2, .. },
                 OrchestrationEvent::WaitingForCapacity { .. }
             ]
+        ));
+    }
+
+    #[test]
+    fn quota_blocked_run_is_parked_without_a_retry_or_reset() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        );
+        let mut execution = FakeExecution::failed_attempt(0).mark_quota_blocked();
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("park a quota-blocked Run");
+
+        // No Reset, no re-claim: the Ticket is parked terminally so the loop
+        // stops rather than hammering the wall.
+        assert_eq!(
+            execution.calls,
+            vec!["workers".to_owned(), "save:r0:ENG-101:failed".to_owned()]
+        );
+        let issue = execution
+            .group
+            .state()
+            .sub_issues
+            .get(&TicketId::parse("ENG-101").expect("Ticket"))
+            .expect("parked Ticket");
+        assert_eq!(issue.retries, 0, "a quota block consumes no retry");
+        assert_eq!(issue.status.as_str(), "failed");
+        assert!(matches!(
+            events.as_slice(),
+            [OrchestrationEvent::QuotaBlocked { detail: Some(detail), .. }]
+                if detail == "build failed"
         ));
     }
 
