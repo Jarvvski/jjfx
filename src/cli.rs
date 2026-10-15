@@ -1771,6 +1771,12 @@ fn render_orchestration_event(event: &OrchestrationEvent) {
         OrchestrationEvent::Retrying {
             ticket, attempt, ..
         } => eprintln!("  retrying {ticket} (attempt {attempt})"),
+        OrchestrationEvent::QuotaBlocked { ticket, detail, .. } => eprintln!(
+            "  quota-blocked {ticket}: {} (waiting; not retried)",
+            detail
+                .as_deref()
+                .unwrap_or("provider quota or billing wall")
+        ),
         OrchestrationEvent::WaitingForCapacity { ticket } => {
             eprintln!("  waiting for capacity: {ticket}")
         }

@@ -293,6 +293,21 @@ pub enum DispatchGroupEvent {
         /// Worker that was reset.
         worker: WorkerId,
     },
+    /// Records a Run blocked on a provider quota or billing wall.
+    ///
+    /// Unlike [`DispatchGroupEvent::Failed`], this never consumes a retry and
+    /// never returns the Ticket to pending: the Run is blocked on capacity or
+    /// account state, so retrying now would only hammer the wall. The Ticket is
+    /// recorded terminally so the orchestration loop stops and a human resumes
+    /// it once the wall clears.
+    QuotaBlocked {
+        /// Ticket whose Run hit the wall.
+        ticket: TicketId,
+        /// Worker that ran the Ticket.
+        worker: WorkerId,
+        /// Caller-provided observation timestamp.
+        at: WireTimestamp,
+    },
     /// Records work delivered outside a Worker Run.
     Merged {
         /// Ticket now present on the main branch.
@@ -315,6 +330,8 @@ pub enum DispatchGroupTransition {
     RetryRequired,
     /// A failed Ticket was returned to pending after Reset.
     Retried,
+    /// A Ticket's Run hit a quota or billing wall and was parked.
+    QuotaBlocked,
     /// A Ticket reached terminal failure.
     Failed,
     /// A Ticket was recorded as merged on main.
@@ -449,6 +466,16 @@ impl DispatchGroup {
                 issue.completed_at = None;
                 issue.retries += 1;
                 Ok(DispatchGroupTransition::Retried)
+            }
+            DispatchGroupEvent::QuotaBlocked { ticket, worker, at } => {
+                let issue = self.issue_mut(&ticket)?;
+                ensure_assigned(issue, &ticket, &worker)?;
+                // Deliberately ignores the retry allowance: a quota wall is not
+                // the transient failure the retry budget exists for, so this
+                // parks the Ticket without returning it to pending.
+                issue.status = WireStatus::new("failed");
+                issue.completed_at = Some(at);
+                Ok(DispatchGroupTransition::QuotaBlocked)
             }
             DispatchGroupEvent::Merged { ticket, at } => {
                 let issue = self.issue_mut(&ticket)?;

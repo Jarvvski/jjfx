@@ -266,6 +266,27 @@ mod tests {
     }
 
     #[test]
+    fn quota_blocked_workspace_groups_with_needs_you() {
+        // A rate-limited agent must sort to the top with the other needs-you
+        // rows, not fall through to idle.
+        let (q, idle) = (ws("rate-limited"), ws("quiet"));
+        let inputs = [
+            input(&idle, AgentState::Absent, WorkState::Clean),
+            input(&q, AgentState::QuotaBlocked, WorkState::Clean),
+        ];
+        let view = ClassifiedView::build(&inputs, false);
+        assert_eq!(
+            shape(&view),
+            [
+                "header:NeedsYou(1)",
+                "ws:rate-limited",
+                "header:Idle(1)",
+                "ws:quiet",
+            ]
+        );
+    }
+
+    #[test]
     fn build_pins_default_first_regardless_of_attention() {
         let (d, a) = (ws(DEFAULT_WORKSPACE), ws("a"));
         let inputs = [

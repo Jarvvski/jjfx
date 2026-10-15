@@ -78,6 +78,12 @@ fn orchestration_notice(event: &crate::engine::OrchestrationEvent) -> Option<Str
         crate::engine::OrchestrationEvent::Retrying {
             ticket, attempt, ..
         } => Some(format!("retrying {ticket} (attempt {attempt})")),
+        crate::engine::OrchestrationEvent::QuotaBlocked { ticket, detail, .. } => Some(format!(
+            "{ticket} quota-blocked: {} (waiting; not retried)",
+            detail
+                .as_deref()
+                .unwrap_or("provider quota or billing wall")
+        )),
         crate::engine::OrchestrationEvent::Dispatched { ticket, worker } => {
             Some(format!("{ticket} dispatched to {worker}"))
         }

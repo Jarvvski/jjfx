@@ -589,6 +589,39 @@ fn first_failure_requires_reset_before_retry_and_second_failure_is_terminal() {
 }
 
 #[test]
+fn a_quota_blocked_run_is_parked_terminal_without_consuming_a_retry() {
+    let mut group = group_from_response(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Build","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    );
+    let ticket = TicketId::parse("ENG-101").expect("Ticket");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    group
+        .apply(DispatchGroupEvent::Dispatched {
+            ticket: ticket.clone(),
+            worker: worker.clone(),
+            at: WireTimestamp::new("2026-08-01T10:01:00Z"),
+        })
+        .expect("dispatch");
+
+    // A quota wall parks the Ticket even on its first failure: it ignores the
+    // retry allowance, so it never returns to pending for a retry-now.
+    assert_eq!(
+        group
+            .apply(DispatchGroupEvent::QuotaBlocked {
+                ticket: ticket.clone(),
+                worker,
+                at: WireTimestamp::new("2026-08-01T10:02:00Z"),
+            })
+            .expect("quota block"),
+        DispatchGroupTransition::QuotaBlocked
+    );
+    let issue = &group.state().sub_issues[&ticket];
+    assert_eq!(issue.status.as_str(), "failed");
+    assert_eq!(issue.retries, 0);
+    assert!(group.is_terminal());
+}
+
+#[test]
 fn construction_rejects_cycles_and_impossible_persisted_relationships() {
     let cyclic = graph(
         r#"{"sub_issues":[{"id":"ENG-101","title":"A","status":"Todo","blocked_by":["ENG-102"],"cross_repo":false},{"id":"ENG-102","title":"B","status":"Todo","blocked_by":["ENG-101"],"cross_repo":false}]}"#,
