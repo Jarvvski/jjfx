@@ -8,7 +8,9 @@
 
 use super::*;
 
+use crate::config::TicketsConfig;
 use crate::engine::DispatchExclusions;
+use crate::ticket_source::configured_ticket_query;
 
 /// The blocking port behind the controller seam: one capability surface the
 /// controller runs off the App task. Production fills it with
@@ -101,6 +103,9 @@ pub struct RealWorkspaceDispatch {
     repository_root: PathBuf,
     /// Whether new Workspaces are colocated with Git (jjfx's `colocate`).
     colocate: bool,
+    /// Where Dispatch discovers Ready Tickets (`[tickets]`), independent of the
+    /// Agent Runtime the Pool runs.
+    tickets: TicketsConfig,
     /// The multiplexer jjfx drives, used to keep Workspaces that are open in a
     /// terminal out of Worker selection. `None` (tests) excludes nothing.
     terminal: Option<std::sync::Arc<dyn crate::terminal::Terminal>>,
@@ -112,6 +117,7 @@ impl std::fmt::Debug for RealWorkspaceDispatch {
             .debug_struct("RealWorkspaceDispatch")
             .field("repository_root", &self.repository_root)
             .field("colocate", &self.colocate)
+            .field("ticket_source", &self.tickets.source)
             .field("terminal", &self.terminal.is_some())
             .finish()
     }
@@ -138,20 +144,6 @@ fn live_exclusions(
     Ok(crate::engine::reconcile_occupancy(repository, &open))
 }
 
-fn configured_ticket_query(
-    repository: &crate::engine::Repository,
-    runtime: AgentRuntime,
-) -> AgentRuntimeQuery {
-    let query = AgentRuntimeQuery::new(runtime, repository.root());
-    if runtime != AgentRuntime::Pi {
-        return query;
-    }
-    match std::env::var_os(PI_DISCOVERY_HELPER_ENV).filter(|executable| !executable.is_empty()) {
-        Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
-        None => query,
-    }
-}
-
 enum DispatchStrategy {
     Complete,
     ApprovedGrowth(usize),
@@ -164,6 +156,7 @@ impl RealWorkspaceDispatch {
         Self {
             repository_root: repository_root.into(),
             colocate: true,
+            tickets: TicketsConfig::default(),
             terminal: None,
         }
     }
@@ -171,6 +164,12 @@ impl RealWorkspaceDispatch {
     /// Sets the Workspace colocation preference (builder form).
     pub fn with_colocate(mut self, colocate: bool) -> Self {
         self.colocate = colocate;
+        self
+    }
+
+    /// Sets where Dispatch discovers Ready Tickets (builder form).
+    pub fn with_tickets(mut self, tickets: TicketsConfig) -> Self {
+        self.tickets = tickets;
         self
     }
 
@@ -414,9 +413,13 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .pool()
             .and_then(|pool| pool.agent_runtime())
             .unwrap_or(AgentRuntime::Claude);
-        let status = TicketStatus::parse("Todo").map_err(|error| error.to_string())?;
+        let status =
+            TicketStatus::parse(self.tickets.ready_status()).map_err(|error| error.to_string())?;
         let filter = ReadyTicketFilter::new(label, status).map_err(|error| error.to_string())?;
-        let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
+        let discovery = TicketDiscovery::new(
+            configured_ticket_query(self.repository_root.as_path(), &self.tickets, runtime)
+                .map_err(|error| error.to_string())?,
+        );
         let ready = discovery
             .ready_tickets(&filter)
             .map_err(|error| error.to_string())?;
@@ -459,7 +462,10 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .ticket()
             .clone();
         let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
-        let discovery = TicketDiscovery::new(configured_ticket_query(&repository, runtime));
+        let discovery = TicketDiscovery::new(
+            configured_ticket_query(repository.root(), &self.tickets, runtime)
+                .map_err(|error| error.to_string())?,
+        );
         let runner = repository
             .orchestration_runner()
             .with_exclusions(self.exclusions_provider());

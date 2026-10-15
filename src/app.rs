@@ -412,11 +412,13 @@ impl App {
         terminal: Arc<dyn Terminal>,
         world_pane: bool,
         tx: UnboundedSender<Msg>,
+        tickets: crate::config::TicketsConfig,
     ) -> Self {
         let dispatch_tx = tx.clone();
         let dispatch = WorkspaceDispatchController::new(
             RealWorkspaceDispatch::new(store.repo_root())
                 .with_colocate(store.colocate())
+                .with_tickets(tickets)
                 .with_terminal(Arc::clone(&terminal)),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
@@ -2841,6 +2843,7 @@ mod tests {
             terminal.into(),
             false,
             tx,
+            crate::config::TicketsConfig::default(),
         )
     }
 
@@ -2891,7 +2894,14 @@ mod tests {
             Arc::from(jj),
             None,
         );
-        let app = App::new(store, agent::AgentStates::default(), terminal, false, tx);
+        let app = App::new(
+            store,
+            agent::AgentStates::default(),
+            terminal,
+            false,
+            tx,
+            crate::config::TicketsConfig::default(),
+        );
         (app, runtime, rx)
     }
 
@@ -6125,6 +6135,7 @@ mod tests {
             Arc::from(Box::new(FakeTerminal::default()) as Box<dyn Terminal>),
             true,
             tx,
+            crate::config::TicketsConfig::default(),
         );
         assert!(app.world_pane());
     }

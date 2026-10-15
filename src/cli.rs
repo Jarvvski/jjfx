@@ -6,15 +6,16 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
+use crate::config::TicketsConfig;
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, AgentRuntimeQuery, CapacityShortage,
-    CleanDecision, DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome,
-    DirectDispatchRequest, DispatchBudget, DispatchExclusions, FollowUpExecution,
-    OrchestrationEvent, PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
+    DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
+    DispatchBudget, DispatchExclusions, FollowUpExecution, OrchestrationEvent, PoolCapacity,
     ReadyTicketFilter, Repository, RunActivity, RunActivityKind, RunMode, TerminalSettings,
     TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, WireAgent, WorkerActions,
     WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
 };
+use crate::ticket_source::configured_ticket_query;
 
 pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
@@ -667,6 +668,7 @@ pub fn run(
     terminal_settings: fn() -> Result<TerminalSettings>,
     colocate: fn() -> Result<bool>,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+    tickets: fn() -> Result<TicketsConfig>,
 ) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
@@ -685,7 +687,7 @@ pub fn run(
         Command::Clean => clean_command(&repository(colocate)?)?,
         Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
         Command::Dispatch(args) => {
-            dispatch_command(&repository(colocate)?, &args, open_workspaces)?
+            dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
         }
         Command::Send {
             worker,
@@ -724,6 +726,7 @@ pub fn run(
             model.as_deref(),
             force,
             open_workspaces,
+            tickets,
         )?,
         Command::Pool(command) => pool_command(&repository(colocate)?, command)?,
     }
@@ -1212,21 +1215,11 @@ fn configured_runtime(repository: &Repository) -> AgentRuntime {
         .unwrap_or(AgentRuntime::Claude)
 }
 
-fn configured_ticket_query(repository: &Repository, runtime: AgentRuntime) -> AgentRuntimeQuery {
-    let query = AgentRuntimeQuery::new(runtime, repository.root());
-    if runtime != AgentRuntime::Pi {
-        return query;
-    }
-    match std::env::var_os(PI_DISCOVERY_HELPER_ENV).filter(|executable| !executable.is_empty()) {
-        Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
-        None => query,
-    }
-}
-
 fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+    tickets_config: fn() -> Result<TicketsConfig>,
 ) -> Result<()> {
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
 
@@ -1241,6 +1234,7 @@ fn dispatch_command(
                 args.model.as_deref(),
                 args.force,
                 open_workspaces,
+                tickets_config,
             );
         }
         let executable = std::env::current_exe()?;
@@ -1269,11 +1263,16 @@ fn dispatch_command(
     }
 
     let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
+    let tickets = tickets_config()?;
     let runtime = configured_runtime(repository);
-    let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository.root(),
+        &tickets,
+        runtime,
+    )?);
 
     if args.all {
-        let status = TicketStatus::parse("Todo")?;
+        let status = TicketStatus::parse(tickets.ready_status())?;
         let filter = ReadyTicketFilter::new(&args.label, status)?;
         eprintln!("Fetching tickets with label '{}'...", args.label);
         let ready = discovery.ready_tickets(&filter)?;
@@ -1705,13 +1704,19 @@ fn orchestrate_command(
     model: Option<&str>,
     force: bool,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+    tickets_config: fn() -> Result<TicketsConfig>,
 ) -> Result<()> {
     let id = TicketId::parse(parent.to_owned())?;
     // The runner re-queries occupancy per claim, so a Workspace a human opens or
     // closes while the group runs changes the next decision (ADR-0011).
     let exclusions = exclusions_provider(repository, force, open_workspaces);
+    let tickets = tickets_config()?;
     let runtime = configured_runtime(repository);
-    let discovery = TicketDiscovery::new(configured_ticket_query(repository, runtime));
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository.root(),
+        &tickets,
+        runtime,
+    )?);
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the
     // no-children direct fallback inlines the Ticket body.
     let details = fetch_ticket_details(runtime, &discovery, &id)?;

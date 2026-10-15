@@ -78,6 +78,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             terminal_settings,
             colocate_setting,
             open_workspaces,
+            tickets_setting,
         )
     };
 
@@ -191,6 +192,13 @@ pub fn colocate_setting() -> anyhow::Result<bool> {
     Ok(config::load()?.colocate)
 }
 
+/// The `[tickets]` settings the CLI uses to discover Ready Tickets. Loaded
+/// lazily, and only by `dispatch` and `orchestrate`, so a bad source surfaces
+/// before any Worker reservation or Pool mutation.
+fn tickets_setting() -> anyhow::Result<config::TicketsConfig> {
+    Ok(config::load()?.tickets)
+}
+
 /// Launch the shared interactive jjfx TUI for a discovered repository.
 ///
 /// The launcher owns the runtime, watchers, pollers, App, and terminal
@@ -266,6 +274,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         terminal,
         ui.world_pane,
         tx,
+        config.tickets,
     );
     // A `jj`/`jj-lib` version mismatch degrades the graph read. Surface it up
     // front, before the first load, so it is visible even if that load errors
