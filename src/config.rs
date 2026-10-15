@@ -36,6 +36,9 @@ pub struct Config {
     pub review: ReviewConfig,
     /// How the cross-workspace migration-order check finds migrations.
     pub migrations: MigrationsConfig,
+    /// The repo-owned build check the forge runs against the welded tree before
+    /// it pushes.
+    pub checks: ChecksConfig,
     /// Whether new workspaces are colocated with Git: `jj workspace add` creates
     /// a Git worktree so each agent workspace has a working `.git`, which lets
     /// tools such as `gh stack` run inside it. On by default; set false to create
@@ -60,6 +63,7 @@ impl Default for Config {
             watchdog: WatchdogConfig::default(),
             review: ReviewConfig::default(),
             migrations: MigrationsConfig::default(),
+            checks: ChecksConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
             colocate: true,
             _legacy_workspace: None,
@@ -124,6 +128,7 @@ impl Config {
         if self.migrations.pattern.trim().is_empty() {
             anyhow::bail!("migrations.pattern cannot be blank");
         }
+        self.checks.validate()?;
         Ok(())
     }
 
@@ -505,6 +510,65 @@ impl Default for MigrationsConfig {
     }
 }
 
+/// The repo-owned build check the forge runs against the welded tree, before it
+/// pushes (ticket 18).
+///
+/// A Run is `done` purely from the agent runtime's own terminal event, so the
+/// whole "this ticket is finished" signal is the agent's report that it is. Two
+/// changes can each be green, mergeable and at zero open threads while not
+/// compiling together - both calling a member a third, still-open change adds.
+/// The forge welds onto trunk before it pushes, so a check run there sees what
+/// `main` will actually be, which a post-Run hook on the un-welded tree would
+/// miss. jjfx never guesses the command: an unconfigured repo is a no-op, not a
+/// default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ChecksConfig {
+    /// The command the repository owns for a build check - `cargo check`,
+    /// `./gradlew :app:backend:compileKotlin`, `bun run build`. Run through the
+    /// user's shell, in the workspace, so the repo decides the toolchain. `None`
+    /// (the default) means no check: the forge behaves exactly as before.
+    pub command: Option<String>,
+    /// Whether the check runs. On by default; set false to keep the command
+    /// configured but skip the check.
+    pub enabled: bool,
+    /// How long the check may run before jjfx kills it and fails the step. A
+    /// build that never finishes must not hold the forge open without bound.
+    pub timeout_secs: u64,
+}
+
+impl Default for ChecksConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            enabled: true,
+            timeout_secs: DEFAULT_CHECK_TIMEOUT_SECS,
+        }
+    }
+}
+
+impl ChecksConfig {
+    /// Reject settings the check cannot run, so a bad config fails at startup
+    /// rather than mid-forge.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.timeout_secs == 0 {
+            anyhow::bail!("checks.timeout_secs must be at least 1");
+        }
+        if self
+            .command
+            .as_deref()
+            .is_some_and(|command| command.trim().is_empty())
+        {
+            anyhow::bail!("checks.command cannot be blank; remove it to disable the check");
+        }
+        Ok(())
+    }
+}
+
+/// Ten minutes: long enough for a cold full build, short enough that a wedged
+/// check does not hold the forge open indefinitely.
+const DEFAULT_CHECK_TIMEOUT_SECS: u64 = 600;
+
 /// Where jjfx opens workspace session tabs. Empty (the default) drives the kitty
 /// jjfx runs inside, matching pre-config behaviour.
 #[derive(Debug, Default, Deserialize)]
@@ -646,6 +710,41 @@ mod tests {
         let blank: Config =
             toml::from_str("[migrations]\npattern = \"  \"\n").expect("toml parses");
         assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn checks_are_unconfigured_by_default() {
+        let cfg: Config = toml::from_str("").expect("empty toml parses");
+        assert_eq!(cfg.checks.command, None);
+        assert!(cfg.checks.enabled);
+        assert_eq!(cfg.checks.timeout_secs, 600);
+        cfg.validate().expect("the default config is valid");
+    }
+
+    #[test]
+    fn checks_are_configurable() {
+        let cfg: Config =
+            toml::from_str("[checks]\ncommand = \"cargo check\"\ntimeout_secs = 120\n")
+                .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.checks.command.as_deref(), Some("cargo check"));
+        assert_eq!(cfg.checks.timeout_secs, 120);
+    }
+
+    #[test]
+    fn an_unknown_checks_key_is_rejected() {
+        let error = toml::from_str::<Config>("[checks]\ncomand = \"cargo check\"\n")
+            .expect_err("deny_unknown_fields must reject a typo");
+        assert!(error.to_string().contains("comand"), "{error}");
+    }
+
+    #[test]
+    fn a_blank_check_command_and_a_zero_timeout_are_rejected() {
+        let blank: Config = toml::from_str("[checks]\ncommand = \"  \"\n").expect("toml parses");
+        assert!(blank.validate().is_err());
+
+        let zero: Config = toml::from_str("[checks]\ntimeout_secs = 0\n").expect("toml parses");
+        assert!(zero.validate().is_err());
     }
 
     #[test]
