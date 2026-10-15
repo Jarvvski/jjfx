@@ -100,7 +100,7 @@ pub(crate) fn agent_color(agent: agent::Agent) -> Color {
         AgentState::Absent | AgentState::Ended => Color::DarkGray,
         AgentState::Working => brand_color(agent.kind),
         AgentState::Waiting => Color::Yellow,
-        AgentState::NeedsAttention => Color::Red,
+        AgentState::NeedsAttention | AgentState::QuotaBlocked => Color::Red,
     }
 }
 
@@ -172,6 +172,9 @@ pub(crate) fn agent_glyph(agent: agent::Agent, tick: u64) -> Span<'static> {
         AgentState::Working => (working_frame(agent.kind, tick), brand_color(agent.kind)),
         AgentState::Waiting => (paused_glyph(agent.kind), Color::Yellow),
         AgentState::NeedsAttention => (paused_glyph(agent.kind), Color::Red),
+        // A quota/billing block wears its own mark: it is not a permission
+        // dialog, and the human's move (wait or fix billing) is different.
+        AgentState::QuotaBlocked => ('⊘', Color::Red),
         AgentState::Absent | AgentState::Ended => ('·', Color::DarkGray),
     };
     Span::styled(format!("{ch} "), Style::default().fg(color))

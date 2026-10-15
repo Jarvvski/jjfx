@@ -3593,6 +3593,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         }));
         let feat = app
             .store
@@ -3624,6 +3626,8 @@ mod tests {
             jjfx_event_version: Some(1),
             agent_kind: Some("pi".into()),
             session_id: Some("pi-1".into()),
+            notification_type: None,
+            error: None,
         }));
 
         let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
@@ -5839,6 +5843,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         }));
         app.handle(Msg::AgentEvent(agent::Event {
             name: "UserPromptSubmit".into(),
@@ -5847,6 +5853,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         }));
         let mut snap = HashMap::new();
         snap.insert(
@@ -5896,6 +5904,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         }));
 
         let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
@@ -6312,6 +6322,13 @@ mod tests {
             agent_glyph(live(NeedsAttention, Codex), 0).style.fg,
             Some(Color::Red)
         );
+        // A quota/billing block wears its own mark, distinct from a permission
+        // dialog, in the needs-you colour.
+        assert_eq!(agent_glyph(live(QuotaBlocked, Claude), 0).content, "⊘ ");
+        assert_eq!(
+            agent_glyph(live(QuotaBlocked, Claude), 0).style.fg,
+            Some(Color::Red)
+        );
         assert_eq!(agent_glyph(live(Absent, Unknown), 0).content, "· ");
         assert_eq!(agent_glyph(live(Ended, Claude), 0).content, "· ");
         // Each agent works in its own animation and brand colour.
@@ -6361,6 +6378,8 @@ mod tests {
                 jjfx_event_version: None,
                 agent_kind: None,
                 session_id: None,
+                notification_type: None,
+                error: None,
             }));
         }
         assert!(app.animate());
@@ -6378,6 +6397,8 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            notification_type: None,
+            error: None,
         }));
         assert!(!app.animate());
     }
@@ -6400,6 +6421,8 @@ mod tests {
                 jjfx_event_version: None,
                 agent_kind: None,
                 session_id: None,
+                notification_type: None,
+                error: None,
             }));
         }
         assert!(app.is_animating());
