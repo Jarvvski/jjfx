@@ -10,8 +10,8 @@ use std::path::Path;
 
 use crate::config::{TicketSource, TicketsConfig};
 use crate::engine::{
-    AgentRuntime, AgentRuntimeQuery, PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, TicketQuery,
-    TicketQueryError,
+    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, PI_DISCOVERY_HELPER_ENV,
+    PiDiscoveryHelper, TicketQuery, TicketQueryError,
 };
 
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
@@ -26,10 +26,11 @@ pub(crate) fn configured_ticket_query(
 ) -> Result<Box<dyn TicketQuery>, TicketQueryError> {
     match tickets.source {
         TicketSource::Linear => Ok(Box::new(linear_query(workspace, runtime))),
-        TicketSource::Local => Err(TicketQueryError::setup(
-            "the local markdown Ticket source is not available yet; \
-             set [tickets] source = \"linear\"",
-        )),
+        TicketSource::Local => Ok(Box::new(LocalMarkdownQuery::new(
+            workspace.join(&tickets.local.root),
+            tickets.local.ready_status.clone(),
+            tickets.local.resolved_status.clone(),
+        ))),
     }
 }
 
@@ -53,7 +54,7 @@ mod tests {
     use super::*;
     use crate::engine::{
         ParentTicket, ReadyTicketFilter, RepositoryIdentity, TicketDiscovery, TicketId,
-        TicketQueryErrorKind, TicketQueryRequest, TicketStatus,
+        TicketQueryRequest, TicketStatus,
     };
 
     fn linear() -> TicketsConfig {
@@ -115,11 +116,10 @@ mod tests {
             AgentRuntime::OpenCode,
             AgentRuntime::Pi,
         ] {
-            let error = configured_ticket_query(workspace, &local(), runtime)
-                .err()
-                .expect("the local source is not available yet");
-            assert_eq!(error.kind(), TicketQueryErrorKind::Setup, "{runtime}");
-            assert!(error.to_string().contains("local"), "{error}");
+            assert!(
+                configured_ticket_query(workspace, &local(), runtime).is_ok(),
+                "{runtime}"
+            );
         }
     }
 
