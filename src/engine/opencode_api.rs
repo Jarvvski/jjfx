@@ -82,6 +82,64 @@ pub enum SessionOutcome {
     Unknown(String),
 }
 
+/// How a human answered a pending permission request (`Permission.Reply`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDecision {
+    /// Allow this one request.
+    Once,
+    /// Allow this request and remember the choice for later ones.
+    Always,
+    /// Refuse the request.
+    Reject,
+}
+
+impl PermissionDecision {
+    /// The wire value opencode expects.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Once => "once",
+            Self::Always => "always",
+            Self::Reject => "reject",
+        }
+    }
+}
+
+/// A pending permission request opencode reports for a session
+/// (`Permission.Request`).
+///
+/// Only the fields a human needs to decide are kept: the id to answer with, the
+/// action being requested, the resources it touches, and the provider's own
+/// message when it supplies one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionRequest {
+    id: String,
+    action: String,
+    resources: Vec<String>,
+    message: Option<String>,
+}
+
+impl PermissionRequest {
+    /// The request id to answer with, e.g. `per_ab12...`.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The action the agent is asking to perform.
+    pub fn action(&self) -> &str {
+        &self.action
+    }
+
+    /// The resources the action touches, in provider order.
+    pub fn resources(&self) -> &[String] {
+        &self.resources
+    }
+
+    /// The provider's own explanatory message, when it supplies one.
+    pub fn message(&self) -> Option<&str> {
+        self.message.as_deref()
+    }
+}
+
 /// The model a session should run with (`Model.Ref`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRef {
@@ -202,6 +260,18 @@ impl<'a> From<&'a ModelRef> for ModelBody<'a> {
             variant: model.variant.as_deref(),
         }
     }
+}
+
+/// The body of a `session.prompt` request.
+#[derive(Serialize)]
+struct PromptBody<'a> {
+    text: &'a str,
+}
+
+/// The body of a `session.permission.reply` request.
+#[derive(Serialize)]
+struct PermissionReplyBody {
+    decision: &'static str,
 }
 
 /// The raw result of one `opencode api` invocation.
@@ -431,6 +501,67 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
             .map(|envelope| envelope.interrupted)
     }
 
+    /// Sends `prompt` to a session without waiting for it (`session.prompt`).
+    ///
+    /// This is opencode's asynchronous prompt - the route the docs call
+    /// `prompt_async`: the daemon admits the input and schedules the agent loop,
+    /// so jjfx reaches a Run's session without spawning a client process. The
+    /// response body carries no value a caller needs, so only acceptance is
+    /// reported.
+    pub fn prompt_async(&self, session_id: &str, prompt: &str) -> Result<(), OpenCodeError> {
+        let body = PromptBody { text: prompt };
+        let body = serde_json::to_string(&body).map_err(|source| OpenCodeError::Unavailable {
+            reason: format!("cannot encode session.prompt request: {source}"),
+        })?;
+        self.call(operation_args(
+            "session.prompt",
+            &[("sessionID", session_id)],
+            Some(&body),
+        ))?;
+        Ok(())
+    }
+
+    /// Answers a pending permission request (`session.permission.reply`).
+    pub fn reply_permission(
+        &self,
+        session_id: &str,
+        request_id: &str,
+        decision: PermissionDecision,
+    ) -> Result<(), OpenCodeError> {
+        let body = PermissionReplyBody {
+            decision: decision.as_str(),
+        };
+        let body = serde_json::to_string(&body).map_err(|source| OpenCodeError::Unavailable {
+            reason: format!("cannot encode session.permission.reply request: {source}"),
+        })?;
+        self.call(operation_args(
+            "session.permission.reply",
+            &[("sessionID", session_id), ("requestID", request_id)],
+            Some(&body),
+        ))?;
+        Ok(())
+    }
+
+    /// The pending permission requests owned by a session
+    /// (`session.permission.list`).
+    pub fn pending_permissions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<PermissionRequest>, OpenCodeError> {
+        let raw = self.call(operation_args(
+            "session.permission.list",
+            &[("sessionID", session_id)],
+            None,
+        ))?;
+        parse_envelope::<PermissionsEnvelope>(&raw, "session.permission.list").map(|envelope| {
+            envelope
+                .data
+                .into_iter()
+                .map(PermissionInfo::into_request)
+                .collect()
+        })
+    }
+
     /// Runs one invocation and returns its stdout, or the classified failure.
     fn call(&self, args: Vec<String>) -> Result<String, OpenCodeError> {
         let output = self
@@ -582,6 +713,32 @@ struct ActiveSessionsEnvelope {
 #[derive(Deserialize)]
 struct InterruptEnvelope {
     interrupted: bool,
+}
+
+#[derive(Deserialize)]
+struct PermissionsEnvelope {
+    data: Vec<PermissionInfo>,
+}
+
+#[derive(Deserialize)]
+struct PermissionInfo {
+    id: String,
+    action: String,
+    #[serde(default)]
+    resources: Vec<String>,
+    #[serde(default)]
+    message: Option<String>,
+}
+
+impl PermissionInfo {
+    fn into_request(self) -> PermissionRequest {
+        PermissionRequest {
+            id: self.id,
+            action: self.action,
+            resources: self.resources,
+            message: self.message,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -890,6 +1047,121 @@ mod tests {
                 "sessionID=ses_x"
             ]]
         );
+    }
+
+    #[test]
+    fn prompt_async_addresses_the_session_and_sends_the_text() {
+        let api =
+            OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(r#"{"data":{"id":"msg_1"}}"#)]));
+
+        api.prompt_async("ses_x", "do the follow-up")
+            .expect("prompts");
+
+        let calls = api.runner.calls();
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0];
+        assert_eq!(
+            &args[..4],
+            ["api", "session.prompt", "--param", "sessionID=ses_x"]
+        );
+        let body = args
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert_eq!(body["text"], "do the follow-up");
+    }
+
+    #[test]
+    fn prompt_async_is_unavailable_when_the_server_cannot_be_reached() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(
+            1,
+            "",
+            "Error: Could not reach server at http://127.0.0.1:1\n    at cli.api\n",
+        )]));
+
+        let error = api
+            .prompt_async("ses_x", "do the follow-up")
+            .expect_err("no server");
+
+        assert!(error.is_unavailable());
+    }
+
+    #[test]
+    fn pending_permissions_maps_the_payload_onto_typed_requests() {
+        let payload = r#"{"data":[
+            {"id":"per_1","sessionID":"ses_x","action":"bash",
+             "resources":["rm -rf build"],"message":"run a shell command"},
+            {"id":"per_2","sessionID":"ses_x","action":"edit","resources":["src/main.rs"]}
+        ]}"#;
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(payload)]));
+
+        let pending = api.pending_permissions("ses_x").expect("parses");
+
+        assert_eq!(
+            api.runner.calls(),
+            vec![vec![
+                "api",
+                "session.permission.list",
+                "--param",
+                "sessionID=ses_x"
+            ]]
+        );
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].id(), "per_1");
+        assert_eq!(pending[0].action(), "bash");
+        assert_eq!(pending[0].resources(), ["rm -rf build"]);
+        assert_eq!(pending[0].message(), Some("run a shell command"));
+        // A request without a message and without resources is not a failure.
+        assert_eq!(pending[1].id(), "per_2");
+        assert_eq!(pending[1].resources(), ["src/main.rs"]);
+        assert_eq!(pending[1].message(), None);
+    }
+
+    #[test]
+    fn reply_permission_addresses_the_request_and_sends_the_decision() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok("")]));
+
+        api.reply_permission("ses_x", "per_1", PermissionDecision::Always)
+            .expect("replies");
+
+        let calls = api.runner.calls();
+        assert_eq!(calls.len(), 1);
+        let args = &calls[0];
+        assert_eq!(&args[..2], ["api", "session.permission.reply"]);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--param", "sessionID=ses_x"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--param", "requestID=per_1"])
+        );
+        let body = args
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert_eq!(body["decision"], "always");
+    }
+
+    #[test]
+    fn reply_permission_surfaces_a_server_rejection() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(
+            1,
+            r#"{"_tag":"PermissionNotFoundError","message":"Permission not found: per_nope"}"#,
+            "HTTP 404 Not Found\n",
+        )]));
+
+        let error = api
+            .reply_permission("ses_x", "per_nope", PermissionDecision::Once)
+            .expect_err("server rejects");
+
+        assert!(!error.is_unavailable());
+        assert_eq!(error.status(), Some(404));
+        assert!(error.to_string().contains("Permission not found: per_nope"));
     }
 
     #[test]

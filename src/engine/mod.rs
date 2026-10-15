@@ -48,7 +48,7 @@ pub use layout::{
 };
 pub use opencode_api::{
     CommandOutput, ModelRef, NewSession, OpenCodeApi, OpenCodeError, OpenCodeRunner,
-    ProcessOpenCodeRunner, Session, SessionOutcome,
+    PermissionDecision, PermissionRequest, ProcessOpenCodeRunner, Session, SessionOutcome,
 };
 pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationPreparation,
