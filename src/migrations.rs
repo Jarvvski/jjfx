@@ -263,11 +263,17 @@ fn space_of(path: &str) -> &str {
 }
 
 /// Every workspace jj reports, as `(name, directory)`, with the implicit
-/// `default` Workspace pinned to the repository root (ADR 0008). A workspace jj
-/// reports without a recorded path is skipped: jjfx never guesses a location.
+/// `default` Workspace pinned to the repository root (ADR 0008). jj reports
+/// `default` too, so it is deduplicated by name - the pinned entry wins. A
+/// workspace jj reports without a recorded path is skipped: jjfx never guesses a
+/// location.
 fn workspaces(repo_root: &Path) -> anyhow::Result<Vec<(String, PathBuf)>> {
     let mut workspaces = vec![(DEFAULT_WORKSPACE.to_owned(), repo_root.to_path_buf())];
+    let mut seen = HashSet::from([DEFAULT_WORKSPACE.to_owned()]);
     for workspace in crate::jj::workspaces(repo_root)? {
+        if !seen.insert(workspace.name.clone()) {
+            continue;
+        }
         if let Some(path) = workspace.path {
             workspaces.push((workspace.name, path));
         }
@@ -575,6 +581,103 @@ mod tests {
         assert_eq!(ambiguous.summary(), "1 ambiguous version(s)");
 
         assert_eq!(analyse(Vec::new()).summary(), "");
+    }
+
+    /// The acceptance test, end to end against real jj: two workspaces each add a
+    /// migration, and the check reports the inversion before either merges -
+    /// naming both files and both workspaces, in the order they must merge.
+    #[test]
+    fn a_real_repo_reports_the_cross_workspace_hazard_before_either_merges() {
+        let base = tempdir("repo");
+        let root = base.join("repo");
+        init_repo(&root);
+        let root = root.canonicalize().expect("the repo canonicalizes");
+        std::fs::create_dir_all(root.join("db/migration")).expect("creating the migration dir");
+        std::fs::write(root.join("db/migration/V188__init.sql"), "")
+            .expect("writing the baseline migration");
+
+        let a = base.join("ws-a");
+        let b = base.join("ws-b");
+        crate::jj::add_workspace(&root, "ws-a", &a).expect("adding ws-a");
+        crate::jj::add_workspace(&root, "ws-b", &b).expect("adding ws-b");
+        let write = |dir: &Path, name: &str| {
+            std::fs::create_dir_all(dir.join("db/migration")).expect("creating the migration dir");
+            std::fs::write(dir.join("db/migration").join(name), "").expect("writing a migration");
+        };
+        write(&a, "V189__a.sql");
+        write(&b, "V190__b.sql");
+
+        // The default workspace is not enumerated twice: jj reports it by name
+        // and jjfx pins it to the repository root, and the two must collapse.
+        let placed = read(&root, "**/V*__*.sql").expect("the read");
+        assert_eq!(
+            placed
+                .iter()
+                .filter(|m| m.path == "db/migration/V188__init.sql")
+                .count(),
+            1,
+            "{placed:?}"
+        );
+
+        // The inversion, named with both files and both workspaces, lowest first.
+        let report = check(&root, "**/V*__*.sql").expect("the check reads the workspaces");
+        assert_eq!(report.findings().len(), 1, "{report:?}");
+        assert_eq!(report.findings()[0].kind, FindingKind::Inversion);
+        assert_eq!(report.findings()[0].space, "db/migration");
+        assert_eq!(
+            report.findings()[0]
+                .migrations
+                .iter()
+                .map(|m| (m.workspace.as_str(), m.path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("ws-a", "db/migration/V189__a.sql"),
+                ("ws-b", "db/migration/V190__b.sql"),
+            ]
+        );
+
+        // The same version on both sides is ambiguous, not silently ordered.
+        std::fs::rename(
+            b.join("db/migration/V190__b.sql"),
+            b.join("db/migration/V189__b.sql"),
+        )
+        .expect("renaming ws-b's migration");
+        let report = check(&root, "**/V*__*.sql").expect("the check reads the workspaces");
+        assert_eq!(report.findings()[0].kind, FindingKind::Ambiguous);
+
+        // One workspace alone cannot invert against itself: clean.
+        std::fs::remove_file(b.join("db/migration/V189__b.sql"))
+            .expect("removing ws-b's migration");
+        assert!(
+            check(&root, "**/V*__*.sql")
+                .expect("the check reads")
+                .is_clean()
+        );
+
+        // A pattern the project's files do not match is a no-op.
+        assert!(
+            check(&root, "**/U*__*.sql")
+                .expect("the check reads")
+                .is_clean()
+        );
+
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// A throwaway jj repository at `dir` for the real-jj acceptance test.
+    fn init_repo(dir: &Path) {
+        let status = std::process::Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
+            .arg(dir)
+            .status()
+            .expect("jj should be installed");
+        assert!(status.success(), "jj git init should succeed");
     }
 
     /// A throwaway directory under the temp dir.
