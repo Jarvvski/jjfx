@@ -1,6 +1,6 @@
 # Promote conflicts to a first-class Work/Attention state with resolve
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -40,12 +40,12 @@ state, name the conflicted commit, and offer resolve:
 
 ## Acceptance Criteria
 
-- [ ] A Workspace whose chain contains a conflict reads as needs-you and names the
+- [x] A Workspace whose chain contains a conflict reads as needs-you and names the
       conflicted commit.
-- [ ] The forge still refuses to push a conflicted commit, but the reason is the
+- [x] The forge still refuses to push a conflicted commit, but the reason is the
       surfaced state, not a silent exclusion.
-- [ ] A conflicted commit can be resolved from the tool.
-- [ ] `mise run check` is green.
+- [x] A conflicted commit can be resolved from the tool.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -60,3 +60,47 @@ state, name the conflicted commit, and offer resolve:
 ## Comments
 
 - 2026-10-15: Filed from the strategy review.
+- 2026-10-15: Done. A conflicted chain is its own `WorkState::Conflicted { commit }`,
+  read from jj's `conflicts()` revset over the whole chain rather than the owned
+  subset, so the surfaced state and the forge's refusal agree by construction
+  instead of by parsing jj's status prose (bug-hunt ticket 21's rule).
+  - The state names the **owner** - the deepest conflicted commit - because
+    `conflicts()` matches every commit that *inherits* the conflict, and
+    resolving the owner clears the rest. It names the short **change id**, not
+    the commit id: the commit id is rewritten the instant the conflict is
+    resolved, while the change id is what `jj resolve -r` takes. The ticket said
+    "names the commit id"; this is the same intent, with the identity that
+    survives the resolve.
+  - A conflicted chain leads needs-you **even while an agent is mid-turn**,
+    unlike the changes-requested rule. A conflict blocks the forge outright, so
+    the human has to decide whether to resolve it or hand it to an agent.
+  - The forge refuses by name (`conflict in <change> - resolve it before
+    pushing`) and re-checks after `jj fix` as well as after the weld, so a
+    conflict a formatter buries is refused rather than quietly dropped by the
+    push revset's `~ conflicts()`. That revset exclusion is kept as a second line
+    of defence, but it is no longer the only thing standing between a conflict
+    and a push.
+  - Resolve is `jjfx resolve <workspace> [--tool <name>]`: `jj resolve -r
+    <change>` deepest-first, re-reading after each one and stopping as soon as
+    the set stops shrinking, so a merge tool that exits without changing anything
+    cannot spin; then `jj workspace update-stale`, because resolving a commit
+    below `@` leaves the working copy stale. `--tool` passes through, including
+    jj's `:ours`/`:theirs`.
+  - The merge tool is interactive, so the TUI keybinding (`C`) opens a tab
+    running the same CLI command rather than hosting the tool in jjfx's own
+    alternate screen - jjfx cannot give it a terminal. Rejected the `jj new
+    <commit>` + edit + `jj squash` path the ticket offered: `jj resolve` is the
+    one primitive that resolves *that* commit in place and rebases its
+    descendants.
+  - A Workspace whose commits another Workspace's rebase rewrote is **stale**,
+    and jj refuses to resolve on a stale working copy, so the resolve brings it
+    up to date first as well as after (`jj workspace update-stale`, a no-op when
+    the working copy is current). CI caught this: the developer machine has
+    `snapshot.auto-update-stale = true`, CI does not.
+  - `docs/conflicts.md` records the read, the scoping rule and the resolve;
+    `CONTEXT.md` gains a **Conflict** term.
+  - Tests live with the commit they cover rather than all in the last one: the
+    read against a real rebase conflict (`src/work.rs`, `src/jj.rs`), the list
+    through the renderer (`src/render/home.rs`), the resolve end to end through
+    the CLI (`tests/resolve.rs`), and the forge's refusal for a conflict the weld
+    buries and one a formatter buries (`src/forge.rs`).

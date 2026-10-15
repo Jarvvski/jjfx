@@ -45,6 +45,11 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Undo a jjfx-initiated Forge, weld, tidy or Reset from the tool: jjfx records the operation the repository was at before each mutation and restores it with `jj op restore` from `jjfx undo <worker>` or `u` in the Pool view, refusing when anything has happened since so a repository-wide restore cannot silently discard another Workspace's work
 - Surface a stalled Run as stuck, and pace a Dispatch batch under an optional `[dispatch] max_concurrent` cap that holds the excess Tickets back
 - Show the Tickets a capped Dispatch held back in `jjfx status` and the Pool view, from jjfx's own `.jj/pool/waiting.json`
+- Surface a conflicted change chain as a needs-you Work state naming the commit that owns the conflict, and resolve it from the tool with `jjfx resolve <workspace>` (or `C` in the list)
+
+### Fixed
+
+- The forge refuses to push a conflicted chain by name instead of silently excluding it from the push revset
 
 ## [0.54.0] - 2026-10-14
 
