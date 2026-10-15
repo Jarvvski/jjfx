@@ -100,10 +100,10 @@ pub use ticket::{
     TicketValueError,
 };
 pub use worker_actions::{
-    DismissOutcome, FollowUpExecution, FollowUpOutcome, FollowUpSession, MountOutcome,
-    OpenPullRequestOutcome, PermissionResolution, RebaseOutcome, ResetOutcome, RunMode,
-    WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration, WorkspaceRestorationError,
-    WorkspaceRestorationHandle,
+    AbsorbOutcome, AbsorbReport, DismissOutcome, FollowUpExecution, FollowUpOutcome,
+    FollowUpSession, MountOutcome, OpenPullRequestOutcome, PermissionResolution, RebaseOutcome,
+    ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration,
+    WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
 pub use workspace::jj_lib_compat_notice;
 pub use workspace::{

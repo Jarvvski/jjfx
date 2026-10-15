@@ -1,6 +1,6 @@
 # Use `jj absorb` for review-feedback edits
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -30,10 +30,10 @@ squash/split, and add a jjfx affordance where it helps.
 
 ## Acceptance Criteria
 
-- [ ] Review feedback that targets a base commit lands there via `jj absorb`
+- [x] Review feedback that targets a base commit lands there via `jj absorb`
       without manual splitting.
-- [ ] The review prompt and any jjfx command agree on the flow.
-- [ ] `mise run check` is green.
+- [x] The review prompt and any jjfx command agree on the flow.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -49,3 +49,27 @@ squash/split, and add a jjfx affordance where it helps.
 
 - 2026-10-15: Filed from the strategy review. jj-native; it removes hand-rolled
   squash targeting from the review loop.
+- 2026-10-15: Resolved. The review prompt's "address each unresolved comment"
+  step now says where a fix belongs before it is made: base-commit feedback goes
+  through `jj log` to find the owning commit, `jj new <commit>` to start an edit
+  on top of it, the edit itself, then `jj absorb` - explicitly *not* a new commit
+  stacked on top and *not* a hand-split. It also warns that absorb can leave the
+  commits above it conflicted and says what to do (`jj undo`, or address the
+  feedback on `@`). `jjfx absorb <worker>` is the same absorb step from outside
+  the workspace: `jj absorb` in the Worker's Workspace, then a push of the
+  rewritten bookmark. It reads `jj absorb`'s stderr summary (absorb exits zero
+  whether or not it moved anything), reports how many revisions took hunks and
+  whether any hunks stayed behind, and skips the push when nothing was absorbed,
+  so it is safe to run speculatively. A failed push rolls back with `jj undo`,
+  matching `rebase`. `jjfx absorb` is the only jjfx command in this flow, and it
+  runs exactly the `jj absorb` the prompt prescribes; both are pinned by tests.
+  Verification: `the_documented_base_commit_flow_lands_feedback_in_the_base_commit`
+  drives real jj through the documented sequence and asserts the base commit ends
+  up with the fix, the descendant keeps its own change, and the edit commit is
+  abandoned - the direct proof that no manual splitting is involved. Three
+  integration tests cover the command's argv (absorb + push), the nothing-to-do
+  case (no push), the hunks-stayed-behind case, and the push-failure rollback.
+  Deviations worth noting: the command's tests landed with the command (commit 2)
+  rather than in the tests/docs/changelog commit, since they pin its argv; and
+  the prompt keeps to raw `jj` rather than naming `jjfx absorb`, so the Worker's
+  agent needs no new binary on its PATH.

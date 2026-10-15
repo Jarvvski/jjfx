@@ -39,6 +39,8 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Show the Pool's aggregate cost and usage in the Pool view and `jjfx status`, and gate Dispatch on an optional `[spend] cap_usd` budget with `block` or `warn`
 - Configure an AI reviewer (`[review] reviewer = "coderabbit"`) and feed its normalised findings into the review prompt
 - Bound the re-review loop with a pass cap, so `jjfx review --fg` iterates review -> address -> review without looping to zero
+- Review feedback that belongs in a base commit now goes through `jj new <commit>` + `jj absorb` instead of a hand-split
+- Add `jjfx absorb <worker>`, which folds a Worker's working-copy edits into their base commits and pushes the rewritten bookmark
 
 ## [0.54.0] - 2026-10-14
 
