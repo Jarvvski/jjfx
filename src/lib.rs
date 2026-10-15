@@ -16,6 +16,7 @@ mod graph;
 mod hooks;
 mod jj;
 mod layout;
+mod migrations;
 mod pool_session;
 mod prs;
 mod render;
@@ -76,11 +77,14 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
         cli::run(
             args,
             launch,
-            terminal_settings,
-            colocate_setting,
-            open_workspaces,
-            tickets_setting,
-            spend_setting,
+            cli::Settings {
+                terminal: terminal_settings,
+                colocate: colocate_setting,
+                open_workspaces,
+                tickets: tickets_setting,
+                spend: spend_setting,
+                migrations: migrations_setting,
+            },
         )
     };
 
@@ -204,6 +208,12 @@ fn tickets_setting() -> anyhow::Result<config::TicketsConfig> {
 /// Resolve the aggregate spend cap Dispatch is gated on.
 fn spend_setting() -> anyhow::Result<config::SpendConfig> {
     Ok(config::load()?.spend)
+}
+
+/// The `[migrations]` settings the `check migrations` verb reads. Loaded lazily,
+/// so only that command pays for the config file.
+fn migrations_setting() -> anyhow::Result<config::MigrationsConfig> {
+    Ok(config::load()?.migrations)
 }
 
 /// Launch the shared interactive jjfx TUI for a discovered repository.

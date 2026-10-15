@@ -30,6 +30,8 @@ pub struct Config {
     /// Which AI reviewer the review loop runs, and how many re-review passes it
     /// makes. `reviewer = "none"` (the default) leaves review human-only.
     pub review: ReviewConfig,
+    /// How the cross-workspace migration-order check finds migrations.
+    pub migrations: MigrationsConfig,
     /// Whether new workspaces are colocated with Git: `jj workspace add` creates
     /// a Git worktree so each agent workspace has a working `.git`, which lets
     /// tools such as `gh stack` run inside it. On by default; set false to create
@@ -51,6 +53,7 @@ impl Default for Config {
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
             review: ReviewConfig::default(),
+            migrations: MigrationsConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
             colocate: true,
             _legacy_workspace: None,
@@ -111,6 +114,9 @@ impl Config {
         self.tickets.validate()?;
         self.spend.cap()?;
         self.review.validate()?;
+        if self.migrations.pattern.trim().is_empty() {
+            anyhow::bail!("migrations.pattern cannot be blank");
+        }
         Ok(())
     }
 }
@@ -382,6 +388,32 @@ pub enum ReviewerKind {
     OpenCodeAction,
 }
 
+/// How the cross-workspace migration-order check (ticket 17) finds migrations.
+///
+/// Parallel Workers each edit their own workspace, and an ordered-migration
+/// project can be individually correct per Pull Request yet wrong as a set: two
+/// workspaces adding `V189` and `V190` land out of order if the higher version
+/// merges first, which Flyway rejects on the next deploy when `outOfOrder` is
+/// unset. The check reads each workspace's working copy for files matching
+/// `pattern`, so the pattern is a setting rather than a hard-coded Flyway shape.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MigrationsConfig {
+    /// The glob a migration file's repo-relative path must match. Defaults to
+    /// Flyway's `V<version>__<description>.sql` shape; set it to your own layout
+    /// so a non-Flyway project is not forced into that shape. `**` matches zero
+    /// or more path segments, `*` any run of characters within one, `?` one.
+    pub pattern: String,
+}
+
+impl Default for MigrationsConfig {
+    fn default() -> Self {
+        Self {
+            pattern: "**/V*__*.sql".to_owned(),
+        }
+    }
+}
+
 /// Where jjfx opens workspace session tabs. Empty (the default) drives the kitty
 /// jjfx runs inside, matching pre-config behaviour.
 #[derive(Debug, Default, Deserialize)]
@@ -498,6 +530,24 @@ mod tests {
     fn colocation_can_be_disabled() {
         let cfg: Config = toml::from_str("colocate = false\n").expect("toml parses");
         assert!(!cfg.colocate);
+    }
+
+    #[test]
+    fn migrations_default_to_the_flyway_pattern() {
+        let cfg: Config = toml::from_str("").expect("empty toml parses");
+        assert_eq!(cfg.migrations.pattern, "**/V*__*.sql");
+    }
+
+    #[test]
+    fn migrations_pattern_is_configurable_and_cannot_be_blank() {
+        let cfg: Config =
+            toml::from_str("[migrations]\npattern = \"db/migrate/*.sql\"\n").expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.migrations.pattern, "db/migrate/*.sql");
+
+        let blank: Config =
+            toml::from_str("[migrations]\npattern = \"  \"\n").expect("toml parses");
+        assert!(blank.validate().is_err());
     }
 
     #[test]
