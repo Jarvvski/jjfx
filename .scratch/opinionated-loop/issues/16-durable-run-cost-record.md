@@ -1,6 +1,6 @@
 # Persist a durable per-Run cost record
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 Blocks: 07
@@ -101,3 +101,22 @@ is the data layer only.
 - 2026-10-15: Filed from the strategy review. Sits underneath 07 and was found
   while checking 07's premise: the costs it aggregates are not persisted, so 07
   cannot be built as written.
+- 2026-10-15: Landed. `RunRecord` (`state.rs`) is the jjfx-owned document for one
+  completed Run, kept in the append-only `.jj/pool/runs.jsonl` beside
+  `sessions.json`; `RunRecordRepository` appends one JSON line under its own
+  sidecar lock and never truncates, and a line that cannot be decoded is skipped
+  so one torn tail never hides the rest. `Reservation::finalize` (`pool.rs`)
+  writes the record once the Worker commit applies, populated from the
+  `RunResult` jjfx already computes plus the Run-owned Worker state - identity
+  (Worker and start timestamp), Ticket, workspace and bookmark, runtime and
+  model, cost, usage, duration, turns and conclusion. A stale finalization
+  appends nothing. An unusable or missing provider cost is recorded as absent,
+  per bug-hunt ticket 28, so a Run with no usable cost still appends a record.
+  Pinned by 5 store unit tests and 5 finalization unit tests (one record per
+  completed Run; a failed Run and a Run with no cost still record; two
+  consecutive Runs in one Worker both survive; a stale finalization appends
+  nothing; concurrent appends never interleave). Documented in
+  `docs/run-records.md`. The Pool view is deliberately unchanged - that is 07.
+  One deliberate decision: the record carries the Worker's bookmark (`branch`)
+  as the Run's change rather than reading the jj change id at finalization, so
+  finalization stays off the jj read path and cannot fail on it.
