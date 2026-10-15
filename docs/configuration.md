@@ -157,6 +157,15 @@ jjfx neither chooses nor ships formatters (see `jj help -k config`). With no
 tools configured the step is a no-op. A formatter that fails is reported as a
 forge error and stops the push, so a broken formatter never passes silently.
 
+### Build check before push
+
+After welding onto trunk and before pushing, the forge runs the repo-owned
+command configured in `[checks]` - if any. Weld has already rebased the workspace
+onto trunk by then, so the check sees what `main` will actually be; a change that
+does not build against it fails here rather than on the next person to rebuild.
+With no `[checks]` command configured the step does not apply and the pipeline is
+unchanged. See [`[checks]`](#checks) below.
+
 ## `[tickets]`
 
 Where `dispatch --all` and orchestration discover Ready Tickets. The source is a
@@ -353,6 +362,36 @@ project keeps each module's sequence separate. The `default` workspace's files
 are the baseline, so a migration every workspace inherits is not an addition and
 cannot invert; two workspaces adding the *same* version are reported as
 ambiguous rather than silently ordered.
+
+## `[checks]`
+
+The repo-owned build check the forge runs against the welded tree, before it
+pushes. A Run is `done` purely from the agent runtime's own terminal event, so
+the whole "this ticket is finished" signal is the agent's report that it is - and
+two changes can each be green, mergeable and at zero open threads while **not
+compiling together**. Weld has already rebased onto trunk when the check runs, so
+it sees what `main` will actually be, which a check on the un-welded tree would
+miss.
+
+jjfx never guesses the command: an unconfigured repo is a no-op, not a default.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `command` | unset | The command the repository owns for a build check, run through the user's shell in the workspace: `cargo check`, `./gradlew :app:backend:compileKotlin`, `bun run build`. Unset means no check. |
+| `enabled` | `true` | Whether the check runs. Set false to keep the command configured but skip the check. |
+| `timeout_secs` | `600` | How long the check may run before jjfx kills it and fails the step. |
+
+```toml
+[checks]
+command = "cargo check"
+timeout_secs = 600
+```
+
+A check that fails **stops the push** - an unbuildable change is not a change,
+and pushing it is what makes the pair invisible. So does a check that cannot run
+at all: a command that does not exist (a shell reports exit 127) or one that
+outruns `timeout_secs` is a loud failure, never a silent pass. The forge names the
+command and the last line of its output.
 
 ## Legacy `[workspace]`
 Earlier releases configured new-workspace provisioning with a `[workspace]`

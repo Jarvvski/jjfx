@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::cmd::cmd;
-use crate::config::ForgeConfig;
+use crate::config::{ChecksConfig, ForgeConfig};
 use crate::engine::{MutationGuard, MutationKind, Repository};
 use crate::jj::{FixOutcome, PushOutcome};
 
@@ -41,13 +41,16 @@ const FIX_SRC: &str = WELD_SRC;
 /// Push revisions: this workspace's chain, minus trunk and any conflicts.
 const PUSH_REVS: &str = "::@ ~ trunk() ~ conflicts()";
 
-/// The four forge steps, in pipeline order.
+/// The five forge steps, in pipeline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
     /// Fetch the remote once for the whole run.
     Fetch,
     /// Rebase a Workspace's mutable chain onto trunk.
     Weld,
+    /// Run the repo-owned build check against the just-welded tree, so it sees
+    /// what trunk will actually be (ticket 18).
+    Check,
     /// Push the Workspace's revisions.
     Push,
     /// Create or update the Workspace's Pull Request stack.
@@ -59,8 +62,9 @@ impl Step {
         match self {
             Step::Fetch => 0,
             Step::Weld => 1,
-            Step::Push => 2,
-            Step::PullRequest => 3,
+            Step::Check => 2,
+            Step::Push => 3,
+            Step::PullRequest => 4,
         }
     }
 }
@@ -76,6 +80,11 @@ pub(crate) enum Status {
     Ok,
     /// The step did nothing useful (nothing to push, weld hit conflicts, ...).
     Skipped,
+    /// The step does not apply to this run: no build check is configured, so
+    /// there is nothing to run. Counts as clean, and the row does not draw a
+    /// step that never ran - an unconfigured repo forges exactly as it did
+    /// before the check existed.
+    NotApplicable,
 }
 
 /// A workspace to forge: its name and the directory whose `@` the revsets target.
@@ -98,7 +107,7 @@ impl Target {
 /// A complete, valid progress snapshot for one Workspace.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Progress {
-    steps: [Status; 4],
+    steps: [Status; 5],
     active: bool,
     reason: Option<String>,
 }
@@ -106,7 +115,7 @@ pub(crate) struct Progress {
 impl Progress {
     fn running() -> Self {
         Self {
-            steps: [Status::Pending; 4],
+            steps: [Status::Pending; 5],
             active: true,
             reason: None,
         }
@@ -117,11 +126,12 @@ impl Progress {
         self.active
     }
 
-    /// The four step statuses in display and execution order.
-    pub(crate) fn steps(&self) -> [(Step, Status); 4] {
+    /// The five step statuses in display and execution order.
+    pub(crate) fn steps(&self) -> [(Step, Status); 5] {
         [
             (Step::Fetch, self.steps[Step::Fetch.index()]),
             (Step::Weld, self.steps[Step::Weld.index()]),
+            (Step::Check, self.steps[Step::Check.index()]),
             (Step::Push, self.steps[Step::Push.index()]),
             (Step::PullRequest, self.steps[Step::PullRequest.index()]),
         ]
@@ -136,12 +146,19 @@ impl Progress {
         self.steps[step.index()] = status;
     }
 
+    /// Whether the run finished cleanly. A step that does not apply (no build
+    /// check configured) is clean: it is not a skip, and it must not taint an
+    /// otherwise successful forge.
     fn clean_success(&self) -> bool {
-        self.reason.is_none() && self.steps == [Status::Ok; 4]
+        self.reason.is_none()
+            && self
+                .steps
+                .iter()
+                .all(|status| matches!(status, Status::Ok | Status::NotApplicable))
     }
 
     #[cfg(test)]
-    pub(crate) fn finished_for_test(steps: [Status; 4], reason: &str) -> Self {
+    pub(crate) fn finished_for_test(steps: [Status; 5], reason: &str) -> Self {
         Self {
             steps,
             active: false,
@@ -241,9 +258,19 @@ trait GitHubAdapter: Send + Sync {
     fn edit(&self, slug: &str, number: u64, body: &str, base: &str) -> Result<(), String>;
 }
 
+/// What the forge pipeline needs from jjfx's config: how it opens Pull Requests,
+/// and the repo-owned check it must pass before it pushes.
+#[derive(Debug, Clone)]
+pub(crate) struct Settings {
+    /// `[forge]`: whether and how the pipeline opens Pull Requests.
+    pub(crate) forge: ForgeConfig,
+    /// `[checks]`: the build check that runs against the welded tree.
+    pub(crate) checks: ChecksConfig,
+}
+
 /// The deep Forge module: one interface over execution, progress, and adapters.
 pub(crate) struct Forge {
-    config: ForgeConfig,
+    settings: Settings,
     jj: Arc<dyn JjAdapter>,
     gpg: Arc<dyn GpgAdapter>,
     github: Arc<dyn GitHubAdapter>,
@@ -254,9 +281,9 @@ pub(crate) struct Forge {
 
 impl Forge {
     /// Bind Forge's production adapters to one repository and configuration.
-    pub(crate) fn new(repo_root: PathBuf, config: ForgeConfig) -> Self {
+    pub(crate) fn new(repo_root: PathBuf, settings: Settings) -> Self {
         Self {
-            config,
+            settings,
             jj: Arc::new(SystemJj {
                 repo_root: repo_root.clone(),
             }),
@@ -267,13 +294,9 @@ impl Forge {
     }
 
     #[cfg(test)]
-    fn with_adapters(
-        config: ForgeConfig,
-        jj: Arc<dyn JjAdapter>,
-        gpg: Arc<dyn GpgAdapter>,
-    ) -> Self {
+    fn with_adapters(settings: Settings, jj: Arc<dyn JjAdapter>, gpg: Arc<dyn GpgAdapter>) -> Self {
         Self {
-            config,
+            settings,
             jj,
             gpg,
             github: Arc::new(SystemGitHub),
@@ -283,13 +306,13 @@ impl Forge {
 
     #[cfg(test)]
     fn with_github(
-        config: ForgeConfig,
+        settings: Settings,
         jj: Arc<dyn JjAdapter>,
         gpg: Arc<dyn GpgAdapter>,
         github: Arc<dyn GitHubAdapter>,
     ) -> Self {
         Self {
-            config,
+            settings,
             jj,
             gpg,
             github,
@@ -300,7 +323,7 @@ impl Forge {
     /// Start one run and return its ordered progress stream immediately.
     pub(crate) fn start(&self, targets: Vec<Target>) -> UnboundedReceiver<Update> {
         let (tx, rx) = mpsc::unbounded_channel();
-        let config = self.config;
+        let settings = self.settings.clone();
         let jj = Arc::clone(&self.jj);
         let gpg = Arc::clone(&self.gpg);
         let github = Arc::clone(&self.github);
@@ -309,7 +332,7 @@ impl Forge {
             run_pipeline(
                 &tx,
                 &targets,
-                config,
+                settings,
                 &*jj,
                 &*gpg,
                 &*github,
@@ -601,12 +624,13 @@ struct PullRequestContext {
 fn run_pipeline(
     tx: &UnboundedSender<Update>,
     targets: &[Target],
-    config: ForgeConfig,
+    settings: Settings,
     jj: &dyn JjAdapter,
     gpg: &dyn GpgAdapter,
     github: &dyn GitHubAdapter,
     repository: Option<&Repository>,
 ) {
+    let config = settings.forge;
     let mut progress = vec![Progress::running(); targets.len()];
     for (target, state) in targets.iter().zip(&progress) {
         publish_progress(tx, target, state, None);
@@ -704,6 +728,36 @@ fn run_pipeline(
         // letting the push revset's conflict exclusion quietly drop it.
         if stop_on_conflicts(tx, target, state, jj.conflict(&target.dir)) {
             continue;
+        }
+
+        // The repo-owned build check runs against the just-welded tree - what
+        // trunk will actually be, which is why it belongs here and not in a
+        // post-Run hook on the un-welded tree. An unconfigured repo has nothing
+        // to run, so the step does not apply and does not taint the result. A
+        // check that fails, or cannot run at all, stops the push: an unbuildable
+        // change is not a change, and pushing it is what makes the pair
+        // invisible.
+        if settings.checks.command().is_none() {
+            state.set(Step::Check, Status::NotApplicable);
+            publish_progress(tx, target, state, None);
+        } else {
+            state.set(Step::Check, Status::Running);
+            publish_progress(tx, target, state, None);
+            match crate::checks::run(&target.dir, &settings.checks) {
+                crate::checks::Outcome::Passed => succeed_step(tx, target, state, Step::Check),
+                crate::checks::Outcome::NotConfigured => {
+                    state.set(Step::Check, Status::NotApplicable);
+                    publish_progress(tx, target, state, None);
+                }
+                outcome => {
+                    let reason = outcome
+                        .stop_reason()
+                        .unwrap_or_else(|| "check: the build check did not pass".to_string());
+                    skip_step(tx, target, state, Step::Check, &reason);
+                    finish_target(tx, target, state);
+                    continue;
+                }
+            }
         }
 
         state.set(Step::Push, Status::Running);
@@ -850,6 +904,33 @@ mod tests {
 
     use super::*;
 
+    /// The forge settings a test forges with: Pull Requests and draft as given,
+    /// and no build check unless the test asks for one.
+    fn settings(pull_requests: bool, draft: bool) -> Settings {
+        Settings {
+            forge: ForgeConfig {
+                pull_requests,
+                draft,
+            },
+            checks: ChecksConfig::default(),
+        }
+    }
+
+    /// The forge settings with a build check configured, for the tests that
+    /// exercise the Check step.
+    fn settings_with_check(pull_requests: bool, command: &str) -> Settings {
+        Settings {
+            forge: ForgeConfig {
+                pull_requests,
+                draft: true,
+            },
+            checks: ChecksConfig {
+                command: Some(command.to_owned()),
+                ..ChecksConfig::default()
+            },
+        }
+    }
+
     struct SuccessfulJj;
 
     impl JjAdapter for SuccessfulJj {
@@ -905,10 +986,7 @@ mod tests {
             .expect("jj should be installed");
         assert!(commit.status.success());
         let repository = crate::engine::Repository::open(&root).expect("repository");
-        let config = ForgeConfig {
-            pull_requests: false,
-            draft: true,
-        };
+        let config = settings(false, true);
         let (tx, _rx) = mpsc::unbounded_channel();
 
         run_pipeline(
@@ -1454,7 +1532,7 @@ mod tests {
         updates
     }
 
-    fn observed(update: &Update) -> (String, [Status; 4], bool, Option<String>, &'static str) {
+    fn observed(update: &Update) -> (String, [Status; 5], bool, Option<String>, &'static str) {
         match update {
             Update::Progress {
                 workspace,
@@ -1475,14 +1553,14 @@ mod tests {
                 progress
                     .as_ref()
                     .map(|progress| progress.steps().map(|(_, status)| status))
-                    .unwrap_or([Status::Ok; 4]),
+                    .unwrap_or([Status::Ok; 5]),
                 false,
                 None,
                 "finished",
             ),
             Update::Aborted { reason } => (
                 String::new(),
-                [Status::Pending; 4],
+                [Status::Pending; 5],
                 false,
                 Some(reason.clone()),
                 "aborted",
@@ -1502,10 +1580,7 @@ mod tests {
     #[tokio::test]
     async fn one_workspace_reports_the_complete_pipeline_then_finishes_cleanly() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(SuccessfulJj),
             Arc::new(UnlockedGpg),
         );
@@ -1522,11 +1597,12 @@ mod tests {
         assert_eq!(
             observed,
             vec![
-                ("feat".into(), [Status::Pending; 4], true, None, "progress"),
+                ("feat".into(), [Status::Pending; 5], true, None, "progress"),
                 (
                     "feat".into(),
                     [
                         Status::Running,
+                        Status::Pending,
                         Status::Pending,
                         Status::Pending,
                         Status::Pending,
@@ -1542,6 +1618,7 @@ mod tests {
                         Status::Pending,
                         Status::Pending,
                         Status::Pending,
+                        Status::Pending,
                     ],
                     true,
                     None,
@@ -1554,6 +1631,7 @@ mod tests {
                         Status::Running,
                         Status::Pending,
                         Status::Pending,
+                        Status::Pending,
                     ],
                     true,
                     None,
@@ -1561,34 +1639,85 @@ mod tests {
                 ),
                 (
                     "feat".into(),
-                    [Status::Ok, Status::Ok, Status::Pending, Status::Pending],
+                    [
+                        Status::Ok,
+                        Status::Ok,
+                        Status::Pending,
+                        Status::Pending,
+                        Status::Pending,
+                    ],
+                    true,
+                    None,
+                    "progress",
+                ),
+                // No build check configured: the step does not apply, and the
+                // pipeline carries straight on to the push.
+                (
+                    "feat".into(),
+                    [
+                        Status::Ok,
+                        Status::Ok,
+                        Status::NotApplicable,
+                        Status::Pending,
+                        Status::Pending,
+                    ],
                     true,
                     None,
                     "progress",
                 ),
                 (
                     "feat".into(),
-                    [Status::Ok, Status::Ok, Status::Running, Status::Pending],
+                    [
+                        Status::Ok,
+                        Status::Ok,
+                        Status::NotApplicable,
+                        Status::Running,
+                        Status::Pending,
+                    ],
                     true,
                     None,
                     "progress",
                 ),
                 (
                     "feat".into(),
-                    [Status::Ok, Status::Ok, Status::Ok, Status::Pending],
+                    [
+                        Status::Ok,
+                        Status::Ok,
+                        Status::NotApplicable,
+                        Status::Ok,
+                        Status::Pending,
+                    ],
                     true,
                     None,
                     "progress",
                 ),
                 (
                     "feat".into(),
-                    [Status::Ok, Status::Ok, Status::Ok, Status::Running],
+                    [
+                        Status::Ok,
+                        Status::Ok,
+                        Status::NotApplicable,
+                        Status::Ok,
+                        Status::Running,
+                    ],
                     true,
                     None,
                     "progress",
                 ),
-                ("feat".into(), [Status::Ok; 4], true, None, "progress"),
-                ("feat".into(), [Status::Ok; 4], false, None, "finished"),
+                (
+                    "feat".into(),
+                    [
+                        Status::Ok,
+                        Status::Ok,
+                        Status::NotApplicable,
+                        Status::Ok,
+                        Status::Ok,
+                    ],
+                    true,
+                    None,
+                    "progress",
+                ),
+                ("feat".into(), [Status::Ok; 5], false, None, "finished",),
             ]
         );
     }
@@ -1596,10 +1725,7 @@ mod tests {
     #[tokio::test]
     async fn fetch_failure_aborts_before_workspace_work() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(FetchFails),
             Arc::new(UnlockedGpg),
         );
@@ -1626,10 +1752,7 @@ mod tests {
     #[tokio::test]
     async fn locked_signing_key_aborts_before_fetch() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(SigningJj),
             Arc::new(LockedGpg),
         );
@@ -1651,10 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn conflicted_workspace_is_skipped_and_the_next_workspace_continues() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(FirstWorkspaceConflicted),
             Arc::new(UnlockedGpg),
         );
@@ -1695,10 +1815,7 @@ mod tests {
     #[tokio::test]
     async fn push_noop_retains_skipped_progress_and_notice() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(PushDoesNothing),
             Arc::new(UnlockedGpg),
         );
@@ -1733,10 +1850,7 @@ mod tests {
     #[tokio::test]
     async fn failed_push_is_reported_and_does_not_open_a_pull_request() {
         let forge = Forge::with_github(
-            ForgeConfig {
-                pull_requests: true,
-                draft: true,
-            },
+            settings(true, true),
             Arc::new(PushFails),
             Arc::new(UnlockedGpg),
             Arc::new(RepositoryGitHub),
@@ -1773,10 +1887,7 @@ mod tests {
     #[tokio::test]
     async fn conflict_introduced_by_weld_stops_the_pipeline_before_push() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(WeldIntroducesConflict {
                 welded: Mutex::new(false),
             }),
@@ -1821,10 +1932,7 @@ mod tests {
         // could not see. The push revset excludes conflicts, so without this gate
         // the commit would vanish from the push silently; the refusal names it.
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(FixIntroducesConflict {
                 fixed: Mutex::new(false),
             }),
@@ -1855,10 +1963,7 @@ mod tests {
     #[tokio::test]
     async fn failed_pull_request_context_is_reported_not_silently_skipped() {
         let forge = Forge::with_github(
-            ForgeConfig {
-                pull_requests: true,
-                draft: true,
-            },
+            settings(true, true),
             Arc::new(StackedChangesJj),
             Arc::new(UnlockedGpg),
             Arc::new(BrokenGitHub),
@@ -1895,10 +2000,7 @@ mod tests {
     async fn a_failed_conflict_check_is_reported_and_does_not_push() {
         // A broken conflict read must not read as "clean" and carry on to push.
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(ConflictCheckFails),
             Arc::new(UnlockedGpg),
         );
@@ -1930,10 +2032,7 @@ mod tests {
     async fn a_failed_weld_is_reported_not_silently_skipped() {
         // A jj rebase failure must surface its error, not read as a conflict skip.
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(WeldErrors),
             Arc::new(UnlockedGpg),
         );
@@ -1960,10 +2059,7 @@ mod tests {
     #[tokio::test]
     async fn weld_failure_is_retained_while_later_steps_continue() {
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(WeldFails),
             Arc::new(UnlockedGpg),
         );
@@ -2000,14 +2096,7 @@ mod tests {
         let jj = Arc::new(RecordingJj {
             calls: Mutex::new(Vec::new()),
         });
-        let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
-            jj.clone(),
-            Arc::new(UnlockedGpg),
-        );
+        let forge = Forge::with_adapters(settings(false, true), jj.clone(), Arc::new(UnlockedGpg));
 
         updates(forge.start(vec![Target::new(
             "feat".to_string(),
@@ -2026,10 +2115,7 @@ mod tests {
         // A formatter that failed must not pass silently: the push stops and the
         // error is reported against the Weld step.
         let forge = Forge::with_adapters(
-            ForgeConfig {
-                pull_requests: false,
-                draft: true,
-            },
+            settings(false, true),
             Arc::new(FixFails),
             Arc::new(UnlockedGpg),
         );
@@ -2063,13 +2149,209 @@ mod tests {
         ));
     }
 
+    /// A jj whose weld materialises trunk into the workspace, as a real rebase
+    /// does, so a check can prove it ran against the welded tree.
+    struct WeldingJj {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl JjAdapter for WeldingJj {
+        fn fetch(&self) -> Result<bool, String> {
+            self.record("fetch");
+            Ok(true)
+        }
+
+        fn weld(&self, dir: &Path) -> Result<bool, String> {
+            self.record("weld");
+            std::fs::write(dir.join("welded"), "").map_err(|error| error.to_string())?;
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            self.record("push");
+            Ok(PushOutcome::Pushed)
+        }
+    }
+
+    impl WeldingJj {
+        fn record(&self, call: &str) {
+            self.calls
+                .lock()
+                .expect("the call log is not poisoned")
+                .push(call.to_string());
+        }
+    }
+
+    /// A jj whose push must never run: the build check in front of it did not
+    /// pass.
+    struct CheckMustStopThePush;
+
+    impl JjAdapter for CheckMustStopThePush {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            panic!("a build check that did not pass must stop the push")
+        }
+    }
+
+    /// A throwaway workspace directory for the tests that run a real build check.
+    fn workspace_dir(tag: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock is after the epoch")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("jjfx-forge-{tag}-{}-{nonce}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creating the workspace dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn the_build_check_runs_against_the_welded_tree_between_weld_and_push() {
+        // The check looks for the file Weld materialises, so it can only pass if
+        // it runs *after* the weld - which is the whole point of running it here
+        // rather than on the un-welded tree.
+        let dir = workspace_dir("check-order");
+        let jj = Arc::new(WeldingJj {
+            calls: Mutex::new(Vec::new()),
+        });
+        let forge = Forge::with_adapters(
+            settings_with_check(false, "test -f welded && pwd > checked-cwd"),
+            jj.clone(),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates =
+            updates(forge.start(vec![Target::new("feat".to_string(), dir.clone())])).await;
+
+        // The check passed (so the weld had happened), and the push followed it.
+        assert_eq!(
+            *jj.calls.lock().expect("the call log is not poisoned"),
+            vec!["fetch", "weld", "push"]
+        );
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                ..
+            } if workspace == "feat" && status(progress, Step::Check) == Status::Ok
+        )));
+
+        // It ran in the workspace's own working copy.
+        let checked = std::fs::read_to_string(dir.join("checked-cwd"))
+            .expect("the check records the directory it ran in");
+        assert_eq!(
+            std::fs::canonicalize(checked.trim()).expect("the recorded directory exists"),
+            std::fs::canonicalize(&dir).expect("the workspace directory exists")
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_change_that_does_not_build_stops_the_push_and_names_the_command() {
+        let dir = workspace_dir("check-fails");
+        let forge = Forge::with_adapters(
+            settings_with_check(false, "echo 'error: cannot find value x' >&2; exit 1"),
+            Arc::new(CheckMustStopThePush),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates =
+            updates(forge.start(vec![Target::new("feat".to_string(), dir.clone())])).await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::Check) == Status::Skipped
+                && notice.contains("check:")
+                && notice.contains("exit 1")
+                && notice.contains("error: cannot find value x")
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                workspace,
+                progress: Some(progress),
+            }) if workspace == "feat"
+                && status(progress, Step::Check) == Status::Skipped
+                && status(progress, Step::Push) == Status::Pending
+                && status(progress, Step::PullRequest) == Status::Pending
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn a_check_that_cannot_run_stops_the_push() {
+        let dir = workspace_dir("check-missing");
+        let forge = Forge::with_adapters(
+            settings_with_check(false, "jjfx-no-such-program-exists"),
+            Arc::new(CheckMustStopThePush),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates =
+            updates(forge.start(vec![Target::new("feat".to_string(), dir.clone())])).await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::Check) == Status::Skipped
+                && notice.contains("could not run")
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                progress: Some(progress),
+                ..
+            }) if status(progress, Step::Push) == Status::Pending
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn an_unconfigured_repo_does_not_run_a_check_and_still_pushes() {
+        let jj = Arc::new(RecordingJj {
+            calls: Mutex::new(Vec::new()),
+        });
+        let forge = Forge::with_adapters(settings(false, true), jj.clone(), Arc::new(UnlockedGpg));
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        // Nothing was run, and the push is not gated on anything.
+        assert_eq!(
+            *jj.calls.lock().expect("the call log is not poisoned"),
+            vec!["fetch", "weld", "fix", "push"]
+        );
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress { progress, .. }
+                if status(progress, Step::Check) == Status::NotApplicable
+        )));
+    }
+
     #[tokio::test]
     async fn pull_request_step_reports_an_empty_bookmark_chain() {
         let forge = Forge::with_github(
-            ForgeConfig {
-                pull_requests: true,
-                draft: true,
-            },
+            settings(true, true),
             Arc::new(NoBookmarksJj),
             Arc::new(UnlockedGpg),
             Arc::new(RepositoryGitHub),
@@ -2104,10 +2386,7 @@ mod tests {
     async fn pull_request_step_creates_and_links_the_stack() {
         let github = Arc::new(MemoryGitHub::with_merged_base());
         let forge = Forge::with_github(
-            ForgeConfig {
-                pull_requests: true,
-                draft: true,
-            },
+            settings(true, true),
             Arc::new(StackedChangesJj),
             Arc::new(UnlockedGpg),
             github.clone(),
@@ -2161,10 +2440,7 @@ mod tests {
     async fn pull_request_step_updates_an_existing_open_stack_entry() {
         let github = Arc::new(MemoryGitHub::with_merged_base_and_open_mid());
         let forge = Forge::with_github(
-            ForgeConfig {
-                pull_requests: true,
-                draft: true,
-            },
+            settings(true, true),
             Arc::new(StackedChangesJj),
             Arc::new(UnlockedGpg),
             github.clone(),

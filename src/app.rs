@@ -3131,7 +3131,10 @@ mod tests {
         let runtime = Runtime::new(
             tx.clone(),
             store.repo_root().to_path_buf(),
-            ForgeConfig::default(),
+            crate::forge::Settings {
+                forge: ForgeConfig::default(),
+                checks: crate::config::ChecksConfig::default(),
+            },
             store.colocate(),
             Arc::clone(&terminal),
             Arc::from(jj),
@@ -3251,7 +3254,8 @@ mod tests {
             [
                 forge::Status::Ok,
                 forge::Status::Ok,
-                forge::Status::Skipped,
+                forge::Status::NotApplicable,
+                forge::Status::Ok,
                 forge::Status::Skipped,
             ],
             reason,

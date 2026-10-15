@@ -13,7 +13,6 @@ use std::sync::Arc;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::app::{LiftJob, Msg, PendingWorkspace, STATUS_TTL, TidyKind};
-use crate::config::ForgeConfig;
 use crate::diff;
 use crate::engine::{MutationGuard, MutationKind, REPOSITORY_WIDE_MUTATION, Repository};
 use crate::forge::{self, Target};
@@ -146,7 +145,7 @@ impl Runtime {
     pub(crate) fn new(
         tx: UnboundedSender<Msg>,
         repo_root: PathBuf,
-        forge: ForgeConfig,
+        forge: forge::Settings,
         colocate: bool,
         terminal: Arc<dyn Terminal>,
         jj: Arc<dyn Jj>,
@@ -547,7 +546,10 @@ mod tests {
         let runtime = Runtime::new(
             tx,
             repo_root.clone(),
-            ForgeConfig::default(),
+            forge::Settings {
+                forge: crate::config::ForgeConfig::default(),
+                checks: crate::config::ChecksConfig::default(),
+            },
             false,
             Arc::new(NoopTerminal),
             Arc::new(RealJj::new(repo_root.clone())),
