@@ -107,6 +107,82 @@ impl LocalTickets {
         Ok(self.scan()?.into_iter().find(|ticket| ticket.id == id))
     }
 
+    /// Marks a Ticket as `claimed` when a Worker reserves it.
+    ///
+    /// Only the `Status:` line is rewritten, so every other byte of the file is
+    /// preserved. A Ticket that is already claimed, or already resolved, is left
+    /// alone rather than downgraded.
+    pub fn claim(&self, id: &str) -> Result<LocalTicketUpdate, LocalTicketError> {
+        let Some(ticket) = self.ticket(id)? else {
+            return Err(self.not_found(id));
+        };
+        if status_eq(&ticket.status, CLAIMED_STATUS)
+            || status_eq(&ticket.status, &self.resolved_status)
+        {
+            return Ok(LocalTicketUpdate::Unchanged);
+        }
+        self.rewrite_status(&ticket, CLAIMED_STATUS)
+    }
+
+    /// Marks a Ticket as resolved and appends a dated `## Comments` line.
+    ///
+    /// Idempotent: a Ticket that is already resolved is left untouched, so a
+    /// repeated reconcile never appends the comment twice.
+    pub fn resolve(&self, id: &str) -> Result<LocalTicketUpdate, LocalTicketError> {
+        let Some(ticket) = self.ticket(id)? else {
+            return Err(self.not_found(id));
+        };
+        if status_eq(&ticket.status, &self.resolved_status) {
+            return Ok(LocalTicketUpdate::Unchanged);
+        }
+        let content = self.read(&ticket)?;
+        let content = set_status_line(&content, &self.resolved_status)
+            .ok_or_else(|| self.missing_status(id))?;
+        let comment = format!("- {}: Resolved by jjfx dispatch.", today());
+        let content = append_comment(&content, &comment);
+        self.write(&ticket, &content)?;
+        Ok(LocalTicketUpdate::Applied)
+    }
+
+    /// Rewrites only a Ticket's `Status:` line.
+    fn rewrite_status(
+        &self,
+        ticket: &LocalTicket,
+        status: &str,
+    ) -> Result<LocalTicketUpdate, LocalTicketError> {
+        let content = self.read(ticket)?;
+        let Some(content) = set_status_line(&content, status) else {
+            return Err(self.missing_status(&ticket.id));
+        };
+        self.write(ticket, &content)?;
+        Ok(LocalTicketUpdate::Applied)
+    }
+
+    fn read(&self, ticket: &LocalTicket) -> Result<String, LocalTicketError> {
+        fs::read_to_string(&ticket.path).map_err(|source| LocalTicketError::Write {
+            path: ticket.path.clone(),
+            source,
+        })
+    }
+
+    fn write(&self, ticket: &LocalTicket, content: &str) -> Result<(), LocalTicketError> {
+        fs::write(&ticket.path, content).map_err(|source| LocalTicketError::Write {
+            path: ticket.path.clone(),
+            source,
+        })
+    }
+
+    fn not_found(&self, id: &str) -> LocalTicketError {
+        LocalTicketError::NotFound {
+            id: id.to_owned(),
+            root: self.root.clone(),
+        }
+    }
+
+    fn missing_status(&self, id: &str) -> LocalTicketError {
+        LocalTicketError::MissingStatus { id: id.to_owned() }
+    }
+
     /// Parses one Ticket file, or `None` when its name is not `<NN>-<slug>.md`.
     fn scan_file(
         &self,
@@ -502,6 +578,62 @@ fn status_eq(left: &str, right: &str) -> bool {
     left.eq_ignore_ascii_case(right)
 }
 
+/// Replaces the first `Status:` line, preserving every other byte of the file.
+///
+/// `None` when the file has no `Status:` line to replace.
+fn set_status_line(content: &str, status: &str) -> Option<String> {
+    let mut replaced = false;
+    let mut updated = String::with_capacity(content.len() + status.len());
+    for line in content.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        let is_status = metadata(body).is_some_and(|(key, _)| key.eq_ignore_ascii_case("Status"));
+        if is_status && !replaced {
+            updated.push_str("Status: ");
+            updated.push_str(status);
+            if line.ends_with('\n') {
+                updated.push('\n');
+            }
+            replaced = true;
+        } else {
+            updated.push_str(line);
+        }
+    }
+    replaced.then_some(updated)
+}
+
+/// Appends a dated bullet under the file's `## Comments` heading, adding the
+/// heading when the file has none.
+fn append_comment(content: &str, comment: &str) -> String {
+    let mut updated = content.to_owned();
+    if !updated.is_empty() && !updated.ends_with('\n') {
+        updated.push('\n');
+    }
+    if !updated.lines().any(|line| line.trim() == "## Comments") {
+        updated.push_str("\n## Comments\n");
+    }
+    updated.push('\n');
+    updated.push_str(comment);
+    updated.push('\n');
+    updated
+}
+
+/// The local date, in the `YYYY-MM-DD` form the ticket convention uses.
+fn today() -> String {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::system())
+        .date()
+        .to_string()
+}
+
+/// The outcome of a local Ticket writeback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalTicketUpdate {
+    /// The Ticket file was rewritten.
+    Applied,
+    /// The Ticket was already in the requested state.
+    Unchanged,
+}
+
 /// A failure reading or writing the local markdown tree.
 #[derive(Debug, Error)]
 pub enum LocalTicketError {
@@ -509,6 +641,28 @@ pub enum LocalTicketError {
     #[error("cannot read local Tickets at {path}: {source}")]
     Read {
         /// The path that could not be read.
+        path: PathBuf,
+        /// The underlying I/O failure.
+        source: io::Error,
+    },
+    /// No Ticket with that id exists under the configured root.
+    #[error("local Ticket {id} was not found under {root}")]
+    NotFound {
+        /// The requested Ticket id.
+        id: String,
+        /// The root that was searched.
+        root: PathBuf,
+    },
+    /// The Ticket file carries no `Status:` line to rewrite.
+    #[error("local Ticket {id} has no `Status:` line to update")]
+    MissingStatus {
+        /// The Ticket whose file is unusable.
+        id: String,
+    },
+    /// A Ticket file could not be written.
+    #[error("cannot write local Ticket {path}: {source}")]
+    Write {
+        /// The path that could not be written.
         path: PathBuf,
         /// The underlying I/O failure.
         source: io::Error,
@@ -820,5 +974,135 @@ mod tests {
             .expect_err("an all-invalid graph is unusable, not empty");
 
         assert!(error.to_string().contains("unusable"), "{error}");
+    }
+
+    fn ticket_path(root: &Path, feature: &str, file: &str) -> std::path::PathBuf {
+        root.join(feature).join(ISSUES_DIRECTORY).join(file)
+    }
+
+    #[test]
+    fn claim_rewrites_only_the_status_line() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let original = "# Ready\n\nStatus: ready-for-agent\nType: task\nBlocked by: none\n\n## Problem\n\nDo it.\n";
+        write_ticket(temporary.path(), "widgets", "01-ready.md", original);
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        let update = tickets.claim("widgets--01-ready").expect("claim");
+
+        assert_eq!(update, LocalTicketUpdate::Applied);
+        let rewritten = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-ready.md"))
+            .expect("rewritten file");
+        assert_eq!(
+            rewritten,
+            "# Ready\n\nStatus: claimed\nType: task\nBlocked by: none\n\n## Problem\n\nDo it.\n"
+        );
+    }
+
+    #[test]
+    fn claim_is_a_no_op_once_claimed() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-ready.md",
+            "# Ready\n\nStatus: claimed\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        assert_eq!(
+            tickets.claim("widgets--01-ready").expect("claim"),
+            LocalTicketUpdate::Unchanged
+        );
+    }
+
+    #[test]
+    fn resolve_sets_the_status_and_appends_a_dated_comment() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-ready.md",
+            "# Ready\n\nStatus: claimed\n\n## Problem\n\nDo it.\n\n## Comments\n\n- 2026-01-01: Filed.\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        let update = tickets.resolve("widgets--01-ready").expect("resolve");
+
+        assert_eq!(update, LocalTicketUpdate::Applied);
+        let rewritten = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-ready.md"))
+            .expect("rewritten file");
+        assert!(
+            rewritten.starts_with("# Ready\n\nStatus: resolved\n"),
+            "{rewritten}"
+        );
+        assert!(rewritten.contains("- 2026-01-01: Filed.\n"), "{rewritten}");
+        assert_eq!(rewritten.matches("## Comments").count(), 1, "{rewritten}");
+        assert_eq!(
+            rewritten.matches("Resolved by jjfx dispatch.").count(),
+            1,
+            "{rewritten}"
+        );
+    }
+
+    #[test]
+    fn resolve_adds_a_comments_heading_when_the_file_has_none() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-ready.md",
+            "# Ready\n\nStatus: claimed\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        tickets.resolve("widgets--01-ready").expect("resolve");
+
+        let rewritten = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-ready.md"))
+            .expect("rewritten file");
+        assert!(rewritten.contains("## Comments\n\n- "), "{rewritten}");
+    }
+
+    #[test]
+    fn resolve_is_idempotent() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-ready.md",
+            "# Ready\n\nStatus: claimed\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        assert_eq!(
+            tickets.resolve("widgets--01-ready").expect("resolve"),
+            LocalTicketUpdate::Applied
+        );
+        assert_eq!(
+            tickets.resolve("widgets--01-ready").expect("resolve"),
+            LocalTicketUpdate::Unchanged
+        );
+
+        let rewritten = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-ready.md"))
+            .expect("rewritten file");
+        assert_eq!(
+            rewritten.matches("Resolved by jjfx dispatch.").count(),
+            1,
+            "{rewritten}"
+        );
+    }
+
+    #[test]
+    fn writeback_of_an_unknown_ticket_reports_not_found() {
+        let temporary = TempDir::new().expect("temporary directory");
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        let error = tickets
+            .claim("widgets--01-ready")
+            .expect_err("unknown Ticket");
+
+        assert!(
+            matches!(error, LocalTicketError::NotFound { .. }),
+            "{error}"
+        );
     }
 }

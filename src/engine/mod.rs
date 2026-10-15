@@ -49,7 +49,7 @@ pub use layout::{
 };
 pub use local_tickets::{
     CLAIMED_STATUS, LocalMarkdownQuery, LocalTicket, LocalTicketError, LocalTicketMalformation,
-    LocalTickets,
+    LocalTicketUpdate, LocalTickets,
 };
 pub use opencode_api::{
     CommandOutput, ModelRef, NewSession, OpenCodeApi, OpenCodeError, OpenCodeRunner,
