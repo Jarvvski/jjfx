@@ -1,6 +1,6 @@
 # Expose jj's operation log as an undo surface
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -35,10 +35,10 @@ workspaces at once** — a naive "undo" could clobber an unrelated workspace.
 
 ## Acceptance Criteria
 
-- [ ] A jjfx-initiated forge/weld/reset can be undone from the tool.
-- [ ] The undo never silently affects an unrelated Workspace; a repository-wide
+- [x] A jjfx-initiated forge/weld/reset can be undone from the tool.
+- [x] The undo never silently affects an unrelated Workspace; a repository-wide
       effect is either avoided or warned about explicitly.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -86,3 +86,25 @@ workspaces at once** — a naive "undo" could clobber an unrelated workspace.
   process *inside* a jjfx mutation's own window is indistinguishable from jjfx's
   and a restore would discard it. jjfx narrows the window to one mutation and
   refuses on anything later; closing it entirely needs jj to tag operations.
+- 2026-10-15: Resolved. Every jjfx-initiated mutation now records a checkpoint
+  (`Repository::begin_mutation`/`finish_mutation`, completed through
+  `MutationGuard` on every exit) into the jjfx-owned sidecar
+  `.jj/pool/undo.json`: a Forge per target Workspace, a lift/weld per Workspace,
+  a Reset's Workspace restoration, and a tidy/tidyws or lift-all under the
+  reserved repository-wide key `*`. `Repository::undo_mutation` restores the
+  checkpoint with `jj op restore` and refuses unless the recorded end is still
+  the repository tip, reporting how many later operations a restore would
+  discard; `jjfx undo [<workspace>] [--force]` lists and applies it, and `u` in
+  the Pool view confirms and submits it for the selected Worker. `docs/undo.md`
+  and a CONTEXT term record the primitive, the scoping rule and the residual
+  limit; `momo add` carries the changelog entry. Wired and tested: the engine
+  (8 tests: restore, refusal, force, no-op, guard, repository-wide key), the
+  Forge pipeline, the runtime recording helper, the CLI parser and key
+  resolution, and the Pool key flow.
+  Two decisions worth recording. (1) A multi-target Forge records each target
+  with its own checkpoint/end, so after a `forge all` only the last target is
+  still the tip and the earlier targets refuse - the safe outcome, since undoing
+  an earlier target would discard the later ones; undoing the whole run is left
+  to `jj op log`/`jj op restore`. (2) `--force` exists on the CLI only; the TUI
+  never forces, so a single `u`/`y` can never silently discard another
+  Workspace's work.
