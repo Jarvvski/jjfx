@@ -107,6 +107,8 @@ Run `jjfx help` for usage.
   Codex, Pi, and OpenCode drive each workspace's agent status.
 - [Pi Worker actions and ticket discovery](docs/pi-workers.md) - Pi Direct
   Dispatch, the pinned adapter, and the read-only Linear helper protocol.
+- [Run records](docs/run-records.md) - the durable per-Run cost and usage record
+  jjfx appends at finalization.
 - [`docs/adr/`](docs/adr/) - architecture decision records.
 - [`skills/jjfx-dispatch/`](skills/jjfx-dispatch/SKILL.md) - the agent skill that
   teaches a coding agent to dispatch work to Workers.

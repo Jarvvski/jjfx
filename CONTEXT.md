@@ -152,6 +152,13 @@ The structured completion of a Run: whether it succeeded or failed, plus usage,
 duration, turns, and cost when reported.
 _Avoid_: outcome
 
+**Run record**:
+The durable, append-only record of one finalized Run - its identity, Worker,
+workspace and change, runtime and model, cost, usage, duration, turns, and
+conclusion - kept in `.jj/pool/runs.jsonl`. The Run result is the in-memory
+completion the record is built from.
+_Avoid_: run log
+
 **Agent Runtime**:
 The external Claude Code, Codex, Pi, or OpenCode program that executes a Run.
 The runtime is not the Agent Session or the Worker that hosts it.
