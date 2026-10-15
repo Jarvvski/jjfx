@@ -174,8 +174,16 @@ trait JjAdapter: Send + Sync {
     }
 
     fn fetch(&self) -> Result<bool, String>;
-    fn has_conflict(&self, _dir: &Path) -> Result<bool, String> {
-        Ok(false)
+    /// The conflicted commit on the workspace's chain
+    /// (`(::@ ~ trunk()) & conflicts()`), or `None` when the chain is clean.
+    ///
+    /// The whole mutable chain, not just `@`: a weld can bury a conflict in a
+    /// lower commit while `@` stays clean, and pushing that chain would push
+    /// broken commits. The commit is returned so the refusal can name it - a
+    /// conflicted chain is refused explicitly, never silently dropped from the
+    /// push.
+    fn conflict(&self, _dir: &Path) -> Result<Option<crate::work::ChangeId>, String> {
+        Ok(None)
     }
     fn weld(&self, dir: &Path) -> Result<bool, String>;
     fn push(&self, dir: &Path) -> Result<PushOutcome, String>;
@@ -337,7 +345,7 @@ impl JjAdapter for SystemJj {
             .map_err(|error| error.to_string())
     }
 
-    fn has_conflict(&self, dir: &Path) -> Result<bool, String> {
+    fn conflict(&self, dir: &Path) -> Result<Option<crate::work::ChangeId>, String> {
         // The whole mutable chain, not just `@`: a weld can bury a conflict in a
         // lower commit while `@` stays clean, and pushing that chain would push
         // broken commits.
@@ -350,14 +358,21 @@ impl JjAdapter for SystemJj {
                 "(::@ ~ trunk()) & conflicts()",
                 "--no-graph",
                 "-T",
-                "\"x\"",
+                "change_id ++ \"\\n\"",
             ])
             .run()
             .map_err(|error| error.to_string())?;
         if !run.ok() {
             return Err(format!("jj log (conflicts): {}", run.stderr().trim()));
         }
-        Ok(!run.stdout().is_empty())
+        // The deepest conflicted commit owns the conflict; every commit above it
+        // merely inherits it, so that is the one to name and to resolve.
+        Ok(run
+            .stdout()
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(crate::work::ChangeId::short))
     }
 
     fn weld(&self, dir: &Path) -> Result<bool, String> {
@@ -649,7 +664,7 @@ fn run_pipeline(
         // The guard completes the record on every exit from the body below.
         let _undo = repository
             .map(|repository| MutationGuard::begin(repository, &target.name, MutationKind::Forge));
-        if stop_on_conflicts(tx, target, state, jj.has_conflict(&target.dir)) {
+        if stop_on_conflicts(tx, target, state, jj.conflict(&target.dir)) {
             continue;
         }
 
@@ -670,7 +685,7 @@ fn run_pipeline(
         // A rebase that produced a conflict still exits zero, so re-check the
         // chain: pushing a conflicted chain would push broken commits and open a
         // Pull Request over them.
-        if stop_on_conflicts(tx, target, state, jj.has_conflict(&target.dir)) {
+        if stop_on_conflicts(tx, target, state, jj.conflict(&target.dir)) {
             continue;
         }
 
@@ -681,6 +696,13 @@ fn run_pipeline(
         if let Err(error) = jj.fix(&target.dir) {
             skip_step(tx, target, state, Step::Weld, &format!("fix: {error}"));
             finish_target(tx, target, state);
+            continue;
+        }
+
+        // `jj fix` rewrites commits, so it can bury a conflict the weld's check
+        // could not see. Refuse it here too, naming the commit, rather than
+        // letting the push revset's conflict exclusion quietly drop it.
+        if stop_on_conflicts(tx, target, state, jj.conflict(&target.dir)) {
             continue;
         }
 
@@ -786,17 +808,21 @@ fn skip_step(
 
 /// Stop one target before push when its chain has conflicts, or when the
 /// conflict check itself failed. Pushing a conflicted chain would push broken
-/// commits, and a failed check must not read as "clean". Returns `true` when the
-/// target was stopped (the caller `continue`s to the next target).
+/// commits, and a failed check must not read as "clean". The refusal names the
+/// conflicted commit, so the reason is the surfaced state rather than a silent
+/// exclusion. Returns `true` when the target was stopped (the caller
+/// `continue`s to the next target).
 fn stop_on_conflicts(
     tx: &UnboundedSender<Update>,
     target: &Target,
     state: &mut Progress,
-    check: Result<bool, String>,
+    check: Result<Option<crate::work::ChangeId>, String>,
 ) -> bool {
     let reason = match check {
-        Ok(false) => return false,
-        Ok(true) => "working copy has conflicts".to_string(),
+        Ok(None) => return false,
+        Ok(Some(commit)) => {
+            format!("conflict in {commit} - resolve it before pushing")
+        }
         Err(error) => format!("conflict check failed: {error}"),
     };
     state.active = false;
@@ -964,8 +990,10 @@ mod tests {
             Ok(true)
         }
 
-        fn has_conflict(&self, dir: &Path) -> Result<bool, String> {
-            Ok(dir.ends_with("conflicted"))
+        fn conflict(&self, dir: &Path) -> Result<Option<crate::work::ChangeId>, String> {
+            Ok(dir
+                .ends_with("conflicted")
+                .then(|| crate::work::ChangeId::short("conflicted1")))
         }
 
         fn weld(&self, dir: &Path) -> Result<bool, String> {
@@ -1120,8 +1148,9 @@ mod tests {
             Ok(true)
         }
 
-        fn has_conflict(&self, _dir: &Path) -> Result<bool, String> {
-            Ok(*self.welded.lock().expect("weld flag is not poisoned"))
+        fn conflict(&self, _dir: &Path) -> Result<Option<crate::work::ChangeId>, String> {
+            Ok((*self.welded.lock().expect("weld flag is not poisoned"))
+                .then(|| crate::work::ChangeId::short("weldconflict")))
         }
 
         fn weld(&self, _dir: &Path) -> Result<bool, String> {
@@ -1136,12 +1165,41 @@ mod tests {
 
     struct ConflictCheckFails;
 
+    /// A jj seam whose `jj fix` buries a conflict the weld's own check could not
+    /// see - the case the push revset's conflict exclusion used to hide.
+    struct FixIntroducesConflict {
+        fixed: Mutex<bool>,
+    }
+
+    impl JjAdapter for FixIntroducesConflict {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn conflict(&self, _dir: &Path) -> Result<Option<crate::work::ChangeId>, String> {
+            Ok((*self.fixed.lock().expect("fix flag is not poisoned"))
+                .then(|| crate::work::ChangeId::short("fixconflict")))
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn fix(&self, _dir: &Path) -> Result<FixOutcome, String> {
+            *self.fixed.lock().expect("fix flag is not poisoned") = true;
+            Ok(FixOutcome::Fixed)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            panic!("a chain that fix left conflicted must not be pushed")
+        }
+    }
     impl JjAdapter for ConflictCheckFails {
         fn fetch(&self) -> Result<bool, String> {
             Ok(true)
         }
 
-        fn has_conflict(&self, _dir: &Path) -> Result<bool, String> {
+        fn conflict(&self, _dir: &Path) -> Result<Option<crate::work::ChangeId>, String> {
             Err("jj log (conflicts): boom".to_string())
         }
 
@@ -1618,8 +1676,8 @@ mod tests {
                 notice: Some(notice),
             } if workspace == "conflicted"
                 && !progress.active()
-                && progress.reason() == Some("working copy has conflicts")
-                && notice == "working copy has conflicts"
+                && progress.reason() == Some("conflict in conflicted1 - resolve it before pushing")
+                && notice == "conflict in conflicted1 - resolve it before pushing"
         )));
         assert!(!updates.iter().any(|update| matches!(
             update,
@@ -1739,8 +1797,8 @@ mod tests {
                 notice: Some(notice),
             } if workspace == "feat"
                 && !progress.active()
-                && progress.reason() == Some("working copy has conflicts")
-                && notice == "working copy has conflicts"
+                && progress.reason() == Some("conflict in weldconflict - resolve it before pushing")
+                && notice == "conflict in weldconflict - resolve it before pushing"
         )));
         assert!(matches!(
             updates.last(),
@@ -1753,7 +1811,44 @@ mod tests {
                 && status(progress, Step::Weld) == Status::Ok
                 && status(progress, Step::Push) == Status::Pending
                 && status(progress, Step::PullRequest) == Status::Pending
-                && notice == "working copy has conflicts"
+                && notice == "conflict in weldconflict - resolve it before pushing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn conflict_introduced_by_fix_is_refused_explicitly_not_silently_excluded() {
+        // `jj fix` rewrites commits, so it can bury a conflict the weld's check
+        // could not see. The push revset excludes conflicts, so without this gate
+        // the commit would vanish from the push silently; the refusal names it.
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            Arc::new(FixIntroducesConflict {
+                fixed: Mutex::new(false),
+            }),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            }) if workspace == "feat"
+                && !progress.active()
+                && status(progress, Step::Weld) == Status::Ok
+                && status(progress, Step::Push) == Status::Pending
+                && status(progress, Step::PullRequest) == Status::Pending
+                && notice == "conflict in fixconflict - resolve it before pushing"
         ));
     }
 

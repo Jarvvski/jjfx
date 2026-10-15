@@ -61,7 +61,10 @@ remote), **PrOpen** (PR open, carrying a Review verdict), or **Merged**. A local
 change makes the workspace Dirty even when a lower change already has a PR -
 unless that lower PR is open with changes requested, which still surfaces as
 PrOpen so a blocked stack reads as needs-you even while you add to it.
-**Unknown** records that jj or gh could not determine the state.
+**Conflicted** overrides all of them: a change chain that carries an unresolved
+conflict cannot be forged at all, so it is its own state, named by the commit
+that owns the conflict. **Unknown** records that jj or gh could not determine
+the state.
 
 **Review verdict**:
 The review state carried by an open pull request: approved, review-required,
@@ -102,6 +105,14 @@ _Avoid_: sync, ship, land (for the whole pipeline)
 **Weld**:
 The forge step that rebases a workspace's change chain onto trunk before it is
 pushed.
+
+**Conflict**:
+An unresolved merge jj recorded *in a commit*. A rebase that hits one succeeds
+and stores it, so a conflicted chain is a normal, recoverable state - the forge
+refuses to push it and names the commit that owns it, and `jjfx resolve` (or `C`
+in the list) clears it with `jj resolve`. The owner is the deepest conflicted
+commit on the chain: every commit above it merely inherits the conflict.
+_See_: `docs/conflicts.md`
 
 **Undo record**:
 The operation the repository was at before a jjfx-initiated mutation (a Forge,

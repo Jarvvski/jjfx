@@ -296,6 +296,9 @@ pub(crate) fn work_color(state: WorkState) -> Color {
         } => Color::Green,
         WorkState::PrOpen { .. } => Color::Cyan,
         WorkState::Merged => Color::Magenta,
+        // A conflict is a blocked state - red, like a change request, not the
+        // amber reserved for the needs-you lane itself.
+        WorkState::Conflicted { .. } => Color::Red,
     }
 }
 

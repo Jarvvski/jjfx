@@ -135,6 +135,7 @@ const NORMAL_BINDINGS: &[(&str, &str)] = &[
     ("Forge selected", "f"),
     ("Forge all", "F"),
     ("Forge default", "g"),
+    ("Resolve conflicts", "C"),
     ("Fetch from remote", "u"),
     ("Lift onto trunk", "r"),
     ("Lift all onto trunk", "R"),
@@ -311,6 +312,12 @@ pub enum Msg {
     WorkspaceOpened {
         name: String,
         created: bool,
+        result: Result<(), String>,
+    },
+    /// A background resolve-tab open finished; `result` carries the multiplexer's
+    /// error text when the tab could not be opened.
+    ResolveOpened {
+        name: String,
         result: Result<(), String>,
     },
     /// A background `tidy`/`tidyws` sweep finished; `result` carries how many
@@ -506,6 +513,7 @@ impl App {
                 created,
                 result,
             } => self.on_workspace_opened(name, created, result),
+            Msg::ResolveOpened { name, result } => self.on_resolve_opened(name, result),
             Msg::Tidied { kind, result } => self.on_tidied(kind, result),
             Msg::StoreReloaded(store) => self.on_store_reloaded(store),
             Msg::WorkspaceSetupOutput {
@@ -949,6 +957,7 @@ impl App {
             KeyCode::Char('F') => self.forge_all(),
             KeyCode::Char('g') => self.forge_default(),
             KeyCode::Char('p') => self.open_pool(),
+            KeyCode::Char('C') => self.resolve_selected(),
             KeyCode::Char('c') => {
                 self.list.toggle_idle();
                 self.ensure_selection();
@@ -1878,6 +1887,36 @@ impl App {
             created: false,
         });
     }
+    /// `C`: resolve the selected Workspace's conflicted commits.
+    ///
+    /// The resolve drives the user's merge tool, which is interactive, so jjfx
+    /// cannot host it inside its own TUI: the key opens a tab running the same
+    /// `jjfx resolve` the CLI exposes. A Workspace with no conflict says so
+    /// rather than opening a tab that would report the same thing.
+    fn resolve_selected(&mut self) {
+        self.status = None;
+        let Some(w) = self.selected_workspace().cloned() else {
+            return;
+        };
+        if self.refuse_if_configuring(&w.name) {
+            return;
+        }
+        if !matches!(self.work_state(&w), WorkState::Conflicted { .. }) {
+            self.set_status(format!("'{}' has no conflicts to resolve", w.name));
+            return;
+        }
+        let Some(path) = w.path.present().map(PathBuf::from) else {
+            self.set_status(format!("no path known for '{}'", w.name));
+            return;
+        };
+        // Opening a tab shells out to the multiplexer and can sleep while a
+        // target starts, so it runs as an effect rather than in the fold.
+        self.emit(Effect::ResolveWorkspace {
+            name: w.name.clone(),
+            path,
+        });
+    }
+
     /// `d`: confirm before deleting; the default workspace is undeletable.
     fn begin_delete_selected(&mut self) {
         self.status = None;
@@ -2028,6 +2067,14 @@ impl App {
             self.set_status(format!("created '{name}', tab failed: {error}"));
         } else {
             self.set_status(format!("open failed: {error}"));
+        }
+    }
+
+    /// A background resolve-tab open finished.
+    fn on_resolve_opened(&mut self, name: String, result: Result<(), String>) {
+        match result {
+            Ok(()) => self.set_status(format!("resolving '{name}' in its tab")),
+            Err(error) => self.set_status(format!("resolve tab failed: {error}")),
         }
     }
 
@@ -2877,6 +2924,9 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
 
+    /// Every `run_command` (title, argv) a test terminal recorded.
+    type RanCommands = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
     /// A `Terminal` that records calls instead of driving kitty, so key handling
     /// is testable without a real multiplexer. Cloning shares the recorders, so a
     /// test can keep a handle to inspect what the app asked the terminal to do.
@@ -2890,6 +2940,8 @@ mod tests {
         /// How long `open` blocks before recording, standing in for kitty's
         /// `ensure_ready` subprocesses and its launch sleep.
         open_delay: Arc<Mutex<Option<Duration>>>,
+        /// Every `run_command` (title, argv) the app asked for.
+        ran: RanCommands,
     }
 
     impl Terminal for FakeTerminal {
@@ -2919,6 +2971,16 @@ mod tests {
         }
         fn close(&self, name: &str) -> anyhow::Result<()> {
             self.closed.lock().unwrap().push(name.to_string());
+            Ok(())
+        }
+        fn run_command(&self, title: &str, _path: &Path, command: &[String]) -> anyhow::Result<()> {
+            self.ran
+                .lock()
+                .unwrap()
+                .push((title.to_string(), command.to_vec()));
+            if let Some(error) = self.open_error.lock().unwrap().clone() {
+                anyhow::bail!(error);
+            }
             Ok(())
         }
     }
@@ -3817,6 +3879,56 @@ mod tests {
         terminal.draw(|frame| app.render(frame)).unwrap();
         let rendered = terminal.backend().to_string();
         assert!(rendered.contains("π pi"), "{rendered}");
+    }
+
+    #[test]
+    fn the_resolve_key_opens_a_resolve_tab_for_a_conflicted_workspace() {
+        let mut app = app_with(&["feat"]);
+        app.handle(Msg::WorkSnapshot(HashMap::from([(
+            "feat".to_string(),
+            crate::work::Work {
+                state: WorkState::Conflicted {
+                    commit: crate::work::ChangeId::short("kqxsylvyrwvq"),
+                },
+                behind: 0,
+            },
+        )])));
+
+        let effects = app.handle(press(KeyCode::Char('C')));
+
+        assert!(
+            matches!(
+                effects.as_slice(),
+                [Effect::ResolveWorkspace { name, path }]
+                    if name == "feat" && path == &PathBuf::from("/wt/feat")
+            ),
+            "the resolve key must open a resolve tab for the conflicted workspace: {effects:?}"
+        );
+    }
+
+    #[test]
+    fn the_resolve_key_says_so_when_there_is_nothing_to_resolve() {
+        let mut app = app_with(&["feat"]);
+        app.handle(Msg::WorkSnapshot(HashMap::from([(
+            "feat".to_string(),
+            crate::work::Work {
+                state: WorkState::Clean,
+                behind: 0,
+            },
+        )])));
+
+        let effects = app.handle(press(KeyCode::Char('C')));
+
+        assert_eq!(
+            app.status.as_deref(),
+            Some("'feat' has no conflicts to resolve")
+        );
+        assert!(
+            !effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::ResolveWorkspace { .. })),
+            "no tab is opened for a chain with no conflict: {effects:?}"
+        );
     }
 
     #[test]

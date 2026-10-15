@@ -53,6 +53,13 @@ pub(crate) enum Effect {
         /// open error.
         created: bool,
     },
+    /// Open a tab that runs the resolve for one Workspace and report
+    /// [`Msg::ResolveOpened`].
+    ///
+    /// The resolve drives the user's merge tool, which is interactive, so it
+    /// needs a terminal of its own: the tab runs the same `jjfx resolve` the CLI
+    /// exposes, in the Workspace's directory.
+    ResolveWorkspace { name: String, path: PathBuf },
     /// Run a remote fetch and report [`Msg::Fetched`].
     Fetch,
     /// Re-project the Workspace list from disk and report
@@ -122,9 +129,20 @@ fn recording_mutation<T>(
     result
 }
 
+/// The command a resolve tab runs: this same jjfx, resolving `name`.
+///
+/// The running binary's absolute path is used, so the tab works without `jjfx`
+/// being on its `PATH`; the argv is passed straight to the multiplexer, so no
+/// shell quoting is involved.
+fn resolve_tab_command(name: &str) -> Vec<String> {
+    let exe = std::env::current_exe()
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| "jjfx".to_string());
+    vec![exe, "resolve".to_string(), name.to_string()]
+}
+
 impl Runtime {
-    /// Bind the runtime to the message loop, repository, terminal, and config.
-    /// `failure_log` is where [`Effect::RecordFailure`] appends full error text.
+    /// Bind the runtime to the message loop, repository, terminal, and config.    /// `failure_log` is where [`Effect::RecordFailure`] appends full error text.
     pub(crate) fn new(
         tx: UnboundedSender<Msg>,
         repo_root: PathBuf,
@@ -162,6 +180,7 @@ impl Runtime {
                 focus,
                 created,
             } => self.open_workspace(name, path, focus, created),
+            Effect::ResolveWorkspace { name, path } => self.resolve_workspace(name, path),
             Effect::Fetch => self.fetch(),
             Effect::ReloadStore => self.reload_store(),
             Effect::Lift { job } => self.lift(job),
@@ -345,6 +364,29 @@ impl Runtime {
         });
     }
 
+    /// Open a tab that runs the interactive resolve for one Workspace.
+    ///
+    /// The tab runs this same jjfx binary with `resolve`, so the merge tool gets
+    /// a terminal jjfx's own TUI cannot give it, and the policy stays in one
+    /// place. The absolute path is used, so the tab does not depend on `jjfx`
+    /// being on its `PATH`.
+    fn resolve_workspace(&self, name: String, path: PathBuf) {
+        let tx = self.tx.clone();
+        let terminal = Arc::clone(&self.terminal);
+        tokio::spawn(async move {
+            let title = format!("resolve:{name}");
+            let command = resolve_tab_command(&name);
+            let result =
+                tokio::task::spawn_blocking(move || terminal.run_command(&title, &path, &command))
+                    .await
+                    .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
+            let _ = tx.send(Msg::ResolveOpened {
+                name,
+                result: result.map_err(|e| format!("{e:#}")),
+            });
+        });
+    }
+
     /// Run one `tidy`/`tidyws` sweep on a blocking worker (jj takes the repo
     /// lock, so it must never run on the render loop), then report
     /// [`Msg::Tidied`].
@@ -438,6 +480,15 @@ mod tests {
         }
 
         fn open(&self, _name: &str, _path: &Path, _focus: bool) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn run_command(
+            &self,
+            _title: &str,
+            _path: &Path,
+            _command: &[String],
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 

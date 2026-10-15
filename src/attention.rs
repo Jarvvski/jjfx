@@ -45,8 +45,8 @@ impl Attention {
 
 /// Derive the Attention badge from the two axes, per the PRD:
 ///
-/// - **needs-you**: agent NeedsAttention, a stuck Run, or agent Waiting over a
-///   changes-requested PR.
+/// - **needs-you**: a stuck Run, agent NeedsAttention, a conflicted chain, or
+///   agent Waiting over a changes-requested PR.
 /// - **working**: agent Working.
 /// - **ready-to-forge**: Dirty/Pushed work sitting idle (agent not Working).
 /// - **idle**: Clean work and no live agent (the fallback).
@@ -65,6 +65,14 @@ pub fn derive(agent: AgentState, work: WorkState, health: RunHealth) -> Attentio
         return Attention::NeedsYou;
     }
     if matches!(agent, AgentState::NeedsAttention | AgentState::QuotaBlocked) {
+        return Attention::NeedsYou;
+    }
+    // A conflicted chain cannot be forged at all, so it leads the needs-you lane
+    // even while an agent is mid-turn: unlike a change-requested PR - where the
+    // agent is expected to keep iterating - the human has to decide whether to
+    // resolve it or hand it to an agent, and the Work column names the commit
+    // either way.
+    if matches!(work, WorkState::Conflicted { .. }) {
         return Attention::NeedsYou;
     }
     if agent == AgentState::Waiting
@@ -161,6 +169,19 @@ mod tests {
             verdict: ReviewVerdict::Approved,
         };
         assert_ne!(derive(AgentState::Waiting, approved), Attention::NeedsYou);
+    }
+
+    #[test]
+    fn a_conflicted_chain_is_needs_you() {
+        let conflicted = WorkState::Conflicted {
+            commit: crate::work::ChangeId::short("kqxsylvyrwvq"),
+        };
+        // A conflicted chain cannot be forged at all, so it leads the needs-you
+        // lane - even while an agent is mid-turn, because the human has to decide
+        // whether to resolve it or hand it to an agent.
+        assert_eq!(derive(AgentState::Absent, conflicted), Attention::NeedsYou);
+        assert_eq!(derive(AgentState::Working, conflicted), Attention::NeedsYou);
+        assert_eq!(derive(AgentState::Waiting, conflicted), Attention::NeedsYou);
     }
 
     #[test]

@@ -73,6 +73,57 @@ pub enum WorkState {
     PrOpen { number: u64, verdict: ReviewVerdict },
     /// The PR merged.
     Merged,
+    /// A commit on the chain carries an unresolved conflict, naming it.
+    ///
+    /// jj stores a conflict *in the commit* and a rebase that hits one succeeds
+    /// and records it, so this is a normal, recoverable state - not a failure.
+    /// It is its own Work state rather than a silent skip: a conflicted chain
+    /// cannot be forged (the forge refuses to push it), so it is work waiting on
+    /// the human. The name is the conflicted commit that *owns* the conflict -
+    /// the deepest one, since every commit above it merely inherits it.
+    Conflicted { commit: ChangeId },
+}
+
+/// The length of the change-id prefix a surfaced conflict names, matching jj's
+/// own default short display (`change_id.short()`).
+const SHORT_CHANGE_ID_LEN: usize = 12;
+
+/// A short jj change-id prefix, carried inline so [`WorkState`] stays `Copy`.
+///
+/// The full change id is 40+ hex characters - too long for a list row - and jj
+/// itself shows a prefix. A prefix is a valid revset, so the named commit is
+/// something the owner can act on directly. The *change* id is named rather than
+/// the commit id because the commit id changes the moment the conflict is
+/// resolved, while the change id is the identity jj's own commands take.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct ChangeId([u8; SHORT_CHANGE_ID_LEN]);
+
+impl ChangeId {
+    /// The short form of `change_id`: its first [`SHORT_CHANGE_ID_LEN`] bytes.
+    pub fn short(change_id: &str) -> Self {
+        let mut bytes = [0u8; SHORT_CHANGE_ID_LEN];
+        for (slot, byte) in bytes.iter_mut().zip(change_id.bytes()) {
+            *slot = byte;
+        }
+        Self(bytes)
+    }
+
+    /// The short change id as text. Trailing padding is trimmed, so a change id
+    /// shorter than the prefix is reported whole rather than with NUL bytes.
+    pub fn as_str(&self) -> &str {
+        let end = self
+            .0
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(self.0.len());
+        std::str::from_utf8(&self.0[..end]).unwrap_or_default()
+    }
+}
+
+impl std::fmt::Display for ChangeId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
 }
 
 /// A workspace's work-lifecycle snapshot: its [`WorkState`] plus how far
@@ -103,6 +154,7 @@ impl WorkState {
                 }
             }
             WorkState::Merged => "merged".to_string(),
+            WorkState::Conflicted { commit } => format!("conflict {commit}"),
         }
     }
 }
@@ -200,14 +252,22 @@ pub fn snapshot(reads: &dyn WorkReads, workspaces: &[String]) -> HashMap<String,
         .map(|(name, chain)| {
             let state = match chain {
                 None => WorkState::Unknown,
-                Some(chain) => {
-                    let owned: Vec<&ChainCommit> = chain
-                        .commits
-                        .iter()
-                        .filter(|c| ownership.owns(name, c))
-                        .collect();
-                    classify(reads, name, &owned, &prs, prs_known)
-                }
+                // A conflicted chain is its own state, read over the *whole*
+                // chain rather than the owned subset: the forge refuses to push
+                // exactly `(::@ ~ trunk()) & conflicts()`, so classifying the
+                // same set keeps the surfaced state and that refusal in
+                // agreement instead of letting a shared conflicted base hide.
+                Some(chain) => match chain.conflict() {
+                    Some(commit) => WorkState::Conflicted { commit },
+                    None => {
+                        let owned: Vec<&ChainCommit> = chain
+                            .commits
+                            .iter()
+                            .filter(|c| ownership.owns(name, c))
+                            .collect();
+                        classify(reads, name, &owned, &prs, prs_known)
+                    }
+                },
             };
             let work = match reads.behind(name) {
                 Ok(behind) => Work { state, behind },
@@ -440,6 +500,10 @@ pub(crate) struct ChainCommit {
     /// This commit carries a real-remote bookmark (excludes the colocated `git`
     /// pseudo-remote, via the `remote_bookmarks()` revset).
     pushed: bool,
+    /// The commit's tree holds an unresolved conflict. A commit above a
+    /// conflicted one inherits the conflict, so several commits on a chain
+    /// report true for one conflict.
+    conflicted: bool,
     /// No non-empty commit sits strictly above this one in the workspace's chain,
     /// so this commit is on the workspace's head-line. Used to pick the single
     /// owner of a commit shared by several workspaces.
@@ -450,6 +514,22 @@ pub(crate) struct ChainCommit {
 #[derive(Debug, Clone)]
 pub(crate) struct Chain {
     commits: Vec<ChainCommit>,
+}
+
+impl Chain {
+    /// The conflicted commit that owns this chain's conflict, if any.
+    ///
+    /// `commits` is tip-first, so the *deepest* conflicted commit is the owner:
+    /// a conflict is recorded in the commit the rebase rewrote, and every commit
+    /// above it merely inherits it. Resolving the owner clears them all, which
+    /// is why the owner is the commit to name and to resolve.
+    pub(crate) fn conflict(&self) -> Option<ChangeId> {
+        self.commits
+            .iter()
+            .rev()
+            .find(|commit| commit.conflicted)
+            .map(|commit| ChangeId::short(&commit.change_id))
+    }
 }
 
 /// Read `trunk::as_revset()..<ws>@` per-commit (empty flag, change id, local
@@ -492,6 +572,27 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
         .filter(|s| !s.is_empty())
         .collect();
 
+    // Change ids on the chain whose tree holds an unresolved conflict. jj's
+    // `conflicts()` revset is the machine-readable source - the same one the
+    // forge's push gate uses - so the state and the refusal agree by
+    // construction rather than by parsing jj's status prose.
+    let conflicted_out = jj(
+        repo_root,
+        &[
+            "log",
+            "-r",
+            &format!("({chain}) & conflicts()"),
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\\n\"",
+        ],
+    )?;
+    let conflicted_ids: HashSet<&str> = conflicted_out
+        .lines()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+
     // Walk newest -> oldest: a commit is on the head-line until a non-empty
     // commit has been seen above it.
     let mut commits = Vec::new();
@@ -511,6 +612,7 @@ fn read_chain(repo_root: &Path, ws: &str) -> Option<Chain> {
         }
         commits.push(ChainCommit {
             pushed: pushed_ids.contains(change_id.as_str()),
+            conflicted: conflicted_ids.contains(change_id.as_str()),
             local_bookmarks: names
                 .split(',')
                 .filter(|n| !n.is_empty())
@@ -594,8 +696,212 @@ mod tests {
             empty,
             local_bookmarks: bms.iter().map(|s| s.to_string()).collect(),
             pushed,
+            conflicted: false,
             head_line,
         }
+    }
+
+    /// Build a `ChainCommit` whose tree holds an unresolved conflict.
+    fn cc_conflicted(change_id: &str, empty: bool, head_line: bool) -> ChainCommit {
+        ChainCommit {
+            conflicted: true,
+            ..cc(change_id, empty, &[], false, head_line)
+        }
+    }
+
+    #[test]
+    fn a_conflicted_chain_reads_conflicted_and_names_its_owner() {
+        // The conflict is recorded in the rewritten commit and *inherited* by
+        // every commit above it, so the chain reports several conflicted commits
+        // for one conflict. The owner - the deepest - is the one named, because
+        // that is where a resolution belongs and where resolving clears the rest.
+        let fake = FakeWorkReads {
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![
+                    cc_conflicted("tip", true, true),
+                    cc_conflicted("owner", false, true),
+                    cc("base", false, &[], false, false),
+                ]),
+            )]),
+            ..FakeWorkReads::default()
+        };
+
+        let work = snapshot(&fake, &["feat".to_string()]);
+
+        assert_eq!(
+            work["feat"].state,
+            WorkState::Conflicted {
+                commit: ChangeId::short("owner")
+            }
+        );
+        assert_eq!(work["feat"].state.label(), "conflict owner");
+    }
+
+    #[test]
+    fn a_chain_with_no_conflict_is_not_conflicted() {
+        let fake = FakeWorkReads {
+            chains: HashMap::from([(
+                "feat".to_string(),
+                chain(vec![cc("tip", true, &[], false, true)]),
+            )]),
+            ..FakeWorkReads::default()
+        };
+
+        assert_eq!(
+            snapshot(&fake, &["feat".to_string()])["feat"].state,
+            WorkState::Clean
+        );
+    }
+
+    #[test]
+    fn the_conflict_is_read_over_the_whole_chain_not_the_owned_subset() {
+        // A conflict in a shared base is still the workspace's problem: the forge
+        // refuses to push exactly `(::@ ~ trunk()) & conflicts()`, so the state
+        // must not filter the conflict through commit ownership and report the
+        // workspace as merely dirty.
+        let fake = FakeWorkReads {
+            chains: HashMap::from([
+                (
+                    "a".to_string(),
+                    chain(vec![
+                        cc("shared", false, &[], false, true),
+                        cc_conflicted("conflict", false, false),
+                    ]),
+                ),
+                (
+                    "b".to_string(),
+                    chain(vec![
+                        cc("shared", false, &[], false, true),
+                        cc_conflicted("conflict", false, false),
+                    ]),
+                ),
+            ]),
+            ..FakeWorkReads::default()
+        };
+
+        let work = snapshot(&fake, &["a".to_string(), "b".to_string()]);
+
+        assert_eq!(
+            work["a"].state,
+            WorkState::Conflicted {
+                commit: ChangeId::short("conflict")
+            }
+        );
+        assert_eq!(
+            work["b"].state,
+            WorkState::Conflicted {
+                commit: ChangeId::short("conflict")
+            }
+        );
+    }
+
+    #[test]
+    fn a_change_id_is_shown_the_way_jj_shows_it() {
+        assert_eq!(
+            ChangeId::short("kqxsylvyrwvqwmpszlmnv").as_str(),
+            "kqxsylvyrwvq"
+        );
+        assert_eq!(ChangeId::short("short").as_str(), "short");
+        assert_eq!(ChangeId::short("kqxsylvyrwvq").to_string(), "kqxsylvyrwvq");
+    }
+
+    /// Run one jj command in `dir`, asserting it succeeds.
+    fn jj(dir: &Path, args: &[&str]) {
+        let output = crate::jj::command()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A repository whose `ws-a` chain holds a real rebase conflict: `ws-a` and
+    /// `ws-b` each rewrite the same line from the shared base, then `ws-a` is
+    /// rebased onto `ws-b`. jj records the conflict in the commit and exits zero -
+    /// a normal, recoverable state, not a failure.
+    fn conflicted_repo(tag: &str) -> std::path::PathBuf {
+        let root = crate::store::test_local_repo(tag);
+        std::fs::write(root.join("f.txt"), "base\n").expect("write base file");
+        jj(&root, &["commit", "-m", "base"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let ws_a = root.with_extension("ws-a");
+        let ws_b = root.with_extension("ws-b");
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws-a",
+                "--no-colocate",
+                &ws_a.to_string_lossy(),
+            ],
+        );
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws-b",
+                "--no-colocate",
+                &ws_b.to_string_lossy(),
+            ],
+        );
+        std::fs::write(ws_a.join("f.txt"), "a\n").expect("write a");
+        jj(&ws_a, &["commit", "-m", "a change"]);
+        std::fs::write(ws_b.join("f.txt"), "b\n").expect("write b");
+        jj(&ws_b, &["commit", "-m", "b change"]);
+        jj(&root, &["rebase", "-s", "\"ws-a\"@-", "-d", "\"ws-b\"@-"]);
+        root
+    }
+
+    #[test]
+    fn a_real_rebase_conflict_reads_conflicted_and_names_the_commit_jj_names() {
+        let root = conflicted_repo("work-conflict");
+        let reads = SystemWorkReads::new(root.clone());
+
+        let work = snapshot(&reads, &["ws-a".to_string(), "ws-b".to_string()]);
+
+        let WorkState::Conflicted { commit } = work["ws-a"].state else {
+            panic!(
+                "a conflicted chain must read conflicted, got {:?}",
+                work["ws-a"]
+            );
+        };
+        // The named commit is the one jj's own machine-readable conflict revset
+        // reports as the chain's deepest conflicted commit.
+        let conflicted = crate::jj::read_at_repo(
+            &root,
+            &[
+                "log",
+                "-r",
+                "(::\"ws-a\"@ ~ trunk()) & conflicts()",
+                "--no-graph",
+                "-T",
+                "change_id ++ \"\\n\"",
+            ],
+        )
+        .expect("conflict read");
+        let deepest = conflicted
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .expect("a conflicted commit");
+        assert_eq!(commit.as_str(), ChangeId::short(deepest).as_str());
+        assert_eq!(work["ws-a"].state.label(), format!("conflict {commit}"));
+
+        // The sibling workspace, whose own chain is untouched, is not conflicted.
+        assert!(
+            !matches!(work["ws-b"].state, WorkState::Conflicted { .. }),
+            "an unrelated chain must not read conflicted: {:?}",
+            work["ws-b"]
+        );
     }
 
     #[test]
