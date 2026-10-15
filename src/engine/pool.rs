@@ -9,9 +9,9 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
-    PoolState, Repository, RunConclusion, RunResult, RunResultSource, SessionOutcome, StateChange,
-    StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
-    WorkerWorkspaceError,
+    PoolState, Repository, RunConclusion, RunCost, RunRecord, RunRecordConclusion, RunRecordUsage,
+    RunResult, RunResultSource, SessionOutcome, StateChange, StateError, StateRevision, WireStatus,
+    WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -240,8 +240,12 @@ impl Reservation {
         }
         let mut state = loaded.value;
         apply_run_result(&mut state, result)?;
+        let record = run_record(&self.repository, &self.worker_id, &state, result);
         match worker_state.commit(Expected::Match(revision), StateChange::Replace(state))? {
-            CommitOutcome::Applied(_) => Ok(RunFinalization::Applied),
+            CommitOutcome::Applied(_) => {
+                self.repository.state_store().runs().append(&record)?;
+                Ok(RunFinalization::Applied)
+            }
             CommitOutcome::Conflict(_) => Ok(RunFinalization::Stale),
         }
     }
@@ -1543,6 +1547,62 @@ fn apply_run_result(state: &mut WorkerState, result: &RunResult) -> Result<(), W
     Ok(())
 }
 
+/// Builds the durable record for a Run that has just been finalized.
+///
+/// Everything here is already on the finalized Worker state or the Run result,
+/// so nothing new is parsed. An absent cost, usage, duration or turns stays
+/// absent: a Run whose cost could not be read is a Run with no reported cost,
+/// never a Run that fails to record.
+fn run_record(
+    repository: &Repository,
+    worker: &WorkerId,
+    state: &WorkerState,
+    result: &RunResult,
+) -> RunRecord {
+    let workspace = crate::engine::workspace::worker_path(repository.root(), worker);
+    let (conclusion, error) = match result.conclusion() {
+        RunConclusion::Succeeded => (RunRecordConclusion::Succeeded, None),
+        RunConclusion::Failed { message } => (RunRecordConclusion::Failed, Some(message.clone())),
+    };
+    RunRecord {
+        run_id: run_identity(worker, state),
+        worker: worker.clone(),
+        ticket: state.ticket.clone(),
+        workspace: Some(workspace.to_string_lossy().into_owned()),
+        branch: state.branch_name.clone(),
+        runtime: state.agent.as_ref().map(|agent| agent.as_str().to_owned()),
+        provider: state.provider.clone(),
+        model: state.model.clone(),
+        cost_micro_usd: result.cost().map(RunCost::as_micro_usd),
+        usage: result.usage().map(|usage| RunRecordUsage {
+            input_tokens: usage.input_tokens(),
+            cached_input_tokens: usage.cached_input_tokens(),
+            cache_write_input_tokens: usage.cache_write_input_tokens(),
+            output_tokens: usage.output_tokens(),
+            reasoning_output_tokens: usage.reasoning_output_tokens(),
+        }),
+        duration_ms: result
+            .duration()
+            .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
+        turns: result.turns(),
+        conclusion,
+        error,
+        started_at: state.started_at.clone(),
+        completed_at: state.completed_at.clone(),
+    }
+}
+
+/// The identity of a Run: its Worker and the timestamp its Reservation recorded.
+///
+/// These are the same Run-owned values a Reset compares to tell one Run from the
+/// next, so a record's identity matches the Run a reader can see in Worker state.
+fn run_identity(worker: &WorkerId, state: &WorkerState) -> String {
+    match state.started_at.as_ref() {
+        Some(started_at) => format!("{worker}@{}", started_at.as_str()),
+        None => worker.as_str().to_owned(),
+    }
+}
+
 pub(crate) fn current_timestamp() -> Result<WireTimestamp, WorkerPoolError> {
     let timestamp = Timestamp::now()
         .round(
@@ -1986,4 +2046,160 @@ fn process_is_alive(pid: u32) -> bool {
 #[cfg(not(unix))]
 fn process_is_alive(_pid: u32) -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::process::Command;
+    use std::time::Duration;
+
+    use crate::engine::{PoolCapacity, RunSupervisor, RunUsage};
+
+    /// A throwaway Jujutsu repository with one idle Worker, so the finalization
+    /// tests own a real Reservation rather than a stub.
+    fn reserved_worker() -> (tempfile::TempDir, Repository, WorkerId) {
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let status = Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "git",
+                "init",
+                "--no-colocate",
+            ])
+            .arg(temporary.path())
+            .status()
+            .expect("jj should be installed");
+        assert!(status.success(), "jj git init should succeed");
+        let repository = Repository::open(temporary.path()).expect("repository");
+        let worker = repository
+            .worker_pool()
+            .resize_to(PoolCapacity::new(1).expect("capacity"))
+            .expect("Worker Workspace should be provisioned")
+            .added_workers()[0]
+            .clone();
+        (temporary, repository, worker)
+    }
+
+    fn reserve(repository: &Repository, worker: &WorkerId, ticket: &str) -> Reservation {
+        repository
+            .worker_pool()
+            .reserve_named(worker.clone(), ticket)
+            .expect("Worker reservation")
+    }
+
+    fn finalize(reservation: &Reservation, result: &RunResult) -> RunFinalization {
+        reservation
+            .finalize(reservation.worker_revision.clone(), result)
+            .expect("Run finalization")
+    }
+
+    fn records(repository: &Repository) -> Vec<RunRecord> {
+        repository
+            .state_store()
+            .runs()
+            .records()
+            .expect("Run records")
+    }
+
+    #[test]
+    fn finalizing_a_run_appends_one_record_carrying_its_result() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-1");
+        let result = RunResult::succeeded()
+            .with_usage(
+                RunUsage::new(10, 4)
+                    .with_cached_input_tokens(2)
+                    .with_cache_write_input_tokens(1)
+                    .with_reasoning_output_tokens(3),
+            )
+            .with_cost(RunCost::from_micro_usd(1500))
+            .with_duration(Duration::from_millis(2000))
+            .with_turns(3);
+
+        assert!(matches!(
+            finalize(&reservation, &result),
+            RunFinalization::Applied
+        ));
+
+        let records = records(&repository);
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.worker, worker);
+        assert_eq!(record.ticket.as_deref(), Some("ENG-1"));
+        assert_eq!(record.runtime.as_deref(), Some("claude"));
+        assert_eq!(record.branch.as_deref(), Some("eng-1"));
+        assert_eq!(record.cost_micro_usd, Some(1500));
+        assert_eq!(record.duration_ms, Some(2000));
+        assert_eq!(record.turns, Some(3));
+        assert_eq!(record.conclusion, RunRecordConclusion::Succeeded);
+        assert_eq!(record.error, None);
+        assert!(record.run_id.contains(worker.as_str()));
+        assert!(record.started_at.is_some());
+        assert!(record.completed_at.is_some());
+        assert!(
+            record
+                .workspace
+                .as_deref()
+                .is_some_and(|workspace| workspace.ends_with(worker.as_str()))
+        );
+        let usage = record.usage.expect("recorded usage");
+        assert_eq!(usage.input_tokens, 10);
+        assert_eq!(usage.cached_input_tokens, 2);
+        assert_eq!(usage.cache_write_input_tokens, 1);
+        assert_eq!(usage.output_tokens, 4);
+        assert_eq!(usage.reasoning_output_tokens, 3);
+    }
+
+    #[test]
+    fn two_consecutive_runs_in_one_worker_both_survive() {
+        let (_temporary, repository, worker) = reserved_worker();
+
+        let first = reserve(&repository, &worker, "ENG-4");
+        assert!(matches!(
+            finalize(
+                &first,
+                &RunResult::succeeded().with_cost(RunCost::from_micro_usd(100))
+            ),
+            RunFinalization::Applied
+        ));
+        RunSupervisor::new()
+            .reset_run(&repository, &worker)
+            .expect("reset the finished Worker");
+
+        let second = reserve(&repository, &worker, "ENG-5");
+        assert!(matches!(
+            finalize(
+                &second,
+                &RunResult::succeeded().with_cost(RunCost::from_micro_usd(200))
+            ),
+            RunFinalization::Applied
+        ));
+
+        let records = records(&repository);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].cost_micro_usd, Some(100));
+        assert_eq!(records[0].ticket.as_deref(), Some("ENG-4"));
+        assert_eq!(records[1].cost_micro_usd, Some(200));
+        assert_eq!(records[1].ticket.as_deref(), Some("ENG-5"));
+    }
+
+    #[test]
+    fn a_stale_finalization_appends_nothing() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-6");
+
+        assert!(matches!(
+            finalize(&reservation, &RunResult::succeeded()),
+            RunFinalization::Applied
+        ));
+        assert!(matches!(
+            finalize(&reservation, &RunResult::succeeded()),
+            RunFinalization::Stale
+        ));
+
+        assert_eq!(records(&repository).len(), 1);
+    }
 }
