@@ -1115,6 +1115,26 @@ mod tests {
         }
     }
 
+    struct FixFails;
+
+    impl JjAdapter for FixFails {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn fix(&self, _dir: &Path) -> Result<FixOutcome, String> {
+            Err("formatter `sh` exited non-zero".to_string())
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            panic!("a failed formatter must stop the push")
+        }
+    }
+
     struct BrokenGitHub;
     impl GitHubAdapter for BrokenGitHub {
         fn default_branch(&self, _slug: &str) -> Result<String, String> {
@@ -1812,6 +1832,48 @@ mod tests {
             *jj.calls.lock().expect("the call log is not poisoned"),
             vec!["fetch", "weld", "fix", "push"]
         );
+    }
+
+    #[tokio::test]
+    async fn a_failed_formatter_stops_the_push_and_surfaces_a_typed_error() {
+        // A formatter that failed must not pass silently: the push stops and the
+        // error is reported against the Weld step.
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            Arc::new(FixFails),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::Weld) == Status::Skipped
+                && progress.reason() == Some("fix: formatter `sh` exited non-zero")
+                && notice == "fix: formatter `sh` exited non-zero"
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                workspace,
+                progress: Some(progress),
+            }) if workspace == "feat"
+                && status(progress, Step::Weld) == Status::Skipped
+                && status(progress, Step::Push) == Status::Pending
+                && status(progress, Step::PullRequest) == Status::Pending
+        ));
     }
 
     #[tokio::test]

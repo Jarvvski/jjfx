@@ -449,7 +449,9 @@ pub fn fix(dir: &Path, revset: &str) -> anyhow::Result<FixOutcome> {
 }
 
 /// Classify one `jj fix` run. A non-zero exit is a typed error carrying jj's
-/// message; otherwise the run succeeded.
+/// message. jj itself exits zero when a fix tool fails (it warns and leaves the
+/// file unfixed), so a failed formatter is read from [`fix_tool_failure`] and
+/// surfaced as a typed error naming the tool - never a silent pass.
 fn classify_fix(run: &Run) -> anyhow::Result<FixOutcome> {
     if !run.ok() {
         let stderr = run.stderr().trim();
@@ -465,7 +467,31 @@ fn classify_fix(run: &Run) -> anyhow::Result<FixOutcome> {
         };
         anyhow::bail!("{message}");
     }
-    Ok(FixOutcome::Fixed)
+    match fix_tool_failure(run.stderr()) {
+        Some(tool) => anyhow::bail!("formatter `{tool}` exited non-zero"),
+        None => Ok(FixOutcome::Fixed),
+    }
+}
+
+/// The first fix tool jj reported as failing, parsed from the warning it prints
+/// on stderr: ``Warning: Fix tool `<cmd>` exited with non-zero exit code for
+/// `<path>` ``. `None` when every tool exited zero.
+///
+/// This is a deliberate, narrow exception to the typed-jj-access rule (bug-hunt
+/// ticket 21): jj exits zero and exposes no machine-readable field when a fix
+/// tool fails, so its own warning line is the only signal that a formatter did
+/// not run. Reading it is what turns a silent pass into the typed error the
+/// forge requires.
+fn fix_tool_failure(stderr: &str) -> Option<String> {
+    const NEEDLE: &str = "Fix tool `";
+    const SUFFIX: &str = "` exited with non-zero exit code";
+    stderr.lines().find_map(|line| {
+        let rest = &line[line.find(NEEDLE)? + NEEDLE.len()..];
+        let end = rest.find('`')?;
+        rest[end..]
+            .starts_with(SUFFIX)
+            .then(|| rest[..end].to_string())
+    })
 }
 
 /// Whether any `[fix.tools.<id>]` is configured, read through jj's template
@@ -688,6 +714,33 @@ mod tests {
             classify_fix(&run).expect("a clean run is Fixed"),
             FixOutcome::Fixed
         );
+    }
+
+    #[test]
+    fn fix_tool_failure_names_the_tool_from_jjs_warning() {
+        // jj exits zero when a fix tool fails, so the warning is the only signal.
+        let stderr = "Warning: Fix tool `sh` exited with non-zero exit code for `f.txt`\n\
+                      Fixed 0 commits of 2 checked.\n";
+        assert_eq!(fix_tool_failure(stderr).as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn fix_tool_failure_is_none_when_every_tool_exited_zero() {
+        assert_eq!(fix_tool_failure("Fixed 2 commits of 2 checked.\n"), None);
+        assert_eq!(fix_tool_failure(""), None);
+        // A line that merely mentions a tool must not read as a failure.
+        assert_eq!(fix_tool_failure("Fix tool `sh` ran cleanly\n"), None);
+    }
+
+    #[test]
+    fn classify_fix_reads_a_failed_tool_as_a_typed_error_not_a_silent_pass() {
+        let run = Run::for_test(
+            true,
+            "",
+            "Warning: Fix tool `sh` exited with non-zero exit code for `f.txt`\n",
+        );
+        let error = classify_fix(&run).expect_err("a failed formatter must not pass");
+        assert_eq!(error.to_string(), "formatter `sh` exited non-zero");
     }
 
     #[test]
