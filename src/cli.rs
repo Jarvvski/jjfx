@@ -16,6 +16,7 @@ use crate::engine::{
     WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
     WorkspaceHookStream,
 };
+use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
 
@@ -829,22 +830,36 @@ fn where_command(repository: &Repository) -> Result<()> {
     Ok(())
 }
 
-/// Read every open workspace's working copy for migrations and print them.
-/// Read-only: the check never reorders or rewrites anything.
+/// Run the read-only cross-workspace migration-order check and print its report.
+/// It never reorders or rewrites anything. Exits non-zero when the set has a
+/// hazard, so an agent can gate a merge on it.
 fn check_migrations_command(repository: &Repository, migrations: &MigrationsConfig) -> Result<()> {
-    let placed = crate::migrations::read(repository.root(), &migrations.pattern)?;
-    if placed.is_empty() {
-        println!("no migrations matching `{}`", migrations.pattern);
+    let report = crate::migrations::check(repository.root(), &migrations.pattern)?;
+    if report.is_clean() {
+        println!(
+            "no migration-order inversions across the workspaces (`{}`)",
+            migrations.pattern
+        );
         return Ok(());
     }
-    println!("{} migration(s) across the workspaces:", placed.len());
-    for migration in placed {
-        println!(
-            "  {}  V{}  {}",
-            migration.workspace, migration.version, migration.path
-        );
+    println!(
+        "migration-order hazards across the workspaces (`{}`):",
+        migrations.pattern
+    );
+    for finding in report.findings() {
+        let heading = match finding.kind {
+            FindingKind::Inversion => "merge in this order",
+            FindingKind::Ambiguous => "ambiguous version - resolve before merging",
+        };
+        println!("\n{} - {heading}:", finding.space);
+        for migration in &finding.migrations {
+            println!(
+                "  V{}  {}  {}",
+                migration.version, migration.workspace, migration.path
+            );
+        }
     }
-    Ok(())
+    anyhow::bail!("migration-order check failed: {}", report.summary())
 }
 
 fn path_command(repository: &Repository, name: &str) -> Result<()> {

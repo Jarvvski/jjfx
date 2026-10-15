@@ -18,6 +18,7 @@
 //! keeps per workspace: a migration an agent has written but not committed is on
 //! disk, while `jj file list -r '<ws>@'` would still show only the baseline.
 
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::store::DEFAULT_WORKSPACE;
@@ -116,6 +117,131 @@ pub fn read(repo_root: &Path, pattern: &str) -> anyhow::Result<Vec<Placed>> {
         placed.extend(read_workspace(&name, &dir, pattern));
     }
     Ok(placed)
+}
+
+/// Run the whole check: read every workspace's migrations and analyse them.
+pub fn check(repo_root: &Path, pattern: &str) -> anyhow::Result<Report> {
+    Ok(analyse(read(repo_root, pattern)?))
+}
+
+/// What kind of cross-workspace hazard one ordering space carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindingKind {
+    /// Two workspaces add different versions: whichever merges first sets the
+    /// applied order, and merging the higher version first leaves the lower one
+    /// landing after it. The migrations are listed in the order they must merge.
+    Inversion,
+    /// Two workspaces add the *same* version: the order is ambiguous, and the
+    /// migration tool would reject the duplicate outright.
+    Ambiguous,
+}
+
+/// A cross-workspace migration hazard in one ordering space, naming the
+/// migrations (and so the workspaces) involved, lowest version first.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Finding {
+    /// The directory that orders the migrations - the ordering space.
+    pub space: String,
+    pub kind: FindingKind,
+    /// The workspace additions in this space, ascending by version.
+    pub migrations: Vec<Placed>,
+}
+
+/// The check's read-only result: the hazards found, or nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Report {
+    findings: Vec<Finding>,
+}
+
+impl Report {
+    /// The hazards, ordered by space.
+    pub fn findings(&self) -> &[Finding] {
+        &self.findings
+    }
+
+    /// Whether the set is clean - no hazard across the open workspaces.
+    pub fn is_clean(&self) -> bool {
+        self.findings.is_empty()
+    }
+
+    /// A one-line summary for a TUI notice, e.g. `2 migration inversions`.
+    pub fn summary(&self) -> String {
+        let inversions = self
+            .findings
+            .iter()
+            .filter(|finding| finding.kind == FindingKind::Inversion)
+            .count();
+        let ambiguous = self.findings.len() - inversions;
+        let mut parts = Vec::new();
+        if inversions > 0 {
+            parts.push(format!("{inversions} migration inversion(s)"));
+        }
+        if ambiguous > 0 {
+            parts.push(format!("{ambiguous} ambiguous version(s)"));
+        }
+        parts.join(", ")
+    }
+}
+
+/// Analyse the migrations the workspaces add, per ordering space.
+///
+/// The baseline is the `default` Workspace's set: a migration every Workspace
+/// inherits is not an addition, so it cannot invert - without this, a Workspace
+/// adding `V189` on top of a shared `V188` would look like an inversion against
+/// the baseline. What remains is grouped by the directory that orders it (a
+/// project whose migrations are per-module must not compare one module's
+/// versions against another's), and a space is reported only when **two or more**
+/// workspaces contribute: one workspace's own migrations merge together and
+/// cannot invert against themselves.
+pub fn analyse(placed: Vec<Placed>) -> Report {
+    let baseline: HashSet<&str> = placed
+        .iter()
+        .filter(|migration| migration.workspace == DEFAULT_WORKSPACE)
+        .map(|migration| migration.path.as_str())
+        .collect();
+
+    let mut spaces: BTreeMap<&str, Vec<&Placed>> = BTreeMap::new();
+    for migration in &placed {
+        if migration.workspace == DEFAULT_WORKSPACE || baseline.contains(migration.path.as_str()) {
+            continue;
+        }
+        spaces
+            .entry(space_of(&migration.path))
+            .or_default()
+            .push(migration);
+    }
+
+    let mut findings = Vec::new();
+    for (space, mut migrations) in spaces {
+        let workspaces: HashSet<&str> = migrations
+            .iter()
+            .map(|migration| migration.workspace.as_str())
+            .collect();
+        if workspaces.len() < 2 {
+            continue;
+        }
+        migrations.sort_by(|a, b| a.version.cmp(&b.version).then_with(|| a.path.cmp(&b.path)));
+        let ambiguous = migrations
+            .windows(2)
+            .any(|pair| pair[0].version == pair[1].version);
+        findings.push(Finding {
+            space: space.to_owned(),
+            kind: if ambiguous {
+                FindingKind::Ambiguous
+            } else {
+                FindingKind::Inversion
+            },
+            migrations: migrations.into_iter().cloned().collect(),
+        });
+    }
+    Report { findings }
+}
+
+/// The ordering space a migration belongs to: the directory that holds it. Two
+/// migrations in different directories never invert against each other, so a
+/// per-module project's sequences stay separate.
+fn space_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
 }
 
 /// Every workspace jj reports, as `(name, directory)`, with the implicit
@@ -315,6 +441,122 @@ mod tests {
         std::fs::write(dir.join("src/main.rs"), "").expect("writing");
         assert!(read_workspace("ws", &dir, "**/V*__*.sql").is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A placed migration, its version parsed from the path's file name.
+    fn placed(workspace: &str, path: &str) -> Placed {
+        Placed {
+            workspace: workspace.to_owned(),
+            path: path.to_owned(),
+            version: Version::parse(
+                Path::new(path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .expect("a file name"),
+            )
+            .expect("a version"),
+        }
+    }
+
+    #[test]
+    fn two_workspaces_adding_distinct_versions_are_an_inversion() {
+        let report = analyse(vec![
+            placed("default", "db/migration/V188__init.sql"),
+            placed("ws-a", "db/migration/V188__init.sql"),
+            placed("ws-b", "db/migration/V188__init.sql"),
+            placed("ws-a", "db/migration/V189__a.sql"),
+            placed("ws-b", "db/migration/V190__b.sql"),
+        ]);
+        assert_eq!(report.findings().len(), 1);
+        let finding = &report.findings()[0];
+        assert_eq!(finding.kind, FindingKind::Inversion);
+        assert_eq!(finding.space, "db/migration");
+        assert_eq!(
+            finding
+                .migrations
+                .iter()
+                .map(|m| (m.workspace.as_str(), m.path.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                ("ws-a", "db/migration/V189__a.sql"),
+                ("ws-b", "db/migration/V190__b.sql"),
+            ]
+        );
+    }
+
+    #[test]
+    fn either_arrangement_of_versions_is_an_inversion() {
+        // Whichever workspace holds the higher version, merging it first inverts
+        // the lower one, so both arrangements are a hazard - and the report still
+        // lists them lowest first (the order they must merge).
+        let report = analyse(vec![
+            placed("ws-a", "db/migration/V190__a.sql"),
+            placed("ws-b", "db/migration/V189__b.sql"),
+        ]);
+        assert_eq!(report.findings().len(), 1);
+        assert_eq!(report.findings()[0].kind, FindingKind::Inversion);
+        assert_eq!(report.findings()[0].migrations[0].workspace, "ws-b");
+    }
+
+    #[test]
+    fn one_workspace_adding_migrations_is_clean() {
+        // A workspace's own migrations merge together; they cannot invert against
+        // themselves.
+        let report = analyse(vec![
+            placed("default", "db/migration/V188__init.sql"),
+            placed("ws-a", "db/migration/V188__init.sql"),
+            placed("ws-a", "db/migration/V189__a.sql"),
+            placed("ws-a", "db/migration/V190__b.sql"),
+        ]);
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
+    fn the_shared_baseline_is_not_an_addition() {
+        // The default workspace's own files, and every workspace's inherited copy
+        // of them, are not additions and cannot invert.
+        let report = analyse(vec![
+            placed("default", "db/migration/V188__init.sql"),
+            placed("ws-a", "db/migration/V188__init.sql"),
+        ]);
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn the_same_version_across_two_workspaces_is_ambiguous() {
+        let report = analyse(vec![
+            placed("ws-a", "db/migration/V189__a.sql"),
+            placed("ws-b", "db/migration/V189__b.sql"),
+        ]);
+        assert_eq!(report.findings().len(), 1);
+        assert_eq!(report.findings()[0].kind, FindingKind::Ambiguous);
+    }
+
+    #[test]
+    fn migrations_in_different_directories_do_not_invert() {
+        // Per-module sequences are separate ordering spaces.
+        let report = analyse(vec![
+            placed("ws-a", "module-a/migrations/V5__a.sql"),
+            placed("ws-b", "module-b/migrations/V10__b.sql"),
+        ]);
+        assert!(report.is_clean(), "{report:?}");
+    }
+
+    #[test]
+    fn a_report_summarises_its_findings() {
+        let inversion = analyse(vec![
+            placed("ws-a", "db/migration/V189__a.sql"),
+            placed("ws-b", "db/migration/V190__b.sql"),
+        ]);
+        assert_eq!(inversion.summary(), "1 migration inversion(s)");
+
+        let ambiguous = analyse(vec![
+            placed("ws-a", "db/migration/V189__a.sql"),
+            placed("ws-b", "db/migration/V189__b.sql"),
+        ]);
+        assert_eq!(ambiguous.summary(), "1 ambiguous version(s)");
+
+        assert_eq!(analyse(Vec::new()).summary(), "");
     }
 
     /// A throwaway directory under the temp dir.
