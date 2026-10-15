@@ -1,6 +1,6 @@
 # First-class local `.scratch/` markdown tickets
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 01
 
@@ -84,3 +84,25 @@ not YAML front-matter.
 - 2026-10-15: Filed from the strategy review. This is the bet: it closes the
   named dispatch-loop friction and lets jjfx dogfood on its own `.scratch`
   tickets.
+- 2026-10-15: Resolved in PR #3. Added `LocalMarkdownQuery` (`src/engine/local_tickets.rs`)
+  implementing `TicketQuery` over `<root>/<feature>/issues/<NN>-<slug>.md`:
+  discovery, `Status:` / `Blocked by:` / `Type:` parsing, id/title/body
+  extraction, the Ready set (ready status + every Blocker resolved), the
+  dependency graph (a feature is the Parent; its Tickets are the children), and
+  ticket-details inlining of the body into the Worker prompt. Added claim/resolve
+  writeback that rewrites only the `Status:` line and appends a dated
+  `## Comments` line, wired into the shared CLI dispatch/orchestrate paths and the
+  TUI adapter's refresh. `source = "local"` is now selected by config and needs no
+  runtime, Linear, or Pi.
+  **Decision:** the id is `<feature>--<NN>-<slug>`, not the `<feature>/<NN>-<slug>`
+  of the Solution text. A `TicketId` must be a single filename component (it names
+  Dispatch Group state files and the orchestration lock), and the branch matcher
+  splits on `/`, so a `/` in an id is unsafe; the feature is joined with `--`
+  instead.
+  **Decision:** writeback is driven from the reconciled Worker Pool snapshot (a
+  Busy Worker claims, a Done Worker resolves) rather than from inside the engine's
+  reservation/completion internals, so every dispatch path - direct, orchestrate,
+  CLI, TUI - is covered by one seam. A background Run started by the CLI is
+  resolved when some jjfx process next reconciles the Pool (the TUI poller, or a
+  later command).
+  `mise run check` green.

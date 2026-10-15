@@ -620,6 +620,16 @@ impl ReadyTicketFilter {
         }
         Ok(Self { label, status })
     }
+
+    /// Returns the dispatch label a Ready Ticket must carry.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Returns the workflow status a Ready Ticket must be in.
+    pub fn status(&self) -> &TicketStatus {
+        &self.status
+    }
 }
 
 /// A canonical GitHub Repository identity used to scope Dispatch delivery.

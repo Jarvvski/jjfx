@@ -17,6 +17,7 @@ mod dispatch_prompt;
 mod eligibility;
 mod foreground;
 mod layout;
+mod local_tickets;
 mod opencode_api;
 mod orchestration;
 mod pool;
@@ -45,6 +46,10 @@ pub use eligibility::{DispatchExclusions, ExclusionsProvider, reconcile_occupanc
 pub use foreground::{FOREGROUND_WRAPPER_ENV, WRAPPER_SUBCOMMAND, run_wrapper};
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
+};
+pub use local_tickets::{
+    CLAIMED_STATUS, LocalMarkdownQuery, LocalTicket, LocalTicketError, LocalTicketMalformation,
+    LocalTicketUpdate, LocalTickets,
 };
 pub use opencode_api::{
     CommandOutput, ModelRef, NewSession, OpenCodeApi, OpenCodeError, OpenCodeRunner,

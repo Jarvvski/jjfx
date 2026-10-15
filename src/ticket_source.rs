@@ -10,8 +10,8 @@ use std::path::Path;
 
 use crate::config::{TicketSource, TicketsConfig};
 use crate::engine::{
-    AgentRuntime, AgentRuntimeQuery, PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, TicketQuery,
-    TicketQueryError,
+    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, PI_DISCOVERY_HELPER_ENV,
+    PiDiscoveryHelper, Repository, TicketQuery, TicketQueryError, WorkerPoolSnapshot,
 };
 
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
@@ -26,10 +26,11 @@ pub(crate) fn configured_ticket_query(
 ) -> Result<Box<dyn TicketQuery>, TicketQueryError> {
     match tickets.source {
         TicketSource::Linear => Ok(Box::new(linear_query(workspace, runtime))),
-        TicketSource::Local => Err(TicketQueryError::setup(
-            "the local markdown Ticket source is not available yet; \
-             set [tickets] source = \"linear\"",
-        )),
+        TicketSource::Local => Ok(Box::new(LocalMarkdownQuery::new(
+            workspace.join(&tickets.local.root),
+            tickets.local.ready_status.clone(),
+            tickets.local.resolved_status.clone(),
+        ))),
     }
 }
 
@@ -46,6 +47,37 @@ fn linear_query(workspace: &Path, runtime: AgentRuntime) -> AgentRuntimeQuery {
     }
 }
 
+/// Writes local Tickets back for the reconciled Worker Pool: a Worker running a
+/// local Ticket claims it, and a Worker whose Run finished resolves it.
+///
+/// A no-op for every other source. The failures are returned rather than raised:
+/// the writeback is a side effect of a Dispatch that already succeeded, and the
+/// caller decides how loudly to report it.
+pub(crate) fn apply_local_writeback(
+    repository: &Repository,
+    snapshot: &WorkerPoolSnapshot,
+    tickets: &TicketsConfig,
+) -> Vec<String> {
+    if tickets.source != TicketSource::Local {
+        return Vec::new();
+    }
+    let local = LocalTickets::new(
+        repository.root().join(&tickets.local.root),
+        tickets.local.ready_status.clone(),
+        tickets.local.resolved_status.clone(),
+    );
+    let workers = snapshot
+        .workers()
+        .iter()
+        .filter_map(|worker| worker.ticket().map(|ticket| (ticket, worker.status())))
+        .collect::<Vec<_>>();
+    local
+        .write_back(&workers)
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
@@ -53,7 +85,7 @@ mod tests {
     use super::*;
     use crate::engine::{
         ParentTicket, ReadyTicketFilter, RepositoryIdentity, TicketDiscovery, TicketId,
-        TicketQueryErrorKind, TicketQueryRequest, TicketStatus,
+        TicketQueryRequest, TicketStatus,
     };
 
     fn linear() -> TicketsConfig {
@@ -115,11 +147,10 @@ mod tests {
             AgentRuntime::OpenCode,
             AgentRuntime::Pi,
         ] {
-            let error = configured_ticket_query(workspace, &local(), runtime)
-                .err()
-                .expect("the local source is not available yet");
-            assert_eq!(error.kind(), TicketQueryErrorKind::Setup, "{runtime}");
-            assert!(error.to_string().contains("local"), "{error}");
+            assert!(
+                configured_ticket_query(workspace, &local(), runtime).is_ok(),
+                "{runtime}"
+            );
         }
     }
 

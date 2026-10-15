@@ -164,15 +164,16 @@ prompt their own way; the runtime is the transport, not the source.
 
 ### `[tickets.local]`
 
-Discover Ready Tickets from local markdown under the repository (the
-`.scratch/<feature>/issues/NN-<slug>.md` convention). Selecting this source
-fails with a setup error for now - the reader is not implemented yet.
+Discover Ready Tickets from local markdown under the repository - the
+`.scratch/<feature>/issues/<NN>-<slug>.md` convention. No runtime, no Linear, and
+no Pi helper are involved; see [Local tickets](local-tickets.md) for the layout,
+identity, dependency, and writeback rules.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `root` | `".scratch"` | Directory under the repository root holding `<feature>/issues/*.md`. |
 | `ready_status` | `"ready-for-agent"` | The `Status:` value marking a Ticket ready for Dispatch. |
-| `resolved_status` | `"resolved"` | The `Status:` value marking a Ticket resolved. |
+| `resolved_status` | `"resolved"` | The `Status:` value marking a Ticket resolved, and therefore a satisfied `Blocked by:` entry. |
 
 ## Legacy `[workspace]`
 
