@@ -1,6 +1,6 @@
 # Ingest the agent lifecycle signals jjfx ignores
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -72,3 +72,15 @@ the lifecycle. This is an extension of an existing contract, not new plumbing.
 
 - 2026-10-15: Filed from the strategy review. Verified event names against the
   vendor docs; jjfx's current registration was read from `src/hooks.rs`.
+- 2026-10-15: Resolved. Registered `Notification`, `StopFailure`,
+  `SubagentStart`/`Stop`, `PostToolBatch`, `TaskCreated`/`Completed`, and
+  `TeammateIdle` for Claude and `Interrupt` + the subagent events for Codex. The
+  shared event schema gained optional `notification_type`/`error` fields (old
+  lines still parse). `Notification:agent_needs_input` folds to
+  `NeedsAttention`; `StopFailure:rate_limit`/`billing_error` folds to a new
+  `AgentState::QuotaBlocked` that sorts to needs-you with its own `⊘` glyph.
+  Orchestration now parks a quota-blocked Run (a new
+  `DispatchGroupEvent::QuotaBlocked` that ignores the retry allowance) instead
+  of retrying it, driven by the hook-derived agent state for the Worker's
+  workspace. Subagent/batch events are recorded without regressing
+  Working/Waiting. `mise run check` green.

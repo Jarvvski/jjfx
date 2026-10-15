@@ -30,6 +30,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Added
 
 - The ticket source Dispatch discovers work from is now configured with a `[tickets]` section (`source = "linear" | "local"`) rather than implied by the Agent Runtime, so an opencode pool can pull work through a configured source; `source = "linear"` is unchanged.
+- Ingest the richer Claude/Codex lifecycle hooks: needs-input, a distinct quota-blocked state, and subagent/batch progress
 
 ## [0.54.0] - 2026-10-14
 
