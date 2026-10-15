@@ -12,11 +12,11 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
     DispatchBudget, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
-    RunActivityKind, RunMode, StuckWindow, TerminalSettings, TicketDetails, TicketDiscovery,
-    TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent, WorkerActions, WorkerId,
-    WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
-    REPOSITORY_WIDE_MUTATION,
+    OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
+    ReviewLoop, RunActivity, RunActivityKind, RunMode, StuckWindow, TerminalSettings,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
