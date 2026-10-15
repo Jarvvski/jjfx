@@ -126,6 +126,11 @@ pub(crate) fn draw(
 
     frame.render_widget(footer, footer_area);
 }
+/// The work column's width: wide enough for the longest label, a conflicted
+/// chain naming its commit (`conflict ` plus jj's 12-character short change id).
+/// Every row pads to this, so a long label never shifts the columns after it.
+const WORK_COLUMN: usize = 21;
+
 /// A leading notice row: a cross-workspace hazard the owner should see before
 /// merging, drawn in the needs-you amber so it reads as "act on this".
 pub(crate) fn notice_item(text: &str) -> ListItem<'static> {
@@ -219,7 +224,7 @@ pub(crate) fn workspace_item(
     match marker {
         RowMarker::Deleting => {
             spans.push(Span::styled(
-                format!("{:<16}", "deleting..."),
+                format!("{:<WORK_COLUMN$}", "deleting..."),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::DIM),
@@ -227,13 +232,13 @@ pub(crate) fn workspace_item(
         }
         RowMarker::Lifting => {
             spans.push(Span::styled(
-                format!("{:<16}", "lifting..."),
+                format!("{:<WORK_COLUMN$}", "lifting..."),
                 Style::default().fg(Color::Yellow),
             ));
         }
         RowMarker::Queued => {
             spans.push(Span::styled(
-                format!("{:<16}", "queued"),
+                format!("{:<WORK_COLUMN$}", "queued"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::DIM),
@@ -244,7 +249,7 @@ pub(crate) fn workspace_item(
         }
         RowMarker::None => {
             spans.push(Span::styled(
-                format!("{:<16}", work.label()),
+                format!("{:<WORK_COLUMN$}", work.label()),
                 Style::default().fg(work_color(work)),
             ));
         }
@@ -387,6 +392,39 @@ mod tests {
         assert!(text.contains("jjfx - 1 workspace(s)"), "{text}");
         assert!(text.contains("needs you"), "{text}");
         assert!(text.contains("feature"), "{text}");
+    }
+
+    #[test]
+    fn a_conflicted_row_names_the_conflicted_commit_in_the_work_column() {
+        let ws = Workspace {
+            name: "feature".to_string(),
+            path: WorkspacePath::Present(std::path::PathBuf::from("/tmp/feature")),
+        };
+        let mut conflicted = row(&ws, Attention::NeedsYou);
+        conflicted.work = WorkState::Conflicted {
+            commit: crate::work::ChangeId::short("kqxsylvyrwvqwmpsz"),
+        };
+        let view = HomeView {
+            rows: vec![
+                HomeRowKind::Header {
+                    attention: Attention::NeedsYou,
+                    count: 1,
+                },
+                HomeRowKind::Workspace(conflicted),
+            ],
+            selected: Some("feature"),
+            idle_collapsed: false,
+            tick: 0,
+            title: "jjfx".to_string(),
+        };
+        let state = RenderState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), Vec::new()))
+            .unwrap();
+        let text = term.backend().to_string();
+        // The lane is needs-you and the row names the commit to resolve.
+        assert!(text.contains("needs you"), "{text}");
+        assert!(text.contains("conflict kqxsylvyrwvq"), "{text}");
     }
 
     #[test]
