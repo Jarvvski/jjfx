@@ -37,6 +37,8 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Record each finalized Run's cost, usage, duration and turns in an append-only store at `.jj/pool/runs.jsonl`, so Run history survives past the next Run
 - Run `jj fix` over a workspace's just-welded chain before the forge pushes, honouring the user's own `[fix.tools]`; a formatter that fails is a typed error, not a silent pass.
 - Show the Pool's aggregate cost and usage in the Pool view and `jjfx status`, and gate Dispatch on an optional `[spend] cap_usd` budget with `block` or `warn`
+- Configure an AI reviewer (`[review] reviewer = "coderabbit"`) and feed its normalised findings into the review prompt
+- Bound the re-review loop with a pass cap, so `jjfx review --fg` iterates review -> address -> review without looping to zero
 
 ## [0.54.0] - 2026-10-14
 

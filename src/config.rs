@@ -370,13 +370,15 @@ impl ReviewConfig {
 
 /// The configured AI reviewer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "kebab-case")]
 pub enum ReviewerKind {
     /// No reviewer: `review` behaves exactly as it did before reviewers existed.
+    #[serde(rename = "none")]
     None,
     /// The CodeRabbit CLI in agent mode (`cr review --agent`).
+    #[serde(rename = "coderabbit")]
     Coderabbit,
     /// The opencode GitHub Action, run repo-side.
+    #[serde(rename = "opencode-action")]
     OpenCodeAction,
 }
 
@@ -601,6 +603,79 @@ mod tests {
             error.to_string().contains("tickets.linear.status"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn review_defaults_to_no_reviewer() {
+        let cfg = Config::default();
+        cfg.validate().expect("the default config is valid");
+        assert_eq!(cfg.review.reviewer, ReviewerKind::None);
+        assert_eq!(cfg.review.max_passes, 2);
+    }
+
+    #[test]
+    fn a_review_section_selects_a_reviewer_and_its_pass_cap() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [review]
+            reviewer = "coderabbit"
+            max_passes = 4
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.review.reviewer, ReviewerKind::Coderabbit);
+        assert_eq!(cfg.review.max_passes, 4);
+    }
+
+    #[test]
+    fn the_opencode_action_reviewer_is_selectable() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [review]
+            reviewer = "opencode-action"
+            "#,
+        )
+        .expect("toml parses");
+        assert_eq!(cfg.review.reviewer, ReviewerKind::OpenCodeAction);
+    }
+
+    #[test]
+    fn an_unknown_reviewer_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [review]
+            reviewer = "sonarqube"
+            "#,
+        )
+        .expect_err("unknown reviewer is an error");
+        assert!(err.to_string().contains("sonarqube"), "{err}");
+    }
+
+    #[test]
+    fn unknown_review_keys_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [review]
+            reveiwer = "coderabbit"
+            "#,
+        )
+        .expect_err("unknown key is an error");
+        assert!(err.to_string().contains("reveiwer"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_pass_cap_is_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [review]
+            reviewer = "coderabbit"
+            max_passes = 0
+            "#,
+        )
+        .expect("toml parses");
+        let error = cfg.validate().expect_err("zero passes is an error");
+        assert!(error.to_string().contains("review.max_passes"), "{error}");
     }
 
     #[test]

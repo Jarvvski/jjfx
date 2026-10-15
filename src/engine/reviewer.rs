@@ -593,3 +593,284 @@ impl ReviewLoop {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_executable(directory: &Path, name: &str, contents: &str) -> String {
+        let path = directory.join(name);
+        fs::write(&path, contents).expect("script");
+        let mut permissions = fs::metadata(&path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&path, permissions).expect("permissions");
+        path.display().to_string()
+    }
+
+    fn request() -> ReviewRequest {
+        ReviewRequest::new("owner/repo", "main", "adam/feature")
+    }
+
+    fn finding() -> ReviewFinding {
+        ReviewFinding::new(
+            ReviewSeverity::Major,
+            Some("src/x.rs".to_owned()),
+            Some((12, 14)),
+            Some("Unbounded loop".to_owned()),
+            "Cap the loop.",
+            vec!["n = 3".to_owned()],
+        )
+    }
+
+    #[test]
+    fn the_coderabbit_adapter_normalises_agent_ndjson() {
+        let directory = TempDir::new().expect("temporary directory");
+        let program = write_executable(
+            directory.path(),
+            "cr",
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"review_context\",\"remote\":\"owner/repo\"}'\n\
+             printf '%s\\n' '{\"type\":\"heartbeat\"}'\n\
+             printf '%s\\n' '{\"type\":\"finding\",\"severity\":\"major\",\"fileName\":\"src/x.rs\",\"startLine\":12,\"endLine\":14,\"title\":\"Unbounded loop\",\"codegenInstructions\":\"Cap the loop.\",\"suggestions\":[\"n = 3\"]}'\n\
+             printf '%s\\n' '{\"type\":\"finding\",\"severity\":\"minor\",\"fileName\":\"src/y.rs\",\"comment\":\"Rename this.\"}'\n\
+             printf '%s\\n' '{\"type\":\"complete\",\"status\":\"review_completed\",\"outcome\":\"completed\"}'\n",
+        );
+        let reviewer = CodeRabbitReviewer::with_program(program);
+
+        let outcome = reviewer.review(&request()).expect("review");
+
+        assert_eq!(outcome.findings().len(), 2, "{:?}", outcome.findings());
+        let first = &outcome.findings()[0];
+        assert_eq!(first.severity(), ReviewSeverity::Major);
+        assert_eq!(first.location().as_deref(), Some("src/x.rs:12-14"));
+        assert_eq!(first.title(), Some("Unbounded loop"));
+        assert_eq!(first.body(), "Cap the loop.");
+        assert_eq!(first.suggestions(), ["n = 3"]);
+        assert_eq!(first.summary(), "[major] src/x.rs:12-14 - Unbounded loop");
+        // A finding with no codegen instructions falls back to its comment.
+        assert_eq!(outcome.findings()[1].body(), "Rename this.");
+        assert_eq!(outcome.completeness(), &ReviewCompleteness::Complete);
+    }
+
+    #[test]
+    fn an_incomplete_review_keeps_the_findings_it_emitted() {
+        let directory = TempDir::new().expect("temporary directory");
+        let program = write_executable(
+            directory.path(),
+            "cr",
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"finding\",\"severity\":\"critical\",\"fileName\":\"src/x.rs\",\"codegenInstructions\":\"Fix it.\"}'\n\
+             printf '%s\\n' '{\"type\":\"complete\",\"status\":\"review_completed\",\"outcome\":\"failed\",\"unreviewedFileCount\":3,\"message\":\"missed 3 files\"}'\n\
+             exit 1\n",
+        );
+        let reviewer = CodeRabbitReviewer::with_program(program);
+
+        let outcome = reviewer.review(&request()).expect("review");
+
+        assert_eq!(outcome.findings().len(), 1);
+        assert!(!outcome.completeness().is_complete());
+        assert_eq!(outcome.completeness().reason(), Some("missed 3 files"));
+    }
+
+    #[test]
+    fn a_skipped_review_is_complete_with_no_findings() {
+        let directory = TempDir::new().expect("temporary directory");
+        let program = write_executable(
+            directory.path(),
+            "cr",
+            "#!/bin/sh\n\
+             printf '%s\\n' '{\"type\":\"status\",\"status\":\"review_skipped\"}'\n\
+             printf '%s\\n' '{\"type\":\"complete\",\"status\":\"review_skipped\",\"findings\":0,\"message\":\"No changes detected\"}'\n",
+        );
+        let reviewer = CodeRabbitReviewer::with_program(program);
+
+        let outcome = reviewer.review(&request()).expect("review");
+
+        assert!(outcome.findings().is_empty());
+        assert_eq!(outcome.completeness(), &ReviewCompleteness::Complete);
+    }
+
+    #[test]
+    fn the_reviewer_command_never_carries_a_credential() {
+        let directory = TempDir::new().expect("temporary directory");
+        let argv_path = directory.path().join("argv.txt");
+        let program = write_executable(
+            directory.path(),
+            "cr",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > {}\nprintf '%s\\n' '{{\"type\":\"complete\",\"status\":\"review_completed\"}}'\n",
+                argv_path.display()
+            ),
+        );
+        let reviewer = CodeRabbitReviewer::with_program(program);
+
+        reviewer.review(&request()).expect("review");
+
+        let argv = fs::read_to_string(&argv_path).expect("argv");
+        let argv = argv.lines().collect::<Vec<_>>();
+        assert_eq!(
+            argv,
+            [
+                "review",
+                "--agent",
+                "--remote",
+                "owner/repo",
+                "--base",
+                "main",
+                "--source-branch",
+                "adam/feature",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_missing_reviewer_program_is_unavailable() {
+        let reviewer = CodeRabbitReviewer::with_program("/nonexistent/jjfx-cr");
+
+        let error = reviewer.review(&request()).expect_err("unavailable");
+
+        assert!(
+            matches!(error, ReviewerError::Unavailable { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_reviewer_that_exits_with_a_signal_fails() {
+        let directory = TempDir::new().expect("temporary directory");
+        let program = write_executable(directory.path(), "cr", "#!/bin/sh\nexit 3\n");
+        let reviewer = CodeRabbitReviewer::with_program(program);
+
+        let error = reviewer.review(&request()).expect_err("command failure");
+
+        assert!(matches!(error, ReviewerError::Command { .. }), "{error}");
+    }
+
+    #[test]
+    fn non_json_lines_are_ignored() {
+        let directory = TempDir::new().expect("temporary directory");
+        let program = write_executable(
+            directory.path(),
+            "cr",
+            "#!/bin/sh\n\
+             printf '%s\\n' 'not json at all'\n\
+             printf '%s\\n' '{\"type\":\"unknown_event\"}'\n\
+             printf '%s\\n' '{\"type\":\"finding\",\"codegenInstructions\":\"Fix it.\"}'\n",
+        );
+        let reviewer = CodeRabbitReviewer::with_program(program);
+
+        let outcome = reviewer.review(&request()).expect("review");
+
+        assert_eq!(outcome.findings().len(), 1);
+        assert_eq!(outcome.findings()[0].severity(), ReviewSeverity::None);
+        assert!(outcome.findings()[0].location().is_none());
+    }
+
+    struct ScriptedReviewer {
+        findings_per_pass: Vec<usize>,
+        calls: AtomicUsize,
+    }
+
+    impl ScriptedReviewer {
+        fn new(findings_per_pass: Vec<usize>) -> Self {
+            Self {
+                findings_per_pass,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Reviewer for ScriptedReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let count = self.findings_per_pass.get(call).copied().unwrap_or(0);
+            let findings = (0..count).map(|_| finding()).collect();
+            Ok(ReviewOutcome::new(findings, ReviewCompleteness::Complete))
+        }
+    }
+
+    struct FailingReviewer;
+
+    impl Reviewer for FailingReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+            Err(ReviewerError::Command {
+                reviewer: "fake",
+                detail: "boom".to_owned(),
+            })
+        }
+    }
+
+    #[test]
+    fn the_loop_stops_at_the_pass_cap() {
+        let reviewer = ScriptedReviewer::new(vec![1, 1, 1, 1, 1]);
+        let mut addressed = Vec::new();
+
+        let summary = ReviewLoop::new(3)
+            .run(&reviewer, &request(), |pass, outcome| {
+                addressed.push((pass, outcome.findings().len()));
+                Ok::<(), String>(())
+            })
+            .expect("loop");
+
+        assert_eq!(summary.passes(), 3);
+        assert_eq!(summary.findings(), 3);
+        assert_eq!(summary.stop(), ReviewStop::PassCap);
+        assert_eq!(addressed, [(1, 1), (2, 1), (3, 1)]);
+    }
+
+    #[test]
+    fn the_loop_stops_when_a_pass_finds_nothing() {
+        let reviewer = ScriptedReviewer::new(vec![2, 0, 5]);
+        let mut addressed = 0;
+
+        let summary = ReviewLoop::new(5)
+            .run(&reviewer, &request(), |_, _| {
+                addressed += 1;
+                Ok::<(), String>(())
+            })
+            .expect("loop");
+
+        assert_eq!(summary.passes(), 2);
+        assert_eq!(summary.findings(), 2);
+        assert_eq!(summary.stop(), ReviewStop::Converged);
+        assert_eq!(addressed, 1);
+    }
+
+    #[test]
+    fn the_loop_never_runs_more_than_the_cap() {
+        let reviewer = ScriptedReviewer::new(vec![1; 10]);
+
+        let summary = ReviewLoop::new(1)
+            .run(&reviewer, &request(), |_, _| Ok::<(), String>(()))
+            .expect("loop");
+
+        assert_eq!(summary.passes(), 1);
+        assert_eq!(summary.stop(), ReviewStop::PassCap);
+    }
+
+    #[test]
+    fn an_address_failure_surfaces_from_the_loop() {
+        let reviewer = ScriptedReviewer::new(vec![1]);
+
+        let error = ReviewLoop::new(3)
+            .run(&reviewer, &request(), |_, _| Err("address boom".to_owned()))
+            .expect_err("address failure");
+
+        assert!(matches!(error, ReviewLoopError::Address(message) if message == "address boom"));
+    }
+
+    #[test]
+    fn a_reviewer_failure_surfaces_from_the_loop() {
+        let error = ReviewLoop::new(3)
+            .run(&FailingReviewer, &request(), |_, _| Ok::<(), String>(()))
+            .expect_err("reviewer failure");
+
+        assert!(matches!(error, ReviewLoopError::Reviewer(_)), "{error}");
+    }
+}

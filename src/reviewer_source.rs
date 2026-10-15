@@ -25,3 +25,43 @@ pub(crate) fn configured_reviewer(
         ),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_reviewer_configured_selects_nothing() {
+        let config = ReviewConfig::default();
+
+        let reviewer = configured_reviewer(&config).expect("no reviewer");
+
+        assert!(reviewer.is_none());
+    }
+
+    #[test]
+    fn coderabbit_is_constructed() {
+        let config = ReviewConfig {
+            reviewer: ReviewerKind::Coderabbit,
+            max_passes: 1,
+        };
+
+        let reviewer = configured_reviewer(&config).expect("coderabbit");
+
+        assert!(reviewer.is_some());
+    }
+
+    #[test]
+    fn the_opencode_action_reviewer_is_a_setup_error() {
+        let config = ReviewConfig {
+            reviewer: ReviewerKind::OpenCodeAction,
+            max_passes: 1,
+        };
+
+        let error = configured_reviewer(&config)
+            .err()
+            .expect("not available yet");
+
+        assert!(error.to_string().contains("not available yet"), "{error}");
+    }
+}
