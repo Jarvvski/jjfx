@@ -1,6 +1,6 @@
 # Make the ticket source a configured, runtime-independent choice
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -87,3 +87,11 @@ seam that already exists: `TicketQuery` (`src/engine/ticket.rs:511`) is a trait,
 - 2026-10-15: Filed from the strategy review. This is the foundation for ticket
   02 (the bet). If `remove-pi` lands first, its "keep the shared discovery
   abstraction working" note is already satisfied here.
+- 2026-10-16: **Landed** as PR #2 (`Make the ticket source a configured,
+  runtime-independent choice`). The source is selected from `[tickets]` config,
+  not `AgentRuntime`; `source = "linear"` is byte-for-byte unchanged; a
+  non-runtime source is proven to drive discovery, dependency graph, and ticket
+  details. The one criterion deferred to 02 — "an opencode Worker can discover
+  tickets through a configured non-runtime source" — is satisfied by 02 (PR #6).
+  Status reconciled after the batch: PR #2 left this file's status uncommitted,
+  so it is committed here.
