@@ -21,6 +21,10 @@ pub struct Config {
     pub terminal: TerminalConfig,
     /// How the forge pipeline opens and maintains pull requests.
     pub forge: ForgeConfig,
+    /// Where Dispatch discovers Ready Tickets, and the settings for the chosen
+    /// source. Selected here rather than from the Agent Runtime, so a tracker
+    /// that has no runtime-shaped path can still be configured.
+    pub tickets: TicketsConfig,
     /// Whether new workspaces are colocated with Git: `jj workspace add` creates
     /// a Git worktree so each agent workspace has a working `.git`, which lets
     /// tools such as `gh stack` run inside it. On by default; set false to create
@@ -39,6 +43,7 @@ impl Default for Config {
             agent: AgentConfig::default(),
             terminal: TerminalConfig::default(),
             forge: ForgeConfig::default(),
+            tickets: TicketsConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
             colocate: true,
             _legacy_workspace: None,
@@ -96,6 +101,7 @@ impl Config {
                 );
             }
         }
+        self.tickets.validate()?;
         Ok(())
     }
 }
@@ -153,6 +159,119 @@ impl Default for ForgeConfig {
         ForgeConfig {
             pull_requests: true,
             draft: true,
+        }
+    }
+}
+
+/// Where `dispatch --all` and orchestration discover Ready Tickets, and the
+/// settings for the chosen source.
+///
+/// The source is a config decision, not a function of the Agent Runtime: a
+/// runtime with no native tracker can still pull work through a configured
+/// source, and a new tracker needs no runtime-shaped path. `source` is required
+/// when `[tickets]` is present; an absent `[tickets]` section means the default,
+/// `linear`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TicketsConfig {
+    /// Which tracker provides Ready Tickets.
+    pub source: TicketSource,
+    /// Settings used when `source = "linear"`.
+    #[serde(default)]
+    pub linear: LinearTicketsConfig,
+    /// Settings used when `source = "local"`.
+    #[serde(default)]
+    pub local: LocalTicketsConfig,
+}
+
+impl TicketsConfig {
+    /// The workflow status a Ready Ticket must be in for the configured source.
+    pub fn ready_status(&self) -> &str {
+        match self.source {
+            TicketSource::Linear => &self.linear.status,
+            TicketSource::Local => &self.local.ready_status,
+        }
+    }
+
+    /// Reject settings a source cannot use, so a bad config fails here rather
+    /// than mid-Dispatch.
+    fn validate(&self) -> anyhow::Result<()> {
+        for (name, value) in [
+            ("tickets.linear.status", self.linear.status.as_str()),
+            ("tickets.local.root", self.local.root.as_str()),
+            (
+                "tickets.local.ready_status",
+                self.local.ready_status.as_str(),
+            ),
+            (
+                "tickets.local.resolved_status",
+                self.local.resolved_status.as_str(),
+            ),
+        ] {
+            if value.trim().is_empty() {
+                anyhow::bail!("{name} cannot be blank");
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for TicketsConfig {
+    fn default() -> Self {
+        Self {
+            source: TicketSource::Linear,
+            linear: LinearTicketsConfig::default(),
+            local: LocalTicketsConfig::default(),
+        }
+    }
+}
+
+/// The configured Ticket source. Selected by config, so it is independent of
+/// the Agent Runtime a Worker Pool happens to run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TicketSource {
+    /// Discover through the Agent Runtime's native Linear access (Claude, Codex
+    /// or opencode).
+    Linear,
+    /// Discover from local markdown under the repository.
+    Local,
+}
+
+/// Settings for `source = "linear"`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LinearTicketsConfig {
+    /// The Linear workflow status a Ready Ticket must be in.
+    pub status: String,
+}
+
+impl Default for LinearTicketsConfig {
+    fn default() -> Self {
+        Self {
+            status: "Todo".to_owned(),
+        }
+    }
+}
+
+/// Settings for `source = "local"`, the repository's local markdown tickets.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalTicketsConfig {
+    /// Directory under the repository root holding `<feature>/issues/*.md`.
+    pub root: String,
+    /// The `Status:` value marking a Ticket ready for Dispatch.
+    pub ready_status: String,
+    /// The `Status:` value marking a Ticket resolved.
+    pub resolved_status: String,
+}
+
+impl Default for LocalTicketsConfig {
+    fn default() -> Self {
+        Self {
+            root: ".scratch".to_owned(),
+            ready_status: "ready-for-agent".to_owned(),
+            resolved_status: "resolved".to_owned(),
         }
     }
 }
@@ -273,6 +392,111 @@ mod tests {
     fn colocation_can_be_disabled() {
         let cfg: Config = toml::from_str("colocate = false\n").expect("toml parses");
         assert!(!cfg.colocate);
+    }
+
+    #[test]
+    fn tickets_default_to_the_linear_source() {
+        let cfg: Config = toml::from_str("").expect("empty toml parses");
+        assert_eq!(cfg.tickets.source, TicketSource::Linear);
+        assert_eq!(cfg.tickets.ready_status(), "Todo");
+        assert_eq!(cfg.tickets.local.root, ".scratch");
+        assert_eq!(cfg.tickets.local.ready_status, "ready-for-agent");
+        assert_eq!(cfg.tickets.local.resolved_status, "resolved");
+    }
+
+    #[test]
+    fn tickets_section_selects_a_source_and_its_settings() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tickets]
+            source = "local"
+
+            [tickets.local]
+            root = ".tickets"
+            ready_status = "todo"
+            resolved_status = "done"
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.tickets.source, TicketSource::Local);
+        assert_eq!(cfg.tickets.local.root, ".tickets");
+        assert_eq!(cfg.tickets.ready_status(), "todo");
+    }
+
+    #[test]
+    fn a_linear_source_can_override_its_expected_status() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tickets]
+            source = "linear"
+
+            [tickets.linear]
+            status = "Ready"
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.tickets.source, TicketSource::Linear);
+        assert_eq!(cfg.tickets.ready_status(), "Ready");
+    }
+
+    #[test]
+    fn an_unknown_ticket_source_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [tickets]
+            source = "jira"
+            "#,
+        )
+        .expect_err("unknown source is an error");
+        assert!(err.to_string().contains("jira"), "{err}");
+    }
+
+    #[test]
+    fn a_tickets_section_without_a_source_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [tickets.local]
+            root = ".tickets"
+            "#,
+        )
+        .expect_err("missing source is an error");
+        assert!(err.to_string().contains("source"), "{err}");
+    }
+
+    #[test]
+    fn unknown_ticket_keys_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [tickets]
+            source = "linear"
+
+            [tickets.linear]
+            sttus = "Todo"
+            "#,
+        )
+        .expect_err("unknown key is an error");
+        assert!(err.to_string().contains("sttus"), "{err}");
+    }
+
+    #[test]
+    fn blank_ticket_settings_are_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [tickets]
+            source = "linear"
+
+            [tickets.linear]
+            status = "   "
+            "#,
+        )
+        .expect("toml parses");
+        let error = cfg.validate().expect_err("blank status is an error");
+        assert!(
+            error.to_string().contains("tickets.linear.status"),
+            "{error}"
+        );
     }
 
     #[test]
