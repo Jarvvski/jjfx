@@ -18,7 +18,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::cmd::cmd;
 use crate::config::ForgeConfig;
-use crate::jj::PushOutcome;
+use crate::jj::{FixOutcome, PushOutcome};
 
 mod pull_requests;
 
@@ -33,6 +33,10 @@ mod pull_requests;
 /// Weld source: the root of this workspace's own mutable chain, rebased onto
 /// `trunk()`. Scoped to `::@` so only this workspace's stack moves.
 const WELD_SRC: &str = "roots(mutable() & mine() & ::@)";
+/// Fix source: the same chain weld just rebased onto trunk. `jj fix -s` on its
+/// root rewrites that root and every descendant through the user's configured
+/// formatters, so what is pushed is already formatted.
+const FIX_SRC: &str = WELD_SRC;
 /// Push revisions: this workspace's chain, minus trunk and any conflicts.
 const PUSH_REVS: &str = "::@ ~ trunk() ~ conflicts()";
 
@@ -174,6 +178,13 @@ trait JjAdapter: Send + Sync {
     }
     fn weld(&self, dir: &Path) -> Result<bool, String>;
     fn push(&self, dir: &Path) -> Result<PushOutcome, String>;
+
+    /// Normalise the workspace's just-welded chain through the user's
+    /// `[fix.tools]` jj config, before anything is pushed. A no-op when none are
+    /// configured; a typed error when a formatter failed.
+    fn fix(&self, _dir: &Path) -> Result<FixOutcome, String> {
+        Ok(FixOutcome::NoTools)
+    }
 
     fn origin_slug(&self) -> Result<Option<String>, String> {
         Ok(None)
@@ -345,6 +356,10 @@ impl JjAdapter for SystemJj {
 
     fn push(&self, dir: &Path) -> Result<PushOutcome, String> {
         crate::jj::push(dir, PUSH_REVS).map_err(|error| error.to_string())
+    }
+
+    fn fix(&self, dir: &Path) -> Result<FixOutcome, String> {
+        crate::jj::fix(dir, FIX_SRC).map_err(|error| error.to_string())
     }
 
     fn origin_slug(&self) -> Result<Option<String>, String> {
@@ -635,6 +650,16 @@ fn run_pipeline(
             continue;
         }
 
+        // Normalise the just-welded chain through the user's `jj fix` tools, so
+        // what is pushed is already formatted. A formatter that failed is a
+        // typed error and stops the push - never a silent pass of unformatted
+        // commits.
+        if let Err(error) = jj.fix(&target.dir) {
+            skip_step(tx, target, state, Step::Weld, &format!("fix: {error}"));
+            finish_target(tx, target, state);
+            continue;
+        }
+
         state.set(Step::Push, Status::Running);
         publish_progress(tx, target, state, None);
         let push = jj.push(&target.dir).unwrap_or_else(PushOutcome::Failed);
@@ -660,12 +685,7 @@ fn run_pipeline(
         if push_failed {
             // The remote was not updated; a Pull Request opened now would point
             // at stale commits.
-            state.active = false;
-            let retained = (!state.clean_success()).then(|| state.clone());
-            let _ = tx.send(Update::Finished {
-                workspace: target.name.clone(),
-                progress: retained,
-            });
+            finish_target(tx, target, state);
             continue;
         }
 
@@ -704,6 +724,18 @@ fn run_pipeline(
             progress: retained,
         });
     }
+}
+
+/// Finish one target: mark it inactive and send the terminal `Finished` update,
+/// retaining its progress when the run was not a clean success. Shared by every
+/// path that ends a target (a completed pipeline, a failed push, a failed fix).
+fn finish_target(tx: &UnboundedSender<Update>, target: &Target, state: &mut Progress) {
+    state.active = false;
+    let retained = (!state.clean_success()).then(|| state.clone());
+    let _ = tx.send(Update::Finished {
+        workspace: target.name.clone(),
+        progress: retained,
+    });
 }
 
 fn succeed_step(
@@ -1043,6 +1075,63 @@ mod tests {
 
         fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
             Ok(PushOutcome::Pushed)
+        }
+    }
+
+    /// Records the order of the mutating steps so a test can prove `fix` runs
+    /// between `weld` and `push`.
+    struct RecordingJj {
+        calls: Mutex<Vec<&'static str>>,
+    }
+
+    impl RecordingJj {
+        fn record(&self, call: &'static str) {
+            self.calls
+                .lock()
+                .expect("the call log is not poisoned")
+                .push(call);
+        }
+    }
+
+    impl JjAdapter for RecordingJj {
+        fn fetch(&self) -> Result<bool, String> {
+            self.record("fetch");
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            self.record("weld");
+            Ok(true)
+        }
+
+        fn fix(&self, _dir: &Path) -> Result<FixOutcome, String> {
+            self.record("fix");
+            Ok(FixOutcome::Fixed)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            self.record("push");
+            Ok(PushOutcome::Pushed)
+        }
+    }
+
+    struct FixFails;
+
+    impl JjAdapter for FixFails {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn fix(&self, _dir: &Path) -> Result<FixOutcome, String> {
+            Err("formatter `sh` exited non-zero".to_string())
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            panic!("a failed formatter must stop the push")
         }
     }
 
@@ -1715,6 +1804,75 @@ mod tests {
             }) if status(progress, Step::Weld) == Status::Skipped
                 && status(progress, Step::Push) == Status::Ok
                 && status(progress, Step::PullRequest) == Status::Ok
+        ));
+    }
+
+    #[tokio::test]
+    async fn fix_normalises_the_chain_between_weld_and_push() {
+        // The just-welded chain must be normalised before it is pushed.
+        let jj = Arc::new(RecordingJj {
+            calls: Mutex::new(Vec::new()),
+        });
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            jj.clone(),
+            Arc::new(UnlockedGpg),
+        );
+
+        updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert_eq!(
+            *jj.calls.lock().expect("the call log is not poisoned"),
+            vec!["fetch", "weld", "fix", "push"]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_formatter_stops_the_push_and_surfaces_a_typed_error() {
+        // A formatter that failed must not pass silently: the push stops and the
+        // error is reported against the Weld step.
+        let forge = Forge::with_adapters(
+            ForgeConfig {
+                pull_requests: false,
+                draft: true,
+            },
+            Arc::new(FixFails),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress {
+                workspace,
+                progress,
+                notice: Some(notice),
+            } if workspace == "feat"
+                && status(progress, Step::Weld) == Status::Skipped
+                && progress.reason() == Some("fix: formatter `sh` exited non-zero")
+                && notice == "fix: formatter `sh` exited non-zero"
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                workspace,
+                progress: Some(progress),
+            }) if workspace == "feat"
+                && status(progress, Step::Weld) == Status::Skipped
+                && status(progress, Step::Push) == Status::Pending
+                && status(progress, Step::PullRequest) == Status::Pending
         ));
     }
 

@@ -138,6 +138,14 @@ How the forge pipeline's final step manages pull requests over `gh`.
 | `pull_requests` | `true` | Whether forging creates and updates PRs at all. Set false to stop after push and open PRs yourself. |
 | `draft` | `true` | Open newly-created PRs as drafts. Set false to open them ready for review. |
 
+### Formatting before push
+
+The forge normalises a workspace's just-welded chain with `jj fix` before it
+pushes, honouring whatever `[fix.tools.<id>]` you have configured in jj itself -
+jjfx neither chooses nor ships formatters (see `jj help -k config`). With no
+tools configured the step is a no-op. A formatter that fails is reported as a
+forge error and stops the push, so a broken formatter never passes silently.
+
 ## `[tickets]`
 
 Where `dispatch --all` and orchestration discover Ready Tickets. The source is a

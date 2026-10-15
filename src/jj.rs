@@ -14,7 +14,7 @@ use std::process::Command;
 
 use anyhow::Context;
 
-use crate::cmd::{Run, cmd};
+use crate::cmd::{Cmd, Run, cmd};
 
 /// Run a read-only jj command against the repo, returning stdout on success. The
 /// single home for the read incantation: `--repository <repo_root>
@@ -419,6 +419,99 @@ pub fn diff_line_delta(repo_root: &Path, from: &str, to: &str) -> anyhow::Result
     Ok(crate::diff::line_totals(&crate::diff::parse(&out)))
 }
 
+/// The outcome of one `jj fix` over a workspace's mutable chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixOutcome {
+    /// No `[fix.tools.<id>]` are configured, so there was nothing to run.
+    NoTools,
+    /// Every configured tool ran; the chain is as formatted as the tools make it.
+    Fixed,
+}
+
+/// Run `jj fix` over `revset` in `dir`, honouring the user's own
+/// `[fix.tools.<id>]` jj config: every changed file in the revset (and its
+/// descendants) is rewritten through its configured formatter, conflict-free.
+/// The forge uses this to normalise a workspace's just-welded chain before push.
+///
+/// `jj fix` exits non-zero with a config error when no tools are configured, so
+/// jjfx probes first and returns [`FixOutcome::NoTools`] - the no-op the forge
+/// relies on - rather than surfacing that as a failure. A jj failure is a typed
+/// error carrying jj's own message.
+pub fn fix(dir: &Path, revset: &str) -> anyhow::Result<FixOutcome> {
+    if !has_fix_tools(dir)? {
+        return Ok(FixOutcome::NoTools);
+    }
+    let run = mut_command()
+        .current_dir(dir)
+        .args(["fix", "-s", revset])
+        .run()?;
+    classify_fix(&run)
+}
+
+/// Classify one `jj fix` run. A non-zero exit is a typed error carrying jj's
+/// message. jj itself exits zero when a fix tool fails (it warns and leaves the
+/// file unfixed), so a failed formatter is read from [`fix_tool_failure`] and
+/// surfaced as a typed error naming the tool - never a silent pass.
+fn classify_fix(run: &Run) -> anyhow::Result<FixOutcome> {
+    if !run.ok() {
+        let stderr = run.stderr().trim();
+        let message = if stderr.is_empty() {
+            let stdout = run.stdout().trim();
+            if stdout.is_empty() {
+                "jj fix failed"
+            } else {
+                stdout
+            }
+        } else {
+            stderr
+        };
+        anyhow::bail!("{message}");
+    }
+    match fix_tool_failure(run.stderr()) {
+        Some(tool) => anyhow::bail!("formatter `{tool}` exited non-zero"),
+        None => Ok(FixOutcome::Fixed),
+    }
+}
+
+/// The first fix tool jj reported as failing, parsed from the warning it prints
+/// on stderr: ``Warning: Fix tool `<cmd>` exited with non-zero exit code for
+/// `<path>` ``. `None` when every tool exited zero.
+///
+/// This is a deliberate, narrow exception to the typed-jj-access rule (bug-hunt
+/// ticket 21): jj exits zero and exposes no machine-readable field when a fix
+/// tool fails, so its own warning line is the only signal that a formatter did
+/// not run. Reading it is what turns a silent pass into the typed error the
+/// forge requires.
+fn fix_tool_failure(stderr: &str) -> Option<String> {
+    const NEEDLE: &str = "Fix tool `";
+    const SUFFIX: &str = "` exited with non-zero exit code";
+    stderr.lines().find_map(|line| {
+        let rest = &line[line.find(NEEDLE)? + NEEDLE.len()..];
+        let end = rest.find('`')?;
+        rest[end..]
+            .starts_with(SUFFIX)
+            .then(|| rest[..end].to_string())
+    })
+}
+
+/// Whether any `[fix.tools.<id>]` is configured, read through jj's template
+/// language (`config list -T name`) rather than jj's English prose. `jj fix`
+/// exits non-zero when none are configured, so this probe is what keeps the
+/// no-tools case a genuine no-op.
+fn has_fix_tools(dir: &Path) -> anyhow::Result<bool> {
+    let run = mut_command()
+        .current_dir(dir)
+        .args(["config", "list", "-T", "name ++ \"\\n\"", "fix.tools"])
+        .run()?;
+    if !run.ok() {
+        anyhow::bail!("jj config list (fix.tools): {}", run.stderr().trim());
+    }
+    Ok(run
+        .stdout()
+        .lines()
+        .any(|line| line.trim_start().starts_with("fix.tools.")))
+}
+
 /// Build a `jj` invocation for a command that may write.
 ///
 /// Tests never sign: their commits are throwaway, and signing them made the
@@ -436,16 +529,26 @@ pub(crate) fn command() -> Command {
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.
 fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let command = cmd("jj");
-    #[cfg(test)]
-    let command = command.args(["--config", "signing.behavior=drop"]);
-    command
+    mut_command()
         .arg("--repository")
         .arg(repo_root)
         .args(args)
         .run()?
         .checked()?;
     Ok(())
+}
+
+/// Build a `jj` invocation for a command that may write, in the current
+/// directory rather than against a fixed `--repository`.
+///
+/// Tests never sign: their commits are throwaway, and signing them made the
+/// suite depend on the developer's GPG key being unlocked. `cfg!(test)` covers
+/// this crate's own tests, which is where the fix paths are exercised.
+fn mut_command() -> Cmd {
+    let command = cmd("jj");
+    #[cfg(test)]
+    let command = command.args(["--config", "signing.behavior=drop"]);
+    command
 }
 
 #[cfg(test)]
@@ -587,6 +690,73 @@ mod tests {
     }
 
     #[test]
+    fn classify_fix_reads_a_non_zero_exit_as_a_typed_error() {
+        let run = Run::for_test(false, "", "Config error: boom");
+        let error = classify_fix(&run).expect_err("a non-zero exit is an error");
+        assert_eq!(error.to_string(), "Config error: boom");
+    }
+
+    #[test]
+    fn classify_fix_falls_back_to_stdout_when_stderr_is_empty() {
+        let run = Run::for_test(false, "boom", "");
+        assert_eq!(
+            classify_fix(&run)
+                .expect_err("a non-zero exit is an error")
+                .to_string(),
+            "boom"
+        );
+    }
+
+    #[test]
+    fn classify_fix_reads_a_clean_run_as_fixed() {
+        let run = Run::for_test(true, "", "Fixed 2 commits of 2 checked.\n");
+        assert_eq!(
+            classify_fix(&run).expect("a clean run is Fixed"),
+            FixOutcome::Fixed
+        );
+    }
+
+    #[test]
+    fn fix_tool_failure_names_the_tool_from_jjs_warning() {
+        // jj exits zero when a fix tool fails, so the warning is the only signal.
+        let stderr = "Warning: Fix tool `sh` exited with non-zero exit code for `f.txt`\n\
+                      Fixed 0 commits of 2 checked.\n";
+        assert_eq!(fix_tool_failure(stderr).as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn fix_tool_failure_is_none_when_every_tool_exited_zero() {
+        assert_eq!(fix_tool_failure("Fixed 2 commits of 2 checked.\n"), None);
+        assert_eq!(fix_tool_failure(""), None);
+        // A line that merely mentions a tool must not read as a failure.
+        assert_eq!(fix_tool_failure("Fix tool `sh` ran cleanly\n"), None);
+    }
+
+    #[test]
+    fn classify_fix_reads_a_failed_tool_as_a_typed_error_not_a_silent_pass() {
+        let run = Run::for_test(
+            true,
+            "",
+            "Warning: Fix tool `sh` exited with non-zero exit code for `f.txt`\n",
+        );
+        let error = classify_fix(&run).expect_err("a failed formatter must not pass");
+        assert_eq!(error.to_string(), "formatter `sh` exited non-zero");
+    }
+
+    #[test]
+    fn fix_is_a_no_op_when_no_tools_are_configured() {
+        // `jj fix` errors when no tools are configured, so the probe must turn
+        // that into the no-op the forge relies on.
+        let repo = temp_repo("notools");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        assert_eq!(
+            fix(&root, "roots(mutable() & mine() & ::@)").expect("a no-tools fix is a no-op"),
+            FixOutcome::NoTools
+        );
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
     fn diff_line_delta_reads_the_git_diff_not_the_stat_summary() {
         // The count must come from the Git diff, not jj's English `--stat`
         // summary. `one\ntwo\n` -> `one\nTWO\nthree\n` is 2 insertions, 1
@@ -670,5 +840,102 @@ mod tests {
 
         std::fs::remove_dir_all(&workspace).ok();
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// The parent half of [`fix_helper`]: drives the helper in a child process
+    /// with a throwaway `JJ_CONFIG`, so the fix tool it configures never touches
+    /// the developer's own jj config. Proves the acceptance end to end against
+    /// real jj: a configured formatter normalises the chain, and a formatter that
+    /// fails is a typed error rather than a silent pass.
+    #[test]
+    fn fix_normalises_a_configured_chain_and_errors_on_a_failed_tool() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let config = dir.path().join("jj-config.toml");
+        std::fs::write(
+            &config,
+            "user.name = \"Fix Test\"\n\
+             user.email = \"fix@example.com\"\n\
+             [fix.tools.upper]\n\
+             command = [\"tr\", \"a-z\", \"A-Z\"]\n\
+             patterns = [\"glob:**/*.txt\"]\n\
+             [fix.tools.boom]\n\
+             command = [\"sh\", \"-c\", \"exit 1\"]\n\
+             patterns = [\"glob:**/*.bad\"]\n",
+        )
+        .expect("writing the fix-tool config");
+
+        // A marker proves the child actually ran the helper: a mistyped filter
+        // would otherwise select zero tests and exit zero.
+        let marker = dir.path().join("helper-ran");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test executable has a path"),
+        )
+        .args([
+            "--exact",
+            "jj::tests::fix_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("JJFX_FIX_HELPER", dir.path())
+        .env("JJ_CONFIG", &config)
+        .status()
+        .expect("the test binary re-runs");
+
+        assert!(status.success(), "the fix helper must pass");
+        assert!(marker.exists(), "the fix helper must have run");
+    }
+
+    /// The child half of the test above, run only when the parent sets
+    /// `JJFX_FIX_HELPER`. `#[ignore]` keeps it out of an ordinary `cargo test`.
+    #[test]
+    #[ignore]
+    fn fix_helper() {
+        let Ok(dir) = std::env::var("JJFX_FIX_HELPER") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+
+        // A tool that rewrites the chain: the content a formatter would change is
+        // normalised, so nothing is left for a formatter to do.
+        let normalised = dir.join("normalised");
+        init_repo_with_change(&normalised, "f.txt", "hello world\n");
+        assert_eq!(
+            fix(&normalised, "roots(mutable() & mine() & ::@)").expect("the fix runs"),
+            FixOutcome::Fixed
+        );
+        assert_eq!(
+            std::fs::read_to_string(normalised.join("f.txt")).expect("reading the fixed file"),
+            "HELLO WORLD\n"
+        );
+
+        // A tool that fails: jj exits zero, so the typed error must come from
+        // jj's warning, not its exit status.
+        let failing = dir.join("failing");
+        init_repo_with_change(&failing, "g.bad", "hello\n");
+        let error = fix(&failing, "roots(mutable() & mine() & ::@)")
+            .expect_err("a failed formatter must be a typed error");
+        assert!(error.to_string().contains("sh"), "{error}");
+
+        std::fs::write(dir.join("helper-ran"), b"ok").expect("writing the marker");
+    }
+
+    /// Create a jj repo at `dir` with one committed file, then a second commit
+    /// that rewrites it, so the chain has a changed file for `jj fix` to run on.
+    fn init_repo_with_change(dir: &Path, name: &str, content: &str) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("jj")
+                .args(["--config", "signing.behavior=drop"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("jj should be installed");
+            assert!(status.success(), "jj {args:?} should succeed");
+        };
+        std::fs::create_dir_all(dir).expect("creating the repo directory");
+        run(&["git", "init", "--no-colocate", "."]);
+        std::fs::write(dir.join(name), content).expect("writing the file");
+        run(&["describe", "-m", "base"]);
+        run(&["new", "-m", "change"]);
+        std::fs::write(dir.join(name), content).expect("writing the file again");
     }
 }

@@ -1,6 +1,6 @@
 # Run `jj fix` as a forge step before push
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -54,3 +54,12 @@ surface as a typed error, never a silent pass.
 
 - 2026-10-15: Filed from the strategy review. jj-native, and it removes per-language
   pre-land glue (supports the "fewer knobs" goal).
+- 2026-10-15: Resolved. `jj fix -s <welded chain>` now runs inside the Weld step,
+  after the conflict re-check and before push, honouring the user's
+  `[fix.tools]`. `jj fix` exits non-zero with a config error when no tools are
+  configured, so a `jj config list -T name fix.tools` probe keeps the no-tools
+  case a genuine no-op. jj exits zero when a tool fails (it warns and leaves the
+  file unfixed), so the forge parses jj's own warning line into a typed error
+  naming the tool and stops the push - a deliberate, documented exception to the
+  typed-jj-access rule (bug-hunt 21), which jj's zero exit and lack of a
+  machine-readable field force.
