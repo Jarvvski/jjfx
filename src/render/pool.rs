@@ -222,12 +222,16 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                     format!("fresh session ({reason})")
                 }
             };
+            let delivery = session.pid().map_or_else(
+                || "delivered to its session".to_owned(),
+                |pid| format!("PID {pid}"),
+            );
             lines.push(dim_line(&format!(
-                " {} {}  runtime: {}  PID {}",
+                " {} {}  runtime: {}  {}",
                 session.action().as_str(),
                 session.worker(),
                 session.runtime().as_str(),
-                session.pid()
+                delivery
             )));
             lines.push(Line::from(format!("  {session_text}")));
         }

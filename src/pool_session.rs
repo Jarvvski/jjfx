@@ -232,13 +232,13 @@ impl PoolSession {
                 if self.active_operation == Some(operation) {
                     let worker = outcome.worker().to_owned();
                     let action = outcome.action();
-                    let pid = outcome.pid();
+                    let status = outcome.pid().map_or_else(
+                        || format!("{} {} (delivered to its session)", action.as_str(), worker),
+                        |pid| format!("{} {} (PID {pid})", action.as_str(), worker),
+                    );
                     self.worker_session = Some(outcome);
                     self.active_operation = None;
-                    return vec![
-                        PoolUpdate::RefreshPool,
-                        PoolUpdate::Status(format!("{} {} (PID {pid})", action.as_str(), worker)),
-                    ];
+                    return vec![PoolUpdate::RefreshPool, PoolUpdate::Status(status)];
                 }
                 Vec::new()
             }
@@ -596,7 +596,7 @@ mod tests {
                 crate::engine::AgentSessionResolution::Fresh {
                     reason: crate::engine::FreshSessionReason::MissingIdentity,
                 },
-                777,
+                Some(777),
             ),
         });
 

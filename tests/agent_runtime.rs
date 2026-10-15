@@ -12,8 +12,9 @@ use std::time::{Duration, Instant};
 
 use jjfx::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation,
-    AgentRuntimeProbeError, Expected, PoolCapacity, Repository, RunRequest, RunReset,
-    RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerId, WorkerStatus,
+    AgentRuntimeProbeError, Expected, FollowUpExecution, PoolCapacity, Repository, RunMode,
+    RunRequest, RunReset, RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus,
+    WorkerActions, WorkerId, WorkerStatus,
 };
 use rustix::process::{
     Pid, Signal, getpgid, kill_process, kill_process_group, test_kill_process,
@@ -53,6 +54,7 @@ const HELPER_OPENCODE_ACTION: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_ACTION";
 const HELPER_OPENCODE_INTERRUPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_INTERRUPT";
 const HELPER_OPENCODE_UNAVAILABLE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE";
 const HELPER_OPENCODE_OUTCOME: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME";
+const HELPER_OPENCODE_SEND_PROMPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_SEND_PROMPT";
 
 #[test]
 fn pi_runtime_has_a_canonical_configured_and_persisted_identity() {
@@ -2616,6 +2618,323 @@ fn reconcile_runs_finishes_a_busy_opencode_worker_on_a_run_log_result() {
     assert_eq!(
         status, "Failed",
         "a Run log with a provider terminal event must finish the Run even while its session is open"
+    );
+}
+
+/// A fake `opencode` that serves the API-native send path: `session.prompt`
+/// records the call it received, `session.create`/`session.get` anchor a fresh
+/// session to the Worker Workspace, and `run` records what a fallback client
+/// invocation was given. Any API call fails when `..._OPENCODE_UNAVAILABLE` is
+/// set, so the fallback can be exercised.
+const OPENCODE_SEND_SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.0.29'; exit 0 ;;
+  api)
+    if [ -n "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE" ]; then
+      printf '%s\n' 'Error: Could not reach server' >&2
+      exit 1
+    fi
+    case "$2" in
+      session.prompt)
+        printf '%s\n' "$@" > "__PROMPT_ARGS__"
+        printf '{"data":{"id":"msg_1"}}'
+        exit 0 ;;
+      session.create)
+        printf '%s' "$4" > "__CREATE_BODY__"
+        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
+        exit 0 ;;
+      session.get)
+        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
+        exit 0 ;;
+    esac
+    exit 1 ;;
+  run)
+    { pwd; printf '%s\n' "$@"; } > "__RUN_ARGS__"
+    exit 0 ;;
+esac
+exit 1
+"#;
+
+/// The repository, Worker, and paths one API-native send test needs.
+struct OpencodeSendFixture {
+    _temporary_directory: TempDir,
+    repository: Repository,
+    worker_id: WorkerId,
+    workspace: PathBuf,
+    bin_directory: PathBuf,
+    result: PathBuf,
+    prompt_args: PathBuf,
+    create_body: PathBuf,
+    run_args: PathBuf,
+}
+
+fn opencode_send_fixture() -> OpencodeSendFixture {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let repository = initialize_repository(temporary_directory.path());
+    let worker_id = grow_one_worker(&repository);
+    // Configure the Pool for opencode so the Follow-up selects it.
+    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let mut pool: Value =
+        serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
+    pool["agent"] = "opencode".into();
+    fs::write(&pool_path, serde_json::to_vec(&pool).expect("pool JSON")).expect("configured pool");
+    let root = repository.root();
+    let workspace = root
+        .parent()
+        .expect("workspace base parent")
+        .join(format!(
+            "{}-workspaces",
+            root.file_name().expect("repository name").to_string_lossy()
+        ))
+        .join(worker_id.as_str());
+    let bin_directory = temporary_directory.path().join("bin");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    OpencodeSendFixture {
+        prompt_args: temporary_directory.path().join("prompt-args"),
+        create_body: temporary_directory.path().join("create-body"),
+        run_args: temporary_directory.path().join("run-args"),
+        result: temporary_directory.path().join("result"),
+        _temporary_directory: temporary_directory,
+        repository,
+        worker_id,
+        workspace,
+        bin_directory,
+    }
+}
+
+impl OpencodeSendFixture {
+    fn write_opencode(&self) {
+        write_executable(
+            &self.bin_directory.join("opencode"),
+            &OPENCODE_SEND_SCRIPT
+                .replace("__PROMPT_ARGS__", &self.prompt_args.display().to_string())
+                .replace("__CREATE_BODY__", &self.create_body.display().to_string())
+                .replace("__RUN_ARGS__", &self.run_args.display().to_string()),
+        );
+    }
+
+    /// Records the session the Worker's Run drives, as ticket 38 would.
+    fn record_session(&self, session_id: &str) {
+        self.repository
+            .state_store()
+            .sessions()
+            .record(&self.worker_id, session_id)
+            .expect("record session");
+    }
+
+    fn run_helper(&self, prompt: &str, extra: &[(&str, &str)]) -> std::process::Output {
+        let mut helper = Command::new(env::current_exe().expect("test executable"));
+        helper
+            .args(["--exact", "opencode_send_helper", "--ignored"])
+            .env("PATH", runtime_path(&self.bin_directory))
+            .env(HELPER_REPOSITORY, self.repository.root())
+            .env(HELPER_WORKER, self.worker_id.as_str())
+            .env(HELPER_RESULT, &self.result)
+            .env(HELPER_OPENCODE_SEND_PROMPT, prompt)
+            .env(HELPER_OPENCODE_WORKSPACE, &self.workspace)
+            .env(HELPER_OPENCODE_GET_DIRECTORY, &self.workspace)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        for (key, value) in extra {
+            helper.env(key, value);
+        }
+        helper.output().expect("opencode send helper should run")
+    }
+
+    /// The cwd a fallback `opencode run` saw, and the arguments it was given.
+    fn recorded_run(&self) -> (PathBuf, Vec<String>) {
+        let contents = fs::read_to_string(&self.run_args).expect("recorded opencode run");
+        let mut lines = contents.lines();
+        let cwd = PathBuf::from(lines.next().expect("recorded cwd"));
+        (cwd, lines.map(str::to_owned).collect())
+    }
+}
+
+/// Runs one API-native `send` in a process whose `PATH` carries the fake
+/// `opencode`, so the API seam is exercised without a live server.
+#[test]
+#[ignore]
+fn opencode_send_helper() {
+    let repository = Repository::open(
+        env::var_os(HELPER_REPOSITORY)
+            .expect("repository")
+            .as_os_str(),
+    )
+    .expect("repository");
+    let worker_id =
+        WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let prompt = env::var(HELPER_OPENCODE_SEND_PROMPT).expect("prompt");
+    let result = env::var_os(HELPER_RESULT).expect("result path");
+    let outcome = match WorkerActions::new(repository).send(&worker_id, prompt, RunMode::Background)
+    {
+        Ok(outcome) => match outcome.into_execution() {
+            FollowUpExecution::Session(session) => format!("session {}", session.session_id()),
+            FollowUpExecution::Background(run) => {
+                let pid = run.pid();
+                let _ = run.wait();
+                format!("background {pid}")
+            }
+            FollowUpExecution::Foreground(_) => "foreground".to_owned(),
+        },
+        Err(error) => format!("err {error}"),
+    };
+    fs::write(result, outcome).expect("result");
+}
+
+/// An opencode `send` to a Worker whose Run session jjfx recorded is delivered
+/// through the daemon API: the prompt reaches that session without spawning a
+/// client process, so it does not depend on a terminal.
+#[test]
+fn opencode_send_delivers_the_prompt_to_the_recorded_session() {
+    let fixture = opencode_send_fixture();
+    fixture.write_opencode();
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("do the follow-up", &[]);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "session ses_run"
+    );
+
+    // The prompt reached the recorded session through the API.
+    let args = fs::read_to_string(&fixture.prompt_args).expect("recorded prompt call");
+    let lines: Vec<&str> = args.lines().collect();
+    assert_eq!(&lines[..2], ["api", "session.prompt"]);
+    assert!(lines.contains(&"sessionID=ses_run"), "{lines:?}");
+    let body = lines
+        .iter()
+        .position(|line| *line == "--data")
+        .map(|index| lines[index + 1])
+        .expect("prompt body");
+    let body: Value = serde_json::from_str(body).expect("prompt body JSON");
+    assert!(
+        body["text"]
+            .as_str()
+            .expect("prompt text")
+            .contains("do the follow-up"),
+        "{body}"
+    );
+
+    // No client process was spawned, and the Worker is busy on its session.
+    assert!(
+        !fixture.run_args.exists(),
+        "an API-native send must not spawn a client"
+    );
+    let snapshot = fixture.repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(fixture.worker_id.as_str())
+        .expect("busy Worker");
+    assert_eq!(worker.status(), WorkerStatus::Busy);
+    assert_eq!(worker.pid(), None);
+}
+
+/// An API-native send clears the previous Run's provider terminal event, so a
+/// later reconcile cannot read it as the new Run's result.
+#[test]
+fn opencode_send_clears_a_stale_run_log_result() {
+    let fixture = opencode_send_fixture();
+    fixture.write_opencode();
+    fixture.record_session("ses_run");
+    let log = fixture
+        .repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{}.log", fixture.worker_id));
+    fs::create_dir_all(log.parent().expect("pool directory")).expect("pool directory");
+    fs::write(
+        &log,
+        "{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}\n",
+    )
+    .expect("stale Run log");
+
+    let output = fixture.run_helper("do the follow-up", &[]);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "session ses_run"
+    );
+    assert_eq!(
+        fs::read_to_string(&log).expect("run log"),
+        "",
+        "a delivered prompt must clear the previous Run's terminal result"
+    );
+}
+
+/// When the session API is unreachable, an opencode `send` falls back to the
+/// existing client invocation and never fails the Run.
+#[test]
+fn opencode_send_falls_back_to_the_client_when_the_session_api_is_unavailable() {
+    let fixture = opencode_send_fixture();
+    fixture.write_opencode();
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("do the follow-up", &[(HELPER_OPENCODE_UNAVAILABLE, "1")]);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(&fixture.result).expect("helper result");
+    assert!(
+        result.starts_with("background "),
+        "an unavailable API must fall back to the client: {result}"
+    );
+    assert!(
+        !fixture.prompt_args.exists(),
+        "no prompt may be delivered through an unavailable API"
+    );
+    let (_, arguments) = fixture.recorded_run();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--session", "ses_run"]),
+        "the fallback client must drive the recorded session: {arguments:?}"
+    );
+}
+
+/// An opencode send with no session to resume starts a fresh client Run,
+/// exactly as before the API path existed.
+#[test]
+fn opencode_send_starts_a_fresh_client_run_without_a_recorded_session() {
+    let fixture = opencode_send_fixture();
+    fixture.write_opencode();
+
+    let output = fixture.run_helper("do the follow-up", &[]);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = fs::read_to_string(&fixture.result).expect("helper result");
+    assert!(
+        result.starts_with("background "),
+        "with no session to prompt, the send must run a fresh client: {result}"
+    );
+    assert!(
+        !fixture.prompt_args.exists(),
+        "there is no session to prompt"
+    );
+    // The Run created and drove a fresh session, as it always did.
+    assert!(
+        fixture.create_body.exists(),
+        "a fresh Run creates its session"
+    );
+    let (_, arguments) = fixture.recorded_run();
+    assert!(
+        arguments
+            .windows(2)
+            .any(|pair| pair == ["--session", "ses_new"]),
+        "the fresh Run should drive the created session: {arguments:?}"
     );
 }
 

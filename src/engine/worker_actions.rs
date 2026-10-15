@@ -14,8 +14,8 @@ use crate::engine::runtime::pi_interactive_command;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, DispatchExclusions, Repository, RunLog, RunSupervisor, RunSupervisorError,
-    WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
+    CompletedRun, DispatchExclusions, Repository, Reservation, RunLog, RunSupervisor,
+    RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -34,6 +34,30 @@ pub enum FollowUpExecution {
     Foreground(CompletedRun),
     /// The background Run must be waited on to reap and finalize it.
     Background(Box<BackgroundRun>),
+    /// The prompt was delivered to the Run's opencode session through the
+    /// daemon API, so there is no client process to reap. The Worker's liveness
+    /// follows the session (ticket 37): reconcile finishes the Run on the
+    /// session's outcome rather than on a process.
+    Session(FollowUpSession),
+}
+
+/// A Follow-up delivered to an opencode Run's session without a client process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpSession {
+    session_id: String,
+}
+
+impl FollowUpSession {
+    pub(crate) fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+
+    /// The session the prompt was delivered to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 /// The typed result of launching one Follow-up Run.
@@ -621,8 +645,9 @@ impl WorkerActions {
             .worker_pool()
             .begin_follow_up(worker, profile)?;
         let runtime = reservation.agent_runtime();
-        let session = resolve_agent_session_for_runtime(
+        let session = self.resolve_follow_up_session(
             runtime,
+            worker,
             prior_log
                 .as_deref()
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -640,6 +665,33 @@ impl WorkerActions {
                     invocation = invocation.with_system_prompt(system_prompt);
                 }
             }
+        }
+        // An opencode Follow-up to a session jjfx can name is delivered through
+        // the daemon API: the prompt reaches the Run's session without a client
+        // process, and the Worker's liveness follows the session (ticket 37).
+        // Anything the API cannot do - unreachable, too old, or rejected - falls
+        // back to today's process invocation rather than fail the Run. A
+        // foreground Follow-up always drives a process: the caller waits on it.
+        let named_session = match &session {
+            AgentSessionResolution::Resumed { session_id } => Some(session_id.clone()),
+            AgentSessionResolution::Fresh { .. } => None,
+        };
+        if mode == RunMode::Background
+            && runtime == AgentRuntime::OpenCode
+            && let Some(session_id) = named_session.as_deref()
+            && self.deliver_session_prompt(
+                &reservation,
+                session_id,
+                &invocation.delivered_prompt(runtime),
+            )
+        {
+            drop(operation);
+            return Ok(FollowUpOutcome {
+                worker: worker.clone(),
+                runtime,
+                session,
+                execution: FollowUpExecution::Session(FollowUpSession::new(session_id)),
+            });
         }
         let execution = match mode {
             RunMode::Foreground => FollowUpExecution::Foreground(
@@ -664,6 +716,81 @@ impl WorkerActions {
             execution,
         })
     }
+
+    /// Resolves the Agent Session a Follow-up should drive.
+    ///
+    /// An opencode Run's session id is recorded in pool-owned sidecar state
+    /// (ticket 38), so that exact id is preferred over the Run log: it is
+    /// available from the first moment, and an API-native Follow-up does not
+    /// rewrite the log a later Run would otherwise read. Every other runtime
+    /// resolves from the Run log exactly as before.
+    fn resolve_follow_up_session(
+        &self,
+        runtime: AgentRuntime,
+        worker: &WorkerId,
+        prior_log: Option<&Path>,
+    ) -> AgentSessionResolution {
+        if runtime == AgentRuntime::OpenCode
+            && let Ok(Some(session_id)) = self.repository.state_store().sessions().session(worker)
+            && !session_id.is_empty()
+        {
+            return AgentSessionResolution::Resumed { session_id };
+        }
+        resolve_agent_session_for_runtime(runtime, prior_log)
+    }
+
+    /// Delivers a Follow-up prompt to an opencode Run's session through the
+    /// daemon API, reporting whether the daemon accepted it.
+    ///
+    /// Best-effort by contract: only an accepted prompt is `true`. An
+    /// unreachable or older opencode, or a server rejection, reports `false` so
+    /// the caller falls back to the process invocation rather than fail the Run.
+    fn deliver_session_prompt(
+        &self,
+        reservation: &Reservation,
+        session_id: &str,
+        prompt: &str,
+    ) -> bool {
+        // Record the session first: a failure here must fall back before the
+        // prompt is sent, so a Run is never delivered twice.
+        if reservation
+            .repository()
+            .state_store()
+            .sessions()
+            .record(reservation.worker_id(), session_id)
+            .is_err()
+        {
+            return false;
+        }
+        if crate::engine::OpenCodeApi::new()
+            .prompt_async(session_id, prompt)
+            .is_err()
+        {
+            return false;
+        }
+        // The daemon admitted the prompt. Clear the previous Run's provider
+        // terminal event, exactly as a spawned client's log truncation does:
+        // reconcile must not read that result as this Run's.
+        truncate_run_log(reservation.repository(), reservation.worker_id());
+        true
+    }
+}
+
+/// Empties a Worker's Run log so a previous Run's provider terminal event is not
+/// read as the current Run's.
+///
+/// Best-effort: a missing or unwritable log must not fail the Follow-up, because
+/// the Run's liveness still follows its session.
+fn truncate_run_log(repository: &Repository, worker: &WorkerId) {
+    let path = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.log"));
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path);
 }
 
 #[derive(Debug, Clone, Copy)]

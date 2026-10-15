@@ -351,6 +351,16 @@ impl AgentRuntimeInvocation {
             );
         (Some(system_prompt), prompt)
     }
+
+    /// The prompt text this invocation delivers to `runtime`, after the
+    /// delegation rules and any ticket-delivery guidance are applied.
+    ///
+    /// This is what a Run's session receives whether the prompt is passed to a
+    /// spawned client or delivered straight to the session through the daemon
+    /// API, so both paths send the same text.
+    pub(crate) fn delivered_prompt(&self, runtime: AgentRuntime) -> String {
+        self.session_prompts(runtime).1
+    }
 }
 
 /// Inputs required to execute one Run.

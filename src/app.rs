@@ -4080,7 +4080,7 @@ mod tests {
                     AgentSessionResolution::Fresh {
                         reason: crate::engine::FreshSessionReason::MissingIdentity,
                     },
-                    77,
+                    Some(77),
                 ),
             },
         ));
@@ -4452,7 +4452,7 @@ mod tests {
                 AgentSessionResolution::Fresh {
                     reason: crate::engine::FreshSessionReason::MissingIdentity,
                 },
-                77,
+                Some(77),
             ));
             app.pool.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
                 "worker-01",

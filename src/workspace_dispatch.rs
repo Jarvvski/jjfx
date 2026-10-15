@@ -94,7 +94,7 @@ pub struct WorkerSessionOutcome {
     action: WorkerActionKind,
     runtime: AgentRuntime,
     session: AgentSessionResolution,
-    pid: u32,
+    pid: Option<u32>,
 }
 
 impl WorkerSessionOutcome {
@@ -103,7 +103,7 @@ impl WorkerSessionOutcome {
         action: WorkerActionKind,
         runtime: AgentRuntime,
         session: AgentSessionResolution,
-        pid: u32,
+        pid: Option<u32>,
     ) -> Self {
         Self {
             worker: worker.into(),
@@ -134,8 +134,9 @@ impl WorkerSessionOutcome {
         &self.session
     }
 
-    /// Returns the Agent Runtime process identifier.
-    pub const fn pid(&self) -> u32 {
+    /// Returns the Agent Runtime process identifier, or `None` when the Run was
+    /// delivered to its session through the daemon API and drives no process.
+    pub const fn pid(&self) -> Option<u32> {
         self.pid
     }
 }
@@ -1262,7 +1263,7 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             AgentSessionResolution::Fresh {
                 reason: crate::engine::FreshSessionReason::NoPriorLog,
             },
-            42,
+            Some(42),
         ))
     }
 
@@ -1280,7 +1281,7 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             AgentSessionResolution::Resumed {
                 session_id: "session-42".to_owned(),
             },
-            43,
+            Some(43),
         ))
     }
 
