@@ -4891,7 +4891,7 @@ mod tests {
         app.dispatch = controller;
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot: snapshot.clone(),
+            snapshot: Box::new(snapshot.clone()),
         }));
         app.handle(press(KeyCode::Char('p')));
         app.handle(press(KeyCode::Char('r')));
@@ -4899,7 +4899,7 @@ mod tests {
         app.handle(press(KeyCode::Char('2')));
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         assert!(matches!(
@@ -4991,7 +4991,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         let workspace = app.store.workspace("worker-01").unwrap();
@@ -5042,7 +5042,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot: idle,
+            snapshot: Box::new(idle),
         }));
         app.handle(press(KeyCode::Char('p')));
         app.handle(press(KeyCode::Char('d')));
@@ -5058,7 +5058,7 @@ mod tests {
         let busy = repository.read_worker_pool_snapshot();
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot: busy,
+            snapshot: Box::new(busy),
         }));
 
         assert!(matches!(
@@ -5102,7 +5102,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         let mut terminal =
@@ -5142,7 +5142,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         let worker = app

@@ -102,7 +102,7 @@ impl PoolSession {
             WorkspaceDispatchEvent::Snapshot {
                 operation,
                 snapshot,
-            } => self.apply_snapshot(operation, snapshot),
+            } => self.apply_snapshot(operation, *snapshot),
             WorkspaceDispatchEvent::Resized { operation, result } => {
                 if self.active_operation == Some(operation) {
                     return vec![PoolUpdate::Status(format!(

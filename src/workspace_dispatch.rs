@@ -624,7 +624,7 @@ pub enum WorkspaceDispatchEvent {
     /// The newest immutable Pool presentation snapshot.
     Snapshot {
         operation: OperationId,
-        snapshot: WorkerPoolSnapshot,
+        snapshot: Box<WorkerPoolSnapshot>,
     },
     /// A Pool mutation completed and its state is being refreshed.
     Resized {
@@ -781,7 +781,7 @@ impl WorkspaceDispatchController {
             WorkspaceDispatchCommand::Refresh { operation } => match adapter.refresh() {
                 Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                     operation,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 }),
                 Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
             },
@@ -794,7 +794,7 @@ impl WorkspaceDispatchController {
                     match adapter.refresh() {
                         Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                             operation,
-                            snapshot,
+                            snapshot: Box::new(snapshot),
                         }),
                         Err(message) => {
                             emit(WorkspaceDispatchEvent::Failed { operation, message });
@@ -809,7 +809,7 @@ impl WorkspaceDispatchController {
                     match adapter.refresh() {
                         Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                             operation,
-                            snapshot,
+                            snapshot: Box::new(snapshot),
                         }),
                         Err(message) => {
                             emit(WorkspaceDispatchEvent::Failed { operation, message });
@@ -956,7 +956,7 @@ impl WorkspaceDispatchController {
                     match adapter.refresh() {
                         Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                             operation,
-                            snapshot,
+                            snapshot: Box::new(snapshot),
                         }),
                         Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
                     }
