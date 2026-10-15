@@ -9,10 +9,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::engine::{
-    AgentRuntime, AgentRuntimeQuery, AgentSessionResolution, DirectDispatchError,
-    DirectDispatchExecution, DirectDispatchFailurePhase, DirectDispatchOutcome,
-    DirectDispatchRequest, DispatchGroupProgress, DispatchGroupStatusCounts,
-    PI_DISCOVERY_HELPER_ENV, PiDiscoveryHelper, PoolCapacity, ReadyTicketFilter, RunActivity,
+    AgentRuntime, AgentSessionResolution, DirectDispatchError, DirectDispatchExecution,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
+    DispatchGroupProgress, DispatchGroupStatusCounts, PoolCapacity, ReadyTicketFilter, RunActivity,
     RunMode, RunResult, TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError,
     WorkerPoolSnapshot, WorkerStatus,
 };

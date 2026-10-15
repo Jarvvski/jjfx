@@ -40,6 +40,17 @@ location = "hsplit"
 [forge]
 pull_requests = true
 draft = true
+
+[tickets]
+source = "linear"
+
+[tickets.linear]
+status = "Todo"
+
+[tickets.local]
+root = ".scratch"
+ready_status = "ready-for-agent"
+resolved_status = "resolved"
 ```
 
 ## `[agent]`
@@ -126,6 +137,42 @@ How the forge pipeline's final step manages pull requests over `gh`.
 | --- | --- | --- |
 | `pull_requests` | `true` | Whether forging creates and updates PRs at all. Set false to stop after push and open PRs yourself. |
 | `draft` | `true` | Open newly-created PRs as drafts. Set false to open them ready for review. |
+
+## `[tickets]`
+
+Where `dispatch --all` and orchestration discover Ready Tickets. The source is a
+config decision, independent of the Agent Runtime a Worker Pool runs, so a
+runtime with no native tracker can still pull work through a configured source.
+
+`source` is required when the section is present; an absent `[tickets]` section
+means the default, `linear`. An unknown source fails at load, before the TUI
+takes the screen or any Worker is reserved.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `source` | `"linear"` (absent section) | Which tracker provides Ready Tickets: `linear` or `local`. |
+
+### `[tickets.linear]`
+
+Discover Ready Tickets through the Agent Runtime's native Linear access - the
+historical path, unchanged. Claude, Codex and opencode each render the discovery
+prompt their own way; the runtime is the transport, not the source.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `status` | `"Todo"` | The Linear workflow status a Ready Ticket must be in. |
+
+### `[tickets.local]`
+
+Discover Ready Tickets from local markdown under the repository (the
+`.scratch/<feature>/issues/NN-<slug>.md` convention). Selecting this source
+fails with a setup error for now - the reader is not implemented yet.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `root` | `".scratch"` | Directory under the repository root holding `<feature>/issues/*.md`. |
+| `ready_status` | `"ready-for-agent"` | The `Status:` value marking a Ticket ready for Dispatch. |
+| `resolved_status` | `"resolved"` | The `Status:` value marking a Ticket resolved. |
 
 ## Legacy `[workspace]`
 

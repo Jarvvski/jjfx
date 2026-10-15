@@ -25,6 +25,12 @@ repository builds and releases.
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
 
+## [Unreleased]
+
+### Added
+
+- The ticket source Dispatch discovers work from is now configured with a `[tickets]` section (`source = "linear" | "local"`) rather than implied by the Agent Runtime, so an opencode pool can pull work through a configured source; `source = "linear"` is unchanged.
+
 ## [0.54.0] - 2026-10-14
 
 ### Breaking

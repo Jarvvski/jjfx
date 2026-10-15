@@ -511,6 +511,15 @@ pub trait TicketQuery {
     fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError>;
 }
 
+impl<T> TicketQuery for Box<T>
+where
+    T: TicketQuery + ?Sized,
+{
+    fn query(&self, request: &TicketQueryRequest) -> Result<String, TicketQueryError> {
+        (**self).query(request)
+    }
+}
+
 /// Stable classifications for Ticket query adapter failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TicketQueryErrorKind {
@@ -550,7 +559,9 @@ impl TicketQueryError {
         Self::new(TicketQueryErrorKind::Query, message, false)
     }
 
-    fn setup(message: impl Into<String>) -> Self {
+    /// Creates a failure that names a setup problem the user must fix - an
+    /// absent executable, an unavailable source, or invalid configuration.
+    pub fn setup(message: impl Into<String>) -> Self {
         Self::new(TicketQueryErrorKind::Setup, message, false)
     }
 
