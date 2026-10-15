@@ -9,10 +9,10 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
-    PoolCostSnapshot, PoolState, Repository, RunConclusion, RunCost, RunRecord,
-    RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource, SessionOutcome, StateChange,
-    StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
-    WorkerWorkspaceError,
+    PoolCostSnapshot, PoolState, Repository, RunConclusion, RunCost, RunHealth, RunProgress,
+    RunRecord, RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource, SessionOutcome,
+    StateChange, StateError, StateRevision, StuckWindow, WireStatus, WireTimestamp, WorkerId,
+    WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -1720,6 +1720,10 @@ pub struct WorkerSnapshot {
     exit_code: Option<i64>,
     pid: Option<u32>,
     process_alive: Option<bool>,
+    /// When the Run log was last written, when it could be read. The watchdog's
+    /// cheap progress signal, captured once per snapshot so a frontend need not
+    /// stat the log per frame.
+    log_activity_at: Option<Timestamp>,
 }
 impl WorkerSnapshot {
     pub fn version(&self) -> u8 {
@@ -1804,6 +1808,27 @@ impl WorkerSnapshot {
     }
     pub fn has_dead_process(&self) -> bool {
         self.process_alive == Some(false)
+    }
+
+    /// The watchdog's view of this Worker's current Run.
+    pub fn run_progress(&self) -> RunProgress {
+        RunProgress {
+            status: self.status,
+            started_at: self
+                .started_at
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            log_activity_at: self.log_activity_at,
+            process_alive: !self.has_dead_process(),
+        }
+    }
+
+    /// The watchdog's verdict on this Worker's current Run.
+    ///
+    /// `now` and `window` are the caller's, not the engine's: the clock and the
+    /// configured window are frontend facts, exactly as the occupied set is.
+    pub fn health(&self, now: Timestamp, window: StuckWindow) -> RunHealth {
+        super::watchdog::health(self.run_progress(), now, window)
     }
 }
 
@@ -2029,6 +2054,7 @@ fn worker_snapshot(
     if pid == Some(0) {
         return Err("Worker PID must be greater than zero".to_owned());
     }
+    let log_activity_at = super::watchdog::log_activity_at(state.log_file.as_deref().map(Path::new));
     Ok(WorkerSnapshot {
         workspace: worker_id.as_str().to_owned(),
         worker_id,
@@ -2044,6 +2070,7 @@ fn worker_snapshot(
         exit_code: state.exit_code,
         process_alive: pid.map(process_is_alive),
         pid,
+        log_activity_at,
     })
 }
 

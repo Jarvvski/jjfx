@@ -28,6 +28,7 @@ mod runtime;
 mod state;
 mod ticket;
 mod undo;
+mod watchdog;
 mod worker_actions;
 mod workspace;
 
@@ -108,6 +109,7 @@ pub use worker_actions::{
     ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration,
     WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
+pub use watchdog::{RunHealth, RunProgress, StuckWindow};
 pub use workspace::jj_lib_compat_notice;
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, WorkerWorkspace,

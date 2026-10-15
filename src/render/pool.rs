@@ -10,10 +10,11 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::engine::{
     AgentSessionResolution, PoolCostSnapshot, RunActivity, RunActivityKind, RunConclusion,
-    RunResult, RunUsage, WorkerPoolSnapshot, WorkerStatus,
+    RunResult, RunUsage, StuckWindow, WorkerPoolSnapshot, WorkerStatus,
 };
 use crate::pool_session::PoolSession;
 use crate::render::style::dim_line;
+use jiff::Timestamp;
 
 /// Which Pool interaction is focused - the subset of modes the view draws.
 pub(crate) enum PoolPane<'a> {
@@ -29,11 +30,14 @@ pub(crate) enum PoolPane<'a> {
 }
 
 /// A read-only projection for the Pool view: the session state plus the focused
-/// pane and the selected Worker.
+/// pane, the selected Worker, and the clock and stuck-Run window the watchdog is
+/// judged against.
 pub(crate) struct PoolView<'a> {
     pub session: &'a PoolSession,
     pub pane: PoolPane<'a>,
     pub selected_worker: Option<&'a str>,
+    pub watchdog: StuckWindow,
+    pub now: Timestamp,
 }
 
 /// Draw the Pool view body; `footer` is rendered into the bottom strip.
@@ -84,9 +88,17 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
             } else {
                 ""
             };
+            // A stuck Run is still `busy` in the compatible document: the
+            // watchdog's verdict is a view of it, surfaced alongside rather than
+            // in place of the persisted status.
+            let stuck = if worker.health(view.now, view.watchdog).is_stuck() {
+                "  [stuck]"
+            } else {
+                ""
+            };
             let line = if body.width < 55 {
                 format!(
-                    " {marker} {}  {}  runtime: {}  ticket:{}{open}",
+                    " {marker} {}  {}  runtime: {}  ticket:{}{stuck}{open}",
                     worker.worker_id(),
                     worker.status().as_str(),
                     worker
@@ -96,7 +108,7 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                 )
             } else {
                 format!(
-                    " {marker} {}  {:<7} {}  runtime: {}  {}{open}{spend}",
+                    " {marker} {}  {:<7} {}  runtime: {}  {}{stuck}{open}{spend}",
                     worker.worker_id(),
                     worker.status().as_str(),
                     worker.alias(),
@@ -428,12 +440,50 @@ mod tests {
         repository.read_worker_pool_snapshot()
     }
 
+    /// A one-Worker Pool snapshot whose Worker is busy with a Run that started at
+    /// `started_at`, optionally with a Run log at `log_file`.
+    fn snapshot_busy(started_at: &str, log_file: Option<&std::path::Path>) -> WorkerPoolSnapshot {
+        let temp = tempfile::tempdir().expect("temp repository");
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).expect("pool directory");
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
+        )
+        .expect("pool state");
+        let log = log_file.map_or_else(String::new, |path| {
+            format!(", \"log_file\":{:?}", path.to_string_lossy())
+        });
+        std::fs::write(
+            pool.join("worker-01.json"),
+            format!(
+                r#"{{"status":"busy","agent":"claude","ticket":"ENG-1","pid":null,"started_at":"{started_at}","completed_at":null{log},"branch_name":null,"exit_code":null,"error":null}}"#
+            ),
+        )
+        .expect("worker state");
+        let repository = Repository::open(temp.path()).expect("repository");
+        repository.read_worker_pool_snapshot()
+    }
+
     fn render(session: &PoolSession, pane: PoolPane<'_>, selected: Option<&str>) -> String {
+        render_at(session, pane, selected, Timestamp::now(), StuckWindow::DEFAULT)
+    }
+
+    /// Render with an explicit watchdog clock and window, for the stuck cases.
+    fn render_at(
+        session: &PoolSession,
+        pane: PoolPane<'_>,
+        selected: Option<&str>,
+        now: Timestamp,
+        watchdog: StuckWindow,
+    ) -> String {
         let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
         let view = PoolView {
             session,
             pane,
             selected_worker: selected,
+            watchdog,
+            now,
         };
         terminal
             .draw(|frame| draw(frame, &view, Paragraph::new("")))
@@ -455,6 +505,38 @@ mod tests {
         };
         let text = render(&session, PoolPane::View, Some("worker-01"));
         assert!(text.contains("[open]"), "expected an open marker: {text}");
+    }
+
+    #[test]
+    fn the_worker_list_marks_a_stuck_run_beside_its_busy_status() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot_busy("2026-01-01T00:00:00Z", None)),
+            ..PoolSession::default()
+        };
+        let now: Timestamp = "2026-01-01T01:00:00Z".parse().expect("a timestamp");
+        let text = render_at(&session, PoolPane::View, Some("worker-01"), now, StuckWindow::DEFAULT);
+        assert!(text.contains("[stuck]"), "expected a stuck marker: {text}");
+        // The persisted status is still shown: stuck is a view of `busy`.
+        assert!(text.contains("busy"), "expected the busy status: {text}");
+
+        // Inside the window it is not stuck, and with the watchdog off it never
+        // is: the marker is the only thing the window changes.
+        let text = render_at(
+            &session,
+            PoolPane::View,
+            Some("worker-01"),
+            "2026-01-01T00:05:00Z".parse().expect("a timestamp"),
+            StuckWindow::DEFAULT,
+        );
+        assert!(!text.contains("[stuck]"), "still inside the window: {text}");
+        let text = render_at(
+            &session,
+            PoolPane::View,
+            Some("worker-01"),
+            now,
+            StuckWindow::DISABLED,
+        );
+        assert!(!text.contains("[stuck]"), "watchdog disabled: {text}");
     }
 
     /// A one-Worker Pool snapshot whose Worker has one recorded Run.

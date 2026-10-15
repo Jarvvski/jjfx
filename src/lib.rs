@@ -296,8 +296,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         terminal,
         ui.world_pane,
         tx,
-        config.tickets,
-        config.spend,
+        config.dispatch_settings(),
     );
     // A `jj`/`jj-lib` version mismatch degrades the graph read. Surface it up
     // front, before the first load, so it is visible even if that load errors

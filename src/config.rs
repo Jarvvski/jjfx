@@ -27,6 +27,8 @@ pub struct Config {
     pub tickets: TicketsConfig,
     /// The optional cap on the aggregate spend Dispatch may run up.
     pub spend: SpendConfig,
+    /// How long a Run may make no progress before the list surfaces it as stuck.
+    pub watchdog: WatchdogConfig,
     /// Which AI reviewer the review loop runs, and how many re-review passes it
     /// makes. `reviewer = "none"` (the default) leaves review human-only.
     pub review: ReviewConfig,
@@ -52,6 +54,7 @@ impl Default for Config {
             forge: ForgeConfig::default(),
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
+            watchdog: WatchdogConfig::default(),
             review: ReviewConfig::default(),
             migrations: MigrationsConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
@@ -119,6 +122,32 @@ impl Config {
         }
         Ok(())
     }
+
+    /// The settings the TUI and Dispatch both act on, loaded once and handed
+    /// together: where Ready Tickets come from, what Dispatch may spend, and how
+    /// long a Run may stall before the list surfaces it as stuck.
+    pub fn dispatch_settings(&self) -> DispatchSettings {
+        DispatchSettings {
+            tickets: self.tickets.clone(),
+            spend: self.spend,
+            watchdog: self.watchdog,
+        }
+    }
+}
+
+/// The jjfx settings a frontend acts on, loaded once and handed together.
+///
+/// These are the settings Dispatch and the Worker Pool list both need, so they
+/// travel as one value rather than as a growing argument list. Each carries its
+/// own validation; [`Config::dispatch_settings`] only collects them.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchSettings {
+    /// Where Ready Tickets are discovered.
+    pub tickets: TicketsConfig,
+    /// The optional aggregate spend cap.
+    pub spend: SpendConfig,
+    /// How long a Run may make no progress before the watchdog flags it.
+    pub watchdog: WatchdogConfig,
 }
 
 /// Wrap a shell command in `$SHELL -l -i -c <command>` so login and interactive
@@ -338,6 +367,34 @@ impl Default for SpendConfig {
             cap_usd: None,
             window: SpendWindow::Week,
             on_exceed: SpendCapMode::Block,
+        }
+    }
+}
+
+/// How long a Run may make no progress before the watchdog flags it as stuck.
+///
+/// The window is a duration rather than a switch so the same setting both tunes
+/// the signal and turns it off: `stuck_after_secs = 0` disables the watchdog
+/// entirely, leaving the list exactly as it was before the watchdog existed.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchdogConfig {
+    /// Seconds of no Run-log activity before a busy Run is surfaced as stuck.
+    /// Zero disables the watchdog. Defaults to thirty minutes.
+    pub stuck_after_secs: u64,
+}
+
+impl WatchdogConfig {
+    /// The engine-level window this config describes.
+    pub fn stuck_window(&self) -> crate::engine::StuckWindow {
+        crate::engine::StuckWindow::from_secs(self.stuck_after_secs)
+    }
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            stuck_after_secs: crate::engine::StuckWindow::DEFAULT.as_duration().as_secs(),
         }
     }
 }
