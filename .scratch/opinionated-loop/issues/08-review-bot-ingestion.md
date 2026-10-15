@@ -60,3 +60,14 @@ bounded number of re-review iterations.
 
 - 2026-10-15: Filed from the strategy review. Corrects an earlier assumption: CI
   checks and comments are *already* ingested — this ticket automates the loop.
+- 2026-10-15: The bounded-loop item now has measured evidence, from a 24-ticket
+  batch run through parallel agents. Of 901 agent sessions, **642 (65% of the
+  batch's ~$174 cost) were the review fan-out** — seven dimensions per pass, plus
+  a scoring child per finding. One work stream reached **Pass 18**: 144 child
+  sessions costing $17.61 of review around $1.49 of work, re-running all seven
+  dimensions each round and finding nothing new after the second pass. The loop
+  was instructed to run "to zero" and treated zero as reachable by repetition, so
+  it terminated on a session limit rather than on convergence. Two things follow
+  for this ticket: the stop condition needs to be a **pass cap**, not a
+  findings-count; and the marginal dimension's value collapses after pass 2, so
+  a re-pass should re-run only the dimensions that found something.

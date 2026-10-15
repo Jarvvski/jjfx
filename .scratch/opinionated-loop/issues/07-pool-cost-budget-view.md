@@ -2,7 +2,7 @@
 
 Status: ready-for-agent
 Type: task
-Blocked by: none
+Blocked by: 16
 
 ## Problem
 
@@ -56,3 +56,10 @@ recorded per-Run costs are sufficient for a first cut.
 ## Comments
 
 - 2026-10-15: Filed from the strategy review.
+- 2026-10-15: **Premise corrected - this ticket cannot be built as written.**
+  It aggregates "the per-Run costs jjfx already records", but jjfx does not retain
+  them: `apply_run_result` (`src/engine/pool.rs:1529-1544`) persists only
+  status/exit_code/error, and the Run log is opened `.truncate(true)`
+  (`src/engine/runtime.rs:403-411`), so each Run overwrites the previous one's
+  cost. Only the latest Run per Worker survives. Re-marked `Blocked by: 16`,
+  which adds the durable per-Run record this needs.

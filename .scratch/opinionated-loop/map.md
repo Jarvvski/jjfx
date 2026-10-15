@@ -70,19 +70,28 @@ in. This is the effort's foundation and its highest-leverage change.
   dispatch stops failing closed. Large; needs a design decision.
 - [06](issues/06-attention-lane-and-glyphs.md) — task: the attention-first lane
   and per-state glyph vocabulary.
+- [16](issues/16-durable-run-cost-record.md) — task: persist the per-Run cost and
+  usage jjfx already parses but discards at finalization. **Blocks 07** — the
+  costs 07 aggregates are not currently retained anywhere.
 - [07](issues/07-pool-cost-budget-view.md) — task: a pool-level cost/usage view
-  and a dispatch gate on a spend cap.
+  and a dispatch gate on a spend cap. Blocked by 16.
 
 ### Phase 2 — review & landing
 
 - [08](issues/08-review-bot-ingestion.md) — task: ingest an AI reviewer's
   findings and route them through the existing `review` verb.
+- [17](issues/17-migration-order-check.md) — task: flag migration-order
+  inversions across open workspaces before either lands. A set property no
+  per-PR check can see.
 - [09](issues/09-gh-stack-adoption.md) — task: adopt `gh stack` for stack state
   instead of hand-rolling base-chaining. Spike first.
 - [10](issues/10-opinionated-landing.md) — decision: an opt-in landing rule
   (auto-merge on approved+green, or a merge-queue handoff). **resolved** —
   option (a), auto-merge on green, ruled by the owner 2026-10-15.
 - [11](issues/11-jj-fix-pre-push.md) — task: run `jj fix` as a forge step.
+- [18](issues/18-forge-build-check.md) — task: verify a change builds against
+  merged trunk before the forge pushes it. The missing half of the lifecycle -
+  today `done` means only that the agent said so.
 
 ### Phase 3 — trustworthiness
 
@@ -126,3 +135,16 @@ in. This is the effort's foundation and its highest-leverage change.
   behavioural loss is unverified — 09 is a spike for exactly this.
 - Headless parity (05) may not be worth it for a single-user local tool; it is
   filed because it removes the `--force` ambiguity, but it may become `wontfix`.
+
+## Comments
+
+- 2026-10-15: Filed from the strategy review.
+- 2026-10-15: **16, 17 and 18 added**, from the evidence of a 24-ticket batch (15
+  merged PRs) run through parallel agents in another repo. The batch's cost
+  analysis found three things this effort can act on: **65% of the spend was the
+  review fan-out** (evidencing 08's bounded loop with a pass cap rather than a
+  findings count), the blockers that actually cost the merges were **cross-PR and
+  invisible to every gate** (17, 18), and the per-Run costs **07** aggregates were
+  never retained (16, which now blocks it). It also found one jjfx premise wrong:
+  "one editor per workspace" is already structurally impossible, since a Worker is
+  1:1 with its own workspace by construction - so no lease is needed.
