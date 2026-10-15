@@ -27,6 +27,7 @@ mod run_log;
 mod runtime;
 mod state;
 mod ticket;
+mod undo;
 mod worker_actions;
 mod workspace;
 
@@ -86,10 +87,11 @@ pub use runtime::{
 };
 pub use state::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
-    Expected, IdentifierError, InUseState, InUseStateRepository, Loaded, PoolState,
-    PoolStateRepository, RunRecord, RunRecordConclusion, RunRecordRepository, RunRecordUsage,
+    Expected, IdentifierError, InUseState, InUseStateRepository, Loaded, MutationKind,
+    MutationRecord, MutationRecordRepository, PoolState, PoolStateRepository,
+    REPOSITORY_WIDE_MUTATION, RunRecord, RunRecordConclusion, RunRecordRepository, RunRecordUsage,
     SessionState, SessionStateRepository, StateChange, StateError, StateRevision, StateStore,
-    SubIssueState, TicketId, Versioned, WireAgent, WireStatus, WireTimestamp, WorkerId,
+    SubIssueState, TicketId, UndoState, Versioned, WireAgent, WireStatus, WireTimestamp, WorkerId,
     WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
@@ -99,6 +101,7 @@ pub use ticket::{
     TicketQueryError, TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
     TicketValueError,
 };
+pub use undo::{MutationCheckpoint, MutationGuard, UndoError, UndoOutcome};
 pub use worker_actions::{
     AbsorbOutcome, AbsorbReport, DismissOutcome, FollowUpExecution, FollowUpOutcome,
     FollowUpSession, MountOutcome, OpenPullRequestOutcome, PermissionResolution, RebaseOutcome,

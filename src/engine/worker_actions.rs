@@ -14,9 +14,10 @@ use crate::engine::runtime::pi_interactive_command;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, DispatchExclusions, PermissionDecision, PermissionRequest, Repository,
-    Reservation, ReviewFinding, ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, WorkerId,
-    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
+    CompletedRun, DispatchExclusions, MutationGuard, MutationKind, PermissionDecision,
+    PermissionRequest, Repository, Reservation, ReviewFinding, ReviewRequest, RunLog,
+    RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus,
+    resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -609,9 +610,18 @@ impl WorkerActions {
         let restoration = if workspace.is_dir() {
             let handle_worker = worker.clone();
             let thread_worker = worker.clone();
+            let repository = self.repository.clone();
             let join = thread::Builder::new()
                 .name(format!("jjfx-restore-{worker}"))
                 .spawn(move || {
+                    // Record the checkpoint immediately before the Workspace is
+                    // restored, so a Reset can be undone from the tool. The guard
+                    // completes the record on both the success and failure exits.
+                    let _undo = MutationGuard::begin(
+                        &repository,
+                        thread_worker.as_str(),
+                        MutationKind::Reset,
+                    );
                     SystemCommands::restore_workspace(&thread_worker, &workspace, operation)
                 })
                 .map_err(|source| WorkerActionError::RestorationSpawn {

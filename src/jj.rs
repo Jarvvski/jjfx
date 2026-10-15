@@ -44,6 +44,52 @@ pub fn read_in_dir(dir: &Path, args: &[&str]) -> anyhow::Result<String> {
         .checked()
 }
 
+/// The repository's operation log, newest first, capped at `limit` entries.
+///
+/// The operation log is repository-wide: jjfx drives many Workspaces at once and
+/// every one of them appends to the same log. That is exactly why an undo has to
+/// be scoped by what the log says happened since the mutation, rather than by the
+/// Workspace alone.
+pub fn operation_log(repo_root: &Path, limit: usize) -> anyhow::Result<Vec<String>> {
+    let out = read_at_repo(
+        repo_root,
+        &[
+            "op",
+            "log",
+            "--no-graph",
+            "-n",
+            &limit.to_string(),
+            "-T",
+            "id ++ \"\\n\"",
+        ],
+    )?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
+}
+
+/// The repository's newest operation id: the checkpoint jjfx records before it
+/// mutates anything.
+pub fn operation_id(repo_root: &Path) -> anyhow::Result<String> {
+    operation_log(repo_root, 1)?
+        .into_iter()
+        .next()
+        .context("jj op log reported no operation")
+}
+
+/// Restore the repository - and every Workspace's working copy - to `operation`
+/// (`jj op restore`).
+///
+/// This is repository-wide by nature: it discards every operation newer than
+/// `operation`. Callers must have established that nothing happened since the
+/// operation they are restoring to, or have warned that it will.
+pub fn restore_operation(repo_root: &Path, operation: &str) -> anyhow::Result<()> {
+    run_mut(repo_root, &["op", "restore", operation])
+}
+
 /// Derive the `owner/repo` slug from jj's `origin` remote URL. Every `gh` call
 /// must pass this explicitly because auto-detection fails in jj workspaces.
 pub(crate) fn derive_repo_slug(repo_root: &Path) -> anyhow::Result<Option<String>> {

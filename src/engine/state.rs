@@ -30,6 +30,16 @@ const SESSION_PATH: &str = ".jj/pool/sessions.json";
 const SESSION_LOCK: &str = ".jj/pool/.sessions.lock";
 const RUN_RECORDS_PATH: &str = ".jj/pool/runs.jsonl";
 const RUN_RECORDS_LOCK: &str = ".jj/pool/.runs.lock";
+const UNDO_PATH: &str = ".jj/pool/undo.json";
+const UNDO_LOCK: &str = ".jj/pool/.undo.lock";
+
+/// The Workspace key a repository-wide jjfx mutation is recorded under.
+///
+/// jj's undo primitives act on the whole repository, and jjfx drives many
+/// Workspaces against it, so a mutation that is not confined to one Workspace
+/// (a tidy, or a lift of every Workspace) must never be recorded as if it were
+/// one Workspace's. It is recorded under this reserved key instead.
+pub const REPOSITORY_WIDE_MUTATION: &str = "*";
 
 type Extensions = BTreeMap<String, Value>;
 
@@ -425,6 +435,76 @@ pub enum RunRecordConclusion {
     Failed,
 }
 
+/// The kind of jjfx-initiated mutation an undo record describes.
+///
+/// Open to the compatible set of mutations jjfx performs; a value jjfx does not
+/// recognize is still carried, so a record written by a newer jjfx is not lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MutationKind {
+    /// A Forge run: fetch, weld, fix and push a Workspace's chain.
+    Forge,
+    /// A weld: rebase a Workspace's own mutable chain onto trunk.
+    Weld,
+    /// A tidy: abandon or rebase junk empty commits.
+    Tidy,
+    /// A Reset: abandon a Run and restore the Workspace.
+    Reset,
+}
+
+impl MutationKind {
+    /// Returns the persisted spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MutationKind::Forge => "forge",
+            MutationKind::Weld => "weld",
+            MutationKind::Tidy => "tidy",
+            MutationKind::Reset => "reset",
+        }
+    }
+}
+
+impl fmt::Display for MutationKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One jjfx-initiated mutation of one Workspace, recorded so it can be undone.
+///
+/// jj snapshots every mutation in a repository-wide operation log. jjfx records
+/// here the operation the repository was at *before* the mutation and the one it
+/// was at when the mutation finished, so an undo can restore the checkpoint - but
+/// only while the recorded end is still the repository's tip, because a restore
+/// is repository-wide (see `engine::undo`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationRecord {
+    /// The Workspace mutated, or [`REPOSITORY_WIDE_MUTATION`] for a mutation that
+    /// is not confined to one Workspace.
+    pub workspace: String,
+    /// What jjfx did.
+    pub kind: MutationKind,
+    /// The operation the repository was at immediately before the mutation.
+    pub before: String,
+    /// The operation the repository was at when the mutation finished.
+    pub after: String,
+    /// When the mutation finished.
+    pub at: WireTimestamp,
+}
+
+/// The latest jjfx-initiated mutation per Workspace.
+///
+/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
+/// Worker documents so their shape is preserved. A compatibility peer ignores it;
+/// a missing or unreadable file means "nothing recorded to undo".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UndoState {
+    /// The latest recorded mutation, keyed by the Workspace it mutated (or
+    /// [`REPOSITORY_WIDE_MUTATION`]).
+    #[serde(default)]
+    pub mutations: BTreeMap<String, MutationRecord>,
+}
+
 /// One Sub-issue entry in a Dispatch Group.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubIssueState {
@@ -791,6 +871,12 @@ pub struct SessionStateRepository {
 pub struct RunRecordRepository {
     root: PathBuf,
 }
+/// The jjfx-owned undo record store: the operation the repository was at before
+/// each jjfx-initiated mutation.
+#[derive(Debug, Clone)]
+pub struct MutationRecordRepository {
+    root: PathBuf,
+}
 
 impl Repository {
     /// Opens the compatible state repository facade.
@@ -840,6 +926,13 @@ impl StateStore {
     /// Opens the jjfx-owned, append-only per-Run cost record store.
     pub fn runs(&self) -> RunRecordRepository {
         RunRecordRepository {
+            root: self.root.clone(),
+        }
+    }
+
+    /// Opens the jjfx-owned undo record store.
+    pub fn undo(&self) -> MutationRecordRepository {
+        MutationRecordRepository {
             root: self.root.clone(),
         }
     }
@@ -1970,6 +2063,14 @@ repository_methods!(
     |_s: &SessionStateRepository| "Worker Sessions".to_owned(),
     validate_sessions
 );
+repository_methods!(
+    MutationRecordRepository,
+    UndoState,
+    |s: &MutationRecordRepository| s.root.join(UNDO_PATH),
+    |s: &MutationRecordRepository| vec![s.root.join(UNDO_LOCK)],
+    |_s: &MutationRecordRepository| "Undo Records".to_owned(),
+    validate_undo
+);
 
 impl InUseStateRepository {
     /// Returns the Worker ids currently marked in use, treating absence as empty.
@@ -2139,6 +2240,56 @@ impl RunRecordRepository {
             .filter(|line| !line.is_empty())
             .filter_map(|line| serde_json::from_slice(line).ok())
             .collect())
+    }
+}
+
+impl MutationRecordRepository {
+    /// Returns the latest mutation recorded for `workspace`, if any.
+    pub fn mutation(&self, workspace: &str) -> Result<Option<MutationRecord>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.mutations.get(workspace).cloned()),
+            Loaded::Missing => Ok(None),
+        }
+    }
+
+    /// Records `record` as the latest mutation for its Workspace, replacing any
+    /// prior one.
+    ///
+    /// Only the latest mutation is kept: an undo restores the operation the
+    /// repository was at *before* it, which already subsumes every earlier
+    /// jjfx-initiated mutation.
+    pub fn record(&self, record: &MutationRecord) -> Result<(), StateError> {
+        let workspace = record.workspace.clone();
+        self.update(|mutations| mutations.insert(workspace, record.clone()).is_none())
+    }
+
+    /// Forgets the mutation recorded for `workspace`, if any.
+    pub fn clear(&self, workspace: &str) -> Result<(), StateError> {
+        self.update(|mutations| mutations.remove(workspace).is_some())
+    }
+
+    /// Applies `edit` under the sidecar lock, writing only when it changed
+    /// something.
+    fn update(
+        &self,
+        edit: impl FnOnce(&mut BTreeMap<String, MutationRecord>) -> bool,
+    ) -> Result<(), StateError> {
+        let subject = "Undo Records";
+        with_locks(&[self.root.join(UNDO_LOCK)], subject, || {
+            let mut mutations =
+                match load_state(&self.root.join(UNDO_PATH), subject, &validate_undo)? {
+                    Loaded::Present(versioned) => versioned.value.mutations,
+                    Loaded::Missing => BTreeMap::new(),
+                };
+            if !edit(&mut mutations) {
+                return Ok(());
+            }
+            write_atomic(
+                &self.root.join(UNDO_PATH),
+                &UndoState { mutations },
+                subject,
+            )
+        })
     }
 }
 
@@ -2409,6 +2560,12 @@ fn validate_in_use(_state: &InUseState) -> Result<(), String> {
 fn validate_sessions(_state: &SessionState) -> Result<(), String> {
     // Worker ids are validated on deserialization and session ids are opaque
     // strings; there is nothing else to check.
+    Ok(())
+}
+fn validate_undo(_state: &UndoState) -> Result<(), String> {
+    // A mutation record's Workspace key is an opaque string (a Workspace name, or
+    // the repository-wide marker) and the operation ids are opaque; there is
+    // nothing else to check.
     Ok(())
 }
 fn validate_dispatch_group_for(

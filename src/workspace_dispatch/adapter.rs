@@ -9,7 +9,7 @@
 use super::*;
 
 use crate::config::{SpendConfig, TicketsConfig};
-use crate::engine::DispatchExclusions;
+use crate::engine::{DispatchExclusions, UndoOutcome};
 use crate::ticket_source::configured_ticket_query;
 
 /// The blocking port behind the controller seam: one capability surface the
@@ -70,6 +70,8 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
         worker: &str,
         decision: PermissionDecision,
     ) -> Result<WorkerCommandResult, String>;
+    /// Undo the last jjfx-initiated mutation on one Worker.
+    fn undo(&self, worker: &str) -> Result<WorkerCommandResult, String>;
     /// Reads one latest Worker log snapshot without choosing a rendering.
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
@@ -709,6 +711,35 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             action: resolution.request().action().to_owned(),
             decision: resolution.decision(),
         })
+    }
+
+    fn undo(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        match repository
+            .undo_mutation(worker_id.as_str(), false)
+            .map_err(|error| error.to_string())?
+        {
+            UndoOutcome::Nothing => Err(format!("nothing recorded to undo for {worker}")),
+            UndoOutcome::Restored {
+                kind,
+                discarded,
+                later,
+            } => Ok(WorkerCommandResult::MutationUndone {
+                worker: worker.to_owned(),
+                kind,
+                discarded,
+                later,
+            }),
+            UndoOutcome::Refused { kind, later } => Err(match later {
+                Some(later) => format!(
+                    "refusing to undo the last {kind} on {worker}: {later} operation(s) have happened since"
+                ),
+                None => format!(
+                    "refusing to undo the last {kind} on {worker}: its recorded operation is no longer in the log"
+                ),
+            }),
+        }
     }
 
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String> {

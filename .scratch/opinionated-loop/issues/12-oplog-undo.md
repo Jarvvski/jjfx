@@ -1,6 +1,6 @@
 # Expose jj's operation log as an undo surface
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -35,10 +35,10 @@ workspaces at once** — a naive "undo" could clobber an unrelated workspace.
 
 ## Acceptance Criteria
 
-- [ ] A jjfx-initiated forge/weld/reset can be undone from the tool.
-- [ ] The undo never silently affects an unrelated Workspace; a repository-wide
+- [x] A jjfx-initiated forge/weld/reset can be undone from the tool.
+- [x] The undo never silently affects an unrelated Workspace; a repository-wide
       effect is either avoided or warned about explicitly.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -54,3 +54,57 @@ workspaces at once** — a naive "undo" could clobber an unrelated workspace.
 
 - 2026-10-15: Filed from the strategy review. The cheap, high-value trust win:
   jj already records the state; jjfx just needs to surface it.
+- 2026-10-15: **Primitive and scoping rule decided before coding.** Probed both
+  primitives on a two-operation mutation (a rebase of a two-commit chain, then a
+  rewrite of one commit). `jj op revert <op>` reverses the named operation's
+  effect but does **not** move any working copy back: after reverting the rebase,
+  the Workspace's `@` still descended from the rebased commits and the pre-rebase
+  commits came back as *additional* commits, so the Workspace was not restored.
+  `jj op restore <checkpoint>` returned the repository and every working copy to
+  exactly the recorded pre-mutation state, as one forward operation that is
+  itself undoable.
+  **Primitive: `jj op restore <checkpoint>`**, where `<checkpoint>` is the
+  operation id jjfx records immediately *before* it begins a mutation (the id this
+  ticket asks for). `jj op revert` is not used: it undoes a single operation,
+  while a jjfx mutation is a sequence of jj operations (a forge is fetch -> weld
+  -> fix -> push), and it leaves the Workspace's working copy on the rewritten
+  chain. `jj undo` is not used: it is `jj op restore` to the previous operation,
+  with the same repository-wide effect and no way to say what it would discard.
+  **Scoping rule: refuse unless the mutation is still the repository's tip.**
+  Alongside the checkpoint jjfx records the operation id that was the tip when the
+  mutation *finished*. An undo runs only when the current tip is still that
+  recorded end - i.e. nothing at all has happened since, in any Workspace - so the
+  operations between the checkpoint and the tip are exactly jjfx's own mutation
+  and restoring to the checkpoint cannot discard another Workspace's work. When
+  any operation has happened since (another Workspace's forge, an agent's commit,
+  a fetch), jjfx **refuses** and reports how many later operations a restore would
+  discard; `--force` is the explicit, warned override. The undo is per Workspace
+  ("undo the last weld on ws-a"); a repository-wide jjfx mutation (tidy, tidyws,
+  lift-all) is recorded under the reserved Workspace key `*` and never mixed with
+  a single Workspace's record. Known residual risk, stated rather than hidden: jj
+  does not record who created an operation, so an operation created by another
+  process *inside* a jjfx mutation's own window is indistinguishable from jjfx's
+  and a restore would discard it. jjfx narrows the window to one mutation and
+  refuses on anything later; closing it entirely needs jj to tag operations.
+- 2026-10-15: Resolved. Every jjfx-initiated mutation now records a checkpoint
+  (`Repository::begin_mutation`/`finish_mutation`, completed through
+  `MutationGuard` on every exit) into the jjfx-owned sidecar
+  `.jj/pool/undo.json`: a Forge per target Workspace, a lift/weld per Workspace,
+  a Reset's Workspace restoration, and a tidy/tidyws or lift-all under the
+  reserved repository-wide key `*`. `Repository::undo_mutation` restores the
+  checkpoint with `jj op restore` and refuses unless the recorded end is still
+  the repository tip, reporting how many later operations a restore would
+  discard; `jjfx undo [<workspace>] [--force]` lists and applies it, and `u` in
+  the Pool view confirms and submits it for the selected Worker. `docs/undo.md`
+  and a CONTEXT term record the primitive, the scoping rule and the residual
+  limit; `momo add` carries the changelog entry. Wired and tested: the engine
+  (8 tests: restore, refusal, force, no-op, guard, repository-wide key), the
+  Forge pipeline, the runtime recording helper, the CLI parser and key
+  resolution, and the Pool key flow.
+  Two decisions worth recording. (1) A multi-target Forge records each target
+  with its own checkpoint/end, so after a `forge all` only the last target is
+  still the tip and the earlier targets refuse - the safe outcome, since undoing
+  an earlier target would discard the later ones; undoing the whole run is left
+  to `jj op log`/`jj op restore`. (2) `--force` exists on the CLI only; the TUI
+  never forces, so a single `u`/`y` can never silently discard another
+  Workspace's work.

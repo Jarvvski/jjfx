@@ -102,6 +102,8 @@ enum Mode {
     ConfirmPoolDestroy,
     /// Confirming Reset for one Worker.
     ConfirmPoolReset(String),
+    /// Confirming an undo of the last jjfx-initiated mutation on one Worker.
+    ConfirmPoolUndo(String),
     /// Confirming Dismiss for one Worker.
     ConfirmPoolDismiss(String),
     /// The `?` help overlay is open over the prior interaction mode.
@@ -162,6 +164,7 @@ const POOL_BINDINGS: &[(&str, &str)] = &[
     ("Dispatch Group orchestration", "o"),
     ("Resize Pool", "r"),
     ("Reset Worker", "K"),
+    ("Undo last jjfx mutation", "u"),
     ("Destroy Pool", "D"),
     ("Toggle this help", "?"),
     ("Back", "q / esc"),
@@ -825,6 +828,7 @@ impl App {
             Mode::ConfirmPoolShrink(_, _) => self.on_key_confirm_pool_shrink(key),
             Mode::ConfirmPoolDestroy => self.on_key_confirm_pool_destroy(key),
             Mode::ConfirmPoolReset(_) => self.on_key_confirm_pool_reset(key),
+            Mode::ConfirmPoolUndo(_) => self.on_key_confirm_pool_undo(key),
             Mode::ConfirmPoolDismiss(_) => self.on_key_confirm_pool_dismiss(key),
             Mode::Help(_) => self.on_key_help(key),
             Mode::Detail(_) => self.on_key_detail(key),
@@ -1227,6 +1231,15 @@ impl App {
                     };
                     self.mode = Mode::ConfirmPoolReset(worker);
                 }
+                KeyCode::Char('u') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status("Select a Worker before undo".to_owned());
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    self.mode = Mode::ConfirmPoolUndo(worker);
+                }
                 KeyCode::Char('D') => self.mode = Mode::ConfirmPoolDestroy,
                 _ => self.mode = Mode::Pool(PoolMode::View { selected }),
             },
@@ -1491,6 +1504,10 @@ impl App {
                 self.pin_status("dismissing Worker...".to_owned());
                 WorkspaceDispatchCommand::Dismiss { operation, worker }
             }
+            WorkspaceDispatchCommand::Undo { worker, .. } => {
+                self.pin_status(format!("undoing the last jjfx mutation on {worker}..."));
+                WorkspaceDispatchCommand::Undo { operation, worker }
+            }
             _ => return,
         };
         self.dispatch.submit(command);
@@ -1592,6 +1609,36 @@ impl App {
                 self.pin_status(format!("resetting Worker {worker}..."));
                 self.dispatch
                     .submit(WorkspaceDispatchCommand::Reset { operation, worker });
+            }
+            KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: Some(worker),
+                });
+            }
+            _ => {}
+        }
+    }
+
+    /// Confirm undoing the last jjfx-initiated mutation on one Worker.
+    ///
+    /// The undo is refused by the engine unless the mutation is still the
+    /// repository's tip, so the confirmation cannot lead to a repository-wide
+    /// restore that discards another Workspace's work without the engine saying
+    /// so in the outcome.
+    fn on_key_confirm_pool_undo(&mut self, key: KeyEvent) {
+        let Mode::ConfirmPoolUndo(worker) = &self.mode else {
+            return;
+        };
+        let worker = worker.clone();
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                self.mode = Mode::Pool(PoolMode::View {
+                    selected: Some(worker.clone()),
+                });
+                self.start_worker_command(WorkspaceDispatchCommand::Undo {
+                    operation: 0,
+                    worker,
+                });
             }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.mode = Mode::Pool(PoolMode::View {
@@ -2647,7 +2694,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  p permission  o orchestrate  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  u undo  p permission  o orchestrate  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -2707,6 +2754,10 @@ impl App {
             )),
             Mode::ConfirmPoolReset(worker) => Paragraph::new(Span::styled(
                 format!(" reset Worker {worker} and restore its Workspace? (y/n) "),
+                Style::default().fg(Color::Red),
+            )),
+            Mode::ConfirmPoolUndo(worker) => Paragraph::new(Span::styled(
+                format!(" undo the last jjfx mutation on {worker}? (y/n) "),
                 Style::default().fg(Color::Red),
             )),
             Mode::ConfirmPoolDismiss(worker) => Paragraph::new(Span::styled(
@@ -4341,6 +4392,51 @@ mod tests {
                 matches!(command, WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01")
             })
         });
+        assert!(adapter.commands().iter().any(|command| matches!(
+            command,
+            WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01"
+        )));
+
+        // `u` asks for confirmation and only then submits the undo, so a
+        // repository-wide restore never happens on a single keystroke.
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+        app.handle(press(KeyCode::Char('u')));
+        assert!(matches!(app.mode, Mode::ConfirmPoolUndo(ref worker) if worker == "worker-01"));
+        app.handle(press(KeyCode::Char('n')));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert!(
+            !adapter
+                .commands()
+                .iter()
+                .any(|command| matches!(command, WorkspaceDispatchCommand::Undo { .. }))
+        );
+        app.handle(press(KeyCode::Char('u')));
+        app.handle(press(KeyCode::Char('y')));
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
+                matches!(command, WorkspaceDispatchCommand::Undo { worker, .. } if worker == "worker-01")
+            })
+        });
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation: app.pool.active_operation.unwrap(),
+                result: WorkerCommandResult::MutationUndone {
+                    worker: "worker-01".to_owned(),
+                    kind: crate::engine::MutationKind::Forge,
+                    discarded: 2,
+                    later: 0,
+                },
+            },
+        ));
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("Undid the last forge on worker-01")),
+            "{:?}",
+            app.status
+        );
         assert!(adapter.commands().iter().any(|command| matches!(
             command,
             WorkspaceDispatchCommand::Dismiss { worker, .. } if worker == "worker-01"
