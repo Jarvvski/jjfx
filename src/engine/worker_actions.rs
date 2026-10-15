@@ -14,8 +14,9 @@ use crate::engine::runtime::pi_interactive_command;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, DispatchExclusions, Repository, Reservation, RunLog, RunSupervisor,
-    RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
+    CompletedRun, DispatchExclusions, PermissionDecision, PermissionRequest, Repository,
+    Reservation, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
+    WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -244,6 +245,31 @@ impl MountOutcome {
     /// Returns kitty's new tab window identifier.
     pub fn tab_id(&self) -> &str {
         &self.tab_id
+    }
+}
+
+/// The result of answering a Worker's pending opencode permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionResolution {
+    worker: WorkerId,
+    request: PermissionRequest,
+    decision: PermissionDecision,
+}
+
+impl PermissionResolution {
+    /// Returns the Worker whose pending request was answered.
+    pub const fn worker(&self) -> &WorkerId {
+        &self.worker
+    }
+
+    /// Returns the request that was answered.
+    pub const fn request(&self) -> &PermissionRequest {
+        &self.request
+    }
+
+    /// Returns the decision the request was answered with.
+    pub const fn decision(&self) -> PermissionDecision {
+        self.decision
     }
 }
 
@@ -542,6 +568,64 @@ impl WorkerActions {
                 Ok(DismissOutcome::Reset)
             }
         }
+    }
+
+    /// Answers a Worker's pending opencode permission request through the
+    /// daemon API.
+    ///
+    /// A permission request is what leaves an opencode Run needing a human, so
+    /// answering it is what lets the Run proceed without mounting its Workspace
+    /// in a terminal. Only an opencode Worker with an identified session and a
+    /// pending request can be answered; anything else is a typed error the
+    /// frontend reports, never a silently dropped action.
+    pub fn resolve_permission(
+        &self,
+        worker: &WorkerId,
+        decision: PermissionDecision,
+    ) -> Result<PermissionResolution, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        if state.agent_runtime() != Some(AgentRuntime::OpenCode) {
+            return Err(WorkerActionError::NoRunSession {
+                worker: worker.clone(),
+            });
+        }
+        let api = crate::engine::OpenCodeApi::new();
+        let session_id = crate::engine::runtime::identify_run_session(
+            &api,
+            &self.repository,
+            worker,
+            state.ticket(),
+        )
+        .ok_or_else(|| WorkerActionError::NoRunSession {
+            worker: worker.clone(),
+        })?;
+        let request = api
+            .pending_permissions(&session_id)
+            .map_err(|error| WorkerActionError::PermissionRequest {
+                worker: worker.clone(),
+                detail: error.to_string(),
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| WorkerActionError::NoPendingPermission {
+                worker: worker.clone(),
+            })?;
+        api.reply_permission(&session_id, request.id(), decision)
+            .map_err(|error| WorkerActionError::PermissionRequest {
+                worker: worker.clone(),
+                detail: error.to_string(),
+            })?;
+        Ok(PermissionResolution {
+            worker: worker.clone(),
+            request,
+            decision,
+        })
     }
 
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
@@ -1275,6 +1359,15 @@ pub enum WorkerActionError {
     /// The selected runtime's interactive command could not be built.
     #[error(transparent)]
     RuntimeCommand(#[from] AgentRuntimeCommandError),
+    /// The Worker has no opencode Run session to answer a permission for.
+    #[error("Worker {worker} has no opencode Run session")]
+    NoRunSession { worker: WorkerId },
+    /// The Worker's opencode session has no pending permission request.
+    #[error("Worker {worker} has no pending permission request")]
+    NoPendingPermission { worker: WorkerId },
+    /// The opencode API could not read or answer a permission request.
+    #[error("cannot answer Worker {worker}'s permission request: {detail}")]
+    PermissionRequest { worker: WorkerId, detail: String },
     /// The Repository has no compatible GitHub slug.
     #[error("cannot detect GitHub repository")]
     RepositoryUnavailable,

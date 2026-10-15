@@ -64,6 +64,12 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     fn set_alias(&self, worker: &str, alias: &str) -> Result<WorkerCommandResult, String>;
     /// Dismiss one Worker using the compatibility disposition.
     fn dismiss(&self, worker: &str) -> Result<WorkerCommandResult, String>;
+    /// Answer one Worker's pending opencode permission request.
+    fn resolve_permission(
+        &self,
+        worker: &str,
+        decision: PermissionDecision,
+    ) -> Result<WorkerCommandResult, String>;
     /// Reads one latest Worker log snapshot without choosing a rendering.
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
@@ -645,6 +651,23 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         Ok(WorkerCommandResult::Dismissed {
             worker: worker.to_owned(),
             disposition,
+        })
+    }
+
+    fn resolve_permission(
+        &self,
+        worker: &str,
+        decision: PermissionDecision,
+    ) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let resolution = crate::engine::WorkerActions::new(repository)
+            .resolve_permission(&worker_id, decision)
+            .map_err(|error| error.to_string())?;
+        Ok(WorkerCommandResult::PermissionResolved {
+            worker: worker.to_owned(),
+            action: resolution.request().action().to_owned(),
+            decision: resolution.decision(),
         })
     }
 

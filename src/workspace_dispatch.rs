@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use crate::engine::{
     AgentRuntime, AgentSessionResolution, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
-    DispatchGroupProgress, DispatchGroupStatusCounts, PoolCapacity, ReadyTicketFilter, RunActivity,
-    RunMode, RunResult, TicketDiscovery, TicketId, TicketStatus, WorkerId, WorkerPoolError,
-    WorkerPoolSnapshot, WorkerStatus,
+    DispatchGroupProgress, DispatchGroupStatusCounts, PermissionDecision, PoolCapacity,
+    ReadyTicketFilter, RunActivity, RunMode, RunResult, TicketDiscovery, TicketId, TicketStatus,
+    WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 mod adapter;
@@ -223,6 +223,12 @@ pub enum WorkerCommandResult {
         worker: String,
         disposition: WorkerDismissDisposition,
     },
+    /// A Worker's pending opencode permission request was answered.
+    PermissionResolved {
+        worker: String,
+        action: String,
+        decision: PermissionDecision,
+    },
 }
 
 impl WorkerCommandResult {
@@ -245,6 +251,14 @@ impl WorkerCommandResult {
                 worker,
                 disposition: WorkerDismissDisposition::Reset,
             } => format!("Reset {worker} to idle without restoring its Workspace"),
+            Self::PermissionResolved {
+                worker,
+                action,
+                decision,
+            } => format!(
+                "Answered {worker}'s {action} permission request ({})",
+                decision.as_str()
+            ),
         }
     }
 }
@@ -327,6 +341,12 @@ pub enum WorkspaceDispatchCommand {
     Dismiss {
         operation: OperationId,
         worker: String,
+    },
+    /// Answer one Worker's pending opencode permission request.
+    ResolvePermission {
+        operation: OperationId,
+        worker: String,
+        decision: PermissionDecision,
     },
     /// Start one cancellable latest-activity Worker log watcher.
     WatchWorkerLog {
@@ -998,6 +1018,16 @@ impl WorkspaceDispatchController {
                     Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
                 }
             }
+            WorkspaceDispatchCommand::ResolvePermission {
+                operation,
+                worker,
+                decision,
+            } => match adapter.resolve_permission(&worker, decision) {
+                Ok(result) => {
+                    emit(WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result })
+                }
+                Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+            },
             WorkspaceDispatchCommand::WatchWorkerLog { operation, worker } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 if let Some(previous) = watchers
@@ -1348,6 +1378,25 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
         Ok(WorkerCommandResult::Dismissed {
             worker: worker.to_owned(),
             disposition: WorkerDismissDisposition::Reset,
+        })
+    }
+
+    fn resolve_permission(
+        &self,
+        worker: &str,
+        decision: PermissionDecision,
+    ) -> Result<WorkerCommandResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::ResolvePermission {
+                operation: 0,
+                worker: worker.to_owned(),
+                decision,
+            },
+        );
+        Ok(WorkerCommandResult::PermissionResolved {
+            worker: worker.to_owned(),
+            action: "bash".to_owned(),
+            decision,
         })
     }
 

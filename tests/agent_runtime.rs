@@ -55,6 +55,7 @@ const HELPER_OPENCODE_INTERRUPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_INTER
 const HELPER_OPENCODE_UNAVAILABLE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE";
 const HELPER_OPENCODE_OUTCOME: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME";
 const HELPER_OPENCODE_SEND_PROMPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_SEND_PROMPT";
+const HELPER_OPENCODE_PERMISSIONS: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS";
 
 #[test]
 fn pi_runtime_has_a_canonical_configured_and_persisted_identity() {
@@ -2262,6 +2263,12 @@ case "$1" in
         printf '%s' "$4" > "__INTERRUPT__"
         printf '{"interrupted":true}'
         exit 0 ;;
+      session.permission.list)
+        printf '{"data":%s}' "${WSG_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS:-[]}"
+        exit 0 ;;
+      session.permission.reply)
+        printf '%s\n' "$@" > "__PERMISSION_REPLY__"
+        exit 0 ;;
     esac
     exit 1 ;;
 esac
@@ -2276,6 +2283,7 @@ struct OpencodeControlFixture {
     bin_directory: PathBuf,
     result: PathBuf,
     interrupt: PathBuf,
+    permission_reply: PathBuf,
 }
 
 fn opencode_control_fixture() -> OpencodeControlFixture {
@@ -2287,6 +2295,7 @@ fn opencode_control_fixture() -> OpencodeControlFixture {
     OpencodeControlFixture {
         result: temporary_directory.path().join("result"),
         interrupt: temporary_directory.path().join("interrupt"),
+        permission_reply: temporary_directory.path().join("permission-reply"),
         _temporary_directory: temporary_directory,
         repository,
         worker_id,
@@ -2299,7 +2308,11 @@ impl OpencodeControlFixture {
         write_executable(
             &self.bin_directory.join("opencode"),
             &OPENCODE_CONTROL_SCRIPT
-                .replace("__INTERRUPT__", &self.interrupt.display().to_string()),
+                .replace("__INTERRUPT__", &self.interrupt.display().to_string())
+                .replace(
+                    "__PERMISSION_REPLY__",
+                    &self.permission_reply.display().to_string(),
+                ),
         );
     }
 
@@ -2413,6 +2426,16 @@ fn opencode_control_helper() {
         }
         Ok("destroy") => match repository.worker_pool().destroy() {
             Ok(()) => "destroyed".to_owned(),
+            Err(error) => format!("err {error}"),
+        },
+        Ok("resolve-permission") => match WorkerActions::new(repository)
+            .resolve_permission(&worker_id, jjfx::engine::PermissionDecision::Always)
+        {
+            Ok(resolution) => format!(
+                "resolved {} {}",
+                resolution.request().id(),
+                resolution.decision().as_str()
+            ),
             Err(error) => format!("err {error}"),
         },
         other => panic!("unknown opencode control action {other:?}"),
@@ -2619,6 +2642,88 @@ fn reconcile_runs_finishes_a_busy_opencode_worker_on_a_run_log_result() {
         status, "Failed",
         "a Run log with a provider terminal event must finish the Run even while its session is open"
     );
+}
+
+/// A pending opencode permission request can be answered through the daemon API,
+/// so a Worker's NeedsAttention can be cleared without mounting it.
+#[test]
+fn resolve_permission_answers_the_pending_request_through_the_daemon() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("opencode", dead_pid(), "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper_with(
+        "resolve-permission",
+        &[(
+            HELPER_OPENCODE_PERMISSIONS,
+            r#"[{"id":"per_1","sessionID":"ses_run","action":"bash","resources":["rm -rf build"]}]"#,
+        )],
+    );
+    let result = fs::read_to_string(&fixture.result).expect("helper result");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(result, "resolved per_1 always");
+    let reply = fs::read_to_string(&fixture.permission_reply).expect("recorded permission reply");
+    let lines: Vec<&str> = reply.lines().collect();
+    assert_eq!(&lines[..2], ["api", "session.permission.reply"]);
+    assert!(lines.contains(&"sessionID=ses_run"), "{lines:?}");
+    assert!(lines.contains(&"requestID=per_1"), "{lines:?}");
+    let body = lines
+        .iter()
+        .position(|line| *line == "--data")
+        .map(|index| lines[index + 1])
+        .expect("reply body");
+    let body: Value = serde_json::from_str(body).expect("reply body JSON");
+    assert_eq!(body["decision"], "always");
+}
+
+/// A Worker whose opencode session has no pending request is reported rather
+/// than answered with a guess.
+#[test]
+fn resolve_permission_reports_a_worker_without_a_pending_request() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("opencode", dead_pid(), "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("resolve-permission");
+    let result = fs::read_to_string(&fixture.result).expect("helper result");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(result.contains("no pending permission request"), "{result}");
+    assert!(
+        !fixture.permission_reply.exists(),
+        "nothing may be answered when there is no pending request"
+    );
+}
+
+/// A non-opencode Worker has no daemon permission to answer.
+#[test]
+fn resolve_permission_rejects_a_worker_that_is_not_opencode() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("claude", dead_pid(), "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper("resolve-permission");
+    let result = fs::read_to_string(&fixture.result).expect("helper result");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(result.contains("no opencode Run session"), "{result}");
+    assert!(!fixture.permission_reply.exists());
 }
 
 /// A fake `opencode` that serves the API-native send path: `session.prompt`
