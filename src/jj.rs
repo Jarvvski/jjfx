@@ -14,7 +14,7 @@ use std::process::Command;
 
 use anyhow::Context;
 
-use crate::cmd::{Run, cmd};
+use crate::cmd::{Cmd, Run, cmd};
 
 /// Run a read-only jj command against the repo, returning stdout on success. The
 /// single home for the read incantation: `--repository <repo_root>
@@ -419,6 +419,73 @@ pub fn diff_line_delta(repo_root: &Path, from: &str, to: &str) -> anyhow::Result
     Ok(crate::diff::line_totals(&crate::diff::parse(&out)))
 }
 
+/// The outcome of one `jj fix` over a workspace's mutable chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixOutcome {
+    /// No `[fix.tools.<id>]` are configured, so there was nothing to run.
+    NoTools,
+    /// Every configured tool ran; the chain is as formatted as the tools make it.
+    Fixed,
+}
+
+/// Run `jj fix` over `revset` in `dir`, honouring the user's own
+/// `[fix.tools.<id>]` jj config: every changed file in the revset (and its
+/// descendants) is rewritten through its configured formatter, conflict-free.
+/// The forge uses this to normalise a workspace's just-welded chain before push.
+///
+/// `jj fix` exits non-zero with a config error when no tools are configured, so
+/// jjfx probes first and returns [`FixOutcome::NoTools`] - the no-op the forge
+/// relies on - rather than surfacing that as a failure. A jj failure is a typed
+/// error carrying jj's own message.
+pub fn fix(dir: &Path, revset: &str) -> anyhow::Result<FixOutcome> {
+    if !has_fix_tools(dir)? {
+        return Ok(FixOutcome::NoTools);
+    }
+    let run = mut_command()
+        .current_dir(dir)
+        .args(["fix", "-s", revset])
+        .run()?;
+    classify_fix(&run)
+}
+
+/// Classify one `jj fix` run. A non-zero exit is a typed error carrying jj's
+/// message; otherwise the run succeeded.
+fn classify_fix(run: &Run) -> anyhow::Result<FixOutcome> {
+    if !run.ok() {
+        let stderr = run.stderr().trim();
+        let message = if stderr.is_empty() {
+            let stdout = run.stdout().trim();
+            if stdout.is_empty() {
+                "jj fix failed"
+            } else {
+                stdout
+            }
+        } else {
+            stderr
+        };
+        anyhow::bail!("{message}");
+    }
+    Ok(FixOutcome::Fixed)
+}
+
+/// Whether any `[fix.tools.<id>]` is configured, read through jj's template
+/// language (`config list -T name`) rather than jj's English prose. `jj fix`
+/// exits non-zero when none are configured, so this probe is what keeps the
+/// no-tools case a genuine no-op.
+fn has_fix_tools(dir: &Path) -> anyhow::Result<bool> {
+    let run = mut_command()
+        .current_dir(dir)
+        .args(["config", "list", "-T", "name ++ \"\\n\"", "fix.tools"])
+        .run()?;
+    if !run.ok() {
+        anyhow::bail!("jj config list (fix.tools): {}", run.stderr().trim());
+    }
+    Ok(run
+        .stdout()
+        .lines()
+        .any(|line| line.trim_start().starts_with("fix.tools.")))
+}
+
 /// Build a `jj` invocation for a command that may write.
 ///
 /// Tests never sign: their commits are throwaway, and signing them made the
@@ -436,16 +503,26 @@ pub(crate) fn command() -> Command {
 
 /// Run a mutating jj command, returning an error carrying jj's stderr on failure.
 fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
-    let command = cmd("jj");
-    #[cfg(test)]
-    let command = command.args(["--config", "signing.behavior=drop"]);
-    command
+    mut_command()
         .arg("--repository")
         .arg(repo_root)
         .args(args)
         .run()?
         .checked()?;
     Ok(())
+}
+
+/// Build a `jj` invocation for a command that may write, in the current
+/// directory rather than against a fixed `--repository`.
+///
+/// Tests never sign: their commits are throwaway, and signing them made the
+/// suite depend on the developer's GPG key being unlocked. `cfg!(test)` covers
+/// this crate's own tests, which is where the fix paths are exercised.
+fn mut_command() -> Cmd {
+    let command = cmd("jj");
+    #[cfg(test)]
+    let command = command.args(["--config", "signing.behavior=drop"]);
+    command
 }
 
 #[cfg(test)]
@@ -584,6 +661,46 @@ mod tests {
             canonical_snapshot("b 2\na 1\n\n"),
             canonical_snapshot("a 1\nb 2\n")
         );
+    }
+
+    #[test]
+    fn classify_fix_reads_a_non_zero_exit_as_a_typed_error() {
+        let run = Run::for_test(false, "", "Config error: boom");
+        let error = classify_fix(&run).expect_err("a non-zero exit is an error");
+        assert_eq!(error.to_string(), "Config error: boom");
+    }
+
+    #[test]
+    fn classify_fix_falls_back_to_stdout_when_stderr_is_empty() {
+        let run = Run::for_test(false, "boom", "");
+        assert_eq!(
+            classify_fix(&run)
+                .expect_err("a non-zero exit is an error")
+                .to_string(),
+            "boom"
+        );
+    }
+
+    #[test]
+    fn classify_fix_reads_a_clean_run_as_fixed() {
+        let run = Run::for_test(true, "", "Fixed 2 commits of 2 checked.\n");
+        assert_eq!(
+            classify_fix(&run).expect("a clean run is Fixed"),
+            FixOutcome::Fixed
+        );
+    }
+
+    #[test]
+    fn fix_is_a_no_op_when_no_tools_are_configured() {
+        // `jj fix` errors when no tools are configured, so the probe must turn
+        // that into the no-op the forge relies on.
+        let repo = temp_repo("notools");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        assert_eq!(
+            fix(&root, "roots(mutable() & mine() & ::@)").expect("a no-tools fix is a no-op"),
+            FixOutcome::NoTools
+        );
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
