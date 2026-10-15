@@ -32,6 +32,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - The ticket source Dispatch discovers work from is now configured with a `[tickets]` section (`source = "linear" | "local"`) rather than implied by the Agent Runtime, so an opencode pool can pull work through a configured source; `source = "linear"` is unchanged.
 - Ingest the richer Claude/Codex lifecycle hooks: needs-input, a distinct quota-blocked state, and subagent/batch progress
 - Send an opencode Follow-up through its session and answer a pending permission request from the Pool view
+- Attention-first workspace list: a needs-you lane with a per-state glyph vocabulary, a reserved amber needs-you colour, and the idle lane folded by default
 
 ## [0.54.0] - 2026-10-14
 
