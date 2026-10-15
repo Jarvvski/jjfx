@@ -15,8 +15,8 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
     CompletedRun, DispatchExclusions, PermissionDecision, PermissionRequest, Repository,
-    Reservation, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
-    WorkerStatus, resolve_agent_session_for_runtime,
+    Reservation, ReviewFinding, ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, WorkerId,
+    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -283,6 +283,7 @@ pub struct WorkerActions {
     first_pane_command: Vec<String>,
     layout: PaneLayout,
     exclusions: DispatchExclusions,
+    review_findings: Vec<ReviewFinding>,
 }
 
 impl WorkerActions {
@@ -296,7 +297,15 @@ impl WorkerActions {
             first_pane_command: Vec::new(),
             layout: PaneLayout::builtin(),
             exclusions: DispatchExclusions::default(),
+            review_findings: Vec::new(),
         }
+    }
+
+    /// Supplies an AI reviewer's normalised findings to inline into the next
+    /// review prompt. Empty (the default) leaves the prompt as it was.
+    pub fn with_review_findings(mut self, findings: Vec<ReviewFinding>) -> Self {
+        self.review_findings = findings;
+        self
     }
 
     /// Excludes the given Worker Workspaces from Follow-up selection.
@@ -629,11 +638,44 @@ impl WorkerActions {
     }
 
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
+    ///
+    /// When [`Self::with_review_findings`] supplied a reviewer's findings, they
+    /// are inlined alongside the human comments and failing checks.
     pub fn review(
         &self,
         worker: &WorkerId,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
+        let (repository, pull_request) = self.pull_request_for(worker)?;
+        let checks = self
+            .commands
+            .failing_checks(&repository, pull_request.number)?;
+        let prompt =
+            build_review_prompt(&repository, &pull_request, &checks, &self.review_findings);
+        self.follow_up(worker, &prompt, None, mode)
+    }
+
+    /// Describes the pull request `review` would review, for a configured AI
+    /// reviewer to review without a local checkout.
+    pub fn review_request(&self, worker: &WorkerId) -> Result<ReviewRequest, WorkerActionError> {
+        let (repository, pull_request) = self.pull_request_for(worker)?;
+        let base = if pull_request.base_ref_name.trim().is_empty() {
+            "main".to_owned()
+        } else {
+            pull_request.base_ref_name.clone()
+        };
+        Ok(ReviewRequest::new(
+            repository,
+            base,
+            pull_request.head_ref_name.clone(),
+        ))
+    }
+
+    /// Returns the `owner/repo` and open pull request for a Worker's bookmark.
+    fn pull_request_for(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<(String, PullRequest), WorkerActionError> {
         let snapshot = self.repository.worker_pool().snapshot();
         let state =
             snapshot
@@ -657,11 +699,7 @@ impl WorkerActions {
             .ok_or_else(|| WorkerActionError::PullRequestNotFound {
                 branch: branch.to_owned(),
             })?;
-        let checks = self
-            .commands
-            .failing_checks(&repository, pull_request.number)?;
-        let prompt = build_review_prompt(&repository, &pull_request, &checks);
-        self.follow_up(worker, &prompt, None, mode)
+        Ok((repository, pull_request))
     }
 
     fn branch_and_workspace(
@@ -886,6 +924,8 @@ struct PullRequest {
     number: u64,
     url: String,
     head_ref_name: String,
+    #[serde(default)]
+    base_ref_name: String,
     mergeable: String,
     #[serde(default)]
     review_decision: String,
@@ -1099,7 +1139,7 @@ impl SystemCommands {
                 "--head",
                 branch,
                 "--json",
-                "number,url,headRefName,mergeable,reviewDecision",
+                "number,url,headRefName,mergeable,reviewDecision,baseRefName",
                 "--limit",
                 "1",
             ],
@@ -1260,7 +1300,12 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[Check]) -> String {
+fn build_review_prompt(
+    repository: &str,
+    pull_request: &PullRequest,
+    checks: &[Check],
+    findings: &[ReviewFinding],
+) -> String {
     let header = if pull_request.url.is_empty() {
         format!("#{}", pull_request.number)
     } else {
@@ -1288,6 +1333,20 @@ fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[C
         pull_request.number, pull_request.number
     ));
     step += 1;
+    if !findings.is_empty() {
+        prompt.push_str(&format!("{step}. Fix these AI reviewer findings:\n"));
+        for finding in findings {
+            prompt.push_str(&format!("   - {}\n", finding.summary()));
+            for line in finding.body().lines() {
+                prompt.push_str(&format!("     {line}\n"));
+            }
+            for suggestion in finding.suggestions() {
+                prompt.push_str(&format!("     Suggested fix: {suggestion}\n"));
+            }
+        }
+        prompt.push('\n');
+        step += 1;
+    }
     prompt.push_str(&format!(
         "{step}. Address each unresolved comment, or explain a reasoned disagreement in the PR.\n\n"
     ));
@@ -1405,4 +1464,58 @@ pub enum WorkerActionError {
     /// The Agent Runtime could not launch or finalize.
     #[error(transparent)]
     Run(#[from] RunSupervisorError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::ReviewSeverity;
+
+    fn pull_request() -> PullRequest {
+        PullRequest {
+            number: 7,
+            url: "https://github.com/o/r/pull/7".to_owned(),
+            head_ref_name: "adam/x".to_owned(),
+            base_ref_name: "main".to_owned(),
+            mergeable: "MERGEABLE".to_owned(),
+            review_decision: "REVIEW_REQUIRED".to_owned(),
+        }
+    }
+
+    fn finding() -> ReviewFinding {
+        ReviewFinding::new(
+            ReviewSeverity::Major,
+            Some("src/x.rs".to_owned()),
+            Some((12, 14)),
+            Some("Unbounded loop".to_owned()),
+            "Cap the loop at the configured pass count.",
+            vec!["let n = max_passes.min(3);".to_owned()],
+        )
+    }
+
+    #[test]
+    fn a_reviewers_findings_are_inlined_into_the_prompt() {
+        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[finding()]);
+
+        assert!(
+            prompt.contains("[major] src/x.rs:12-14 - Unbounded loop"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Cap the loop at the configured pass count."),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Suggested fix: let n = max_passes.min(3);"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn no_findings_leaves_the_prompt_without_a_reviewer_step() {
+        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[]);
+
+        assert!(!prompt.contains("AI reviewer findings"), "{prompt}");
+        assert!(prompt.contains("Fetch all review comments"), "{prompt}");
+    }
 }
