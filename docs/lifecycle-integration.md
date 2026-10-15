@@ -31,13 +31,34 @@ run.
 Both register a single append command on the same event names:
 
 - **Claude Code** - `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`,
-  `PermissionRequest`, and `PostToolUse`.
-- **Codex** - the same set minus `SessionEnd`. A closed Codex session therefore
-  stays `waiting` after its final `Stop` rather than reaching `ended`.
+  `PermissionRequest`, `PostToolUse`, `Notification`, `StopFailure`,
+  `SubagentStart`, `SubagentStop`, `PostToolBatch`, `TaskCreated`,
+  `TaskCompleted`, and `TeammateIdle`.
+- **Codex** - `SessionStart`, `UserPromptSubmit`, `Stop`, `PermissionRequest`,
+  `PostToolUse`, `Interrupt`, `SubagentStart`, and `SubagentStop`. A closed
+  Codex session therefore stays `waiting` after its final `Stop` rather than
+  reaching `ended`.
 
 No hook fires when a permission dialog is *resolved*, so `PostToolUse` is also
 registered: the first tool completing afterwards is the observable "running
 again" signal that clears needs-attention.
+
+Two of the registered events are catch-alls discriminated by a payload field
+rather than the event name, so the config registers them once and the Rust fold
+reads the type:
+
+- **`Notification`** carries `notification_type`. `agent_needs_input` is a
+  genuine blocked-on-a-human signal mapped to needs-attention; the other types
+  (`permission_prompt`, `agent_completed`, `idle_prompt`, ...) are covered by
+  `PermissionRequest` and `Stop` and leave the state alone.
+- **`StopFailure`** carries `error`. `rate_limit` and `billing_error` are a
+  distinct **quota-blocked** outcome (blocked on provider capacity or billing,
+  not on a bug), shown in the workspace list and never auto-retried by
+  orchestration; any other error keeps the ordinary finished-turn mapping.
+
+`SubagentStart`/`SubagentStop`, `PostToolBatch`, `TaskCreated`/`TaskCompleted`,
+and `TeammateIdle` are recorded for live progress on long Runs; they never move
+the agent state.
 
 ### Pi
 
