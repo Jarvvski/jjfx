@@ -206,7 +206,8 @@ impl Repository {
 }
 
 /// The window a spend cap totals over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SpendWindow {
     /// Runs completed today, in the operator's local time.
     Today,
@@ -237,7 +238,8 @@ impl SpendWindow {
 }
 
 /// What Dispatch does once the aggregate reaches the cap.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum SpendCapMode {
     /// Refuse Dispatch until the aggregate drops below the cap or the cap is
     /// raised.

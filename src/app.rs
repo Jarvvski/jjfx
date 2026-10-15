@@ -418,12 +418,14 @@ impl App {
         world_pane: bool,
         tx: UnboundedSender<Msg>,
         tickets: crate::config::TicketsConfig,
+        spend: crate::config::SpendConfig,
     ) -> Self {
         let dispatch_tx = tx.clone();
         let dispatch = WorkspaceDispatchController::new(
             RealWorkspaceDispatch::new(store.repo_root())
                 .with_colocate(store.colocate())
                 .with_tickets(tickets)
+                .with_spend(spend)
                 .with_terminal(Arc::clone(&terminal)),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
@@ -2890,6 +2892,7 @@ mod tests {
             false,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         );
         reveal_idle(&mut app);
         app
@@ -2915,6 +2918,7 @@ mod tests {
             false,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         )
     }
 
@@ -2972,6 +2976,7 @@ mod tests {
             false,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         );
         let mut app = app;
         reveal_idle(&mut app);
@@ -6303,6 +6308,7 @@ mod tests {
             true,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         );
         assert!(app.world_pane());
     }
