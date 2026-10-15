@@ -10,11 +10,13 @@ use crate::config::{SpendConfig, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
-    DispatchBudget, DispatchExclusions, FollowUpExecution, OrchestrationEvent, PoolCapacity,
-    ReadyTicketFilter, Repository, RunActivity, RunActivityKind, RunMode, TerminalSettings,
-    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, WireAgent, WorkerActions,
-    WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
+    DispatchBudget, DispatchExclusions, FollowUpExecution, FollowUpOutcome, OrchestrationEvent,
+    PoolCapacity, ReadyTicketFilter, Repository, ReviewLoop, RunActivity, RunActivityKind, RunMode,
+    TerminalSettings, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
+    WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream,
 };
+use crate::reviewer_source::configured_reviewer;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
 
 pub const HELP: &str = concat!(
@@ -1593,13 +1595,49 @@ fn send_command(
 
 fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result<()> {
     let worker = normalize_worker(value)?;
-    let outcome = WorkerActions::new(repository.clone()).review(&worker, mode)?;
+    let config = crate::config::load()?.review;
+    let Some(reviewer) = configured_reviewer(&config)? else {
+        // No reviewer configured: exactly the pre-reviewer behaviour, one prompt
+        // in the requested mode.
+        let outcome = WorkerActions::new(repository.clone()).review(&worker, mode)?;
+        render_review_outcome(&worker, &outcome);
+        return Ok(());
+    };
+    let actions = WorkerActions::new(repository.clone());
+    let request = actions.review_request(&worker)?;
+    // A background Run returns before it has addressed anything, so only a
+    // foreground review can iterate: it runs the full pass cap, while a
+    // background review is a single pass. The cap is the bound either way.
+    let passes = match mode {
+        RunMode::Foreground => config.max_passes,
+        RunMode::Background => 1,
+    };
+    let summary = ReviewLoop::new(passes).run(&*reviewer, &request, |_, outcome| {
+        if let Some(reason) = outcome.completeness().reason() {
+            eprintln!("Reviewer pass incomplete: {reason}");
+        }
+        let follow_up = actions
+            .clone()
+            .with_review_findings(outcome.findings().to_vec())
+            .review(&worker, mode)?;
+        render_review_outcome(&worker, &follow_up);
+        Ok::<(), crate::engine::WorkerActionError>(())
+    })?;
+    eprintln!(
+        "Review loop: {} pass(es), {} finding(s), stopped on {}.",
+        summary.passes(),
+        summary.findings(),
+        summary.stop().as_str()
+    );
+    Ok(())
+}
+
+fn render_review_outcome(worker: &WorkerId, outcome: &FollowUpOutcome) {
     eprintln!("Agent Runtime: {}", outcome.runtime());
     render_session(outcome.session());
     if let FollowUpExecution::Background(run) = outcome.execution() {
         eprintln!("  {worker} (PID {}) -> review", run.pid());
     }
-    Ok(())
 }
 
 fn render_session(session: &crate::engine::AgentSessionResolution) {
