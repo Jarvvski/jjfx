@@ -7,7 +7,7 @@
 //!
 //! [`App::handle`]: crate::app::App::handle
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tokio::sync::mpsc::UnboundedSender;
@@ -15,6 +15,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::app::{LiftJob, Msg, PendingWorkspace, STATUS_TTL, TidyKind};
 use crate::config::ForgeConfig;
 use crate::diff;
+use crate::engine::{MutationGuard, MutationKind, REPOSITORY_WIDE_MUTATION, Repository};
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::jj::{self, Jj};
@@ -86,6 +87,39 @@ pub(crate) struct Runtime {
     colocate: bool,
     /// Where full failure text is appended; `None` disables logging (tests).
     failure_log: Option<PathBuf>,
+}
+
+/// The Workspace key and mutation kind a lift is recorded under.
+///
+/// A lift of every Workspace is not confined to one Workspace, so it is recorded
+/// repository-wide rather than as any one Workspace's mutation.
+fn lift_target(job: &LiftJob) -> (String, MutationKind) {
+    match job {
+        LiftJob::Workspace(workspace) => (workspace.clone(), MutationKind::Weld),
+        LiftJob::All => (REPOSITORY_WIDE_MUTATION.to_owned(), MutationKind::Weld),
+    }
+}
+
+/// Run one jjfx-initiated mutation, recording the operation the repository was
+/// at before it so the mutation can be undone from the tool.
+///
+/// Recording is best-effort: the mutation is the caller's goal and must run
+/// whether or not the record can be written. A mutation that changed nothing is
+/// not recorded (see [`Repository::finish_mutation`]), so it cannot displace the
+/// record of the last mutation that did.
+fn recording_mutation<T>(
+    repo_root: &Path,
+    workspace: &str,
+    kind: MutationKind,
+    run: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let repository = Repository::open(repo_root).ok();
+    let guard = repository
+        .as_ref()
+        .map(|repository| MutationGuard::begin(repository, workspace, kind));
+    let result = run();
+    drop(guard);
+    result
 }
 
 impl Runtime {
@@ -265,9 +299,12 @@ impl Runtime {
         let repo_root = self.repo_root.clone();
         tokio::spawn(async move {
             let worker_job = job.clone();
-            let result = tokio::task::spawn_blocking(move || match worker_job {
-                LiftJob::Workspace(ws) => jj::lift(&repo_root, &ws),
-                LiftJob::All => jj::lift_all(&repo_root),
+            let result = tokio::task::spawn_blocking(move || {
+                let (workspace, kind) = lift_target(&worker_job);
+                recording_mutation(&repo_root, &workspace, kind, || match worker_job {
+                    LiftJob::Workspace(ws) => jj::lift(&repo_root, &ws),
+                    LiftJob::All => jj::lift_all(&repo_root),
+                })
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));
@@ -314,10 +351,20 @@ impl Runtime {
     fn tidy(&self, kind: TidyKind) {
         let tx = self.tx.clone();
         let jj = Arc::clone(&self.jj);
+        let repo_root = self.repo_root.clone();
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || match kind {
-                TidyKind::Workspaces => jj.tidyws(),
-                TidyKind::Abandon => jj.tidy(),
+            let result = tokio::task::spawn_blocking(move || {
+                // A tidy sweep is not confined to one Workspace, so it is
+                // recorded as repository-wide rather than as any one Workspace's.
+                recording_mutation(
+                    &repo_root,
+                    REPOSITORY_WIDE_MUTATION,
+                    MutationKind::Tidy,
+                    || match kind {
+                        TidyKind::Workspaces => jj.tidyws(),
+                        TidyKind::Abandon => jj.tidy(),
+                    },
+                )
             })
             .await
             .unwrap_or_else(|e| Err(anyhow::anyhow!(e)));

@@ -18,6 +18,7 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::cmd::cmd;
 use crate::config::ForgeConfig;
+use crate::engine::{MutationGuard, MutationKind, Repository};
 use crate::jj::{FixOutcome, PushOutcome};
 
 mod pull_requests;
@@ -238,6 +239,9 @@ pub(crate) struct Forge {
     jj: Arc<dyn JjAdapter>,
     gpg: Arc<dyn GpgAdapter>,
     github: Arc<dyn GitHubAdapter>,
+    /// The repository facade the undo records are written through, when the
+    /// Forge is bound to a real repository (it is absent in unit tests).
+    repository: Option<Repository>,
 }
 
 impl Forge {
@@ -245,9 +249,12 @@ impl Forge {
     pub(crate) fn new(repo_root: PathBuf, config: ForgeConfig) -> Self {
         Self {
             config,
-            jj: Arc::new(SystemJj { repo_root }),
+            jj: Arc::new(SystemJj {
+                repo_root: repo_root.clone(),
+            }),
             gpg: Arc::new(SystemGpg),
             github: Arc::new(SystemGitHub),
+            repository: Repository::open(&repo_root).ok(),
         }
     }
 
@@ -262,6 +269,7 @@ impl Forge {
             jj,
             gpg,
             github: Arc::new(SystemGitHub),
+            repository: None,
         }
     }
 
@@ -277,6 +285,7 @@ impl Forge {
             jj,
             gpg,
             github,
+            repository: None,
         }
     }
 
@@ -287,8 +296,17 @@ impl Forge {
         let jj = Arc::clone(&self.jj);
         let gpg = Arc::clone(&self.gpg);
         let github = Arc::clone(&self.github);
+        let repository = self.repository.clone();
         tokio::task::spawn_blocking(move || {
-            run_pipeline(&tx, &targets, config, &*jj, &*gpg, &*github)
+            run_pipeline(
+                &tx,
+                &targets,
+                config,
+                &*jj,
+                &*gpg,
+                &*github,
+                repository.as_ref(),
+            )
         });
         rx
     }
@@ -572,6 +590,7 @@ fn run_pipeline(
     jj: &dyn JjAdapter,
     gpg: &dyn GpgAdapter,
     github: &dyn GitHubAdapter,
+    repository: Option<&Repository>,
 ) {
     let mut progress = vec![Progress::running(); targets.len()];
     for (target, state) in targets.iter().zip(&progress) {
@@ -625,6 +644,11 @@ fn run_pipeline(
     };
 
     for (target, state) in targets.iter().zip(&mut progress) {
+        // Record the operation the repository is at before this Workspace's
+        // weld, so the whole forge of this Workspace can be undone from the tool.
+        // The guard completes the record on every exit from the body below.
+        let _undo = repository
+            .map(|repository| MutationGuard::begin(repository, &target.name, MutationKind::Forge));
         if stop_on_conflicts(tx, target, state, jj.has_conflict(&target.dir)) {
             continue;
         }
