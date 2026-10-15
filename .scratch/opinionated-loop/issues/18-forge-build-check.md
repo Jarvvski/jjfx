@@ -1,6 +1,6 @@
 # Verify a change builds against trunk before the forge pushes it
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -68,13 +68,13 @@ config section and the failure shape.
 
 ## Acceptance Criteria
 
-- [ ] With a check configured, a change that does not build against merged trunk
+- [x] With a check configured, a change that does not build against merged trunk
       fails before the push, naming the command and its output.
-- [ ] With no check configured, the forge behaves exactly as today.
-- [ ] A check that cannot run (missing command, timeout) fails loudly and does not
+- [x] With no check configured, the forge behaves exactly as today.
+- [x] A check that cannot run (missing command, timeout) fails loudly and does not
       report success.
-- [ ] The check runs against the welded (trunk-based) tree, not the pre-weld tree.
-- [ ] `mise run check` is green.
+- [x] The check runs against the welded (trunk-based) tree, not the pre-weld tree.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -99,3 +99,15 @@ config section and the failure shape.
   the lifecycle rather than an optimisation. Filed as the compile half first
   because it is universal and cheap; the trust boundary it closes is the whole
   `done` signal.
+- 2026-10-15: Resolved.
+  - `[checks]` (`command`, `enabled`, `timeout_secs`) names the repo-owned command; `enabled` is on by default and `command` unset is the no-op, so an unconfigured repo is not forced into a guessed default. Validated at load (a blank command or a zero timeout fails at startup).
+  - The runner (`src/checks.rs`) runs the command through the user's shell (`sh -c`) in the **workspace's** working copy, bounded by `timeout_secs`, and classifies a typed `Outcome`: `NotConfigured` / `Passed` / `Failed { command, output }` / `CouldNotRun { command, detail }`. It runs on the forge pipeline's `spawn_blocking` thread, which is already off the UI thread (bug-hunt 17).
+  - `Step::Check` sits **between Weld and Push**, so it sees the just-welded, trunk-based tree - the point of the ticket. A failure, or a check that cannot run, stops the push and names the command and the last line of its output.
+  - Decisions:
+    - **"Could not run" is exact.** The command runs through `sh -c`, so a missing command would otherwise be just exit 127. `Run` gained `code()`, and 126/127 map to `CouldNotRun` - a check that checked nothing must not read as a pass.
+    - **The reason is one bounded line** (the tool's own summary line, ≤240 chars). `Failed`/`CouldNotRun` keep the whole output; the footer is a single line, so only the summary is shown.
+    - **An unconfigured check is `Status::NotApplicable`**, which counts as clean and is not drawn - so an unconfigured repo's pipeline, result and row are exactly as before. `NotApplicable` is a new `Status` rather than reusing `Skipped`, because `Skipped` carries a reason and would retain progress, changing today's behaviour.
+    - **`forge::Settings`** bundles `[forge]` and `[checks]` into one `Runtime::new` parameter (the positional list had reached clippy's argument limit).
+  - `[checks]` shares `[migrations]`'s section shape (doc comment, `deny_unknown_fields`, `impl Default`, `fn validate`) and its docs sit beside it; both are cross-PR-set hazards that belong before the push.
+  - Commits: the config section landed alone; the runner and its wiring landed together - the runner is dead code until the pipeline calls it, and `mise run lint` is `-D warnings` - with `Step::Check`, the failure stop, and the render in that commit; docs and changelog last. Tests landed with the code (TDD): the acceptance tests are `the_build_check_runs_against_the_welded_tree_between_weld_and_push` (the check only passes because Weld materialised the tree first, and it asserts the cwd), `a_change_that_does_not_build_stops_the_push_and_names_the_command`, `a_check_that_cannot_run_stops_the_push`, `an_unconfigured_repo_does_not_run_a_check_and_still_pushes`, and the runner's own outcome tests.
+  - Scope held: no language-specific command shipped, no test-suite gate, and required CI checks are not read.
