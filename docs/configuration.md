@@ -247,8 +247,32 @@ error rather than silently skipping the review.
 See [The review loop](review-loop.md) for what a configured reviewer does, how
 the pass cap bounds it, and how it authenticates without leaking credentials.
 
-## Legacy `[workspace]`
+## `[migrations]`
 
+How the cross-workspace migration-order check finds migrations. Parallel Workers
+can each add an ordered migration and be individually correct yet wrong as a
+*set*: two workspaces adding `V189` and `V190` land out of order if the higher
+version merges first, which Flyway rejects on the next deploy when `outOfOrder`
+is unset - and CI never sees it, because CI applies the whole set in version
+order on a fresh database.
+
+`jjfx check migrations` reads each open workspace's working copy - the files on
+disk, including a migration an agent has written but not committed - and reports
+any inversion before either merges, exiting non-zero on a hazard so an agent can
+gate on it. The check is read-only; it never reorders or rewrites. The same
+report also leads the TUI's workspace list as a notice.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `pattern` | `"**/V*__*.sql"` | The glob a migration file's repo-relative path must match. `**` matches zero or more path segments, `*` any run of characters within one, `?` one. Set it to your own layout so a non-Flyway project is not forced into Flyway's shape. |
+
+Two migrations in the same directory are one ordering space, so a per-module
+project keeps each module's sequence separate. The `default` workspace's files
+are the baseline, so a migration every workspace inherits is not an addition and
+cannot invert; two workspaces adding the *same* version are reported as
+ambiguous rather than silently ordered.
+
+## Legacy `[workspace]`
 Earlier releases configured new-workspace provisioning with a `[workspace]`
 section (for example `on_create = ["mise", "trust"]`). That moved into
 repository-owned lifecycle hooks - see [Workspace hooks](workspace-hooks.md).

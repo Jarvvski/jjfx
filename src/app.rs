@@ -253,6 +253,8 @@ pub enum Msg {
     AgentEvent(agent::Event),
     /// A freshly computed work-lifecycle snapshot, keyed by workspace name.
     WorkSnapshot(HashMap<String, Work>),
+    /// The cross-workspace migration-order report (ticket 17).
+    MigrationReport(crate::migrations::Report),
     /// A Workspace Dispatch controller event.
     WorkspaceDispatch(WorkspaceDispatchEvent),
     /// A forge pipeline transition (ticket 08).
@@ -340,6 +342,9 @@ pub struct App {
     /// Latest work-lifecycle snapshot per workspace, keyed by workspace name.
     /// Missing entries render as unknown until the first snapshot arrives.
     work: HashMap<String, Work>,
+    /// The latest cross-workspace migration-order report (ticket 17). Empty until
+    /// the first poll; a hazard surfaces as a leading notice row.
+    migrations: crate::migrations::Report,
     /// The deep Workspace Dispatch seam for Pool commands and events.
     dispatch: WorkspaceDispatchController,
     /// All Worker Pool interaction state and its operation-identity rules.
@@ -435,6 +440,7 @@ impl App {
             store,
             agents,
             work: HashMap::new(),
+            migrations: crate::migrations::Report::default(),
             dispatch,
             pool: PoolSession::default(),
             next_operation: 0,
@@ -477,6 +483,7 @@ impl App {
             Msg::Reload => self.reload(),
             Msg::AgentEvent(ev) => self.on_agent_event(ev),
             Msg::WorkSnapshot(work) => self.work = work,
+            Msg::MigrationReport(report) => self.migrations = report,
             Msg::WorkspaceDispatch(event) => self.on_workspace_dispatch(event),
             Msg::Forge(update) => self.on_forge(update),
             Msg::Fetched(result) => self.on_fetched(result),
@@ -2465,17 +2472,25 @@ impl App {
     fn home_view(&self) -> HomeView<'_> {
         let inputs = self.row_inputs();
         let classified = self.list.view(&inputs);
-        let rows = classified
-            .rows()
-            .iter()
-            .map(|row| match row {
-                Row::Header(attention, count) => HomeRowKind::Header {
-                    attention: *attention,
-                    count: *count,
-                },
-                Row::Ws(row) => HomeRowKind::Workspace(self.home_row(row)),
-            })
-            .collect();
+        let mut rows: Vec<HomeRowKind> = Vec::new();
+        // A cross-workspace migration-order hazard leads the list, above the
+        // Attention lanes: no single row owns it, and the owner must see it
+        // before merging either workspace.
+        if !self.migrations.is_clean() {
+            rows.push(HomeRowKind::Notice {
+                text: format!(
+                    "migration order: {} - run `jjfx check migrations`",
+                    self.migrations.summary()
+                ),
+            });
+        }
+        rows.extend(classified.rows().iter().map(|row| match row {
+            Row::Header(attention, count) => HomeRowKind::Header {
+                attention: *attention,
+                count: *count,
+            },
+            Row::Ws(row) => HomeRowKind::Workspace(self.home_row(row)),
+        }));
         let title = match &self.pool.worker_pool {
             Some(snapshot) if snapshot.diagnostics().is_empty() => format!(
                 "jjfx - {} workspace(s)  [pool]",
@@ -2877,6 +2892,29 @@ mod tests {
             *self.tidy_calls.lock().unwrap() += 1;
             self.result(self.outcome.tidy_n)
         }
+    }
+
+    #[test]
+    fn a_migration_hazard_leads_the_home_list_as_a_notice() {
+        let mut app = app_with(&["default", "a"]);
+        app.handle(Msg::MigrationReport(
+            crate::migrations::Report::inversion_for_test(),
+        ));
+        let view = app.home_view();
+        assert!(
+            matches!(
+                view.rows.first(),
+                Some(HomeRowKind::Notice { text }) if text.contains("migration order")
+            ),
+            "a hazard must lead the list with a notice"
+        );
+
+        // A clean report drops the notice entirely.
+        app.handle(Msg::MigrationReport(crate::migrations::Report::default()));
+        assert!(!matches!(
+            app.home_view().rows.first(),
+            Some(HomeRowKind::Notice { .. })
+        ));
     }
 
     fn app_with(names: &[&str]) -> App {

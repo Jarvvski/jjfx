@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
-use crate::config::{SpendConfig, TicketsConfig};
+use crate::config::{MigrationsConfig, SpendConfig, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
@@ -16,6 +16,7 @@ use crate::engine::{
     WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
     WorkspaceHookStream,
 };
+use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
 
@@ -71,7 +72,9 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " open-pr <worker>         Open a Worker's Pull Request (pr)\n\nCompletion:\n  ",
     env!("CARGO_PKG_NAME"),
-    " completion [zsh]         Print zsh completion\n\nObservability:\n  ",
+    " completion [zsh]         Print zsh completion\n\nChecks:\n  ",
+    env!("CARGO_PKG_NAME"),
+    " check migrations          Flag migration-order inversions across workspaces\n\nObservability:\n  ",
     env!("CARGO_PKG_NAME"),
     " status [--json]           Alias for pool list\n  ",
     env!("CARGO_PKG_NAME"),
@@ -136,6 +139,7 @@ pub enum Command {
     Completion {
         shell: String,
     },
+    Check(CheckCommand),
     InternalComplete {
         mode: String,
     },
@@ -157,6 +161,13 @@ pub enum ColocationAction {
     Enable,
     Disable,
     Status,
+}
+
+/// The read-only cross-workspace checks `jjfx check` can run.
+#[derive(Debug, PartialEq, Eq)]
+pub enum CheckCommand {
+    /// Flag migration-order inversions across the open workspaces.
+    Migrations,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -250,6 +261,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         )
         .map(|worker| Command::OpenPullRequest { worker }),
         "completion" => parse_completion(&args[1..]),
+        "check" => parse_check(&args[1..]),
         "__complete" => parse_worker_command(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " __complete <mode>"),
             &args[1..],
@@ -263,6 +275,18 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "__orchestrate" => parse_orchestrate(&args[1..]),
         "pool" => parse_pool(&args[1..]),
         unknown => bail!("Unknown command: {unknown}. Run '{PROGRAM} help' for usage."),
+    }
+}
+
+/// Parse `check <what>`, the read-only cross-workspace checks.
+fn parse_check(args: &[String]) -> Result<Command> {
+    match args.first().map(String::as_str) {
+        Some("migrations") => Ok(Command::Check(CheckCommand::Migrations)),
+        _ => bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " check migrations"
+        )),
     }
 }
 
@@ -670,19 +694,36 @@ impl From<PoolCommand> for Command {
     }
 }
 
-/// Route a CLI invocation. `launch` enters the interactive TUI; `terminal_settings`
-/// lazily resolves the configured terminal settings (the first-pane command and
-/// the display-selected layout), which only `mount` consumes - so no other
-/// command reads the config file.
-pub fn run(
-    args: Vec<String>,
-    launch: fn(PathBuf) -> Result<()>,
-    terminal_settings: fn() -> Result<TerminalSettings>,
-    colocate: fn() -> Result<bool>,
-    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
-    tickets: fn() -> Result<TicketsConfig>,
-    spend: fn() -> Result<SpendConfig>,
-) -> Result<()> {
+/// The settings a CLI invocation resolves lazily, so a command only reads the
+/// config file it actually uses. Bundled rather than threaded positionally: the
+/// list outgrew a readable argument list.
+pub struct Settings {
+    /// The terminal settings `mount` reads.
+    pub terminal: fn() -> Result<TerminalSettings>,
+    /// Whether new workspaces are colocated with Git.
+    pub colocate: fn() -> Result<bool>,
+    /// The workspaces currently open in the terminal jjfx drives.
+    pub open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+    /// Where Dispatch discovers Ready Tickets.
+    pub tickets: fn() -> Result<TicketsConfig>,
+    /// The aggregate spend cap Dispatch is gated on.
+    pub spend: fn() -> Result<SpendConfig>,
+    /// How the migration-order check finds migrations.
+    pub migrations: fn() -> Result<MigrationsConfig>,
+}
+
+/// Route a CLI invocation. `launch` enters the interactive TUI; the rest of the
+/// [`Settings`] resolve lazily, so a command reads only the config it uses - no
+/// command pays for a file it never opens.
+pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Settings) -> Result<()> {
+    let Settings {
+        terminal: terminal_settings,
+        colocate,
+        open_workspaces,
+        tickets,
+        spend,
+        migrations,
+    } = settings;
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
         Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
@@ -728,6 +769,9 @@ pub fn run(
         Command::Absorb { worker } => absorb_command(&repository(colocate)?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
+        Command::Check(CheckCommand::Migrations) => {
+            check_migrations_command(&repository(colocate)?, &migrations()?)?
+        }
         Command::InternalComplete { mode } => internal_complete_command(&mode)?,
         Command::InternalForeground { arguments } => {
             crate::engine::run_wrapper(&arguments)?;
@@ -784,6 +828,38 @@ fn where_command(repository: &Repository) -> Result<()> {
         repository.workspaces().base_dir().display()
     );
     Ok(())
+}
+
+/// Run the read-only cross-workspace migration-order check and print its report.
+/// It never reorders or rewrites anything. Exits non-zero when the set has a
+/// hazard, so an agent can gate a merge on it.
+fn check_migrations_command(repository: &Repository, migrations: &MigrationsConfig) -> Result<()> {
+    let report = crate::migrations::check(repository.root(), &migrations.pattern)?;
+    if report.is_clean() {
+        println!(
+            "no migration-order inversions across the workspaces (`{}`)",
+            migrations.pattern
+        );
+        return Ok(());
+    }
+    println!(
+        "migration-order hazards across the workspaces (`{}`):",
+        migrations.pattern
+    );
+    for finding in report.findings() {
+        let heading = match finding.kind {
+            FindingKind::Inversion => "merge in this order",
+            FindingKind::Ambiguous => "ambiguous version - resolve before merging",
+        };
+        println!("\n{} - {heading}:", finding.space);
+        for migration in &finding.migrations {
+            println!(
+                "  V{}  {}  {}",
+                migration.version, migration.workspace, migration.path
+            );
+        }
+    }
+    anyhow::bail!("migration-order check failed: {}", report.summary())
 }
 
 fn path_command(repository: &Repository, name: &str) -> Result<()> {
@@ -2068,6 +2144,16 @@ mod tests {
     fn parser_rejects_unknown_dispatch_options_and_budgeted_orchestration() {
         assert!(parse(&args(&["dispatch", "AMBA-42", "--wat"])).is_err());
         assert!(parse(&args(&["dispatch", "AMBA-42", "--budget", "12"])).is_err());
+    }
+
+    #[test]
+    fn check_parser_accepts_migrations_and_rejects_anything_else() {
+        assert_eq!(
+            parse(&args(&["check", "migrations"])).unwrap(),
+            Command::Check(CheckCommand::Migrations)
+        );
+        assert!(parse(&args(&["check"])).is_err());
+        assert!(parse(&args(&["check", "wat"])).is_err());
     }
 
     #[test]

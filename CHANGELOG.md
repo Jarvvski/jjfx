@@ -41,6 +41,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Bound the re-review loop with a pass cap, so `jjfx review --fg` iterates review -> address -> review without looping to zero
 - Review feedback that belongs in a base commit now goes through `jj new <commit>` + `jj absorb` instead of a hand-split
 - Add `jjfx absorb <worker>`, which folds a Worker's working-copy edits into their base commits and pushes the rewritten bookmark
+- Flag migration-order inversions across the open workspaces with `jjfx check migrations` and a leading TUI notice: read each workspace's working copy for files matching a configurable `[migrations] pattern` (default `**/V*__*.sql`) and report two workspaces adding distinct versions (an inversion, listed in merge order) or the same version (ambiguous).
 
 ## [0.54.0] - 2026-10-14
 

@@ -21,9 +21,18 @@ use crate::store::WorkspacePath;
 /// home body is shorter than this the pane is dropped so the list stays usable.
 const MIN_WORLD_PANE_HEIGHT: u16 = 5;
 
-/// One rendered home-list line: a group header or a workspace row.
+/// One rendered home-list line: a group header, a cross-workspace hazard notice,
+/// or a workspace row.
 pub(crate) enum HomeRowKind<'a> {
-    Header { attention: Attention, count: usize },
+    /// A leading, non-selectable notice about the whole set - currently a
+    /// migration-order hazard across the open workspaces (ticket 17).
+    Notice {
+        text: String,
+    },
+    Header {
+        attention: Attention,
+        count: usize,
+    },
     Workspace(HomeRow<'a>),
 }
 
@@ -81,6 +90,7 @@ pub(crate) fn draw(
         .iter()
         .enumerate()
         .map(|(i, row)| match row {
+            HomeRowKind::Notice { text } => notice_item(text),
             HomeRowKind::Header { attention, count } => {
                 header_item(*attention, *count, view.idle_collapsed)
             }
@@ -116,6 +126,17 @@ pub(crate) fn draw(
 
     frame.render_widget(footer, footer_area);
 }
+/// A leading notice row: a cross-workspace hazard the owner should see before
+/// merging, drawn in the needs-you amber so it reads as "act on this".
+pub(crate) fn notice_item(text: &str) -> ListItem<'static> {
+    ListItem::new(Line::from(Span::styled(
+        format!(" ! {text}"),
+        Style::default()
+            .fg(attention_color(Attention::NeedsYou))
+            .add_modifier(Modifier::BOLD),
+    )))
+}
+
 /// A group-header row: the lane glyph, Attention heading, count, and a fold
 /// hint for idle.
 pub(crate) fn header_item(att: Attention, count: usize, idle_collapsed: bool) -> ListItem<'static> {
@@ -394,6 +415,38 @@ mod tests {
         let text = term.backend().to_string();
         assert!(text.contains("feature"), "{text}");
         assert!(!text.contains(" world "), "{text}");
+    }
+
+    #[test]
+    fn a_migration_notice_leads_the_list_above_the_lanes() {
+        let ws = Workspace {
+            name: "feature".to_string(),
+            path: WorkspacePath::Present(std::path::PathBuf::from("/tmp/feature")),
+        };
+        let view = HomeView {
+            rows: vec![
+                HomeRowKind::Notice {
+                    text: "migration order: 1 migration inversion(s)".to_string(),
+                },
+                HomeRowKind::Header {
+                    attention: Attention::NeedsYou,
+                    count: 1,
+                },
+                HomeRowKind::Workspace(row(&ws, Attention::NeedsYou)),
+            ],
+            selected: Some("feature"),
+            idle_collapsed: false,
+            tick: 0,
+            title: "jjfx".to_string(),
+        };
+        let state = RenderState::default();
+        let mut term = Terminal::new(TestBackend::new(120, 12)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), Vec::new()))
+            .unwrap();
+        let text = term.backend().to_string();
+        let notice = text.find("migration order").expect("the notice is drawn");
+        let header = text.find("needs you").expect("the lane header is drawn");
+        assert!(notice < header, "the notice must lead the lanes:\n{text}");
     }
 
     #[test]

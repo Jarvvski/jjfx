@@ -1,6 +1,6 @@
 # Flag migration-order inversions across open workspaces
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -64,13 +64,13 @@ the bookmark's committed tree, which may lag).
 
 ## Acceptance Criteria
 
-- [ ] Two workspaces adding `V189` and `V190` in either arrangement produce a
+- [x] Two workspaces adding `V189` and `V190` in either arrangement produce a
       named inversion report before either is merged.
-- [ ] A set with no inversions reports clean.
-- [ ] Two migrations with the **same** version are reported as ambiguous.
-- [ ] The pattern is configurable and a project with no matching files is a
+- [x] A set with no inversions reports clean.
+- [x] Two migrations with the **same** version are reported as ambiguous.
+- [x] The pattern is configurable and a project with no matching files is a
       no-op.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -91,3 +91,11 @@ the bookmark's committed tree, which may lag).
 - 2026-10-15: Filed from the strategy review. The closest of the three new
   tickets to jjfx's existing data - it is a pure read over workspaces jjfx
   already enumerates, so it is the cheapest way to close a cross-PR hazard.
+- 2026-10-15: Resolved. Verification-first, against a real `V*__*.sql` project:
+  - **The failure mode is real.** Built a Flyway-shaped repo (trunk `V188`), two workspaces each adding a migration, and merged them in the wrong order: trunk then added `V190` before `V189`, so the file-added order was 188, 190, 189. Flyway with `outOfOrder` unset applies in version order and rejects the later `V189` on the next deploy, while CI (fresh database, applied in version order) never sees it.
+  - **The working copy is the right unit.** A workspace's migration lived in its working copy on disk while `jj file list -r '<ws>@'` (run from another workspace) still showed only the baseline - jj snapshots only the current working copy, so a committed-tree read lags. The check reads the files on disk in each workspace's directory.
+  - What landed: `src/migrations.rs` reads every workspace's working copy for files matching `[migrations] pattern` (default `**/V*__*.sql`) and parses each version; the `default` workspace's files are the baseline (an inherited file is not an addition), the rest are grouped by directory - the ordering space, so per-module sequences stay separate - and reported when **two or more** workspaces contribute: distinct versions as an inversion listed in merge order, the same version as ambiguous. `jjfx check migrations` prints the report and exits non-zero on a hazard; the TUI leads its list with the same notice.
+  - Read-only throughout: it reports, never reorders or rewrites.
+  - A single workspace's own migrations are not compared - they merge together and cannot invert against themselves - which is what makes "no inversions reports clean" hold. A project whose files match no pattern is a no-op.
+  - Decision: the ordering space is the containing **directory** (per-module safe by construction); the `default` workspace is the baseline. Both follow the ticket's "scoped, and guessing that wrong produces false positives" note.
+  - The real-jj acceptance test surfaced a bug: jj reports `default` by name while jjfx also pins it to the repository root, so the read enumerated it twice; deduplicated by name.
