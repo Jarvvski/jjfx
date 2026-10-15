@@ -1,6 +1,6 @@
 # API-native `send`, follow-up, and permission resolution for opencode
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -38,14 +38,14 @@ fallback when the API is unreachable or too old, exactly as the stop/liveness wo
 
 ## Acceptance Criteria
 
-- [ ] An opencode `send` reaches the recorded session via `prompt_async` and does
+- [x] An opencode `send` reaches the recorded session via `prompt_async` and does
       not depend on a PTY.
-- [ ] A pending permission request can be answered from the TUI and clears
+- [x] A pending permission request can be answered from the TUI and clears
       `NeedsAttention`.
-- [ ] When the API is unavailable, behaviour falls back to the existing path and
+- [x] When the API is unavailable, behaviour falls back to the existing path and
       never fails a Run.
-- [ ] claude/codex are unchanged.
-- [ ] `mise run check` is green.
+- [x] claude/codex are unchanged.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -64,3 +64,5 @@ fallback when the API is unreachable or too old, exactly as the stop/liveness wo
 
 - 2026-10-15: Filed from the strategy review. Endpoints verified against the
   opencode server docs; the client seam already exists.
+- 2026-10-15: Landed. `opencode_api.rs` gains `prompt_async` (`session.prompt`), `reply_permission` (`session.permission.reply`), and `pending_permissions` (`session.permission.list`), all on the existing unavailable-versus-rejected contract. An opencode `send`/Follow-up to a Worker whose Run session jjfx recorded is delivered straight to that session through the daemon - no client process, no terminal - and anything the API cannot do (unreachable, too old, rejected) falls back to the existing client invocation, so claude/codex/pi are untouched. The Pool view gains `p` to answer a pending permission (once/always/reject) without mounting, which is what lets `NeedsAttention` clear. Pinned by 5 client unit tests, 7 `agent_runtime` integration tests against a fake `opencode` on `PATH`, and 2 app tests.
+- 2026-10-15: Endpoint names differ from the ticket's docs links. The installed opencode (v2.0.29) exposes `session.prompt` for the asynchronous prompt the docs call `prompt_async`, and `session.permission.reply` for the reply route, so the client uses the operation ids the running server actually has (the docs' `POST /session/:id/permissions/:permissionID` is the v1 route).
