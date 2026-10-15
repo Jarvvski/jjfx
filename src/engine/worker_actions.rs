@@ -1348,7 +1348,7 @@ fn build_review_prompt(
         step += 1;
     }
     prompt.push_str(&format!(
-        "{step}. Address each unresolved comment, or explain a reasoned disagreement in the PR.\n\n"
+        "{step}. Address each unresolved comment, or explain a reasoned disagreement in the PR. Decide where each fix belongs before you make it:\n   - A fix to code this PR already introduced belongs in the commit that introduced it - not in a new commit stacked on top, and not in a hand-split. Find that commit with `jj log`, start an edit on top of it with `jj new <commit>`, make the change, then run `jj absorb`. jj moves each hunk into the closest mutable ancestor where those lines last changed, and abandons the edit commit once every hunk has landed (describe the edit if you want to keep it).\n   - `jj absorb` can leave the commits above it conflicted: resolve every conflict it reports, or run `jj undo` and address that feedback on top of `@` instead.\n   - Feedback that does not belong in an existing commit - a new file, a new test - is an ordinary edit on `@`.\n\n"
     ));
     step += 1;
     if !checks.is_empty() {
@@ -1517,5 +1517,21 @@ mod tests {
 
         assert!(!prompt.contains("AI reviewer findings"), "{prompt}");
         assert!(prompt.contains("Fetch all review comments"), "{prompt}");
+    }
+
+    #[test]
+    fn the_prompt_sends_base_commit_feedback_through_jj_new_and_absorb() {
+        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[]);
+
+        assert!(prompt.contains("`jj new <commit>`"), "{prompt}");
+        assert!(prompt.contains("`jj absorb`"), "{prompt}");
+        // The manual alternatives the prompt must steer away from.
+        assert!(prompt.contains("not in a hand-split"), "{prompt}");
+        assert!(
+            prompt.contains("not in a new commit stacked on top"),
+            "{prompt}"
+        );
+        // Absorb can conflict the commits above it, so the prompt says so.
+        assert!(prompt.contains("conflicted"), "{prompt}");
     }
 }
