@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use crate::engine::{
     AgentRuntime, AgentSessionResolution, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
-    DispatchGroupProgress, DispatchGroupStatusCounts, PermissionDecision, PoolCapacity,
-    ReadyTicketFilter, RunActivity, RunMode, RunResult, TicketDiscovery, TicketId, TicketStatus,
-    WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
+    DispatchGroupProgress, DispatchGroupStatusCounts, MutationKind, PermissionDecision,
+    PoolCapacity, ReadyTicketFilter, RunActivity, RunMode, RunResult, TicketDiscovery, TicketId,
+    TicketStatus, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 mod adapter;
@@ -229,6 +229,14 @@ pub enum WorkerCommandResult {
         action: String,
         decision: PermissionDecision,
     },
+    /// The last jjfx-initiated mutation on a Worker was undone through jj's
+    /// operation log.
+    MutationUndone {
+        worker: String,
+        kind: MutationKind,
+        discarded: usize,
+        later: usize,
+    },
 }
 
 impl WorkerCommandResult {
@@ -259,6 +267,21 @@ impl WorkerCommandResult {
                 "Answered {worker}'s {action} permission request ({})",
                 decision.as_str()
             ),
+            Self::MutationUndone {
+                worker,
+                kind,
+                discarded,
+                later,
+            } => {
+                let base = format!("Undid the last {kind} on {worker} ({discarded} operations)");
+                if *later > 0 {
+                    format!(
+                        "{base}; the repository-wide restore also discarded {later} later operation(s)"
+                    )
+                } else {
+                    base
+                }
+            }
         }
     }
 }
@@ -347,6 +370,11 @@ pub enum WorkspaceDispatchCommand {
         operation: OperationId,
         worker: String,
         decision: PermissionDecision,
+    },
+    /// Undo the last jjfx-initiated mutation on one Worker.
+    Undo {
+        operation: OperationId,
+        worker: String,
     },
     /// Start one cancellable latest-activity Worker log watcher.
     WatchWorkerLog {
@@ -1042,6 +1070,12 @@ impl WorkspaceDispatchController {
                 }
                 Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
             },
+            WorkspaceDispatchCommand::Undo { operation, worker } => match adapter.undo(&worker) {
+                Ok(result) => {
+                    emit(WorkspaceDispatchEvent::WorkerCommandCompleted { operation, result })
+                }
+                Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
+            },
             WorkspaceDispatchCommand::WatchWorkerLog { operation, worker } => {
                 let cancel = Arc::new(AtomicBool::new(false));
                 if let Some(previous) = watchers
@@ -1412,6 +1446,21 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
             worker: worker.to_owned(),
             action: "bash".to_owned(),
             decision,
+        })
+    }
+
+    fn undo(&self, worker: &str) -> Result<WorkerCommandResult, String> {
+        self.commands.lock().expect("recording adapter lock").push(
+            WorkspaceDispatchCommand::Undo {
+                operation: 0,
+                worker: worker.to_owned(),
+            },
+        );
+        Ok(WorkerCommandResult::MutationUndone {
+            worker: worker.to_owned(),
+            kind: MutationKind::Forge,
+            discarded: 2,
+            later: 0,
         })
     }
 

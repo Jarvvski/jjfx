@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -10,11 +11,11 @@ use crate::config::{MigrationsConfig, SpendConfig, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
-    DispatchBudget, DispatchExclusions, FollowUpExecution, FollowUpOutcome, OrchestrationEvent,
-    PoolCapacity, ReadyTicketFilter, Repository, ReviewLoop, RunActivity, RunActivityKind, RunMode,
-    TerminalSettings, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
-    WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
-    WorkspaceHookStream,
+    DispatchBudget, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
+    OrchestrationEvent, PoolCapacity, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
+    RunActivityKind, RunMode, TerminalSettings, TicketDetails, TicketDiscovery, TicketId,
+    TicketQuery, TicketStatus, UndoOutcome, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
+    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream, REPOSITORY_WIDE_MUTATION,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -70,7 +71,9 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " absorb <worker>          Fold a Worker's edits into their base commits (ab)\n  ",
     env!("CARGO_PKG_NAME"),
-    " open-pr <worker>         Open a Worker's Pull Request (pr)\n\nCompletion:\n  ",
+    " open-pr <worker>         Open a Worker's Pull Request (pr)\n  ",
+    env!("CARGO_PKG_NAME"),
+    " undo [<worker>] [--force] Undo the last jjfx mutation on a Worker (list when omitted)\n\nCompletion:\n  ",
     env!("CARGO_PKG_NAME"),
     " completion [zsh]         Print zsh completion\n\nChecks:\n  ",
     env!("CARGO_PKG_NAME"),
@@ -135,6 +138,10 @@ pub enum Command {
     },
     OpenPullRequest {
         worker: String,
+    },
+    Undo {
+        workspace: Option<String>,
+        force: bool,
     },
     Completion {
         shell: String,
@@ -260,6 +267,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|worker| Command::OpenPullRequest { worker }),
+        "undo" => parse_undo(&args[1..]),
         "completion" => parse_completion(&args[1..]),
         "check" => parse_check(&args[1..]),
         "__complete" => parse_worker_command(
@@ -377,6 +385,26 @@ fn parse_status(args: &[String]) -> Result<Command> {
         }
     }
     Ok(Command::Status { json })
+}
+
+/// Parse `undo [workspace] [--force]`.
+///
+/// With no Workspace, `undo` lists the jjfx-initiated mutations that can be
+/// undone; naming one undoes it. The Workspace may be a Worker in either
+/// spelling (`3` or `worker-3`), any Workspace name, or `repo`/`*` for a
+/// repository-wide mutation.
+fn parse_undo(args: &[String]) -> Result<Command> {
+    let mut workspace = None;
+    let mut force = false;
+    for argument in args {
+        match argument.as_str() {
+            "--force" | "-f" => force = true,
+            value if value.starts_with('-') => bail!("unknown option for undo: {value}"),
+            value if workspace.is_none() => workspace = Some(value.to_owned()),
+            value => bail!("unexpected argument for undo: {value}"),
+        }
+    }
+    Ok(Command::Undo { workspace, force })
 }
 
 /// Parse `pool list`/`ls`/`status`, which accepts `--json`.
@@ -768,6 +796,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Rebase { worker } => rebase_command(&repository(colocate)?, &worker)?,
         Command::Absorb { worker } => absorb_command(&repository(colocate)?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
+        Command::Undo { workspace, force } => {
+            undo_command(&repository(colocate)?, workspace.as_deref(), force)?
+        }
         Command::Completion { shell } => completion_command(&shell)?,
         Command::Check(CheckCommand::Migrations) => {
             check_migrations_command(&repository(colocate)?, &migrations()?)?
@@ -1886,6 +1917,79 @@ fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Undo the last jjfx-initiated mutation on a Workspace, or list what can be
+/// undone when no Workspace is named.
+fn undo_command(repository: &Repository, workspace: Option<&str>, force: bool) -> Result<()> {
+    let Some(workspace) = workspace else {
+        return list_undoable(repository);
+    };
+    let workspace = undo_workspace_key(repository, workspace)?;
+    match repository.undo_mutation(&workspace, force)? {
+        UndoOutcome::Nothing => {
+            bail!("nothing recorded to undo for {workspace}")
+        }
+        UndoOutcome::Restored {
+            kind,
+            discarded,
+            later,
+        } => {
+            eprintln!("Undid the last {kind} on {workspace} ({discarded} operations)");
+            if later > 0 {
+                eprintln!(
+                    "warning: the restore is repository-wide and also discarded {later} later operation(s)"
+                );
+            }
+            Ok(())
+        }
+        UndoOutcome::Refused { kind, later } => match later {
+            Some(later) => bail!(
+                "refusing to undo the last {kind} on {workspace}: {later} operation(s) have happened since, \
+                 and a restore is repository-wide. Re-run with --force to discard them, or inspect `jj op log`."
+            ),
+            None => bail!(
+                "refusing to undo the last {kind} on {workspace}: its recorded operation is no longer in the log, \
+                 so what a restore would discard cannot be established. Inspect `jj op log`."
+            ),
+        },
+    }
+}
+
+/// Resolve the undo record key a user named: a Worker in either spelling, any
+/// Workspace name, or the repository-wide marker.
+///
+/// A name that already has a record is used as it is, so an ad-hoc Workspace is
+/// reachable by its own name; otherwise the name is normalized to a Worker's
+/// `worker-<id>`, which is how `3` reaches `worker-3`.
+fn undo_workspace_key(repository: &Repository, value: &str) -> Result<String> {
+    if value == REPOSITORY_WIDE_MUTATION || value.eq_ignore_ascii_case("repo") {
+        return Ok(REPOSITORY_WIDE_MUTATION.to_owned());
+    }
+    if repository.state_store().undo().mutation(value)?.is_some() {
+        return Ok(value.to_owned());
+    }
+    Ok(match normalize_worker(value) {
+        Ok(worker) => worker.as_str().to_owned(),
+        Err(_) => value.to_owned(),
+    })
+}
+
+/// Print the jjfx-initiated mutations that can be undone.
+fn list_undoable(repository: &Repository) -> Result<()> {
+    let mutations = match repository.state_store().undo().load()? {
+        Loaded::Present(versioned) => versioned.value.mutations,
+        Loaded::Missing => BTreeMap::new(),
+    };
+    if mutations.is_empty() {
+        eprintln!("Nothing recorded to undo.");
+        return Ok(());
+    }
+    println!("{:<20} {:<8} WHEN", "WORKSPACE", "MUTATION");
+    for (workspace, record) in mutations {
+        println!("{workspace:<20} {:<8} {}", record.kind.as_str(), record.at);
+    }
+    Ok(())
+}
+
 fn completion_command(shell: &str) -> Result<()> {
     if shell != "zsh" {
         bail!("Unsupported shell: {shell} (supported: zsh)");
@@ -2072,7 +2176,7 @@ _jjfx() {
     'reset:Reset Worker' 'status:Show Pool status' 'logs:Follow Worker log'
     'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
     'absorb:Fold Worker edits into base commits'
-    'completion:Print shell completion' 'help:Show help'
+    'undo:Undo the last jjfx mutation' 'completion:Print shell completion' 'help:Show help'
   )
   _arguments -C '1:command:->command' '*::arg:->args'
   case $state in
@@ -2083,6 +2187,7 @@ _jjfx() {
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
         mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
+        undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
@@ -2297,6 +2402,33 @@ mod tests {
             parse(&args(&["pr", "worker-1"])),
             Ok(Command::OpenPullRequest { .. })
         ));
+    }
+
+    #[test]
+    fn undo_parser_takes_an_optional_workspace_and_force() {
+        assert_eq!(
+            parse(&args(&["undo"])).unwrap(),
+            Command::Undo {
+                workspace: None,
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["undo", "worker-3"])).unwrap(),
+            Command::Undo {
+                workspace: Some("worker-3".to_owned()),
+                force: false,
+            }
+        );
+        assert_eq!(
+            parse(&args(&["undo", "*", "--force"])).unwrap(),
+            Command::Undo {
+                workspace: Some("*".to_owned()),
+                force: true,
+            }
+        );
+        assert!(parse(&args(&["undo", "--nope"])).is_err());
+        assert!(parse(&args(&["undo", "a", "b"])).is_err());
     }
 
     #[test]
