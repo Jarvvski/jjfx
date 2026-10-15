@@ -67,6 +67,8 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " rebase <worker>          Rebase and push a Worker (rb)\n  ",
     env!("CARGO_PKG_NAME"),
+    " absorb <worker>          Fold a Worker's edits into their base commits (ab)\n  ",
+    env!("CARGO_PKG_NAME"),
     " open-pr <worker>         Open a Worker's Pull Request (pr)\n\nCompletion:\n  ",
     env!("CARGO_PKG_NAME"),
     " completion [zsh]         Print zsh completion\n\nObservability:\n  ",
@@ -123,6 +125,9 @@ pub enum Command {
         worker: String,
     },
     Rebase {
+        worker: String,
+    },
+    Absorb {
         worker: String,
     },
     OpenPullRequest {
@@ -234,6 +239,11 @@ pub fn parse(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|worker| Command::Rebase { worker }),
+        "absorb" | "ab" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " absorb <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::Absorb { worker }),
         "open-pr" | "pr" => parse_worker_command(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " open-pr <worker>"),
             &args[1..],
@@ -715,6 +725,7 @@ pub fn run(
             mount_command(&repository(colocate)?, &worker, terminal_settings)?
         }
         Command::Rebase { worker } => rebase_command(&repository(colocate)?, &worker)?,
+        Command::Absorb { worker } => absorb_command(&repository(colocate)?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
         Command::Completion { shell } => completion_command(&shell)?,
         Command::InternalComplete { mode } => internal_complete_command(&mode)?,
@@ -1768,6 +1779,30 @@ fn rebase_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+fn absorb_command(repository: &Repository, value: &str) -> Result<()> {
+    let worker = normalize_worker(value)?;
+    let outcome = WorkerActions::new(repository.clone()).absorb(&worker)?;
+    let report = outcome.report();
+    if report.is_empty() {
+        eprintln!(
+            "Nothing to absorb for {}: no working-copy edit belongs in an earlier commit",
+            outcome.branch()
+        );
+        return Ok(());
+    }
+    eprintln!(
+        "Absorbed edits into {} commit(s) on {}",
+        report.revisions(),
+        outcome.branch()
+    );
+    if report.has_remaining_changes() {
+        eprintln!(
+            "  Some edits stayed in the working copy: no ancestor unambiguously owns those lines."
+        );
+    }
+    Ok(())
+}
+
 fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let outcome = WorkerActions::new(repository.clone()).open_pull_request(&worker)?;
@@ -1960,6 +1995,7 @@ _jjfx() {
     'review:Address review comments' 'mount:Open Worker in kitty'
     'reset:Reset Worker' 'status:Show Pool status' 'logs:Follow Worker log'
     'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
+    'absorb:Fold Worker edits into base commits'
     'completion:Print shell completion' 'help:Show help'
   )
   _arguments -C '1:command:->command' '*::arg:->args'
@@ -1970,7 +2006,7 @@ _jjfx() {
         rm|remove|path) _arguments '1:workspace:__jjfx_workspaces' ;;
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
-        mount|m|reset|logs|log|rebase|rb|open-pr|pr) _arguments '1:worker:__jjfx_workers' ;;
+        mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
@@ -2168,6 +2204,10 @@ mod tests {
             Ok(Command::Rebase { .. })
         ));
         assert!(matches!(
+            parse(&args(&["ab", "worker-1"])),
+            Ok(Command::Absorb { .. })
+        ));
+        assert!(matches!(
             parse(&args(&["pr", "worker-1"])),
             Ok(Command::OpenPullRequest { .. })
         ));
@@ -2259,6 +2299,12 @@ mod tests {
         assert_eq!(
             parse(&args(&["rb", "worker-1"])).unwrap(),
             Command::Rebase {
+                worker: "worker-1".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse(&args(&["absorb", "worker-1"])).unwrap(),
+            Command::Absorb {
                 worker: "worker-1".to_owned(),
             }
         );

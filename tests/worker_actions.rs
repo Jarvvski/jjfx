@@ -408,6 +408,209 @@ fn rebase_and_open_pull_request_use_compatible_typed_actions() {
 }
 
 #[test]
+fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("absorb-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "if [ \"$1\" = absorb ]; then\n",
+            "  printf 'Absorbed changes into 2 revisions:\\n  aaa111 A: add x\\n  bbb222 B: bump y\\n' >&2\n",
+            "fi\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("absorb-commands");
+    let result = temporary_directory.path().join("absorb-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(
+        output.status.success(),
+        "absorb helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&result).expect("absorb result"),
+        "owner/eng-301-action\nabsorbed=2 remaining=false\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("command capture"),
+        concat!("jj absorb\n", "jj git push -b owner/eng-301-action\n",)
+    );
+}
+
+#[test]
+fn absorb_that_moves_nothing_skips_the_push() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-nothing.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("absorb-nothing-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "if [ \"$1\" = absorb ]; then printf 'Nothing changed.\\n' >&2; fi\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("absorb-nothing-commands");
+    let result = temporary_directory.path().join("absorb-nothing-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&result).expect("absorb result"),
+        "owner/eng-301-action\nabsorbed=0 remaining=false\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("command capture"),
+        "jj absorb\n"
+    );
+}
+
+#[test]
+fn absorb_reports_hunks_that_stayed_in_the_working_copy() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-remaining.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("absorb-remaining-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "if [ \"$1\" = absorb ]; then\n",
+            "  printf 'Absorbed changes into 1 revisions:\\n  aaa111 A: add x\\nRemaining changes:\\nA new.rs\\n' >&2\n",
+            "fi\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("absorb-remaining-commands");
+    let result = temporary_directory.path().join("absorb-remaining-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&result).expect("absorb result"),
+        "owner/eng-301-action\nabsorbed=1 remaining=true\n"
+    );
+}
+
+#[test]
+fn failed_absorb_push_rolls_back_the_local_operation() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-failure.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("absorb-failure-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "if [ \"$1\" = absorb ]; then printf 'Absorbed changes into 1 revisions:\\n' >&2; fi\n",
+            "if [ \"$1\" = git ] && [ \"$2\" = push ]; then echo rejected >&2; exit 1; fi\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("absorb-failure-commands");
+    let result = temporary_directory.path().join("absorb-failure-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(output.status.success());
+    assert!(
+        fs::read_to_string(&result)
+            .expect("absorb result")
+            .contains("cannot push absorbed branch"),
+        "result should name the absorb push failure"
+    );
+    assert_eq!(
+        fs::read_to_string(&capture).expect("command capture"),
+        concat!(
+            "jj absorb\n",
+            "jj git push -b owner/eng-301-action\n",
+            "jj undo --allow-cross-workspace\n"
+        )
+    );
+}
+
+#[test]
 fn failed_rebase_push_rolls_back_the_local_operation() {
     let (temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
@@ -457,6 +660,75 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
             "jj git push -b owner/eng-301-action\n",
             "jj undo --allow-cross-workspace\n"
         )
+    );
+}
+
+/// The flow the review prompt prescribes for feedback that belongs in a base
+/// commit: start an edit on top of the commit that should own the fix, then let
+/// `jj absorb` fold the hunk into it. This drives real jj, so the guidance
+/// cannot rot into something jj does not do.
+#[test]
+fn the_documented_base_commit_flow_lands_feedback_in_the_base_commit() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let run = |arguments: &[&str]| {
+        let output = Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "--config",
+                "user.name=jjfx test",
+                "--config",
+                "user.email=jjfx@example.com",
+            ])
+            .args(arguments)
+            .current_dir(directory.path())
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    };
+
+    run(&["git", "init", "--no-colocate"]);
+    fs::write(directory.path().join("a.rs"), "let a = 1;\n").expect("base file");
+    fs::write(directory.path().join("b.rs"), "let b = 2;\n").expect("later file");
+    run(&["describe", "-m", "A: add a and b"]);
+    run(&["new", "-m", "B: bump b"]);
+    fs::write(directory.path().join("b.rs"), "let b = 3;\n").expect("later edit");
+    let base = run(&["log", "--no-graph", "-r", "@-", "-T", "change_id"]);
+    let later = run(&["log", "--no-graph", "-r", "@", "-T", "change_id"]);
+
+    // Review feedback: `a.rs` line 1 was introduced by the base commit, so the
+    // author starts an edit on top of it rather than stacking a new commit.
+    run(&["new", "@-", "-m", ""]);
+    fs::write(directory.path().join("a.rs"), "let a = 0;\n").expect("feedback edit");
+    run(&["absorb"]);
+
+    assert_eq!(
+        run(&["file", "show", "-r", &base, "a.rs"]),
+        "let a = 0;",
+        "the fix should land in the base commit"
+    );
+    assert_eq!(
+        run(&["file", "show", "-r", &later, "b.rs"]),
+        "let b = 3;",
+        "the descendant commit should keep its own change"
+    );
+    let described = run(&[
+        "log",
+        "--no-graph",
+        "-r",
+        "all()",
+        "-T",
+        "description.first_line() ++ \"\\n\"",
+    ]);
+    assert_eq!(
+        described.lines().filter(|line| !line.is_empty()).count(),
+        2,
+        "the edit commit should be abandoned, leaving only the two described commits: {described}"
     );
 }
 
@@ -1725,7 +1997,7 @@ fn mount_action_helper() {
 #[ignore]
 fn repository_action_helper() {
     let mode = env::var(HELPER_MODE).unwrap_or_default();
-    if mode != "repository" && mode != "rebase-failure" {
+    if mode != "repository" && mode != "rebase-failure" && mode != "absorb" {
         return;
     }
     let repository =
@@ -1738,6 +2010,19 @@ fn repository_action_helper() {
             .open_pull_request(&worker)
             .expect("Open PR should succeed");
         format!("{}\n{}\n", rebase.branch(), open.branch())
+    } else if mode == "absorb" {
+        match actions.absorb(&worker) {
+            Ok(absorb) => {
+                let report = absorb.report();
+                format!(
+                    "{}\nabsorbed={} remaining={}\n",
+                    absorb.branch(),
+                    report.revisions(),
+                    report.has_remaining_changes()
+                )
+            }
+            Err(error) => error.to_string(),
+        }
     } else {
         actions
             .rebase(&worker)

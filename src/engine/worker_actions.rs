@@ -186,6 +186,50 @@ impl RebaseOutcome {
     }
 }
 
+/// What `jj absorb` did with one Worker's working-copy edits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AbsorbReport {
+    revisions: usize,
+    remaining: bool,
+}
+
+impl AbsorbReport {
+    /// Returns how many ancestor commits took absorbed hunks.
+    pub const fn revisions(&self) -> usize {
+        self.revisions
+    }
+
+    /// Reports whether hunks stayed in the source revision, because no ancestor
+    /// unambiguously owned the lines they changed.
+    pub const fn has_remaining_changes(&self) -> bool {
+        self.remaining
+    }
+
+    /// Reports whether absorb moved nothing at all.
+    pub const fn is_empty(&self) -> bool {
+        self.revisions == 0
+    }
+}
+
+/// The result of folding a Worker's working-copy edits into their base commits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AbsorbOutcome {
+    branch: String,
+    report: AbsorbReport,
+}
+
+impl AbsorbOutcome {
+    /// Returns the bookmark whose rewritten history was published.
+    pub fn branch(&self) -> &str {
+        &self.branch
+    }
+
+    /// Returns what absorb moved.
+    pub const fn report(&self) -> AbsorbReport {
+        self.report
+    }
+}
+
 /// The result of opening one Worker's pull request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenPullRequestOutcome {
@@ -464,6 +508,44 @@ impl WorkerActions {
         }
         self.commands.open_pull_request(&repository, &branch)?;
         Ok(OpenPullRequestOutcome { branch })
+    }
+
+    /// Folds the Worker's working-copy edits into the commits they belong to,
+    /// then pushes the rewritten bookmark.
+    ///
+    /// This is the mechanical half of "address this feedback in the base
+    /// commit": the author chooses the destination by starting an edit on top of
+    /// it (`jj new <commit>`), and `jj absorb` moves each hunk into the closest
+    /// mutable ancestor where those lines last changed. A run that absorbs
+    /// nothing does not push, so `absorb` is safe to run speculatively.
+    pub fn absorb(&self, worker: &WorkerId) -> Result<AbsorbOutcome, WorkerActionError> {
+        let (branch, workspace) = self.branch_and_workspace(worker)?;
+        // Absorb rewrites the working copy, so serialise it with preparation and
+        // Reset restoration like every other Workspace operation.
+        let _operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
+            .map_err(|source| WorkerActionError::WorkspaceOperation {
+                worker: worker.clone(),
+                detail: source.to_string(),
+            })?;
+        let report =
+            self.commands
+                .absorb(&workspace)
+                .map_err(|detail| WorkerActionError::Command {
+                    operation: "absorb Worker working-copy edits",
+                    detail,
+                })?;
+        if report.is_empty() {
+            return Ok(AbsorbOutcome { branch, report });
+        }
+        if let Err(push) = self.commands.push(&workspace, &branch) {
+            let rollback = self.commands.undo(&workspace).err();
+            return Err(WorkerActionError::AbsorbPush {
+                branch,
+                push,
+                rollback,
+            });
+        }
+        Ok(AbsorbOutcome { branch, report })
     }
 
     /// Opens an interactive provider Session for the Worker in kitty.
@@ -1060,6 +1142,23 @@ impl SystemCommands {
         self.run_status(workspace, "jj", &["git", "push", "-b", branch])
     }
 
+    /// Runs `jj absorb` and reads what it did from its summary.
+    ///
+    /// `jj absorb` writes that summary to stderr and exits zero whether or not
+    /// anything was absorbed, so the summary - not the exit code - says what
+    /// happened.
+    fn absorb(self, workspace: &Path) -> Result<AbsorbReport, String> {
+        let output = Command::new("jj")
+            .args(["absorb"])
+            .current_dir(workspace)
+            .output()
+            .map_err(|source| source.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+        }
+        Ok(classify_absorb(&String::from_utf8_lossy(&output.stderr)))
+    }
+
     fn undo(self, workspace: &Path) -> Result<(), String> {
         // `jj op undo` was removed; the command is `jj undo`. jjfx shares one op
         // log across workspaces, so allow undoing the last operation even when it
@@ -1369,6 +1468,33 @@ fn build_review_prompt(
     prompt
 }
 
+/// Reads `jj absorb`'s stderr summary.
+///
+/// The summary is prose, so classify it tolerantly: an unrecognised summary
+/// means absorb moved nothing, which is the safe reading - the caller then skips
+/// the push it would otherwise make.
+fn classify_absorb(stderr: &str) -> AbsorbReport {
+    let mut revisions = 0;
+    let mut remaining = false;
+    for line in stderr.lines() {
+        if let Some(count) = line
+            .trim()
+            .strip_prefix("Absorbed changes into ")
+            .and_then(|rest| rest.split_whitespace().next())
+            .and_then(|count| count.parse::<usize>().ok())
+        {
+            revisions = count;
+        }
+        if line.trim_start().starts_with("Remaining changes:") {
+            remaining = true;
+        }
+    }
+    AbsorbReport {
+        revisions,
+        remaining,
+    }
+}
+
 fn repository_slug(repository: &Repository) -> String {
     repository
         .worker_pool()
@@ -1436,6 +1562,13 @@ pub enum WorkerActionError {
     /// Pushing a rebased bookmark failed after the local operation completed.
     #[error("cannot push rebased branch {branch}: {push}; rollback: {rollback:?}")]
     RebasePush {
+        branch: String,
+        push: String,
+        rollback: Option<String>,
+    },
+    /// Pushing a bookmark whose history `jj absorb` rewrote failed.
+    #[error("cannot push absorbed branch {branch}: {push}; rollback: {rollback:?}")]
+    AbsorbPush {
         branch: String,
         push: String,
         rollback: Option<String>,
@@ -1533,5 +1666,36 @@ mod tests {
         );
         // Absorb can conflict the commits above it, so the prompt says so.
         assert!(prompt.contains("conflicted"), "{prompt}");
+    }
+
+    #[test]
+    fn an_absorb_summary_reports_the_revisions_it_filled() {
+        let report = classify_absorb(
+            "Absorbed changes into 1 revisions:\n  kyzvyv b12347 A: add x\nRebased 1 descendant commits.\n",
+        );
+
+        assert_eq!(report.revisions(), 1);
+        assert!(!report.has_remaining_changes());
+        assert!(!report.is_empty());
+    }
+
+    #[test]
+    fn an_absorb_summary_reports_hunks_that_stayed_behind() {
+        let report = classify_absorb(
+            "Absorbed changes into 1 revisions:\n  kpuuuw 06ed0b A: add x\nRemaining changes:\nA y.rs\n",
+        );
+
+        assert_eq!(report.revisions(), 1);
+        assert!(report.has_remaining_changes());
+    }
+
+    #[test]
+    fn an_unrecognised_absorb_summary_reads_as_nothing_absorbed() {
+        // jj prints this when no ancestor unambiguously owns the changed lines.
+        let report = classify_absorb("Nothing changed.\n");
+
+        assert_eq!(report.revisions(), 0);
+        assert!(report.is_empty());
+        assert!(!report.has_remaining_changes());
     }
 }
