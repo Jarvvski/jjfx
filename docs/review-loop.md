@@ -35,6 +35,33 @@ act on. Lines the adapter does not recognise are ignored, and a reviewer that
 reports an incomplete review keeps the findings it did emit - a partial review
 is still worth acting on.
 
+## Where a fix belongs
+
+Review feedback often belongs in a **base commit**, not in a new commit stacked
+on top. The prompt sends that case through `jj`'s own absorb primitive rather
+than a hand-split:
+
+1. Find the commit that introduced the code with `jj log`.
+2. Start an edit on top of it with `jj new <commit>`.
+3. Make the change.
+4. Run `jj absorb`. jj moves each hunk into the closest mutable ancestor where
+   those lines last changed, and abandons the edit commit once every hunk has
+   landed (give the edit a description if you want to keep it).
+
+`jjfx absorb <worker>` is the same absorb step from outside the workspace: it
+runs `jj absorb` in the Worker's Workspace and pushes the rewritten bookmark, so
+the PR picks the folded history up. A run that absorbs nothing does not push, so
+it is safe to run speculatively. `jj absorb` reports what it did on stderr, and
+jjfx reads that summary: a run that leaves hunks behind - because no ancestor
+unambiguously owns those lines - says so rather than pretending the working copy
+is clean.
+
+Absorb can leave the commits above it conflicted, because it rewrites a commit
+they sit on. The prompt says so: resolve every conflict absorb reports, or
+`jj undo` and address that feedback on top of `@` instead. Feedback that does not
+belong in an existing commit - a new file, a new test - stays an ordinary edit on
+`@`.
+
 ## The pass cap
 
 The re-review loop is **review, address, review again**, bounded by
