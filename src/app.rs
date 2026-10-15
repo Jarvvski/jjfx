@@ -4554,7 +4554,7 @@ mod tests {
         });
 
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
             .backend()
@@ -4630,7 +4630,7 @@ mod tests {
             });
 
             let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 16)).unwrap();
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 18)).unwrap();
             terminal.draw(|frame| app.render(frame)).unwrap();
             let text: String = terminal
                 .backend()
@@ -5066,7 +5066,7 @@ mod tests {
             Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG-101"
         ));
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
             .backend()
@@ -5106,7 +5106,7 @@ mod tests {
         }));
 
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
             .backend()

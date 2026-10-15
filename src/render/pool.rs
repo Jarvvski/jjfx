@@ -9,8 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::engine::{
-    AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult, RunUsage,
-    WorkerPoolSnapshot, WorkerStatus,
+    AgentSessionResolution, PoolCostSnapshot, RunActivity, RunActivityKind, RunConclusion,
+    RunResult, RunUsage, WorkerPoolSnapshot, WorkerStatus,
 };
 use crate::pool_session::PoolSession;
 use crate::render::style::dim_line;
@@ -63,6 +63,10 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
         if let Some(runtime) = snapshot.pool().and_then(|pool| pool.agent_runtime()) {
             lines.push(Line::from(format!(" profile: {}", runtime.as_str())));
         }
+        lines.push(match snapshot.cost() {
+            Some(cost) => Line::from(format!(" {}", pool_cost_line(cost))),
+            None => dim_line(" spend: record store unavailable"),
+        });
         if snapshot.workers().is_empty() {
             lines.push(dim_line(" (no Workers)"));
         }
@@ -92,14 +96,15 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                 )
             } else {
                 format!(
-                    " {marker} {}  {:<7} {}  runtime: {}  {}{open}",
+                    " {marker} {}  {:<7} {}  runtime: {}  {}{open}{spend}",
                     worker.worker_id(),
                     worker.status().as_str(),
                     worker.alias(),
                     worker
                         .agent_runtime()
                         .map_or("-", |runtime| runtime.as_str()),
-                    worker.workspace()
+                    worker.workspace(),
+                    spend = worker_spend(snapshot, worker.worker_id().as_str())
                 )
             };
             lines.push(Line::from(line));
@@ -315,6 +320,37 @@ fn first_eligible_worker(snapshot: &WorkerPoolSnapshot) -> Option<&str> {
         .map(|worker| worker.worker_id().as_str())
 }
 
+/// The pool-level cost/usage line: the windows the view shows, plus the Run
+/// count and how many Runs reported no usable cost.
+fn pool_cost_line(cost: &PoolCostSnapshot) -> String {
+    let total = cost.total();
+    let mut line = format!(
+        " spend: {} today, {} (7d), {} total  runs: {}  tokens: {}",
+        cost.today().cost_display(),
+        cost.week().cost_display(),
+        total.cost_display(),
+        total.runs(),
+        total.tokens_display()
+    );
+    if total.unpriced_runs() > 0 {
+        line.push_str(&format!(
+            "  ({} Run(s) without a reported cost)",
+            total.unpriced_runs()
+        ));
+    }
+    line
+}
+
+/// One Worker's recorded spend, or nothing when it recorded no Run.
+fn worker_spend(snapshot: &WorkerPoolSnapshot, worker: &str) -> String {
+    snapshot
+        .cost()
+        .and_then(|cost| cost.worker(worker))
+        .map_or_else(String::new, |cost| {
+            format!("  spend: {}", cost.cost_display())
+        })
+}
+
 fn worker_activity_line(activity: &RunActivity) -> String {
     let detail = match activity.kind() {
         RunActivityKind::SessionStarted => "session started".to_owned(),
@@ -419,6 +455,78 @@ mod tests {
         };
         let text = render(&session, PoolPane::View, Some("worker-01"));
         assert!(text.contains("[open]"), "expected an open marker: {text}");
+    }
+
+    /// A one-Worker Pool snapshot whose Worker has one recorded Run.
+    fn snapshot_with_recorded_cost() -> WorkerPoolSnapshot {
+        let temp = tempfile::tempdir().expect("temp repository");
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).expect("pool directory");
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
+        )
+        .expect("pool state");
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"done","agent":"claude","ticket":"ENG-1","pid":null,"started_at":null,"completed_at":"2026-07-27T10:05:00Z","log_file":null,"branch_name":null,"exit_code":0,"error":null}"#,
+        )
+        .expect("worker state");
+        let repository = Repository::open(temp.path()).expect("repository");
+        repository
+            .state_store()
+            .runs()
+            .append(&crate::engine::RunRecord {
+                run_id: "worker-01@1".to_owned(),
+                worker: WorkerId::parse("worker-01").expect("worker id"),
+                ticket: Some("ENG-1".to_owned()),
+                workspace: None,
+                branch: None,
+                runtime: Some("claude".to_owned()),
+                provider: None,
+                model: None,
+                cost_micro_usd: Some(250_000),
+                usage: Some(crate::engine::RunRecordUsage {
+                    input_tokens: 1_200,
+                    cached_input_tokens: 0,
+                    cache_write_input_tokens: 0,
+                    output_tokens: 340,
+                    reasoning_output_tokens: 0,
+                }),
+                duration_ms: None,
+                turns: None,
+                conclusion: crate::engine::RunRecordConclusion::Succeeded,
+                error: None,
+                started_at: None,
+                completed_at: Some(crate::engine::WireTimestamp::new("2026-07-27T10:05:00Z")),
+            })
+            .expect("append record");
+        repository.read_worker_pool_snapshot()
+    }
+
+    #[test]
+    fn the_pool_view_shows_aggregate_spend_usage_and_per_worker_spend() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot_with_recorded_cost()),
+            ..PoolSession::default()
+        };
+        let text = render(&session, PoolPane::View, Some("worker-01"));
+        assert!(text.contains("spend: $0.2500"), "pool spend: {text}");
+        assert!(text.contains("total"), "pool total: {text}");
+        assert!(text.contains("tokens: in 1.2k out 340"), "usage: {text}");
+        assert!(text.contains("runs: 1"), "run count: {text}");
+        assert!(text.contains("spend: $0.2500"), "per-worker spend: {text}");
+    }
+
+    #[test]
+    fn the_pool_view_shows_a_zero_spend_when_no_runs_are_recorded() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot(false)),
+            ..PoolSession::default()
+        };
+        let text = render(&session, PoolPane::View, Some("worker-01"));
+        assert!(text.contains("spend: $0.0000"), "{text}");
+        assert!(text.contains("runs: 0"), "{text}");
     }
 
     #[test]

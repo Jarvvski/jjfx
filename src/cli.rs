@@ -1013,12 +1013,12 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         eprintln!("{}", diagnostic.message());
     }
     println!(
-        "{:<10} {:<12} {:<10} {:<14} ELAPSED",
-        "WORKER", "NAME", "STATUS", "TICKET"
+        "{:<10} {:<12} {:<10} {:<14} {:<11} ELAPSED",
+        "WORKER", "NAME", "STATUS", "TICKET", "SPEND"
     );
     println!(
-        "{:<10} {:<12} {:<10} {:<14} -------",
-        "------", "----", "------", "------"
+        "{:<10} {:<12} {:<10} {:<14} {:<11} -------",
+        "------", "----", "------", "------", "-----"
     );
     let mut counts = [0usize; 4];
     for worker in snapshot.workers() {
@@ -1036,9 +1036,10 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
             worker.alias()
         };
         let ticket = worker.ticket().unwrap_or("-");
+        let spend = worker_spend(&snapshot, worker.worker_id().as_str());
         let elapsed = elapsed_display(worker.started_at(), worker.completed_at());
         println!(
-            "{short:<10} {name:<12} {:<10} {ticket:<14} {elapsed}",
+            "{short:<10} {name:<12} {:<10} {ticket:<14} {spend:<11} {elapsed}",
             worker.status().as_str()
         );
         // A terminal Worker's reason is only useful when surfaced here: the raw
@@ -1068,7 +1069,38 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         counts[3],
         pool.size()
     );
+    println!("{}", spend_summary(&snapshot));
     Ok(())
+}
+
+/// One Worker's recorded spend, or `-` when it recorded no Run.
+fn worker_spend(snapshot: &crate::engine::WorkerPoolSnapshot, worker: &str) -> String {
+    snapshot
+        .cost()
+        .and_then(|cost| cost.worker(worker))
+        .map_or_else(|| "-".to_owned(), crate::engine::PoolCost::cost_display)
+}
+
+/// The pool-level cost/usage summary line.
+fn spend_summary(snapshot: &crate::engine::WorkerPoolSnapshot) -> String {
+    let Some(cost) = snapshot.cost() else {
+        return "Spend: record store unavailable".to_owned();
+    };
+    let total = cost.total();
+    let unpriced = if total.unpriced_runs() > 0 {
+        format!(" ({} without a reported cost)", total.unpriced_runs())
+    } else {
+        String::new()
+    };
+    format!(
+        "Spend: {} today, {} last 7 days, {} total across {} Run(s){}; tokens {}",
+        cost.today().cost_display(),
+        cost.week().cost_display(),
+        total.cost_display(),
+        total.runs(),
+        unpriced,
+        total.tokens_display()
+    )
 }
 
 /// The short Worker id (without the `worker-` prefix) used in the list view.
@@ -1109,6 +1141,16 @@ fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
                     .map_or_else(|| "null".to_owned(), |code| code.to_string()),
             ),
             ("log_file", json_option(worker.log_file())),
+            (
+                "cost_usd",
+                snapshot
+                    .cost()
+                    .and_then(|cost| cost.worker(worker.worker_id().as_str()))
+                    .map_or_else(
+                        || "null".to_owned(),
+                        |cost| format!("{:.6}", cost.cost_usd()),
+                    ),
+            ),
         ];
         out.push_str("  {\n");
         for (field, (key, value)) in fields.iter().enumerate() {
@@ -2148,5 +2190,45 @@ mod tests {
                 worker: "worker-1".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn the_spend_summary_totals_the_recorded_runs() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        for (worker, cost) in [("worker-01", 250_000_u64), ("worker-02", 750_000)] {
+            repository
+                .state_store()
+                .runs()
+                .append(&crate::engine::RunRecord {
+                    run_id: format!("{worker}@1"),
+                    worker: crate::engine::WorkerId::parse(worker).expect("worker id"),
+                    ticket: None,
+                    workspace: None,
+                    branch: None,
+                    runtime: None,
+                    provider: None,
+                    model: None,
+                    cost_micro_usd: Some(cost),
+                    usage: None,
+                    duration_ms: None,
+                    turns: None,
+                    conclusion: crate::engine::RunRecordConclusion::Succeeded,
+                    error: None,
+                    started_at: None,
+                    completed_at: Some(crate::engine::WireTimestamp::new(
+                        jiff::Timestamp::now().to_string(),
+                    )),
+                })
+                .expect("append record");
+        }
+        let snapshot = repository.read_worker_pool_snapshot();
+
+        let summary = spend_summary(&snapshot);
+        assert!(summary.contains("$1.0000 total"), "{summary}");
+        assert!(summary.contains("across 2 Run(s)"), "{summary}");
+        assert_eq!(worker_spend(&snapshot, "worker-01"), "$0.2500");
+        assert_eq!(worker_spend(&snapshot, "worker-03"), "-");
     }
 }

@@ -55,6 +55,21 @@ impl PoolCost {
         self.cost_micro_usd as f64 / 1_000_000.0
     }
 
+    /// The total cost formatted as `$d.dddd`, the form the cost views show.
+    pub fn cost_display(self) -> String {
+        usd(self.cost_micro_usd)
+    }
+
+    /// The input and output token totals formatted compactly, e.g. `in 1.2k out
+    /// 340`.
+    pub fn tokens_display(self) -> String {
+        format!(
+            "in {} out {}",
+            compact_tokens(self.input_tokens),
+            compact_tokens(self.output_tokens)
+        )
+    }
+
     /// The total provider-reported input tokens.
     pub const fn input_tokens(self) -> u64 {
         self.input_tokens
@@ -315,6 +330,15 @@ impl SpendDecision {
 /// Formats millionths of one US dollar as `$d.dddd`.
 fn usd(micro_usd: u64) -> String {
     format!("${:.4}", micro_usd as f64 / 1_000_000.0)
+}
+
+/// Formats a token count compactly: `340`, `1.2k`, `3.4m`.
+fn compact_tokens(tokens: u64) -> String {
+    match tokens {
+        0..1_000 => tokens.to_string(),
+        1_000..1_000_000 => format!("{:.1}k", tokens as f64 / 1_000.0),
+        _ => format!("{:.1}m", tokens as f64 / 1_000_000.0),
+    }
 }
 
 #[cfg(test)]
