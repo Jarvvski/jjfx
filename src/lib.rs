@@ -24,6 +24,7 @@ mod runtime;
 mod store;
 mod task_editor;
 mod terminal;
+mod ticket_source;
 mod trunk;
 mod tui;
 mod ui_state;
