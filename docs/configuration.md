@@ -222,6 +222,31 @@ The current aggregate is always visible without the cap: the Pool view shows a
 pool spend line, and `jjfx status` (and `jjfx pool list`) shows a `SPEND` column
 and a pool-level summary.
 
+## `[review]`
+
+Which AI reviewer `jjfx review <worker>` runs, and how many times the re-review
+loop may iterate. An absent `[review]` section means `reviewer = "none"`, which
+leaves `review` exactly as it was: the prompt inlines the PR's review state,
+failing checks and human comments, and nothing else runs.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `reviewer` | `"none"` | Which reviewer produces findings: `none`, `coderabbit`, or `opencode-action`. |
+| `max_passes` | `2` | The pass cap for the re-review loop; must be at least 1. |
+
+```toml
+[review]
+reviewer = "coderabbit"
+max_passes = 2
+```
+
+`coderabbit` shells out to the CodeRabbit CLI in agent mode. `opencode-action`
+is accepted but not implemented yet: selecting it fails at load with a setup
+error rather than silently skipping the review.
+
+See [The review loop](review-loop.md) for what a configured reviewer does, how
+the pass cap bounds it, and how it authenticates without leaking credentials.
+
 ## Legacy `[workspace]`
 
 Earlier releases configured new-workspace provisioning with a `[workspace]`

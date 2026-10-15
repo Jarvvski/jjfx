@@ -27,6 +27,9 @@ pub struct Config {
     pub tickets: TicketsConfig,
     /// The optional cap on the aggregate spend Dispatch may run up.
     pub spend: SpendConfig,
+    /// Which AI reviewer the review loop runs, and how many re-review passes it
+    /// makes. `reviewer = "none"` (the default) leaves review human-only.
+    pub review: ReviewConfig,
     /// Whether new workspaces are colocated with Git: `jj workspace add` creates
     /// a Git worktree so each agent workspace has a working `.git`, which lets
     /// tools such as `gh stack` run inside it. On by default; set false to create
@@ -47,6 +50,7 @@ impl Default for Config {
             forge: ForgeConfig::default(),
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
+            review: ReviewConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
             colocate: true,
             _legacy_workspace: None,
@@ -106,6 +110,7 @@ impl Config {
         }
         self.tickets.validate()?;
         self.spend.cap()?;
+        self.review.validate()?;
         Ok(())
     }
 }
@@ -331,6 +336,52 @@ impl Default for SpendConfig {
     }
 }
 
+/// The AI reviewer the review loop runs, and how far it iterates.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Which reviewer produces findings. `none` (the default) keeps the review
+    /// verb's human-only behaviour: nothing is run and the prompt is unchanged.
+    pub reviewer: ReviewerKind,
+    /// The pass cap for the re-review loop: the most reviewer passes jjfx runs
+    /// before it stops. One pass reviews and addresses once.
+    pub max_passes: usize,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            reviewer: ReviewerKind::None,
+            max_passes: 2,
+        }
+    }
+}
+
+impl ReviewConfig {
+    /// Reject settings the review loop cannot run, so a bad config fails here
+    /// rather than mid-review.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.max_passes == 0 {
+            anyhow::bail!("review.max_passes must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+/// The configured AI reviewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub enum ReviewerKind {
+    /// No reviewer: `review` behaves exactly as it did before reviewers existed.
+    #[serde(rename = "none")]
+    None,
+    /// The CodeRabbit CLI in agent mode (`cr review --agent`).
+    #[serde(rename = "coderabbit")]
+    Coderabbit,
+    /// The opencode GitHub Action, run repo-side.
+    #[serde(rename = "opencode-action")]
+    OpenCodeAction,
+}
+
 /// Where jjfx opens workspace session tabs. Empty (the default) drives the kitty
 /// jjfx runs inside, matching pre-config behaviour.
 #[derive(Debug, Default, Deserialize)]
@@ -552,6 +603,79 @@ mod tests {
             error.to_string().contains("tickets.linear.status"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn review_defaults_to_no_reviewer() {
+        let cfg = Config::default();
+        cfg.validate().expect("the default config is valid");
+        assert_eq!(cfg.review.reviewer, ReviewerKind::None);
+        assert_eq!(cfg.review.max_passes, 2);
+    }
+
+    #[test]
+    fn a_review_section_selects_a_reviewer_and_its_pass_cap() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [review]
+            reviewer = "coderabbit"
+            max_passes = 4
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.review.reviewer, ReviewerKind::Coderabbit);
+        assert_eq!(cfg.review.max_passes, 4);
+    }
+
+    #[test]
+    fn the_opencode_action_reviewer_is_selectable() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [review]
+            reviewer = "opencode-action"
+            "#,
+        )
+        .expect("toml parses");
+        assert_eq!(cfg.review.reviewer, ReviewerKind::OpenCodeAction);
+    }
+
+    #[test]
+    fn an_unknown_reviewer_is_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [review]
+            reviewer = "sonarqube"
+            "#,
+        )
+        .expect_err("unknown reviewer is an error");
+        assert!(err.to_string().contains("sonarqube"), "{err}");
+    }
+
+    #[test]
+    fn unknown_review_keys_are_rejected() {
+        let err = toml::from_str::<Config>(
+            r#"
+            [review]
+            reveiwer = "coderabbit"
+            "#,
+        )
+        .expect_err("unknown key is an error");
+        assert!(err.to_string().contains("reveiwer"), "{err}");
+    }
+
+    #[test]
+    fn a_zero_pass_cap_is_rejected() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [review]
+            reviewer = "coderabbit"
+            max_passes = 0
+            "#,
+        )
+        .expect("toml parses");
+        let error = cfg.validate().expect_err("zero passes is an error");
+        assert!(error.to_string().contains("review.max_passes"), "{error}");
     }
 
     #[test]

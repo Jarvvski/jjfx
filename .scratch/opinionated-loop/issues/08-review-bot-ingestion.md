@@ -1,6 +1,6 @@
 # Ingest an AI reviewer's findings into the review loop
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -38,12 +38,12 @@ bounded number of re-review iterations.
 
 ## Acceptance Criteria
 
-- [ ] With a reviewer configured, `jjfx review <worker>` fetches the reviewer's
+- [x] With a reviewer configured, `jjfx review <worker>` fetches the reviewer's
       findings and inlines them into the Worker's prompt.
-- [ ] The re-review loop is bounded and stops on a clear condition.
-- [ ] With no reviewer configured, behaviour is exactly today's.
-- [ ] Reviewer auth is headless-capable and never leaks credentials into argv.
-- [ ] `mise run check` is green.
+- [x] The re-review loop is bounded and stops on a clear condition.
+- [x] With no reviewer configured, behaviour is exactly today's.
+- [x] Reviewer auth is headless-capable and never leaks credentials into argv.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -71,3 +71,18 @@ bounded number of re-review iterations.
   for this ticket: the stop condition needs to be a **pass cap**, not a
   findings-count; and the marginal dimension's value collapses after pass 2, so
   a re-pass should re-run only the dimensions that found something.
+- 2026-10-15: Resolved. `[review] reviewer` selects the reviewer (`none` is the
+  default, and `none` runs neither a reviewer nor a loop, so today's prompt is
+  byte-for-byte unchanged); `[review] max_passes` is the pass cap. The first
+  adapter is the CodeRabbit CLI in agent mode (`cr review --agent --remote`),
+  which the tests drive through a fake `cr` on disk: findings normalise from the
+  NDJSON stream, an incomplete run keeps the findings it did emit, and the argv
+  is asserted exactly so no credential can ever be on it (`cr` reads its own
+  stored auth, so headless login stays out of band). `ReviewLoop` bounds the
+  cycle by the cap and stops early only when a pass has nothing to address; it
+  reports passes, findings, and why it stopped. A background Run cannot wait for
+  an address pass, so `--fg` runs the cap and a background review is one pass.
+  Deviations worth noting: the `ReviewLoop` type landed in the same commit as
+  the config and adapter (same module) rather than in the loop commit, which
+  only wires it; and `opencode-action` parses but is a load-time setup error, as
+  the ticket's Out of Scope allows.
