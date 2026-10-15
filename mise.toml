@@ -1,9 +1,7 @@
 [tools]
-# Rust is rustup's job, not mise's: the toolchain pin (and its clippy/rustfmt
-# components) lives in rust-toolchain.toml, which rustup honours. A mise `rust`
-# entry also resolves to ~/.cargo/bin and shims every binary there - cargo,
-# rustc, jjfx - and a shim for a tool that is not active in the current config
-# fails outright instead of falling through to the real binary.
+# Rust is mise's: the toolchain pin (and its clippy/rustfmt components) lives
+# here rather than in a rust-toolchain.toml, so there is one place to bump it.
+rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 # Versioning and changelog are momo's job (see docs/releasing.md). Pin the CLI
 # so `mise run check` and the release workflow resolve the same binary.
 "github:Jarvvski/momo" = "0.6.0"

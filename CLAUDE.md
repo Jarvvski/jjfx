@@ -57,7 +57,7 @@ is the default scope for that agent session.
 
 ## Toolchain
 
-**mise** owns tasks and the Rust pin (see `mise.toml`, `rust-toolchain.toml`). Use the tasks, don't hand-roll cargo:
+**mise** owns tasks and the Rust pin (see `mise.toml`). Use the tasks, don't hand-roll cargo:
 
 - `mise run check` - the pre-land gate: changelog validation + fmt + lint + build + test.
 - `mise run run` / `build` / `test` / `fmt` / `lint` - individual steps.

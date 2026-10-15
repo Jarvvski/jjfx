@@ -11,8 +11,8 @@ repository = "https://github.com/Jarvvski/jjfx"
 readme = "README.md"
 keywords = ["jujutsu", "jj", "tui", "workspaces", "agents"]
 categories = ["command-line-utilities", "development-tools"]
-# The project pins its toolchain in rust-toolchain.toml and mise.toml; this is
-# the version the suite is verified against, not a hand-computed minimum.
+# The project pins its toolchain in mise.toml; this is the version the suite is
+# verified against, not a hand-computed minimum.
 rust-version = "1.97"
 # Keep the published crate to what a `cargo install` consumer needs: agent
 # state, local planning notes, CI config, and the compatibility binary (which
@@ -27,9 +27,6 @@ exclude = [
   ".scratch/",
   "crates/",
   "momo.toml",
-  # `rust-version` already states the toolchain floor; shipping the pin would
-  # make `cargo install` download a specific toolchain instead.
-  "rust-toolchain.toml",
 ]
 
 [features]
