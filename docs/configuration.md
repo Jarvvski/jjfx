@@ -51,6 +51,11 @@ status = "Todo"
 root = ".scratch"
 ready_status = "ready-for-agent"
 resolved_status = "resolved"
+
+[spend]
+cap_usd = 25.0
+window = "week"
+on_exceed = "block"
 ```
 
 ## `[agent]`
@@ -182,6 +187,40 @@ identity, dependency, and writeback rules.
 | `root` | `".scratch"` | Directory under the repository root holding `<feature>/issues/*.md`. |
 | `ready_status` | `"ready-for-agent"` | The `Status:` value marking a Ticket ready for Dispatch. |
 | `resolved_status` | `"resolved"` | The `Status:` value marking a Ticket resolved, and therefore a satisfied `Blocked by:` entry. |
+
+## `[spend]`
+
+An optional cap on the aggregate spend Dispatch may run up. The aggregate is the
+sum of the durable per-Run cost records jjfx writes at finalization (see
+[Run records](run-records.md)), so the cap is enforced from what Runs actually
+cost rather than from a per-Run hint. An absent `cap_usd` means no cap and no
+gate.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `cap_usd` | unset | The cap in US dollars. Must be a positive, finite amount; an absent key means no cap. |
+| `window` | `"week"` | The window the cap totals over: `today`, `week` (the last seven days), or `total` (every recorded Run). |
+| `on_exceed` | `"block"` | What Dispatch does once the aggregate reaches the cap: `block` refuses it, `warn` lets it through and reports the overage. |
+
+The cap fires at or above its limit - a Run at exactly the cap would push the
+total past it. A blocked Dispatch is refused before any Worker is reserved or
+launched, with a message naming the cap, the current total and the setting that
+overrides it:
+
+```text
+recorded Run spend $27.4000 over the last 7 days exceeds the $25.0000 spend cap;
+raise or remove spend.cap_usd, or set spend.on_exceed = "warn", to override
+```
+
+To override, raise or remove `spend.cap_usd`, or set `spend.on_exceed = "warn"`.
+Both Dispatch paths are gated: the Pool view's Dispatch and orchestration, and
+`jjfx dispatch` (including its orchestration handoff). A cap that cannot be
+evaluated because the record store is unreadable also refuses Dispatch - failing
+closed is the only safe answer for a spend gate.
+
+The current aggregate is always visible without the cap: the Pool view shows a
+pool spend line, and `jjfx status` (and `jjfx pool list`) shows a `SPEND` column
+and a pool-level summary.
 
 ## Legacy `[workspace]`
 
