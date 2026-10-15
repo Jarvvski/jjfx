@@ -841,4 +841,101 @@ mod tests {
         std::fs::remove_dir_all(&workspace).ok();
         std::fs::remove_dir_all(&repo).ok();
     }
+
+    /// The parent half of [`fix_helper`]: drives the helper in a child process
+    /// with a throwaway `JJ_CONFIG`, so the fix tool it configures never touches
+    /// the developer's own jj config. Proves the acceptance end to end against
+    /// real jj: a configured formatter normalises the chain, and a formatter that
+    /// fails is a typed error rather than a silent pass.
+    #[test]
+    fn fix_normalises_a_configured_chain_and_errors_on_a_failed_tool() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let config = dir.path().join("jj-config.toml");
+        std::fs::write(
+            &config,
+            "user.name = \"Fix Test\"\n\
+             user.email = \"fix@example.com\"\n\
+             [fix.tools.upper]\n\
+             command = [\"tr\", \"a-z\", \"A-Z\"]\n\
+             patterns = [\"glob:**/*.txt\"]\n\
+             [fix.tools.boom]\n\
+             command = [\"sh\", \"-c\", \"exit 1\"]\n\
+             patterns = [\"glob:**/*.bad\"]\n",
+        )
+        .expect("writing the fix-tool config");
+
+        // A marker proves the child actually ran the helper: a mistyped filter
+        // would otherwise select zero tests and exit zero.
+        let marker = dir.path().join("helper-ran");
+        let status = std::process::Command::new(
+            std::env::current_exe().expect("the test executable has a path"),
+        )
+        .args([
+            "--exact",
+            "jj::tests::fix_helper",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("JJFX_FIX_HELPER", dir.path())
+        .env("JJ_CONFIG", &config)
+        .status()
+        .expect("the test binary re-runs");
+
+        assert!(status.success(), "the fix helper must pass");
+        assert!(marker.exists(), "the fix helper must have run");
+    }
+
+    /// The child half of the test above, run only when the parent sets
+    /// `JJFX_FIX_HELPER`. `#[ignore]` keeps it out of an ordinary `cargo test`.
+    #[test]
+    #[ignore]
+    fn fix_helper() {
+        let Ok(dir) = std::env::var("JJFX_FIX_HELPER") else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+
+        // A tool that rewrites the chain: the content a formatter would change is
+        // normalised, so nothing is left for a formatter to do.
+        let normalised = dir.join("normalised");
+        init_repo_with_change(&normalised, "f.txt", "hello world\n");
+        assert_eq!(
+            fix(&normalised, "roots(mutable() & mine() & ::@)").expect("the fix runs"),
+            FixOutcome::Fixed
+        );
+        assert_eq!(
+            std::fs::read_to_string(normalised.join("f.txt")).expect("reading the fixed file"),
+            "HELLO WORLD\n"
+        );
+
+        // A tool that fails: jj exits zero, so the typed error must come from
+        // jj's warning, not its exit status.
+        let failing = dir.join("failing");
+        init_repo_with_change(&failing, "g.bad", "hello\n");
+        let error = fix(&failing, "roots(mutable() & mine() & ::@)")
+            .expect_err("a failed formatter must be a typed error");
+        assert!(error.to_string().contains("sh"), "{error}");
+
+        std::fs::write(dir.join("helper-ran"), b"ok").expect("writing the marker");
+    }
+
+    /// Create a jj repo at `dir` with one committed file, then a second commit
+    /// that rewrites it, so the chain has a changed file for `jj fix` to run on.
+    fn init_repo_with_change(dir: &Path, name: &str, content: &str) {
+        let run = |args: &[&str]| {
+            let status = std::process::Command::new("jj")
+                .args(["--config", "signing.behavior=drop"])
+                .args(args)
+                .current_dir(dir)
+                .status()
+                .expect("jj should be installed");
+            assert!(status.success(), "jj {args:?} should succeed");
+        };
+        std::fs::create_dir_all(dir).expect("creating the repo directory");
+        run(&["git", "init", "--no-colocate", "."]);
+        std::fs::write(dir.join(name), content).expect("writing the file");
+        run(&["describe", "-m", "base"]);
+        run(&["new", "-m", "change"]);
+        std::fs::write(dir.join(name), content).expect("writing the file again");
+    }
 }
