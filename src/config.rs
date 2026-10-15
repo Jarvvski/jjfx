@@ -27,6 +27,9 @@ pub struct Config {
     pub tickets: TicketsConfig,
     /// The optional cap on the aggregate spend Dispatch may run up.
     pub spend: SpendConfig,
+    /// Which AI reviewer the review loop runs, and how many re-review passes it
+    /// makes. `reviewer = "none"` (the default) leaves review human-only.
+    pub review: ReviewConfig,
     /// Whether new workspaces are colocated with Git: `jj workspace add` creates
     /// a Git worktree so each agent workspace has a working `.git`, which lets
     /// tools such as `gh stack` run inside it. On by default; set false to create
@@ -47,6 +50,7 @@ impl Default for Config {
             forge: ForgeConfig::default(),
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
+            review: ReviewConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
             colocate: true,
             _legacy_workspace: None,
@@ -106,6 +110,7 @@ impl Config {
         }
         self.tickets.validate()?;
         self.spend.cap()?;
+        self.review.validate()?;
         Ok(())
     }
 }
@@ -329,6 +334,50 @@ impl Default for SpendConfig {
             on_exceed: SpendCapMode::Block,
         }
     }
+}
+
+/// The AI reviewer the review loop runs, and how far it iterates.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ReviewConfig {
+    /// Which reviewer produces findings. `none` (the default) keeps the review
+    /// verb's human-only behaviour: nothing is run and the prompt is unchanged.
+    pub reviewer: ReviewerKind,
+    /// The pass cap for the re-review loop: the most reviewer passes jjfx runs
+    /// before it stops. One pass reviews and addresses once.
+    pub max_passes: usize,
+}
+
+impl Default for ReviewConfig {
+    fn default() -> Self {
+        Self {
+            reviewer: ReviewerKind::None,
+            max_passes: 2,
+        }
+    }
+}
+
+impl ReviewConfig {
+    /// Reject settings the review loop cannot run, so a bad config fails here
+    /// rather than mid-review.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.max_passes == 0 {
+            anyhow::bail!("review.max_passes must be at least 1");
+        }
+        Ok(())
+    }
+}
+
+/// The configured AI reviewer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReviewerKind {
+    /// No reviewer: `review` behaves exactly as it did before reviewers existed.
+    None,
+    /// The CodeRabbit CLI in agent mode (`cr review --agent`).
+    Coderabbit,
+    /// The opencode GitHub Action, run repo-side.
+    OpenCodeAction,
 }
 
 /// Where jjfx opens workspace session tabs. Empty (the default) drives the kitty
