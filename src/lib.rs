@@ -283,8 +283,8 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         app.set_graph_notice(notice);
     }
     // A persisted-on world pane needs its first graph load requested here (the
-    // load is otherwise only triggered by the toggle keys).
-    app.set_idle_collapsed(ui.idle_collapsed);
+    // load is otherwise only triggered by the toggle keys). The idle lane starts
+    // folded (a launch default, not persisted state), so nothing to restore.
     app.refresh_graph_if_visible();
     for effect in app.take_effects() {
         runtime.execute(effect);
@@ -310,7 +310,6 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
     // turn a clean quit into an error.
     ui_state::save(&ui_state::UiState {
         world_pane: app.world_pane(),
-        idle_collapsed: app.idle_collapsed(),
     })
     .ok();
 

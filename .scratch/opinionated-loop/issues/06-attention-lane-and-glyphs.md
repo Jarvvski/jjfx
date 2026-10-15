@@ -1,6 +1,6 @@
 # Attention-first lane and a per-state glyph vocabulary
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -59,3 +59,13 @@ Adopt the converged vocabulary on top of the existing Attention model:
 
 - 2026-10-15: Filed from the strategy review. Refinement of an existing, correct
   thesis rather than net-new behaviour.
+- 2026-10-15: Resolved. Added a per-state lane glyph vocabulary in the render
+  layer (`attention_glyph`: `⚑` needs-you, `◐` working, `⚒` ready-to-forge, `·`
+  idle) and a reserved amber `NEEDS_YOU_AMBER` for the needs-you lane, leaving
+  red for blocked/failed. The lane glyph leads every group header and row. The
+  idle lane now starts folded (a launch default, not persisted state: the
+  `idle_collapsed` UI-state field is retired) and is revealed with `c`. Agent
+  transitions are hook-driven already; `on_agent_event` now also revalidates the
+  selection so a row moving into the folded idle lane cannot leave a dangling
+  selection. Decided to keep the `default` workspace pinned first per ADR 0008,
+  with the needs-you lane leading the remaining groups. `mise run check` green.

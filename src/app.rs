@@ -715,8 +715,14 @@ impl App {
     }
 
     /// Fold one hook event into the per-workspace agent state.
+    ///
+    /// The fold is push-driven (ADR 0004): a transition is visible on the next
+    /// frame with no poll tick. Because that can move a workspace between
+    /// Attention lanes - including out of the folded idle lane - revalidate the
+    /// selection so it always points at a real, currently-selectable row.
     fn on_agent_event(&mut self, ev: agent::Event) {
         self.agents.apply(&ev);
+        self.ensure_selection();
     }
 
     /// The agent state for a workspace, `Absent` if the log has none for it.
@@ -983,17 +989,6 @@ impl App {
     /// Whether the inline world-graph pane is on - persisted as UI state at exit.
     pub fn world_pane(&self) -> bool {
         self.render.world.is_some()
-    }
-
-    /// Restore the idle-group fold state from persisted UI preferences.
-    pub fn set_idle_collapsed(&mut self, collapsed: bool) {
-        self.list.set_idle_collapsed(collapsed);
-        self.ensure_selection();
-    }
-
-    /// Whether the idle workspace group is folded - persisted as UI state at exit.
-    pub fn idle_collapsed(&self) -> bool {
-        self.list.idle_collapsed()
     }
 
     /// `W`: open the full-screen world graph and ask for an async jj-lib read.
@@ -2888,6 +2883,31 @@ mod tests {
 
     fn app_with_terminal(names: &[&str], terminal: Box<dyn Terminal>) -> App {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            store_for(names),
+            agent::AgentStates::default(),
+            terminal.into(),
+            false,
+            tx,
+            crate::config::TicketsConfig::default(),
+        );
+        reveal_idle(&mut app);
+        app
+    }
+
+    /// Reveal the idle lane for tests that want every workspace selectable.
+    /// Production opens with the idle lane folded (see `WorkspaceList::default`);
+    /// the fold-by-default behaviour has its own focused tests, and a test that
+    /// needs the folded start builds the App without this.
+    fn reveal_idle(app: &mut App) {
+        app.handle(press(KeyCode::Char('c')));
+    }
+
+    /// An App in its production launch state - the idle lane folded - for the
+    /// tests that pin the fold-by-default behaviour.
+    fn app_with_folded(names: &[&str]) -> App {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let terminal: Box<dyn Terminal> = Box::new(FakeTerminal::default());
         App::new(
             store_for(names),
             agent::AgentStates::default(),
@@ -2953,6 +2973,8 @@ mod tests {
             tx,
             crate::config::TicketsConfig::default(),
         );
+        let mut app = app;
+        reveal_idle(&mut app);
         (app, runtime, rx)
     }
 
@@ -6062,17 +6084,19 @@ mod tests {
 
     #[test]
     fn idle_group_folds_and_selection_stays_valid() {
-        let mut app = app_with(&["default", "a"]); // both idle
-        assert_eq!(app.selectable_names().len(), 2);
-        // Fold idle -> pinned default remains visible and selected.
-        app.handle(press(KeyCode::Char('c')));
+        let mut app = app_with_folded(&["default", "a"]); // both idle
+        // The idle lane starts folded: only the pinned default is selectable.
         assert!(app.list.idle_collapsed());
         assert_eq!(app.selectable_names(), vec!["default"]);
-        assert_eq!(app.list.selected(), Some("default"));
-        // Unfold restores the grouped workspace without disturbing selection.
+        // Unfold -> the grouped workspace joins without disturbing selection.
         app.handle(press(KeyCode::Char('c')));
         assert!(!app.list.idle_collapsed());
         assert_eq!(app.selectable_names().len(), 2);
+        assert_eq!(app.list.selected(), Some("default"));
+        // Fold again -> pinned default remains visible and selected.
+        app.handle(press(KeyCode::Char('c')));
+        assert!(app.list.idle_collapsed());
+        assert_eq!(app.selectable_names(), vec!["default"]);
         assert_eq!(app.list.selected(), Some("default"));
     }
 
@@ -6247,14 +6271,17 @@ mod tests {
     }
 
     #[test]
-    fn idle_group_fold_state_can_be_restored_from_ui_preferences() {
-        let mut app = app_with(&["default", "idle"]);
-        assert!(!app.idle_collapsed());
-
-        app.set_idle_collapsed(true);
-
-        assert!(app.idle_collapsed());
+    fn idle_group_starts_folded_and_is_revealable() {
+        // The fold is a launch default, not remembered state: the list opens
+        // calm and the `c` key reveals the quiet rows.
+        let mut app = app_with_folded(&["default", "idle"]);
+        assert!(app.list.idle_collapsed());
         assert_eq!(app.selectable_names(), vec!["default"]);
+
+        app.handle(press(KeyCode::Char('c')));
+
+        assert!(!app.list.idle_collapsed());
+        assert_eq!(app.selectable_names().len(), 2);
     }
 
     #[tokio::test]
@@ -6478,6 +6505,67 @@ mod tests {
             agent_glyph(live(Working, Unknown), 0).style.fg,
             Some(Color::DarkGray)
         );
+    }
+
+    /// A hook event line, as the tailer hands it to the app.
+    fn hook(name: &str, cwd: &str) -> Msg {
+        Msg::AgentEvent(agent::Event {
+            name: name.to_string(),
+            cwd: cwd.to_string(),
+            transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
+            notification_type: None,
+            error: None,
+        })
+    }
+
+    #[test]
+    fn a_hook_event_moves_a_row_between_lanes_without_a_poll_tick() {
+        // Both workspaces are idle, so `feat` starts folded away.
+        let mut app = app_with_folded(&["default", "feat"]);
+        assert_eq!(app.selectable_names(), vec!["default"]);
+
+        // A hook puts `feat` to work: it leaves the idle lane immediately, so it
+        // is selectable with no work-snapshot poll.
+        app.handle(hook("UserPromptSubmit", "/wt/feat"));
+        assert!(
+            app.selectable_names().contains(&"feat".to_string()),
+            "a working workspace is visible at once"
+        );
+
+        // A rate-limit StopFailure moves it into the needs-you lane, right after
+        // the pinned default - again with no poll.
+        app.handle(Msg::AgentEvent(agent::Event {
+            name: "StopFailure".to_string(),
+            cwd: "/wt/feat".to_string(),
+            transcript_path: None,
+            jjfx_event_version: None,
+            agent_kind: None,
+            session_id: None,
+            notification_type: None,
+            error: Some("rate_limit".to_string()),
+        }));
+        let names = app.selectable_names();
+        assert_eq!(names.first().map(String::as_str), Some("default"));
+        assert_eq!(names.get(1).map(String::as_str), Some("feat"));
+    }
+
+    #[test]
+    fn a_hook_event_keeps_the_selection_on_a_selectable_row() {
+        // `default` is pinned and idle; `feat` needs you and is selectable.
+        let mut app = app_with_folded(&["default", "feat"]);
+        app.handle(hook("PermissionRequest", "/wt/feat"));
+        app.select_last();
+        assert_eq!(app.list.selected(), Some("feat"));
+
+        // A hook ends `feat`'s turn with clean work, so it drops into the folded
+        // idle lane. The selection must fall back to a still-selectable row
+        // rather than dangle on a hidden one.
+        app.handle(hook("Stop", "/wt/feat"));
+        assert_eq!(app.list.selected(), Some("default"));
+        assert_eq!(app.selectable_names(), vec!["default"]);
     }
 
     #[test]

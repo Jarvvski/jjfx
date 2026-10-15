@@ -1,8 +1,7 @@
 //! jjfx's persisted UI state: small presentation toggles that survive a
-//! relaunch, such as the home view's world-graph pane and idle-group fold.
-//! Lives in the XDG *state* dir beside the event log - jjfx-owned runtime data,
-//! deliberately separate from the user-edited `config.toml`, which jjfx never
-//! writes back.
+//! relaunch, such as the home view's world-graph pane. Lives in the XDG *state*
+//! dir beside the event log - jjfx-owned runtime data, deliberately separate
+//! from the user-edited `config.toml`, which jjfx never writes back.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,14 +10,14 @@ use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 /// The persisted toggles. Unknown keys are ignored (not `deny_unknown_fields`):
-/// a newer jjfx's state file must not break an older one, and vice versa.
+/// a newer jjfx's state file must not break an older one, and vice versa. The
+/// idle-group fold is deliberately *not* here: it is a launch default, so every
+/// session starts calm rather than inheriting a previous fold.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct UiState {
     /// Whether the home view shows the world-graph pane under the list.
     pub world_pane: bool,
-    /// Whether the home view folds the idle workspace group.
-    pub idle_collapsed: bool,
 }
 
 /// `${XDG_STATE_HOME:-~/.local/state}/jjfx/ui.toml` - the same convention as
@@ -78,36 +77,10 @@ mod tests {
     fn round_trips_the_world_pane_toggle() {
         let dir = scratch("rt");
         let file = dir.join("ui.toml");
-        save_to(
-            &file,
-            &UiState {
-                world_pane: true,
-                idle_collapsed: true,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            load_from(&file),
-            UiState {
-                world_pane: true,
-                idle_collapsed: true,
-            }
-        );
-        save_to(
-            &file,
-            &UiState {
-                world_pane: false,
-                idle_collapsed: false,
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            load_from(&file),
-            UiState {
-                world_pane: false,
-                idle_collapsed: false,
-            }
-        );
+        save_to(&file, &UiState { world_pane: true }).unwrap();
+        assert_eq!(load_from(&file), UiState { world_pane: true });
+        save_to(&file, &UiState { world_pane: false }).unwrap();
+        assert_eq!(load_from(&file), UiState { world_pane: false });
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -130,9 +103,11 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_tolerated() {
-        // A state file written by a newer jjfx must still load.
-        let state: UiState = toml::from_str("world_pane = true\nfuture_toggle = 3\n").unwrap();
+        // A state file written by a newer jjfx must still load, and the retired
+        // `idle_collapsed` key from an older one is simply ignored.
+        let state: UiState =
+            toml::from_str("world_pane = true\nidle_collapsed = true\nfuture_toggle = 3\n")
+                .unwrap();
         assert!(state.world_pane);
-        assert!(!state.idle_collapsed);
     }
 }
