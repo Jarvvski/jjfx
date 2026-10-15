@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
@@ -28,6 +28,8 @@ const IN_USE_PATH: &str = ".jj/pool/in-use.json";
 const IN_USE_LOCK: &str = ".jj/pool/.in-use.lock";
 const SESSION_PATH: &str = ".jj/pool/sessions.json";
 const SESSION_LOCK: &str = ".jj/pool/.sessions.lock";
+const RUN_RECORDS_PATH: &str = ".jj/pool/runs.jsonl";
+const RUN_RECORDS_LOCK: &str = ".jj/pool/.runs.lock";
 
 type Extensions = BTreeMap<String, Value>;
 
@@ -327,6 +329,94 @@ pub struct SessionState {
     /// Session identifier keyed by the Worker whose current Run drives it.
     #[serde(default)]
     pub sessions: BTreeMap<WorkerId, String>,
+}
+
+/// One durable record of a completed Run.
+///
+/// jjfx parses a Run's cost, usage, duration and turns at finalization but keeps
+/// them nowhere else: `apply_run_result` persists only status, exit code and
+/// error, and the Run log is opened with `.truncate(true)`, so each Run
+/// overwrites the previous Run's cost data. This record is where that data is
+/// kept instead - one JSON object per line in `.jj/pool/runs.jsonl`, appended
+/// and never truncated, the same shape the Agent Runtime hooks already write.
+///
+/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
+/// Worker documents so their shape is preserved. A compatibility peer ignores
+/// it, and it is readable without the TUI.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    /// The identity of the Run: its Worker and the timestamp its Reservation
+    /// recorded.
+    pub run_id: String,
+    /// The Worker the Run executed in.
+    pub worker: WorkerId,
+    /// The Ticket the Run was dispatched for, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ticket: Option<String>,
+    /// The Worker Workspace path the Run executed in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The bookmark naming the Run's change, if it was resolved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The Agent Runtime that executed the Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The model provider selected for the Run, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The model selected for the Run, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Provider-reported cost in millionths of one US dollar, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_micro_usd: Option<u64>,
+    /// Provider-reported token usage, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<RunRecordUsage>,
+    /// Provider-reported duration in milliseconds, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Provider-reported number of turns, if reported.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turns: Option<u64>,
+    /// The provider-reported conclusion.
+    pub conclusion: RunRecordConclusion,
+    /// The provider-neutral failure message, for a failed Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When the Run started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<WireTimestamp>,
+    /// When the Run completed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub completed_at: Option<WireTimestamp>,
+}
+
+/// Token usage normalized across Agent Runtime providers, as persisted in a
+/// [`RunRecord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecordUsage {
+    /// Provider-reported input tokens.
+    pub input_tokens: u64,
+    /// Input tokens read from a provider cache.
+    pub cached_input_tokens: u64,
+    /// Input tokens written to a provider cache.
+    pub cache_write_input_tokens: u64,
+    /// Provider-reported output tokens.
+    pub output_tokens: u64,
+    /// Output tokens used for provider reasoning.
+    pub reasoning_output_tokens: u64,
+}
+
+/// The provider-reported conclusion of a Run, as persisted in a [`RunRecord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunRecordConclusion {
+    /// The Agent Runtime reported successful completion.
+    Succeeded,
+    /// The Agent Runtime reported a failure.
+    Failed,
 }
 
 /// One Sub-issue entry in a Dispatch Group.
@@ -690,6 +780,11 @@ pub struct InUseStateRepository {
 pub struct SessionStateRepository {
     root: PathBuf,
 }
+/// The jjfx-owned, append-only per-Run cost record store.
+#[derive(Debug, Clone)]
+pub struct RunRecordRepository {
+    root: PathBuf,
+}
 
 impl Repository {
     /// Opens the compatible state repository facade.
@@ -732,6 +827,13 @@ impl StateStore {
     /// Opens the jjfx-owned Agent Runtime Session sidecar repository.
     pub fn sessions(&self) -> SessionStateRepository {
         SessionStateRepository {
+            root: self.root.clone(),
+        }
+    }
+
+    /// Opens the jjfx-owned, append-only per-Run cost record store.
+    pub fn runs(&self) -> RunRecordRepository {
+        RunRecordRepository {
             root: self.root.clone(),
         }
     }
@@ -1983,6 +2085,57 @@ impl SessionStateRepository {
     }
 }
 
+impl RunRecordRepository {
+    /// Appends one Run record as a single JSON line, creating the store if it is
+    /// missing.
+    ///
+    /// The line is written under the store's sidecar lock and flushed before the
+    /// lock is released, so concurrent Workers append whole records and the
+    /// store is never truncated or rewritten.
+    pub fn append(&self, record: &RunRecord) -> Result<(), StateError> {
+        let subject = "Run Records";
+        with_locks(&[self.root.join(RUN_RECORDS_LOCK)], subject, || {
+            let mut line = serde_json::to_vec(record)
+                .map_err(|error| StateError::new("serialize", subject, error))?;
+            line.push(b'\n');
+            let path = self.root.join(RUN_RECORDS_PATH);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| {
+                    StateError::new("create store directory for", subject, error)
+                })?;
+            }
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .map_err(|error| StateError::new("open", subject, error))?;
+            file.write_all(&line)
+                .map_err(|error| StateError::new("append", subject, error))?;
+            file.sync_data()
+                .map_err(|error| StateError::new("sync", subject, error))
+        })
+    }
+
+    /// Reads every recorded Run in append order.
+    ///
+    /// A missing store means "no Runs recorded". A line that cannot be decoded -
+    /// a torn tail from a process that died mid-append, or a foreign writer - is
+    /// skipped so one bad line never hides the rest.
+    pub fn records(&self) -> Result<Vec<RunRecord>, StateError> {
+        let subject = "Run Records";
+        let bytes = match fs::read(self.root.join(RUN_RECORDS_PATH)) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(StateError::new("read", subject, error)),
+        };
+        Ok(bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect())
+    }
+}
+
 impl WorkerStateRepository {
     /// Reports whether Pool membership removal left a durable cleanup marker.
     pub(crate) fn cleanup_marker_exists(&self) -> bool {
@@ -2263,4 +2416,125 @@ fn validate_dispatch_group_for(
         return Err("Sub-issue retries must not be negative".to_owned());
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn record(worker: &str, run_id: &str, cost_micro_usd: Option<u64>) -> RunRecord {
+        RunRecord {
+            run_id: run_id.to_owned(),
+            worker: WorkerId::parse(worker).expect("worker id"),
+            ticket: Some("ENG-1".to_owned()),
+            workspace: None,
+            branch: None,
+            runtime: Some("claude".to_owned()),
+            provider: None,
+            model: None,
+            cost_micro_usd,
+            usage: None,
+            duration_ms: None,
+            turns: None,
+            conclusion: RunRecordConclusion::Succeeded,
+            error: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    fn store() -> (tempfile::TempDir, RunRecordRepository) {
+        let temp = tempfile::tempdir().expect("temp repository");
+        fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        let store = repository.state_store().runs();
+        (temp, store)
+    }
+
+    #[test]
+    fn a_missing_store_reads_as_no_records() {
+        let (_temp, store) = store();
+        assert!(store.records().expect("records").is_empty());
+    }
+
+    #[test]
+    fn appending_run_records_is_append_only_and_ordered() {
+        let (_temp, store) = store();
+        store
+            .append(&record("worker-01", "worker-01@1", Some(100)))
+            .expect("first append");
+        store
+            .append(&record("worker-01", "worker-01@2", Some(200)))
+            .expect("second append");
+
+        let records = store.records().expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].run_id, "worker-01@1");
+        assert_eq!(records[0].cost_micro_usd, Some(100));
+        assert_eq!(records[1].run_id, "worker-01@2");
+        assert_eq!(records[1].cost_micro_usd, Some(200));
+
+        // The store is never truncated: the raw file still carries both lines.
+        let bytes = fs::read(store.root.join(RUN_RECORDS_PATH)).expect("store bytes");
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+    }
+
+    #[test]
+    fn a_record_without_a_cost_round_trips() {
+        let (_temp, store) = store();
+        store
+            .append(&record("worker-01", "worker-01@1", None))
+            .expect("append");
+        let records = store.records().expect("records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_micro_usd, None);
+    }
+
+    #[test]
+    fn an_undecodable_line_does_not_hide_the_rest() {
+        let (_temp, store) = store();
+        store
+            .append(&record("worker-01", "worker-01@1", Some(100)))
+            .expect("append");
+        let path = store.root.join(RUN_RECORDS_PATH);
+        let mut bytes = fs::read(&path).expect("store bytes");
+        bytes.extend_from_slice(b"{\"torn\":");
+        bytes.push(b'\n');
+        bytes.extend_from_slice(
+            &serde_json::to_vec(&record("worker-01", "worker-01@2", Some(200))).expect("line"),
+        );
+        bytes.push(b'\n');
+        fs::write(&path, bytes).expect("write store");
+
+        let records = store.records().expect("records");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].cost_micro_usd, Some(100));
+        assert_eq!(records[1].cost_micro_usd, Some(200));
+    }
+
+    #[test]
+    fn concurrent_appends_do_not_interleave_a_partial_line() {
+        let (_temp, store) = store();
+        let writers = 8;
+        let per_writer = 25;
+        std::thread::scope(|scope| {
+            for writer in 0..writers {
+                let store = store.clone();
+                scope.spawn(move || {
+                    for index in 0..per_writer {
+                        store
+                            .append(&record(
+                                "worker-01",
+                                &format!("worker-01@{writer}-{index}"),
+                                Some(1),
+                            ))
+                            .expect("append");
+                    }
+                });
+            }
+        });
+
+        let records = store.records().expect("records");
+        assert_eq!(records.len(), writers * per_writer);
+    }
 }
