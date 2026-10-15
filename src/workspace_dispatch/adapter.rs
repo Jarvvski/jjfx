@@ -64,6 +64,12 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
     fn set_alias(&self, worker: &str, alias: &str) -> Result<WorkerCommandResult, String>;
     /// Dismiss one Worker using the compatibility disposition.
     fn dismiss(&self, worker: &str) -> Result<WorkerCommandResult, String>;
+    /// Answer one Worker's pending opencode permission request.
+    fn resolve_permission(
+        &self,
+        worker: &str,
+        decision: PermissionDecision,
+    ) -> Result<WorkerCommandResult, String>;
     /// Reads one latest Worker log snapshot without choosing a rendering.
     fn worker_log(&self, worker: &str) -> Result<WorkerLogSnapshot, String>;
 }
@@ -351,13 +357,22 @@ impl RealWorkspaceDispatch {
         let resolved_worker = outcome.worker().to_string();
         let runtime = outcome.runtime();
         let session = outcome.session().clone();
-        let crate::engine::FollowUpExecution::Background(run) = outcome.into_execution() else {
-            return Err("foreground Worker actions are not supported by jjfx".to_owned());
+        let pid = match outcome.into_execution() {
+            crate::engine::FollowUpExecution::Background(run) => {
+                let pid = run.pid();
+                std::thread::spawn(move || {
+                    let _ = run.wait();
+                });
+                Some(pid)
+            }
+            // A daemon-delivered prompt drives no client process; the Worker's
+            // liveness follows its session (ticket 37), so there is nothing to
+            // reap or finalize here.
+            crate::engine::FollowUpExecution::Session(_) => None,
+            crate::engine::FollowUpExecution::Foreground(_) => {
+                return Err("foreground Worker actions are not supported by jjfx".to_owned());
+            }
         };
-        let pid = run.pid();
-        std::thread::spawn(move || {
-            let _ = run.wait();
-        });
         Ok(WorkerSessionOutcome::new(
             resolved_worker,
             action,
@@ -636,6 +651,23 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         Ok(WorkerCommandResult::Dismissed {
             worker: worker.to_owned(),
             disposition,
+        })
+    }
+
+    fn resolve_permission(
+        &self,
+        worker: &str,
+        decision: PermissionDecision,
+    ) -> Result<WorkerCommandResult, String> {
+        let repository = self.repository()?;
+        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
+        let resolution = crate::engine::WorkerActions::new(repository)
+            .resolve_permission(&worker_id, decision)
+            .map_err(|error| error.to_string())?;
+        Ok(WorkerCommandResult::PermissionResolved {
+            worker: worker.to_owned(),
+            action: resolution.request().action().to_owned(),
+            decision: resolution.decision(),
         })
     }
 

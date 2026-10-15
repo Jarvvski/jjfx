@@ -14,8 +14,9 @@ use crate::engine::runtime::pi_interactive_command;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
     AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, DispatchExclusions, Repository, RunLog, RunSupervisor, RunSupervisorError,
-    WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
+    CompletedRun, DispatchExclusions, PermissionDecision, PermissionRequest, Repository,
+    Reservation, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
+    WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -34,6 +35,30 @@ pub enum FollowUpExecution {
     Foreground(CompletedRun),
     /// The background Run must be waited on to reap and finalize it.
     Background(Box<BackgroundRun>),
+    /// The prompt was delivered to the Run's opencode session through the
+    /// daemon API, so there is no client process to reap. The Worker's liveness
+    /// follows the session (ticket 37): reconcile finishes the Run on the
+    /// session's outcome rather than on a process.
+    Session(FollowUpSession),
+}
+
+/// A Follow-up delivered to an opencode Run's session without a client process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowUpSession {
+    session_id: String,
+}
+
+impl FollowUpSession {
+    pub(crate) fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+
+    /// The session the prompt was delivered to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
 }
 
 /// The typed result of launching one Follow-up Run.
@@ -220,6 +245,31 @@ impl MountOutcome {
     /// Returns kitty's new tab window identifier.
     pub fn tab_id(&self) -> &str {
         &self.tab_id
+    }
+}
+
+/// The result of answering a Worker's pending opencode permission request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionResolution {
+    worker: WorkerId,
+    request: PermissionRequest,
+    decision: PermissionDecision,
+}
+
+impl PermissionResolution {
+    /// Returns the Worker whose pending request was answered.
+    pub const fn worker(&self) -> &WorkerId {
+        &self.worker
+    }
+
+    /// Returns the request that was answered.
+    pub const fn request(&self) -> &PermissionRequest {
+        &self.request
+    }
+
+    /// Returns the decision the request was answered with.
+    pub const fn decision(&self) -> PermissionDecision {
+        self.decision
     }
 }
 
@@ -520,6 +570,64 @@ impl WorkerActions {
         }
     }
 
+    /// Answers a Worker's pending opencode permission request through the
+    /// daemon API.
+    ///
+    /// A permission request is what leaves an opencode Run needing a human, so
+    /// answering it is what lets the Run proceed without mounting its Workspace
+    /// in a terminal. Only an opencode Worker with an identified session and a
+    /// pending request can be answered; anything else is a typed error the
+    /// frontend reports, never a silently dropped action.
+    pub fn resolve_permission(
+        &self,
+        worker: &WorkerId,
+        decision: PermissionDecision,
+    ) -> Result<PermissionResolution, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        if state.agent_runtime() != Some(AgentRuntime::OpenCode) {
+            return Err(WorkerActionError::NoRunSession {
+                worker: worker.clone(),
+            });
+        }
+        let api = crate::engine::OpenCodeApi::new();
+        let session_id = crate::engine::runtime::identify_run_session(
+            &api,
+            &self.repository,
+            worker,
+            state.ticket(),
+        )
+        .ok_or_else(|| WorkerActionError::NoRunSession {
+            worker: worker.clone(),
+        })?;
+        let request = api
+            .pending_permissions(&session_id)
+            .map_err(|error| WorkerActionError::PermissionRequest {
+                worker: worker.clone(),
+                detail: error.to_string(),
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| WorkerActionError::NoPendingPermission {
+                worker: worker.clone(),
+            })?;
+        api.reply_permission(&session_id, request.id(), decision)
+            .map_err(|error| WorkerActionError::PermissionRequest {
+                worker: worker.clone(),
+                detail: error.to_string(),
+            })?;
+        Ok(PermissionResolution {
+            worker: worker.clone(),
+            request,
+            decision,
+        })
+    }
+
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
     pub fn review(
         &self,
@@ -621,8 +729,9 @@ impl WorkerActions {
             .worker_pool()
             .begin_follow_up(worker, profile)?;
         let runtime = reservation.agent_runtime();
-        let session = resolve_agent_session_for_runtime(
+        let session = self.resolve_follow_up_session(
             runtime,
+            worker,
             prior_log
                 .as_deref()
                 .filter(|path| !path.as_os_str().is_empty()),
@@ -640,6 +749,33 @@ impl WorkerActions {
                     invocation = invocation.with_system_prompt(system_prompt);
                 }
             }
+        }
+        // An opencode Follow-up to a session jjfx can name is delivered through
+        // the daemon API: the prompt reaches the Run's session without a client
+        // process, and the Worker's liveness follows the session (ticket 37).
+        // Anything the API cannot do - unreachable, too old, or rejected - falls
+        // back to today's process invocation rather than fail the Run. A
+        // foreground Follow-up always drives a process: the caller waits on it.
+        let named_session = match &session {
+            AgentSessionResolution::Resumed { session_id } => Some(session_id.clone()),
+            AgentSessionResolution::Fresh { .. } => None,
+        };
+        if mode == RunMode::Background
+            && runtime == AgentRuntime::OpenCode
+            && let Some(session_id) = named_session.as_deref()
+            && self.deliver_session_prompt(
+                &reservation,
+                session_id,
+                &invocation.delivered_prompt(runtime),
+            )
+        {
+            drop(operation);
+            return Ok(FollowUpOutcome {
+                worker: worker.clone(),
+                runtime,
+                session,
+                execution: FollowUpExecution::Session(FollowUpSession::new(session_id)),
+            });
         }
         let execution = match mode {
             RunMode::Foreground => FollowUpExecution::Foreground(
@@ -664,6 +800,81 @@ impl WorkerActions {
             execution,
         })
     }
+
+    /// Resolves the Agent Session a Follow-up should drive.
+    ///
+    /// An opencode Run's session id is recorded in pool-owned sidecar state
+    /// (ticket 38), so that exact id is preferred over the Run log: it is
+    /// available from the first moment, and an API-native Follow-up does not
+    /// rewrite the log a later Run would otherwise read. Every other runtime
+    /// resolves from the Run log exactly as before.
+    fn resolve_follow_up_session(
+        &self,
+        runtime: AgentRuntime,
+        worker: &WorkerId,
+        prior_log: Option<&Path>,
+    ) -> AgentSessionResolution {
+        if runtime == AgentRuntime::OpenCode
+            && let Ok(Some(session_id)) = self.repository.state_store().sessions().session(worker)
+            && !session_id.is_empty()
+        {
+            return AgentSessionResolution::Resumed { session_id };
+        }
+        resolve_agent_session_for_runtime(runtime, prior_log)
+    }
+
+    /// Delivers a Follow-up prompt to an opencode Run's session through the
+    /// daemon API, reporting whether the daemon accepted it.
+    ///
+    /// Best-effort by contract: only an accepted prompt is `true`. An
+    /// unreachable or older opencode, or a server rejection, reports `false` so
+    /// the caller falls back to the process invocation rather than fail the Run.
+    fn deliver_session_prompt(
+        &self,
+        reservation: &Reservation,
+        session_id: &str,
+        prompt: &str,
+    ) -> bool {
+        // Record the session first: a failure here must fall back before the
+        // prompt is sent, so a Run is never delivered twice.
+        if reservation
+            .repository()
+            .state_store()
+            .sessions()
+            .record(reservation.worker_id(), session_id)
+            .is_err()
+        {
+            return false;
+        }
+        if crate::engine::OpenCodeApi::new()
+            .prompt_async(session_id, prompt)
+            .is_err()
+        {
+            return false;
+        }
+        // The daemon admitted the prompt. Clear the previous Run's provider
+        // terminal event, exactly as a spawned client's log truncation does:
+        // reconcile must not read that result as this Run's.
+        truncate_run_log(reservation.repository(), reservation.worker_id());
+        true
+    }
+}
+
+/// Empties a Worker's Run log so a previous Run's provider terminal event is not
+/// read as the current Run's.
+///
+/// Best-effort: a missing or unwritable log must not fail the Follow-up, because
+/// the Run's liveness still follows its session.
+fn truncate_run_log(repository: &Repository, worker: &WorkerId) {
+    let path = repository
+        .root()
+        .join(".jj/pool")
+        .join(format!("{worker}.log"));
+    let _ = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path);
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1148,6 +1359,15 @@ pub enum WorkerActionError {
     /// The selected runtime's interactive command could not be built.
     #[error(transparent)]
     RuntimeCommand(#[from] AgentRuntimeCommandError),
+    /// The Worker has no opencode Run session to answer a permission for.
+    #[error("Worker {worker} has no opencode Run session")]
+    NoRunSession { worker: WorkerId },
+    /// The Worker's opencode session has no pending permission request.
+    #[error("Worker {worker} has no pending permission request")]
+    NoPendingPermission { worker: WorkerId },
+    /// The opencode API could not read or answer a permission request.
+    #[error("cannot answer Worker {worker}'s permission request: {detail}")]
+    PermissionRequest { worker: WorkerId, detail: String },
     /// The Repository has no compatible GitHub slug.
     #[error("cannot detect GitHub repository")]
     RepositoryUnavailable,

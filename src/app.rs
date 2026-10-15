@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::{self, AgentState};
 use crate::diff::FileDiff;
 use crate::diff_view::Detail;
-use crate::engine::{WorkerPoolSnapshot, WorkerStatus};
+use crate::engine::{PermissionDecision, WorkerPoolSnapshot, WorkerStatus};
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::pool_session::{PoolSession, PoolUpdate};
@@ -61,6 +61,10 @@ enum PoolMode {
     AliasInput {
         worker: String,
         buffer: String,
+    },
+    /// Choosing how to answer one Worker's pending opencode permission request.
+    PermissionChoice {
+        worker: String,
     },
     DispatchPreview {
         tickets: Vec<String>,
@@ -151,6 +155,7 @@ const POOL_BINDINGS: &[(&str, &str)] = &[
     ("Rebase Worker", "g"),
     ("Open Pull Request", "P"),
     ("Edit Worker alias", "e"),
+    ("Answer permission request", "p"),
     ("Dismiss Worker", "x"),
     ("Worker log", "l"),
     ("Ready Ticket discovery", "a"),
@@ -1176,6 +1181,17 @@ impl App {
                         worker,
                     });
                 }
+                KeyCode::Char('p') => {
+                    let Some(worker) = selected.clone().or_else(|| self.pool_worker_after(None, 0))
+                    else {
+                        self.set_status(
+                            "Select a Worker before answering a permission request".to_owned(),
+                        );
+                        self.mode = Mode::Pool(PoolMode::View { selected });
+                        return;
+                    };
+                    self.mode = Mode::Pool(PoolMode::PermissionChoice { worker });
+                }
                 KeyCode::Char('a') => self.discover_ready_tickets(),
                 KeyCode::Char('o') => {
                     self.mode = Mode::Pool(PoolMode::ParentInput {
@@ -1263,6 +1279,17 @@ impl App {
                     self.set_worker_alias(worker, buffer);
                 }
                 _ => self.mode = Mode::Pool(PoolMode::AliasInput { worker, buffer }),
+            },
+            Mode::Pool(PoolMode::PermissionChoice { worker }) => match key.code {
+                KeyCode::Esc => {
+                    self.mode = Mode::Pool(PoolMode::View {
+                        selected: Some(worker),
+                    });
+                }
+                KeyCode::Char('o') => self.answer_permission(worker, PermissionDecision::Once),
+                KeyCode::Char('a') => self.answer_permission(worker, PermissionDecision::Always),
+                KeyCode::Char('r') => self.answer_permission(worker, PermissionDecision::Reject),
+                _ => self.mode = Mode::Pool(PoolMode::PermissionChoice { worker }),
             },
             Mode::Pool(PoolMode::SendInput {
                 worker,
@@ -1419,6 +1446,22 @@ impl App {
         self.pin_status(format!("starting review for {worker}..."));
         self.dispatch
             .submit(WorkspaceDispatchCommand::Review { operation, worker });
+    }
+
+    /// Answer a Worker's pending opencode permission request through the daemon
+    /// API, so the Run can proceed without mounting its Workspace.
+    fn answer_permission(&mut self, worker: String, decision: PermissionDecision) {
+        self.mode = Mode::Pool(PoolMode::View {
+            selected: Some(worker.clone()),
+        });
+        let operation = self.begin_dispatch();
+        self.pin_status(format!("answering {worker}'s permission request..."));
+        self.dispatch
+            .submit(WorkspaceDispatchCommand::ResolvePermission {
+                operation,
+                worker,
+                decision,
+            });
     }
 
     fn start_worker_command(&mut self, command: WorkspaceDispatchCommand) {
@@ -2485,7 +2528,9 @@ impl App {
                 worker: selected, ..
             } => selected.as_deref(),
             PoolMode::SendInput { selected, .. } => selected.as_deref(),
-            PoolMode::AliasInput { worker, .. } | PoolMode::LogDetail { worker } => Some(worker),
+            PoolMode::AliasInput { worker, .. }
+            | PoolMode::LogDetail { worker }
+            | PoolMode::PermissionChoice { worker } => Some(worker),
             PoolMode::ParentInput { .. } => None,
         }
     }
@@ -2590,7 +2635,7 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  o orchestrate  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  p permission  o orchestrate  a ready  r resize  D destroy  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -2604,6 +2649,12 @@ impl App {
             Mode::Pool(PoolMode::SendInput { .. }) => Paragraph::new(Span::raw("")),
             Mode::Pool(PoolMode::AliasInput { worker, buffer }) => Paragraph::new(Span::styled(
                 format!(" Alias for {worker}: {buffer}_  (enter save, esc cancel) "),
+                Style::default().fg(Color::Cyan),
+            )),
+            Mode::Pool(PoolMode::PermissionChoice { worker }) => Paragraph::new(Span::styled(
+                format!(
+                    " Answer {worker}'s permission request: o allow once, a always, r reject, esc cancel "
+                ),
                 Style::default().fg(Color::Cyan),
             )),
             Mode::Pool(PoolMode::DispatchPreview { tickets, .. }) => Paragraph::new(Span::styled(
@@ -4080,7 +4131,7 @@ mod tests {
                     AgentSessionResolution::Fresh {
                         reason: crate::engine::FreshSessionReason::MissingIdentity,
                     },
-                    77,
+                    Some(77),
                 ),
             },
         ));
@@ -4257,6 +4308,85 @@ mod tests {
         assert_eq!(
             app.status.as_deref(),
             Some("Worker Pool: browser unavailable")
+        );
+    }
+
+    #[test]
+    fn pool_permission_key_chooses_a_decision_and_answers_through_the_controller() {
+        let temp = tempfile::tempdir().unwrap();
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).unwrap();
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","agent":"opencode"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"busy","agent":"opencode","ticket":"ENG-42","pid":null,"started_at":"2026-07-27T10:00:00Z","completed_at":null,"log_file":null,"branch_name":"eng-42","exit_code":null,"error":null}"#,
+        )
+        .unwrap();
+        let snapshot = crate::engine::Repository::open(temp.path())
+            .unwrap()
+            .read_worker_pool_snapshot();
+        let adapter = RecordingAdapter::new(snapshot.clone());
+        let controller = WorkspaceDispatchController::new(adapter.clone(), |_| {});
+        let mut app = app_with(&["default", "worker-01"]);
+        app.pool.worker_pool = Some(snapshot);
+        app.dispatch = controller;
+        app.mode = Mode::Pool(PoolMode::View {
+            selected: Some("worker-01".to_owned()),
+        });
+
+        // `p` opens the decision prompt without submitting anything.
+        app.handle(press(KeyCode::Char('p')));
+        assert!(matches!(
+            app.mode,
+            Mode::Pool(PoolMode::PermissionChoice { ref worker }) if worker == "worker-01"
+        ));
+        app.handle(press(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert!(
+            !adapter.commands().iter().any(|command| matches!(
+                command,
+                WorkspaceDispatchCommand::ResolvePermission { .. }
+            ))
+        );
+
+        // `a` answers with "always" through the controller.
+        app.handle(press(KeyCode::Char('p')));
+        app.handle(press(KeyCode::Char('a')));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        wait_until(|| {
+            adapter.commands().iter().any(|command| {
+                matches!(
+                    command,
+                    WorkspaceDispatchCommand::ResolvePermission { worker, decision, .. }
+                        if worker == "worker-01" && *decision == PermissionDecision::Always
+                )
+            })
+        });
+
+        // The completed action is reported, and the Pool refreshes so the
+        // Worker's attention follows the answered request.
+        let operation = app.pool.active_operation.expect("permission operation");
+        app.handle(Msg::WorkspaceDispatch(
+            WorkspaceDispatchEvent::WorkerCommandCompleted {
+                operation,
+                result: WorkerCommandResult::PermissionResolved {
+                    worker: "worker-01".to_owned(),
+                    action: "bash".to_owned(),
+                    decision: PermissionDecision::Always,
+                },
+            },
+        ));
+        assert_eq!(app.pool.active_operation, None);
+        assert!(
+            app.status
+                .as_deref()
+                .is_some_and(|status| status.contains("permission request")),
+            "{:?}",
+            app.status
         );
     }
 
@@ -4452,7 +4582,7 @@ mod tests {
                 AgentSessionResolution::Fresh {
                     reason: crate::engine::FreshSessionReason::MissingIdentity,
                 },
-                77,
+                Some(77),
             ));
             app.pool.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
                 "worker-01",

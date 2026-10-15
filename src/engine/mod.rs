@@ -48,7 +48,7 @@ pub use layout::{
 };
 pub use opencode_api::{
     CommandOutput, ModelRef, NewSession, OpenCodeApi, OpenCodeError, OpenCodeRunner,
-    ProcessOpenCodeRunner, Session, SessionOutcome,
+    PermissionDecision, PermissionRequest, ProcessOpenCodeRunner, Session, SessionOutcome,
 };
 pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationPreparation,
@@ -86,9 +86,10 @@ pub use ticket::{
     TicketValueError,
 };
 pub use worker_actions::{
-    DismissOutcome, FollowUpExecution, FollowUpOutcome, MountOutcome, OpenPullRequestOutcome,
-    RebaseOutcome, ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs,
-    WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
+    DismissOutcome, FollowUpExecution, FollowUpOutcome, FollowUpSession, MountOutcome,
+    OpenPullRequestOutcome, PermissionResolution, RebaseOutcome, ResetOutcome, RunMode,
+    WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration, WorkspaceRestorationError,
+    WorkspaceRestorationHandle,
 };
 pub use workspace::jj_lib_compat_notice;
 pub use workspace::{
