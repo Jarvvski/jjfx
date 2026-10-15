@@ -2148,6 +2148,31 @@ fn occupancy_marker_round_trips_through_the_state_store() {
 }
 
 #[test]
+fn the_waiting_marker_round_trips_and_surfaces_in_the_snapshot() {
+    let (_temp, repository) = repository_with_pool();
+    let waiting = repository.state_store().waiting();
+
+    // Nothing held back is the default, and an unreadable record reads the same.
+    assert!(waiting.held().is_empty());
+    assert!(repository.worker_pool().snapshot().waiting().is_empty());
+
+    waiting
+        .replace(vec!["ENG-10".to_owned(), "ENG-11".to_owned()])
+        .expect("record the held Tickets");
+    assert_eq!(waiting.held(), ["ENG-10", "ENG-11"]);
+    // The Pool snapshot carries it, so every frontend sees the same backlog
+    // without reading jjfx-owned state itself.
+    assert_eq!(
+        repository.worker_pool().snapshot().waiting(),
+        ["ENG-10", "ENG-11"]
+    );
+
+    // A later Dispatch that holds nothing clears it rather than accumulating.
+    waiting.replace(Vec::new()).expect("clear the record");
+    assert!(repository.worker_pool().snapshot().waiting().is_empty());
+}
+
+#[test]
 fn reconcile_occupancy_excludes_only_open_pool_members() {
     use std::collections::BTreeSet;
 

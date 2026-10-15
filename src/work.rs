@@ -765,7 +765,11 @@ mod tests {
         assert_eq!(overlay(&[&pushed, &lower], &prs), changes);
         // The combined signal: a Waiting agent over that stack is needs-you.
         assert_eq!(
-            crate::attention::derive(crate::agent::AgentState::Waiting, changes),
+            crate::attention::derive(
+                crate::agent::AgentState::Waiting,
+                changes,
+                crate::engine::RunHealth::Live
+            ),
             crate::attention::Attention::NeedsYou
         );
     }

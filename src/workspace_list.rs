@@ -13,17 +13,20 @@
 
 use crate::agent::Agent;
 use crate::attention::{self, Attention};
-use crate::engine::WorkerSnapshot;
+use crate::engine::{RunHealth, WorkerSnapshot};
 use crate::store::{DEFAULT_WORKSPACE, Workspace};
 use crate::work::WorkState;
 
 /// The raw per-workspace inputs the list classifies and renders from: the two
-/// lifecycle axes (agent + work) plus the joined Worker snapshot.
+/// lifecycle axes (agent + work), the watchdog's verdict on the Run behind them,
+/// plus the joined Worker snapshot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RowInput<'a> {
     pub workspace: &'a Workspace,
     pub agent: Agent,
     pub work: WorkState,
+    /// The watchdog's verdict on this workspace's current Run.
+    pub health: RunHealth,
     pub worker: Option<&'a WorkerSnapshot>,
 }
 
@@ -74,7 +77,9 @@ impl<'a> ClassifiedView<'a> {
             let mut members: Vec<&RowInput<'a>> = inputs
                 .iter()
                 .filter(|input| input.workspace.name != DEFAULT_WORKSPACE)
-                .filter(|input| attention::derive(input.agent.state, input.work) == att)
+                .filter(|input| {
+                    attention::derive(input.agent.state, input.work, input.health) == att
+                })
                 .collect();
             if members.is_empty() {
                 continue;
@@ -112,7 +117,7 @@ impl<'a> ClassifiedView<'a> {
 fn row<'a>(input: &RowInput<'a>) -> Row<'a> {
     Row::Ws(WorkspaceRow {
         workspace: input.workspace,
-        attention: attention::derive(input.agent.state, input.work),
+        attention: attention::derive(input.agent.state, input.work, input.health),
         agent: input.agent,
         work: input.work,
         worker: input.worker,
@@ -233,7 +238,20 @@ mod tests {
                 ..Default::default()
             },
             work,
+            health: RunHealth::Live,
             worker: None,
+        }
+    }
+
+    /// The same input, with the watchdog having called the workspace's Run stuck.
+    fn stuck_input<'a>(
+        workspace: &'a Workspace,
+        agent: AgentState,
+        work: WorkState,
+    ) -> RowInput<'a> {
+        RowInput {
+            health: RunHealth::Stuck,
+            ..input(workspace, agent, work)
         }
     }
 
@@ -286,6 +304,30 @@ mod tests {
             [
                 "header:NeedsYou(1)",
                 "ws:rate-limited",
+                "header:Idle(1)",
+                "ws:quiet",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stuck_run_groups_with_needs_you() {
+        // A busy Worker whose Run has made no progress is not "working": the
+        // watchdog's verdict lifts it into the needs-you lane.
+        let (stuck, working, idle) = (ws("wedged"), ws("busy"), ws("quiet"));
+        let inputs = [
+            input(&idle, AgentState::Absent, WorkState::Clean),
+            input(&working, AgentState::Working, WorkState::Clean),
+            stuck_input(&stuck, AgentState::Working, WorkState::Clean),
+        ];
+        let view = ClassifiedView::build(&inputs, false);
+        assert_eq!(
+            shape(&view),
+            [
+                "header:NeedsYou(1)",
+                "ws:wedged",
+                "header:Working(1)",
+                "ws:busy",
                 "header:Idle(1)",
                 "ws:quiet",
             ]

@@ -122,6 +122,8 @@ pub struct RealWorkspaceDispatch {
     tickets: TicketsConfig,
     /// The optional aggregate spend cap (`[spend]`) that gates Dispatch.
     spend: SpendConfig,
+    /// The optional ceiling on how many Runs Dispatch may keep in flight.
+    cap: Option<crate::engine::ConcurrencyCap>,
     /// The multiplexer jjfx drives, used to keep Workspaces that are open in a
     /// terminal out of Worker selection. `None` (tests) excludes nothing.
     terminal: Option<std::sync::Arc<dyn crate::terminal::Terminal>>,
@@ -174,6 +176,7 @@ impl RealWorkspaceDispatch {
             colocate: true,
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
+            cap: None,
             terminal: None,
         }
     }
@@ -193,6 +196,12 @@ impl RealWorkspaceDispatch {
     /// Sets the aggregate spend cap that gates Dispatch (builder form).
     pub fn with_spend(mut self, spend: SpendConfig) -> Self {
         self.spend = spend;
+        self
+    }
+
+    /// Sets the ceiling on how many Runs Dispatch may keep in flight.
+    pub fn with_concurrency_cap(mut self, cap: Option<crate::engine::ConcurrencyCap>) -> Self {
+        self.cap = cap;
         self
     }
 
@@ -296,7 +305,10 @@ impl RealWorkspaceDispatch {
                 })
             })
             .collect::<Result<Vec<_>, WorkspaceDispatchError>>()?;
-        let dispatcher = repository.direct_dispatch().with_exclusions(exclusions);
+        let dispatcher = repository
+            .direct_dispatch()
+            .with_exclusions(exclusions)
+            .with_concurrency_cap(self.cap);
         let result = match strategy {
             DispatchStrategy::Complete => dispatcher.dispatch(&requests),
             DispatchStrategy::ApprovedGrowth(additional) => {
@@ -338,6 +350,11 @@ impl RealWorkspaceDispatch {
                     failure.worker().map(ToString::to_string),
                     failure.phase(),
                     failure.detail().to_owned(),
+                ),
+                DirectDispatchOutcome::Waiting(waiting) => DispatchOutcome::waiting(
+                    waiting.ticket().id().to_string(),
+                    waiting.ticket().title().as_str().to_owned(),
+                    waiting.detail().to_owned(),
                 ),
             })
             .collect();

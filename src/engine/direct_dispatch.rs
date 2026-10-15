@@ -6,11 +6,11 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError,
-    AgentRuntimeProfile, CompletedRun, DeliveryContract, DispatchBudget, DispatchExclusions,
-    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, Repository,
-    RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError, Ticket,
-    TicketDetails, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError,
-    WorkerWorkspaceError,
+    AgentRuntimeProfile, CompletedRun, ConcurrencyCap, DeliveryContract, DispatchBudget,
+    DispatchExclusions, DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError,
+    Repository, RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError,
+    Ticket, TicketDetails, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError,
+    WorkerStatus, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -186,6 +186,9 @@ impl DirectDispatchRequest {
 pub struct DirectDispatch {
     repository: Repository,
     exclusions: DispatchExclusions,
+    /// The optional ceiling on concurrent Runs. `None` fires whole batches, the
+    /// behaviour that predates the capacity governor.
+    cap: Option<ConcurrencyCap>,
 }
 
 impl DirectDispatch {
@@ -194,6 +197,7 @@ impl DirectDispatch {
         Self {
             repository,
             exclusions: DispatchExclusions::default(),
+            cap: None,
         }
     }
 
@@ -204,6 +208,74 @@ impl DirectDispatch {
     pub fn with_exclusions(mut self, exclusions: DispatchExclusions) -> Self {
         self.exclusions = exclusions;
         self
+    }
+
+    /// Caps how many Runs this operation may keep in flight at once.
+    ///
+    /// A capped batch fires its first `limit - in_flight` Tickets and holds the
+    /// rest back; `None` (the default) fires the whole batch.
+    pub fn with_concurrency_cap(mut self, cap: Option<ConcurrencyCap>) -> Self {
+        self.cap = cap;
+        self
+    }
+
+    /// Splits a batch at the capacity governor.
+    ///
+    /// The held-back Tickets are the tail of the requested batch, so a caller
+    /// that appends them to its outcomes keeps input order. Nothing is recorded
+    /// here: a batch that fails before it is launched must not leave a waiting
+    /// record behind for Tickets that were never actually held.
+    fn governed<'a>(
+        &self,
+        requests: &'a [DirectDispatchRequest],
+    ) -> (&'a [DirectDispatchRequest], Vec<DirectDispatchWaiting>) {
+        let Some(cap) = self.cap else {
+            return (requests, Vec::new());
+        };
+        let in_flight = self.in_flight();
+        let (fire, held) = super::governor::pace(cap, in_flight, requests);
+        let detail = format!(
+            "concurrency cap {} reached ({} Run(s) in flight)",
+            cap.limit(),
+            in_flight
+        );
+        let waiting = held
+            .iter()
+            .map(|request| DirectDispatchWaiting::new(request.ticket().clone(), detail.clone()))
+            .collect();
+        (fire, waiting)
+    }
+
+    /// Records the waiting set for this batch and appends it to the outcomes.
+    ///
+    /// The set is rewritten on every batch Dispatch - including an uncapped one,
+    /// which clears it - so it always describes the last Dispatch rather than
+    /// accumulating Tickets that have since been fired by hand. A waiting record
+    /// that cannot be written must not fail a Dispatch that is otherwise fine:
+    /// it is how a frontend shows the backlog, nothing more.
+    fn finish(
+        &self,
+        result: DirectDispatchResult,
+        waiting: Vec<DirectDispatchWaiting>,
+    ) -> DirectDispatchResult {
+        let _ = self.repository.state_store().waiting().replace(
+            waiting
+                .iter()
+                .map(|held| held.ticket().id().as_str().to_owned())
+                .collect(),
+        );
+        result.with_waiting(waiting)
+    }
+
+    /// The Runs already in flight: every Worker the Pool records as busy.
+    fn in_flight(&self) -> usize {
+        self.repository
+            .worker_pool()
+            .snapshot()
+            .workers()
+            .iter()
+            .filter(|worker| worker.status() == WorkerStatus::Busy)
+            .count()
     }
 
     /// Reserves capacity for one request using its deterministic target.
@@ -228,6 +300,9 @@ impl DirectDispatch {
     }
 
     /// Atomically reserves the complete batch before launching ordered outcomes.
+    ///
+    /// With a concurrency cap configured, only the Tickets that fit under it are
+    /// reserved and launched; the rest are held back as waiting outcomes.
     pub fn dispatch(
         &self,
         requests: &[DirectDispatchRequest],
@@ -235,8 +310,12 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
-        let profiles = self.preflight_all(requests)?;
-        let targets = requests
+        let (fire, waiting) = self.governed(requests);
+        if fire.is_empty() {
+            return Ok(self.finish(DirectDispatchResult::default(), waiting));
+        }
+        let profiles = self.preflight_all(fire)?;
+        let targets = fire
             .iter()
             .zip(profiles)
             .map(|(request, profile)| {
@@ -255,12 +334,13 @@ impl DirectDispatch {
             .repository
             .worker_pool()
             .reserve_targeted(&targets, &self.exclusions)?;
-        Ok(self.dispatch_claimed(
-            requests,
+        let result = self.dispatch_claimed(
+            fire,
             reservations.into_iter().enumerate().collect(),
             Vec::new(),
             false,
-        ))
+        );
+        Ok(self.finish(result, waiting))
     }
 
     /// Provisions only caller-approved missing capacity, then reserves atomically.
@@ -272,8 +352,12 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
-        let profiles = self.preflight_all(requests)?;
-        let targets = requests
+        let (fire, waiting) = self.governed(requests);
+        if fire.is_empty() {
+            return Ok(self.finish(DirectDispatchResult::default(), waiting));
+        }
+        let profiles = self.preflight_all(fire)?;
+        let targets = fire
             .iter()
             .zip(profiles)
             .map(|(request, profile)| {
@@ -293,12 +377,13 @@ impl DirectDispatch {
             approved_additional,
             &self.exclusions,
         )?;
-        Ok(self.dispatch_claimed(
-            requests,
+        let result = self.dispatch_claimed(
+            fire,
             reservations.into_iter().enumerate().collect(),
             Vec::new(),
             false,
-        ))
+        );
+        Ok(self.finish(result, waiting))
     }
 
     /// Explicitly dispatches only the currently available subset of a batch.
@@ -309,8 +394,12 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
-        let profiles = self.preflight_all(requests)?;
-        let targets = requests
+        let (fire, waiting) = self.governed(requests);
+        if fire.is_empty() {
+            return Ok(self.finish(DirectDispatchResult::default(), waiting));
+        }
+        let profiles = self.preflight_all(fire)?;
+        let targets = fire
             .iter()
             .zip(profiles)
             .map(|(request, profile)| {
@@ -330,7 +419,8 @@ impl DirectDispatch {
             .worker_pool()
             .reserve_available_targeted(&targets, &self.exclusions)?;
         let partial = !available.unavailable.is_empty();
-        Ok(self.dispatch_claimed(requests, available.claimed, available.unavailable, partial))
+        let result = self.dispatch_claimed(fire, available.claimed, available.unavailable, partial);
+        Ok(self.finish(result, waiting))
     }
 
     /// Launches a previously persisted Reservation and transfers its ownership.
@@ -814,6 +904,37 @@ impl DirectDispatchFailure {
     }
 }
 
+/// One Ticket the capacity governor held back rather than fired.
+///
+/// Not a failure: nothing was attempted and nothing was reserved. The Ticket is
+/// waiting for a Run to finish and free a slot under the configured cap, so the
+/// owner can dispatch it again (or let the next Dispatch pick it up).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectDispatchWaiting {
+    ticket: Ticket,
+    detail: String,
+}
+
+impl DirectDispatchWaiting {
+    /// Creates a waiting outcome with the reason it was held back.
+    pub fn new(ticket: Ticket, detail: impl Into<String>) -> Self {
+        Self {
+            ticket,
+            detail: detail.into(),
+        }
+    }
+
+    /// Returns the Ticket that is waiting.
+    pub fn ticket(&self) -> &Ticket {
+        &self.ticket
+    }
+
+    /// Returns why the Ticket was held back.
+    pub fn detail(&self) -> &str {
+        &self.detail
+    }
+}
+
 /// Ordered result for one Ticket in a Direct Dispatch batch.
 #[derive(Debug)]
 pub enum DirectDispatchOutcome {
@@ -821,6 +942,8 @@ pub enum DirectDispatchOutcome {
     Succeeded(DirectDispatchSuccess),
     /// The Ticket failed before a usable Run was launched.
     Failed(DirectDispatchFailure),
+    /// The capacity governor held the Ticket back; nothing was attempted.
+    Waiting(DirectDispatchWaiting),
 }
 
 impl DirectDispatchOutcome {
@@ -829,6 +952,7 @@ impl DirectDispatchOutcome {
         match self {
             Self::Succeeded(outcome) => outcome.ticket(),
             Self::Failed(outcome) => outcome.ticket(),
+            Self::Waiting(outcome) => outcome.ticket(),
         }
     }
 }
@@ -854,5 +978,29 @@ impl DirectDispatchResult {
     /// Reports that an explicit use-available request left Tickets undispatched.
     pub const fn is_partial(&self) -> bool {
         self.partial
+    }
+
+    /// Returns the Tickets the capacity governor held back, in input order.
+    pub fn waiting(&self) -> Vec<&DirectDispatchWaiting> {
+        self.outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                DirectDispatchOutcome::Waiting(waiting) => Some(waiting),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Appends the Tickets the capacity governor held back.
+    ///
+    /// They are the tail of the requested batch, so appending keeps the outcomes
+    /// in the order the caller asked for them. Held-back Tickets do not make the
+    /// result partial: `partial` means an explicit use-available Dispatch could
+    /// not find capacity, which is a different answer from "you asked for more
+    /// than the cap allows at once".
+    pub fn with_waiting(mut self, waiting: Vec<DirectDispatchWaiting>) -> Self {
+        self.outcomes
+            .extend(waiting.into_iter().map(DirectDispatchOutcome::Waiting));
+        self
     }
 }

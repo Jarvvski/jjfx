@@ -436,6 +436,7 @@ mod tests {
     fn a_fake_hook_emitter_drives_the_lifecycle_and_attention_through_the_log() {
         use crate::agent::{AgentKind, AgentState, AgentStates};
         use crate::attention::{self, Attention};
+        use crate::engine::RunHealth;
         use crate::work::WorkState;
 
         let dir = scratch("fake-emitter");
@@ -472,7 +473,7 @@ mod tests {
         assert_eq!(agent.state, AgentState::NeedsAttention);
         assert_eq!(agent.kind, AgentKind::Claude);
         assert_eq!(
-            attention::derive(agent.state, WorkState::Clean),
+            attention::derive(agent.state, WorkState::Clean, RunHealth::Live),
             Attention::NeedsYou
         );
 
@@ -492,7 +493,7 @@ mod tests {
         let agent = states.agent_for(&workspace);
         assert_eq!(agent.state, AgentState::QuotaBlocked);
         assert_eq!(
-            attention::derive(agent.state, WorkState::Clean),
+            attention::derive(agent.state, WorkState::Clean, RunHealth::Live),
             Attention::NeedsYou
         );
 

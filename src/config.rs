@@ -27,6 +27,10 @@ pub struct Config {
     pub tickets: TicketsConfig,
     /// The optional cap on the aggregate spend Dispatch may run up.
     pub spend: SpendConfig,
+    /// The optional ceiling on how many Runs Dispatch may keep in flight.
+    pub dispatch: DispatchConfig,
+    /// How long a Run may make no progress before the list surfaces it as stuck.
+    pub watchdog: WatchdogConfig,
     /// Which AI reviewer the review loop runs, and how many re-review passes it
     /// makes. `reviewer = "none"` (the default) leaves review human-only.
     pub review: ReviewConfig,
@@ -52,6 +56,8 @@ impl Default for Config {
             forge: ForgeConfig::default(),
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
+            dispatch: DispatchConfig::default(),
+            watchdog: WatchdogConfig::default(),
             review: ReviewConfig::default(),
             migrations: MigrationsConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
@@ -113,12 +119,43 @@ impl Config {
         }
         self.tickets.validate()?;
         self.spend.cap()?;
+        self.dispatch.cap()?;
         self.review.validate()?;
         if self.migrations.pattern.trim().is_empty() {
             anyhow::bail!("migrations.pattern cannot be blank");
         }
         Ok(())
     }
+
+    /// The settings the TUI and Dispatch both act on, loaded once and handed
+    /// together: where Ready Tickets come from, what Dispatch may spend, how many
+    /// Runs it may keep in flight, and how long a Run may stall before the list
+    /// surfaces it as stuck.
+    pub fn dispatch_settings(&self) -> DispatchSettings {
+        DispatchSettings {
+            tickets: self.tickets.clone(),
+            spend: self.spend,
+            dispatch: self.dispatch,
+            watchdog: self.watchdog,
+        }
+    }
+}
+
+/// The jjfx settings a frontend acts on, loaded once and handed together.
+///
+/// These are the settings Dispatch and the Worker Pool list both need, so they
+/// travel as one value rather than as a growing argument list. Each carries its
+/// own validation; [`Config::dispatch_settings`] only collects them.
+#[derive(Debug, Clone, Default)]
+pub struct DispatchSettings {
+    /// Where Ready Tickets are discovered.
+    pub tickets: TicketsConfig,
+    /// The optional aggregate spend cap.
+    pub spend: SpendConfig,
+    /// The optional ceiling on concurrent Runs.
+    pub dispatch: DispatchConfig,
+    /// How long a Run may make no progress before the watchdog flags it.
+    pub watchdog: WatchdogConfig,
 }
 
 /// Wrap a shell command in `$SHELL -l -i -c <command>` so login and interactive
@@ -342,6 +379,60 @@ impl Default for SpendConfig {
     }
 }
 
+/// An optional ceiling on how many Runs Dispatch may keep in flight at once.
+///
+/// Absent `max_concurrent` (the default) is no cap: a Dispatch fires its whole
+/// batch, exactly as it did before the governor existed.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DispatchConfig {
+    /// The most Runs that may be in flight at once. Absent means no cap.
+    pub max_concurrent: Option<usize>,
+}
+
+impl DispatchConfig {
+    /// The engine-level cap this config describes, or `None` when there is none.
+    ///
+    /// A cap below one Run is rejected, so a bad config fails at startup rather
+    /// than holding every Dispatch back forever.
+    pub fn cap(&self) -> anyhow::Result<Option<crate::engine::ConcurrencyCap>> {
+        let Some(limit) = self.max_concurrent else {
+            return Ok(None);
+        };
+        crate::engine::ConcurrencyCap::new(limit)
+            .map(Some)
+            .ok_or_else(|| anyhow::anyhow!("dispatch.max_concurrent must be at least 1"))
+    }
+}
+
+/// How long a Run may make no progress before the watchdog flags it as stuck.
+///
+/// The window is a duration rather than a switch so the same setting both tunes
+/// the signal and turns it off: `stuck_after_secs = 0` disables the watchdog
+/// entirely, leaving the list exactly as it was before the watchdog existed.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct WatchdogConfig {
+    /// Seconds of no Run-log activity before a busy Run is surfaced as stuck.
+    /// Zero disables the watchdog. Defaults to thirty minutes.
+    pub stuck_after_secs: u64,
+}
+
+impl WatchdogConfig {
+    /// The engine-level window this config describes.
+    pub fn stuck_window(&self) -> crate::engine::StuckWindow {
+        crate::engine::StuckWindow::from_secs(self.stuck_after_secs)
+    }
+}
+
+impl Default for WatchdogConfig {
+    fn default() -> Self {
+        Self {
+            stuck_after_secs: crate::engine::StuckWindow::DEFAULT.as_duration().as_secs(),
+        }
+    }
+}
+
 /// The AI reviewer the review loop runs, and how far it iterates.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -507,6 +598,13 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl Config {
+        /// Parses a config from TOML, for tests that do not want to write a file.
+        fn from_toml(text: &str) -> Self {
+            toml::from_str(text).expect("test TOML parses")
+        }
+    }
 
     #[test]
     fn empty_config_is_all_defaults() {
@@ -925,6 +1023,68 @@ mod tests {
         let err = toml::from_str::<Config>("[spend]\non_exceed = \"shout\"\n")
             .expect_err("unknown mode is an error");
         assert!(err.to_string().contains("shout"), "{err}");
+    }
+
+    #[test]
+    fn dispatch_is_uncapped_by_default() {
+        let cfg = Config::default();
+        cfg.validate().expect("the default config is valid");
+        assert!(cfg.dispatch.max_concurrent.is_none());
+        assert!(cfg.dispatch.cap().expect("valid").is_none());
+    }
+
+    #[test]
+    fn a_dispatch_section_configures_the_concurrency_cap() {
+        let cfg = Config::from_toml("[dispatch]\nmax_concurrent = 4\n");
+        cfg.validate().expect("the config is valid");
+        let cap = cfg.dispatch.cap().expect("valid").expect("a cap");
+        assert_eq!(cap.limit(), 4);
+    }
+
+    #[test]
+    fn a_concurrency_cap_below_one_is_rejected() {
+        let cfg = Config::from_toml("[dispatch]\nmax_concurrent = 0\n");
+        let error = cfg.validate().expect_err("a cap of zero is an error");
+        assert!(
+            error.to_string().contains("dispatch.max_concurrent"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn unknown_dispatch_keys_are_rejected() {
+        let err = toml::from_str::<Config>("[dispatch]\nmax_concurrent_runs = 2\n")
+            .expect_err("unknown key is an error");
+        assert!(err.to_string().contains("max_concurrent_runs"), "{err}");
+    }
+
+    #[test]
+    fn the_watchdog_defaults_to_thirty_minutes() {
+        let cfg = Config::default();
+        cfg.validate().expect("the default config is valid");
+        assert_eq!(cfg.watchdog.stuck_after_secs, 30 * 60);
+        let window = cfg.watchdog.stuck_window();
+        assert!(window.is_enabled());
+        assert_eq!(window.as_duration().as_secs(), 30 * 60);
+    }
+
+    #[test]
+    fn a_watchdog_section_configures_and_disables_the_window() {
+        let cfg = Config::from_toml("[watchdog]\nstuck_after_secs = 90\n");
+        assert_eq!(cfg.watchdog.stuck_window().as_duration().as_secs(), 90);
+
+        // Zero is the off switch, so the signal can be turned off without a
+        // second setting.
+        let cfg = Config::from_toml("[watchdog]\nstuck_after_secs = 0\n");
+        cfg.validate().expect("a disabled watchdog is valid");
+        assert!(!cfg.watchdog.stuck_window().is_enabled());
+    }
+
+    #[test]
+    fn unknown_watchdog_keys_are_rejected() {
+        let err = toml::from_str::<Config>("[watchdog]\nstuck_after = 90\n")
+            .expect_err("unknown key is an error");
+        assert!(err.to_string().contains("stuck_after"), "{err}");
     }
 
     #[test]

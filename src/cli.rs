@@ -12,10 +12,11 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
     DispatchBudget, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
-    RunActivityKind, RunMode, TerminalSettings, TicketDetails, TicketDiscovery, TicketId,
-    TicketQuery, TicketStatus, UndoOutcome, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
-    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream, REPOSITORY_WIDE_MUTATION,
+    OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
+    ReviewLoop, RunActivity, RunActivityKind, RunMode, StuckWindow, TerminalSettings,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -1131,8 +1132,13 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     let pool = snapshot
         .pool()
         .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
+    // The watchdog's window is jjfx's own setting, read here rather than passed
+    // down: `pool list` is the only CLI command that surfaces Run health, and
+    // `cli::run` is already at the argument limit.
+    let watchdog = crate::config::load()?.watchdog.stuck_window();
+    let now = Timestamp::now();
     if json {
-        return pool_list_json(&snapshot);
+        return pool_list_json(&snapshot, now, watchdog);
     }
     for diagnostic in snapshot.diagnostics() {
         eprintln!("{}", diagnostic.message());
@@ -1146,6 +1152,7 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         "------", "----", "------", "------", "-----"
     );
     let mut counts = [0usize; 4];
+    let mut stuck = 0usize;
     for worker in snapshot.workers() {
         let index = match worker.status() {
             WorkerStatus::Idle => 0,
@@ -1167,6 +1174,16 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
             "{short:<10} {name:<12} {:<10} {ticket:<14} {spend:<11} {elapsed}",
             worker.status().as_str()
         );
+        // A stuck Run reads as `busy`, which is exactly the guessing the
+        // watchdog removes, so say how long it has been quiet.
+        if worker.health(now, watchdog).is_stuck() {
+            stuck += 1;
+            let quiet = worker.run_progress().last_progress_at().map_or_else(
+                || "-".to_owned(),
+                |since| seconds_display(now.duration_since(since)),
+            );
+            println!("           stuck: no progress for {quiet}");
+        }
         // A terminal Worker's reason is only useful when surfaced here: the raw
         // diagnosis lives in its Run log, and the persisted error may be a
         // generic fallback.
@@ -1186,15 +1203,24 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     if let Some(profile) = pool.profile() {
         println!("Profile: {}", render_profile(profile));
     }
+    let stuck = if stuck > 0 {
+        format!(", {stuck} stuck")
+    } else {
+        String::new()
+    };
     println!(
-        "Pool: {} idle, {} busy, {} done, {} failed ({} total)",
+        "Pool: {} idle, {} busy{}, {} done, {} failed ({} total)",
         counts[0],
         counts[1],
+        stuck,
         counts[2],
         counts[3],
         pool.size()
     );
     println!("{}", spend_summary(&snapshot));
+    if !snapshot.waiting().is_empty() {
+        println!("Waiting: {}", snapshot.waiting().join(", "));
+    }
     Ok(())
 }
 
@@ -1236,7 +1262,11 @@ fn short_worker_id(worker_id: &str) -> &str {
 /// Machine-readable Pool status, including the failure fields the table omits.
 ///
 /// Encoded by hand so the emitted field order is fixed.
-fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
+fn pool_list_json(
+    snapshot: &crate::engine::WorkerPoolSnapshot,
+    now: Timestamp,
+    watchdog: StuckWindow,
+) -> Result<()> {
     let mut out = String::from("[\n");
     for (index, worker) in snapshot.workers().iter().enumerate() {
         if index > 0 {
@@ -1253,6 +1283,7 @@ fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
                 }),
             ),
             ("status", json_string(worker.status().as_str())),
+            ("stuck", worker.health(now, watchdog).is_stuck().to_string()),
             ("ticket", json_option(worker.ticket())),
             (
                 "elapsed",
@@ -1353,8 +1384,13 @@ fn elapsed_display(started: Option<&str>, completed: Option<&str>) -> String {
     let completed = completed
         .and_then(|value| Timestamp::from_str(value).ok())
         .unwrap_or_else(Timestamp::now);
-    let duration = completed.duration_since(started);
-    let seconds = duration.as_secs_f64().trunc() as i64;
+    seconds_display(completed.duration_since(started))
+}
+
+/// A span of time as `Xm Ys`, the ELAPSED column's format. A span that runs
+/// backwards (a clock that moved, or a timestamp from the future) reads as `-`.
+fn seconds_display(elapsed: jiff::SignedDuration) -> String {
+    let seconds = elapsed.as_secs_f64().trunc() as i64;
     if seconds < 0 {
         return "-".to_owned();
     }
@@ -1608,9 +1644,14 @@ fn dispatch_with_capacity_prompt(
     requests: &[DirectDispatchRequest],
     exclusions: &DispatchExclusions,
 ) -> Result<crate::engine::DirectDispatchResult> {
+    // The concurrency cap is jjfx's own setting, read here rather than passed
+    // down: `cli::run` is already at the argument limit, and this is the only
+    // place a whole batch is dispatched.
+    let cap = crate::config::load()?.dispatch.cap()?;
     let dispatcher = repository
         .direct_dispatch()
-        .with_exclusions(exclusions.clone());
+        .with_exclusions(exclusions.clone())
+        .with_concurrency_cap(cap);
     match dispatcher.dispatch(requests) {
         Ok(result) => Ok(result),
         Err(DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(shortage))) => {
@@ -1648,40 +1689,53 @@ fn render_dispatch_result(
     requested: usize,
     all: bool,
 ) {
+    let mut fired = 0usize;
     for outcome in result.outcomes() {
         match outcome {
-            DirectDispatchOutcome::Succeeded(success) => match success.execution() {
-                DirectDispatchExecution::Background { pid } => eprintln!(
-                    "  {} (PID {}) -> {}",
-                    success.worker(),
-                    pid,
-                    success.ticket().id()
-                ),
-                DirectDispatchExecution::Foreground(completed) => {
-                    eprintln!(
-                        "  {} completed {:?}",
+            DirectDispatchOutcome::Succeeded(success) => {
+                fired += 1;
+                match success.execution() {
+                    DirectDispatchExecution::Background { pid } => eprintln!(
+                        "  {} (PID {}) -> {}",
                         success.worker(),
-                        completed.result().conclusion()
-                    )
+                        pid,
+                        success.ticket().id()
+                    ),
+                    DirectDispatchExecution::Foreground(completed) => {
+                        eprintln!(
+                            "  {} completed {:?}",
+                            success.worker(),
+                            completed.result().conclusion()
+                        )
+                    }
                 }
-            },
-            DirectDispatchOutcome::Failed(failure) => eprintln!(
-                "  {} failed at {:?}: {}",
-                failure.ticket().id(),
-                failure.phase(),
-                failure.detail()
-            ),
+            }
+            DirectDispatchOutcome::Failed(failure) => {
+                fired += 1;
+                eprintln!(
+                    "  {} failed at {:?}: {}",
+                    failure.ticket().id(),
+                    failure.phase(),
+                    failure.detail()
+                );
+            }
+            DirectDispatchOutcome::Waiting(waiting) => {
+                eprintln!("  {} waiting: {}", waiting.ticket().id(), waiting.detail())
+            }
         }
     }
     if result.is_partial() {
-        let dispatched = result.outcomes().len();
-        if dispatched == 0 && !all {
+        if fired == 0 && !all {
             eprintln!("No idle workers. Run: {PROGRAM} pool list");
         } else {
-            eprintln!("No more idle workers. Dispatched {dispatched}/{requested} ticket(s).");
+            eprintln!("No more idle workers. Dispatched {fired}/{requested} ticket(s).");
         }
     } else if all {
-        eprintln!("Dispatched {} ticket(s)", result.outcomes().len());
+        eprintln!("Dispatched {fired} ticket(s)");
+    }
+    let held = result.waiting().len();
+    if held > 0 {
+        eprintln!("Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes.");
     }
 }
 

@@ -4,6 +4,7 @@
 //! it follows the PRD rules verbatim.
 
 use crate::agent::AgentState;
+use crate::engine::RunHealth;
 use crate::work::WorkState;
 
 /// The single human-facing signal per workspace, in priority order (the order
@@ -44,16 +45,25 @@ impl Attention {
 
 /// Derive the Attention badge from the two axes, per the PRD:
 ///
-/// - **needs-you**: agent NeedsAttention, or agent Waiting over a
+/// - **needs-you**: agent NeedsAttention, a stuck Run, or agent Waiting over a
 ///   changes-requested PR.
 /// - **working**: agent Working.
 /// - **ready-to-forge**: Dirty/Pushed work sitting idle (agent not Working).
 /// - **idle**: Clean work and no live agent (the fallback).
-pub fn derive(agent: AgentState, work: WorkState) -> Attention {
-    // needs-you: a blocked agent, or a Waiting agent over a change-requested PR.
-    // The second clause is what distinguishes a genuine needs-you from an idle
-    // Clean workspace whose agent merely finished its turn. A quota-blocked agent
-    // is blocked on provider capacity or billing, so it needs the human too.
+///
+/// `health` is the watchdog's verdict on the Run behind the workspace (see
+/// [`crate::engine::StuckWindow`]): a Run that has made no progress is the one
+/// case where the two lifecycle axes say "working" while the truth is that the
+/// human is needed, so it outranks everything but a blocked agent.
+pub fn derive(agent: AgentState, work: WorkState, health: RunHealth) -> Attention {
+    // needs-you: a blocked agent, a stuck Run, or a Waiting agent over a
+    // change-requested PR. The last clause is what distinguishes a genuine
+    // needs-you from an idle Clean workspace whose agent merely finished its
+    // turn. A quota-blocked agent is blocked on provider capacity or billing, so
+    // it needs the human too.
+    if health.is_stuck() {
+        return Attention::NeedsYou;
+    }
     if matches!(agent, AgentState::NeedsAttention | AgentState::QuotaBlocked) {
         return Attention::NeedsYou;
     }
@@ -80,6 +90,28 @@ pub fn derive(agent: AgentState, work: WorkState) -> Attention {
 mod tests {
     use super::*;
     use crate::work::ReviewVerdict;
+
+    /// The two lifecycle axes with a Run the watchdog is not flagging, which is
+    /// what every axis-only case below means. The stuck axis has its own test.
+    fn derive(agent: AgentState, work: WorkState) -> Attention {
+        super::derive(agent, work, RunHealth::Live)
+    }
+
+    #[test]
+    fn a_stuck_run_is_needs_you_whatever_the_axes_say() {
+        // The one case the axes get wrong: a Working agent whose Run has made no
+        // progress is not "working" - the human has to look.
+        assert_eq!(
+            super::derive(AgentState::Working, WorkState::Clean, RunHealth::Stuck),
+            Attention::NeedsYou
+        );
+        assert_eq!(
+            super::derive(AgentState::Absent, WorkState::Clean, RunHealth::Stuck),
+            Attention::NeedsYou
+        );
+        assert!(!RunHealth::Live.is_stuck());
+        assert!(RunHealth::Stuck.is_stuck());
+    }
 
     #[test]
     fn needs_attention_agent_is_always_needs_you() {

@@ -9,10 +9,10 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
-    PoolCostSnapshot, PoolState, Repository, RunConclusion, RunCost, RunRecord,
-    RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource, SessionOutcome, StateChange,
-    StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
-    WorkerWorkspaceError,
+    PoolCostSnapshot, PoolState, Repository, RunConclusion, RunCost, RunHealth, RunProgress,
+    RunRecord, RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource, SessionOutcome,
+    StateChange, StateError, StateRevision, StuckWindow, WireStatus, WireTimestamp, WorkerId,
+    WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -1720,6 +1720,10 @@ pub struct WorkerSnapshot {
     exit_code: Option<i64>,
     pid: Option<u32>,
     process_alive: Option<bool>,
+    /// When the Run log was last written, when it could be read. The watchdog's
+    /// cheap progress signal, captured once per snapshot so a frontend need not
+    /// stat the log per frame.
+    log_activity_at: Option<Timestamp>,
 }
 impl WorkerSnapshot {
     pub fn version(&self) -> u8 {
@@ -1805,6 +1809,27 @@ impl WorkerSnapshot {
     pub fn has_dead_process(&self) -> bool {
         self.process_alive == Some(false)
     }
+
+    /// The watchdog's view of this Worker's current Run.
+    pub fn run_progress(&self) -> RunProgress {
+        RunProgress {
+            status: self.status,
+            started_at: self
+                .started_at
+                .as_deref()
+                .and_then(|value| value.parse().ok()),
+            log_activity_at: self.log_activity_at,
+            process_alive: !self.has_dead_process(),
+        }
+    }
+
+    /// The watchdog's verdict on this Worker's current Run.
+    ///
+    /// `now` and `window` are the caller's, not the engine's: the clock and the
+    /// configured window are frontend facts, exactly as the occupied set is.
+    pub fn health(&self, now: Timestamp, window: StuckWindow) -> RunHealth {
+        super::watchdog::health(self.run_progress(), now, window)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1847,6 +1872,8 @@ pub struct WorkerPoolSnapshot {
     diagnostics: Vec<SnapshotDiagnostic>,
     /// Worker Workspaces jjfx currently records as open in a terminal.
     occupied: BTreeSet<WorkerId>,
+    /// Tickets the Dispatch capacity governor held back rather than fired.
+    waiting: Vec<String>,
     /// The Pool's recorded cost and usage, or `None` when the record store could
     /// not be read (so a frontend can say "unavailable" rather than "$0").
     cost: Option<PoolCostSnapshot>,
@@ -1875,6 +1902,11 @@ impl WorkerPoolSnapshot {
     pub fn occupied(&self) -> &BTreeSet<WorkerId> {
         &self.occupied
     }
+    /// Returns the Tickets the capacity governor held back from the last capped
+    /// Dispatch, in the order they were requested.
+    pub fn waiting(&self) -> &[String] {
+        &self.waiting
+    }
     /// Reports whether `worker_id` is currently open in a terminal.
     pub fn is_occupied(&self, worker_id: &str) -> bool {
         self.occupied
@@ -1897,6 +1929,9 @@ impl Repository {
         // The in-use marker is jjfx-owned presentation state, read without
         // touching the terminal; the frontend reconciles it against open tabs.
         let occupied = state.in_use().marked().unwrap_or_default();
+        // The waiting set is jjfx-owned presentation state too: what the last
+        // capped Dispatch held back, so a frontend can show the backlog.
+        let waiting = state.waiting().held();
         // The recorded Run costs are read once here so every Pool presentation
         // carries them; an unreadable store is `None`, not zero spend.
         let cost = self.pool_cost().ok();
@@ -1914,6 +1949,7 @@ impl Repository {
                     workers: Vec::new(),
                     diagnostics,
                     occupied,
+                    waiting,
                     cost,
                 };
             }
@@ -1930,6 +1966,7 @@ impl Repository {
                     workers: Vec::new(),
                     diagnostics,
                     occupied,
+                    waiting,
                     cost,
                 };
             }
@@ -1990,6 +2027,7 @@ impl Repository {
             workers,
             diagnostics,
             occupied,
+            waiting,
             cost,
         }
     }
@@ -2029,6 +2067,8 @@ fn worker_snapshot(
     if pid == Some(0) {
         return Err("Worker PID must be greater than zero".to_owned());
     }
+    let log_activity_at =
+        super::watchdog::log_activity_at(state.log_file.as_deref().map(Path::new));
     Ok(WorkerSnapshot {
         workspace: worker_id.as_str().to_owned(),
         worker_id,
@@ -2044,6 +2084,7 @@ fn worker_snapshot(
         exit_code: state.exit_code,
         process_alive: pid.map(process_is_alive),
         pid,
+        log_activity_at,
     })
 }
 

@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::{self, AgentState};
 use crate::diff::FileDiff;
 use crate::diff_view::Detail;
-use crate::engine::{PermissionDecision, WorkerPoolSnapshot, WorkerStatus};
+use crate::engine::{PermissionDecision, RunHealth, WorkerPoolSnapshot, WorkerStatus};
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::pool_session::{PoolSession, PoolUpdate};
@@ -39,6 +39,7 @@ use crate::workspace_dispatch::{
     WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
+use jiff::Timestamp;
 
 /// The focused Worker Pool management interaction.
 enum PoolMode {
@@ -415,6 +416,10 @@ pub struct App {
     /// The working-glyph animation frame counter, advanced by [`App::animate`]
     /// on each [`Msg::Tick`].
     tick: u64,
+    /// How long a Run may make no progress before the list surfaces it as stuck.
+    /// The clock is read per classification, so a Run crosses the window while
+    /// the TUI is open without waiting for a state change to notice it.
+    watchdog: crate::engine::StuckWindow,
     pub should_quit: bool,
 }
 
@@ -425,15 +430,19 @@ impl App {
         terminal: Arc<dyn Terminal>,
         world_pane: bool,
         tx: UnboundedSender<Msg>,
-        tickets: crate::config::TicketsConfig,
-        spend: crate::config::SpendConfig,
+        settings: crate::config::DispatchSettings,
     ) -> Self {
         let dispatch_tx = tx.clone();
+        let watchdog = settings.watchdog.stuck_window();
         let dispatch = WorkspaceDispatchController::new(
             RealWorkspaceDispatch::new(store.repo_root())
                 .with_colocate(store.colocate())
-                .with_tickets(tickets)
-                .with_spend(spend)
+                .with_tickets(settings.tickets)
+                .with_spend(settings.spend)
+                // The config was validated when it was loaded, so an unusable
+                // cap cannot arrive from a real launch; a hand-built one falls
+                // back to no cap rather than refusing the whole TUI.
+                .with_concurrency_cap(settings.dispatch.cap().ok().flatten())
                 .with_terminal(Arc::clone(&terminal)),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
@@ -471,6 +480,7 @@ impl App {
             list: WorkspaceList::default(),
             tick: 0,
             should_quit: false,
+            watchdog,
         };
         app.track_agent_paths();
         app.ensure_selection();
@@ -2401,21 +2411,28 @@ impl App {
     }
 
     /// The raw per-workspace inputs the list classifies and renders from: each
-    /// workspace paired with its agent, work state, and joined Worker snapshot.
+    /// workspace paired with its agent, work state, Run health, and joined
+    /// Worker snapshot.
     fn row_inputs(&self) -> Vec<RowInput<'_>> {
         let workers = self
             .pool
             .worker_pool
             .as_ref()
             .map_or(&[][..], WorkerPoolSnapshot::workers);
+        let now = Timestamp::now();
         self.store
             .workspaces()
             .iter()
-            .map(|w| RowInput {
-                workspace: w,
-                agent: self.agent_of(w),
-                work: self.work_state(w),
-                worker: workers.iter().find(|worker| worker.workspace() == w.name),
+            .map(|w| {
+                let worker = workers.iter().find(|worker| worker.workspace() == w.name);
+                RowInput {
+                    workspace: w,
+                    agent: self.agent_of(w),
+                    work: self.work_state(w),
+                    health: worker
+                        .map_or(RunHealth::Live, |worker| worker.health(now, self.watchdog)),
+                    worker,
+                }
             })
             .collect()
     }
@@ -2615,6 +2632,8 @@ impl App {
             session: &self.pool,
             pane,
             selected_worker: self.pool_selected(),
+            watchdog: self.watchdog,
+            now: Timestamp::now(),
         }
     }
 
@@ -2980,8 +2999,7 @@ mod tests {
             terminal.into(),
             false,
             tx,
-            crate::config::TicketsConfig::default(),
-            crate::config::SpendConfig::default(),
+            crate::config::DispatchSettings::default(),
         );
         reveal_idle(&mut app);
         app
@@ -3006,8 +3024,7 @@ mod tests {
             terminal.into(),
             false,
             tx,
-            crate::config::TicketsConfig::default(),
-            crate::config::SpendConfig::default(),
+            crate::config::DispatchSettings::default(),
         )
     }
 
@@ -3064,8 +3081,7 @@ mod tests {
             terminal,
             false,
             tx,
-            crate::config::TicketsConfig::default(),
-            crate::config::SpendConfig::default(),
+            crate::config::DispatchSettings::default(),
         );
         let mut app = app;
         reveal_idle(&mut app);
@@ -6441,8 +6457,7 @@ mod tests {
             Arc::from(Box::new(FakeTerminal::default()) as Box<dyn Terminal>),
             true,
             tx,
-            crate::config::TicketsConfig::default(),
-            crate::config::SpendConfig::default(),
+            crate::config::DispatchSettings::default(),
         );
         assert!(app.world_pane());
     }

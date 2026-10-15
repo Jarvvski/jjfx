@@ -56,6 +56,12 @@ resolved_status = "resolved"
 cap_usd = 25.0
 window = "week"
 on_exceed = "block"
+
+[dispatch]
+max_concurrent = 4
+
+[watchdog]
+stuck_after_secs = 1800
 ```
 
 ## `[agent]`
@@ -221,6 +227,82 @@ closed is the only safe answer for a spend gate.
 The current aggregate is always visible without the cap: the Pool view shows a
 pool spend line, and `jjfx status` (and `jjfx pool list`) shows a `SPEND` column
 and a pool-level summary.
+
+## `[dispatch]`
+
+An optional ceiling on how many Runs Dispatch may keep in flight at once. `pool N`
+sizes the Pool and `dispatch --all` fires the whole batch, so a large Pool plus a
+large batch can trip a provider's rate limit in one go; the cap paces the batch
+instead. Absent `max_concurrent` means no cap and Dispatch behaves exactly as it
+did before the governor existed: the whole batch fires at once.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `max_concurrent` | unset | The most Runs that may be in flight at once. Must be at least 1; an absent key means no cap. |
+
+```toml
+[dispatch]
+max_concurrent = 4
+```
+
+The cap is a ceiling on concurrent Runs, not a batch size. A batch fires its
+first `max_concurrent - in_flight` Tickets, where `in_flight` counts the Workers
+the Pool already records as busy, and holds the rest back. Repeated Dispatches
+therefore stay under the same limit rather than each firing a fresh batch of
+`max_concurrent`.
+
+A held Ticket is neither reserved nor launched. It comes back as a waiting
+outcome in input order, named in the CLI and the Pool view:
+
+```text
+  ENG-42 waiting: concurrency cap 4 reached (4 Run(s) in flight)
+Held 2 ticket(s) back under the dispatch cap; re-run once a Run finishes.
+```
+
+The waiting set is recorded in jjfx's own `.jj/pool/waiting.json` and shown by
+`jjfx status` (a `Waiting:` line) and the Pool view, so the backlog is visible
+after the Dispatch that held it. It is jjfx-owned presentation state, kept out of
+the Go-compatible Pool and Worker documents, and it is rewritten by every
+Dispatch - including an uncapped one, which clears it - so it always describes
+the last Dispatch rather than accumulating Tickets you have since dispatched by
+hand.
+
+## `[watchdog]`
+
+How long a Run may make no progress before jjfx surfaces it as stuck. A Worker
+whose agent has wedged - waiting on a prompt it will never get, or looping -
+stays `busy` with no signal beyond elapsed time, so the owner finds out by
+reading the list and guessing.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `stuck_after_secs` | `1800` | Seconds without progress before a busy Run is surfaced as stuck. `0` disables the watchdog. |
+
+```toml
+[watchdog]
+stuck_after_secs = 1800
+```
+
+Progress is the later of the Run's start and its Run log's last write, so a Run
+that just started is not stuck and a log still being written is progress by
+definition. A Run whose recorded process is gone is reconciliation's problem, not
+the watchdog's: it becomes failed, never stuck. A Run with neither a start time
+nor a readable log has no evidence either way and is never flagged on a guess.
+
+Stuck is derived, never persisted - like occupancy it is a view of live Run
+state, so the Go-compatible Pool and Worker documents are untouched. It shows up
+in three places:
+
+- the home list, where a stuck Run sorts into the `needs you` lane instead of
+  reading as `working`;
+- the Pool view, as a `[stuck]` marker beside the Worker's persisted `busy`
+  status;
+- `jjfx status`, as a per-Worker `stuck: no progress for 42m 0s` line and a
+  `, N stuck` count in the pool summary.
+
+Set `stuck_after_secs = 0` to turn the signal off entirely, leaving the list
+exactly as it was before the watchdog existed. Nothing is ever re-dispatched
+automatically: a stuck Run is surfaced, and the human decides.
 
 ## `[review]`
 

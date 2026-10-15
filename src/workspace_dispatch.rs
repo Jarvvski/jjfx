@@ -402,6 +402,8 @@ pub struct DispatchOutcome {
     pid: Option<u32>,
     phase: Option<String>,
     detail: Option<String>,
+    /// The capacity governor held this Ticket back: nothing was attempted.
+    waiting: bool,
 }
 
 impl DispatchOutcome {
@@ -414,6 +416,7 @@ impl DispatchOutcome {
             pid: Some(pid),
             phase: None,
             detail: None,
+            waiting: false,
         }
     }
 
@@ -432,6 +435,20 @@ impl DispatchOutcome {
             pid: None,
             phase: Some(format!("{phase:?}")),
             detail: Some(detail),
+            waiting: false,
+        }
+    }
+
+    /// Creates an outcome for a Ticket the capacity governor held back.
+    pub fn waiting(ticket: String, title: String, detail: String) -> Self {
+        Self {
+            ticket,
+            title,
+            worker: None,
+            pid: None,
+            phase: None,
+            detail: Some(detail),
+            waiting: true,
         }
     }
 
@@ -462,6 +479,10 @@ impl DispatchOutcome {
     /// Reports whether the Ticket launched successfully.
     pub const fn succeeded(&self) -> bool {
         self.pid.is_some()
+    }
+    /// Reports whether the capacity governor held the Ticket back.
+    pub const fn is_waiting(&self) -> bool {
+        self.waiting
     }
 }
 
@@ -1187,6 +1208,7 @@ impl RecordingAdapter {
                     pid: Some(42),
                     phase: None,
                     detail: None,
+                    waiting: false,
                 })
                 .collect(),
             partial: false,
