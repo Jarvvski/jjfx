@@ -123,6 +123,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn an_absent_tickets_section_selects_the_linear_source() {
+        // Backwards compatible: no `[tickets]` still means the Agent Runtime's
+        // native Linear discovery.
+        let default = TicketsConfig::default();
+        assert_eq!(default.source, TicketSource::Linear);
+        let workspace = Path::new("/tmp/jjfx-ticket-source");
+        for runtime in [
+            AgentRuntime::Claude,
+            AgentRuntime::Codex,
+            AgentRuntime::OpenCode,
+        ] {
+            assert!(
+                configured_ticket_query(workspace, &default, runtime).is_ok(),
+                "{runtime}"
+            );
+        }
+    }
+
     /// A non-runtime `TicketQuery` stands in for a configured source: it proves
     /// discovery, the dependency graph, and ticket details all route through
     /// whichever source is selected, with no Agent Runtime involved.

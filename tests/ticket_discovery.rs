@@ -83,6 +83,27 @@ fn ready_ticket_discovery_sends_a_typed_request_to_the_query_adapter() {
     );
 }
 
+#[test]
+fn a_boxed_source_is_a_ticket_query() {
+    // A dynamically selected source - the shape a configured non-runtime source
+    // takes - drives the shared discovery abstraction.
+    let source: Box<dyn TicketQuery> = Box::new(StubQuery::returning(
+        r#"{"tickets":[{"id":"ENG-7","title":"Boxed","status":"Todo","labels":["ready-for-agent"]}]}"#,
+    ));
+    let discovery = TicketDiscovery::new(source);
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let ready = discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+
+    assert_eq!(ready.tickets()[0].id().as_str(), "ENG-7");
+}
+
 struct RecordingDetailsQuery {
     request: Arc<Mutex<Option<TicketQueryRequest>>>,
 }
