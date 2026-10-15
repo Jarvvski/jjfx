@@ -181,6 +181,65 @@ impl LocalTickets {
         .to_string())
     }
 
+    /// Builds the dependency graph of one feature, whose id is the Parent.
+    ///
+    /// A local Parent is the feature directory: its direct children are that
+    /// feature's Tickets, and each child's `Blocked by:` numbers resolve to the
+    /// sibling Tickets they name. A Parent that is not a feature directory has no
+    /// children, so orchestration falls back to dispatching it directly.
+    fn dependency_payload(&self, parent: &TicketId) -> Result<String, TicketQueryError> {
+        let tickets = self.scan().map_err(TicketQueryError::from)?;
+        let children = tickets
+            .iter()
+            .filter(|ticket| ticket.feature == parent.as_str());
+        let mut sub_issues = Vec::new();
+        for ticket in children {
+            let blocked_by = ticket
+                .blockers
+                .as_ref()
+                .map(|blockers| {
+                    blockers
+                        .iter()
+                        .map(|number| {
+                            tickets
+                                .iter()
+                                .find(|candidate| {
+                                    candidate.feature == ticket.feature
+                                        && candidate.number == *number
+                                })
+                                .map_or_else(|| number.to_string(), |blocker| blocker.id.clone())
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            sub_issues.push(json!({
+                "id": ticket.id,
+                "title": ticket.title,
+                "status": self.dispatch_vocabulary_status(&ticket.status),
+                "blocked_by": blocked_by,
+                "cross_repo": false,
+            }));
+        }
+        Ok(json!({ "sub_issues": sub_issues }).to_string())
+    }
+
+    /// Maps a local Ticket status onto the shared Dispatch Group vocabulary.
+    ///
+    /// The group builder dispatches `todo`-like work and treats terminal work as
+    /// delivered, so the local ready status reads as `todo` and a resolved Ticket
+    /// reads as `done`; a claimed Ticket is in flight and is skipped.
+    fn dispatch_vocabulary_status(&self, status: &str) -> String {
+        if status_eq(status, &self.ready_status) {
+            "todo".to_owned()
+        } else if status_eq(status, &self.resolved_status) {
+            "done".to_owned()
+        } else if status_eq(status, CLAIMED_STATUS) {
+            "in progress".to_owned()
+        } else {
+            status.to_owned()
+        }
+    }
+
     /// Whether one Ticket is ready for Dispatch: its status is the ready status
     /// and every Blocker resolves to a resolved sibling in the same feature.
     fn is_ready(&self, ticket: &LocalTicket, tickets: &[LocalTicket]) -> bool {
@@ -225,8 +284,8 @@ impl TicketQuery for LocalMarkdownQuery {
         match request {
             TicketQueryRequest::ReadyTickets { filter } => self.tickets.ready_payload(filter),
             TicketQueryRequest::TicketDetails { id } => self.tickets.details_payload(id),
-            TicketQueryRequest::DependencyGraph { .. } => {
-                Ok(json!({ "sub_issues": [] }).to_string())
+            TicketQueryRequest::DependencyGraph { parent, .. } => {
+                self.tickets.dependency_payload(parent.id())
             }
         }
     }
@@ -468,7 +527,7 @@ mod tests {
     use std::path::Path;
 
     use super::*;
-    use crate::engine::{TicketDiscovery, TicketStatus};
+    use crate::engine::{ParentTicket, RepositoryIdentity, TicketDiscovery, TicketStatus};
     use tempfile::TempDir;
 
     fn write_ticket(root: &Path, feature: &str, file: &str, content: &str) {
@@ -601,5 +660,165 @@ mod tests {
         assert!(ready.tickets().is_empty());
         assert_eq!(ready.diagnostics().len(), 1, "{:?}", ready.diagnostics());
         assert_eq!(ready.diagnostics()[0].subject(), "widgets--01-no-title");
+    }
+
+    #[test]
+    fn a_ticket_blocked_by_an_unresolved_sibling_is_not_ready() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: ready-for-agent\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        assert_eq!(ready.tickets().len(), 1);
+        assert_eq!(ready.tickets()[0].id().as_str(), "widgets--01-foundation");
+    }
+
+    #[test]
+    fn resolving_a_blocker_makes_its_dependent_ready() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: resolved\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        assert_eq!(ready.tickets().len(), 1);
+        assert_eq!(ready.tickets()[0].id().as_str(), "widgets--02-dependent");
+    }
+
+    #[test]
+    fn dependency_graph_maps_blockers_to_sibling_ids() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: resolved\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "other",
+            "01-elsewhere.md",
+            "# Elsewhere\n\nStatus: ready-for-agent\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+        let parent = ParentTicket::new(TicketId::parse("widgets").expect("Parent id"));
+        let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+        let graph = discovery
+            .dependency_graph(&parent, &repository)
+            .expect("dependency graph");
+
+        assert_eq!(graph.sub_issues().len(), 2, "{:?}", graph.diagnostics());
+        let dependent = &graph.sub_issues()[&TicketId::parse("widgets--02-dependent").expect("id")];
+        assert_eq!(dependent.ticket().status().as_str(), "todo");
+        assert_eq!(dependent.blockers().len(), 1);
+        assert_eq!(
+            dependent.blockers()[0].id().as_str(),
+            "widgets--01-foundation"
+        );
+        assert!(!dependent.is_cross_repository());
+        let foundation =
+            &graph.sub_issues()[&TicketId::parse("widgets--01-foundation").expect("id")];
+        assert_eq!(foundation.ticket().status().as_str(), "done");
+    }
+
+    #[test]
+    fn a_parent_that_is_not_a_feature_has_no_children() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: ready-for-agent\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+        let parent = ParentTicket::new(TicketId::parse("widgets--01-foundation").expect("id"));
+        let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+        let graph = discovery
+            .dependency_graph(&parent, &repository)
+            .expect("dependency graph");
+
+        assert!(graph.sub_issues().is_empty());
+    }
+
+    #[test]
+    fn an_unknown_blocker_is_reported_in_the_dependency_graph() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 99\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-independent.md",
+            "# Independent\n\nStatus: ready-for-agent\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+        let parent = ParentTicket::new(TicketId::parse("widgets").expect("Parent id"));
+        let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+        let graph = discovery
+            .dependency_graph(&parent, &repository)
+            .expect("dependency graph");
+
+        assert_eq!(graph.sub_issues().len(), 1);
+        assert!(
+            graph.diagnostics()[0].reason().contains("99"),
+            "{:?}",
+            graph.diagnostics()
+        );
+    }
+
+    #[test]
+    fn a_feature_whose_only_ticket_is_invalid_is_not_an_empty_graph() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 99\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+        let parent = ParentTicket::new(TicketId::parse("widgets").expect("Parent id"));
+        let repository = RepositoryIdentity::parse("owner/repo").expect("Repository identity");
+
+        let error = discovery
+            .dependency_graph(&parent, &repository)
+            .expect_err("an all-invalid graph is unusable, not empty");
+
+        assert!(error.to_string().contains("unusable"), "{error}");
     }
 }
