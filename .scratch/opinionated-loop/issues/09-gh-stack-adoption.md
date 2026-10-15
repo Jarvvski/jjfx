@@ -1,6 +1,6 @@
 # Adopt `gh stack` for stack state instead of hand-rolling base-chaining
 
-Status: ready-for-agent
+Status: wontfix
 Type: task
 Blocked by: none
 
@@ -58,3 +58,11 @@ hand-rolled path stays.
 
 - 2026-10-15: Filed from the strategy review. `gh stack link`'s jj support was
   read from GitHub docs; whether it *fully* replaces jjfx's assembly is the spike.
+- 2026-10-15: **Spike: not adopted — closes `wontfix`.** Run on a real throwaway repo (`Jarvvski/jjfx-stack-spike`, private, now archived) with the real tool (`github/gh-stack` v0.1.0, `gh` 2.102.0). Native stacked PRs are enabled there (`GET /repos/Jarvvski/jjfx-stack-spike/stacks` → `[]`, not 404), and jj bookmarks do export as git branches in a colocated workspace, so `gh stack` can see jj's branches — the jj-accommodation claim holds. `gh stack link t1 t2 t3` pushed the three branches, created three PRs, set the bases exactly as `base_for` would (t1→main, t2→t1, t3→t2), and created native stack #4. Bases match; nothing else does.
+- The rest is a behavioural loss, so the hand-rolled path stays:
+- **Titles and bodies are lost.** `link` titled the PRs from the *branch names* (`t1`, `t2`, `t3`) and wrote a fixed gh-stack footer as the body, discarding the jj commit description that `split_title_body` turns into the PR title and body. jjfx's `## Stack` section is not written at all (the native stack UI replaces it), so the bodies are not "identical". A re-run of `link` preserves an existing body only because it never manages bodies — it cannot produce jjfx's bodies either.
+- **No local tracking, so no cascade rebase.** `link` "does not create or modify any local tracking state": afterwards `gh stack view` and `gh stack sync` both exit 2 ("current branch is not part of a stack"). The merge-queue-aware `sync`/`merge` value the ticket hoped for is unavailable through `link`; jjfx's weld would still be the only cascade path, so nothing is removed there.
+- **It pushes the branches itself** (`git push`, "Pushing 3 branches to origin"), overlapping the `jj git push` push step the ticket wanted to keep.
+- **Portability and dependency cost.** The Stacks REST API is gated per repository: without the feature it 404s and `gh stack` warns "Stacked PRs are not enabled for this repository" (`cmd/utils.go`, `internal/github/github.go`; `docs/.../reference/rest-api.md`). `gh stack` is also a separate extension, not core `gh`, so adopting it would make a general tool depend on a gated GitHub feature plus an extra extension install.
+- Net: `link` can replace `base_for` but loses the description-derived title/body and the `## Stack` section, gains no cascade rebase, and adds a gated-feature + extension dependency. The adoption criterion ("stack assembly removed, PR stack identical in bases **and** reviewable bodies") is not met, so no code change is made.
+- Spike hygiene: the throwaway repo's PRs were closed and its branches deleted, and the repo was archived. It could not be deleted — the token lacks the `delete_repo` scope, and refreshing scopes was out of scope — so the owner may delete `Jarvvski/jjfx-stack-spike` at leisure.
