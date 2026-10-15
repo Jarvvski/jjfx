@@ -11,8 +11,8 @@ use crate::attention::Attention;
 use crate::engine::{AgentRuntime, WorkerSnapshot, WorkerStatus};
 use crate::render::state::RenderState;
 use crate::render::style::{
-    agent_color, agent_glyph, agent_label, attention_color, behind_color, display_path,
-    elapsed_label, forge_spans, pane_border, work_color,
+    agent_color, agent_glyph, agent_label, attention_color, attention_glyph, behind_color,
+    display_path, elapsed_label, forge_spans, pane_border, work_color,
 };
 use crate::render::view::{HomeRow, RowMarker};
 use crate::store::WorkspacePath;
@@ -116,9 +116,10 @@ pub(crate) fn draw(
 
     frame.render_widget(footer, footer_area);
 }
-/// A group-header row: the Attention heading, count, and a fold hint for idle.
+/// A group-header row: the lane glyph, Attention heading, count, and a fold
+/// hint for idle.
 pub(crate) fn header_item(att: Attention, count: usize, idle_collapsed: bool) -> ListItem<'static> {
-    let mut text = format!("{} ({count})", att.heading());
+    let mut text = format!("{} {} ({count})", attention_glyph(att), att.heading());
     if att == Attention::Idle {
         text.push_str(if idle_collapsed {
             "  [c: expand]"
@@ -177,9 +178,10 @@ pub(crate) fn workspace_item(
     let mut spans = vec![
         bullet,
         Span::styled(
-            // Widest heading ("ready to forge") is 14 chars; pad past it so
-            // the following columns align across every row.
-            format!("{:<15}", att.heading()),
+            // The lane glyph leads the badge; widest heading ("ready to forge")
+            // is 14 chars, so glyph + space + 13 keeps the column at 15 and the
+            // following columns align across every row.
+            format!("{} {:<13}", attention_glyph(att), att.heading()),
             Style::default().fg(attention_color(att)),
         ),
         agent_glyph(agent, tick),
@@ -424,5 +426,75 @@ mod tests {
         assert!(text.contains("(missing: /tmp/gone-workspace)"), "{text}");
         assert!(text.contains("(path unknown)"), "{text}");
         assert!(!text.contains("not in ws-cache"), "{text}");
+    }
+
+    #[test]
+    fn the_needs_you_lane_leads_with_its_glyph_in_the_reserved_amber() {
+        use crate::render::style::NEEDS_YOU_AMBER;
+
+        let ws = Workspace {
+            name: "blocked".to_string(),
+            path: WorkspacePath::Present(std::path::PathBuf::from("/tmp/blocked")),
+        };
+        let view = HomeView {
+            rows: vec![
+                HomeRowKind::Header {
+                    attention: Attention::NeedsYou,
+                    count: 1,
+                },
+                HomeRowKind::Workspace(row(&ws, Attention::NeedsYou)),
+            ],
+            selected: None,
+            idle_collapsed: true,
+            tick: 0,
+            title: "jjfx".to_string(),
+        };
+        let state = RenderState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), Vec::new()))
+            .unwrap();
+
+        let text = term.backend().to_string();
+        assert!(text.contains("⚑ needs you (1)"), "{text}");
+
+        // Every lane glyph drawn on the needs-you lane wears the reserved amber,
+        // not the red reserved for a blocked/failed state.
+        let buffer = term.backend().buffer();
+        let mut glyphs = 0;
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                if cell.symbol() == "⚑" {
+                    assert_eq!(cell.fg, NEEDS_YOU_AMBER, "lane glyph is amber");
+                    glyphs += 1;
+                }
+            }
+        }
+        assert_eq!(glyphs, 2, "header and row each carry the lane glyph");
+    }
+
+    #[test]
+    fn a_folded_idle_lane_shows_the_reveal_hint() {
+        let ws = Workspace {
+            name: "quiet".to_string(),
+            path: WorkspacePath::Present(std::path::PathBuf::from("/tmp/quiet")),
+        };
+        let view = HomeView {
+            rows: vec![HomeRowKind::Header {
+                attention: Attention::Idle,
+                count: 3,
+            }],
+            selected: Some(&ws.name),
+            idle_collapsed: true,
+            tick: 0,
+            title: "jjfx".to_string(),
+        };
+        let state = RenderState::default();
+        let mut term = Terminal::new(TestBackend::new(80, 8)).unwrap();
+        term.draw(|frame| draw(frame, &view, &state, Paragraph::new(""), Vec::new()))
+            .unwrap();
+        let text = term.backend().to_string();
+        assert!(text.contains("· idle (3)"), "{text}");
+        assert!(text.contains("[c: expand]"), "{text}");
     }
 }

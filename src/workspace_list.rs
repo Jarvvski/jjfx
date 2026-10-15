@@ -121,13 +121,24 @@ fn row<'a>(input: &RowInput<'a>) -> Row<'a> {
 
 /// The stateful workspace list: which workspace is selected (by name) and
 /// whether the idle group is folded. The render cursor lives with the renderer.
-#[derive(Default)]
 pub struct WorkspaceList {
     /// Selection tracked by workspace name, not row index, so it follows a
     /// workspace as live state re-sorts it between Attention groups.
     selected: Option<String>,
     /// Whether the idle group is folded away.
     idle_collapsed: bool,
+}
+
+impl Default for WorkspaceList {
+    /// The idle lane starts folded: the list leads with what needs you, and the
+    /// quiet rows are revealed on demand rather than persisted. The fold is a
+    /// deliberate default, not remembered state, so every launch starts calm.
+    fn default() -> Self {
+        Self {
+            selected: None,
+            idle_collapsed: true,
+        }
+    }
 }
 
 impl WorkspaceList {
@@ -144,11 +155,6 @@ impl WorkspaceList {
     /// Fold or unfold the idle group.
     pub fn toggle_idle(&mut self) {
         self.idle_collapsed = !self.idle_collapsed;
-    }
-
-    /// Restore the idle-group fold state from persisted UI preferences.
-    pub fn set_idle_collapsed(&mut self, collapsed: bool) {
-        self.idle_collapsed = collapsed;
     }
 
     /// Classify and lay out `inputs` into the current view, honoring the idle
@@ -287,6 +293,47 @@ mod tests {
     }
 
     #[test]
+    fn needs_you_is_the_leading_lane_after_the_pinned_default() {
+        // The needs-you lane is the first attention lane; only the pinned
+        // `default` row precedes it. One row per lane, given out of order.
+        let (d, n, w, f, i) = (
+            ws(DEFAULT_WORKSPACE),
+            ws("needs"),
+            ws("working"),
+            ws("forge"),
+            ws("idle"),
+        );
+        let inputs = [
+            input(&i, AgentState::Absent, WorkState::Clean),
+            input(
+                &f,
+                AgentState::Absent,
+                WorkState::Dirty {
+                    added: 1,
+                    removed: 0,
+                },
+            ),
+            input(&w, AgentState::Working, WorkState::Clean),
+            input(&n, AgentState::NeedsAttention, WorkState::Clean),
+            input(&d, AgentState::Absent, WorkState::Clean),
+        ];
+        assert_eq!(
+            shape(&ClassifiedView::build(&inputs, false)),
+            [
+                "ws:default",
+                "header:NeedsYou(1)",
+                "ws:needs",
+                "header:Working(1)",
+                "ws:working",
+                "header:ReadyToForge(1)",
+                "ws:forge",
+                "header:Idle(1)",
+                "ws:idle",
+            ]
+        );
+    }
+
+    #[test]
     fn build_pins_default_first_regardless_of_attention() {
         let (d, a) = (ws(DEFAULT_WORKSPACE), ws("a"));
         let inputs = [
@@ -329,16 +376,19 @@ mod tests {
     }
 
     #[test]
-    fn view_honors_the_lists_idle_fold() {
+    fn view_starts_with_the_idle_lane_folded_and_reveals_it_on_toggle() {
         let (a, b) = (ws("a"), ws("b"));
         let inputs = [
             input(&a, AgentState::NeedsAttention, WorkState::Clean),
             input(&b, AgentState::Absent, WorkState::Clean),
         ];
+        // The default is folded: the quiet rows are hidden until revealed.
         let mut list = WorkspaceList::default();
-        assert_eq!(list.view(&inputs).selectable_names(), ["a", "b"]);
-        list.toggle_idle();
+        assert!(list.idle_collapsed());
         assert_eq!(list.view(&inputs).selectable_names(), ["a"]);
+        list.toggle_idle();
+        assert!(!list.idle_collapsed());
+        assert_eq!(list.view(&inputs).selectable_names(), ["a", "b"]);
     }
 
     #[test]
