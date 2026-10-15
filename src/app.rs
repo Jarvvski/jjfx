@@ -418,12 +418,14 @@ impl App {
         world_pane: bool,
         tx: UnboundedSender<Msg>,
         tickets: crate::config::TicketsConfig,
+        spend: crate::config::SpendConfig,
     ) -> Self {
         let dispatch_tx = tx.clone();
         let dispatch = WorkspaceDispatchController::new(
             RealWorkspaceDispatch::new(store.repo_root())
                 .with_colocate(store.colocate())
                 .with_tickets(tickets)
+                .with_spend(spend)
                 .with_terminal(Arc::clone(&terminal)),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
@@ -2890,6 +2892,7 @@ mod tests {
             false,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         );
         reveal_idle(&mut app);
         app
@@ -2915,6 +2918,7 @@ mod tests {
             false,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         )
     }
 
@@ -2972,6 +2976,7 @@ mod tests {
             false,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         );
         let mut app = app;
         reveal_idle(&mut app);
@@ -4554,7 +4559,7 @@ mod tests {
         });
 
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 12)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 14)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
             .backend()
@@ -4630,7 +4635,7 @@ mod tests {
             });
 
             let mut terminal =
-                ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 16)).unwrap();
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 18)).unwrap();
             terminal.draw(|frame| app.render(frame)).unwrap();
             let text: String = terminal
                 .backend()
@@ -4891,7 +4896,7 @@ mod tests {
         app.dispatch = controller;
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot: snapshot.clone(),
+            snapshot: Box::new(snapshot.clone()),
         }));
         app.handle(press(KeyCode::Char('p')));
         app.handle(press(KeyCode::Char('r')));
@@ -4899,7 +4904,7 @@ mod tests {
         app.handle(press(KeyCode::Char('2')));
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         assert!(matches!(
@@ -4991,7 +4996,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         let workspace = app.store.workspace("worker-01").unwrap();
@@ -5042,7 +5047,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot: idle,
+            snapshot: Box::new(idle),
         }));
         app.handle(press(KeyCode::Char('p')));
         app.handle(press(KeyCode::Char('d')));
@@ -5058,7 +5063,7 @@ mod tests {
         let busy = repository.read_worker_pool_snapshot();
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot: busy,
+            snapshot: Box::new(busy),
         }));
 
         assert!(matches!(
@@ -5066,7 +5071,7 @@ mod tests {
             Mode::Pool(PoolMode::TicketInput { ref buffer, .. }) if buffer == "ENG-101"
         ));
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
             .backend()
@@ -5102,11 +5107,11 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 8)).unwrap();
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(40, 10)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let text: String = terminal
             .backend()
@@ -5142,7 +5147,7 @@ mod tests {
         let mut app = app_with(&["default", "worker-01"]);
         app.handle(Msg::WorkspaceDispatch(WorkspaceDispatchEvent::Snapshot {
             operation: 0,
-            snapshot,
+            snapshot: Box::new(snapshot),
         }));
 
         let worker = app
@@ -6303,6 +6308,7 @@ mod tests {
             true,
             tx,
             crate::config::TicketsConfig::default(),
+            crate::config::SpendConfig::default(),
         );
         assert!(app.world_pane());
     }

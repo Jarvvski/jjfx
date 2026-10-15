@@ -102,7 +102,7 @@ impl PoolSession {
             WorkspaceDispatchEvent::Snapshot {
                 operation,
                 snapshot,
-            } => self.apply_snapshot(operation, snapshot),
+            } => self.apply_snapshot(operation, *snapshot),
             WorkspaceDispatchEvent::Resized { operation, result } => {
                 if self.active_operation == Some(operation) {
                     return vec![PoolUpdate::Status(format!(
@@ -127,12 +127,17 @@ impl PoolSession {
                 if self.active_operation == Some(operation) {
                     let count = result.outcomes().len();
                     let partial = result.is_partial();
+                    let warning = result.warning().map(ToOwned::to_owned);
                     self.dispatch_result = Some(result);
                     self.active_operation = None;
                     let status = if partial {
                         format!("Dispatched {count} Ticket(s) with partial capacity")
                     } else {
                         format!("Dispatched {count} Ticket(s)")
+                    };
+                    let status = match warning {
+                        Some(warning) => format!("{status}; {warning}"),
+                        None => status,
                     };
                     return vec![PoolUpdate::RefreshPool, PoolUpdate::Status(status)];
                 }
@@ -603,6 +608,26 @@ mod tests {
         assert!(pool.worker_session.is_some());
         assert!(
             matches!(updates.as_slice(), [PoolUpdate::RefreshPool, PoolUpdate::Status(message)] if message == "Send worker-01 (PID 777)")
+        );
+    }
+
+    #[test]
+    fn a_spend_cap_warning_rides_along_with_the_dispatch_status() {
+        let mut pool = PoolSession::default();
+        pool.begin_dispatch(4);
+
+        let updates = pool.apply(WorkspaceDispatchEvent::Dispatched {
+            operation: 4,
+            result: dispatch_result(false).with_warning("recorded Run spend exceeds the cap"),
+        });
+
+        assert!(
+            matches!(
+                updates.as_slice(),
+                [PoolUpdate::RefreshPool, PoolUpdate::Status(message)]
+                    if message == "Dispatched 1 Ticket(s); recorded Run spend exceeds the cap"
+            ),
+            "{updates:?}"
         );
     }
 }

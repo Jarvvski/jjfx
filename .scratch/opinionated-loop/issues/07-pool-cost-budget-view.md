@@ -1,6 +1,6 @@
 # Pool-level cost/usage view and a dispatch spend cap
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 16
 
@@ -63,3 +63,24 @@ recorded per-Run costs are sufficient for a first cut.
   (`src/engine/runtime.rs:403-411`), so each Run overwrites the previous one's
   cost. Only the latest Run per Worker survives. Re-marked `Blocked by: 16`,
   which adds the durable per-Run record this needs.
+- 2026-10-15: Landed, on the ticket 16 record store. `engine/cost.rs` folds the
+  durable records into `PoolCostSnapshot` - a pool total, today and the last
+  seven days, and a per-Worker split, with Runs whose provider reported no usable
+  cost counted apart from a zero spend - and `WorkerPoolSnapshot` carries it, so
+  both frontends read it from the snapshot they already have. The Pool view shows
+  a pool spend/usage line and a per-Worker spend on each row; `jjfx status` (and
+  `pool list`) shows a `SPEND` column, a pool-level summary, and `cost_usd` per
+  Worker in its JSON. A new optional `[spend]` section (`cap_usd`, `window`,
+  `on_exceed`) gates Dispatch from the same aggregate: `block` refuses before any
+  Worker is reserved with a message naming the cap, the current total and the
+  override; `warn` proceeds and reports the overage (the TUI rides it on the
+  Dispatch status, the CLI prints it). Both Dispatch paths are gated - the TUI
+  adapter's Direct Dispatch and orchestration, and `jjfx dispatch` including its
+  orchestration handoff. Pinned by 9 engine aggregation/cap unit tests, 4 adapter
+  gate unit tests, 2 `jjfx status` unit tests, a render test and a Pool session
+  test, plus 6 config parsing/validation tests. Documented in
+  `docs/configuration.md`. Decisions: `week` is a rolling seven days rather than a
+  calendar week (the total resets continuously instead of jumping at a boundary);
+  the cap fires at or above its limit; and a cap that cannot be evaluated because
+  the record store is unreadable refuses Dispatch rather than guessing. The
+  provider usage/cost API reconciliation stays out of scope, as the ticket says.

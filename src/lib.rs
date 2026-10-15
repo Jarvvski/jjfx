@@ -79,6 +79,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
             colocate_setting,
             open_workspaces,
             tickets_setting,
+            spend_setting,
         )
     };
 
@@ -199,6 +200,11 @@ fn tickets_setting() -> anyhow::Result<config::TicketsConfig> {
     Ok(config::load()?.tickets)
 }
 
+/// Resolve the aggregate spend cap Dispatch is gated on.
+fn spend_setting() -> anyhow::Result<config::SpendConfig> {
+    Ok(config::load()?.spend)
+}
+
 /// Launch the shared interactive jjfx TUI for a discovered repository.
 ///
 /// The launcher owns the runtime, watchers, pollers, App, and terminal
@@ -275,6 +281,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         ui.world_pane,
         tx,
         config.tickets,
+        config.spend,
     );
     // A `jj`/`jj-lib` version mismatch degrades the graph read. Surface it up
     // front, before the first load, so it is visible even if that load errors

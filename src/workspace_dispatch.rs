@@ -443,6 +443,8 @@ pub struct DispatchResult {
     runtime: AgentRuntime,
     outcomes: Vec<DispatchOutcome>,
     partial: bool,
+    /// A spend-cap warning attached when Dispatch proceeded over the cap.
+    warning: Option<String>,
 }
 
 impl DispatchResult {
@@ -453,6 +455,7 @@ impl DispatchResult {
             runtime,
             outcomes,
             partial,
+            warning: None,
         }
     }
 
@@ -468,6 +471,17 @@ impl DispatchResult {
     /// Reports whether the shared coordinator dispatched only a subset.
     pub const fn is_partial(&self) -> bool {
         self.partial
+    }
+    /// Returns the spend-cap warning Dispatch proceeded under, when it did.
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+
+    /// Attaches a spend-cap warning, for tests.
+    #[cfg(test)]
+    pub fn with_warning(mut self, warning: impl Into<String>) -> Self {
+        self.warning = Some(warning.into());
+        self
     }
 }
 
@@ -624,7 +638,7 @@ pub enum WorkspaceDispatchEvent {
     /// The newest immutable Pool presentation snapshot.
     Snapshot {
         operation: OperationId,
-        snapshot: WorkerPoolSnapshot,
+        snapshot: Box<WorkerPoolSnapshot>,
     },
     /// A Pool mutation completed and its state is being refreshed.
     Resized {
@@ -781,7 +795,7 @@ impl WorkspaceDispatchController {
             WorkspaceDispatchCommand::Refresh { operation } => match adapter.refresh() {
                 Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                     operation,
-                    snapshot,
+                    snapshot: Box::new(snapshot),
                 }),
                 Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
             },
@@ -794,7 +808,7 @@ impl WorkspaceDispatchController {
                     match adapter.refresh() {
                         Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                             operation,
-                            snapshot,
+                            snapshot: Box::new(snapshot),
                         }),
                         Err(message) => {
                             emit(WorkspaceDispatchEvent::Failed { operation, message });
@@ -809,7 +823,7 @@ impl WorkspaceDispatchController {
                     match adapter.refresh() {
                         Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                             operation,
-                            snapshot,
+                            snapshot: Box::new(snapshot),
                         }),
                         Err(message) => {
                             emit(WorkspaceDispatchEvent::Failed { operation, message });
@@ -956,7 +970,7 @@ impl WorkspaceDispatchController {
                     match adapter.refresh() {
                         Ok(snapshot) => emit(WorkspaceDispatchEvent::Snapshot {
                             operation,
-                            snapshot,
+                            snapshot: Box::new(snapshot),
                         }),
                         Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
                     }
@@ -1142,6 +1156,7 @@ impl RecordingAdapter {
                 })
                 .collect(),
             partial: false,
+            warning: None,
         })
     }
 }

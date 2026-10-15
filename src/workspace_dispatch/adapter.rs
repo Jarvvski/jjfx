@@ -8,7 +8,7 @@
 
 use super::*;
 
-use crate::config::TicketsConfig;
+use crate::config::{SpendConfig, TicketsConfig};
 use crate::engine::DispatchExclusions;
 use crate::ticket_source::configured_ticket_query;
 
@@ -118,6 +118,8 @@ pub struct RealWorkspaceDispatch {
     /// Where Dispatch discovers Ready Tickets (`[tickets]`), independent of the
     /// Agent Runtime the Pool runs.
     tickets: TicketsConfig,
+    /// The optional aggregate spend cap (`[spend]`) that gates Dispatch.
+    spend: SpendConfig,
     /// The multiplexer jjfx drives, used to keep Workspaces that are open in a
     /// terminal out of Worker selection. `None` (tests) excludes nothing.
     terminal: Option<std::sync::Arc<dyn crate::terminal::Terminal>>,
@@ -169,6 +171,7 @@ impl RealWorkspaceDispatch {
             repository_root: repository_root.into(),
             colocate: true,
             tickets: TicketsConfig::default(),
+            spend: SpendConfig::default(),
             terminal: None,
         }
     }
@@ -182,6 +185,12 @@ impl RealWorkspaceDispatch {
     /// Sets where Dispatch discovers Ready Tickets (builder form).
     pub fn with_tickets(mut self, tickets: TicketsConfig) -> Self {
         self.tickets = tickets;
+        self
+    }
+
+    /// Sets the aggregate spend cap that gates Dispatch (builder form).
+    pub fn with_spend(mut self, spend: SpendConfig) -> Self {
+        self.spend = spend;
         self
     }
 
@@ -229,6 +238,25 @@ impl RealWorkspaceDispatch {
             .map_err(|error| error.to_string())
     }
 
+    /// Evaluates the configured spend cap for one Dispatch.
+    ///
+    /// Returns the warning message when Dispatch is over the cap in `warn` mode,
+    /// `None` when it is under the cap or no cap is configured, and an error -
+    /// refusing Dispatch - when the cap is reached in `block` mode. A cap that
+    /// cannot be evaluated because the record store is unreadable refuses too:
+    /// failing closed is the only safe answer for a spend gate.
+    fn spend_gate(&self, repository: &crate::engine::Repository) -> Result<Option<String>, String> {
+        let Some(cap) = self.spend.cap().map_err(|error| error.to_string())? else {
+            return Ok(None);
+        };
+        let snapshot = repository.pool_cost().map_err(|error| error.to_string())?;
+        match cap.evaluate(&snapshot) {
+            crate::engine::SpendDecision::Allowed => Ok(None),
+            crate::engine::SpendDecision::Warned(message) => Ok(Some(message)),
+            crate::engine::SpendDecision::Refused(message) => Err(message),
+        }
+    }
+
     fn dispatch_with_strategy(
         &self,
         tickets: &[String],
@@ -236,6 +264,9 @@ impl RealWorkspaceDispatch {
         strategy: DispatchStrategy,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError> {
         let repository = self.repository().map_err(WorkspaceDispatchError::Failed)?;
+        let warning = self
+            .spend_gate(&repository)
+            .map_err(WorkspaceDispatchError::Failed)?;
         let exclusions = self
             .exclusions(&repository)
             .map_err(WorkspaceDispatchError::Failed)?;
@@ -312,6 +343,7 @@ impl RealWorkspaceDispatch {
             runtime,
             outcomes,
             partial: result.is_partial(),
+            warning,
         }))
     }
 
@@ -469,6 +501,9 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         emit: &mut dyn FnMut(WorkspaceDispatchOrchestrationEvent),
     ) -> Result<(), String> {
         let repository = self.repository()?;
+        // A blocked spend cap refuses orchestration too: it dispatches Runs the
+        // same way, so the gate belongs on both Dispatch paths.
+        self.spend_gate(&repository)?;
         let id = TicketId::parse(parent.to_owned()).map_err(|error| error.to_string())?;
         let pool = repository.worker_pool().snapshot();
         let profile = pool.pool().and_then(|pool| pool.profile()).cloned();
@@ -701,5 +736,90 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             activity,
             result,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::engine::{Repository, RunRecord, RunRecordConclusion, SpendCapMode, WireTimestamp};
+
+    /// A repository with one recorded Run costing `cost_micro_usd`.
+    fn repository_with_record(cost_micro_usd: u64) -> (tempfile::TempDir, Repository) {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        repository
+            .state_store()
+            .runs()
+            .append(&RunRecord {
+                run_id: "worker-01@1".to_owned(),
+                worker: crate::engine::WorkerId::parse("worker-01").expect("worker id"),
+                ticket: None,
+                workspace: None,
+                branch: None,
+                runtime: None,
+                provider: None,
+                model: None,
+                cost_micro_usd: Some(cost_micro_usd),
+                usage: None,
+                duration_ms: None,
+                turns: None,
+                conclusion: RunRecordConclusion::Succeeded,
+                error: None,
+                started_at: None,
+                completed_at: Some(WireTimestamp::new(jiff::Timestamp::now().to_string())),
+            })
+            .expect("append record");
+        (temp, repository)
+    }
+
+    #[test]
+    fn no_configured_cap_never_gates_dispatch() {
+        let (_temp, repository) = repository_with_record(6_000_000);
+        let adapter = RealWorkspaceDispatch::new(repository.root());
+        assert_eq!(adapter.spend_gate(&repository).expect("no cap"), None);
+    }
+
+    #[test]
+    fn a_blocked_spend_cap_refuses_dispatch_with_the_override() {
+        let (_temp, repository) = repository_with_record(6_000_000);
+        let adapter = RealWorkspaceDispatch::new(repository.root()).with_spend(SpendConfig {
+            cap_usd: Some(5.0),
+            ..SpendConfig::default()
+        });
+
+        let message = adapter
+            .spend_gate(&repository)
+            .expect_err("a blocked cap refuses Dispatch");
+        assert!(message.contains("spend.cap_usd"), "{message}");
+        assert!(message.contains("spend.on_exceed"), "{message}");
+    }
+
+    #[test]
+    fn a_warn_spend_cap_reports_the_overage_and_proceeds() {
+        let (_temp, repository) = repository_with_record(6_000_000);
+        let adapter = RealWorkspaceDispatch::new(repository.root()).with_spend(SpendConfig {
+            cap_usd: Some(5.0),
+            on_exceed: SpendCapMode::Warn,
+            ..SpendConfig::default()
+        });
+
+        let warning = adapter
+            .spend_gate(&repository)
+            .expect("a warn cap lets Dispatch through")
+            .expect("a warning");
+        assert!(warning.contains("dispatching anyway"), "{warning}");
+    }
+
+    #[test]
+    fn a_cap_under_its_limit_does_not_gate() {
+        let (_temp, repository) = repository_with_record(1_000_000);
+        let adapter = RealWorkspaceDispatch::new(repository.root()).with_spend(SpendConfig {
+            cap_usd: Some(5.0),
+            ..SpendConfig::default()
+        });
+        assert_eq!(adapter.spend_gate(&repository).expect("under"), None);
     }
 }

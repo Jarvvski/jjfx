@@ -36,6 +36,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Ticket discovery can now read the repository's own local markdown tickets with `[tickets] source = "local"`: it discovers `.scratch/<feature>/issues/<NN>-<slug>.md` ready tickets with no Agent Runtime, Linear, or Pi helper, resolves `Blocked by:` into the existing Dispatch Group, inlines the ticket body into the Worker prompt, and writes `Status: claimed` / `Status: resolved` back with a dated comment.
 - Record each finalized Run's cost, usage, duration and turns in an append-only store at `.jj/pool/runs.jsonl`, so Run history survives past the next Run
 - Run `jj fix` over a workspace's just-welded chain before the forge pushes, honouring the user's own `[fix.tools]`; a formatter that fails is a typed error, not a silent pass.
+- Show the Pool's aggregate cost and usage in the Pool view and `jjfx status`, and gate Dispatch on an optional `[spend] cap_usd` budget with `block` or `warn`
 
 ## [0.54.0] - 2026-10-14
 

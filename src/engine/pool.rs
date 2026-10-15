@@ -9,9 +9,10 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
-    PoolState, Repository, RunConclusion, RunCost, RunRecord, RunRecordConclusion, RunRecordUsage,
-    RunResult, RunResultSource, SessionOutcome, StateChange, StateError, StateRevision, WireStatus,
-    WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
+    PoolCostSnapshot, PoolState, Repository, RunConclusion, RunCost, RunRecord,
+    RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource, SessionOutcome, StateChange,
+    StateError, StateRevision, WireStatus, WireTimestamp, WorkerId, WorkerState,
+    WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -1846,6 +1847,9 @@ pub struct WorkerPoolSnapshot {
     diagnostics: Vec<SnapshotDiagnostic>,
     /// Worker Workspaces jjfx currently records as open in a terminal.
     occupied: BTreeSet<WorkerId>,
+    /// The Pool's recorded cost and usage, or `None` when the record store could
+    /// not be read (so a frontend can say "unavailable" rather than "$0").
+    cost: Option<PoolCostSnapshot>,
 }
 impl WorkerPoolSnapshot {
     pub fn pool(&self) -> Option<&PoolSnapshot> {
@@ -1861,6 +1865,11 @@ impl WorkerPoolSnapshot {
     }
     pub fn diagnostics(&self) -> &[SnapshotDiagnostic] {
         &self.diagnostics
+    }
+    /// Returns the Pool's recorded cost and usage, or `None` when the record
+    /// store could not be read.
+    pub fn cost(&self) -> Option<&PoolCostSnapshot> {
+        self.cost.as_ref()
     }
     /// Returns the Workers recorded as open in a terminal.
     pub fn occupied(&self) -> &BTreeSet<WorkerId> {
@@ -1888,6 +1897,9 @@ impl Repository {
         // The in-use marker is jjfx-owned presentation state, read without
         // touching the terminal; the frontend reconciles it against open tabs.
         let occupied = state.in_use().marked().unwrap_or_default();
+        // The recorded Run costs are read once here so every Pool presentation
+        // carries them; an unreadable store is `None`, not zero spend.
+        let cost = self.pool_cost().ok();
         let mut diagnostics = Vec::new();
         let pool = match state.pool().load() {
             Ok(Loaded::Missing) => {
@@ -1902,6 +1914,7 @@ impl Repository {
                     workers: Vec::new(),
                     diagnostics,
                     occupied,
+                    cost,
                 };
             }
             Ok(Loaded::Present(versioned)) => versioned.value,
@@ -1917,6 +1930,7 @@ impl Repository {
                     workers: Vec::new(),
                     diagnostics,
                     occupied,
+                    cost,
                 };
             }
         };
@@ -1976,6 +1990,7 @@ impl Repository {
             workers,
             diagnostics,
             occupied,
+            cost,
         }
     }
 }

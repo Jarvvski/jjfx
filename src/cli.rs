@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
-use crate::config::TicketsConfig;
+use crate::config::{SpendConfig, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
@@ -669,6 +669,7 @@ pub fn run(
     colocate: fn() -> Result<bool>,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
     tickets: fn() -> Result<TicketsConfig>,
+    spend: fn() -> Result<SpendConfig>,
 ) -> Result<()> {
     match parse(&args)? {
         Command::Help => print!("{HELP}"),
@@ -686,9 +687,13 @@ pub fn run(
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
         Command::Clean => clean_command(&repository(colocate)?)?,
         Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
-        Command::Dispatch(args) => {
-            dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
-        }
+        Command::Dispatch(args) => dispatch_command(
+            &repository(colocate)?,
+            &args,
+            open_workspaces,
+            tickets,
+            spend,
+        )?,
         Command::Send {
             worker,
             prompt,
@@ -1013,12 +1018,12 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         eprintln!("{}", diagnostic.message());
     }
     println!(
-        "{:<10} {:<12} {:<10} {:<14} ELAPSED",
-        "WORKER", "NAME", "STATUS", "TICKET"
+        "{:<10} {:<12} {:<10} {:<14} {:<11} ELAPSED",
+        "WORKER", "NAME", "STATUS", "TICKET", "SPEND"
     );
     println!(
-        "{:<10} {:<12} {:<10} {:<14} -------",
-        "------", "----", "------", "------"
+        "{:<10} {:<12} {:<10} {:<14} {:<11} -------",
+        "------", "----", "------", "------", "-----"
     );
     let mut counts = [0usize; 4];
     for worker in snapshot.workers() {
@@ -1036,9 +1041,10 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
             worker.alias()
         };
         let ticket = worker.ticket().unwrap_or("-");
+        let spend = worker_spend(&snapshot, worker.worker_id().as_str());
         let elapsed = elapsed_display(worker.started_at(), worker.completed_at());
         println!(
-            "{short:<10} {name:<12} {:<10} {ticket:<14} {elapsed}",
+            "{short:<10} {name:<12} {:<10} {ticket:<14} {spend:<11} {elapsed}",
             worker.status().as_str()
         );
         // A terminal Worker's reason is only useful when surfaced here: the raw
@@ -1068,7 +1074,38 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         counts[3],
         pool.size()
     );
+    println!("{}", spend_summary(&snapshot));
     Ok(())
+}
+
+/// One Worker's recorded spend, or `-` when it recorded no Run.
+fn worker_spend(snapshot: &crate::engine::WorkerPoolSnapshot, worker: &str) -> String {
+    snapshot
+        .cost()
+        .and_then(|cost| cost.worker(worker))
+        .map_or_else(|| "-".to_owned(), crate::engine::PoolCost::cost_display)
+}
+
+/// The pool-level cost/usage summary line.
+fn spend_summary(snapshot: &crate::engine::WorkerPoolSnapshot) -> String {
+    let Some(cost) = snapshot.cost() else {
+        return "Spend: record store unavailable".to_owned();
+    };
+    let total = cost.total();
+    let unpriced = if total.unpriced_runs() > 0 {
+        format!(" ({} without a reported cost)", total.unpriced_runs())
+    } else {
+        String::new()
+    };
+    format!(
+        "Spend: {} today, {} last 7 days, {} total across {} Run(s){}; tokens {}",
+        cost.today().cost_display(),
+        cost.week().cost_display(),
+        total.cost_display(),
+        total.runs(),
+        unpriced,
+        total.tokens_display()
+    )
 }
 
 /// The short Worker id (without the `worker-` prefix) used in the list view.
@@ -1109,6 +1146,16 @@ fn pool_list_json(snapshot: &crate::engine::WorkerPoolSnapshot) -> Result<()> {
                     .map_or_else(|| "null".to_owned(), |code| code.to_string()),
             ),
             ("log_file", json_option(worker.log_file())),
+            (
+                "cost_usd",
+                snapshot
+                    .cost()
+                    .and_then(|cost| cost.worker(worker.worker_id().as_str()))
+                    .map_or_else(
+                        || "null".to_owned(),
+                        |cost| format!("{:.6}", cost.cost_usd()),
+                    ),
+            ),
         ];
         out.push_str("  {\n");
         for (field, (key, value)) in fields.iter().enumerate() {
@@ -1231,8 +1278,15 @@ fn dispatch_command(
     args: &DispatchArgs,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
     tickets_config: fn() -> Result<TicketsConfig>,
+    spend_config: fn() -> Result<SpendConfig>,
 ) -> Result<()> {
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
+    // The spend gate runs before anything is reserved or launched, including the
+    // orchestration handoff below, so a blocked cap refuses the whole Dispatch.
+    let spend_warning = spend_gate(repository, spend_config)?;
+    if let Some(warning) = spend_warning {
+        eprintln!("{warning}");
+    }
 
     // A single Ticket with orchestration enabled fetches its own details before
     // reserving a placeholder, so hand off before building direct requests.
@@ -1359,6 +1413,28 @@ fn dispatch_exclusions(
         "cannot determine which Worker Workspaces are open; re-run with --force to dispatch anyway",
     )?;
     Ok(crate::engine::reconcile_occupancy(repository, &open))
+}
+
+/// Evaluates the configured aggregate spend cap for one Dispatch.
+///
+/// `Ok(None)` when Dispatch is under the cap or no cap is configured; `Ok(Some)`
+/// with the warning message when it is over the cap in `warn` mode; an error
+/// naming the cap and its override when the cap is reached in `block` mode.
+/// A cap that cannot be evaluated because the record store is unreadable is
+/// also an error: failing closed is the only safe answer for a spend gate.
+fn spend_gate(
+    repository: &Repository,
+    spend_config: fn() -> Result<SpendConfig>,
+) -> Result<Option<String>> {
+    let Some(cap) = spend_config()?.cap()? else {
+        return Ok(None);
+    };
+    let snapshot = repository.pool_cost()?;
+    match cap.evaluate(&snapshot) {
+        crate::engine::SpendDecision::Allowed => Ok(None),
+        crate::engine::SpendDecision::Warned(message) => Ok(Some(message)),
+        crate::engine::SpendDecision::Refused(message) => Err(anyhow::anyhow!(message)),
+    }
 }
 
 /// A live occupancy source for the orchestration runner.
@@ -2148,5 +2224,96 @@ mod tests {
                 worker: "worker-1".to_owned(),
             }
         );
+    }
+
+    #[test]
+    fn the_spend_summary_totals_the_recorded_runs() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        append_run(&repository, "worker-01", Some(250_000));
+        append_run(&repository, "worker-02", Some(750_000));
+        let snapshot = repository.read_worker_pool_snapshot();
+
+        let summary = spend_summary(&snapshot);
+        assert!(summary.contains("$1.0000 total"), "{summary}");
+        assert!(summary.contains("across 2 Run(s)"), "{summary}");
+        assert_eq!(worker_spend(&snapshot, "worker-01"), "$0.2500");
+        assert_eq!(worker_spend(&snapshot, "worker-03"), "-");
+    }
+
+    #[test]
+    fn the_dispatch_spend_gate_allows_warns_and_blocks() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        append_run(&repository, "worker-01", Some(6_000_000));
+
+        // No cap configured: Dispatch is never gated.
+        assert_eq!(
+            spend_gate(&repository, || Ok(SpendConfig::default())).expect("no cap"),
+            None
+        );
+
+        // Under the cap: allowed.
+        let under = || {
+            Ok(SpendConfig {
+                cap_usd: Some(10.0),
+                ..SpendConfig::default()
+            })
+        };
+        assert_eq!(spend_gate(&repository, under).expect("under"), None);
+
+        // Over the cap in warn mode: a message, and Dispatch proceeds.
+        let warn = || {
+            Ok(SpendConfig {
+                cap_usd: Some(5.0),
+                on_exceed: crate::engine::SpendCapMode::Warn,
+                ..SpendConfig::default()
+            })
+        };
+        let warning = spend_gate(&repository, warn)
+            .expect("warn")
+            .expect("a warning");
+        assert!(warning.contains("dispatching anyway"), "{warning}");
+
+        // Over the cap in block mode: an error naming the cap and the override.
+        let block = || {
+            Ok(SpendConfig {
+                cap_usd: Some(5.0),
+                ..SpendConfig::default()
+            })
+        };
+        let error = spend_gate(&repository, block).expect_err("blocked");
+        assert!(error.to_string().contains("spend.cap_usd"), "{error}");
+        assert!(error.to_string().contains("spend.on_exceed"), "{error}");
+    }
+
+    /// Appends one completed Run record to `repository`'s store.
+    fn append_run(repository: &Repository, worker: &str, cost_micro_usd: Option<u64>) {
+        repository
+            .state_store()
+            .runs()
+            .append(&crate::engine::RunRecord {
+                run_id: format!("{worker}@1"),
+                worker: crate::engine::WorkerId::parse(worker).expect("worker id"),
+                ticket: None,
+                workspace: None,
+                branch: None,
+                runtime: None,
+                provider: None,
+                model: None,
+                cost_micro_usd,
+                usage: None,
+                duration_ms: None,
+                turns: None,
+                conclusion: crate::engine::RunRecordConclusion::Succeeded,
+                error: None,
+                started_at: None,
+                completed_at: Some(crate::engine::WireTimestamp::new(
+                    jiff::Timestamp::now().to_string(),
+                )),
+            })
+            .expect("append record");
     }
 }

@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
 
-use crate::engine::PaneLayout;
+use crate::engine::{PaneLayout, SpendCap, SpendCapMode, SpendWindow};
 use anyhow::Context;
 use serde::Deserialize;
 
@@ -25,6 +25,8 @@ pub struct Config {
     /// source. Selected here rather than from the Agent Runtime, so a tracker
     /// that has no runtime-shaped path can still be configured.
     pub tickets: TicketsConfig,
+    /// The optional cap on the aggregate spend Dispatch may run up.
+    pub spend: SpendConfig,
     /// Whether new workspaces are colocated with Git: `jj workspace add` creates
     /// a Git worktree so each agent workspace has a working `.git`, which lets
     /// tools such as `gh stack` run inside it. On by default; set false to create
@@ -44,6 +46,7 @@ impl Default for Config {
             terminal: TerminalConfig::default(),
             forge: ForgeConfig::default(),
             tickets: TicketsConfig::default(),
+            spend: SpendConfig::default(),
             // Colocation is on by default, matching jj 0.46's own default.
             colocate: true,
             _legacy_workspace: None,
@@ -102,6 +105,7 @@ impl Config {
             }
         }
         self.tickets.validate()?;
+        self.spend.cap()?;
         Ok(())
     }
 }
@@ -272,6 +276,57 @@ impl Default for LocalTicketsConfig {
             root: ".scratch".to_owned(),
             ready_status: "ready-for-agent".to_owned(),
             resolved_status: "resolved".to_owned(),
+        }
+    }
+}
+
+/// An optional cap on the aggregate spend Dispatch may run up.
+///
+/// The aggregate is the sum of the durable per-Run cost records jjfx writes at
+/// finalization, so the cap is enforced from what Runs actually cost rather than
+/// from a per-Run hint. Absent `cap_usd` (the default) means no cap and no gate.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SpendConfig {
+    /// The cap in US dollars. Absent means no cap.
+    pub cap_usd: Option<f64>,
+    /// The window the cap totals over. Defaults to `week`, the last seven days.
+    pub window: SpendWindow,
+    /// What Dispatch does once the aggregate reaches the cap. Defaults to
+    /// `block`; `warn` lets Dispatch proceed and reports the overage.
+    pub on_exceed: SpendCapMode,
+}
+
+impl SpendConfig {
+    /// The engine-level cap this config describes, or `None` when no cap is set.
+    ///
+    /// A cap that is not a positive, finite dollar amount is rejected, so a bad
+    /// config fails at startup rather than mid-Dispatch.
+    pub fn cap(&self) -> anyhow::Result<Option<SpendCap>> {
+        let Some(dollars) = self.cap_usd else {
+            return Ok(None);
+        };
+        if !dollars.is_finite() || dollars <= 0.0 {
+            anyhow::bail!("spend.cap_usd must be a positive dollar amount");
+        }
+        let micro_usd = dollars * 1_000_000.0;
+        if micro_usd > u64::MAX as f64 {
+            anyhow::bail!("spend.cap_usd is too large");
+        }
+        Ok(Some(SpendCap::new(
+            micro_usd.round() as u64,
+            self.window,
+            self.on_exceed,
+        )))
+    }
+}
+
+impl Default for SpendConfig {
+    fn default() -> Self {
+        Self {
+            cap_usd: None,
+            window: SpendWindow::Week,
+            on_exceed: SpendCapMode::Block,
         }
     }
 }
@@ -633,6 +688,69 @@ mod tests {
         )
         .expect_err("unknown condition is an error");
         assert!(err.to_string().contains("monitor"), "{err}");
+    }
+
+    #[test]
+    fn spend_is_uncapped_by_default() {
+        let cfg: Config = toml::from_str("").expect("empty toml parses");
+        assert!(cfg.spend.cap_usd.is_none());
+        assert_eq!(cfg.spend.window, SpendWindow::Week);
+        assert_eq!(cfg.spend.on_exceed, SpendCapMode::Block);
+        assert!(cfg.spend.cap().expect("valid").is_none());
+    }
+
+    #[test]
+    fn a_spend_section_configures_the_cap_window_and_mode() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [spend]
+            cap_usd = 12.5
+            window = "today"
+            on_exceed = "warn"
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.spend.window, SpendWindow::Today);
+        assert_eq!(cfg.spend.on_exceed, SpendCapMode::Warn);
+        let cap = cfg.spend.cap().expect("valid").expect("a cap");
+        assert_eq!(cap.limit_micro_usd(), 12_500_000);
+        assert_eq!(cap.window(), SpendWindow::Today);
+        assert_eq!(cap.mode(), SpendCapMode::Warn);
+    }
+
+    #[test]
+    fn a_spend_section_keeps_the_uncapped_defaults_for_absent_keys() {
+        let cfg: Config = toml::from_str("[spend]\ncap_usd = 5.0\n").expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        assert_eq!(cfg.spend.window, SpendWindow::Week);
+        assert_eq!(cfg.spend.on_exceed, SpendCapMode::Block);
+    }
+
+    #[test]
+    fn a_non_positive_or_unknown_spend_cap_is_rejected() {
+        for text in [
+            "[spend]\ncap_usd = 0\n",
+            "[spend]\ncap_usd = -1.0\n",
+            "[spend]\ncap_usd = nan\n",
+        ] {
+            let cfg: Config = toml::from_str(text).expect("toml parses");
+            let error = cfg.validate().expect_err("an unusable cap is an error");
+            assert!(error.to_string().contains("spend.cap_usd"), "{error}");
+        }
+        let err =
+            toml::from_str::<Config>("[spend]\ncap = 5.0\n").expect_err("unknown key is an error");
+        assert!(err.to_string().contains("cap"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_spend_window_or_mode_is_rejected() {
+        let err = toml::from_str::<Config>("[spend]\nwindow = \"fortnight\"\n")
+            .expect_err("unknown window is an error");
+        assert!(err.to_string().contains("fortnight"), "{err}");
+        let err = toml::from_str::<Config>("[spend]\non_exceed = \"shout\"\n")
+            .expect_err("unknown mode is an error");
+        assert!(err.to_string().contains("shout"), "{err}");
     }
 
     #[test]

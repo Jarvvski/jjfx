@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 mod atomic;
+mod cost;
 mod direct_dispatch;
 mod dispatch_group;
 mod dispatch_prompt;
@@ -28,6 +29,7 @@ mod ticket;
 mod worker_actions;
 mod workspace;
 
+pub use cost::{PoolCost, PoolCostSnapshot, SpendCap, SpendCapMode, SpendDecision, SpendWindow};
 pub use direct_dispatch::{
     DirectDispatch, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
