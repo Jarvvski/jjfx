@@ -343,6 +343,12 @@ pub struct SessionState {
 /// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
 /// Worker documents so their shape is preserved. A compatibility peer ignores
 /// it, and it is readable without the TUI.
+///
+/// A value the provider reported unusably - a negative, non-finite or
+/// out-of-range cost, as bug-hunt ticket 28 handles - is recorded as absent,
+/// never as a reason for the Run to fail or for the record to be dropped. A Run
+/// with no reported cost still appends a record, and a reader aggregates the
+/// costs that are present.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecord {
     /// The identity of the Run: its Worker and the timestamp its Reservation

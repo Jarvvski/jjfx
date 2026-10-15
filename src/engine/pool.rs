@@ -2154,6 +2154,42 @@ mod tests {
     }
 
     #[test]
+    fn a_run_without_a_reported_cost_still_appends_a_record() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-2");
+
+        assert!(matches!(
+            finalize(&reservation, &RunResult::succeeded()),
+            RunFinalization::Applied
+        ));
+
+        let records = records(&repository);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_micro_usd, None);
+        assert_eq!(records[0].usage, None);
+        assert_eq!(records[0].duration_ms, None);
+        assert_eq!(records[0].turns, None);
+        assert_eq!(records[0].conclusion, RunRecordConclusion::Succeeded);
+    }
+
+    #[test]
+    fn a_failed_run_appends_a_record() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-3");
+
+        assert!(matches!(
+            finalize(&reservation, &RunResult::failed("boom")),
+            RunFinalization::Applied
+        ));
+
+        let records = records(&repository);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].conclusion, RunRecordConclusion::Failed);
+        assert_eq!(records[0].error.as_deref(), Some("boom"));
+        assert_eq!(records[0].cost_micro_usd, None);
+    }
+
+    #[test]
     fn two_consecutive_runs_in_one_worker_both_survive() {
         let (_temporary, repository, worker) = reserved_worker();
 
