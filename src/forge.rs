@@ -840,6 +840,74 @@ mod tests {
         }
     }
 
+    /// A jj seam whose weld really mutates the repository, so the pipeline's undo
+    /// record has something to point at.
+    struct MutatingJj {
+        root: PathBuf,
+    }
+
+    impl JjAdapter for MutatingJj {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            let output = crate::jj::command()
+                .current_dir(&self.root)
+                .args(["describe", "-r", "@-", "-m", "welded"])
+                .output()
+                .map_err(|error| error.to_string())?;
+            if !output.status.success() {
+                return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
+            }
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
+        }
+    }
+
+    #[test]
+    fn a_pipeline_run_records_the_workspace_it_forged() {
+        let root = crate::store::test_local_repo("forge-undo");
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("write seed file");
+        let commit = crate::jj::command()
+            .current_dir(&root)
+            .args(["commit", "-m", "seed"])
+            .output()
+            .expect("jj should be installed");
+        assert!(commit.status.success());
+        let repository = crate::engine::Repository::open(&root).expect("repository");
+        let config = ForgeConfig {
+            pull_requests: false,
+            draft: true,
+        };
+        let (tx, _rx) = mpsc::unbounded_channel();
+
+        run_pipeline(
+            &tx,
+            &[Target::new("feat".to_owned(), root.clone())],
+            config,
+            &MutatingJj { root: root.clone() },
+            &UnlockedGpg,
+            &RepositoryGitHub,
+            Some(&repository),
+        );
+
+        let record = repository
+            .state_store()
+            .undo()
+            .mutation("feat")
+            .expect("record")
+            .expect("a forged Workspace is recorded for undo");
+        assert_eq!(record.kind, crate::engine::MutationKind::Forge);
+        assert!(matches!(
+            repository.undo_mutation("feat", false).expect("undo"),
+            crate::engine::UndoOutcome::Restored { .. }
+        ));
+    }
+
     struct UnlockedGpg;
 
     impl GpgAdapter for UnlockedGpg {}

@@ -450,6 +450,45 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_recorded_mutation_is_written_and_can_be_undone() {
+        let repo_root = test_local_repo("runtime-undo");
+        let repository = Repository::open(&repo_root).expect("repository");
+        std::fs::write(repo_root.join("seed.txt"), "seed\n").expect("write seed file");
+        let commit = crate::jj::command()
+            .current_dir(&repo_root)
+            .args(["commit", "-m", "seed"])
+            .output()
+            .expect("jj should be installed");
+        assert!(commit.status.success());
+
+        let result = recording_mutation(
+            &repo_root,
+            "worker-1",
+            MutationKind::Weld,
+            || -> anyhow::Result<bool> {
+                let output = crate::jj::command()
+                    .current_dir(&repo_root)
+                    .args(["describe", "-r", "@-", "-m", "welded"])
+                    .output()?;
+                Ok(output.status.success())
+            },
+        );
+        assert!(result.expect("the mutation runs"));
+
+        let record = repository
+            .state_store()
+            .undo()
+            .mutation("worker-1")
+            .expect("record")
+            .expect("a mutation that changed something is recorded");
+        assert_eq!(record.kind, MutationKind::Weld);
+        assert!(matches!(
+            repository.undo_mutation("worker-1", false).expect("undo"),
+            crate::engine::UndoOutcome::Restored { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn deletion_reports_a_store_that_keeps_the_runtime_colocate_setting() {
         let repo_root = test_local_repo("runtime-colocate");

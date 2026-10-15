@@ -42,6 +42,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Review feedback that belongs in a base commit now goes through `jj new <commit>` + `jj absorb` instead of a hand-split
 - Add `jjfx absorb <worker>`, which folds a Worker's working-copy edits into their base commits and pushes the rewritten bookmark
 - Flag migration-order inversions across the open workspaces with `jjfx check migrations` and a leading TUI notice: read each workspace's working copy for files matching a configurable `[migrations] pattern` (default `**/V*__*.sql`) and report two workspaces adding distinct versions (an inversion, listed in merge order) or the same version (ambiguous).
+- Undo a jjfx-initiated Forge, weld, tidy or Reset from the tool: jjfx records the operation the repository was at before each mutation and restores it with `jj op restore` from `jjfx undo <worker>` or `u` in the Pool view, refusing when anything has happened since so a repository-wide restore cannot silently discard another Workspace's work
 
 ## [0.54.0] - 2026-10-14
 

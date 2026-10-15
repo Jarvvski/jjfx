@@ -103,6 +103,13 @@ _Avoid_: sync, ship, land (for the whole pipeline)
 The forge step that rebases a workspace's change chain onto trunk before it is
 pushed.
 
+**Undo record**:
+The operation the repository was at before a jjfx-initiated mutation (a Forge,
+weld, tidy or Reset), kept per Workspace so the mutation can be restored from the
+tool. Undo is `jj op restore` to that operation and is refused unless the
+mutation is still the repository's tip, because the restore is repository-wide.
+_See_: `docs/undo.md`
+
 **Behind**:
 How far trunk has advanced past a workspace's base - the drift that accumulates
 while a workspace sits idle. Lifting resets it to zero; tidying workspaces does

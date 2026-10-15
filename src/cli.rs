@@ -2432,6 +2432,41 @@ mod tests {
     }
 
     #[test]
+    fn undo_workspace_key_reaches_a_worker_and_an_ad_hoc_workspace() {
+        let root = crate::store::test_local_repo("cli-undo-key");
+        let repository = Repository::open(&root).expect("repository");
+
+        // Nothing recorded yet: a short Worker id resolves to its Workspace name.
+        assert_eq!(undo_workspace_key(&repository, "3").unwrap(), "worker-3");
+        assert_eq!(
+            undo_workspace_key(&repository, "repo").unwrap(),
+            REPOSITORY_WIDE_MUTATION
+        );
+
+        // A recorded name is used as it is, so an ad-hoc Workspace - which has no
+        // `worker-` prefix and may not even be a valid Worker id - is reachable.
+        repository
+            .state_store()
+            .undo()
+            .record(&crate::engine::MutationRecord {
+                workspace: "my work".to_owned(),
+                kind: crate::engine::MutationKind::Weld,
+                before: "before".to_owned(),
+                after: "after".to_owned(),
+                at: crate::engine::WireTimestamp::new("2026-10-15T00:00:00Z"),
+            })
+            .unwrap();
+        assert_eq!(
+            undo_workspace_key(&repository, "my work").unwrap(),
+            "my work"
+        );
+        assert_eq!(
+            undo_workspace_key(&repository, "worker-3").unwrap(),
+            "worker-3"
+        );
+    }
+
+    #[test]
     fn send_parser_preserves_prompt_and_foreground_mode() {
         assert_eq!(
             parse(&args(&["s", "worker-1", "follow up", "--fg"])).unwrap(),
