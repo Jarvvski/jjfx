@@ -10,8 +10,8 @@ use std::path::Path;
 
 use crate::config::{TicketSource, TicketsConfig};
 use crate::engine::{
-    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, PI_DISCOVERY_HELPER_ENV,
-    PiDiscoveryHelper, TicketQuery, TicketQueryError,
+    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, PI_DISCOVERY_HELPER_ENV,
+    PiDiscoveryHelper, Repository, TicketQuery, TicketQueryError, WorkerPoolSnapshot,
 };
 
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
@@ -45,6 +45,37 @@ fn linear_query(workspace: &Path, runtime: AgentRuntime) -> AgentRuntimeQuery {
         Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
         None => query,
     }
+}
+
+/// Writes local Tickets back for the reconciled Worker Pool: a Worker running a
+/// local Ticket claims it, and a Worker whose Run finished resolves it.
+///
+/// A no-op for every other source. The failures are returned rather than raised:
+/// the writeback is a side effect of a Dispatch that already succeeded, and the
+/// caller decides how loudly to report it.
+pub(crate) fn apply_local_writeback(
+    repository: &Repository,
+    snapshot: &WorkerPoolSnapshot,
+    tickets: &TicketsConfig,
+) -> Vec<String> {
+    if tickets.source != TicketSource::Local {
+        return Vec::new();
+    }
+    let local = LocalTickets::new(
+        repository.root().join(&tickets.local.root),
+        tickets.local.ready_status.clone(),
+        tickets.local.resolved_status.clone(),
+    );
+    let workers = snapshot
+        .workers()
+        .iter()
+        .filter_map(|worker| worker.ticket().map(|ticket| (ticket, worker.status())))
+        .collect::<Vec<_>>();
+    local
+        .write_back(&workers)
+        .into_iter()
+        .map(|error| error.to_string())
+        .collect()
 }
 
 #[cfg(test)]

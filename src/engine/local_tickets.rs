@@ -18,7 +18,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::engine::{
-    ReadyTicketFilter, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest,
+    ReadyTicketFilter, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, WorkerStatus,
 };
 
 /// The `issues` directory holding one feature's Ticket files.
@@ -100,6 +100,31 @@ impl LocalTickets {
             }
         }
         Ok(tickets)
+    }
+
+    /// Claims or resolves the Tickets the given Workers own.
+    ///
+    /// A `Busy` Worker claims its Ticket and a `Done` Worker resolves it; every
+    /// other Worker state is left alone. Failures are collected rather than
+    /// raised: the writeback is a side effect of a Dispatch that already
+    /// succeeded, so the caller decides how loudly to report it. A Ticket that is
+    /// not a local file is skipped - a Worker can own a Ticket named by hand, or
+    /// one left over from another source.
+    pub fn write_back(&self, workers: &[(&str, WorkerStatus)]) -> Vec<LocalTicketError> {
+        let mut failures = Vec::new();
+        for (ticket, status) in workers {
+            let update = match status {
+                WorkerStatus::Busy => self.claim(ticket),
+                WorkerStatus::Done => self.resolve(ticket),
+                WorkerStatus::Idle | WorkerStatus::Failed => continue,
+            };
+            match update {
+                Ok(_) => {}
+                Err(LocalTicketError::NotFound { .. }) => {}
+                Err(error) => failures.push(error),
+            }
+        }
+        failures
     }
 
     /// Finds one Ticket by its path-derived id.
@@ -1103,6 +1128,44 @@ mod tests {
         assert!(
             matches!(error, LocalTicketError::NotFound { .. }),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn write_back_claims_busy_workers_and_resolves_done_ones() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-running.md",
+            "# Running\n\nStatus: ready-for-agent\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-finished.md",
+            "# Finished\n\nStatus: claimed\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        let failures = tickets.write_back(&[
+            ("widgets--01-running", WorkerStatus::Busy),
+            ("widgets--02-finished", WorkerStatus::Done),
+            ("widgets--03-not-local", WorkerStatus::Busy),
+            ("widgets--04-idle", WorkerStatus::Idle),
+        ]);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        let running = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-running.md"))
+            .expect("running file");
+        assert!(running.contains("Status: claimed"), "{running}");
+        let finished =
+            fs::read_to_string(ticket_path(temporary.path(), "widgets", "02-finished.md"))
+                .expect("finished file");
+        assert!(finished.contains("Status: resolved"), "{finished}");
+        assert!(
+            finished.contains("Resolved by jjfx dispatch."),
+            "{finished}"
         );
     }
 }

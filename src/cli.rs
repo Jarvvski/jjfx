@@ -15,7 +15,7 @@ use crate::engine::{
     TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, WireAgent, WorkerActions,
     WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
 };
-use crate::ticket_source::configured_ticket_query;
+use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
 
 pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
@@ -1215,6 +1215,17 @@ fn configured_runtime(repository: &Repository) -> AgentRuntime {
         .unwrap_or(AgentRuntime::Claude)
 }
 
+/// Claims or resolves local Tickets for the current Worker Pool.
+///
+/// A no-op unless `[tickets] source = "local"`. The writeback is a side effect of
+/// a Dispatch that already succeeded, so a failure is reported rather than raised.
+fn write_back_local_tickets(repository: &Repository, tickets: &TicketsConfig) {
+    let snapshot = repository.worker_pool().reconcile_runs();
+    for failure in apply_local_writeback(repository, &snapshot, tickets) {
+        eprintln!("local Ticket writeback failed: {failure}");
+    }
+}
+
 fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
@@ -1302,6 +1313,7 @@ fn dispatch_command(
             .collect::<Result<Vec<_>>>()?;
         let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
         render_dispatch_result(&result, requests.len(), true);
+        write_back_local_tickets(repository, &tickets);
         return Ok(());
     }
 
@@ -1325,6 +1337,7 @@ fn dispatch_command(
         .collect::<Result<Vec<_>>>()?;
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
     render_dispatch_result(&result, requests.len(), false);
+    write_back_local_tickets(repository, &tickets);
     Ok(())
 }
 
@@ -1754,6 +1767,7 @@ fn orchestrate_command(
         render_orchestration_event(&event);
     })?;
     render_orchestration_event(&OrchestrationEvent::Terminal(summary));
+    write_back_local_tickets(repository, &tickets);
     Ok(())
 }
 

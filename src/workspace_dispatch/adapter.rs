@@ -394,7 +394,12 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         {
             let _ = crate::engine::reconcile_occupancy(&repository, &open);
         }
-        Ok(repository.worker_pool().reconcile_runs())
+        let snapshot = repository.worker_pool().reconcile_runs();
+        // Claim a Ticket a Worker is running and resolve one whose Run finished.
+        // Best effort: a failed writeback leaves the Ticket as it was and the
+        // next refresh retries, so it must not fail the refresh itself.
+        let _ = crate::ticket_source::apply_local_writeback(&repository, &snapshot, &self.tickets);
+        Ok(snapshot)
     }
 
     fn resize(&self, capacity: usize) -> Result<PoolMutationResult, String> {
