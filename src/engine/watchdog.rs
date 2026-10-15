@@ -176,12 +176,7 @@ mod tests {
 
     #[test]
     fn a_run_that_just_started_is_not_stuck() {
-        let run = progress(
-            WorkerStatus::Busy,
-            Some("2026-01-01T00:59:30Z"),
-            None,
-            true,
-        );
+        let run = progress(WorkerStatus::Busy, Some("2026-01-01T00:59:30Z"), None, true);
         assert_eq!(
             health(run, at("2026-01-01T01:00:00Z"), WINDOW),
             RunHealth::Live
@@ -192,11 +187,7 @@ mod tests {
     fn only_a_busy_live_run_can_be_stuck() {
         let stale = at("2026-01-01T00:00:00Z");
         let now = at("2026-01-01T01:00:00Z");
-        for status in [
-            WorkerStatus::Idle,
-            WorkerStatus::Done,
-            WorkerStatus::Failed,
-        ] {
+        for status in [WorkerStatus::Idle, WorkerStatus::Done, WorkerStatus::Failed] {
             let run = progress(status, Some("2026-01-01T00:00:00Z"), None, true);
             assert_eq!(health(run, now, WINDOW), RunHealth::Live, "{status:?}");
         }

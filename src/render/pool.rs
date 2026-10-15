@@ -74,6 +74,12 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
         if snapshot.workers().is_empty() {
             lines.push(dim_line(" (no Workers)"));
         }
+        if !snapshot.waiting().is_empty() {
+            lines.push(Line::from(format!(
+                " waiting: {}",
+                snapshot.waiting().join(", ")
+            )));
+        }
         let selected = view.selected_worker;
         for worker in snapshot.workers() {
             let marker = if selected == Some(worker.worker_id().as_str()) {
@@ -268,6 +274,12 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
                         outcome.title(),
                         outcome.worker().unwrap_or("?"),
                         outcome.pid().unwrap_or_default()
+                    )
+                } else if outcome.is_waiting() {
+                    format!(
+                        "  ⏸ {}  {}",
+                        outcome.ticket(),
+                        outcome.detail().unwrap_or("held by the dispatch cap")
                     )
                 } else {
                     format!(
@@ -466,7 +478,13 @@ mod tests {
     }
 
     fn render(session: &PoolSession, pane: PoolPane<'_>, selected: Option<&str>) -> String {
-        render_at(session, pane, selected, Timestamp::now(), StuckWindow::DEFAULT)
+        render_at(
+            session,
+            pane,
+            selected,
+            Timestamp::now(),
+            StuckWindow::DEFAULT,
+        )
     }
 
     /// Render with an explicit watchdog clock and window, for the stuck cases.
@@ -514,7 +532,13 @@ mod tests {
             ..PoolSession::default()
         };
         let now: Timestamp = "2026-01-01T01:00:00Z".parse().expect("a timestamp");
-        let text = render_at(&session, PoolPane::View, Some("worker-01"), now, StuckWindow::DEFAULT);
+        let text = render_at(
+            &session,
+            PoolPane::View,
+            Some("worker-01"),
+            now,
+            StuckWindow::DEFAULT,
+        );
         assert!(text.contains("[stuck]"), "expected a stuck marker: {text}");
         // The persisted status is still shown: stuck is a view of `busy`.
         assert!(text.contains("busy"), "expected the busy status: {text}");

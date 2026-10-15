@@ -1178,10 +1178,10 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         // watchdog removes, so say how long it has been quiet.
         if worker.health(now, watchdog).is_stuck() {
             stuck += 1;
-            let quiet = worker
-                .run_progress()
-                .last_progress_at()
-                .map_or_else(|| "-".to_owned(), |since| seconds_display(now.duration_since(since)));
+            let quiet = worker.run_progress().last_progress_at().map_or_else(
+                || "-".to_owned(),
+                |since| seconds_display(now.duration_since(since)),
+            );
             println!("           stuck: no progress for {quiet}");
         }
         // A terminal Worker's reason is only useful when surfaced here: the raw
@@ -1218,6 +1218,9 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         pool.size()
     );
     println!("{}", spend_summary(&snapshot));
+    if !snapshot.waiting().is_empty() {
+        println!("Waiting: {}", snapshot.waiting().join(", "));
+    }
     Ok(())
 }
 
@@ -1280,10 +1283,7 @@ fn pool_list_json(
                 }),
             ),
             ("status", json_string(worker.status().as_str())),
-            (
-                "stuck",
-                worker.health(now, watchdog).is_stuck().to_string(),
-            ),
+            ("stuck", worker.health(now, watchdog).is_stuck().to_string()),
             ("ticket", json_option(worker.ticket())),
             (
                 "elapsed",
@@ -1644,9 +1644,14 @@ fn dispatch_with_capacity_prompt(
     requests: &[DirectDispatchRequest],
     exclusions: &DispatchExclusions,
 ) -> Result<crate::engine::DirectDispatchResult> {
+    // The concurrency cap is jjfx's own setting, read here rather than passed
+    // down: `cli::run` is already at the argument limit, and this is the only
+    // place a whole batch is dispatched.
+    let cap = crate::config::load()?.dispatch.cap()?;
     let dispatcher = repository
         .direct_dispatch()
-        .with_exclusions(exclusions.clone());
+        .with_exclusions(exclusions.clone())
+        .with_concurrency_cap(cap);
     match dispatcher.dispatch(requests) {
         Ok(result) => Ok(result),
         Err(DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(shortage))) => {
@@ -1684,40 +1689,53 @@ fn render_dispatch_result(
     requested: usize,
     all: bool,
 ) {
+    let mut fired = 0usize;
     for outcome in result.outcomes() {
         match outcome {
-            DirectDispatchOutcome::Succeeded(success) => match success.execution() {
-                DirectDispatchExecution::Background { pid } => eprintln!(
-                    "  {} (PID {}) -> {}",
-                    success.worker(),
-                    pid,
-                    success.ticket().id()
-                ),
-                DirectDispatchExecution::Foreground(completed) => {
-                    eprintln!(
-                        "  {} completed {:?}",
+            DirectDispatchOutcome::Succeeded(success) => {
+                fired += 1;
+                match success.execution() {
+                    DirectDispatchExecution::Background { pid } => eprintln!(
+                        "  {} (PID {}) -> {}",
                         success.worker(),
-                        completed.result().conclusion()
-                    )
+                        pid,
+                        success.ticket().id()
+                    ),
+                    DirectDispatchExecution::Foreground(completed) => {
+                        eprintln!(
+                            "  {} completed {:?}",
+                            success.worker(),
+                            completed.result().conclusion()
+                        )
+                    }
                 }
-            },
-            DirectDispatchOutcome::Failed(failure) => eprintln!(
-                "  {} failed at {:?}: {}",
-                failure.ticket().id(),
-                failure.phase(),
-                failure.detail()
-            ),
+            }
+            DirectDispatchOutcome::Failed(failure) => {
+                fired += 1;
+                eprintln!(
+                    "  {} failed at {:?}: {}",
+                    failure.ticket().id(),
+                    failure.phase(),
+                    failure.detail()
+                );
+            }
+            DirectDispatchOutcome::Waiting(waiting) => {
+                eprintln!("  {} waiting: {}", waiting.ticket().id(), waiting.detail())
+            }
         }
     }
     if result.is_partial() {
-        let dispatched = result.outcomes().len();
-        if dispatched == 0 && !all {
+        if fired == 0 && !all {
             eprintln!("No idle workers. Run: {PROGRAM} pool list");
         } else {
-            eprintln!("No more idle workers. Dispatched {dispatched}/{requested} ticket(s).");
+            eprintln!("No more idle workers. Dispatched {fired}/{requested} ticket(s).");
         }
     } else if all {
-        eprintln!("Dispatched {} ticket(s)", result.outcomes().len());
+        eprintln!("Dispatched {fired} ticket(s)");
+    }
+    let held = result.waiting().len();
+    if held > 0 {
+        eprintln!("Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes.");
     }
 }
 

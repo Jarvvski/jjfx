@@ -1872,6 +1872,8 @@ pub struct WorkerPoolSnapshot {
     diagnostics: Vec<SnapshotDiagnostic>,
     /// Worker Workspaces jjfx currently records as open in a terminal.
     occupied: BTreeSet<WorkerId>,
+    /// Tickets the Dispatch capacity governor held back rather than fired.
+    waiting: Vec<String>,
     /// The Pool's recorded cost and usage, or `None` when the record store could
     /// not be read (so a frontend can say "unavailable" rather than "$0").
     cost: Option<PoolCostSnapshot>,
@@ -1900,6 +1902,11 @@ impl WorkerPoolSnapshot {
     pub fn occupied(&self) -> &BTreeSet<WorkerId> {
         &self.occupied
     }
+    /// Returns the Tickets the capacity governor held back from the last capped
+    /// Dispatch, in the order they were requested.
+    pub fn waiting(&self) -> &[String] {
+        &self.waiting
+    }
     /// Reports whether `worker_id` is currently open in a terminal.
     pub fn is_occupied(&self, worker_id: &str) -> bool {
         self.occupied
@@ -1922,6 +1929,9 @@ impl Repository {
         // The in-use marker is jjfx-owned presentation state, read without
         // touching the terminal; the frontend reconciles it against open tabs.
         let occupied = state.in_use().marked().unwrap_or_default();
+        // The waiting set is jjfx-owned presentation state too: what the last
+        // capped Dispatch held back, so a frontend can show the backlog.
+        let waiting = state.waiting().held();
         // The recorded Run costs are read once here so every Pool presentation
         // carries them; an unreadable store is `None`, not zero spend.
         let cost = self.pool_cost().ok();
@@ -1939,6 +1949,7 @@ impl Repository {
                     workers: Vec::new(),
                     diagnostics,
                     occupied,
+                    waiting,
                     cost,
                 };
             }
@@ -1955,6 +1966,7 @@ impl Repository {
                     workers: Vec::new(),
                     diagnostics,
                     occupied,
+                    waiting,
                     cost,
                 };
             }
@@ -2015,6 +2027,7 @@ impl Repository {
             workers,
             diagnostics,
             occupied,
+            waiting,
             cost,
         }
     }
@@ -2054,7 +2067,8 @@ fn worker_snapshot(
     if pid == Some(0) {
         return Err("Worker PID must be greater than zero".to_owned());
     }
-    let log_activity_at = super::watchdog::log_activity_at(state.log_file.as_deref().map(Path::new));
+    let log_activity_at =
+        super::watchdog::log_activity_at(state.log_file.as_deref().map(Path::new));
     Ok(WorkerSnapshot {
         workspace: worker_id.as_str().to_owned(),
         worker_id,

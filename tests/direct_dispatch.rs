@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jjfx::engine::{
-    AgentModel, AgentRuntimePreflightErrorKind, CommitOutcome, DirectDispatchError,
+    AgentModel, AgentRuntimePreflightErrorKind, CommitOutcome, ConcurrencyCap, DirectDispatchError,
     DirectDispatchExecution, DirectDispatchFailure, DirectDispatchFailurePhase,
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult, DirectDispatchSuccess,
     DispatchBudget, DispatchDependencyContext, Expected, Loaded, PoolCapacity, Repository, RunMode,
@@ -37,6 +37,7 @@ const HELPER_PROFILE_DESCENDANT: &str = "WSG_DIRECT_DISPATCH_PROFILE_DESCENDANT"
 const HELPER_PROFILE_COUNT: &str = "WSG_DIRECT_DISPATCH_PROFILE_COUNT";
 const HELPER_MODEL_PROVIDER: &str = "WSG_DIRECT_DISPATCH_MODEL_PROVIDER";
 const HELPER_OPERATION: &str = "WSG_DIRECT_DISPATCH_OPERATION";
+const HELPER_CAP: &str = "WSG_DIRECT_DISPATCH_CAP";
 
 #[test]
 fn request_for_ticket_id_constructs_a_valid_direct_request() {
@@ -48,6 +49,178 @@ fn request_for_ticket_id_constructs_a_valid_direct_request() {
     assert_eq!(request.ticket().title().as_str(), "AMBA-42");
     assert_eq!(request.ticket().status().as_str(), "Todo");
     assert_eq!(request.mode(), RunMode::Foreground);
+}
+
+/// A capped Dispatch with no room left fires nothing, so it never reaches the
+/// Agent Runtime and needs no fake one on PATH.
+#[test]
+fn a_capped_dispatch_holds_a_batch_back_when_the_pool_is_full() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(3).expect("capacity"))
+        .expect("grow Worker Pool");
+    // Two Workers are already running, so a cap of two leaves no room at all.
+    assert_eq!(
+        repository
+            .worker_pool()
+            .reserve_many(&["ENG-1", "ENG-2"])
+            .expect("reserve the running Workers")
+            .len(),
+        2
+    );
+
+    let requests = ["ENG-10", "ENG-11", "ENG-12"].map(|id| {
+        DirectDispatchRequest::for_ticket_id(
+            TicketId::parse(id).expect("Ticket ID"),
+            RunMode::Background,
+        )
+        .expect("a direct request")
+    });
+    let result = repository
+        .direct_dispatch()
+        .with_concurrency_cap(ConcurrencyCap::new(2))
+        .dispatch(&requests)
+        .expect("a fully held batch never reaches the Agent Runtime");
+
+    // One outcome per requested Ticket, in input order, and none of them fired.
+    assert_eq!(result.outcomes().len(), 3);
+    assert_eq!(
+        result
+            .waiting()
+            .iter()
+            .map(|waiting| waiting.ticket().id().as_str())
+            .collect::<Vec<_>>(),
+        ["ENG-10", "ENG-11", "ENG-12"]
+    );
+    assert!(result.waiting()[0].detail().contains("cap 2"));
+
+    // Nothing was reserved: the free Worker is still idle, and the two running
+    // Workers still hold their own Tickets.
+    let snapshot = repository.worker_pool().snapshot();
+    assert_eq!(
+        snapshot
+            .waiting()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["ENG-10", "ENG-11", "ENG-12"]
+    );
+    assert_eq!(
+        snapshot
+            .workers()
+            .iter()
+            .filter(|worker| worker.status() == WorkerStatus::Idle)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn a_capped_dispatch_fires_the_prefix_that_fits_and_holds_the_rest() {
+    let (temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    add_origin(&repository);
+    create_main(&repository);
+    repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(2).expect("capacity"))
+        .expect("grow Worker Pool");
+    // One Worker is already running, so a cap of two leaves room for exactly one
+    // more Run: a two-Ticket batch fires its first and holds its second.
+    assert_eq!(
+        repository
+            .worker_pool()
+            .reserve_many(&["ENG-1"])
+            .expect("reserve the running Worker")
+            .len(),
+        1
+    );
+    let bin = temporary_directory.path().join("bin");
+    fs::create_dir(&bin).expect("runtime bin directory");
+    write_executable(
+        &bin.join("claude"),
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
+    );
+    let mut paths = vec![bin];
+    paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
+    let path = env::join_paths(paths).expect("runtime PATH");
+    let result = temporary_directory.path().join("capped-result");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "capped_direct_dispatch_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAP, "2")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run capped Direct Dispatch helper");
+    assert!(
+        output.status.success(),
+        "capped Direct Dispatch helper failed with {}:\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(result).expect("capped Dispatch result"),
+        "fired=1;waiting=ENG-11"
+    );
+    // The waiting set outlives the process that wrote it: it is how a later
+    // `status` or TUI shows the backlog.
+    assert_eq!(
+        repository
+            .worker_pool()
+            .snapshot()
+            .waiting()
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>(),
+        ["ENG-11"]
+    );
+}
+
+#[test]
+#[ignore]
+fn capped_direct_dispatch_helper() {
+    let repository = Repository::open(env::var_os(HELPER_REPOSITORY).expect("Repository path"))
+        .expect("open Repository");
+    let cap = ConcurrencyCap::new(
+        env::var(HELPER_CAP)
+            .expect("cap")
+            .parse()
+            .expect("cap number"),
+    )
+    .expect("a usable cap");
+    let requests = ["ENG-10", "ENG-11"].map(|id| {
+        DirectDispatchRequest::new(ticket(id, "Capped batch ticket"), RunMode::Foreground)
+    });
+    let result = repository
+        .direct_dispatch()
+        .with_concurrency_cap(Some(cap))
+        .dispatch(&requests)
+        .expect("capped Direct Dispatch");
+    let fired = result
+        .outcomes()
+        .iter()
+        .filter(|outcome| !matches!(outcome, DirectDispatchOutcome::Waiting(_)))
+        .count();
+    let waiting = result
+        .waiting()
+        .iter()
+        .map(|waiting| waiting.ticket().id().as_str().to_owned())
+        .collect::<Vec<_>>()
+        .join(",");
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("Dispatch result"),
+        format!("fired={fired};waiting={waiting}"),
+    )
+    .expect("write capped Dispatch result");
 }
 
 #[test]
@@ -154,6 +327,7 @@ fn missing_pi_dispatch_profile_helper() {
                     "success".to_owned()
                 }
                 DirectDispatchOutcome::Succeeded(_) => "unexpected success".to_owned(),
+                DirectDispatchOutcome::Waiting(_) => "unexpected wait".to_owned(),
             },
         }
     };

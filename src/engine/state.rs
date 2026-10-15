@@ -28,6 +28,8 @@ const IN_USE_PATH: &str = ".jj/pool/in-use.json";
 const IN_USE_LOCK: &str = ".jj/pool/.in-use.lock";
 const SESSION_PATH: &str = ".jj/pool/sessions.json";
 const SESSION_LOCK: &str = ".jj/pool/.sessions.lock";
+const WAITING_PATH: &str = ".jj/pool/waiting.json";
+const WAITING_LOCK: &str = ".jj/pool/.waiting.lock";
 const RUN_RECORDS_PATH: &str = ".jj/pool/runs.jsonl";
 const RUN_RECORDS_LOCK: &str = ".jj/pool/.runs.lock";
 const UNDO_PATH: &str = ".jj/pool/undo.json";
@@ -339,6 +341,21 @@ pub struct SessionState {
     /// Session identifier keyed by the Worker whose current Run drives it.
     #[serde(default)]
     pub sessions: BTreeMap<WorkerId, String>,
+}
+
+/// The Tickets the Dispatch capacity governor held back rather than fired.
+///
+/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
+/// Worker documents so their shape is preserved. A compatibility peer ignores
+/// it; a missing or unreadable file means "nothing was held back". The set is
+/// rewritten by each capped Dispatch, so it always describes the last one: a
+/// Ticket the owner dispatched by hand (or that a later, uncapped Dispatch
+/// fired) is no longer waiting.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WaitingState {
+    /// The Tickets held back from the last capped Dispatch, in input order.
+    #[serde(default)]
+    pub tickets: Vec<String>,
 }
 
 /// One durable record of a completed Run.
@@ -866,6 +883,11 @@ pub struct InUseStateRepository {
 pub struct SessionStateRepository {
     root: PathBuf,
 }
+/// The jjfx-owned record of Tickets the Dispatch capacity governor held back.
+#[derive(Debug, Clone)]
+pub struct WaitingStateRepository {
+    root: PathBuf,
+}
 /// The jjfx-owned, append-only per-Run cost record store.
 #[derive(Debug, Clone)]
 pub struct RunRecordRepository {
@@ -919,6 +941,13 @@ impl StateStore {
     /// Opens the jjfx-owned Agent Runtime Session sidecar repository.
     pub fn sessions(&self) -> SessionStateRepository {
         SessionStateRepository {
+            root: self.root.clone(),
+        }
+    }
+
+    /// Opens the jjfx-owned Waiting (governor-held) Ticket repository.
+    pub fn waiting(&self) -> WaitingStateRepository {
+        WaitingStateRepository {
             root: self.root.clone(),
         }
     }
@@ -2071,6 +2100,50 @@ repository_methods!(
     |_s: &MutationRecordRepository| "Undo Records".to_owned(),
     validate_undo
 );
+repository_methods!(
+    WaitingStateRepository,
+    WaitingState,
+    |s: &WaitingStateRepository| s.root.join(WAITING_PATH),
+    |s: &WaitingStateRepository| vec![s.root.join(WAITING_LOCK)],
+    |_s: &WaitingStateRepository| "Waiting Tickets".to_owned(),
+    validate_waiting
+);
+
+impl WaitingStateRepository {
+    /// Returns the Tickets held back by the last capped Dispatch, in order.
+    ///
+    /// Absence and an unreadable file both mean "nothing held back": the waiting
+    /// set is a presentation aid, never a reason to refuse a Dispatch.
+    pub fn held(&self) -> Vec<String> {
+        match self.load() {
+            Ok(Loaded::Present(versioned)) => versioned.value.tickets,
+            Ok(Loaded::Missing) | Err(_) => Vec::new(),
+        }
+    }
+
+    /// Replaces the waiting set wholesale, for the Dispatch that just ran.
+    ///
+    /// A no-op when the set is unchanged, so re-running an identical capped
+    /// Dispatch does not rewrite the record.
+    pub fn replace(&self, tickets: Vec<String>) -> Result<(), StateError> {
+        let subject = "Waiting Tickets";
+        with_locks(&[self.root.join(WAITING_LOCK)], subject, || {
+            let current =
+                match load_state(&self.root.join(WAITING_PATH), subject, &validate_waiting)? {
+                    Loaded::Present(versioned) => versioned.value.tickets,
+                    Loaded::Missing => Vec::new(),
+                };
+            if current == tickets {
+                return Ok(());
+            }
+            write_atomic(
+                &self.root.join(WAITING_PATH),
+                &WaitingState { tickets },
+                subject,
+            )
+        })
+    }
+}
 
 impl InUseStateRepository {
     /// Returns the Worker ids currently marked in use, treating absence as empty.
@@ -2566,6 +2639,11 @@ fn validate_undo(_state: &UndoState) -> Result<(), String> {
     // A mutation record's Workspace key is an opaque string (a Workspace name, or
     // the repository-wide marker) and the operation ids are opaque; there is
     // nothing else to check.
+    Ok(())
+}
+fn validate_waiting(_state: &WaitingState) -> Result<(), String> {
+    // Ticket ids are opaque strings to this record: it names Tickets back to the
+    // owner, and never parses them.
     Ok(())
 }
 fn validate_dispatch_group_for(

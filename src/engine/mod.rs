@@ -17,6 +17,7 @@ mod dispatch_group;
 mod dispatch_prompt;
 mod eligibility;
 mod foreground;
+mod governor;
 mod layout;
 mod local_tickets;
 mod opencode_api;
@@ -36,7 +37,7 @@ pub use cost::{PoolCost, PoolCostSnapshot, SpendCap, SpendCapMode, SpendDecision
 pub use direct_dispatch::{
     DirectDispatch, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,
-    DirectDispatchSuccess, DirectDispatchTarget, DispatchDependencyContext,
+    DirectDispatchSuccess, DirectDispatchTarget, DirectDispatchWaiting, DispatchDependencyContext,
 };
 pub use dispatch_group::{
     DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent,
@@ -49,6 +50,7 @@ pub use dispatch_prompt::{
 };
 pub use eligibility::{DispatchExclusions, ExclusionsProvider, reconcile_occupancy};
 pub use foreground::{FOREGROUND_WRAPPER_ENV, WRAPPER_SUBCOMMAND, run_wrapper};
+pub use governor::ConcurrencyCap;
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
 };
@@ -92,8 +94,8 @@ pub use state::{
     MutationRecord, MutationRecordRepository, PoolState, PoolStateRepository,
     REPOSITORY_WIDE_MUTATION, RunRecord, RunRecordConclusion, RunRecordRepository, RunRecordUsage,
     SessionState, SessionStateRepository, StateChange, StateError, StateRevision, StateStore,
-    SubIssueState, TicketId, UndoState, Versioned, WireAgent, WireStatus, WireTimestamp, WorkerId,
-    WorkerState, WorkerStateRepository,
+    SubIssueState, TicketId, UndoState, Versioned, WaitingState, WaitingStateRepository, WireAgent,
+    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
@@ -103,13 +105,13 @@ pub use ticket::{
     TicketValueError,
 };
 pub use undo::{MutationCheckpoint, MutationGuard, UndoError, UndoOutcome};
+pub use watchdog::{RunHealth, RunProgress, StuckWindow};
 pub use worker_actions::{
     AbsorbOutcome, AbsorbReport, DismissOutcome, FollowUpExecution, FollowUpOutcome,
     FollowUpSession, MountOutcome, OpenPullRequestOutcome, PermissionResolution, RebaseOutcome,
     ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs, WorkspaceRestoration,
     WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
-pub use watchdog::{RunHealth, RunProgress, StuckWindow};
 pub use workspace::jj_lib_compat_notice;
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, WorkerWorkspace,

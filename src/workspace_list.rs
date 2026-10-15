@@ -77,7 +77,9 @@ impl<'a> ClassifiedView<'a> {
             let mut members: Vec<&RowInput<'a>> = inputs
                 .iter()
                 .filter(|input| input.workspace.name != DEFAULT_WORKSPACE)
-                .filter(|input| attention::derive(input.agent.state, input.work, input.health) == att)
+                .filter(|input| {
+                    attention::derive(input.agent.state, input.work, input.health) == att
+                })
                 .collect();
             if members.is_empty() {
                 continue;

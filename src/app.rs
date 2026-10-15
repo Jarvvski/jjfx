@@ -21,7 +21,6 @@ use crate::diff_view::Detail;
 use crate::engine::{PermissionDecision, RunHealth, WorkerPoolSnapshot, WorkerStatus};
 use crate::forge::{self, Target};
 use crate::graph;
-use jiff::Timestamp;
 use crate::pool_session::{PoolSession, PoolUpdate};
 use crate::render;
 use crate::render::home::{HomeRowKind, HomeView};
@@ -40,6 +39,7 @@ use crate::workspace_dispatch::{
     WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
+use jiff::Timestamp;
 
 /// The focused Worker Pool management interaction.
 enum PoolMode {
@@ -439,6 +439,10 @@ impl App {
                 .with_colocate(store.colocate())
                 .with_tickets(settings.tickets)
                 .with_spend(settings.spend)
+                // The config was validated when it was loaded, so an unusable
+                // cap cannot arrive from a real launch; a hand-built one falls
+                // back to no cap rather than refusing the whole TUI.
+                .with_concurrency_cap(settings.dispatch.cap().ok().flatten())
                 .with_terminal(Arc::clone(&terminal)),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
@@ -2425,9 +2429,8 @@ impl App {
                     workspace: w,
                     agent: self.agent_of(w),
                     work: self.work_state(w),
-                    health: worker.map_or(RunHealth::Live, |worker| {
-                        worker.health(now, self.watchdog)
-                    }),
+                    health: worker
+                        .map_or(RunHealth::Live, |worker| worker.health(now, self.watchdog)),
                     worker,
                 }
             })
