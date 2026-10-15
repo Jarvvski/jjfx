@@ -73,10 +73,34 @@ pub(crate) fn display_path(path: &std::path::Path) -> String {
     path.to_string_lossy().into_owned()
 }
 
-/// Colour cue for the Attention badge - the primary triage signal.
+/// The reserved "look here" colour: amber, worn only by the needs-you lane.
+/// Red is reserved for a blocked or failed state (a permission block, a quota
+/// wall, a changes-requested PR), so the two never read as the same alarm.
+pub(crate) const NEEDS_YOU_AMBER: Color = Color::Rgb(255, 191, 0);
+
+/// The one-glyph lane marker per Attention state. Drawn ahead of the group
+/// heading and on every row, so a lane is legible without reading its words:
+///
+/// | Attention | glyph | reads as |
+/// | --- | --- | --- |
+/// | NeedsYou | `⚑` | a flag planted for you |
+/// | Working | `◐` | a turn in progress |
+/// | ReadyToForge | `⚒` | work ready to forge |
+/// | Idle | `·` | nothing to do |
+pub(crate) fn attention_glyph(att: Attention) -> char {
+    match att {
+        Attention::NeedsYou => '⚑',
+        Attention::Working => '◐',
+        Attention::ReadyToForge => '⚒',
+        Attention::Idle => '·',
+    }
+}
+
+/// Colour cue for the Attention badge - the primary triage signal. Needs-you is
+/// the reserved amber; the rest keep their calm, distinct hues.
 pub(crate) fn attention_color(att: Attention) -> Color {
     match att {
-        Attention::NeedsYou => Color::Red,
+        Attention::NeedsYou => NEEDS_YOU_AMBER,
         Attention::Working => Color::Green,
         Attention::ReadyToForge => Color::Cyan,
         Attention::Idle => Color::DarkGray,
@@ -165,8 +189,18 @@ pub(crate) fn working_frame(kind: AgentKind, tick: u64) -> char {
 
 /// The one-glyph agent status ahead of the label: the agent's own working
 /// animation in its brand colour, its own static mark while it waits on the
-/// human (yellow; red when blocked on a permission), and a dim dot when there
-/// is no live session.
+/// human (yellow; red when blocked on a permission or quota wall), and a dim dot
+/// when there is no live session.
+///
+/// The per-state vocabulary (ticket 03's glyphs, extended here):
+///
+/// | Agent lifecycle | glyph | colour |
+/// | --- | --- | --- |
+/// | Working | the agent's working animation | brand |
+/// | Waiting | the agent's paused mark | yellow |
+/// | NeedsAttention | the agent's paused mark | red |
+/// | QuotaBlocked | `⊘` | red |
+/// | Absent / Ended | `·` | dim |
 pub(crate) fn agent_glyph(agent: agent::Agent, tick: u64) -> Span<'static> {
     let (ch, color) = match agent.state {
         AgentState::Working => (working_frame(agent.kind, tick), brand_color(agent.kind)),
@@ -356,5 +390,31 @@ mod tests {
         assert_eq!(brand_color(AgentKind::Pi), PI_VIOLET);
         assert_eq!(brand_color(AgentKind::OpenCode), OPENCODE_GREEN);
         assert_eq!(brand_color(AgentKind::Unknown), Color::DarkGray);
+    }
+
+    #[test]
+    fn each_attention_state_has_a_distinct_glyph() {
+        let glyphs: Vec<char> = Attention::ALL
+            .iter()
+            .map(|att| attention_glyph(*att))
+            .collect();
+        let unique: std::collections::BTreeSet<char> = glyphs.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            glyphs.len(),
+            "every Attention state needs its own glyph: {glyphs:?}"
+        );
+        assert_eq!(attention_glyph(Attention::NeedsYou), '⚑');
+    }
+
+    #[test]
+    fn needs_you_wears_the_reserved_amber_not_red() {
+        // Amber is reserved for the needs-you lane; red stays for blocked/failed.
+        assert_eq!(attention_color(Attention::NeedsYou), NEEDS_YOU_AMBER);
+        assert_ne!(attention_color(Attention::NeedsYou), Color::Red);
+        // The other lanes keep distinct, non-alarm hues.
+        assert_eq!(attention_color(Attention::Working), Color::Green);
+        assert_eq!(attention_color(Attention::ReadyToForge), Color::Cyan);
+        assert_eq!(attention_color(Attention::Idle), Color::DarkGray);
     }
 }
