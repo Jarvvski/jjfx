@@ -1,6 +1,6 @@
 # Bug hunt: correctness and resilience sweep
 
-Status: closed (2026-10-14) - 40 resolved, 1 `wontfix` (06).
+Status: reopened (2026-10-16) for ticket 42 - 40 resolved, 1 `wontfix` (06).
 
 ## Notes
 
@@ -77,6 +77,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T11 | TUI | H | report | `jjfx tui` floods the terminal with unbounded, un-deduplicated `kitten @ ls` subprocesses until kitty pegs a core | 40 (fixed) |
 | T12 | TUI | H | report | the recursive `.jj` watcher and a snapshotting Workspace projection form a self-sustaining reload loop that storms `jj` and everything downstream of a reload | 41 (fixed) |
 | T13 | process | L | verified | the engine's two `jj git remote list` identity reads also snapshot the working copy, committing it as a side effect of dispatching | 41 (fixed) |
+| F3 | tests | M | verified | the process- and exec-timing integration tests flake under CI and load (an empty PID-file read; an ETXTBSY holder race) | 42 |
 
 ## Tickets
 
@@ -250,6 +251,11 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   `pool_send_editor_submits_a_prompt_without_blocking_input` pins that. The
   three direct `SendInput` comparisons are a latent inconsistency with
   `pool_mode()`; recorded as optional hardening in ticket 28.
+
+### Reopened - 2026-10-16
+
+- [42](issues/42-flaky-process-and-exec-tests.md) - F3: the process- and
+  exec-timing integration tests flake under CI and load. `ready-for-agent`.
 
 ## Decisions so far
 
