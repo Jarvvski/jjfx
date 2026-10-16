@@ -25,6 +25,12 @@ repository builds and releases.
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
 
+## [Unreleased]
+
+### Fixed
+
+- The `jjfx-dispatch` skill is corrected for 0.55.0 and made deterministic to drive: it reads terminal state from `jjfx status --json` (status, stuck, exit_code, error) rather than prose, documents both ticket sources (`[tickets] source = "linear" | "local"`), and covers `hooks install`, `--fg`/`--bg`, `absorb`, `resolve`, `undo`, and the repository build check that `open-pr` runs before pushing.
+
 ## [0.55.0] - 2026-10-16
 
 ### Breaking
