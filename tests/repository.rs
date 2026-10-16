@@ -8,7 +8,7 @@ use std::thread;
 use std::time::Duration;
 
 use jjfx::engine::{
-    CleanDecision, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome,
+    CleanDecision, CleanScope, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome,
 };
 use tempfile::TempDir;
 
@@ -148,7 +148,9 @@ fn workspaces_facade_exposes_compatible_paths_and_idempotent_add() {
         .expect("existing workspace should be idempotent");
     assert!(matches!(existing, WorkspaceAddOutcome::Existing(_)));
 
-    let plan = workspaces.plan_clean().expect("clean plan should load");
+    let plan = workspaces
+        .plan_clean(CleanScope::Repository)
+        .expect("clean plan should load");
     assert_eq!(plan.entries().len(), 1);
     assert_eq!(plan.entries()[0].name(), "feature");
     workspaces

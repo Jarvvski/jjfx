@@ -119,8 +119,8 @@ pub use worker_actions::{
 };
 pub use workspace::jj_lib_compat_notice;
 pub use workspace::{
-    AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, SyncAction,
-    TrunkDrift, TrunkSync, TrunkSyncError, WorkerWorkspace, WorkerWorkspaceError,
+    AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, CleanScope,
+    SyncAction, TrunkDrift, TrunkSync, TrunkSyncError, WorkerWorkspace, WorkerWorkspaceError,
     WorkspaceAddOutcome, WorkspaceCleanPlan, WorkspaceEntry, WorkspaceHookStream,
     WorkspaceSnapshot, Workspaces, ad_hoc_workspace_path,
 };

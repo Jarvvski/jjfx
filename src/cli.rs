@@ -31,15 +31,15 @@ const fn version_string(development: bool) -> &'static str {
 
 use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
-    ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS, POOL_DESTROY_FLAGS, POOL_LIST_FLAGS,
-    POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS,
-    STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
+    ADD_FLAGS, CLEAN_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS, POOL_DESTROY_FLAGS,
+    POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS,
+    SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{
     Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, TicketSource, TicketsConfig,
 };
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision, CleanScope,
     DEFAULT_POOL_NAME, DEFAULT_READY_LABEL, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
@@ -73,7 +73,11 @@ pub enum Command {
         names: Vec<String>,
     },
     List,
-    Clean,
+    Clean {
+        /// The Worker Pool to scope the sweep to; `None` sweeps the whole
+        /// Repository, which is the default.
+        pool: Option<String>,
+    },
     Root,
     Where,
     Path {
@@ -369,7 +373,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "add" | "a" => parse_add(&args[1..]),
         "rm" | "remove" => parse_remove(&args[1..]),
         "list" | "ls" => Ok(Command::List),
-        "clean" => Ok(Command::Clean),
+        "clean" => parse_clean(&args[1..]),
         "root" => Ok(Command::Root),
         "where" | "info" => Ok(Command::Where),
         "path" => parse_single(
@@ -572,6 +576,32 @@ fn parse_remove(args: &[String]) -> Result<Command> {
         ));
     }
     Ok(Command::Remove { force, names })
+}
+
+/// Parse `clean [--pool <name>]`.
+///
+/// The parser only shapes the request; whether the named pool exists is settled
+/// against the Repository's declarations when the command runs, so a parse never
+/// reads state. A bare `clean` sweeps the whole Repository.
+fn parse_clean(args: &[String]) -> Result<Command> {
+    let usage = concat!("Usage: ", env!("CARGO_PKG_NAME"), " clean [--pool <name>]");
+    reject_unknown_flags("clean", CLEAN_FLAGS, args)?;
+    let mut pool = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--pool" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("{usage}"))?;
+                pool = Some(value.clone());
+                index += 2;
+            }
+            value if value.starts_with('-') => bail!("unknown option for clean: {value}"),
+            value => bail!("unexpected argument for clean: {value}\n{usage}"),
+        }
+    }
+    Ok(Command::Clean { pool })
 }
 
 /// Parse the top-level `status` alias, which accepts `--json`.
@@ -1217,7 +1247,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         }
         Command::List => list_command(&repository(colocate)?)?,
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
-        Command::Clean => clean_command(&repository(colocate)?)?,
+        Command::Clean { pool } => clean_command(&repository(colocate)?, pool.as_deref())?,
         Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
         Command::Dispatch(args) => {
             dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
@@ -1538,9 +1568,25 @@ fn remove_command(repository: &Repository, force: bool, names: &[String]) -> Res
     Ok(())
 }
 
-fn clean_command(repository: &Repository) -> Result<()> {
+/// Removes non-default Workspaces, Repository-wide or scoped to one Worker Pool.
+///
+/// `--pool <name>` scopes the sweep to that pool's Workers' Workspaces, so one
+/// lane's tidy-up leaves another lane's work in progress alone. The
+/// Repository-wide form stays the explicit "everything" and stays the default,
+/// so every existing invocation is unchanged. An unknown pool name is refused
+/// loudly, naming the pools the Repository holds, the way a Dispatch refuses an
+/// ambiguous target.
+fn clean_command(repository: &Repository, pool: Option<&str>) -> Result<()> {
+    let scope = match pool {
+        Some(name) => {
+            let config = crate::config::load()?;
+            let available = config.pool_names_for(repository.root())?;
+            CleanScope::Pool(resolve_pool(&available, Some(name))?)
+        }
+        None => CleanScope::Repository,
+    };
     let workspaces = repository.workspaces();
-    let plan = workspaces.plan_clean()?;
+    let plan = workspaces.plan_clean(scope)?;
     if plan.entries().is_empty() {
         println!("No workspaces to remove");
         return Ok(());
@@ -4784,6 +4830,7 @@ _jjfx() {
     args)
       case $words[1] in
         rm|remove|path) _arguments '1:workspace:__jjfx_workspaces' ;;
+        clean) _arguments '--pool[Worker Pool to scope the sweep to]:name:' ;;
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
         mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
@@ -4814,6 +4861,29 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    /// `clean` is Repository-wide by default, and `--pool <name>` scopes it.
+    #[test]
+    fn clean_parser_reads_an_optional_pool_scope() {
+        assert_eq!(
+            parse(&args(&["clean"])).expect("a bare clean parses"),
+            Command::Clean { pool: None }
+        );
+        assert_eq!(
+            parse(&args(&["clean", "--pool", "bugs"])).expect("--pool parses"),
+            Command::Clean {
+                pool: Some("bugs".to_owned()),
+            }
+        );
+        assert!(
+            parse(&args(&["clean", "--pool"])).is_err(),
+            "a value-taking flag with no value must fail"
+        );
+        assert!(
+            parse(&args(&["clean", "bugs"])).is_err(),
+            "clean takes no positional argument"
+        );
     }
 
     #[test]

@@ -1,5 +1,6 @@
 //! Repository-owned Worker Workspace lifecycle operations.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::io;
@@ -12,7 +13,8 @@ use thiserror::Error;
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::locks::{self, ScopedLock};
 use crate::engine::{
-    Expected, Loaded, Repository, StateChange, StateStore, WireStatus, WorkerId, WorkerState,
+    Expected, Loaded, PoolName, Repository, StateChange, StateStore, WireStatus, WorkerId,
+    WorkerState,
 };
 
 const CACHE_PATH: &str = ".jj/ws-cache";
@@ -107,6 +109,23 @@ pub enum CleanDecision {
     Confirmed,
     /// Leave every planned Workspace untouched.
     Declined,
+}
+
+/// What a clean sweep covers.
+///
+/// A maintenance verb is pool-scoped when its blast radius is Workers and
+/// Repository-scoped when it is trunk; `Clean` removes Workers' Workspaces, so
+/// it is the one that can destroy a neighbour lane's work in progress. The
+/// Repository-wide form stays the explicit "everything", and it is the default
+/// so every existing invocation is unchanged
+/// (`.scratch/multi-pool/issues/11-do-maintenance-verbs-need-a-pool-scope.md`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum CleanScope {
+    /// Every non-default Workspace in the Repository.
+    #[default]
+    Repository,
+    /// Only the non-default Workspaces belonging to one Worker Pool.
+    Pool(PoolName),
 }
 
 /// A Workspace entry projected from jj.
@@ -494,16 +513,56 @@ impl Workspaces {
         }
     }
 
-    /// Plans removal of every non-default Workspace in projection order.
-    pub fn plan_clean(&self) -> Result<WorkspaceCleanPlan, AdHocWorkspaceError> {
+    /// Plans removal of the non-default Workspaces `scope` selects, in
+    /// projection order.
+    ///
+    /// A Repository-wide scope takes every non-default Workspace; a Pool scope
+    /// takes only the Workspaces of that pool's Workers, because a Worker Pool
+    /// owns its Workers' Workspaces and nothing else. A pool whose state has
+    /// never been materialised has no Workspaces, so its plan is empty rather
+    /// than an error.
+    pub fn plan_clean(&self, scope: CleanScope) -> Result<WorkspaceCleanPlan, AdHocWorkspaceError> {
+        let selected = match &scope {
+            CleanScope::Repository => None,
+            CleanScope::Pool(pool) => Some(self.pool_workspaces(pool)?),
+        };
         let snapshot = self.snapshot()?;
         Ok(WorkspaceCleanPlan {
             entries: snapshot
                 .entries
                 .into_iter()
                 .filter(|entry| entry.name != DEFAULT_WORKSPACE)
+                .filter(|entry| {
+                    selected
+                        .as_ref()
+                        .is_none_or(|names| names.contains(&entry.name))
+                })
                 .collect(),
         })
+    }
+
+    /// The Workspace names one Worker Pool's Workers occupy.
+    ///
+    /// A Pool's Workers are its Workspaces (ADR 0012), so the pool document's
+    /// Worker ids are exactly the names a pool-scoped clean may remove. A pool
+    /// that has never materialised its state has no document and therefore no
+    /// Workspaces, which is an empty set rather than an error; a document that
+    /// exists but cannot be read is a loud error, because "no Workspaces" and
+    /// "could not tell" must not look alike.
+    fn pool_workspaces(&self, pool: &PoolName) -> Result<BTreeSet<String>, AdHocWorkspaceError> {
+        let store = self.repository.state_store_for_pool(pool.clone());
+        match store.pool().load() {
+            Ok(Loaded::Present(versioned)) => Ok(versioned
+                .value
+                .workers
+                .iter()
+                .map(|worker| worker.as_str().to_owned())
+                .collect()),
+            Ok(Loaded::Missing) => Ok(BTreeSet::new()),
+            Err(error) => Err(AdHocWorkspaceError::new(format!(
+                "read Worker Pool {pool}: {error}"
+            ))),
+        }
     }
 
     /// Applies or declines a previously rendered clean plan.
