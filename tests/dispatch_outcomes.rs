@@ -562,18 +562,20 @@ fn a_dispatch_into_a_repository_with_several_pools_is_refused_naming_them() {
 }
 
 /// `--pool` selects the lane: reservation, eligibility and size are all read
-/// from the named pool, so a Dispatch into a named pool with no state fails on
-/// that pool rather than quietly using `default`'s Worker.
+/// from the named pool, so a Dispatch into a named pool fails on that pool
+/// rather than quietly using `default`'s Worker.
 #[test]
 fn an_explicit_pool_fills_that_lane_not_default() {
     let fixture = DispatchFixture::new();
     fixture.with_origin();
-    // `default` is sized and ready; `bugs` is declared but has no state.
+    // `default` is sized and ready; `bugs` is declared with no size and no state.
     fixture.with_pool(1);
     fixture.write_repo_config("[pools.bugs]\n");
     fixture.with_fake_agent();
 
-    // Naming `bugs` targets its (absent) state, not `default`'s idle Worker.
+    // Naming `bugs` materialises that lane's own state - empty, because the
+    // declaration names no size - and fails for want of an idle Worker there
+    // rather than falling back to `default`'s idle one.
     let bugs = fixture
         .jjfx(&[
             "dispatch",
@@ -586,12 +588,15 @@ fn an_explicit_pool_fills_that_lane_not_default() {
         .expect("jjfx should run");
     assert!(
         !bugs.status.success(),
-        "a Dispatch into an unprovisioned lane must fail:\nstdout:\n{}",
+        "a Dispatch into a lane with no idle Worker must fail:\nstdout:\n{}",
         stdout(&bugs)
     );
+    let bugs_state =
+        fs::read_to_string(fixture.path().join(".jj/pools/bugs/pool.json")).expect("bugs state");
+    assert!(bugs_state.contains("\"size\": 0"), "{bugs_state}");
     assert!(
-        !fixture.path().join(".jj/pools/bugs/pool.json").exists(),
-        "the selected lane is not materialised by a failed Dispatch"
+        bugs_state.contains("\"workers\": []") || bugs_state.contains("\"workers\":[]"),
+        "the declared lane materialises with no Workers of its own: {bugs_state}"
     );
 
     // Naming `default` fills the lane that is provisioned.

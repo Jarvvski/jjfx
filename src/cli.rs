@@ -1750,6 +1750,39 @@ fn resize_declared_pool(
     Ok(())
 }
 
+/// Materialises a declared Worker Pool's state on first use.
+///
+/// A Repository may commit a `[pools.<name>]` declaration while the lane's state
+/// directory does not exist yet; that is normal, not a disagreement (ADR 0013).
+/// The first Dispatch into such a lane provisions its Workers at the declared
+/// size - exactly as `jjfx pool <N>` does for `default` - so a declaration a
+/// teammate committed works on a fresh clone with nobody provisioning it by
+/// hand. A lane whose state already exists is left alone, so this is idempotent.
+///
+/// An implicit `default` has no declaration to materialise from, so sizing it
+/// stays `jjfx pool <N>`, unchanged. This is deliberately called from the
+/// Dispatch path rather than from `Repository::with_pool`: `status` and
+/// `pool list` build the same handles to *read* every Pool, and must keep
+/// reporting a declared-but-unmaterialised lane without creating its state.
+fn materialise_declared_pool(repository: &Repository, user: &Config) -> Result<()> {
+    if repository.state_store().directory_exists() {
+        return Ok(());
+    }
+    let Some(declaration) = user
+        .repo_config(repository.root())?
+        .pools
+        .get(repository.selected_pool().as_str())
+        .cloned()
+    else {
+        return Ok(());
+    };
+    let capacity = PoolCapacity::new(declaration.size.unwrap_or(0))?;
+    for worker in repository.worker_pool().materialise(capacity)? {
+        eprintln!("  Created {worker}");
+    }
+    Ok(())
+}
+
 /// One Worker Pool as `status` and `pool list` report it: its declaration, its
 /// materialised state, its recorded spend, and the Workers and held Tickets
 /// that belong to it.
@@ -2909,6 +2942,9 @@ fn dispatch_all_across_pools(
         if ready.tickets().is_empty() {
             continue;
         }
+        // Materialise a declared lane only once it has work to take, so a fan-out
+        // never provisions a lane that matched nothing.
+        materialise_declared_pool(&scoped, user_config)?;
         let requests =
             ready_ticket_requests(&scoped, args, &discovery, &ready, &ticket_hint, &model)?;
         // A pool whose cap has run out holds its Tickets back rather than firing
@@ -3057,6 +3093,12 @@ fn dispatch_command(
         SpendDecision::Refused(message) if !args.all => bail!("{message}"),
         SpendDecision::Refused(_) => {}
     }
+
+    // Materialise a declared lane's state before anything reserves or launches in
+    // it, so `dispatch --pool <name>` into a freshly declared Pool works with no
+    // hand-provisioning. The spend gate runs first, so a refused Dispatch creates
+    // nothing.
+    materialise_declared_pool(repository, &config)?;
 
     // A Ticket handed in directly is an input to Direct Dispatch, not a source
     // lookup: it is dispatched here, before any `[tickets]` config is read, so
