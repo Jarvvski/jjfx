@@ -1,7 +1,7 @@
 # Removing a pool drains, and reports what it discards
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 04
 
 ## Problem
@@ -17,11 +17,11 @@ Removing one lane while others keep working raises questions the single-pool wor
 
 ## Acceptance Criteria
 
-- [ ] Removal refuses while any Worker in the pool is busy, naming them.
-- [ ] Removal enumerates each Worker's branch and whether it is pushed or merged, and refuses on undelivered work unless forced.
-- [ ] Removal touches only the removed pool's Workers' Workspaces, leaving other pools running.
-- [ ] `--force` is the only path that discards work, and says so.
-- [ ] `mise run check` is green.
+- [x] Removal refuses while any Worker in the pool is busy, naming them.
+- [x] Removal enumerates each Worker's branch and whether it is pushed or merged, and refuses on undelivered work unless forced.
+- [x] Removal touches only the removed pool's Workers' Workspaces, leaving other pools running.
+- [x] `--force` is the only path that discards work, and says so.
+- [x] `mise run check` is green.
 
 ## References
 

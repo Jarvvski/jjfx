@@ -243,6 +243,11 @@ impl Repository {
         Workspaces::new(self.clone())
     }
 
+    /// The directory a Worker's Workspace lives at (ADR 0008's convention).
+    pub fn worker_workspace_path(&self, worker: &WorkerId) -> PathBuf {
+        workspace::worker_path(self.root(), worker)
+    }
+
     /// Creates an Ad Hoc Workspace at the jjfx-compatible sibling path.
     pub fn create_ad_hoc_workspace(
         &self,

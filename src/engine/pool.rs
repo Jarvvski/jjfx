@@ -1124,6 +1124,10 @@ impl WorkerPool {
     /// Membership is detached before any process or Workspace operation runs.
     /// Worker state and cleanup markers remain durable until external cleanup
     /// succeeds, so repeating this operation resumes an interrupted destroy.
+    ///
+    /// This is the forced path: it terminates whatever is running rather than
+    /// refusing. `pool destroy` drains first and only reaches here with
+    /// `--force` when a Worker is busy.
     pub fn destroy(&self) -> Result<(), WorkerPoolError> {
         self.destroy_with_progress(|_, _| {})
     }
@@ -1133,84 +1137,11 @@ impl WorkerPool {
     where
         F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
     {
-        let state_store = self.repository.state_store();
-        state_store.detach_pool_for_destroy()?;
-        let workers = state_store.detached_cleanup_markers()?;
-        self.destroy_detached(&workers, &mut on_output)?;
-        state_store.finish_pool_destroy()?;
-        Ok(())
-    }
-
-    fn destroy_detached<F>(
-        &self,
-        workers: &[WorkerId],
-        on_output: &mut F,
-    ) -> Result<(), WorkerPoolError>
-    where
-        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
-    {
-        let state_store = self.repository.state_store();
-        let mut residual = Vec::new();
-        let mut failures = Vec::new();
-        for worker in workers {
-            let status = match state_store.detached_cleanup_status(worker) {
-                Ok(status) => status,
-                Err(error) => {
-                    residual.push(worker.clone());
-                    failures.push(format!("{worker}: {error}"));
-                    continue;
-                }
-            };
-            match status {
-                crate::engine::state::DetachedCleanupStatus::Busy {
-                    pid: Some(pid),
-                    runtime,
-                } => {
-                    if let Err(error) = crate::engine::RunSupervisor::new()
-                        .terminate_recorded_process(&self.repository, worker, runtime, pid)
-                    {
-                        residual.push(worker.clone());
-                        failures.push(format!(
-                            "{worker}: cannot terminate process group {pid}: {error}"
-                        ));
-                        continue;
-                    }
-                }
-                crate::engine::state::DetachedCleanupStatus::Busy { pid: None, .. }
-                | crate::engine::state::DetachedCleanupStatus::Ready => {}
-                crate::engine::state::DetachedCleanupStatus::NotDetached => continue,
-            }
-            if let Err(error) = crate::engine::workspace::teardown_detached_with_progress(
-                &self.repository,
-                worker,
-                &mut *on_output,
-            ) {
-                residual.push(worker.clone());
-                failures.push(format!("{worker}: {error}"));
-                continue;
-            }
-            match state_store.finish_detached_cleanup(worker) {
-                Ok(true) => {}
-                Ok(false) => {
-                    residual.push(worker.clone());
-                    failures.push(format!(
-                        "{worker}: Worker rejoined the Pool during destruction"
-                    ));
-                }
-                Err(error) => {
-                    residual.push(worker.clone());
-                    failures.push(format!("{worker}: {error}"));
-                }
-            }
-        }
-        if failures.is_empty() {
-            Ok(())
-        } else {
-            Err(WorkerPoolError::DestroyCleanup {
-                workers: residual,
-                details: failures.join("; "),
-            })
-        }
+        destroy_pool_state(
+            &self.repository,
+            &self.repository.state_store(),
+            &mut on_output,
+        )
     }
 
     fn current_capacity(&self) -> Result<PoolCapacity, WorkerPoolError> {
@@ -1333,6 +1264,7 @@ impl WorkerPool {
                 Ok(crate::engine::state::DetachedCleanupStatus::Ready) => {
                     if let Err(error) = crate::engine::workspace::teardown_detached_with_progress(
                         &self.repository,
+                        &state_store,
                         worker,
                         &mut *on_output,
                     ) {
@@ -1423,6 +1355,100 @@ impl WorkerPool {
                 }
             }
         }
+    }
+}
+
+/// Destroys one Pool's state and every Worker Workspace it owns.
+///
+/// The Pool's state store is the caller's, so this destroys `default` or a
+/// named Pool by the same mechanism. Membership is detached before any process
+/// or Workspace operation runs, and Worker state stays durable until external
+/// cleanup succeeds, so repeating it resumes an interrupted destroy.
+fn destroy_pool_state<F>(
+    repository: &Repository,
+    state_store: &crate::engine::StateStore,
+    on_output: &mut F,
+) -> Result<(), WorkerPoolError>
+where
+    F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
+{
+    state_store.detach_pool_for_destroy()?;
+    let workers = state_store.detached_cleanup_markers()?;
+    destroy_detached(repository, state_store, &workers, on_output)?;
+    state_store.finish_pool_destroy()?;
+    Ok(())
+}
+
+fn destroy_detached<F>(
+    repository: &Repository,
+    state_store: &crate::engine::StateStore,
+    workers: &[WorkerId],
+    on_output: &mut F,
+) -> Result<(), WorkerPoolError>
+where
+    F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
+{
+    let mut residual = Vec::new();
+    let mut failures = Vec::new();
+    for worker in workers {
+        let status = match state_store.detached_cleanup_status(worker) {
+            Ok(status) => status,
+            Err(error) => {
+                residual.push(worker.clone());
+                failures.push(format!("{worker}: {error}"));
+                continue;
+            }
+        };
+        match status {
+            crate::engine::state::DetachedCleanupStatus::Busy {
+                pid: Some(pid),
+                runtime,
+            } => {
+                if let Err(error) = crate::engine::RunSupervisor::new()
+                    .terminate_recorded_process(repository, worker, runtime, pid)
+                {
+                    residual.push(worker.clone());
+                    failures.push(format!(
+                        "{worker}: cannot terminate process group {pid}: {error}"
+                    ));
+                    continue;
+                }
+            }
+            crate::engine::state::DetachedCleanupStatus::Busy { pid: None, .. }
+            | crate::engine::state::DetachedCleanupStatus::Ready => {}
+            crate::engine::state::DetachedCleanupStatus::NotDetached => continue,
+        }
+        if let Err(error) = crate::engine::workspace::teardown_detached_with_progress(
+            repository,
+            state_store,
+            worker,
+            &mut *on_output,
+        ) {
+            residual.push(worker.clone());
+            failures.push(format!("{worker}: {error}"));
+            continue;
+        }
+        match state_store.finish_detached_cleanup(worker) {
+            Ok(true) => {}
+            Ok(false) => {
+                residual.push(worker.clone());
+                failures.push(format!(
+                    "{worker}: Worker rejoined the Pool during destruction"
+                ));
+            }
+            Err(error) => {
+                residual.push(worker.clone());
+                failures.push(format!("{worker}: {error}"));
+            }
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(WorkerPoolError::DestroyCleanup {
+            workers: residual,
+            details: failures.join("; "),
+        })
     }
 }
 
@@ -1964,7 +1990,13 @@ impl WorkerPoolSnapshot {
 }
 
 impl Repository {
-    /// Reads the existing Worker Pool without changing any file.
+    /// Reads this handle's Worker Pool without changing any file.
+    ///
+    /// A handle from [`Repository::open`] reads `default`; one narrowed with
+    /// [`Repository::with_pool`] reads the named pool. The pool's own state,
+    /// waiting set and Run costs are pool-scoped; the in-use marker is
+    /// repository-scoped, because occupancy is one reconcile over every tab the
+    /// terminal has open (ADR 0013).
     pub fn read_worker_pool_snapshot(&self) -> WorkerPoolSnapshot {
         let state = self.state_store();
         // The in-use marker is jjfx-owned presentation state, read without
@@ -2071,6 +2103,32 @@ impl Repository {
             waiting,
             cost,
         }
+    }
+
+    /// Removes this handle's Worker Pool: terminates its recorded Runs, removes
+    /// every Worker's Workspace, and removes the Pool's state directory.
+    ///
+    /// This is the forced path - it does not drain. `pool destroy` refuses a
+    /// Pool with a busy Worker or undelivered work before it reaches here unless
+    /// `--force`. A Pool that never materialised state has nothing to remove and
+    /// is a no-op.
+    ///
+    /// Unlike [`WorkerPool::destroy`], which leaves a Pool that is recreated in
+    /// place, this removes the state directory outright: the Pool is gone, so
+    /// leaving it (and its locks) behind would be a leak that
+    /// `orphan_pool_directories` would then have to report.
+    pub fn remove_pool_with_progress<F>(&self, mut on_output: F) -> Result<(), WorkerPoolError>
+    where
+        F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
+    {
+        let state_store = self.state_store();
+        if !state_store.directory_exists() {
+            return Ok(());
+        }
+        destroy_pool_state(self, &state_store, &mut on_output)?;
+        state_store
+            .remove_directory()
+            .map_err(WorkerPoolError::State)
     }
 }
 

@@ -1010,6 +1010,30 @@ impl StateStore {
         self.root.join(POOLS_DIRECTORY).join(self.pool.as_str())
     }
 
+    /// Whether the Pool has ever materialised its state directory.
+    pub(crate) fn directory_exists(&self) -> bool {
+        self.directory().is_dir()
+    }
+
+    /// Removes the Pool's state directory outright.
+    ///
+    /// For a Pool that is being *removed* rather than destroyed and recreated:
+    /// nothing will read the directory again, so leaving it (and its locks)
+    /// behind would be a leak that `orphan_pool_directories` would then have to
+    /// report. A directory that is already gone is not an error.
+    pub(crate) fn remove_directory(&self) -> Result<(), StateError> {
+        let directory = self.directory();
+        match fs::remove_dir_all(&directory) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(StateError::new(
+                "remove",
+                directory.display().to_string(),
+                error,
+            )),
+        }
+    }
+
     /// The structured Run log path for `worker`, inside the pool directory.
     pub fn worker_log(&self, worker: &WorkerId) -> PathBuf {
         self.directory().join(format!("{worker}.log"))
