@@ -6,6 +6,8 @@
 
 A locked design for running **several Worker Pools in one Repository** — each pool owning its size, its Agent Runtime Profile, its spend cap under a global ceiling, and its own Ticket source — precise enough that implementation tickets can be cut from it without further decisions. CLI and persisted state only; the TUI is out of scope.
 
+**Reached 2026-10-16.** The design is locked, every ticket on this map is resolved, and the implementation backlog cut from it lives at `.scratch/named-pools/`.
+
 ## Notes
 
 - **Domain**: jjfx. This effort changes the Workspace Dispatch domain, so start from `CONTEXT.md` (the glossary) and `docs/adr/0009-workspace-dispatch-domain.md`, which defines **Worker Pool** as *Repository-scoped* and singular. Read both before resolving any ticket — several decisions below are really glossary decisions.
