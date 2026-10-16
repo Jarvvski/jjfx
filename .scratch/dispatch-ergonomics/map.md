@@ -32,12 +32,13 @@ Both themes cost the test-drive real time, and both are invisible unless you rea
 | 11 | `jjfx wait`: block until a Worker is done, exit code carries the answer | `cli.rs`, `engine/foreground.rs` |
 | 12 | `jjfx logs` follows a finished Worker forever | `cli.rs` |
 | 13 | The working copy goes stale after a fetch, with no way to re-sync it | `cli.rs`, `engine/workspace.rs` |
+| 14 | Guard the remaining raw test helpers | `tests/support/mod.rs` |
 
 ## Waves
 
 Wave 1 (dispatched 2026-10-16): **01, 02, 03, 08** — the owner's two priorities (ad-hoc Ticket input, out-of-the-box defaults) plus the worst bug in the test-drive (the writeback deadlock) and the most surprising (Run Records and spend).
 
-Wave 2 (queued): **04, 05, 06, 07, 09, 10, 11, 12, 13**.
+Wave 2 (queued): **04, 05, 06, 07, 09, 10, 11, 12, 13**, plus **14** — filed during wave 2, when ticket 10 fixed the demonstrated leaks and deliberately left the remaining raw `spawn()` sites alone.
 
 **Sequencing, from the multi-pool map (2026-10-16).** Two wave-2 tickets interact with named Worker Pools, and both were settled by the multi-pool map's *Does the queued dispatch-ergonomics batch wait for this design?*:
 
