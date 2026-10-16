@@ -7,6 +7,10 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
+use crate::cli_help::{
+    ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
+    RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS,
+};
 use crate::config::{MigrationsConfig, SpendConfig, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
@@ -22,77 +26,13 @@ use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
 
-pub const HELP: &str = concat!(
-    env!("CARGO_PKG_NAME"),
-    " - jj workspace manager\n\nUsage: ",
-    env!("CARGO_PKG_NAME"),
-    " [OPTIONS]\n\nUsage:\n  ",
-    env!("CARGO_PKG_NAME"),
-    " add <name> [-r <rev>]     Create workspace and print path (stdout)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " rm [--force] <name>       Remove workspace\n  ",
-    env!("CARGO_PKG_NAME"),
-    " list                      List workspaces\n  ",
-    env!("CARGO_PKG_NAME"),
-    " clean                     Remove all non-default workspaces\n  ",
-    env!("CARGO_PKG_NAME"),
-    " root                      Print repo root\n  ",
-    env!("CARGO_PKG_NAME"),
-    " where                     Show repo and workspace paths\n  ",
-    env!("CARGO_PKG_NAME"),
-    " path <name>               Print workspace path\n  ",
-    env!("CARGO_PKG_NAME"),
-    " refresh                   Rebuild workspace cache\n  ",
-    env!("CARGO_PKG_NAME"),
-    " colocation <action>       Enable/disable Git colocation (enable|disable|status)\n\nPool:\n  ",
-    env!("CARGO_PKG_NAME"),
-    " pool <N>                  Set pool size (creates pool if needed, safe shrink)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " pool list [--json]        Show pool status\n  ",
-    env!("CARGO_PKG_NAME"),
-    " pool rm <worker>          Remove a worker from the pool (must not be busy)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " pool reset <worker>       Reset a worker to idle\n  ",
-    env!("CARGO_PKG_NAME"),
-    " pool profile <runtime>    Set runtime profile (--provider/--model)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " pool destroy              Tear down all workers and remove pool\n\nDispatch and sessions:\n  ",
-    env!("CARGO_PKG_NAME"),
-    " dispatch <TICKET>...     Dispatch Tickets (d; --provider/--model/--force/--json)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " send <worker> <prompt>   Send a Follow-up (s; --force)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " review <worker>          Address PR review comments (rev)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " logs <worker>            Follow a Worker log (log)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " mount <worker>           Mount a Worker in kitty (m)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " rebase <worker>          Rebase and push a Worker (rb)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " absorb <worker>          Fold a Worker's edits into their base commits (ab)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " open-pr <worker>         Open a Worker's Pull Request (pr)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " resolve <workspace>      Resolve a Workspace's conflicted commits (jj resolve)\n  ",
-    env!("CARGO_PKG_NAME"),
-    " undo [<worker>] [--force] Undo the last jjfx mutation on a Worker (list when omitted)\n\nCompletion:\n  ",
-    env!("CARGO_PKG_NAME"),
-    " completion [zsh]         Print zsh completion\n\nChecks:\n  ",
-    env!("CARGO_PKG_NAME"),
-    " check migrations          Flag migration-order inversions across workspaces\n\nObservability:\n  ",
-    env!("CARGO_PKG_NAME"),
-    " status [--json]           Alias for pool list\n  ",
-    env!("CARGO_PKG_NAME"),
-    " version                   Print the ",
-    env!("CARGO_PKG_NAME"),
-    " version\n",
-);
-
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Default,
-    Help,
+    /// `help [<command>...]`: the top-level list, or one command's page.
+    Help {
+        command: Option<String>,
+    },
     Version,
     Add {
         name: String,
@@ -226,7 +166,9 @@ pub fn parse(args: &[String]) -> Result<Command> {
         return Ok(Command::Default);
     };
     match command {
-        "help" | "-h" | "--help" => Ok(Command::Help),
+        "help" | "-h" | "--help" => Ok(Command::Help {
+            command: help_argument(&args[1..]),
+        }),
         "version" | "--version" => Ok(Command::Version),
         "add" | "a" => parse_add(&args[1..]),
         "rm" | "remove" => parse_remove(&args[1..]),
@@ -295,6 +237,41 @@ pub fn parse(args: &[String]) -> Result<Command> {
     }
 }
 
+/// Join the words after `help` into the command key a page is looked up by, or
+/// `None` for a bare `help`.
+fn help_argument(args: &[String]) -> Option<String> {
+    if args.is_empty() {
+        return None;
+    }
+    Some(args.join(" "))
+}
+
+/// Reject any option the command's help page does not document.
+///
+/// The page's flags are the *same* slice the parser validates against, so the
+/// parser only ever accepts a flag some page documents: a flag handled here but
+/// missing from the page (or the reverse) cannot be accepted. Each `parse_*`
+/// match arm below gives a documented flag its meaning; it cannot widen the set.
+fn reject_unknown_flags(command: &str, flags: &[Flag], args: &[String]) -> Result<()> {
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        match flags.iter().find(|flag| flag.matches(argument)) {
+            // A value-taking flag consumes the next token, whatever it looks
+            // like: `--provider -x` is the parser's "missing value", not an
+            // unknown option.
+            Some(flag) if flag.value.is_some() => index += 1,
+            Some(_) => {}
+            None if argument.starts_with('-') => {
+                bail!("unknown option for {command}: {argument}");
+            }
+            None => {}
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
 /// Parse `check <what>`, the read-only cross-workspace checks.
 fn parse_check(args: &[String]) -> Result<Command> {
     match args.first().map(String::as_str) {
@@ -326,6 +303,7 @@ fn parse_colocation(args: &[String]) -> Result<Command> {
 }
 
 fn parse_add(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("add", ADD_FLAGS, args)?;
     let mut name = None;
     let mut revision = None;
     let mut index = 0;
@@ -365,6 +343,7 @@ fn parse_add(args: &[String]) -> Result<Command> {
 }
 
 fn parse_remove(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("rm", RM_FLAGS, args)?;
     let mut force = false;
     let mut names = Vec::new();
     for argument in args {
@@ -386,6 +365,7 @@ fn parse_remove(args: &[String]) -> Result<Command> {
 
 /// Parse the top-level `status` alias, which accepts `--json`.
 fn parse_status(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("status", STATUS_FLAGS, args)?;
     let mut json = false;
     for argument in args {
         match argument.as_str() {
@@ -403,6 +383,7 @@ fn parse_status(args: &[String]) -> Result<Command> {
 /// spelling (`3` or `worker-3`), any Workspace name, or `repo`/`*` for a
 /// repository-wide mutation.
 fn parse_undo(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("undo", UNDO_FLAGS, args)?;
     let mut workspace = None;
     let mut force = false;
     for argument in args {
@@ -422,6 +403,7 @@ fn parse_undo(args: &[String]) -> Result<Command> {
 /// Workspace name. `--tool` is passed to `jj resolve`, including jj's built-in
 /// `:ours`/`:theirs` side pickers; without it the user's own merge tool runs.
 fn parse_resolve(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("resolve", RESOLVE_FLAGS, args)?;
     let mut workspace = None;
     let mut tool = None;
     let mut index = 0;
@@ -458,6 +440,7 @@ fn parse_resolve(args: &[String]) -> Result<Command> {
 
 /// Parse `pool list`/`ls`/`status`, which accepts `--json`.
 fn parse_pool_list(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("pool list", POOL_LIST_FLAGS, args)?;
     let mut json = false;
     for argument in args {
         match argument.as_str() {
@@ -494,6 +477,7 @@ fn parse_pool(args: &[String]) -> Result<Command> {
 }
 
 fn parse_pool_profile(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("pool profile", POOL_PROFILE_FLAGS, args)?;
     let usage = concat!(
         "Usage: ",
         env!("CARGO_PKG_NAME"),
@@ -530,6 +514,7 @@ fn parse_pool_profile(args: &[String]) -> Result<Command> {
 }
 
 fn parse_pool_size(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("pool resize", POOL_RESIZE_FLAGS, args)?;
     let mut size = None;
     let mut index = 0;
     while index < args.len() {
@@ -585,6 +570,7 @@ fn parse_mode(flag: &str, mode: &mut Option<RunMode>) -> Result<()> {
 }
 
 fn parse_dispatch(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("dispatch", DISPATCH_FLAGS, args)?;
     let mut tickets = Vec::new();
     let mut all = false;
     let mut mode = None;
@@ -661,6 +647,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
 }
 
 fn parse_send(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("send", SEND_FLAGS, args)?;
     let mut values = Vec::new();
     let mut mode = None;
     let mut force = false;
@@ -688,6 +675,7 @@ fn parse_send(args: &[String]) -> Result<Command> {
 }
 
 fn parse_review(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("review", REVIEW_FLAGS, args)?;
     let mut worker = None;
     let mut mode = None;
     for argument in args {
@@ -805,7 +793,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         migrations,
     } = settings;
     match parse(&args)? {
-        Command::Help => print!("{HELP}"),
+        Command::Help { command } => print!("{}", crate::cli_help::text(command.as_deref())?),
         Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
         Command::Default => default_command(launch)?,
         Command::Root => root_command(&repository(colocate)?)?,
@@ -1099,7 +1087,7 @@ fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
         } => pool_profile_command(repository, &runtime, provider.as_deref(), model.as_deref()),
         PoolCommand::Destroy => destroy_pool_command(repository),
         PoolCommand::Help => {
-            print!("{HELP}");
+            print!("{}", crate::cli_help::text(Some("pool"))?);
             Ok(())
         }
     }
@@ -2584,7 +2572,7 @@ compdef _jjfx jjfx
 
 fn default_command(launch: fn(PathBuf) -> Result<()>) -> Result<()> {
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        print!("{HELP}");
+        print!("{}", crate::cli_help::top_level());
         return Ok(());
     }
     let repository = Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))?;
@@ -2889,8 +2877,8 @@ mod tests {
                 shell: "zsh".to_owned(),
             }
         );
-        assert!(HELP.contains("completion [zsh]"));
-        assert!(!HELP.contains("__complete"));
+        assert!(crate::cli_help::top_level().contains("completion [zsh]"));
+        assert!(!crate::cli_help::top_level().contains("__complete"));
     }
 
     #[test]

@@ -95,8 +95,10 @@ The same binary carries the non-interactive command surface alongside the TUI:
 | Dispatch & sessions | `dispatch`, `send`, `review`, `logs`, `mount`, `rebase`, `absorb`, `open-pr` |
 | Lifecycle | `hooks install`, `hooks status` |
 
-Run `jjfx help` for usage. `pool list` (and its `status` alias) and `dispatch`
-take `--json` to print machine-readable output instead of the prose.
+Run `jjfx help` for the command list, or `jjfx help <command>` for one
+command's arguments and flags (`jjfx help pool list`, `jjfx help dispatch`).
+`pool list` (and its `status` alias) and `dispatch` take `--json` to print
+machine-readable output instead of the prose.
 
 `jjfx status --json` (alias `jjfx pool list --json`) emits a single JSON object
 rather than a bare array, so it can carry the pool-level state the human table

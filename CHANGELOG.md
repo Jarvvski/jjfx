@@ -34,6 +34,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Added
 
 - jjfx dispatch --json prints one machine-readable object per Ticket - its id, outcome, Worker and detail - including the Tickets a Dispatch held back or failed, so an agent reads a batch result instead of parsing prose.
+- Every command has a help page: `jjfx help <command>` prints a command's usage, arguments and flags (derived from the same definitions the parser reads, so the two cannot drift), an unknown command fails naming it, and the top-level help now lists the Lifecycle group (`hooks install` / `hooks status`).
 
 ### Fixed
 

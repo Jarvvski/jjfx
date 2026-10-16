@@ -1,0 +1,943 @@
+//! The CLI's command surface: the top-level command list and one help page per
+//! command, reachable as `jjfx help <command>`.
+//!
+//! The pages and the parser read the *same* flag definitions. Each command's
+//! `flags` slice is the exact one `cli::reject_unknown_flags` validates
+//! against, so a flag the parser handles but a page omits (or the reverse)
+//! cannot be accepted - the parser only ever accepts a flag some page
+//! documents. The tests drive `cli::parse` from the pages to keep that honest.
+
+use anyhow::Result;
+
+const PROGRAM: &str = env!("CARGO_PKG_NAME");
+
+/// One command-line flag: the single definition a help page and the parser
+/// both read, so the two cannot drift.
+pub(crate) struct Flag {
+    /// Canonical long spelling, e.g. `--provider`.
+    pub(crate) long: &'static str,
+    /// Short alias, when the parser accepts one.
+    pub(crate) short: Option<&'static str>,
+    /// Value placeholder when the flag takes a value, e.g. `PROVIDER`.
+    pub(crate) value: Option<&'static str>,
+    /// One-line description for the help page.
+    pub(crate) help: &'static str,
+}
+
+impl Flag {
+    /// Whether `argument` spells this flag in either its long or short form.
+    pub(crate) fn matches(&self, argument: &str) -> bool {
+        argument == self.long || self.short == Some(argument)
+    }
+
+    /// The spelling shown on a help page, e.g. `-r, --revision <REV>`.
+    fn rendered(&self) -> String {
+        let mut out = String::new();
+        if let Some(short) = self.short {
+            out.push_str(short);
+            out.push_str(", ");
+        }
+        out.push_str(self.long);
+        if let Some(value) = self.value {
+            out.push_str(&format!(" <{value}>"));
+        }
+        out
+    }
+}
+
+/// One positional argument a command accepts.
+struct Argument {
+    name: &'static str,
+    help: &'static str,
+}
+
+/// One command's help page.
+struct CommandHelp {
+    /// The command words, which is also the `jjfx help <key>` key.
+    key: &'static str,
+    /// One-line description, shown under the heading.
+    summary: &'static str,
+    /// The usage line, without the leading `Usage: jjfx `.
+    usage: &'static str,
+    arguments: &'static [Argument],
+    /// The flags the parser validates this command against.
+    flags: &'static [Flag],
+}
+
+impl CommandHelp {
+    /// The page as plain text: a heading, the usage line, then the arguments
+    /// and flags the command accepts.
+    fn render(&self) -> String {
+        let mut out = format!(
+            "{PROGRAM} {} - {}\n\nUsage: {PROGRAM} {}\n",
+            self.key, self.summary, self.usage
+        );
+        if !self.arguments.is_empty() {
+            out.push_str("\nArguments:\n");
+            for argument in self.arguments {
+                out.push_str(&format!("  {:<24} {}\n", argument.name, argument.help));
+            }
+        }
+        if !self.flags.is_empty() {
+            out.push_str("\nFlags:\n");
+            for flag in self.flags {
+                out.push_str(&format!("  {:<24} {}\n", flag.rendered(), flag.help));
+            }
+        }
+        out
+    }
+}
+
+/// One line in the top-level command list.
+struct Entry {
+    /// The command words, which is also the `jjfx help <key>` key.
+    key: &'static str,
+    /// The arguments and flags shown after the command words.
+    args: &'static str,
+    summary: &'static str,
+}
+
+/// A titled block of the top-level command list. The first group is
+/// unlabelled and sits directly under `Usage:`.
+struct Group {
+    title: Option<&'static str>,
+    entries: &'static [Entry],
+}
+
+/// No flags: a command whose page lists only a usage line and arguments.
+const NO_FLAGS: &[Flag] = &[];
+
+// Flags shared verbatim by more than one command. A command's page and its
+// parser read the same const, so the two can never disagree about the flag.
+const FG: Flag = Flag {
+    long: "--fg",
+    short: None,
+    value: None,
+    help: "Wait for each Run to finish before returning",
+};
+const BG: Flag = Flag {
+    long: "--bg",
+    short: None,
+    value: None,
+    help: "Return once each Run's pid is persisted (default)",
+};
+
+pub(crate) const ADD_FLAGS: &[Flag] = &[Flag {
+    long: "--revision",
+    short: Some("-r"),
+    value: Some("REV"),
+    help: "Create the workspace at this revision",
+}];
+
+pub(crate) const RM_FLAGS: &[Flag] = &[Flag {
+    long: "--force",
+    short: Some("-f"),
+    value: None,
+    help: "Remove even a workspace with uncommitted work",
+}];
+
+pub(crate) const STATUS_FLAGS: &[Flag] = &[Flag {
+    long: "--json",
+    short: None,
+    value: None,
+    help: "Emit machine-readable JSON",
+}];
+
+pub(crate) const DISPATCH_FLAGS: &[Flag] = &[
+    FG,
+    BG,
+    Flag {
+        long: "--all",
+        short: None,
+        value: None,
+        help: "Dispatch every discovered Ready Ticket",
+    },
+    Flag {
+        long: "--label",
+        short: None,
+        value: Some("LABEL"),
+        help: "Ticket label for `--all` discovery (default ready-for-agent)",
+    },
+    Flag {
+        long: "--provider",
+        short: None,
+        value: Some("PROVIDER"),
+        help: "Override the pool profile's model provider",
+    },
+    Flag {
+        long: "--model",
+        short: None,
+        value: Some("MODEL"),
+        help: "Override the pool profile's model",
+    },
+    Flag {
+        long: "--budget",
+        short: None,
+        value: Some("USD"),
+        help: "Cap this Dispatch's spend in whole dollars",
+    },
+    Flag {
+        long: "--no-orchestrate",
+        short: None,
+        value: None,
+        help: "Dispatch the Ticket directly, skipping Parent orchestration",
+    },
+    Flag {
+        long: "--force",
+        short: None,
+        value: None,
+        help: "Dispatch even to a Worker whose Workspace is open",
+    },
+    Flag {
+        long: "--json",
+        short: None,
+        value: None,
+        help: "Print one machine-readable object per Ticket instead of prose",
+    },
+];
+
+pub(crate) const SEND_FLAGS: &[Flag] = &[
+    FG,
+    BG,
+    Flag {
+        long: "--force",
+        short: None,
+        value: None,
+        help: "Send even to a Worker whose Workspace is open",
+    },
+];
+
+pub(crate) const REVIEW_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--fg",
+        short: None,
+        value: None,
+        help: "Run the full bounded review loop in the foreground",
+    },
+    Flag {
+        long: "--bg",
+        short: None,
+        value: None,
+        help: "Run a single background review pass (default)",
+    },
+];
+
+pub(crate) const RESOLVE_FLAGS: &[Flag] = &[Flag {
+    long: "--tool",
+    short: Some("-t"),
+    value: Some("NAME"),
+    help: "Merge tool passed to `jj resolve` (for example `:ours`)",
+}];
+
+pub(crate) const UNDO_FLAGS: &[Flag] = &[Flag {
+    long: "--force",
+    short: Some("-f"),
+    value: None,
+    help: "Discard the later operations a restore would also roll back",
+}];
+
+pub(crate) const POOL_LIST_FLAGS: &[Flag] = &[Flag {
+    long: "--json",
+    short: None,
+    value: None,
+    help: "Emit machine-readable JSON",
+}];
+
+pub(crate) const POOL_PROFILE_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--provider",
+        short: None,
+        value: Some("PROVIDER"),
+        help: "Model provider for the profile",
+    },
+    Flag {
+        long: "--model",
+        short: None,
+        value: Some("MODEL"),
+        help: "Model for the profile",
+    },
+];
+
+pub(crate) const POOL_RESIZE_FLAGS: &[Flag] = &[Flag {
+    long: "--size",
+    short: Some("-s"),
+    value: Some("N"),
+    help: "Pool size; the positional `<N>` is the usual form",
+}];
+
+/// The top-level command list, grouped. Each entry names a command that
+/// [`PAGES`] must document, which is what `every_top_level_command_has_a_page`
+/// enforces.
+const TOP_LEVEL: &[Group] = &[
+    Group {
+        title: None,
+        entries: &[
+            Entry {
+                key: "add",
+                args: "<name> [-r <rev>]",
+                summary: "Create workspace and print path (stdout)",
+            },
+            Entry {
+                key: "rm",
+                args: "[--force] <name>",
+                summary: "Remove workspace",
+            },
+            Entry {
+                key: "list",
+                args: "",
+                summary: "List workspaces",
+            },
+            Entry {
+                key: "clean",
+                args: "",
+                summary: "Remove all non-default workspaces",
+            },
+            Entry {
+                key: "root",
+                args: "",
+                summary: "Print repo root",
+            },
+            Entry {
+                key: "where",
+                args: "",
+                summary: "Show repo and workspace paths",
+            },
+            Entry {
+                key: "path",
+                args: "<name>",
+                summary: "Print workspace path",
+            },
+            Entry {
+                key: "refresh",
+                args: "",
+                summary: "Rebuild workspace cache",
+            },
+            Entry {
+                key: "colocation",
+                args: "<action>",
+                summary: "Enable/disable Git colocation (enable|disable|status)",
+            },
+        ],
+    },
+    Group {
+        title: Some("Pool"),
+        entries: &[
+            Entry {
+                key: "pool",
+                args: "<N>",
+                summary: "Set pool size (creates pool if needed, safe shrink)",
+            },
+            Entry {
+                key: "pool list",
+                args: "[--json]",
+                summary: "Show pool status",
+            },
+            Entry {
+                key: "pool rm",
+                args: "<worker>",
+                summary: "Remove a worker from the pool (must not be busy)",
+            },
+            Entry {
+                key: "pool reset",
+                args: "<worker>",
+                summary: "Reset a worker to idle",
+            },
+            Entry {
+                key: "pool profile",
+                args: "<runtime>",
+                summary: "Set runtime profile (--provider/--model)",
+            },
+            Entry {
+                key: "pool destroy",
+                args: "",
+                summary: "Tear down all workers and remove pool",
+            },
+        ],
+    },
+    Group {
+        title: Some("Dispatch and sessions"),
+        entries: &[
+            Entry {
+                key: "dispatch",
+                args: "<TICKET>...",
+                summary: "Dispatch Tickets (d; --provider/--model/--force/--json)",
+            },
+            Entry {
+                key: "send",
+                args: "<worker> <prompt>",
+                summary: "Send a Follow-up (s; --force)",
+            },
+            Entry {
+                key: "review",
+                args: "<worker>",
+                summary: "Address PR review comments (rev)",
+            },
+            Entry {
+                key: "logs",
+                args: "<worker>",
+                summary: "Follow a Worker log (log)",
+            },
+            Entry {
+                key: "mount",
+                args: "<worker>",
+                summary: "Mount a Worker in kitty (m)",
+            },
+            Entry {
+                key: "rebase",
+                args: "<worker>",
+                summary: "Rebase and push a Worker (rb)",
+            },
+            Entry {
+                key: "absorb",
+                args: "<worker>",
+                summary: "Fold a Worker's edits into their base commits (ab)",
+            },
+            Entry {
+                key: "open-pr",
+                args: "<worker>",
+                summary: "Open a Worker's Pull Request (pr)",
+            },
+            Entry {
+                key: "resolve",
+                args: "<workspace>",
+                summary: "Resolve a Workspace's conflicted commits (jj resolve)",
+            },
+            Entry {
+                key: "undo",
+                args: "[<worker>] [--force]",
+                summary: "Undo the last jjfx mutation on a Worker (list when omitted)",
+            },
+        ],
+    },
+    Group {
+        title: Some("Lifecycle"),
+        entries: &[
+            Entry {
+                key: "hooks install",
+                args: "",
+                summary: "Install lifecycle integrations for coding agents",
+            },
+            Entry {
+                key: "hooks status",
+                args: "",
+                summary: "Report lifecycle integration state",
+            },
+        ],
+    },
+    Group {
+        title: Some("Completion"),
+        entries: &[Entry {
+            key: "completion",
+            args: "[zsh]",
+            summary: "Print zsh completion",
+        }],
+    },
+    Group {
+        title: Some("Checks"),
+        entries: &[Entry {
+            key: "check migrations",
+            args: "",
+            summary: "Flag migration-order inversions across workspaces",
+        }],
+    },
+    Group {
+        title: Some("Observability"),
+        entries: &[
+            Entry {
+                key: "status",
+                args: "[--json]",
+                summary: "Alias for pool list",
+            },
+            Entry {
+                key: "version",
+                args: "",
+                summary: concat!("Print the ", env!("CARGO_PKG_NAME"), " version"),
+            },
+        ],
+    },
+];
+
+/// One help page per command the top-level list names.
+const PAGES: &[CommandHelp] = &[
+    CommandHelp {
+        key: "add",
+        summary: "Create a workspace and print its path on stdout",
+        usage: "add <name> [-r <rev>]",
+        arguments: &[Argument {
+            name: "<name>",
+            help: "Name for the new workspace",
+        }],
+        flags: ADD_FLAGS,
+    },
+    CommandHelp {
+        key: "rm",
+        summary: "Remove one or more workspaces",
+        usage: "rm [--force] <name> [name...]",
+        arguments: &[Argument {
+            name: "<name>",
+            help: "Workspace to remove; repeat to remove several",
+        }],
+        flags: RM_FLAGS,
+    },
+    CommandHelp {
+        key: "list",
+        summary: "List workspaces",
+        usage: "list",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "clean",
+        summary: "Remove every non-default workspace, after one confirmation",
+        usage: "clean",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "root",
+        summary: "Print the repository root",
+        usage: "root",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "where",
+        summary: "Show the repository and workspace directories",
+        usage: "where",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "path",
+        summary: "Print a workspace's directory",
+        usage: "path <name>",
+        arguments: &[Argument {
+            name: "<name>",
+            help: "Workspace name, or a short Worker id",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "refresh",
+        summary: "Rebuild the workspace cache",
+        usage: "refresh",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "colocation",
+        summary: "Enable or disable Git colocation through jj",
+        usage: "colocation <enable|disable|status>",
+        arguments: &[Argument {
+            name: "<enable|disable|status>",
+            help: "Transition to perform",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "pool",
+        summary: "Manage the Worker Pool",
+        usage: "pool [<N>]",
+        arguments: &[Argument {
+            name: "<N>",
+            help: "Optional: resize the pool to N Workers (safe shrink)",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "pool list",
+        summary: "Show pool status",
+        usage: "pool list [--json]",
+        arguments: &[],
+        flags: POOL_LIST_FLAGS,
+    },
+    CommandHelp {
+        key: "pool rm",
+        summary: "Remove one Worker from the pool",
+        usage: "pool rm <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker to remove; it must not be busy",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "pool reset",
+        summary: "Reset one Worker to idle",
+        usage: "pool reset <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker to reset to idle",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "pool profile",
+        summary: "Set the runtime profile every Worker runs",
+        usage: "pool profile <claude|codex|opencode> [--provider PROVIDER] [--model MODEL]",
+        arguments: &[Argument {
+            name: "<claude|codex|opencode>",
+            help: "Agent runtime every Worker runs",
+        }],
+        flags: POOL_PROFILE_FLAGS,
+    },
+    CommandHelp {
+        key: "pool destroy",
+        summary: "Tear down every Worker and remove the pool",
+        usage: "pool destroy",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "dispatch",
+        summary: "Dispatch Tickets to idle Workers",
+        usage: "dispatch <TICKET>... [--fg|--bg] [--all] [--label LABEL] [--provider PROVIDER] [--model MODEL] [--budget USD] [--no-orchestrate] [--force] [--json]",
+        arguments: &[Argument {
+            name: "<TICKET>...",
+            help: "Ticket ids to dispatch; use --all to discover them instead",
+        }],
+        flags: DISPATCH_FLAGS,
+    },
+    CommandHelp {
+        key: "send",
+        summary: "Send a Follow-up prompt to a Worker",
+        usage: "send <worker> <prompt> [--fg|--bg] [--force]",
+        arguments: &[
+            Argument {
+                name: "<worker>",
+                help: "Worker to send to",
+            },
+            Argument {
+                name: "<prompt>",
+                help: "Follow-up prompt",
+            },
+        ],
+        flags: SEND_FLAGS,
+    },
+    CommandHelp {
+        key: "review",
+        summary: "Address a Worker's pull-request review comments",
+        usage: "review <worker> [--fg|--bg]",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker whose review comments to address",
+        }],
+        flags: REVIEW_FLAGS,
+    },
+    CommandHelp {
+        key: "logs",
+        summary: "Follow a Worker's Run log",
+        usage: "logs <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker whose log to follow",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "mount",
+        summary: "Mount a Worker in a kitty tab",
+        usage: "mount <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker to mount",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "rebase",
+        summary: "Rebase and push a Worker's bookmark",
+        usage: "rebase <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker to rebase and push",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "absorb",
+        summary: "Fold a Worker's working-copy edits into their base commits",
+        usage: "absorb <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker whose edits to fold in",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "open-pr",
+        summary: "Weld a Worker's chain onto trunk and open its Pull Request",
+        usage: "open-pr <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker whose Pull Request to open",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "resolve",
+        summary: "Resolve a Workspace's conflicted commits with jj resolve",
+        usage: "resolve <workspace> [--tool NAME]",
+        arguments: &[Argument {
+            name: "<workspace>",
+            help: "Workspace, or a short Worker id",
+        }],
+        flags: RESOLVE_FLAGS,
+    },
+    CommandHelp {
+        key: "undo",
+        summary: "Undo the last jjfx mutation on a Workspace",
+        usage: "undo [<workspace>] [--force]",
+        arguments: &[Argument {
+            name: "[<workspace>]",
+            help: "Worker id, workspace name, or `repo`/`*` for a repository-wide mutation; omit to list what can be undone",
+        }],
+        flags: UNDO_FLAGS,
+    },
+    CommandHelp {
+        key: "hooks install",
+        summary: "Install the lifecycle integrations for Claude Code, Codex and OpenCode",
+        usage: "hooks install",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "hooks status",
+        summary: "Report each agent's lifecycle integration state",
+        usage: "hooks status",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "completion",
+        summary: "Print the zsh completion script",
+        usage: "completion [zsh]",
+        arguments: &[Argument {
+            name: "[zsh]",
+            help: "Shell to complete for; zsh is the only supported shell",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "check migrations",
+        summary: "Flag migration-order inversions across the workspaces",
+        usage: "check migrations",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "status",
+        summary: "Show pool status (alias for pool list)",
+        usage: "status [--json]",
+        arguments: &[],
+        flags: STATUS_FLAGS,
+    },
+    CommandHelp {
+        key: "version",
+        summary: concat!("Print the ", env!("CARGO_PKG_NAME"), " version"),
+        usage: "version",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+];
+
+/// The page for `key`, or `None` when no command by that name exists.
+fn page(key: &str) -> Option<&'static CommandHelp> {
+    PAGES.iter().find(|page| page.key == key)
+}
+
+/// The rendered help text: a command's page when `key` names one, otherwise the
+/// top-level command list. An unknown command is a loud error naming it, so a
+/// typo never silently prints the wrong thing.
+pub(crate) fn text(key: Option<&str>) -> Result<String> {
+    match key {
+        None => Ok(top_level()),
+        Some(key) => page(key).map(CommandHelp::render).ok_or_else(|| {
+            anyhow::anyhow!("unknown command: {key}. Run '{PROGRAM} help' for the command list.")
+        }),
+    }
+}
+
+/// The rendered top-level command list.
+pub(crate) fn top_level() -> String {
+    let mut out =
+        format!("{PROGRAM} - jj workspace manager\n\nUsage: {PROGRAM} [OPTIONS]\n\nUsage:\n");
+    for group in TOP_LEVEL {
+        if let Some(title) = group.title {
+            out.push_str(&format!("\n{title}:\n"));
+        }
+        for entry in group.entries {
+            let field = if entry.args.is_empty() {
+                entry.key.to_owned()
+            } else {
+                format!("{} {}", entry.key, entry.args)
+            };
+            out.push_str(&format!("  {PROGRAM} {field:<25} {}\n", entry.summary));
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::cli::parse;
+
+    /// A command in the top-level list without a page is a dead end for a
+    /// reader: `jjfx help <command>` would fail. Adding a command to the list
+    /// must therefore add its page in the same change. Driving `text` - the
+    /// function the `help` command calls - covers the lookup and the render.
+    #[test]
+    fn every_top_level_command_has_a_page() {
+        for group in TOP_LEVEL {
+            for entry in group.entries {
+                let rendered = text(Some(entry.key)).unwrap_or_else(|error| {
+                    panic!(
+                        "top-level command `{}` has no help page: {error}",
+                        entry.key
+                    )
+                });
+                assert!(
+                    rendered.contains(&format!("Usage: {PROGRAM} ")),
+                    "page `{}` has no usage line",
+                    entry.key
+                );
+            }
+        }
+    }
+
+    /// The reverse: a page for a command the top-level list does not name is
+    /// unreachable - nothing tells a reader it exists.
+    #[test]
+    fn every_page_is_named_at_the_top_level() {
+        let listed: Vec<&str> = TOP_LEVEL
+            .iter()
+            .flat_map(|group| group.entries.iter().map(|entry| entry.key))
+            .collect();
+        for page in PAGES {
+            assert!(
+                listed.contains(&page.key),
+                "help page `{}` is not in the top-level list",
+                page.key
+            );
+        }
+    }
+
+    /// Each page must actually print what it promises: a usage line, and every
+    /// argument and flag it declares.
+    #[test]
+    fn every_page_renders_its_usage_arguments_and_flags() {
+        for page in PAGES {
+            let rendered = page.render();
+            assert!(
+                rendered.contains(&format!("Usage: {PROGRAM} {}", page.usage)),
+                "page `{}` is missing its usage line",
+                page.key
+            );
+            for argument in page.arguments {
+                assert!(
+                    rendered.contains(argument.name),
+                    "page `{}` omits argument `{}`",
+                    page.key,
+                    argument.name
+                );
+            }
+            for flag in page.flags {
+                assert!(
+                    rendered.contains(flag.long),
+                    "page `{}` omits flag `{}`",
+                    page.key,
+                    flag.long
+                );
+                if let Some(short) = flag.short {
+                    assert!(
+                        rendered.contains(short),
+                        "page `{}` omits short flag `{short}`",
+                        page.key
+                    );
+                }
+                if let Some(value) = flag.value {
+                    assert!(
+                        rendered.contains(&format!("<{value}>")),
+                        "page `{}` omits the `{}` placeholder for {}",
+                        page.key,
+                        value,
+                        flag.long
+                    );
+                }
+            }
+        }
+    }
+
+    /// A flag a page documents must be one the parser accepts. The parser
+    /// rejects any option the page's flag slice does not contain (see
+    /// `cli::reject_unknown_flags`), so a page that drifts from its command
+    /// fails here rather than shipping.
+    #[test]
+    fn documented_flags_are_accepted_by_the_parser() {
+        for page in PAGES {
+            for flag in page.flags {
+                let mut args: Vec<String> = page.key.split(' ').map(str::to_owned).collect();
+                args.push(flag.long.to_owned());
+                if flag.value.is_some() {
+                    args.push("value".to_owned());
+                }
+                if let Err(error) = parse(&args) {
+                    assert!(
+                        !error.to_string().contains("unknown option"),
+                        "`{} {}` is documented but the parser rejects it: {error}",
+                        page.key,
+                        flag.long
+                    );
+                }
+            }
+        }
+    }
+
+    /// The other direction: a flag the parser does not document must be
+    /// rejected, so the page cannot silently under-report the surface.
+    #[test]
+    fn an_undocumented_flag_is_rejected_by_the_parser() {
+        for page in PAGES.iter().filter(|page| !page.flags.is_empty()) {
+            let mut args: Vec<String> = page.key.split(' ').map(str::to_owned).collect();
+            args.push("--definitely-not-a-flag".to_owned());
+            let error = parse(&args).expect_err("an undocumented flag must be rejected");
+            assert!(
+                error.to_string().contains("--definitely-not-a-flag"),
+                "`{}` did not name the rejected flag: {error}",
+                page.key
+            );
+        }
+    }
+
+    #[test]
+    fn an_unknown_command_is_named_in_the_error() {
+        let error = text(Some("definitely-not-a-command"))
+            .expect_err("an unknown command must fail loudly");
+        assert!(error.to_string().contains("definitely-not-a-command"));
+    }
+
+    #[test]
+    fn the_top_level_help_lists_the_lifecycle_commands() {
+        let help = top_level();
+        assert!(help.contains("hooks install"), "{help}");
+        assert!(help.contains("hooks status"), "{help}");
+    }
+
+    #[test]
+    fn the_top_level_help_keeps_hidden_commands_private() {
+        let help = top_level();
+        assert!(!help.contains("__complete"), "{help}");
+        assert!(!help.contains("__orchestrate"), "{help}");
+        assert!(help.contains("completion [zsh]"), "{help}");
+    }
+
+    #[test]
+    fn a_named_page_is_returned_and_a_bare_help_is_the_command_list() {
+        let dispatch = text(Some("dispatch")).expect("dispatch has a page");
+        assert!(dispatch.contains("Usage: jjfx dispatch"), "{dispatch}");
+        assert!(dispatch.contains("--no-orchestrate"), "{dispatch}");
+        assert_eq!(text(None).expect("top-level help"), top_level());
+    }
+}
