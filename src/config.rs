@@ -11,7 +11,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, PaneLayout, PoolCapacity, SpendCap,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, PaneLayout, PoolCapacity, PoolName, SpendCap,
     SpendCapMode, SpendWindow, WireAgent,
 };
 use anyhow::Context;
@@ -183,6 +183,23 @@ impl Config {
             tickets.source = selection.source;
         }
         Ok(tickets)
+    }
+
+    /// The names of every Worker Pool `repo_root` holds, `default` first.
+    ///
+    /// The set is `default` - which every Repository has, implicitly or by
+    /// declaration - plus each pool its `[pools]` section declares. A Repository
+    /// that declares nothing therefore has exactly one pool, which is what lets
+    /// an unqualified Dispatch imply it (`.scratch/multi-pool/issues/04`).
+    pub fn pool_names_for(&self, repo_root: &Path) -> anyhow::Result<Vec<PoolName>> {
+        let mut names = vec![PoolName::default()];
+        for name in self.repo_config(repo_root)?.pools.keys() {
+            if name == crate::engine::DEFAULT_POOL_NAME {
+                continue;
+            }
+            names.push(PoolName::parse(name.clone())?);
+        }
+        Ok(names)
     }
 
     /// The settings the TUI and Dispatch both act on, loaded once and handed
@@ -1446,6 +1463,45 @@ mod tests {
                 .expect("no repository override");
             assert!(repo_config.pools.is_empty());
         }
+    }
+
+    /// The pool set a Dispatch resolves against: `default`, which every
+    /// Repository has, plus each declared pool, `default` first. A Repository
+    /// that declares nothing has exactly one pool, which is what lets an
+    /// unqualified Dispatch imply it.
+    #[test]
+    fn the_pool_set_is_default_plus_every_declared_pool() {
+        let config = Config::from_toml("");
+        let bare = config
+            .pool_names_for(repo_with_config(None).path())
+            .expect("no repository override");
+        assert_eq!(bare, vec![PoolName::default()]);
+
+        let repo = repo_with_config(Some("[pools.bugs]\n\n[pools.features]\n"));
+        let named = config
+            .pool_names_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(
+            named,
+            vec![
+                PoolName::default(),
+                PoolName::parse("bugs").expect("pool name"),
+                PoolName::parse("features").expect("pool name"),
+            ]
+        );
+
+        // A declared `default` is the same pool, not a second one.
+        let declared = repo_with_config(Some("[pools.default]\n\n[pools.bugs]\n"));
+        let names = config
+            .pool_names_for(declared.path())
+            .expect("the repository config parses");
+        assert_eq!(
+            names,
+            vec![
+                PoolName::default(),
+                PoolName::parse("bugs").expect("pool name"),
+            ]
+        );
     }
 
     #[test]

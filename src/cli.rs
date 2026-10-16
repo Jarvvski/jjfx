@@ -135,6 +135,9 @@ pub enum Command {
         provider: Option<String>,
         model: Option<String>,
         force: bool,
+        /// The Worker Pool the detached runner fills, as the parent resolved it.
+        /// `None` means `default`, so a hand-run `__orchestrate` is unchanged.
+        pool: Option<String>,
     },
     Pool(PoolCommand),
     Ticket(TicketCommand),
@@ -171,6 +174,10 @@ pub struct DispatchArgs {
     pub model: Option<String>,
     pub budget: Option<u32>,
     pub label: String,
+    /// The Worker Pool this Dispatch fills. `None` means "the Repository's only
+    /// pool", which is `default` for a Repository that declares none; several
+    /// pools with no `--pool` is a loud refusal, never a silent choice.
+    pub pool: Option<String>,
     pub no_orchestrate: bool,
     pub force: bool,
     pub json: bool,
@@ -913,6 +920,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     let mut model = None;
     let mut budget = None;
     let mut label = "ready-for-agent".to_owned();
+    let mut pool = None;
     let mut no_orchestrate = false;
     let mut force = false;
     let mut json = false;
@@ -957,7 +965,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
             // A bare `-` reads the Ticket from stdin, so a paragraph can be
             // piped straight in without dressing it up as a tracker item.
             "-" => set_adhoc_source(&mut input, AdHocSource::Stdin)?,
-            "--provider" | "--model" | "--label" | "--budget" => {
+            "--provider" | "--model" | "--label" | "--budget" | "--pool" => {
                 let option = args[index].as_str();
                 let value = args
                     .get(index + 1)
@@ -969,6 +977,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
                     "--provider" => provider = Some(value.clone()),
                     "--model" => model = Some(value.clone()),
                     "--label" => label = value.clone(),
+                    "--pool" => pool = Some(value.clone()),
                     "--budget" => {
                         let dollars = value
                             .parse::<u32>()
@@ -1017,6 +1026,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         model,
         budget,
         label,
+        pool,
         no_orchestrate,
         force,
         json,
@@ -1108,11 +1118,12 @@ fn parse_orchestrate(args: &[String]) -> Result<Command> {
         bail!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
-            " __orchestrate <PARENT-TICKET> [--provider PROVIDER] [--model MODEL]"
+            " __orchestrate <PARENT-TICKET> [--provider PROVIDER] [--model MODEL] [--pool NAME]"
         ));
     };
     let mut provider = None;
     let mut model = None;
+    let mut pool = None;
     let mut force = false;
     let mut index = 1;
     while index < args.len() {
@@ -1125,6 +1136,7 @@ fn parse_orchestrate(args: &[String]) -> Result<Command> {
         let destination = match option {
             "--provider" => &mut provider,
             "--model" => &mut model,
+            "--pool" => &mut pool,
             _ => bail!("unknown option for __orchestrate: {option}"),
         };
         let value = args
@@ -1141,6 +1153,7 @@ fn parse_orchestrate(args: &[String]) -> Result<Command> {
         provider,
         model,
         force,
+        pool,
     })
 }
 
@@ -1246,15 +1259,23 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
             provider,
             model,
             force,
-        } => orchestrate_command(
-            &repository(colocate)?,
-            &parent,
-            selected_model(provider.as_deref(), model.as_deref())?,
-            force,
-            false,
-            open_workspaces,
-            tickets,
-        )?,
+            pool,
+        } => {
+            let repository = repository(colocate)?;
+            let repository = match pool {
+                Some(name) => repository.with_pool(PoolName::parse(name)?),
+                None => repository,
+            };
+            orchestrate_command(
+                &repository,
+                &parent,
+                selected_model(provider.as_deref(), model.as_deref())?,
+                force,
+                false,
+                open_workspaces,
+                tickets,
+            )?
+        }
         Command::Pool(command) => pool_command(&repository(colocate)?, command)?,
         Command::Ticket(TicketCommand::Reconcile) => {
             ticket_reconcile_command(&repository(colocate)?, tickets)?
@@ -2333,6 +2354,43 @@ fn report_named_ticket_readiness(
     Ok(())
 }
 
+/// The Worker Pool a Dispatch fills, from the pools a Repository holds.
+///
+/// One pool implies it; several require `--pool`, and an unqualified Dispatch
+/// against several is refused loudly, naming the pools that exist - never a
+/// silent choice of one (`.scratch/multi-pool/issues/04-how-tickets-reach-a-pool.md`).
+/// An explicit `--pool` naming a pool the Repository does not hold is refused
+/// the same way, so a typo cannot quietly fill a lane that is not there.
+fn resolve_pool(available: &[PoolName], requested: Option<&str>) -> Result<PoolName> {
+    let names = || {
+        available
+            .iter()
+            .map(PoolName::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(name) = requested {
+        let pool = PoolName::parse(name.to_owned())
+            .map_err(|_| anyhow::anyhow!("`{name}` is not a valid Worker Pool name"))?;
+        if available.contains(&pool) {
+            return Ok(pool);
+        }
+        bail!(
+            "no Worker Pool named `{name}`; this Repository holds: {}",
+            names()
+        );
+    }
+    match available {
+        [] => bail!("this Repository holds no Worker Pools"),
+        [only] => Ok(only.clone()),
+        several => bail!(
+            "this Repository holds {} Worker Pools ({}); name one with --pool <name>",
+            several.len(),
+            names()
+        ),
+    }
+}
+
 fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
@@ -2340,6 +2398,23 @@ fn dispatch_command(
     tickets_config: fn(&Repository) -> Result<TicketsConfig>,
     spend_config: fn() -> Result<SpendConfig>,
 ) -> Result<()> {
+    // Resolve the pool this Dispatch fills before anything is gated, reserved or
+    // launched. One pool implies it - every Repository that declares none has one
+    // implicit `default` - while several require `--pool`, so an unqualified
+    // Dispatch into a Repository with several pools refuses loudly, naming them,
+    // rather than silently filling one. `--text` and `--from-file` follow the
+    // same rule because they pass through here too.
+    let pool = resolve_pool(
+        &crate::config::load()?.pool_names_for(repository.root())?,
+        args.pool.as_deref(),
+    )?;
+    // Every pool-scoped read and write below - the pool document, its Workers,
+    // its Run Records, its locks, its spend - follows the handle, so Worker
+    // reservation, Dispatch Eligibility and the pool's size are all the selected
+    // pool's (ADR 0012).
+    let scoped = repository.clone().with_pool(pool);
+    let repository = &scoped;
+
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
     // The spend gate runs before anything is reserved or launched, including the
     // orchestration handoff below, so a blocked cap refuses the whole Dispatch.
@@ -3893,6 +3968,10 @@ fn spawn_background_orchestration(
     let executable = std::env::current_exe()?;
     let mut command = std::process::Command::new(executable);
     command.arg("__orchestrate").arg(parent.as_str());
+    // The detached runner re-discovers the Repository, so it must be told which
+    // pool to fill: without this a named pool's orchestration would run against
+    // `default`, and its Workers, locks and log would all land in the wrong lane.
+    command.args(["--pool", repository.selected_pool().as_str()]);
     if let Some(provider) = args.provider.as_deref() {
         command.args(["--provider", provider]);
     }
@@ -4021,7 +4100,7 @@ _jjfx() {
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         ticket) _arguments '1:subcommand:(reconcile)' ;;
         pool) _arguments '1:subcommand:(list create destroy resize rm reset profile)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' '--pool[pool name]:name:' '--size[pool size]:N:' '--profile[Agent Runtime Profile]:name:' '--source[Ticket source]:(linear local)' '--label[routing label]:label:' '--ready-status[ready Status:]:status:' '--cap-usd[spend cap in USD]:dollars:' '--window[cap window]:(today week total)' '--on-exceed[cap mode]:(block warn)' ;;
-        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--text[dispatch a one-off Ticket from text]:text:' '--from-file[dispatch a Ticket from a markdown file]:path:_files' '--id[Ticket id for ad-hoc input]:id:' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
+        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--text[dispatch a one-off Ticket from text]:text:' '--from-file[dispatch a Ticket from a markdown file]:path:_files' '--id[Ticket id for ad-hoc input]:id:' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--pool[Worker Pool to fill]:pool:' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
   esac
@@ -4071,6 +4150,7 @@ mod tests {
                 model: Some("opus".to_owned()),
                 budget: Some(12),
                 label: "ready-for-agent".to_owned(),
+                pool: None,
                 no_orchestrate: true,
                 force: false,
                 json: false,
@@ -4107,6 +4187,7 @@ mod tests {
                 model: None,
                 budget: None,
                 label: "ready-for-agent".to_owned(),
+                pool: None,
                 no_orchestrate: false,
                 force: false,
                 json: false,
@@ -4186,6 +4267,90 @@ mod tests {
             command,
             Command::Dispatch(DispatchArgs { json: true, .. })
         ));
+    }
+
+    /// `--pool` names the lane a Dispatch fills. It parses for a positional
+    /// Ticket, `--all`, and the ad-hoc inputs alike, because all three pass
+    /// through the same resolution.
+    #[test]
+    fn dispatch_parser_reads_the_pool_flag() {
+        for arguments in [
+            args(&["dispatch", "AMBA-42", "--pool", "bugs"]),
+            args(&["dispatch", "--all", "--pool", "bugs"]),
+            args(&["dispatch", "--text", "a", "--pool", "bugs"]),
+        ] {
+            let command = parse(&arguments).expect("--pool should parse");
+            assert!(
+                matches!(
+                    command,
+                    Command::Dispatch(DispatchArgs {
+                        pool: Some(ref name),
+                        ..
+                    }) if name == "bugs"
+                ),
+                "{arguments:?}"
+            );
+        }
+    }
+
+    /// One pool implies it: a Repository that declares none has one implicit
+    /// `default`, so an unqualified Dispatch fills it - today's behaviour,
+    /// untouched.
+    #[test]
+    fn one_pool_implies_the_target() {
+        let only = [PoolName::default()];
+        assert_eq!(
+            resolve_pool(&only, None).expect("one pool implies it"),
+            PoolName::default()
+        );
+    }
+
+    /// Several pools require `--pool`: an unqualified Dispatch is refused loudly,
+    /// naming the pools that exist, never silently filling one.
+    #[test]
+    fn several_pools_require_an_explicit_one() {
+        let available = [
+            PoolName::default(),
+            PoolName::parse("bugs").expect("pool name"),
+            PoolName::parse("features").expect("pool name"),
+        ];
+        let error = resolve_pool(&available, None).expect_err("several pools must be refused");
+        let message = error.to_string();
+        for name in ["default", "bugs", "features"] {
+            assert!(message.contains(name), "{message}");
+        }
+        assert!(message.contains("--pool"), "{message}");
+    }
+
+    /// An explicit `--pool` selects the lane, so reservation, eligibility and
+    /// size are read from that pool's state.
+    #[test]
+    fn an_explicit_pool_selects_the_lane() {
+        let available = [
+            PoolName::default(),
+            PoolName::parse("bugs").expect("pool name"),
+        ];
+        assert_eq!(
+            resolve_pool(&available, Some("bugs")).expect("an explicit pool"),
+            PoolName::parse("bugs").expect("pool name")
+        );
+        // An explicit `--pool default` works on a multi-pool Repository too.
+        assert_eq!(
+            resolve_pool(&available, Some("default")).expect("an explicit pool"),
+            PoolName::default()
+        );
+    }
+
+    /// Naming a pool the Repository does not hold is refused the same way, so a
+    /// typo cannot quietly fill a lane that is not there.
+    #[test]
+    fn an_unknown_pool_is_refused_naming_the_pools_that_exist() {
+        let available = [PoolName::default()];
+        let error =
+            resolve_pool(&available, Some("ghost")).expect_err("an undeclared pool is refused");
+        let message = error.to_string();
+        assert!(message.contains("ghost"), "{message}");
+        assert!(message.contains("default"), "{message}");
     }
 
     #[test]
@@ -5082,6 +5247,7 @@ mod tests {
                 model: None,
                 budget: None,
                 label: "needs-review".to_owned(),
+                pool: None,
                 no_orchestrate: false,
                 force: false,
                 json: false,
@@ -5102,6 +5268,7 @@ mod tests {
                 model: None,
                 budget: None,
                 label: "ready-for-agent".to_owned(),
+                pool: None,
                 no_orchestrate: true,
                 force: false,
                 json: false,

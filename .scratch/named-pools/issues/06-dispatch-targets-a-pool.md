@@ -1,7 +1,7 @@
 # Dispatch targets a pool
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01, 02
 
 ## Problem
@@ -23,11 +23,11 @@ Every Dispatch assumes the one pool. With several, a Dispatch has to know which 
 
 ## Acceptance Criteria
 
-- [ ] With one pool, `jjfx dispatch <TICKET>` behaves exactly as today.
-- [ ] With several, an unqualified Dispatch is refused, naming the pools that exist.
-- [ ] `--pool <name>` selects the lane, and `--text` / `--from-file` follow the same rule.
-- [ ] Eligibility, occupancy and size are all evaluated against the selected pool.
-- [ ] `mise run check` is green.
+- [x] With one pool, `jjfx dispatch <TICKET>` behaves exactly as today.
+- [x] With several, an unqualified Dispatch is refused, naming the pools that exist.
+- [x] `--pool <name>` selects the lane, and `--text` / `--from-file` follow the same rule.
+- [x] Eligibility, occupancy and size are all evaluated against the selected pool.
+- [x] `mise run check` is green.
 
 ## References
 

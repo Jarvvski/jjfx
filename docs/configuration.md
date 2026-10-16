@@ -554,6 +554,21 @@ and behaves exactly as it did before pools could be named: `jjfx pool <N>` sizes
 so `default` is not removable - resize it to zero instead. `jjfx pool <N>` keeps
 sizing `default` even when other pools are declared.
 
+### Dispatch fills one pool
+
+A Dispatch has to know which pool it fills, and the rule keys off how many the
+Repository has, not off Ticket sources. A Repository that declares none has one
+implicit `default`, so `jjfx dispatch <TICKET>` implies it and works unchanged.
+Declaring any named pool makes `--pool <name>` required - `default` still exists
+beside the named lanes - and an unqualified Dispatch is refused loudly, naming
+the pools that exist, rather than silently choosing one. `--text` and
+`--from-file` follow the same rule.
+
+Naming a pool the Repository does not hold is refused the same way. Worker
+reservation, Dispatch Eligibility and the pool's size are all evaluated against
+the selected pool, so `jjfx dispatch --pool bugs` fills `bugs` and leaves every
+other lane alone.
+
 ### The verbs edit the declaration
 
 The declaration is the source of truth, so `jjfx pool create` and
