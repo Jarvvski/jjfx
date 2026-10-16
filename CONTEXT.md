@@ -10,7 +10,7 @@ workspace's changes from creation to merge.
 
 **Repository**:
 A single Jujutsu repository that jjfx operates on: the container for its
-Workspaces and Trunk and the scope of its Worker Pool.
+Workspaces, Trunk and Worker Pools.
 _Avoid_: repo (in prose), project
 
 **Workspace**:
@@ -129,12 +129,15 @@ the same for idle, empty workspaces.
 ### Workspace Dispatch
 
 **Worker Pool**:
-The Repository-scoped collection of reusable Workers and their execution
-capacity.
+One named collection of reusable Workers and their execution capacity, held by
+a Repository. A Repository holds one or more; `default` is the one every
+Repository starts with.
+_Avoid_: pool (unqualified), lane
 
 **Worker**:
-A reusable execution slot backed by exactly one Worker Workspace. A Worker is
-not an Agent, Agent Session, Workspace, or process.
+A reusable execution slot backed by exactly one Worker Workspace and belonging
+to exactly one Worker Pool for its life. A Worker is not an Agent, Agent
+Session, Workspace, or process.
 _Avoid_: agent slot
 
 **Worker Workspace**:
@@ -156,9 +159,9 @@ jjfx's durable in-use marker and reconciled against the terminal's open tabs.
 _Avoid_: in-use (for the state), attached, mounted (a Mount is one way to occupy)
 
 **Dispatch Eligibility**:
-Whether a Worker may be selected for a new Run: a Pool member whose Worker
-Status is idle and that is not Occupied. Only Pool Workspaces are ever
-dispatch-eligible.
+Whether a Worker may be selected for a new Run: a member of the pool being
+dispatched into, whose Worker Status is idle and that is not Occupied. Only
+Worker Workspaces are ever dispatch-eligible.
 _Avoid_: availability, dispatchable
 
 **Run**:
@@ -243,8 +246,8 @@ without starting a new Run.
 _Avoid_: attach
 
 **Dismiss**:
-Removing an idle Worker from the Pool; for a terminal Worker it instead performs
-an in-place Reset.
+Removing an idle Worker from its Worker Pool; for a terminal Worker it instead
+performs an in-place Reset.
 _Avoid_: remove (unqualified)
 
 Worker, Agent, Agent Session, Workspace, and Process therefore name distinct

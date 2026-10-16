@@ -42,6 +42,9 @@ Workspace, Agent, Agent Session, Work, and Forge model.
   compatibility peers until conformance is proven; adopting this domain does
   not authorize destructive state conversion or a behavior cutover.
 
+The Worker Pool described here is one per Repository. ADR 0012 later makes it one
+or more, with each Worker belonging to exactly one.
+
 The terms and distinctions are recorded in the repository glossary in
 `CONTEXT.md`. The migration scope and compatibility promise are defined by
 `.scratch/wsg-migration/PRD.md`.

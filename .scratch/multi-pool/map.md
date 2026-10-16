@@ -22,14 +22,16 @@ A locked design for running **several Worker Pools in one Repository** — each 
 <!-- the index — one line per closed ticket: enough to judge relevance, then zoom the link for the detail the ticket holds -->
 
 - [Is the persisted Pool state a `wsg` compatibility contract?](issues/01-is-pool-state-a-wsg-contract.md) — **Ours.** The Go project is archived, the Rust compatibility binary is removed, and the cutover evidence was waived, so the persisted state is jjfx's to reshape. Two things carry forward: additive fields were *always* allowed, and the dead contract's residue (fixtures, ADR 0011's constraint, three sidecar documents) is still live — retired separately by *Retire the dead `wsg` compatibility residue*.
+- [What is a Pool now that there are several?](issues/02-what-is-a-pool-now.md) — A Worker **belongs to exactly one pool for its life** (membership, not assignment); `Worker Pool` stays the unit and the collection gets **no new noun** — a Repository holds *its Worker Pools*, so the bare "the Pool" must always name which. Glossary swept; `Pool Workspace` collapsed as a synonym slip for `Worker Workspace`. Landed as **ADR 0012** plus `CONTEXT.md`, superseding the Repository-scoped definition in ADR 0009.
 
 ## Not yet specified
 
-- **Borrowing capacity between pools.** Can an idle "features" Worker take a "bugs" Ticket when the bugs pool is saturated? Unclear until the domain model lands, and it changes what a pool's "size" means.
-- **What removing a pool does with its Workers' branches.** Ties to the known gap where a Reset Worker's earlier branches become unreachable from `open-pr` / `rebase` / `absorb`.
-- **Whether pools need their own Lift / Tidy / Reset semantics.** Probably not — those are per-Workspace — but a plural Pool model may force a distinction.
+<!-- see "Fog of war": in-scope fog you can't ticket yet; graduates as the frontier advances -->
+
+Currently empty. The three items here — borrowing capacity between pools, what removing a pool does with its Workers' branches, and whether pools need their own Lift / Tidy / Reset semantics — graduated when the domain model resolved: the first was decided against (membership is the model, so it moved to Out of scope), and the other two became tickets.
 
 ## Out of scope
 
 - **The TUI.** The primary interface is deferred to its own effort once the model settles. The cost of deferring it, stated plainly: we may lock a model the TUI cannot wear comfortably, and `CONTEXT.md` is an attention-first UI model.
-- **Multi-repository pools.** *Repository* is defined as "the scope of its Worker Pool"; a pool spanning repositories is a different effort.
+- **Multi-repository pools.** A Worker Pool is held by one Repository, and its Workers are backed by that Repository's Workspaces; a pool spanning repositories is a different effort.
+- **Moving or borrowing Workers between pools.** Membership is the model: a Worker belongs to one pool for its life, so an idle "features" Worker cannot take a "bugs" Ticket. A Reset-backed move is a conceivable future effort, but it is not this design — decided by *What is a Pool now that there are several?*.
