@@ -51,9 +51,9 @@ is the default scope for that agent session.
   session, not as separate session boundaries.
 - Do not stop after the first green TDD slice or focused commit.
 - For a ticket with multiple focused commits, describe each completed commit
-  and start the next with `jj new`, but do not move `main` between them. After
-  the whole ticket passes, move `main` to the stack tip and immediately run
-  `jj new`.
+  and start the next with `jj new`. Publish the whole stack on the ticket's
+  bookmark and open one PR for it - never move `main` yourself, which the
+  landing rules above forbid.
 - Update the ticket status to `resolved` only after `mise run check` passes.
 - If the ticket cannot reasonably fit in one session, identify that before
   editing and ask the user to split it. Do not silently implement only the
