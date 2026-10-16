@@ -8,6 +8,27 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
+/// Whether this build is a development build rather than a release.
+///
+/// `build.rs` sets the marker for a checkout build the release pipeline did not
+/// produce. See `docs/releasing.md`.
+const DEVELOPMENT_BUILD: bool = option_env!("JJFX_DEV_BUILD").is_some();
+
+/// The version `jjfx version` reports.
+///
+/// A development build carries a `-dev` suffix, so a binary built from `main`
+/// after a release cannot be mistaken for that release in a bug report.
+pub(crate) const VERSION: &str = version_string(DEVELOPMENT_BUILD);
+
+/// The version string for a build: `-dev` when it is a development build.
+const fn version_string(development: bool) -> &'static str {
+    if development {
+        concat!(env!("CARGO_PKG_VERSION"), "-dev")
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
 use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
     ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
@@ -998,7 +1019,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
     } = settings;
     match parse(&args)? {
         Command::Help { command } => print!("{}", crate::cli_help::text(command.as_deref())?),
-        Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => println!("{PROGRAM} {VERSION}"),
         Command::Default => default_command(launch)?,
         Command::Root => root_command(&repository(colocate)?)?,
         Command::Where => where_command(&repository(colocate)?)?,
@@ -4301,6 +4322,19 @@ mod tests {
         for answer in ["", "\n", "n", "no", "nope", "maybe", "y n"] {
             assert!(!answer_approves_growth(answer), "`{answer}` should refuse");
         }
+    }
+
+    /// A development build must say so: its version carries a `-dev` suffix, so
+    /// a binary built from `main` cannot be mistaken for the release it
+    /// followed. A release build reports the clean version.
+    #[test]
+    fn a_development_build_is_marked_in_the_version() {
+        assert_eq!(
+            version_string(true),
+            concat!(env!("CARGO_PKG_VERSION"), "-dev")
+        );
+        assert_eq!(version_string(false), env!("CARGO_PKG_VERSION"));
+        assert_ne!(version_string(true), version_string(false));
     }
 
     #[test]

@@ -19,6 +19,9 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 cd "$root"
 
 jjfx_version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+# Mark the archives as release builds: `jjfx version` then reports the clean
+# version instead of the `-dev` suffix build.rs gives a checkout build.
+export JJFX_RELEASE_VERSION="$jjfx_version"
 host=$(rustc -vV | sed -n 's/^host: //p')
 
 targets=("$@")

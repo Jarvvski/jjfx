@@ -14,6 +14,12 @@ The CLI is pinned in `mise.toml`; the configuration is
 The version of record is the **latest tag** (`v<x.y.z>`), and it is
 **release-owned** - an ordinary change never moves it.
 
+`jjfx version` reports `<version>-dev` for a build from a checkout, because such
+a build is not the tagged release: `build.rs` marks every build the release did
+not produce. The release task sets `JJFX_RELEASE_VERSION` when it builds the
+archives, and a crate unpacked from crates.io carries no VCS metadata, so both
+report the clean version. A bug report therefore says which build is in hand.
+
 Every user-visible change is recorded with momo, which owns the changelog heading
 and the section it lands in:
 
