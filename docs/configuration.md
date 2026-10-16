@@ -278,7 +278,7 @@ Held 2 ticket(s) back under the dispatch cap; re-run once a Run finishes.
 The waiting set is recorded in jjfx's own `.jj/pool/waiting.json` and shown by
 `jjfx status` (a `Waiting:` line, and the `waiting` array in `jjfx status --json`)
 and the Pool view, so the backlog is visible after the Dispatch that held it. It is jjfx-owned presentation state, kept out of
-the Go-compatible Pool and Worker documents, and it is rewritten by every
+the Pool and Worker documents, and it is rewritten by every
 Dispatch - including an uncapped one, which clears it - so it always describes
 the last Dispatch rather than accumulating Tickets you have since dispatched by
 hand.
@@ -306,7 +306,7 @@ the watchdog's: it becomes failed, never stuck. A Run with neither a start time
 nor a readable log has no evidence either way and is never flagged on a guess.
 
 Stuck is derived, never persisted - like occupancy it is a view of live Run
-state, so the Go-compatible Pool and Worker documents are untouched. It shows up
+state, so the Pool and Worker documents are untouched. It shows up
 in three places:
 
 - the home list, where a stuck Run sorts into the `needs you` lane instead of

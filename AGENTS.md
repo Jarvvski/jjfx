@@ -34,8 +34,6 @@ A user-visible change is recorded with momo, which owns the changelog heading an
 
 `momo status` derives the next version from the unreleased changes and the latest tag. jjfx is pre-1.0, so the minor position is the breaking slot (Cargo's `^0.52.0` means `>=0.52.0, <0.53.0`): `break` and `add` both raise the minor, `fix` raises the patch - momo's zero-aware rule. **Never bump to 1.0.0 (or any MAJOR) without the owner's explicit approval.** Skip pure internal refactors.
 
-`crates/wsg` is frozen at its current version while the migration-era binary is retired; entries are versioned by `jjfx` alone.
-
 Releases are cut by dispatching `.github/workflows/release.yml` - see
 [`docs/releasing.md`](docs/releasing.md). Dispatch the real run; dry-run
 (`-f dry_run=true`) only when the release process itself changed.

@@ -50,7 +50,7 @@ cargo run -p jjfx -- pool list  # run a CLI command
 
 | Area | Path |
 | --- | --- |
-| CLI, TUI, and the engine | `src/`, with the absorbed former `wsg-core` under `src/engine/` |
+| CLI, TUI, and the engine | `src/`, with the engine under `src/engine/` |
 | Integration tests and fixtures | `tests/` |
 | Configuration reference | [`docs/configuration.md`](docs/configuration.md) |
 | Architecture decision records | [`docs/adr/`](docs/adr/) |

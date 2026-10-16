@@ -3,7 +3,7 @@
 //!
 //! Stuck is derived, not persisted. Like occupancy (ADR-0011) it is a view of
 //! live Run state - the Run's start, its Run log's last write, and its process -
-//! so it never enters the Go-compatible Pool and Worker documents. The engine
+//! so it never enters the Pool and Worker documents. The engine
 //! decides it from facts it is handed; a frontend supplies the clock and the
 //! configured window, exactly as it supplies the occupied set for Dispatch.
 

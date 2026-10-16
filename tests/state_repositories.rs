@@ -25,7 +25,8 @@ fn pool_repository_creates_replaces_conflicts_and_removes() {
     let (_temp, repository) = repository();
     let pool = repository.state_store().pool();
     assert!(matches!(pool.load().expect("load"), Loaded::Missing));
-    let state: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
+    let state: PoolState =
+        serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
     let applied = pool
         .commit(Expected::Missing, StateChange::Replace(state))
         .expect("create");
@@ -116,7 +117,8 @@ fn dispatch_group_repository_uses_lowercase_compatible_name() {
 fn invalid_replacement_preserves_previous_valid_file() {
     let (temp, repository) = repository();
     let pool = repository.state_store().pool();
-    let state: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
+    let state: PoolState =
+        serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
     pool.commit(Expected::Missing, StateChange::Replace(state))
         .expect("create");
     let path = temp.path().join(".jj/pool.json");
@@ -185,7 +187,8 @@ fn public_state_models_accept_forward_compatible_wire_values() {
 #[test]
 fn go_omitempty_and_branch_null_semantics_are_preserved() {
     let (temp, repository) = repository();
-    let mut pool: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
+    let mut pool: PoolState =
+        serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
     pool.agent = Some(jjfx::engine::WireAgent::new(""));
     repository
         .state_store()

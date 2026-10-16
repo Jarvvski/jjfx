@@ -5,7 +5,7 @@ description: Dispatch work to background agents with jjfx. Use when the user wan
 
 # jjfx dispatch
 
-jjfx runs background agents as **Workers**. A Worker is one reusable slot backed by its own jj workspace (a colocated Git worktree) running a single coding agent — Claude, Codex, or opencode. A **Ticket** is the unit of work, and **Dispatch** assigns tickets to idle Workers. You drive all of it from the `jjfx` CLI (the `wsg` binary exposes the same commands).
+jjfx runs background agents as **Workers**. A Worker is one reusable slot backed by its own jj workspace (a colocated Git worktree) running a single coding agent — Claude, Codex, or opencode. A **Ticket** is the unit of work, and **Dispatch** assigns tickets to idle Workers. You drive all of it from the `jjfx` CLI.
 
 `jjfx help <command>` is the command surface: it prints a command's usage, arguments and flags, derived from the same definitions the parser validates against, so the two cannot drift. Take the flag surface from there — `jjfx help dispatch`, `jjfx help pool list`, `jjfx help send` — rather than transcribing it here. This skill carries the judgement a help page cannot: when to dispatch, what a flag *means* for how you drive the pool, and how to read the state back.
 

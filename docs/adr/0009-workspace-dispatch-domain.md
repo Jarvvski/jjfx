@@ -49,6 +49,12 @@ The terms and distinctions are recorded in the repository glossary in
 `CONTEXT.md`. The migration scope and compatibility promise are defined by
 `.scratch/wsg-migration/PRD.md`.
 
+The wsg migration described here is retired: the Go project is archived, the
+compatibility binary has been removed, and the multi-pool effort ruled the
+persisted state is jjfx's to reshape. `.scratch/wsg-migration/PRD.md` no longer
+exists, so that pointer is dead. The Context above is kept as the history of the
+decision.
+
 ## Consequences
 
 jjfx can now add Worker Pool and Ticket orchestration without treating a Worker

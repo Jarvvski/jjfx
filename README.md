@@ -149,15 +149,6 @@ with `jq -r '.workers[] | ...'`.
   the dispatch workflow, and recovery from a partial release.
 - [`CHANGELOG.md`](CHANGELOG.md) - what has landed.
 
-## Status
-
-`jjfx` provides the CLI and an explicit interactive TUI entrypoint. It is the
-authoritative implementation: the Go `wsg` project is **deprecated** - it was
-archived on 2026-08-19 - and the `wsg` compatibility binary that briefly
-replaced it has been removed. `jjfx` is the only binary built and released from
-this repository. Existing Go `wsg` releases stay available, but receive no new
-development.
-
 ## Contributing
 
 Build instructions, the development task list, and where things live are in
