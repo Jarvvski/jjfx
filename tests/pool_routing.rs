@@ -22,7 +22,8 @@ mod support;
 
 /// A throwaway repository with an origin, a fake Agent Runtime and a stub
 /// terminal, so a Dispatch can launch a Run without a real agent or a real
-/// kitty. Named pools are provisioned per case.
+/// kitty. Named pools are only *declared*: their state materialises on first use,
+/// so no case provisions a lane by hand.
 ///
 /// Worker Workspaces are pinned under `<root>/ws` with `JJ_WS_DIR` so the fixture
 /// owns every path it creates (a sibling `<repo>-workspaces` directory would sit
@@ -134,42 +135,6 @@ impl RoutingFixture {
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("executable agent");
     }
 
-    /// Provisions one named lane: its state, one idle Worker, and that Worker's
-    /// jj Workspace, so a Dispatch reaches a launched Run rather than failing on
-    /// a missing pool or Workspace.
-    fn with_lane(&self, pool: &str, worker: &str) {
-        let directory = self.path().join(".jj").join("pools").join(pool);
-        fs::create_dir_all(&directory).expect("pool directory");
-        fs::write(
-            directory.join("pool.json"),
-            format!(
-                "{{\"created_at\":\"2026-07-27T10:00:00Z\",\"gh_repo\":\"\",\"size\":1,\
-                 \"workers\":[\"{worker}\"]}}"
-            ),
-        )
-        .expect("pool state");
-        fs::write(
-            directory.join(format!("{worker}.json")),
-            "{\"agent\":\"claude\",\"branch_name\":null,\"completed_at\":null,\"error\":null,\
-             \"exit_code\":null,\"log_file\":null,\"pid\":null,\"started_at\":null,\
-             \"status\":\"idle\",\"ticket\":null}",
-        )
-        .expect("worker state");
-        fs::create_dir_all(self.ws_dir()).expect("workspace base");
-        self.jj_ok(&[
-            "workspace",
-            "add",
-            "--name",
-            worker,
-            "-r",
-            "main",
-            self.ws_dir()
-                .join(worker)
-                .to_str()
-                .expect("workspace path is UTF-8"),
-        ]);
-    }
-
     fn jjfx(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_jjfx"))
             .args(args)
@@ -222,13 +187,28 @@ fn entry<'a>(json: &'a serde_json::Value, ticket: &str) -> &'a serde_json::Value
 }
 
 /// The two lanes this fixture's cases share: `bugs` routes `bug`, `features`
-/// routes `features`.
+/// routes `features`. Each is one Worker, provisioned when its first Dispatch
+/// materialises it.
 fn declare_two_lanes(fixture: &RoutingFixture) {
     fixture.write_repo_config(
-        "[pools.bugs]\nlabel = \"bug\"\n\n[pools.features]\nlabel = \"features\"\n",
+        "[pools.bugs]\nsize = 1\nlabel = \"bug\"\n\n\
+         [pools.features]\nsize = 1\nlabel = \"features\"\n",
     );
-    fixture.with_lane("bugs", "worker-bugs");
-    fixture.with_lane("features", "worker-features");
+}
+
+/// The one Worker a materialised single-Worker lane holds, read from its state:
+/// the Dispatch provisions it, so the test cannot name it in advance.
+fn lane_worker(fixture: &RoutingFixture, pool: &str) -> String {
+    let text = fs::read_to_string(
+        fixture
+            .path()
+            .join(".jj/pools")
+            .join(pool)
+            .join("pool.json"),
+    )
+    .expect("the lane's materialised state");
+    let value: serde_json::Value = serde_json::from_str(&text).expect("pool state is JSON");
+    value["workers"][0].as_str().expect("a Worker").to_owned()
 }
 
 /// Each Ticket goes to the pool whose label it carries, in one `--all` call.
@@ -261,20 +241,29 @@ fn dispatch_all_routes_each_ticket_to_the_pool_whose_label_it_carries() {
     );
     let json: serde_json::Value =
         serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
-    assert_eq!(entry(&json, "widgets--01-bug")["worker"], "worker-bugs");
+    let bugs_worker = lane_worker(&fixture, "bugs");
+    let features_worker = lane_worker(&fixture, "features");
+    assert_eq!(
+        entry(&json, "widgets--01-bug")["worker"],
+        bugs_worker.as_str()
+    );
     assert_eq!(
         entry(&json, "widgets--02-feature")["worker"],
-        "worker-features"
+        features_worker.as_str()
     );
     // Each lane's own state records the Ticket it took, so the routing is not
     // only what the batch said.
-    let bugs = fs::read_to_string(fixture.path().join(".jj/pools/bugs/worker-bugs.json"))
-        .expect("bugs Worker state");
+    let bugs = fs::read_to_string(
+        fixture
+            .path()
+            .join(format!(".jj/pools/bugs/{bugs_worker}.json")),
+    )
+    .expect("bugs Worker state");
     assert!(bugs.contains("\"ticket\": \"widgets--01-bug\""), "{bugs}");
     let features = fs::read_to_string(
         fixture
             .path()
-            .join(".jj/pools/features/worker-features.json"),
+            .join(format!(".jj/pools/features/{features_worker}.json")),
     )
     .expect("features Worker state");
     assert!(
@@ -316,7 +305,10 @@ fn a_ticket_matching_no_pool_is_reported_not_dropped() {
     let json: serde_json::Value =
         serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
     assert_eq!(json.as_array().expect("a batch").len(), 1, "{json}");
-    assert_eq!(entry(&json, "widgets--01-bug")["worker"], "worker-bugs");
+    assert_eq!(
+        entry(&json, "widgets--01-bug")["worker"],
+        lane_worker(&fixture, "bugs").as_str()
+    );
 }
 
 /// A Ticket that declares no `Labels:` carries the ready label alone, never a
@@ -393,7 +385,7 @@ fn an_explicit_pool_overrides_label_routing() {
     assert_eq!(json.as_array().expect("a batch").len(), 1, "{json}");
     assert_eq!(
         entry(&json, "widgets--02-feature")["worker"],
-        "worker-features"
+        lane_worker(&fixture, "features").as_str()
     );
 }
 
@@ -433,7 +425,7 @@ fn a_capped_lane_is_held_while_other_lanes_dispatch() {
     // `bugs` declares a cap it has already run out of; `features` has room.
     fixture.write_repo_config(
         "[pools.bugs]\nlabel = \"bug\"\ncap_usd = 5.0\n\n\
-         [pools.features]\nlabel = \"features\"\n",
+         [pools.features]\nsize = 1\nlabel = \"features\"\n",
     );
     fixture.seed_spend("bugs", "worker-bugs", 6_000_000);
     fixture.write_ticket(
@@ -466,7 +458,7 @@ fn a_capped_lane_is_held_while_other_lanes_dispatch() {
     // The other lane is untouched by its neighbour's cap.
     assert_eq!(
         entry(&json, "widgets--02-feature")["worker"],
-        "worker-features"
+        lane_worker(&fixture, "features").as_str()
     );
     let waiting = fs::read_to_string(fixture.path().join(".jj/pools/bugs/waiting.json"))
         .expect("bugs waiting set");
@@ -479,8 +471,6 @@ fn a_capped_lane_is_held_while_other_lanes_dispatch() {
 fn pools_that_declare_no_label_keep_the_refusal() {
     let fixture = RoutingFixture::new();
     fixture.write_repo_config("[pools.bugs]\n\n[pools.features]\n");
-    fixture.with_lane("bugs", "worker-bugs");
-    fixture.with_lane("features", "worker-features");
     fixture.write_ticket(
         "01-bug.md",
         "# Fix the crash\n\nStatus: ready-for-agent\nLabels: bug\n\n## Problem\n\nDo it.\n",

@@ -550,6 +550,17 @@ Every key is optional but the pool's name (the table key).
 | `window` | the global value | The window the pool's cap totals over, defaulting to `spend.window`. |
 | `on_exceed` | the global value | What Dispatch does once the pool's cap is reached, defaulting to `spend.on_exceed`. |
 
+### A declared lane materialises on first use
+
+The declaration is the source of truth and `.jj/pools/<name>/` is state, so a
+declared pool with no state directory is normal, not a disagreement. The first
+Dispatch into such a lane provisions the Workers its `size` names - exactly as
+`jjfx pool <N>` does for `default` - and the lane is created once, never
+re-provisioned by a later Dispatch. That is what makes a committed declaration
+work on a fresh clone with nobody provisioning the lane by hand. An implicit
+`default` has no declaration to materialise from, so sizing it stays
+`jjfx pool <N>`.
+
 ### The implicit `default` pool
 
 With no `[pools]` section, a Repository has one implicit pool named `default`,

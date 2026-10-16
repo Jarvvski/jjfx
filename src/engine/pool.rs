@@ -1010,6 +1010,27 @@ impl WorkerPool {
         }
     }
 
+    /// Materialises a declared Pool's state on first use.
+    ///
+    /// A declared Pool with no state directory is normal, not a disagreement
+    /// (ADR 0013): `[pools.<name>]` is the source of truth and
+    /// `.jj/pools/<name>/` is state, so the first operation that needs the Pool's
+    /// document creates it - provisioning the Workers the declaration names,
+    /// exactly as `jjfx pool <N>` does for `default`. That is what makes a
+    /// committed declaration work on a fresh clone with nobody provisioning the
+    /// lane by hand.
+    ///
+    /// Idempotent: a Pool whose state directory already exists is left untouched,
+    /// so a second Dispatch never re-provisions it. Provisioning runs outside
+    /// state locks and adoption takes the Pool lock, so this is safe under the
+    /// repository-outermost lock order (ADR 0013).
+    pub fn materialise(&self, capacity: PoolCapacity) -> Result<Vec<WorkerId>, WorkerPoolError> {
+        if self.repository.state_store().directory_exists() {
+            return Ok(Vec::new());
+        }
+        Ok(self.resize_to(capacity)?.added_workers().to_vec())
+    }
+
     /// Resizes the Pool, provisioning new Workers or detaching its stable tail.
     pub fn resize_to(&self, capacity: PoolCapacity) -> Result<PoolResize, WorkerPoolError> {
         self.resize_to_with_progress(capacity, |_, _| {})

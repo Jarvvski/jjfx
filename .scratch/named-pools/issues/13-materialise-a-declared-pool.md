@@ -1,7 +1,7 @@
 # A declared pool's state is never materialised
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -21,10 +21,10 @@ Decide and record **where "first use" is**: `Repository::with_pool` / `state_sto
 
 ## Acceptance Criteria
 
-- [ ] `dispatch --pool <name>` into a freshly declared pool works with no manual provisioning.
-- [ ] Materialisation is idempotent, and safe under the ticket-03 lock order.
-- [ ] The integration tests that provision named-pool state by hand can drop that setup.
-- [ ] `mise run check` is green.
+- [x] `dispatch --pool <name>` into a freshly declared pool works with no manual provisioning.
+- [x] Materialisation is idempotent, and safe under the ticket-03 lock order.
+- [x] The integration tests that provision named-pool state by hand can drop that setup.
+- [x] `mise run check` is green.
 
 ## References
 
