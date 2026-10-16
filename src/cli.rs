@@ -36,18 +36,18 @@ use crate::cli_help::{
     STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{
-    Config, MigrationsConfig, PoolConfig, SpendConfig, TicketSource, TicketsConfig,
+    Config, MigrationsConfig, PoolConfig, RepoConfig, SpendConfig, TicketSource, TicketsConfig,
 };
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DEFAULT_POOL_NAME, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
     DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, PoolName, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter,
-    Repository, ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode, SpendCapMode,
-    SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails, TicketDiscovery,
-    TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent, WorkerActions,
-    WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
+    OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, REPOSITORY_WIDE_MUTATION,
+    ReadyTicketFilter, Repository, ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode,
+    SpendCap, SpendCapMode, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
+    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
     WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
@@ -1753,8 +1753,10 @@ fn resize_declared_pool(
     Ok(())
 }
 
-/// One Worker Pool as `pool list` reports it.
-struct PoolSummary {
+/// One Worker Pool as `status` and `pool list` report it: its declaration, its
+/// materialised state, its recorded spend, and the Workers and held Tickets
+/// that belong to it.
+struct PoolStatus {
     /// The pool's name. `default` is always present.
     name: String,
     /// Whether the pool exists only implicitly - `default` when no declaration
@@ -1764,6 +1766,55 @@ struct PoolSummary {
     size: Option<u64>,
     /// The pool's materialised Worker count, when its state exists.
     workers: Option<usize>,
+    /// The pool's own cap, or `None` when the declaration sets none and the
+    /// Repository-wide ceiling is the only limit.
+    cap: Option<SpendCap>,
+    /// The window the pool's `spend` and `cap` are stated over: the pool's own,
+    /// else the global `spend.window`.
+    window: SpendWindow,
+    /// The pool's recorded cost, or `None` when its record store could not be
+    /// read (so a frontend says "unavailable" rather than "$0").
+    cost: Option<PoolCostSnapshot>,
+    /// The pool's materialised Workers.
+    members: Vec<WorkerSnapshot>,
+    /// The Tickets this pool's last capped Dispatch held back, in input order.
+    waiting: Vec<String>,
+    /// The pool's configured Agent Runtime Profile, when its state names one.
+    profile: Option<AgentRuntimeProfile>,
+}
+
+impl PoolStatus {
+    /// The pool's recorded spend in its cap window as `$d.dddd`, or `-` when the
+    /// record store could not be read.
+    fn spend_display(&self) -> String {
+        self.cost.as_ref().map_or_else(
+            || "-".to_owned(),
+            |cost| cost.window(self.window).cost_display(),
+        )
+    }
+
+    /// The pool's own cap as `$d.dddd`, or `-` when it sets none.
+    fn cap_display(&self) -> String {
+        self.cap
+            .map_or_else(|| "-".to_owned(), SpendCap::limit_display)
+    }
+}
+
+/// Everything `status` and `pool list` report: every pool, the Repository-wide
+/// spend their subtotals sit under, and the orphan pool directories no pool
+/// claims.
+struct PoolReport {
+    pools: Vec<PoolStatus>,
+    /// The Repository-wide recorded spend, or `None` when a record store could
+    /// not be read.
+    total_cost: Option<PoolCostSnapshot>,
+    /// Pool directories under `.jj/pools/` that no pool the Repository holds
+    /// claims. Reported by name, never adopted.
+    orphans: Vec<String>,
+    /// Per-pool snapshot diagnostics, printed before the tables.
+    diagnostics: Vec<String>,
+    /// Local Ticket writeback failures, reported after the pass.
+    failures: Vec<String>,
 }
 
 fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
@@ -1774,152 +1825,113 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     // source is resolved for this Repository, so its own `[tickets]` selection
     // is honoured.
     let tickets = config.tickets_for(repository.root())?;
-    let (snapshot, failures) = reconcile_pass(repository, &tickets);
-    report_writeback_failures(&failures);
     let repo_config = config.repo_config(repository.root())?;
+    let report = pool_report(&config, &repo_config, repository, &tickets)?;
+    report_writeback_failures(&report.failures);
     // A Repository that neither declares a pool nor has any state is the
     // pre-pools shape: keep the old "no pool yet" guidance unchanged. Once a
     // pool is declared, listing the pools is the useful answer even when
     // `default` has no Workers yet.
-    if snapshot.pool().is_none() && repo_config.pools.is_empty() {
+    if repo_config.pools.is_empty() && report.pools.iter().all(|pool| pool.workers.is_none()) {
         bail!("No pool. Run: {PROGRAM} pool <N>");
     }
-    let pools = pool_summaries(&repo_config, &snapshot);
     // The watchdog's window is jjfx's own setting, read here rather than passed
     // down: `pool list` is the only CLI command that surfaces Run health, and
     // `cli::run` is already at the argument limit.
     let watchdog = config.watchdog.stuck_window();
     let now = Timestamp::now();
     if json {
-        return pool_list_json(&snapshot, &pools, now, watchdog);
-    }
-    for diagnostic in snapshot.diagnostics() {
-        eprintln!("{}", diagnostic.message());
-    }
-    render_pool_summaries(&pools);
-    if snapshot.pool().is_none() {
+        println!("{}", pool_list_json_string(&report, now, watchdog));
         return Ok(());
     }
-    println!(
-        "{:<10} {:<12} {:<10} {:<14} {:<11} ELAPSED",
-        "WORKER", "NAME", "STATUS", "TICKET", "SPEND"
-    );
-    println!(
-        "{:<10} {:<12} {:<10} {:<14} {:<11} -------",
-        "------", "----", "------", "------", "-----"
-    );
-    let mut counts = [0usize; 4];
-    let mut stuck = 0usize;
-    for worker in snapshot.workers() {
-        let index = match worker.status() {
-            WorkerStatus::Idle => 0,
-            WorkerStatus::Busy => 1,
-            WorkerStatus::Done => 2,
-            WorkerStatus::Failed => 3,
-        };
-        counts[index] += 1;
-        let short = short_worker_id(worker.worker_id().as_str());
-        let name = if worker.alias().is_empty() {
-            "-"
-        } else {
-            worker.alias()
-        };
-        let ticket = worker.ticket().unwrap_or("-");
-        let spend = worker_spend(&snapshot, worker.worker_id().as_str());
-        let elapsed = elapsed_display(worker.started_at(), worker.completed_at());
-        println!(
-            "{short:<10} {name:<12} {:<10} {ticket:<14} {spend:<11} {elapsed}",
-            worker.status().as_str()
-        );
-        // A stuck Run reads as `busy`, which is exactly the guessing the
-        // watchdog removes, so say how long it has been quiet.
-        if worker.health(now, watchdog).is_stuck() {
-            stuck += 1;
-            let quiet = worker.run_progress().last_progress_at().map_or_else(
-                || "-".to_owned(),
-                |since| seconds_display(now.duration_since(since)),
-            );
-            println!("           stuck: no progress for {quiet}");
-        }
-        // A terminal Worker's reason is only useful when surfaced here: the raw
-        // diagnosis lives in its Run log, and the persisted error may be a
-        // generic fallback.
-        if worker.status() == WorkerStatus::Failed {
-            if let Some(error) = worker.error().filter(|error| !error.is_empty()) {
-                println!("           reason: {error}");
-            }
-            if let Some(code) = worker.exit_code() {
-                println!("           exit: {code}");
-            }
-            if let Some(log) = worker.log_file().filter(|log| !log.is_empty()) {
-                println!("           log: {log}");
-            }
-        }
+    for diagnostic in &report.diagnostics {
+        eprintln!("{diagnostic}");
     }
-    println!();
-    if let Some(profile) = snapshot.pool().and_then(|pool| pool.profile()) {
-        println!("Profile: {}", render_profile(profile));
-    }
-    let stuck = if stuck > 0 {
-        format!(", {stuck} stuck")
-    } else {
-        String::new()
-    };
-    let size = snapshot.pool().map_or(0, |pool| pool.size());
-    println!(
-        "Pool: {} idle, {} busy{}, {} done, {} failed ({} total)",
-        counts[0], counts[1], stuck, counts[2], counts[3], size
-    );
-    println!("{}", spend_summary(&snapshot));
-    if !snapshot.waiting().is_empty() {
-        println!("Waiting: {}", snapshot.waiting().join(", "));
-    }
+    render_pool_summaries(&report.pools);
+    render_orphan_pools(&report.orphans);
+    render_pool_workers(&report, now, watchdog);
     Ok(())
 }
 
-/// Every pool the Repository holds, `default` first.
+/// Reads every Worker Pool the Repository holds, reconciling each.
 ///
-/// The set is the declared pools plus `default`, which always exists: a
-/// Repository that declares nothing still has one implicit `default` pool. A
-/// named pool's size is its declaration's (its state materialises on first
-/// use); `default`'s is its state's, falling back to a declaration when one
-/// names it.
-fn pool_summaries(
-    repo_config: &crate::config::RepoConfig,
-    snapshot: &crate::engine::WorkerPoolSnapshot,
-) -> Vec<PoolSummary> {
-    let declared_default = repo_config.pools.get(DEFAULT_POOL_NAME);
-    let mut pools = vec![PoolSummary {
-        name: DEFAULT_POOL_NAME.to_owned(),
-        implicit: declared_default.is_none(),
-        size: snapshot
-            .pool()
-            .and_then(|pool| u64::try_from(pool.size()).ok())
-            .or_else(|| {
-                declared_default
-                    .and_then(|pool| pool.size)
-                    .map(|size| size as u64)
-            }),
-        workers: snapshot.pool().map(|_| snapshot.workers().len()),
-    }];
-    for (name, pool) in &repo_config.pools {
-        if name == DEFAULT_POOL_NAME {
-            continue;
-        }
-        pools.push(PoolSummary {
-            name: name.clone(),
-            implicit: false,
-            size: pool.size.map(|size| size as u64),
-            workers: None,
+/// Reading all of them - not just `default` - is what lets one `status` describe
+/// several lanes: each Worker and each held Ticket is tagged with the pool it
+/// belongs to, and the per-pool subtotals sit under the Repository-wide total.
+/// `default` is always first, the order [`Config::pool_names_for`] gives, so the
+/// pre-pools single-pool output is unchanged. The orphan directories are the
+/// pool names the Repository does *not* hold, which is why `default` counts as
+/// held even when nothing declares it.
+fn pool_report(
+    config: &Config,
+    repo_config: &RepoConfig,
+    repository: &Repository,
+    tickets: &TicketsConfig,
+) -> Result<PoolReport> {
+    let names = config.pool_names_for(repository.root())?;
+    let held: std::collections::BTreeSet<PoolName> = names.iter().cloned().collect();
+    let orphans = repository
+        .orphan_pool_directories(&held)
+        .map_err(|error| anyhow::anyhow!("{error}"))?
+        .iter()
+        .map(|name| name.as_str().to_owned())
+        .collect();
+    let mut pools = Vec::new();
+    let mut diagnostics = Vec::new();
+    let mut failures = Vec::new();
+    for name in &names {
+        let scoped = repository.clone().with_pool(name.clone());
+        let (snapshot, pool_failures) = reconcile_pass(&scoped, tickets);
+        failures.extend(pool_failures);
+        diagnostics.extend(
+            snapshot
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message().to_owned()),
+        );
+        let declaration = repo_config.pools.get(name.as_str());
+        let cap = declaration
+            .map(|declaration| declaration.spend_cap(&config.spend))
+            .transpose()?
+            .flatten();
+        pools.push(PoolStatus {
+            name: name.as_str().to_owned(),
+            implicit: declaration.is_none(),
+            size: snapshot
+                .pool()
+                .and_then(|pool| u64::try_from(pool.size()).ok())
+                .or_else(|| {
+                    declaration
+                        .and_then(|pool| pool.size)
+                        .map(|size| size as u64)
+                }),
+            workers: snapshot.pool().map(|_| snapshot.workers().len()),
+            cap,
+            window: cap.map_or(config.spend.window, SpendCap::window),
+            cost: scoped.pool_cost().ok(),
+            members: snapshot.workers().to_vec(),
+            waiting: snapshot.waiting().to_vec(),
+            profile: snapshot.pool().and_then(|pool| pool.profile()).cloned(),
         });
     }
-    pools
+    let total_cost = repository.repository_cost(&names).ok();
+    Ok(PoolReport {
+        pools,
+        total_cost,
+        orphans,
+        diagnostics,
+        failures,
+    })
 }
 
-/// The `Pools:` table: every pool, its size, and whether a declaration names it.
-fn render_pool_summaries(pools: &[PoolSummary]) {
+/// The `Pools:` table: every pool, its size, its recorded spend against its own
+/// cap, and whether a declaration names it.
+fn render_pool_summaries(pools: &[PoolStatus]) {
     println!("Pools:");
-    println!("{:<12} {:<6} {:<8} DECLARED", "POOL", "SIZE", "WORKERS");
+    println!(
+        "{:<12} {:<6} {:<8} {:<11} {:<11} {:<8} DECLARED",
+        "POOL", "SIZE", "WORKERS", "SPEND", "CAP", "WINDOW"
+    );
     for pool in pools {
         let size = pool
             .size
@@ -1928,22 +1940,146 @@ fn render_pool_summaries(pools: &[PoolSummary]) {
             .workers
             .map_or_else(|| "-".to_owned(), |workers| workers.to_string());
         let declared = if pool.implicit { "no" } else { "yes" };
-        println!("{:<12} {:<6} {:<8} {declared}", pool.name, size, workers);
+        println!(
+            "{:<12} {:<6} {:<8} {:<11} {:<11} {:<8} {declared}",
+            pool.name,
+            size,
+            workers,
+            pool.spend_display(),
+            pool.cap_display(),
+            pool.window.as_str()
+        );
     }
     println!();
 }
 
-/// One Worker's recorded spend, or `-` when it recorded no Run.
-fn worker_spend(snapshot: &crate::engine::WorkerPoolSnapshot, worker: &str) -> String {
-    snapshot
-        .cost()
-        .and_then(|cost| cost.worker(worker))
+/// Names the pool directories no pool claims, so a stray directory is told
+/// rather than left to guess about. Nothing is adopted or removed.
+fn render_orphan_pools(orphans: &[String]) {
+    if orphans.is_empty() {
+        return;
+    }
+    println!(
+        "Orphaned pool directories (no pool claims them; their state is left in place): {}",
+        orphans.join(", ")
+    );
+    println!();
+}
+
+/// The Worker table across every pool, each row naming its pool, then the
+/// Repository-wide summary and the held-back Tickets.
+fn render_pool_workers(report: &PoolReport, now: Timestamp, watchdog: StuckWindow) {
+    println!(
+        "{:<10} {:<12} {:<12} {:<10} {:<14} {:<11} ELAPSED",
+        "WORKER", "POOL", "NAME", "STATUS", "TICKET", "SPEND"
+    );
+    println!(
+        "{:<10} {:<12} {:<12} {:<10} {:<14} {:<11} -------",
+        "------", "----", "----", "------", "------", "-----"
+    );
+    let mut counts = [0usize; 4];
+    let mut stuck = 0usize;
+    for pool in &report.pools {
+        for worker in &pool.members {
+            let index = match worker.status() {
+                WorkerStatus::Idle => 0,
+                WorkerStatus::Busy => 1,
+                WorkerStatus::Done => 2,
+                WorkerStatus::Failed => 3,
+            };
+            counts[index] += 1;
+            let short = short_worker_id(worker.worker_id().as_str());
+            let name = if worker.alias().is_empty() {
+                "-"
+            } else {
+                worker.alias()
+            };
+            let ticket = worker.ticket().unwrap_or("-");
+            let spend = worker_spend(pool.cost.as_ref(), worker.worker_id().as_str());
+            let elapsed = elapsed_display(worker.started_at(), worker.completed_at());
+            println!(
+                "{short:<10} {:<12} {name:<12} {:<10} {ticket:<14} {spend:<11} {elapsed}",
+                pool.name,
+                worker.status().as_str()
+            );
+            // A stuck Run reads as `busy`, which is exactly the guessing the
+            // watchdog removes, so say how long it has been quiet.
+            if worker.health(now, watchdog).is_stuck() {
+                stuck += 1;
+                let quiet = worker.run_progress().last_progress_at().map_or_else(
+                    || "-".to_owned(),
+                    |since| seconds_display(now.duration_since(since)),
+                );
+                println!("           stuck: no progress for {quiet}");
+            }
+            // A terminal Worker's reason is only useful when surfaced here: the
+            // raw diagnosis lives in its Run log, and the persisted error may be
+            // a generic fallback.
+            if worker.status() == WorkerStatus::Failed {
+                if let Some(error) = worker.error().filter(|error| !error.is_empty()) {
+                    println!("           reason: {error}");
+                }
+                if let Some(code) = worker.exit_code() {
+                    println!("           exit: {code}");
+                }
+                if let Some(log) = worker.log_file().filter(|log| !log.is_empty()) {
+                    println!("           log: {log}");
+                }
+            }
+        }
+    }
+    println!();
+    // A pool's Profile line names its pool once there is more than one, so a
+    // multi-lane Repository cannot read the first profile as the only one.
+    let named = report.pools.len() > 1;
+    for pool in &report.pools {
+        if let Some(profile) = &pool.profile {
+            if named {
+                println!("Profile ({}): {}", pool.name, render_profile(profile));
+            } else {
+                println!("Profile: {}", render_profile(profile));
+            }
+        }
+    }
+    let stuck = if stuck > 0 {
+        format!(", {stuck} stuck")
+    } else {
+        String::new()
+    };
+    let size: u64 = report.pools.iter().filter_map(|pool| pool.size).sum();
+    println!(
+        "Pool: {} idle, {} busy{}, {} done, {} failed ({} total)",
+        counts[0], counts[1], stuck, counts[2], counts[3], size
+    );
+    println!("{}", spend_summary(report.total_cost.as_ref()));
+    render_waiting(&report.pools);
+}
+
+/// The held-back Tickets, each named with the pool whose Dispatch held it.
+fn render_waiting(pools: &[PoolStatus]) {
+    let held = pools
+        .iter()
+        .flat_map(|pool| {
+            pool.waiting
+                .iter()
+                .map(|ticket| format!("{ticket} ({})", pool.name))
+        })
+        .collect::<Vec<_>>();
+    if !held.is_empty() {
+        println!("Waiting: {}", held.join(", "));
+    }
+}
+
+/// One Worker's recorded spend in its pool, or `-` when it recorded no Run.
+fn worker_spend(cost: Option<&PoolCostSnapshot>, worker: &str) -> String {
+    cost.and_then(|cost| cost.worker(worker))
         .map_or_else(|| "-".to_owned(), crate::engine::PoolCost::cost_display)
 }
 
-/// The pool-level cost/usage summary line.
-fn spend_summary(snapshot: &crate::engine::WorkerPoolSnapshot) -> String {
-    let Some(cost) = snapshot.cost() else {
+/// The Repository-wide cost/usage summary line, the total the per-pool subtotals
+/// sit under.
+fn spend_summary(cost: Option<&PoolCostSnapshot>) -> String {
+    let Some(cost) = cost else {
         return "Spend: record store unavailable".to_owned();
     };
     let total = cost.total();
@@ -1968,71 +2104,93 @@ fn short_worker_id(worker_id: &str) -> &str {
     worker_id.strip_prefix("worker-").unwrap_or(worker_id)
 }
 
-/// Machine-readable Pool status, including the failure fields the table omits.
-fn pool_list_json(
-    snapshot: &crate::engine::WorkerPoolSnapshot,
-    pools: &[PoolSummary],
-    now: Timestamp,
-    watchdog: StuckWindow,
-) -> Result<()> {
-    println!("{}", pool_list_json_string(snapshot, pools, now, watchdog));
-    Ok(())
-}
-
 /// The Pool status JSON document:
-/// `{"workers": [ ... ], "waiting": [ ... ], "pools": [ ... ]}`.
+/// `{"workers": [ ... ], "waiting": [ ... ], "pools": [ ... ], "orphans": [ ... ]}`.
 ///
 /// A top-level object rather than the bare Worker array: the human table prints
 /// state that is not per-Worker (the `Waiting:` line), and a bare array has
 /// nowhere to put it. The wrapper is the seam for that state and for the next
 /// line the table grows, so the JSON can always carry what the table prints.
-/// `pools` names every pool the Repository holds, including an implicit
-/// `default`. Encoded by hand so the emitted field order is fixed.
-fn pool_list_json_string(
-    snapshot: &crate::engine::WorkerPoolSnapshot,
-    pools: &[PoolSummary],
-    now: Timestamp,
-    watchdog: StuckWindow,
-) -> String {
+///
+/// `workers` and `waiting` stay flat and each entry names its pool, so
+/// `jq '.workers[] | select(.pool == "bugs")'` answers the per-pool question
+/// without a second shape. `pools` names every pool the Repository holds,
+/// including an implicit `default`, with its size and its recorded spend against
+/// its own cap - a subtotal under the Repository-wide total. `orphans` names
+/// pool directories no pool claims. Encoded by hand so the emitted field order
+/// is fixed.
+fn pool_list_json_string(report: &PoolReport, now: Timestamp, watchdog: StuckWindow) -> String {
     let mut out = String::from("{\n  \"workers\": [");
-    for (index, worker) in snapshot.workers().iter().enumerate() {
-        if index > 0 {
-            out.push(',');
+    let mut first = true;
+    for pool in &report.pools {
+        for worker in &pool.members {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            out.push_str("\n    ");
+            out.push_str(&worker_json(
+                worker,
+                &pool.name,
+                pool.cost.as_ref(),
+                now,
+                watchdog,
+            ));
         }
-        out.push_str("\n    ");
-        out.push_str(&worker_json(worker, snapshot, now, watchdog));
     }
-    if snapshot.workers().is_empty() {
+    if first {
         out.push_str("],\n");
     } else {
         out.push_str("\n  ],\n");
     }
     out.push_str("  \"waiting\": [");
-    for (index, ticket) in snapshot.waiting().iter().enumerate() {
-        if index > 0 {
-            out.push_str(", ");
+    let mut first = true;
+    for pool in &report.pools {
+        for ticket in &pool.waiting {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(&waiting_json(ticket, &pool.name));
         }
-        out.push_str(&json_string(ticket));
     }
     out.push_str("],\n");
     out.push_str("  \"pools\": [");
-    for (index, pool) in pools.iter().enumerate() {
+    for (index, pool) in report.pools.iter().enumerate() {
         if index > 0 {
             out.push(',');
         }
         out.push_str("\n    ");
         out.push_str(&pool_summary_json(pool));
     }
-    if pools.is_empty() {
-        out.push_str("]\n}");
+    if report.pools.is_empty() {
+        out.push_str("],\n");
     } else {
-        out.push_str("\n  ]\n}");
+        out.push_str("\n  ],\n");
     }
+    out.push_str("  \"orphans\": [");
+    for (index, orphan) in report.orphans.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&json_string(orphan));
+    }
+    out.push_str("]\n}");
     out
 }
 
+/// One held-back Ticket, the shape `status --json` emits per waiting entry: the
+/// Ticket and the pool whose capped Dispatch held it.
+fn waiting_json(ticket: &str, pool: &str) -> String {
+    format!(
+        "{{\"ticket\": {}, \"pool\": {}}}",
+        json_string(ticket),
+        json_string(pool)
+    )
+}
+
 /// One pool's JSON object, the shape `status --json` emits per pool.
-fn pool_summary_json(pool: &PoolSummary) -> String {
+fn pool_summary_json(pool: &PoolStatus) -> String {
     let fields = [
         ("name", json_string(&pool.name)),
         (
@@ -2046,6 +2204,9 @@ fn pool_summary_json(pool: &PoolSummary) -> String {
                 .map_or_else(|| "null".to_owned(), |workers| workers.to_string()),
         ),
         ("implicit", pool.implicit.to_string()),
+        ("spend", pool.spend_json()),
+        ("cap", pool.cap_json()),
+        ("window", json_string(pool.window.as_str())),
     ];
     let mut out = String::from("{");
     for (index, (key, value)) in fields.iter().enumerate() {
@@ -2058,13 +2219,38 @@ fn pool_summary_json(pool: &PoolSummary) -> String {
     out
 }
 
-/// One Worker's JSON object, the shape `status --json` emits per Worker.
+impl PoolStatus {
+    /// The pool's recorded spend in its cap window as a JSON number, or `null`
+    /// when the record store could not be read.
+    fn spend_json(&self) -> String {
+        self.cost.as_ref().map_or_else(
+            || "null".to_owned(),
+            |cost| json_usd(cost.window(self.window).cost_micro_usd()),
+        )
+    }
+
+    /// The pool's own cap as a JSON number, or `null` when it sets none.
+    fn cap_json(&self) -> String {
+        self.cap
+            .map_or_else(|| "null".to_owned(), |cap| json_usd(cap.limit_micro_usd()))
+    }
+}
+
+/// A US-dollar amount as a JSON number, six decimal places like `cost_usd`.
+fn json_usd(micro_usd: u64) -> String {
+    format!("{:.6}", micro_usd as f64 / 1_000_000.0)
+}
+
+/// One Worker's JSON object, the shape `status --json` and `wait --json` emit
+/// per Worker.
 ///
-/// The field set and its order live here alone, so `status --json` and
-/// `wait --json` cannot describe the same Worker differently.
+/// The field set and its order live here alone, so the two cannot describe the
+/// same Worker differently. `pool` names the Worker's pool - `wait` reports the
+/// pool it acts on - so a flat `workers[]` carries the pool dimension.
 fn worker_json(
     worker: &WorkerSnapshot,
-    snapshot: &WorkerPoolSnapshot,
+    pool: &str,
+    cost: Option<&PoolCostSnapshot>,
     now: Timestamp,
     watchdog: StuckWindow,
 ) -> String {
@@ -2095,14 +2281,13 @@ fn worker_json(
         ("log_file", json_option(worker.log_file())),
         (
             "cost_usd",
-            snapshot
-                .cost()
-                .and_then(|cost| cost.worker(worker.worker_id().as_str()))
+            cost.and_then(|cost| cost.worker(worker.worker_id().as_str()))
                 .map_or_else(
                     || "null".to_owned(),
                     |cost| format!("{:.6}", cost.cost_usd()),
                 ),
         ),
+        ("pool", json_string(pool)),
     ];
     let mut out = String::from("{\n");
     for (index, (key, value)) in fields.iter().enumerate() {
@@ -3516,6 +3701,9 @@ fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
     let targets = wait_targets(repository, args)?;
     let ticket_resolved = wait_ticket_resolver(repository, args, &tickets, &targets)?;
     let watchdog = config.watchdog.stuck_window();
+    // The pool `wait` acts on travels with the handle, so a Worker object it
+    // prints names the same pool `status` would.
+    let pool = repository.selected_pool().as_str();
     let deadline = args
         .timeout
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
@@ -3525,11 +3713,11 @@ fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
         let now = Timestamp::now();
         match wait_verdict(args.until, &targets, &snapshot, ticket_resolved.as_ref()) {
             WaitVerdict::Satisfied => {
-                print_wait_workers(&targets, &snapshot, args.json, now, watchdog);
+                print_wait_workers(&targets, &snapshot, pool, args.json, now, watchdog);
                 return Ok(());
             }
             WaitVerdict::Unsatisfied => {
-                print_wait_workers(&targets, &snapshot, args.json, now, watchdog);
+                print_wait_workers(&targets, &snapshot, pool, args.json, now, watchdog);
                 eprintln!(
                     "a Worker reached a terminal state that does not satisfy --until {}",
                     args.until.as_str()
@@ -3541,7 +3729,7 @@ fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
         if let Some(deadline) = deadline
             && Instant::now() >= deadline
         {
-            print_wait_workers(&targets, &snapshot, args.json, now, watchdog);
+            print_wait_workers(&targets, &snapshot, pool, args.json, now, watchdog);
             eprintln!(
                 "timed out after {}s waiting for --until {}; still pending: {}",
                 args.timeout.unwrap_or_default(),
@@ -3703,12 +3891,16 @@ fn pending_workers(targets: &[WorkerId], snapshot: &WorkerPoolSnapshot) -> Vec<S
 fn print_wait_workers(
     targets: &[WorkerId],
     snapshot: &WorkerPoolSnapshot,
+    pool: &str,
     json: bool,
     now: Timestamp,
     watchdog: StuckWindow,
 ) {
     if json {
-        println!("{}", wait_workers_json(targets, snapshot, now, watchdog));
+        println!(
+            "{}",
+            wait_workers_json(targets, snapshot, pool, now, watchdog)
+        );
         return;
     }
     for target in targets {
@@ -3731,6 +3923,7 @@ fn print_wait_workers(
 fn wait_workers_json(
     targets: &[WorkerId],
     snapshot: &WorkerPoolSnapshot,
+    pool: &str,
     now: Timestamp,
     watchdog: StuckWindow,
 ) -> String {
@@ -3744,7 +3937,7 @@ fn wait_workers_json(
             out.push(',');
         }
         out.push_str("\n    ");
-        out.push_str(&worker_json(worker, snapshot, now, watchdog));
+        out.push_str(&worker_json(worker, pool, snapshot.cost(), now, watchdog));
     }
     if workers.is_empty() {
         out.push_str("]\n}");
@@ -5070,32 +5263,44 @@ mod tests {
         assert!(error.to_string().contains("ghost"), "{error}");
     }
 
-    #[test]
-    fn pool_summaries_name_every_pool_including_an_implicit_default() {
-        let repo = lifecycle_repo(Some("[pools.bugs]\nsize = 2\n"));
-        let repository = Repository::open(repo.path()).expect("repository");
-        let user = toml::from_str::<Config>("").expect("user config");
+    /// The report `status`/`pool list` builds for `repository`, with `user` as
+    /// the user-global config.
+    fn report_for(repository: &Repository, user: &Config) -> PoolReport {
         let repo_config = user
             .repo_config(repository.root())
             .expect("the config parses");
-        let snapshot = repository.read_worker_pool_snapshot();
+        let tickets = user
+            .tickets_for(repository.root())
+            .expect("the tickets config parses");
+        pool_report(user, &repo_config, repository, &tickets).expect("pool report")
+    }
 
-        let pools = pool_summaries(&repo_config, &snapshot);
-        assert_eq!(pools.len(), 2, "`default` plus the declared pool");
-        assert_eq!(pools[0].name, DEFAULT_POOL_NAME);
-        assert!(pools[0].implicit, "nothing declares `default`");
-        assert_eq!(pools[1].name, "bugs");
-        assert!(!pools[1].implicit);
-        assert_eq!(pools[1].size, Some(2));
+    #[test]
+    fn pool_report_names_every_pool_including_an_implicit_default() {
+        let repo = lifecycle_repo(Some("[pools.bugs]\nsize = 2\n"));
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
 
-        // `pool list --json` names every pool too.
-        let json = pool_list_json_string(&snapshot, &pools, Timestamp::now(), StuckWindow::DEFAULT);
+        let report = report_for(&repository, &user);
+        assert_eq!(report.pools.len(), 2, "`default` plus the declared pool");
+        assert_eq!(report.pools[0].name, DEFAULT_POOL_NAME);
+        assert!(report.pools[0].implicit, "nothing declares `default`");
+        assert_eq!(report.pools[1].name, "bugs");
+        assert!(!report.pools[1].implicit);
+        assert_eq!(report.pools[1].size, Some(2));
+
+        // `pool list --json` names every pool too, with its spend against its cap.
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["pools"][0]["name"], "default");
         assert_eq!(value["pools"][0]["implicit"], true);
         assert_eq!(value["pools"][1]["name"], "bugs");
         assert_eq!(value["pools"][1]["size"], 2);
         assert_eq!(value["pools"][1]["implicit"], false);
+        assert_eq!(value["pools"][1]["cap"], serde_json::Value::Null);
+        assert_eq!(value["pools"][1]["window"], "week");
+        assert_eq!(value["pools"][1]["spend"], 0.0);
+        assert_eq!(value["orphans"], serde_json::json!([]));
     }
 
     #[test]
@@ -5104,15 +5309,11 @@ mod tests {
         let repository = Repository::open(repo.path()).expect("repository");
         let user = toml::from_str::<Config>("[profiles.fast]\nruntime = \"claude\"\n")
             .expect("user config");
-        let repo_config = user
-            .repo_config(repository.root())
-            .expect("the config parses");
-        let snapshot = repository.read_worker_pool_snapshot();
 
-        let pools = pool_summaries(&repo_config, &snapshot);
-        assert_eq!(pools.len(), 1);
-        assert_eq!(pools[0].name, DEFAULT_POOL_NAME);
-        assert!(!pools[0].implicit, "a declaration names it");
+        let report = report_for(&repository, &user);
+        assert_eq!(report.pools.len(), 1);
+        assert_eq!(report.pools[0].name, DEFAULT_POOL_NAME);
+        assert!(!report.pools[0].implicit, "a declaration names it");
     }
 
     struct FailingQuery;
@@ -5205,21 +5406,143 @@ mod tests {
             .read_worker_pool_snapshot()
     }
 
+    /// A one-pool report from a `default`-pool snapshot, for the JSON tests.
+    fn report_with_snapshot(snapshot: WorkerPoolSnapshot) -> PoolReport {
+        let cost = snapshot.cost().cloned();
+        let members = snapshot.workers().to_vec();
+        let waiting = snapshot.waiting().to_vec();
+        let profile = snapshot.pool().and_then(|pool| pool.profile()).cloned();
+        let size = snapshot.pool().map(|pool| pool.size() as u64);
+        let workers = snapshot.pool().map(|_| members.len());
+        PoolReport {
+            pools: vec![PoolStatus {
+                name: DEFAULT_POOL_NAME.to_owned(),
+                implicit: true,
+                size,
+                workers,
+                cap: None,
+                window: SpendWindow::Week,
+                cost: cost.clone(),
+                members,
+                waiting,
+                profile,
+            }],
+            total_cost: cost,
+            orphans: Vec::new(),
+            diagnostics: Vec::new(),
+            failures: Vec::new(),
+        }
+    }
+
     #[test]
-    fn status_json_carries_the_waiting_set() {
-        let held = snapshot_with_waiting(&["AMBA-42", "AMBA-43"]);
-        let json = pool_list_json_string(&held, &[], Timestamp::now(), StuckWindow::DEFAULT);
+    fn status_json_carries_the_waiting_set_tagged_with_its_pool() {
+        let held = report_with_snapshot(snapshot_with_waiting(&["AMBA-42", "AMBA-43"]));
+        let json = pool_list_json_string(&held, Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
-        assert_eq!(value["waiting"], serde_json::json!(["AMBA-42", "AMBA-43"]));
+        assert_eq!(
+            value["waiting"],
+            serde_json::json!([
+                { "ticket": "AMBA-42", "pool": "default" },
+                { "ticket": "AMBA-43", "pool": "default" }
+            ])
+        );
         assert_eq!(value["workers"][0]["worker"], "worker-01");
+        assert_eq!(value["workers"][0]["pool"], "default");
     }
 
     #[test]
     fn status_json_waiting_is_empty_without_a_capped_dispatch() {
-        let idle = snapshot_with_waiting(&[]);
-        let json = pool_list_json_string(&idle, &[], Timestamp::now(), StuckWindow::DEFAULT);
+        let idle = report_with_snapshot(snapshot_with_waiting(&[]));
+        let json = pool_list_json_string(&idle, Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["waiting"], serde_json::json!([]));
+    }
+
+    /// Seeds `.jj/pools/<pool>/` with a one-Worker idle pool, so a report has
+    /// materialised state to read.
+    fn seed_pool(root: &std::path::Path, pool: &str, worker: &str) {
+        let directory = root.join(".jj/pools").join(pool);
+        std::fs::create_dir_all(&directory).expect("pool directory");
+        std::fs::write(
+            directory.join("pool.json"),
+            format!(
+                r#"{{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["{worker}"],"created_at":"2026-07-27T10:00:00Z","names":{{}}}}"#
+            ),
+        )
+        .expect("pool state");
+        std::fs::write(
+            directory.join(format!("{worker}.json")),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .expect("worker state");
+    }
+
+    /// The documented way to filter a multi-pool `status --json`: the flat
+    /// `workers[]` carries `pool`, so `jq '.workers[] | select(.pool == "bugs")'`
+    /// answers the per-pool question without a nested shape - and a stray pool
+    /// directory is named rather than adopted.
+    #[test]
+    fn status_json_workers_filter_by_pool_the_documented_way() {
+        let repo = lifecycle_repo(Some("[pools.bugs]\nsize = 1\ncap_usd = 5.0\n"));
+        seed_pool(repo.path(), DEFAULT_POOL_NAME, "worker-01");
+        seed_pool(repo.path(), "bugs", "worker-02");
+        // A directory no declaration claims: reported, never adopted.
+        seed_pool(repo.path(), "stray", "worker-03");
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+
+        let report = report_for(&repository, &user);
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        // `jq '.workers[] | select(.pool == "bugs")'`.
+        let bugs = value["workers"]
+            .as_array()
+            .expect("workers array")
+            .iter()
+            .filter(|worker| worker["pool"] == "bugs")
+            .collect::<Vec<_>>();
+        assert_eq!(bugs.len(), 1, "{json}");
+        assert_eq!(bugs[0]["worker"], "worker-02");
+        // Every Worker names its pool, and the stray pool's Worker is not one.
+        assert!(
+            value["workers"]
+                .as_array()
+                .expect("workers")
+                .iter()
+                .all(|worker| worker["pool"] == "default" || worker["pool"] == "bugs"),
+            "{json}"
+        );
+
+        // The per-pool subtotal states its own size, cap and window.
+        assert_eq!(value["pools"][1]["name"], "bugs");
+        assert_eq!(value["pools"][1]["size"], 1);
+        assert_eq!(value["pools"][1]["cap"], 5.0);
+        assert_eq!(value["pools"][1]["window"], "week");
+        assert_eq!(value["pools"][1]["spend"], 0.0);
+        // `default` sets no cap, so it reports `null` against the ceiling.
+        assert_eq!(value["pools"][0]["cap"], serde_json::Value::Null);
+
+        assert_eq!(value["orphans"], serde_json::json!(["stray"]));
+    }
+
+    #[test]
+    fn a_pool_cap_speaks_in_its_own_window() {
+        let repo = lifecycle_repo(Some("[pools.bugs]\ncap_usd = 5.0\nwindow = \"today\"\n"));
+        seed_pool(repo.path(), DEFAULT_POOL_NAME, "worker-01");
+        seed_pool(repo.path(), "bugs", "worker-02");
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+
+        let report = report_for(&repository, &user);
+        assert_eq!(report.pools[1].window, SpendWindow::Today);
+        assert_eq!(
+            report.pools[1].cap.expect("a cap").limit_display(),
+            "$5.0000"
+        );
+        // `default` sets no cap, so it follows the global window.
+        assert_eq!(report.pools[0].cap, None);
+        assert_eq!(report.pools[0].window, SpendWindow::Week);
     }
 
     fn ticket(id: &str) -> crate::engine::Ticket {
@@ -5678,13 +6001,18 @@ mod tests {
         let repository = Repository::open(temp.path()).expect("repository");
         append_run(&repository, "worker-01", Some(250_000));
         append_run(&repository, "worker-02", Some(750_000));
-        let snapshot = repository.read_worker_pool_snapshot();
+        let cost = repository.pool_cost().expect("pool cost");
 
-        let summary = spend_summary(&snapshot);
+        let summary = spend_summary(Some(&cost));
         assert!(summary.contains("$1.0000 total"), "{summary}");
         assert!(summary.contains("across 2 Run(s)"), "{summary}");
-        assert_eq!(worker_spend(&snapshot, "worker-01"), "$0.2500");
-        assert_eq!(worker_spend(&snapshot, "worker-03"), "-");
+        assert_eq!(worker_spend(Some(&cost), "worker-01"), "$0.2500");
+        assert_eq!(worker_spend(Some(&cost), "worker-03"), "-");
+        assert_eq!(
+            spend_summary(None),
+            "Spend: record store unavailable",
+            "an unreadable store is unavailable, never $0"
+        );
     }
 
     #[test]

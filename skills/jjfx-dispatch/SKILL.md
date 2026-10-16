@@ -28,7 +28,7 @@ Settle four things first, so a dispatch does not fail on setup:
 
 ```bash
 jjfx pool 4          # set the pool to 4 Workers (creates it if absent)
-jjfx status --json   # {"workers": [one object per Worker], "waiting": [held Tickets]}
+jjfx status --json   # {"workers": [one object per Worker, naming its pool], "waiting": [held Tickets]}
 ```
 
 `jjfx pool <N>` is a **safe shrink**: it removes only idle Workers. `jjfx status` is an alias for `jjfx pool list`.
@@ -75,7 +75,7 @@ jjfx status --json                                  # the whole pool, machine-re
 jjfx logs worker-01                                 # follow one Worker's activity
 ```
 
-The output is an object: `workers` is one entry per Worker, and `waiting` lists the Tickets a capped Dispatch held back (empty when nothing was held). Poll it and read each Worker's `status`; `done` and `failed` are the only terminal values, and `done` means its Run finished with its changes sitting in its workspace. `exit_code` and `error` say why a Worker failed, `stuck` is true when the Run has made no progress inside the watchdog window, and `log_file` is the file `jjfx logs` follows.
+The output is an object: `workers` is one entry per Worker across every pool, each naming its `pool`; `waiting` lists the Tickets a capped Dispatch held back, each with the pool that held it (empty when nothing was held). Poll it and read each Worker's `status`; `done` and `failed` are the only terminal values, and `done` means its Run finished with its changes sitting in its workspace. `exit_code` and `error` say why a Worker failed, `stuck` is true when the Run has made no progress inside the watchdog window, and `log_file` is the file `jjfx logs` follows. A Repository with several pools reports a per-pool subtotal under `pools`; filter one lane with `jq '.workers[] | select(.pool == "bugs")'`.
 
 ```bash
 jjfx status --json | jq -r '.workers[] | select(.status != "done" and .status != "failed") | .worker'
@@ -122,7 +122,7 @@ jjfx pool destroy          # tear down the pool
 ## Rules
 
 - **Dispatch real tickets.** Never invent an id; jjfx reads the Parent's sub-issues and each Worker's ticket back from the source.
-- **Read state from `jjfx status --json`.** `workers[]` carries each Worker's `status`, `stuck`, `exit_code` and `error` (the terminal-state and failure signals), and `waiting` carries the Tickets a capped Dispatch held back; do not infer any of it from `jjfx logs` prose.
+- **Read state from `jjfx status --json`.** `workers[]` carries each Worker's `status`, `stuck`, `exit_code`, `error` (the terminal-state and failure signals) and `pool`, and `waiting` carries the Tickets a capped Dispatch held back, each with its pool; do not infer any of it from `jjfx logs` prose.
 - **Never merge.** Dispatch produces pull requests; landing them is the user's call.
 - **Leave open Workspaces alone.** jjfx will not dispatch to (or `send` into) a Workspace that is open in a terminal. If a headless run reports it cannot see the terminal, re-run with `--force`; otherwise do not force past a Workspace a human is using.
 - **Set the runtime deliberately.** The pool profile is repository state that survives a restart — set it with `jjfx pool profile`, not per dispatch, unless the user asks for a one-off `--provider`/`--model` override.

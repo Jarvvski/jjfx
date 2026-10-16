@@ -305,7 +305,10 @@ closed is the only safe answer for a spend gate.
 
 The current aggregate is always visible without the cap: the Pool view shows a
 pool spend line, and `jjfx status` (and `jjfx pool list`) shows a `SPEND` column
-and a pool-level summary.
+and a Repository-wide summary. When the Repository holds several pools, each
+pool's recorded spend is reported against its own [`cap_usd`](#pools) - a
+subtotal under that total, in the `Pools:` table and in the `pools` array of
+`jjfx status --json`.
 
 ## `[dispatch]`
 
@@ -340,12 +343,13 @@ Held 2 ticket(s) back under the dispatch cap; re-run once a Run finishes.
 
 The waiting set is recorded in jjfx's own
 `.jj/pools/<name>/waiting.json`, inside the pool's own state directory, and
-shown by `jjfx status` (a `Waiting:` line, and the `waiting` array in `jjfx
-status --json`) and the Pool view, so the backlog is visible after the Dispatch
-that held it. It is jjfx-owned presentation state, kept out of the Pool and
-Worker documents, and it is rewritten by every Dispatch - including an uncapped
-one, which clears it - so it always describes the last Dispatch rather than
-accumulating Tickets you have since dispatched by hand.
+shown by `jjfx status` (a `Waiting:` line naming each Ticket's pool, and the
+`waiting` array in `jjfx status --json`, where each entry carries its `ticket`
+and the `pool` whose Dispatch held it) and the Pool view, so the backlog is
+visible after the Dispatch that held it. It is jjfx-owned presentation state,
+kept out of the Pool and Worker documents, and it is rewritten by every Dispatch
+- including an uncapped one, which clears it - so it always describes the last
+Dispatch rather than accumulating Tickets you have since dispatched by hand.
 
 ## `[watchdog]`
 
@@ -592,6 +596,30 @@ The write preserves the rest of the file - comments, key order and formatting -
 so the verbs are safe to use on a hand-maintained config. A declaration the
 reader would reject (an unknown profile, say) is refused before anything is
 written.
+
+### Pools in `status` and `pool list`
+
+`jjfx status` (alias `jjfx pool list`) names every pool the Repository holds -
+including an implicit `default` - with its size, its recorded spend against its
+own cap, and the window that spend is stated over. Each Worker row names its
+pool, and so does each Ticket on the `Waiting:` line.
+
+`jjfx status --json` carries the same machine-readably. The flat `workers[]`
+gains a `pool` field per Worker, `waiting[]` gains one per held Ticket (each
+entry an object with `ticket` and `pool`), and a sibling `pools` key carries
+`{name, size, workers, implicit, spend, cap, window}` per pool - a subtotal
+under the Repository-wide `Spend:` line, never a restructure. The documented way
+to read one lane is:
+
+```bash
+jjfx status --json | jq '.workers[] | select(.pool == "bugs")'
+```
+
+A **pool directory with no declaration** (`.jj/pools/<name>/` with no
+`[pools.<name>]` table) is an orphan: jjfx names it in the `Orphaned pool
+directories:` line and in the `orphans` array, and leaves its state in place. It
+is never adopted as a pool and never blocks another one; removing it is the
+operator's call.
 
 ### Validation is loud
 
