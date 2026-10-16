@@ -53,7 +53,7 @@ markers; they are history and carry no meaning.
 
 | Input | Default | Meaning |
 | --- | --- | --- |
-| `dry_run` | `true` | stop before building, committing, tagging, publishing, or releasing |
+| `dry_run` | `false` | stop before building, committing, tagging, publishing, or releasing |
 
 momo derives the bump from the recorded changes; there is no manual override.
 
@@ -61,29 +61,35 @@ momo derives the bump from the recorded changes; there is no manual override.
 to be on `main` before it can be dispatched at all. There is no rehearsal from a
 feature branch.
 
-A dry run first:
+Dispatch the release:
 
 ```bash
-gh workflow run release.yml -f dry_run=true
+gh workflow run release.yml
 gh run watch
-```
-
-That runs the gate, derives the version, mints it (`momo release` writes the
-changelog, the `.momo/version` ledger and the `Cargo.toml` scalar), and verifies
-the package with `cargo publish --dry-run --locked --allow-dirty` - then stops
-and prints the diff. `--allow-dirty` is required because the mint is deliberately
-left uncommitted at that point, so the checkout is dirty by design; it packages
-exactly what the commit step would record. Nothing is committed, tagged,
-published, or released.
-
-The real thing:
-
-```bash
-gh workflow run release.yml -f dry_run=false
 ```
 
 The `release` environment requires a reviewer, so the job pauses for approval
 before it can reach the crates.io token.
+
+### When to dry-run instead
+
+`-f dry_run=true` runs the gate, derives the version, mints it (`momo release`
+writes the changelog, the `.momo/version` ledger and the `Cargo.toml` scalar),
+and verifies the package with `cargo publish --dry-run --locked --allow-dirty` -
+then stops and prints the diff. `--allow-dirty` is required because the mint is
+deliberately left uncommitted at that point, so the checkout is dirty by design;
+it packages exactly what the commit step would record. Nothing is committed,
+tagged, published, or released.
+
+That is worth an extra run only when the release *process* changed - a new step
+in this workflow, a change to the packaging, or a first release after a long gap.
+For an ordinary release of accumulated changes, dispatch the real run: the
+environment approval is the gate, and the step order below already fails before
+anything irreversible.
+
+```bash
+gh workflow run release.yml -f dry_run=true
+```
 
 ### Step order
 
@@ -121,8 +127,8 @@ pointing at a crate version that does not exist.
 | `cargo publish` | tag pushed, crate not published | re-dispatch, or publish by hand |
 | `gh release create` | tag and crate published, no release | `gh release create v<version> --notes-file <(momo notes --version <version>) dist/*` |
 
-A crates.io version number can never be reused, which is why `dry_run` defaults
-to `true`.
+A crates.io version number can never be reused, so recovery is always
+re-dispatching or running the step by hand - never reusing the version.
 
 ## Prerequisites
 

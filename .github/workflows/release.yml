@@ -11,15 +11,16 @@ name: Release
 #
 # The `release` environment gates publishing: it holds CARGO_REGISTRY_TOKEN and
 # requires a reviewer, so a real release needs an approval click on top of the
-# dispatch. `dry_run` defaults to true because a crates.io version number can
-# never be reused.
+# dispatch. That approval is the gate, so `dry_run` defaults to false - an
+# ordinary release does not pay for a rehearsal. Pass `-f dry_run=true` when the
+# release process itself changed.
 on:
   workflow_dispatch:
     inputs:
       dry_run:
         description: "Stop before building, committing, tagging, publishing, or releasing"
         type: boolean
-        default: true
+        default: false
 
 env:
   CARGO_TERM_COLOR: always

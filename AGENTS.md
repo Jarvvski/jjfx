@@ -37,7 +37,8 @@ A user-visible change is recorded with momo, which owns the changelog heading an
 `crates/wsg` is frozen at its current version while the migration-era binary is retired; entries are versioned by `jjfx` alone.
 
 Releases are cut by dispatching `.github/workflows/release.yml` - see
-[`docs/releasing.md`](docs/releasing.md).
+[`docs/releasing.md`](docs/releasing.md). Dispatch the real run; dry-run
+(`-f dry_run=true`) only when the release process itself changed.
 
 Remote: `origin` = `Jarvvski/jjfx` (SSH: `git@github.com:Jarvvski/jjfx.git` - SSH avoids the OAuth `workflow`-scope gate on pushing `.github/workflows/`). `gh` auto-detection fails in jj workspaces - always pass `-R Jarvvski/jjfx`.
 
