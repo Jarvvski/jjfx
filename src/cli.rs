@@ -40,15 +40,16 @@ use crate::config::{
 };
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
-    DEFAULT_POOL_NAME, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
-    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
-    DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, REPOSITORY_WIDE_MUTATION,
-    ReadyTicketFilter, Repository, ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode,
-    SpendCap, SpendCapMode, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
-    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
-    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
+    DEFAULT_POOL_NAME, DEFAULT_READY_LABEL, DirectDispatchError, DirectDispatchExecution,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess,
+    DispatchBudget, DispatchDependencyContext, DispatchExclusions, FollowUpExecution,
+    FollowUpOutcome, Loaded, OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName,
+    REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
+    RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendWindow, StuckWindow,
+    SyncAction, TerminalSettings, TicketDetails, TicketDiscovery, TicketId, TicketQuery,
+    TicketStatus, TrunkDrift, UndoOutcome, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
+    WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
+    dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -2701,6 +2702,7 @@ fn report_named_ticket_readiness(
         repository.root(),
         &tickets,
         runtime,
+        &args.label,
     )?);
     let ready = discovery.ready_tickets(&filter)?;
     for ticket in &args.tickets {
@@ -2857,6 +2859,7 @@ fn dispatch_command(
         repository.root(),
         &tickets,
         runtime,
+        &args.label,
     )?);
 
     if args.all {
@@ -4240,6 +4243,7 @@ fn prepare_orchestration(
         repository.root(),
         &tickets,
         runtime,
+        DEFAULT_READY_LABEL,
     )?);
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the
     // no-children direct fallback inlines the Ticket body. A local feature Parent

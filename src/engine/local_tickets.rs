@@ -18,7 +18,8 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::engine::{
-    ReadyTicketFilter, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest,
+    DEFAULT_READY_LABEL, ReadyTicketFilter, TicketId, TicketQuery, TicketQueryError,
+    TicketQueryRequest,
 };
 
 /// The `issues` directory holding one feature's Ticket files.
@@ -33,6 +34,11 @@ pub struct LocalTickets {
     root: PathBuf,
     ready_status: String,
     resolved_status: String,
+    /// The label a Ticket that declares no `Labels:` of its own carries, so a
+    /// Repository that never adopted labels keeps discovering its work. Set from
+    /// the Dispatch's global ready label, never a pool's routing label: the
+    /// fallback must not make an unlabelled Ticket match every lane.
+    ready_label: String,
 }
 
 impl LocalTickets {
@@ -46,7 +52,14 @@ impl LocalTickets {
             root: root.into(),
             ready_status: ready_status.into(),
             resolved_status: resolved_status.into(),
+            ready_label: DEFAULT_READY_LABEL.to_owned(),
         }
+    }
+
+    /// Returns this source carrying `label` for a Ticket that declares none.
+    pub fn with_ready_label(mut self, label: impl Into<String>) -> Self {
+        self.ready_label = label.into();
+        self
     }
 
     /// Returns the directory the Tickets are read from.
@@ -270,7 +283,7 @@ impl LocalTickets {
                     "id": ticket.id,
                     "title": ticket.title,
                     "status": filter.status().as_str(),
-                    "labels": [filter.label()],
+                    "labels": ticket.routing_labels(&self.ready_label),
                     "blocked_by": self.blocker_ids(ticket, &tickets),
                 }));
                 continue;
@@ -469,6 +482,13 @@ impl LocalMarkdownQuery {
             tickets: LocalTickets::new(root, ready_status, resolved_status),
         }
     }
+
+    /// Returns this query carrying `label` for a Ticket that declares no
+    /// `Labels:` of its own.
+    pub fn with_ready_label(mut self, label: impl Into<String>) -> Self {
+        self.tickets = self.tickets.with_ready_label(label);
+        self
+    }
 }
 
 impl TicketQuery for LocalMarkdownQuery {
@@ -496,6 +516,10 @@ pub struct LocalTicket {
     /// `None` when the `Blocked by:` value could not be parsed.
     blockers: Option<Vec<u32>>,
     ticket_type: Option<String>,
+    /// The `Labels:` entries the Ticket declares, in order. Empty when it
+    /// declares none - the local convention predates labels, so a Ticket
+    /// without the line is normal rather than malformed.
+    labels: Vec<String>,
     path: PathBuf,
 }
 
@@ -514,6 +538,7 @@ impl LocalTicket {
         let mut status = String::new();
         let mut blockers = Some(Vec::new());
         let mut ticket_type = None;
+        let mut labels = Vec::new();
         while let Some(line) = lines.get(index) {
             if line.trim().is_empty() {
                 index += 1;
@@ -526,6 +551,7 @@ impl LocalTicket {
                 "status" => status = value.to_owned(),
                 "blocked by" => blockers = parse_blockers(value),
                 "type" => ticket_type = Some(value.to_owned()),
+                "labels" => labels = parse_labels(value),
                 _ => {}
             }
             index += 1;
@@ -547,6 +573,7 @@ impl LocalTicket {
             status,
             blockers,
             ticket_type,
+            labels,
             path: path.to_path_buf(),
         }
     }
@@ -589,6 +616,29 @@ impl LocalTicket {
     /// Returns the `Type:` value, when the Ticket carries one.
     pub fn ticket_type(&self) -> Option<&str> {
         self.ticket_type.as_deref()
+    }
+
+    /// Returns the `Labels:` entries the Ticket declares, in order.
+    pub fn labels(&self) -> &[String] {
+        &self.labels
+    }
+
+    /// Returns the labels a ready Ticket is discovered by: the ones it declares,
+    /// plus the synthetic ready label every local Ticket carries.
+    ///
+    /// A local Ticket's readiness is its `Status:`, so in the label sense it is
+    /// always ready; the declared labels are what route it to a Worker Pool
+    /// lane. Keeping the ready label alongside them is what leaves a Repository
+    /// that never adopted `Labels:` discovering its work exactly as before.
+    fn routing_labels(&self, ready_label: &str) -> Vec<String> {
+        let mut labels = self.labels.clone();
+        if !labels
+            .iter()
+            .any(|label| label.eq_ignore_ascii_case(ready_label))
+        {
+            labels.push(ready_label.to_owned());
+        }
+        labels
     }
 
     /// Returns the Ticket file's path.
@@ -686,6 +736,20 @@ fn parse_blockers(value: &str) -> Option<Vec<u32>> {
     value
         .split(',')
         .map(|part| part.trim().parse::<u32>().ok())
+        .collect()
+}
+
+/// Parses a `Labels:` value: comma-separated labels, with blank entries dropped.
+///
+/// A blank `Labels:` is an empty list rather than an error - the local convention
+/// treats an absent or empty line as "no labels of its own", which is what a
+/// Ticket written before labels existed has.
+fn parse_labels(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(str::to_owned)
         .collect()
 }
 
@@ -843,6 +907,122 @@ mod tests {
         assert_eq!(ticket.blockers(), Some(&[][..]));
         assert_eq!(ticket.body(), "## Problem\n\nDo the work.");
         assert!(ticket.malformation().is_none());
+    }
+
+    /// `Labels:` is the routing tag a Worker Pool lane selects on, so the parser
+    /// has to surface it. A Ticket that predates the line is normal, not
+    /// malformed: its labels are simply empty.
+    #[test]
+    fn scan_parses_the_labels_line() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-tagged.md",
+            "# Tagged\n\nStatus: ready-for-agent\nLabels: bug, ui\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-untagged.md",
+            "# Untagged\n\nStatus: ready-for-agent\n",
+        );
+
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved")
+            .scan()
+            .expect("scan");
+
+        assert_eq!(tickets[0].labels(), ["bug", "ui"]);
+        assert!(tickets[1].labels().is_empty());
+        assert!(
+            tickets[1].malformation().is_none(),
+            "an absent `Labels:` line is normal"
+        );
+        // A blank line declares no labels rather than a malformation.
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "03-blank.md",
+            "# Blank\n\nStatus: ready-for-agent\nLabels:\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved")
+            .scan()
+            .expect("scan");
+        assert!(tickets[2].labels().is_empty());
+    }
+
+    /// A local Ticket is always ready in the label sense - its readiness is its
+    /// `Status:` - so it carries the ready label beside whatever it declares.
+    /// That is what leaves a Repository that never adopted `Labels:` unchanged.
+    #[test]
+    fn a_ready_ticket_carries_its_labels_and_the_ready_label() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-tagged.md",
+            "# Tagged\n\nStatus: ready-for-agent\nLabels: bug\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-untagged.md",
+            "# Untagged\n\nStatus: ready-for-agent\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        // The default filter still finds both: the declared label routes, and the
+        // synthetic ready label keeps an untagged Ticket discoverable.
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+        assert_eq!(ready.tickets().len(), 2, "{:?}", ready.diagnostics());
+
+        // A pool that routes `bug` finds only the tagged Ticket.
+        let bug = ReadyTicketFilter::new(
+            "bug",
+            TicketStatus::parse("ready-for-agent").expect("ready status"),
+        )
+        .expect("filter");
+        let ready = discovery.ready_tickets(&bug).expect("discovery");
+        assert_eq!(ready.tickets().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.tickets()[0].id().as_str(), "widgets--01-tagged");
+        // The Ticket that carries no `bug` is reported, and the reason says what
+        // it carried - a routing miss, not a typo.
+        assert_eq!(ready.diagnostics().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.diagnostics()[0].subject(), "widgets--02-untagged");
+        assert_eq!(
+            ready.diagnostics()[0].reason(),
+            "missing label \"bug\" (carries \"ready-for-agent\")"
+        );
+    }
+
+    /// The synthetic label a Ticket that declares none carries is the source's
+    /// ready label, not the filter's: otherwise an untagged Ticket would match
+    /// every lane a Repository holds.
+    #[test]
+    fn an_untagged_ticket_carries_the_ready_label_not_the_filter_label() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-untagged.md",
+            "# Untagged\n\nStatus: ready-for-agent\n",
+        );
+        let discovery = TicketDiscovery::new(
+            source(temporary.path()).with_ready_label("ready-for-agent"),
+        );
+        let bug = ReadyTicketFilter::new(
+            "bug",
+            TicketStatus::parse("ready-for-agent").expect("ready status"),
+        )
+        .expect("filter");
+
+        let ready = discovery.ready_tickets(&bug).expect("discovery");
+
+        assert!(ready.tickets().is_empty(), "{:?}", ready.tickets());
+        assert_eq!(
+            ready.diagnostics()[0].reason(),
+            "missing label \"bug\" (carries \"ready-for-agent\")"
+        );
     }
 
     #[test]

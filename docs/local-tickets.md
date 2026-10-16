@@ -26,6 +26,7 @@ The header carries the metadata the convention defines:
 Status: ready-for-agent
 Type: task
 Blocked by: 01, 02
+Labels: bug, ui
 
 ## Problem
 
@@ -38,6 +39,22 @@ The body is everything below the metadata lines.
 | `Status:` | Its triage state. Required. |
 | `Type:` | `task`, `research`, `prototype`, or `grilling`. Recorded, not used for readiness. |
 | `Blocked by:` | Comma-separated sibling ticket numbers, or `none`. |
+| `Labels:` | Comma-separated labels. Optional, and absent on every Ticket written before labels existed. |
+
+## Labels
+
+A local Ticket's readiness is its `Status:`, so its label is a routing tag
+rather than a tracker fact: it is what sends the Ticket to a Worker Pool lane
+(see [configuration](configuration.md)). `Labels:` carries the tags a Ticket
+declares, and a Ticket that declares none carries the ready label alone -
+`ready-for-agent` unless a Dispatch overrides it with `--label` - so a
+repository that never adopted the line discovers exactly the work it always
+did.
+
+A Ticket always carries the ready label *alongside* its own, because in the
+label sense a ready local Ticket is ready for an agent. That is what keeps
+`jjfx dispatch <TICKET>` finding a tagged Ticket when the Ticket is named by
+hand.
 
 ## Identity
 

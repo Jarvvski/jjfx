@@ -9,7 +9,7 @@
 use super::*;
 
 use crate::config::{SpendConfig, TicketsConfig};
-use crate::engine::{DispatchExclusions, UndoOutcome};
+use crate::engine::{DEFAULT_READY_LABEL, DispatchExclusions, UndoOutcome};
 use crate::ticket_source::configured_ticket_query;
 
 /// The blocking port behind the controller seam: one capability surface the
@@ -494,7 +494,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             TicketStatus::parse(self.tickets.ready_status()).map_err(|error| error.to_string())?;
         let filter = ReadyTicketFilter::new(label, status).map_err(|error| error.to_string())?;
         let discovery = TicketDiscovery::new(
-            configured_ticket_query(self.repository_root.as_path(), &self.tickets, runtime)
+            configured_ticket_query(self.repository_root.as_path(), &self.tickets, runtime, label)
                 .map_err(|error| error.to_string())?,
         );
         let ready = discovery
@@ -543,8 +543,13 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .clone();
         let parent_ticket = crate::engine::ParentTicket::new(ticket.id().clone());
         let discovery = TicketDiscovery::new(
-            configured_ticket_query(repository.root(), &self.tickets, runtime)
-                .map_err(|error| error.to_string())?,
+            configured_ticket_query(
+                repository.root(),
+                &self.tickets,
+                runtime,
+                DEFAULT_READY_LABEL,
+            )
+            .map_err(|error| error.to_string())?,
         );
         let runner = repository
             .orchestration_runner()
