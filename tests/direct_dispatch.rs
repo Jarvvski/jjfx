@@ -3,7 +3,7 @@
 use std::env;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Barrier};
 use std::thread;
@@ -680,6 +680,11 @@ fn direct_dispatch_releases_its_reservation_after_identity_failure() {
         .expect_err("missing Repository remote must fail before launch");
 
     assert!(matches!(error, DirectDispatchError::Identity(_)));
+    // The failure names the missing remote and the command that adds it, rather
+    // than a format complaint about an empty slug.
+    let message = error.to_string();
+    assert!(message.contains("origin"), "{message}");
+    assert!(message.contains("jj git remote add origin"), "{message}");
     assert_eq!(
         repository
             .worker_pool()
@@ -800,6 +805,51 @@ fn direct_dispatch_prepares_the_worker_workspace_on_main_under_an_operation_lock
         .expect("read prepared parent");
     assert!(parent.status.success());
     assert!(String::from_utf8_lossy(&parent.stdout).contains("main"));
+}
+
+/// A fresh repository has no bookmarks at all, so a hard-coded `main` base fails
+/// Workspace preparation. Dispatch must instead base the Worker on the default
+/// Workspace's working copy, then fail (if at all) on the genuinely missing
+/// piece - here, the remote - naming its fix.
+#[test]
+fn direct_dispatch_prepares_a_worker_workspace_without_a_main_bookmark() {
+    let (_temporary_directory, repository) = local_repository();
+    configure_jj_identity(&repository);
+    // Deliberately neither `create_main` nor `add_origin`: the repository is as
+    // fresh as `jj git init` leaves it.
+    let worker = repository
+        .worker_pool()
+        .resize_to(PoolCapacity::new(1).expect("capacity"))
+        .expect("grow Worker Pool")
+        .added_workers()[0]
+        .clone();
+    let workspace = worker_workspace(&repository, &worker);
+    let request = DirectDispatchRequest::new(
+        ticket("ENG-420", "Dispatch with no main bookmark"),
+        RunMode::Foreground,
+    );
+    let dispatch = repository.direct_dispatch();
+    let reservation = dispatch.reserve(&request).expect("Reservation");
+
+    let error = dispatch
+        .dispatch_reserved(reservation, &request)
+        .expect_err("a repository with no origin must fail at identity");
+
+    assert!(
+        matches!(error, DirectDispatchError::Identity(_)),
+        "an absent `main` bookmark must not fail Workspace preparation: {error}"
+    );
+    assert!(
+        error.to_string().contains("jj git remote add origin"),
+        "the failure must name the remote fix: {error}"
+    );
+
+    // The Worker Workspace was prepared on the default Workspace's working-copy
+    // commit, so provisioning got past the absent `main` bookmark.
+    assert_eq!(
+        working_copy_parent(&workspace),
+        working_copy_commit(repository.root())
+    );
 }
 
 #[test]
@@ -1145,6 +1195,46 @@ fn create_main(repository: &Repository) {
         .output()
         .expect("create main");
     assert!(output.status.success());
+}
+
+/// The Worker Workspace path the base-directory convention derives for `worker`.
+fn worker_workspace(repository: &Repository, worker: &WorkerId) -> PathBuf {
+    repository
+        .root()
+        .parent()
+        .expect("Repository parent")
+        .join(format!(
+            "{}-workspaces/{worker}",
+            repository
+                .root()
+                .file_name()
+                .expect("Repository name")
+                .to_string_lossy()
+        ))
+}
+
+/// The commit `@` resolves to in `dir`, read without snapshotting it.
+fn working_copy_commit(dir: &Path) -> String {
+    jj_stdout(dir, &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+}
+
+/// The parent commit of `dir`'s working copy, read without snapshotting it.
+fn working_copy_parent(dir: &Path) -> String {
+    jj_stdout(dir, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"])
+}
+
+fn jj_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("jj")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("jj");
+    assert!(
+        output.status.success(),
+        "jj {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }
 
 fn write_executable(path: &Path, contents: &str) {

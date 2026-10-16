@@ -618,6 +618,42 @@ pub(crate) fn lock_worker_operation(
     Ok(WorkspaceOperationGuard { _lock: lock })
 }
 
+/// The revision a Worker Workspace is based on when a Dispatch supplies no
+/// dependency context.
+///
+/// The repository's `main` (then `master`) bookmark is the trunk, so a Worker
+/// branches from the shared mainline rather than the user's working copy. A
+/// fresh repository has neither, so fall back to the default Workspace's
+/// working-copy commit: dispatch works out of the box instead of failing on a
+/// `main` bookmark nobody created.
+fn default_base_revision(root: &Path) -> Result<String, WorkerWorkspaceError> {
+    for bookmark in ["main", "master"] {
+        let revset = format!("bookmarks(exact:{})", crate::jj::revset_symbol(bookmark));
+        let resolved = crate::jj::read_at_repo(
+            root,
+            &["log", "-r", &revset, "--no-graph", "-T", "commit_id"],
+        )
+        .map_err(|error| {
+            WorkerWorkspaceError::new(format!("resolve default base revision: {error:#}"))
+        })?;
+        if !resolved.trim().is_empty() {
+            return Ok((*bookmark).to_owned());
+        }
+    }
+    let working_copy =
+        crate::jj::read_at_repo(root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+            .map_err(|error| {
+                WorkerWorkspaceError::new(format!("resolve default base revision: {error:#}"))
+            })?;
+    let working_copy = working_copy.trim();
+    if working_copy.is_empty() {
+        return Err(WorkerWorkspaceError::new(
+            "no default base revision: create one with `jj bookmark create main -r @`",
+        ));
+    }
+    Ok(working_copy.to_owned())
+}
+
 pub(crate) fn prepare_for_dispatch(
     repository: &Repository,
     worker: &WorkerId,
@@ -634,7 +670,7 @@ pub(crate) fn prepare_for_dispatch(
     let mut command = crate::jj::command();
     command.arg("new");
     if base_revisions.is_empty() {
-        command.arg("main");
+        command.arg(default_base_revision(repository.root())?);
     } else {
         command.args(base_revisions);
     }
@@ -1749,6 +1785,43 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn default_base_revision_falls_back_to_the_working_copy_without_a_trunk_bookmark() {
+        let repo = temp_repo("default-base");
+        let root = repo.canonicalize().unwrap();
+
+        // A fresh repository has no `main`/`master`, so the default Workspace's
+        // working-copy commit is the only sensible base.
+        let head = working_copy_commit(&root);
+        assert!(!head.is_empty());
+        assert_eq!(default_base_revision(&root).unwrap(), head);
+
+        // `main` wins once it exists.
+        jj_at(&root, &["bookmark", "create", "main", "-r", "@"]);
+        assert_eq!(default_base_revision(&root).unwrap(), "main");
+
+        // `master` is the next preference when `main` is gone.
+        jj_at(&root, &["bookmark", "delete", "main"]);
+        jj_at(&root, &["bookmark", "create", "master", "-r", "@"]);
+        assert_eq!(default_base_revision(&root).unwrap(), "master");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    fn jj_at(root: &Path, args: &[&str]) {
+        let output = Command::new("jj")
+            .args(["--config", "signing.behavior=drop"])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("jj");
+        assert!(
+            output.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     /// The working-copy commit id, read without snapshotting it first.

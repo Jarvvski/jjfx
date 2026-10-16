@@ -1,6 +1,6 @@
 # Dispatch must work with no `main` bookmark and no remote
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -54,3 +54,5 @@ Make the out-of-the-box path work, and make the failures name their fix.
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive.
+- 2026-10-16: Resolved. **Trunk:** `prepare_for_dispatch` bases a Worker Workspace on `main`, then `master`, then the default Workspace's working-copy commit, so a fresh repository with no bookmarks dispatches without a hand-made `main`. **Remote:** a repository with no `origin` (or no usable slug) now fails with `no origin remote ...; add one with jj git remote add origin <url> (or set the pool's gh_repo)` instead of the bare `owner/name` format error. Chose to refuse loudly rather than make identity optional: a Worker with no remote cannot push or open a PR, so its delivery contract cannot be honoured, and a named failure is more honest than a Worker that silently cannot deliver.
+- 2026-10-16: Not addressed here: a local-path `origin` (e.g. `/path/jarvis/todo-md.git`) still resolves to a slug (`jarvis/todo-md`) that may name an unrelated GitHub repository. Refusing it needs a GitHub-host policy decision (GitHub Enterprise, `gh_repo` as the override), so it wants an owner ruling rather than an agent guess.
