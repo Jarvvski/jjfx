@@ -10,14 +10,12 @@ use serde::Deserialize;
 use thiserror::Error;
 
 use crate::engine::layout::{PaneLayout, PaneRole};
-use crate::engine::runtime::pi_interactive_command;
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeCommandError, AgentRuntimeInvocation,
-    AgentRuntimePreflightError, AgentRuntimeProbeError, AgentSessionResolution, BackgroundRun,
-    CompletedRun, DispatchExclusions, MutationGuard, MutationKind, PermissionDecision,
-    PermissionRequest, Repository, Reservation, ReviewFinding, ReviewRequest, RunLog,
-    RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError, WorkerStatus,
-    resolve_agent_session_for_runtime,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
+    AgentSessionResolution, BackgroundRun, CompletedRun, DispatchExclusions, MutationGuard,
+    MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation, ReviewFinding,
+    ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
+    WorkerStatus, resolve_agent_session_for_runtime,
 };
 
 /// Whether a Worker action runs attached to the caller or in the background.
@@ -365,8 +363,8 @@ impl WorkerActions {
 
     /// Supplies the provider-aware model profile used by Worker actions.
     ///
-    /// Pi requires both provider and model values. Other runtimes retain their
-    /// existing provider-managed defaults when no profile is supplied.
+    /// A runtime that needs an explicit provider keeps it here. Runtimes with
+    /// provider-managed defaults retain them when no profile is supplied.
     pub fn with_model(mut self, model: impl Into<AgentModel>) -> Self {
         self.model = Some(model.into());
         self
@@ -573,14 +571,11 @@ impl WorkerActions {
         let runtime = profile.runtime();
         let session = resolve_agent_session_for_runtime(runtime, state.log_file().map(Path::new));
         runtime.probe(&workspace)?;
-        runtime.preflight_dispatch_input(profile.model())?;
-        let session_directory = self.repository.root().join(".jj/pool/pi-sessions");
         let session_id = match &session {
             AgentSessionResolution::Resumed { session_id } => Some(session_id.as_str()),
             AgentSessionResolution::Fresh { .. } => None,
         };
-        let command =
-            interactive_agent_command(runtime, profile.model(), &session_directory, session_id)?;
+        let command = interactive_agent_command(runtime, session_id);
         let tab_id = self.commands.mount(
             worker,
             &workspace,
@@ -851,9 +846,6 @@ impl WorkerActions {
             .or_else(|| snapshot.pool().and_then(|pool| pool.profile().cloned()))
             .unwrap_or_else(|| crate::engine::AgentRuntimeProfile::new(AgentRuntime::Claude))
             .with_model_override(self.model.as_ref());
-        profile
-            .runtime()
-            .preflight_dispatch(profile.model(), self.repository.root())?;
         let (reservation, prior_log) = self
             .repository
             .worker_pool()
@@ -1363,13 +1355,8 @@ fn kitty_address() -> Result<String, WorkerActionError> {
     })
 }
 
-fn interactive_agent_command(
-    runtime: AgentRuntime,
-    model: Option<&AgentModel>,
-    session_directory: &Path,
-    session_id: Option<&str>,
-) -> Result<String, WorkerActionError> {
-    let command = match (runtime, session_id) {
+fn interactive_agent_command(runtime: AgentRuntime, session_id: Option<&str>) -> String {
+    match (runtime, session_id) {
         (AgentRuntime::Claude, Some(session)) => {
             format!("claude --resume {}; exec zsh", shell_quote(session))
         }
@@ -1381,28 +1368,11 @@ fn interactive_agent_command(
         (AgentRuntime::Codex, None) => {
             "codex --sandbox workspace-write --ask-for-approval on-request; exec zsh".to_owned()
         }
-        (AgentRuntime::Pi, session) => {
-            return Ok(render_shell_command(&pi_interactive_command(
-                model,
-                session_directory,
-                session,
-            )?));
-        }
         (AgentRuntime::OpenCode, Some(session)) => {
             format!("opencode --session {}; exec zsh", shell_quote(session))
         }
         (AgentRuntime::OpenCode, None) => "opencode; exec zsh".to_owned(),
-    };
-    Ok(command)
-}
-
-fn render_shell_command(command: &Command) -> String {
-    let arguments = std::iter::once(command.get_program())
-        .chain(command.get_args())
-        .map(|value| shell_quote(&value.to_string_lossy()))
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("exec {arguments}")
+    }
 }
 
 fn shell_quote(value: &str) -> String {
@@ -1548,12 +1518,6 @@ pub enum WorkerActionError {
     /// kitty could not be located for Mount.
     #[error("kitty is unavailable: {detail}")]
     KittyUnavailable { detail: String },
-    /// The selected runtime's Direct Dispatch profile is not ready.
-    #[error(transparent)]
-    RuntimePreflight(#[from] AgentRuntimePreflightError),
-    /// The selected runtime's interactive command could not be built.
-    #[error(transparent)]
-    RuntimeCommand(#[from] AgentRuntimeCommandError),
     /// The Worker has no opencode Run session to answer a permission for.
     #[error("Worker {worker} has no opencode Run session")]
     NoRunSession { worker: WorkerId },

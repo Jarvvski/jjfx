@@ -193,8 +193,8 @@ prompt their own way; the runtime is the transport, not the source.
 ### `[tickets.local]`
 
 Discover Ready Tickets from local markdown under the repository - the
-`.scratch/<feature>/issues/<NN>-<slug>.md` convention. No runtime, no Linear, and
-no Pi helper are involved; see [Local tickets](local-tickets.md) for the layout,
+`.scratch/<feature>/issues/<NN>-<slug>.md` convention. No runtime and no Linear
+are involved; see [Local tickets](local-tickets.md) for the layout,
 identity, dependency, and writeback rules.
 
 | Key | Default | Meaning |

@@ -496,7 +496,7 @@ fn parse_pool_profile(args: &[String]) -> Result<Command> {
     let usage = concat!(
         "Usage: ",
         env!("CARGO_PKG_NAME"),
-        " pool profile <claude|codex|pi|opencode> [--provider PROVIDER] [--model MODEL]"
+        " pool profile <claude|codex|opencode> [--provider PROVIDER] [--model MODEL]"
     );
     let Some(runtime) = args.first().filter(|value| !value.starts_with('-')) else {
         bail!(usage);
@@ -1119,9 +1119,8 @@ fn runtime_profile(
     model: Option<&str>,
 ) -> Result<AgentRuntimeProfile> {
     let configured = WireAgent::new(runtime);
-    let runtime = AgentRuntime::from_configured(Some(&configured)).map_err(|value| {
-        anyhow::anyhow!("invalid Agent Runtime {value:?} (expected claude, codex, pi, or opencode)")
-    })?;
+    let runtime = AgentRuntime::from_configured(Some(&configured))
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
     let mut profile = AgentRuntimeProfile::new(runtime);
     if let Some(selection) = selected_model(provider, model)? {
         profile = profile.with_model(selection);
@@ -1564,7 +1563,7 @@ fn dispatch_command(
             .iter()
             .map(|ticket| {
                 let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
-                if let Some(details) = fetch_ticket_details(runtime, &discovery, ticket.id())? {
+                if let Some(details) = fetch_ticket_details(&discovery, ticket.id())? {
                     request = request.with_ticket_details(details);
                 }
                 if let Some(model) = model.clone() {
@@ -1588,7 +1587,7 @@ fn dispatch_command(
         .map(|ticket| {
             let id = TicketId::parse(ticket.clone())?;
             let mut request = DirectDispatchRequest::for_ticket_id(id.clone(), args.mode)?;
-            if let Some(details) = fetch_ticket_details(runtime, &discovery, &id)? {
+            if let Some(details) = fetch_ticket_details(&discovery, &id)? {
                 request = request.with_ticket_details(details);
             }
             if let Some(model) = model.clone() {
@@ -1676,17 +1675,10 @@ fn exclusions_provider(
 
 /// Fetch a Ticket's details to inline into the Dispatch prompt, failing before
 /// any Pool or Workspace mutation when the runtime cannot reach the tracker.
-///
-/// Pi is skipped: its Direct Dispatch preflight already guarantees the pinned
-/// Linear tools, so the Worker fetches the Ticket itself.
 fn fetch_ticket_details<Q: TicketQuery>(
-    runtime: AgentRuntime,
     discovery: &TicketDiscovery<Q>,
     id: &TicketId,
 ) -> Result<Option<TicketDetails>> {
-    if runtime == AgentRuntime::Pi {
-        return Ok(None);
-    }
     discovery.ticket_details(id).map(Some).with_context(|| {
         format!(
             "cannot fetch Ticket {id} to inline into the Dispatch prompt; ensure the pool runtime can reach Linear"
@@ -2219,7 +2211,7 @@ fn orchestrate_command(
     )?);
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the
     // no-children direct fallback inlines the Ticket body.
-    let details = fetch_ticket_details(runtime, &discovery, &id)?;
+    let details = fetch_ticket_details(&discovery, &id)?;
     let mut request = crate::engine::OrchestrationRequest::new(id.clone(), runtime);
     if let Some(details) = details {
         request = request.with_ticket_details(details);
@@ -2347,7 +2339,7 @@ _jjfx() {
         mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
-        pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex pi opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
+        pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
@@ -2485,21 +2477,15 @@ mod tests {
     }
 
     #[test]
-    fn fetch_ticket_details_aborts_with_context_and_skips_pi() {
+    fn fetch_ticket_details_aborts_with_context() {
         let discovery = TicketDiscovery::new(FailingQuery);
         let id = TicketId::parse("AMBA-42").expect("Ticket ID");
 
-        let error = fetch_ticket_details(AgentRuntime::Claude, &discovery, &id)
+        let error = fetch_ticket_details(&discovery, &id)
             .expect_err("a runtime that cannot fetch the Ticket must abort Dispatch");
         let message = error.to_string();
         assert!(message.contains("AMBA-42"), "{message}");
         assert!(message.contains("Linear"), "{message}");
-
-        // Pi is skipped: its Direct Dispatch preflight owns tool validation.
-        assert_eq!(
-            fetch_ticket_details(AgentRuntime::Pi, &discovery, &id).expect("Pi is skipped"),
-            None
-        );
     }
 
     #[test]

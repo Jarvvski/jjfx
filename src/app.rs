@@ -2914,7 +2914,7 @@ mod tests {
         AgentSessionResolution, RunActivity, RunActivityKind, RunConclusion, RunResult,
     };
     use crate::render::style::{
-        CLAUDE_ORANGE, CODEX_CYAN, PI_VIOLET, agent_glyph, agent_label, working_frame,
+        CLAUDE_ORANGE, CODEX_CYAN, agent_glyph, agent_label, working_frame,
     };
     use crate::runtime::Runtime;
     use crate::store::{Workspace, WorkspacePath};
@@ -3863,7 +3863,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_agent_identity_renders_on_a_narrow_workspace_row() {
+    fn opencode_agent_identity_renders_on_a_narrow_workspace_row() {
         use ratatui::Terminal;
         use ratatui::backend::TestBackend;
 
@@ -3873,8 +3873,8 @@ mod tests {
             cwd: "/wt/feat".into(),
             transcript_path: None,
             jjfx_event_version: Some(1),
-            agent_kind: Some("pi".into()),
-            session_id: Some("pi-1".into()),
+            agent_kind: Some("opencode".into()),
+            session_id: Some("oc-1".into()),
             notification_type: None,
             error: None,
         }));
@@ -3882,7 +3882,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(32, 8)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
         let rendered = terminal.backend().to_string();
-        assert!(rendered.contains("π pi"), "{rendered}");
+        assert!(rendered.contains("O opencode"), "{rendered}");
     }
 
     #[test]
@@ -4375,7 +4375,7 @@ mod tests {
                 outcome: WorkerSessionOutcome::new(
                     "worker-01",
                     crate::workspace_dispatch::WorkerActionKind::Send,
-                    crate::engine::AgentRuntime::Pi,
+                    crate::engine::AgentRuntime::Codex,
                     AgentSessionResolution::Fresh {
                         reason: crate::engine::FreshSessionReason::MissingIdentity,
                     },
@@ -4400,7 +4400,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("runtime: pi"), "{text}");
+        assert!(text.contains("runtime: codex"), "{text}");
         assert!(
             text.contains("fresh session (log has no session id yet)"),
             "{text}"
@@ -4408,18 +4408,18 @@ mod tests {
     }
 
     #[test]
-    fn pi_pool_profile_renders_runtime_capability_without_provider_details() {
+    fn pool_profile_renders_runtime_capability_without_provider_details() {
         let temp = tempfile::tempdir().unwrap();
         let pool = temp.path().join(".jj/pool");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
             temp.path().join(".jj/pool.json"),
-            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-08-17T10:00:00Z","agent":"pi","provider":"openai","model":"gpt-5.4"}"#,
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-08-17T10:00:00Z","agent":"codex","provider":"openai","model":"gpt-5.4"}"#,
         )
         .unwrap();
         std::fs::write(
             pool.join("worker-01.json"),
-            br#"{"status":"busy","agent":"pi","provider":"openai","model":"gpt-5.4","ticket":"ENG-42","pid":42,"started_at":"2026-08-17T10:00:00Z","completed_at":null,"log_file":".jj/pool/worker-01.log","branch_name":"eng-42","exit_code":null,"error":null}"#,
+            br#"{"status":"busy","agent":"codex","provider":"openai","model":"gpt-5.4","ticket":"ENG-42","pid":42,"started_at":"2026-08-17T10:00:00Z","completed_at":null,"log_file":".jj/pool/worker-01.log","branch_name":"eng-42","exit_code":null,"error":null}"#,
         )
         .unwrap();
         let mut app = app_with(&["default", "worker-01"]);
@@ -4442,8 +4442,8 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("profile: pi"), "{text}");
-        assert!(text.contains("runtime: pi"), "{text}");
+        assert!(text.contains("profile: codex"), "{text}");
+        assert!(text.contains("runtime: codex"), "{text}");
         assert!(!text.contains("openai"), "{text}");
         assert!(!text.contains("gpt-5.4"), "{text}");
     }
@@ -4789,7 +4789,7 @@ mod tests {
     }
 
     #[test]
-    fn worker_log_detail_renders_provider_neutral_pi_activity_and_result() {
+    fn worker_log_detail_renders_provider_neutral_activity_and_result() {
         let temp = tempfile::tempdir().unwrap();
         let output = std::process::Command::new("jj")
             .args([
@@ -4811,7 +4811,7 @@ mod tests {
         );
         app.pool.worker_log = Some(crate::workspace_dispatch::WorkerLogSnapshot::new(
             "worker-01",
-            crate::engine::AgentRuntime::Pi,
+            crate::engine::AgentRuntime::Codex,
             Some(RunActivity::new(RunActivityKind::FileChanges {
                 paths: vec![
                     "src/app.rs".to_owned(),
@@ -4834,7 +4834,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("runtime: pi"), "{text}");
+        assert!(text.contains("runtime: codex"), "{text}");
         assert!(
             text.contains("files: src/app.rs, src/workspace_dispatch.rs"),
             "{text}"
@@ -4864,7 +4864,7 @@ mod tests {
         for runtime in [
             crate::engine::AgentRuntime::Claude,
             crate::engine::AgentRuntime::Codex,
-            crate::engine::AgentRuntime::Pi,
+            crate::engine::AgentRuntime::OpenCode,
         ] {
             let mut app = app_with(&["default"]);
             app.pool.worker_pool = Some(snapshot.clone());
@@ -5020,7 +5020,7 @@ mod tests {
                 .read_worker_pool_snapshot(),
         );
         app.pool.dispatch_result = Some(crate::workspace_dispatch::DispatchResult::new(
-            crate::engine::AgentRuntime::Pi,
+            crate::engine::AgentRuntime::Codex,
             vec![
                 crate::workspace_dispatch::DispatchOutcome::success(
                     "ENG-42".to_owned(),
@@ -5049,7 +5049,10 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect();
-        assert!(text.contains("Dispatch outcomes (runtime: pi)"), "{text}");
+        assert!(
+            text.contains("Dispatch outcomes (runtime: codex)"),
+            "{text}"
+        );
         assert!(text.contains("ENG-42  First Ticket"), "{text}");
         assert!(text.contains("ENG-43 [Capacity]"), "{text}");
         assert!(text.find("ENG-42").unwrap() < text.find("ENG-43").unwrap());
@@ -5094,7 +5097,7 @@ mod tests {
             ),
         );
         let mut group_options = crate::engine::DispatchGroupOptions::new("gpt-5.4");
-        group_options.agent = Some(crate::engine::WireAgent::new("pi"));
+        group_options.agent = Some(crate::engine::WireAgent::new("codex"));
         group_options.provider = Some("openai".to_owned());
         let mut state = crate::engine::DispatchGroupState::new(
             parent,
@@ -5128,7 +5131,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect();
         assert!(
-            text.contains("Dispatch Group ENG-100  runtime: pi"),
+            text.contains("Dispatch Group ENG-100  runtime: codex"),
             "{text}"
         );
         assert!(text.contains("ready: ENG-102"), "{text}");
@@ -6728,8 +6731,6 @@ mod tests {
             seq,
             "\u{f0ac3}\u{f0ac4}\u{f0ac5}\u{f0ac6}\u{f0ac7}\u{f0ac8}\u{f0ac3}"
         );
-        let seq: String = (0..=6).map(|t| working_frame(AgentKind::Pi, t)).collect();
-        assert_eq!(seq, "·∙•●•∙·");
         assert_eq!(working_frame(AgentKind::Unknown, 0), '?');
     }
 
@@ -6740,7 +6741,6 @@ mod tests {
         // Each agent pauses under its own mark; colour carries the state.
         assert_eq!(agent_glyph(live(Waiting, Claude), 0).content, "✻ ");
         assert_eq!(agent_glyph(live(Waiting, Codex), 0).content, "\u{f02d9} ");
-        assert_eq!(agent_glyph(live(Waiting, Pi), 0).content, "π ");
         assert_eq!(agent_glyph(live(Waiting, Unknown), 0).content, "? ");
         assert_eq!(
             agent_glyph(live(NeedsAttention, Codex), 0).content,
@@ -6762,7 +6762,6 @@ mod tests {
         // Each agent works in its own animation and brand colour.
         assert_eq!(agent_glyph(live(Working, Claude), 0).content, "❀ ");
         assert_eq!(agent_glyph(live(Working, Codex), 0).content, "\u{f0ac3} ");
-        assert_eq!(agent_glyph(live(Working, Pi), 0).content, "· ");
         assert_eq!(
             agent_glyph(live(Working, Claude), 0).style.fg,
             Some(CLAUDE_ORANGE)
@@ -6771,7 +6770,6 @@ mod tests {
             agent_glyph(live(Working, Codex), 0).style.fg,
             Some(CODEX_CYAN)
         );
-        assert_eq!(agent_glyph(live(Working, Pi), 0).style.fg, Some(PI_VIOLET));
         assert_eq!(
             agent_glyph(live(Working, Unknown), 0).style.fg,
             Some(Color::DarkGray)
@@ -6845,7 +6843,6 @@ mod tests {
         use AgentState::*;
         assert_eq!(agent_label(live(Working, Claude)), "claude");
         assert_eq!(agent_label(live(Waiting, Codex)), "codex");
-        assert_eq!(agent_label(live(Waiting, Pi)), "pi");
         assert_eq!(agent_label(live(NeedsAttention, Unknown)), "agent");
         // No live session: a dash, whoever was here before.
         assert_eq!(agent_label(live(Absent, Unknown)), "-");

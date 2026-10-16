@@ -760,7 +760,7 @@ mod tests {
     fn role_command(role: PaneRole) -> Vec<String> {
         match role {
             PaneRole::First => vec!["dev-server".to_string()],
-            PaneRole::Agent => vec!["pi".to_string()],
+            PaneRole::Agent => vec!["agent".to_string()],
             PaneRole::Shell => Vec::new(),
         }
     }
@@ -795,7 +795,7 @@ mod tests {
                     role: PaneRole::Agent,
                     location: Some(SplitLocation::Vsplit),
                     bias: 81,
-                    command: vec!["pi".to_string()],
+                    command: vec!["agent".to_string()],
                 },
                 OpenStep::Split {
                     anchor: 0,
@@ -832,7 +832,7 @@ mod tests {
                     role: PaneRole::Agent,
                     location: Some(SplitLocation::Vsplit),
                     bias: 70,
-                    command: vec!["pi".to_string()],
+                    command: vec!["agent".to_string()],
                 },
                 OpenStep::Split {
                     anchor: 0,
@@ -857,7 +857,7 @@ mod tests {
             vec![
                 OpenStep::LaunchTab {
                     role: PaneRole::Agent,
-                    command: vec!["pi".to_string()],
+                    command: vec!["agent".to_string()],
                 },
                 OpenStep::Focus { pane: 0 },
             ]
@@ -887,7 +887,7 @@ mod tests {
                     role: PaneRole::Agent,
                     location: Some(SplitLocation::Vsplit),
                     bias: 81,
-                    command: vec!["pi".to_string()],
+                    command: vec!["agent".to_string()],
                 },
                 OpenStep::Split {
                     anchor: 1,
@@ -917,7 +917,7 @@ mod tests {
 
     #[test]
     fn workspace_layout_places_the_agent_right_of_a_split_shell_column() {
-        let agent_command = vec!["zsh".to_string(), "-lc".to_string(), "pi".to_string()];
+        let agent_command = vec!["zsh".to_string(), "-lc".to_string(), "agent".to_string()];
 
         assert_eq!(
             new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", true, PaneRole::First, &[],),
@@ -987,7 +987,7 @@ mod tests {
                 "jjfx_role=agent",
                 "zsh",
                 "-lc",
-                "pi",
+                "agent",
             ]
         );
         // The left column is then split into two evenly stacked shells.
@@ -1022,7 +1022,7 @@ mod tests {
 
     #[test]
     fn background_workspace_layout_keeps_focus_during_every_launch() {
-        let agent_command = vec!["pi".to_string()];
+        let agent_command = vec!["agent".to_string()];
 
         assert_eq!(
             new_shell_tab_args("jjfx:feat", "--cwd=/repo-feat", false, PaneRole::First, &[],),
@@ -1059,7 +1059,7 @@ mod tests {
                 "--var",
                 "jjfx_role=agent",
                 "--dont-take-focus",
-                "pi",
+                "agent",
             ]
         );
         assert_eq!(

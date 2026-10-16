@@ -3,7 +3,7 @@
 //! The source reads jjfx's own ticket convention - `<root>/<feature>/issues/
 //! <NN>-<slug>.md` with `Key: value` metadata lines (see
 //! `docs/agents/issue-tracker.md`) - so a repository that tracks work locally
-//! can dispatch without Linear, an Agent Runtime, or the Pi helper.
+//! can dispatch without Linear or an Agent Runtime.
 //!
 //! Ticket identity is path-derived: `<feature>--<NN>-<slug>`. A local Ticket id
 //! must be a single [`TicketId`] component (it names Dispatch Group state files),

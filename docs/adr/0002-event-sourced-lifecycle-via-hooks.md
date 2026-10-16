@@ -52,4 +52,9 @@ and graceful `session_shutdown` means Ended. Pi has no native permission or
 attention event, so tool failures and provider errors never imply
 NeedsAttention.
 
-Status: accepted (validated by spike 01; Pi amendment implemented by issue 05)
+**Removed 2026-10-16.** The Pi Agent Runtime was removed, so this amendment no
+longer describes shipped behaviour; Claude Code and Codex remain the hook-based
+lifecycle sources.
+
+Status: accepted (validated by spike 01; Pi amendment implemented by issue 05,
+removed 2026-10-16)

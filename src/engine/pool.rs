@@ -297,10 +297,8 @@ pub enum WorkerPoolError {
         worker: WorkerId,
         source: StateError,
     },
-    #[error("invalid configured Agent Runtime {value:?} (expected claude, codex, or pi)")]
-    InvalidAgentRuntime { value: String },
-    #[error(transparent)]
-    InvalidRuntimeProfile(#[from] crate::engine::AgentRuntimePreflightError),
+    #[error("{message}")]
+    InvalidAgentRuntime { message: String },
     #[error("cannot discover GitHub repository: {0}")]
     RepositoryDiscovery(String),
     #[error("cannot create a Worker timestamp: {0}")]
@@ -390,7 +388,12 @@ impl WorkerPool {
             return Ok(());
         }
         let runtime = loaded.value.agent.as_ref().and_then(AgentRuntime::parse);
-        let result = if runtime == Some(AgentRuntime::OpenCode) {
+        let result = if let Some(removed) = removed_worker_runtime(&loaded.value) {
+            // The runtime this Run was launched under has been removed, so no
+            // process can still be its Run and nothing can finish or resume it.
+            // Finalize it rather than leave the Worker stranded `busy` forever.
+            RunResult::failed(removed)
+        } else if runtime == Some(AgentRuntime::OpenCode) {
             // An opencode Run's recorded PID is only a daemon client, so it
             // says nothing about whether the work is done: the Run is finished
             // when its session has an outcome, or its log has a result.
@@ -623,8 +626,8 @@ impl WorkerPool {
                     worker: worker.clone(),
                 })
             }
-            crate::engine::state::FollowUpOutcome::InvalidAgentRuntime { value } => {
-                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            crate::engine::state::FollowUpOutcome::InvalidAgentRuntime { message } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { message })
             }
         }
     }
@@ -710,8 +713,8 @@ impl WorkerPool {
             crate::engine::state::ReservationsOutcome::WorkerNotEligible { worker } => {
                 Err(WorkerPoolError::WorkerNotEligible { worker })
             }
-            crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
-                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { message } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { message })
             }
         }
     }
@@ -765,8 +768,8 @@ impl WorkerPool {
                     unavailable,
                 })
             }
-            crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { value } => {
-                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            crate::engine::state::ReservationsOutcome::InvalidAgentRuntime { message } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { message })
             }
             crate::engine::state::ReservationsOutcome::NoIdle { available } => {
                 Err(CapacityShortage::new(requests.len(), available).into())
@@ -888,8 +891,8 @@ impl WorkerPool {
             Ok(crate::engine::state::GrowReservationsOutcome::NoIdle { available }) => {
                 Err(CapacityShortage::new(requests.len(), available).into())
             }
-            Ok(crate::engine::state::GrowReservationsOutcome::InvalidAgentRuntime { value }) => {
-                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            Ok(crate::engine::state::GrowReservationsOutcome::InvalidAgentRuntime { message }) => {
+                Err(WorkerPoolError::InvalidAgentRuntime { message })
             }
             Err(error) => Err(WorkerPoolError::State(error)),
         };
@@ -920,9 +923,6 @@ impl WorkerPool {
     /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
     /// Replaces the Repository default profile used by future Reservations.
     pub fn set_profile(&self, profile: AgentRuntimeProfile) -> Result<(), WorkerPoolError> {
-        profile
-            .runtime()
-            .preflight_dispatch_input(profile.model())?;
         self.repository.state_store().set_pool_profile(&profile)?;
         Ok(())
     }
@@ -993,8 +993,8 @@ impl WorkerPool {
             crate::engine::state::ReservationOutcome::WorkerNotEligible { worker } => {
                 Err(WorkerPoolError::WorkerNotEligible { worker })
             }
-            crate::engine::state::ReservationOutcome::InvalidAgentRuntime { value } => {
-                Err(WorkerPoolError::InvalidAgentRuntime { value })
+            crate::engine::state::ReservationOutcome::InvalidAgentRuntime { message } => {
+                Err(WorkerPoolError::InvalidAgentRuntime { message })
             }
         }
     }
@@ -1500,6 +1500,25 @@ enum RunSessionState {
     Finished(SessionOutcome),
     /// The session could not be identified or read.
     Unavailable,
+}
+
+/// Whether a Worker's persisted Agent Runtime is one this build removed.
+fn is_removed_worker_runtime(state: &WorkerState) -> bool {
+    state
+        .agent
+        .as_ref()
+        .is_some_and(|agent| crate::engine::runtime::is_removed_runtime(agent.as_str()))
+}
+
+/// The clear removal message for a Worker whose persisted Agent Runtime was
+/// removed, or `None` when its runtime is one this build still supports.
+fn removed_worker_runtime(state: &WorkerState) -> Option<String> {
+    state
+        .agent
+        .as_ref()
+        .map(crate::engine::WireAgent::as_str)
+        .filter(|agent| crate::engine::runtime::is_removed_runtime(agent))
+        .map(crate::engine::runtime::removed_runtime_message)
 }
 
 /// The terminal result a Run log provides, or the compatible unexpected-exit
@@ -2054,11 +2073,19 @@ fn worker_snapshot(
 ) -> Result<WorkerSnapshot, String> {
     let status = WorkerStatus::parse(&state.status)
         .ok_or_else(|| format!("unknown Worker status {:?}", state.status.as_str()))?;
-    let profile = AgentRuntimeProfile::from_run_state(
+    let profile = match AgentRuntimeProfile::from_run_state(
         state.agent.as_ref(),
         state.provider.as_deref(),
         state.model.as_deref(),
-    )?;
+    ) {
+        Ok(profile) => profile,
+        // A Worker recorded under a removed runtime stays observable, with no
+        // usable profile, so reconciliation can finalize its Run and the Pool
+        // view can show why it cannot run. Any other malformed runtime is
+        // still reported.
+        Err(_) if is_removed_worker_runtime(&state) => None,
+        Err(message) => return Err(message),
+    };
     let pid = state
         .pid
         .map(u32::try_from)
@@ -2091,7 +2118,7 @@ fn worker_snapshot(
 /// Reports whether the recorded PID still leads a live process group.
 ///
 /// This is the same group-based probe reconciliation uses for the runtimes
-/// whose work the PID owns (claude, codex, pi), so the Pool view and
+/// whose work the PID owns (claude, codex), so the Pool view and
 /// reconciliation agree for them. An opencode Run is judged from its session
 /// instead, because its recorded PID is only a daemon client - for opencode
 /// this probe answers about the client, not the work.

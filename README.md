@@ -58,7 +58,7 @@ scripts and shell completion never unexpectedly enter the TUI.
 jjfx runs background agents as **Workers**, each backed by its own jj workspace:
 
 ```bash
-jjfx pool profile claude   # the agent every Worker runs (claude | codex | pi | opencode)
+jjfx pool profile claude   # the agent every Worker runs (claude | codex | opencode)
 jjfx pool 2                # two Workers, ready for dispatch
 jjfx dispatch AMBA-42      # hand a ticket to an idle Worker
 jjfx status                # WORKER  NAME  STATUS  TICKET  ELAPSED
@@ -106,9 +106,7 @@ Run `jjfx help` for usage.
 - [Workspace hooks](docs/workspace-hooks.md) - repository-local `.jjfx/setup.sh`
   and `.jjfx/teardown.sh`.
 - [Agent lifecycle integration](docs/lifecycle-integration.md) - how Claude Code,
-  Codex, Pi, and OpenCode drive each workspace's agent status.
-- [Pi Worker actions and ticket discovery](docs/pi-workers.md) - Pi Direct
-  Dispatch, the pinned adapter, and the read-only Linear helper protocol.
+  Codex, and OpenCode drive each workspace's agent status.
 - [Run records](docs/run-records.md) - the durable per-Run cost and usage record
   jjfx appends at finalization.
 - [`docs/adr/`](docs/adr/) - architecture decision records.

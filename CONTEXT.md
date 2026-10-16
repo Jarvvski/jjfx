@@ -178,7 +178,7 @@ completion the record is built from.
 _Avoid_: run log
 
 **Agent Runtime**:
-The external Claude Code, Codex, Pi, or OpenCode program that executes a Run.
+The external Claude Code, Codex, or OpenCode program that executes a Run.
 The runtime is not the Agent Session or the Worker that hosts it.
 _Avoid_: agent (unqualified)
 

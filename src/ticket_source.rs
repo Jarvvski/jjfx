@@ -10,8 +10,8 @@ use std::path::Path;
 
 use crate::config::{TicketSource, TicketsConfig};
 use crate::engine::{
-    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, PI_DISCOVERY_HELPER_ENV,
-    PiDiscoveryHelper, Repository, TicketQuery, TicketQueryError, WorkerPoolSnapshot,
+    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, Repository, TicketQuery,
+    TicketQueryError, WorkerPoolSnapshot,
 };
 
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
@@ -25,25 +25,12 @@ pub(crate) fn configured_ticket_query(
     runtime: AgentRuntime,
 ) -> Result<Box<dyn TicketQuery>, TicketQueryError> {
     match tickets.source {
-        TicketSource::Linear => Ok(Box::new(linear_query(workspace, runtime))),
+        TicketSource::Linear => Ok(Box::new(AgentRuntimeQuery::new(runtime, workspace))),
         TicketSource::Local => Ok(Box::new(LocalMarkdownQuery::new(
             workspace.join(&tickets.local.root),
             tickets.local.ready_status.clone(),
             tickets.local.resolved_status.clone(),
         ))),
-    }
-}
-
-/// The `source = "linear"` query: the Agent Runtime's native Linear access,
-/// unchanged from the runtime-shaped path it replaces.
-fn linear_query(workspace: &Path, runtime: AgentRuntime) -> AgentRuntimeQuery {
-    let query = AgentRuntimeQuery::new(runtime, workspace);
-    if runtime != AgentRuntime::Pi {
-        return query;
-    }
-    match std::env::var_os(PI_DISCOVERY_HELPER_ENV).filter(|executable| !executable.is_empty()) {
-        Some(executable) => query.with_pi_helper(PiDiscoveryHelper::new(executable)),
-        None => query,
     }
 }
 
@@ -103,31 +90,12 @@ mod tests {
     }
 
     #[test]
-    fn the_linear_source_is_byte_for_byte_the_agent_runtime_query() {
-        let workspace = Path::new("/tmp/jjfx-ticket-source");
-        // The runtime-shaped query the linear source replaced, unchanged: the
-        // source decision moved to config, not the query itself.
-        for runtime in [
-            AgentRuntime::Claude,
-            AgentRuntime::Codex,
-            AgentRuntime::OpenCode,
-        ] {
-            assert_eq!(
-                linear_query(workspace, runtime),
-                AgentRuntimeQuery::new(runtime, workspace),
-                "{runtime}"
-            );
-        }
-    }
-
-    #[test]
     fn the_configured_linear_source_is_constructible_for_every_runtime() {
         let workspace = Path::new("/tmp/jjfx-ticket-source");
         for runtime in [
             AgentRuntime::Claude,
             AgentRuntime::Codex,
             AgentRuntime::OpenCode,
-            AgentRuntime::Pi,
         ] {
             assert!(
                 configured_ticket_query(workspace, &linear(), runtime).is_ok(),
@@ -145,7 +113,6 @@ mod tests {
             AgentRuntime::Claude,
             AgentRuntime::Codex,
             AgentRuntime::OpenCode,
-            AgentRuntime::Pi,
         ] {
             assert!(
                 configured_ticket_query(workspace, &local(), runtime).is_ok(),

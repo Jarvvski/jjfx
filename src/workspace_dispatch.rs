@@ -1500,14 +1500,8 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env;
-    use std::fs;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use tempfile::TempDir;
-
-    const PI_HELPER_REPOSITORY: &str = "JJFX_TEST_PI_HELPER_REPOSITORY";
-    const PI_HELPER_RESULT: &str = "JJFX_TEST_PI_HELPER_RESULT";
 
     fn empty_snapshot() -> WorkerPoolSnapshot {
         let directory = TempDir::new().expect("temporary repository");
@@ -1526,114 +1520,6 @@ mod tests {
         crate::engine::Repository::open(directory.path())
             .expect("repository should open")
             .read_worker_pool_snapshot()
-    }
-
-    fn pi_repository() -> (TempDir, crate::engine::Repository) {
-        let directory = TempDir::new().expect("temporary repository");
-        let output = Command::new("jj")
-            .args([
-                "--config",
-                "signing.behavior=drop",
-                "git",
-                "init",
-                "--no-colocate",
-            ])
-            .arg(directory.path())
-            .output()
-            .expect("jj should be installed");
-        assert!(output.status.success());
-        let repository =
-            crate::engine::Repository::open(directory.path()).expect("repository opens");
-        repository
-            .worker_pool()
-            .resize_to(PoolCapacity::new(1).expect("Pool capacity"))
-            .expect("Worker Pool grows");
-        let state_repository = repository.state_store().pool();
-        let loaded = match state_repository.load().expect("Pool state") {
-            crate::engine::Loaded::Present(versioned) => versioned,
-            crate::engine::Loaded::Missing => panic!("Pool state should exist"),
-        };
-        let (mut state, revision) = loaded.into_parts();
-        state.agent = Some(crate::engine::WireAgent::new(AgentRuntime::Pi.as_str()));
-        let outcome = state_repository
-            .commit(
-                crate::engine::Expected::Match(revision),
-                crate::engine::StateChange::Replace(state),
-            )
-            .expect("configured Pool runtime");
-        assert!(matches!(outcome, crate::engine::CommitOutcome::Applied(_)));
-        (directory, repository)
-    }
-
-    fn write_executable(path: &std::path::Path, body: &str) {
-        fs::write(path, body).expect("write helper executable");
-        let mut permissions = fs::metadata(path).expect("helper metadata").permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions).expect("helper permissions");
-    }
-
-    #[test]
-    fn real_workspace_dispatch_uses_pi_helper_configuration_before_pool_mutation() {
-        let (directory, repository) = pi_repository();
-        let helper = directory.path().join("pi-linear-helper");
-        let request = directory.path().join("pi-linear-request.json");
-        let result = directory.path().join("pi-linear-result");
-        write_executable(
-            &helper,
-            &format!(
-                "#!/bin/sh\ncat > '{}'\nprintf '%s\\n' '{{\"version\":1,\"result\":{{\"tickets\":[]}}}}'\n",
-                request.display(),
-            ),
-        );
-
-        let output = Command::new(env::current_exe().expect("test executable"))
-            .args(["real_workspace_dispatch_pi_helper", "--ignored"])
-            .env(PI_HELPER_REPOSITORY, repository.root())
-            .env(PI_HELPER_RESULT, &result)
-            .env("JJFX_PI_LINEAR_HELPER", &helper)
-            .output()
-            .expect("TUI adapter helper should run");
-
-        assert!(
-            output.status.success(),
-            "TUI adapter helper failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert_eq!(fs::read_to_string(result).expect("adapter result"), "0");
-        assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
-                &fs::read_to_string(request).expect("captured helper request")
-            )
-            .expect("valid helper request"),
-            serde_json::json!({
-                "version": 1,
-                "operation": "ready_tickets",
-                "label": "ready-for-agent",
-                "status": "Todo",
-            }),
-        );
-        let snapshot = repository.worker_pool().snapshot();
-        assert!(
-            snapshot.workers().iter().all(|worker| {
-                worker.status() == WorkerStatus::Idle && worker.ticket().is_none()
-            })
-        );
-    }
-
-    #[test]
-    #[ignore]
-    fn real_workspace_dispatch_pi_helper() {
-        let adapter = RealWorkspaceDispatch::new(
-            env::var_os(PI_HELPER_REPOSITORY).expect("helper repository"),
-        );
-        let ready = adapter
-            .discover_ready("ready-for-agent")
-            .expect("Pi TUI discovery");
-        fs::write(
-            env::var_os(PI_HELPER_RESULT).expect("helper result"),
-            ready.tickets().len().to_string(),
-        )
-        .expect("write helper result");
     }
 
     #[test]

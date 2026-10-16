@@ -28,4 +28,8 @@ envelope normalizes Pi event names and includes explicit agent and session
 identity; provider-specific extension payloads do not enter the Rust lifecycle
 model. Installation writes only the jjfx-owned auto-discovered extension file.
 
-Status: accepted (Pi amendment implemented by issue 05)
+**Removed 2026-10-16.** The Pi Agent Runtime was removed, so this amendment no
+longer describes shipped behaviour; Claude Code and Codex use the dumb append
+hooks and OpenCode uses an owned plugin.
+
+Status: accepted (Pi amendment implemented by issue 05, removed 2026-10-16)

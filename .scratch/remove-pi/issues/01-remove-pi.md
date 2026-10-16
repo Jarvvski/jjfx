@@ -1,6 +1,6 @@
 # Remove the Pi Agent Runtime
 
-Status: ready-for-agent
+Status: resolved
 
 ## Problem Statement
 
@@ -107,3 +107,11 @@ only real costs are the multiplier on future work and the ageing adapter pin. Th
 owner's decision was "keep it for now - make a ticket to remove", so this ticket
 exists to hold that decision and the survey above rather than to ask for the work
 now. If it is picked up, expect a large, deletion-heavy diff and a review pass.
+
+**Resolved 2026-10-16.** The Pi Agent Runtime is gone: `AgentRuntime::Pi`, its probe, log/session parsers, event/tool/usage types, the `JJFX_PI_LINEAR_HELPER` discovery path, the Pi hook transport, the TUI's violet styling, and the whole `pi-mcp-adapter` preflight seam are removed. Claude, Codex and opencode are unchanged, and their hooks, discovery and dispatch tests still pass.
+
+Persisted state is handled deliberately. `AgentRuntime::from_configured` rejects a `pi` value with `the Pi Agent Runtime (<value>) was removed; choose claude, codex, or opencode with \`jjfx pool profile <runtime>\``, so a pool profile or Worker recorded as `pi` fails with a message naming the removal rather than a bare parse error. `reconcile_runs` finalizes a Worker still recorded under `pi` as `failed` with that message instead of leaving it stranded `busy`. Both paths are covered by tests.
+
+`docs/pi-workers.md` and its README link are deleted, as are the Pi tests and fixtures (including `tests/fixtures/compatibility/worker-done-pi.json`), and `momo break` records the incompatible change.
+
+**Deviation.** Solution step 6 asks to amend `docs/wsg-compatibility-contract.md`, but that file (and `tests/compatibility_contract.rs`) was already deleted when the wsg compatibility binary was eliminated, so there is nothing left to amend. No surviving doc or fixture pins Pi, so the compatibility-contract criterion is satisfied vacuously.

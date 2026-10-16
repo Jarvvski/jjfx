@@ -1,8 +1,7 @@
 //! Agent Runtime identity and execution capability probing.
 
-use std::env;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -14,7 +13,6 @@ use std::time::{Duration, Instant};
 use rustix::process::{
     Pid, Signal, getpgid, kill_process_group, test_kill_process, test_kill_process_group,
 };
-use serde::Deserialize;
 use thiserror::Error;
 
 use crate::engine::pool::RunClearing;
@@ -26,38 +24,38 @@ use crate::engine::{
 const PROCESS_GROUP_GRACE: Duration = Duration::from_secs(1);
 const PROCESS_GROUP_POLL: Duration = Duration::from_millis(10);
 const PROCESS_GROUP_FORCE_TIMEOUT: Duration = Duration::from_secs(1);
-const PI_MCP_ADAPTER_NAME: &str = "pi-mcp-adapter";
-const PI_MCP_ADAPTER_VERSION: &str = "2.11.0";
-const PI_MCP_ADAPTER_ENTRY: &str = "index.ts";
-const PI_PROFILE_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-const PI_PROFILE_PROBE_OUTPUT_ENV: &str = "JJFX_PI_PROFILE_PROBE_OUTPUT";
-const PI_LINEAR_TOOLS: [&str; 3] = [
-    "linear_get_issue",
-    "linear_update_issue",
-    "linear_create_comment",
-];
-const PI_DIRECT_DISPATCH_GUIDANCE: &str = "Linear delivery tools are direct Pi tools for this Run. Call linear_get_issue directly to fetch the Ticket, linear_update_issue directly to change status or assignee, and linear_create_comment directly to post delivery notes. Do not look for an MCP wrapper or another tool namespace.";
+/// The persisted spelling of the Pi Agent Runtime before it was removed.
+///
+/// The compatibility contract fixed `pi` as a canonical Worker runtime value,
+/// so a pool or Worker that still carries it must be rejected with a clear
+/// message rather than a bare parse error, and reconciled rather than left
+/// stranded `busy`.
+pub(crate) const REMOVED_PI_RUNTIME: &str = "pi";
 const CLAUDE_DISPATCH_GUIDANCE: &str = "Linear delivery tools are available as the mcp__claude_ai_Linear__get_issue, mcp__claude_ai_Linear__update_issue, and mcp__claude_ai_Linear__create_comment MCP tools when this session has them. Use them to update status or post delivery notes; if they are unavailable, continue the implementation and note it - do not stop.";
 const NEUTRAL_DISPATCH_GUIDANCE: &str = "Use your configured Linear/MCP delivery tools to update status or post delivery notes when they are available. If they are unavailable, continue the implementation and note it - do not stop.";
-const PI_PROFILE_PROBE_EXTENSION: &str = r#"import { writeFileSync } from "node:fs";
-export default function (pi) {
-  pi.on("session_start", () => {
-    const output = process.env.JJFX_PI_PROFILE_PROBE_OUTPUT;
-    if (!output) throw new Error("missing profile output path");
-    writeFileSync(output, JSON.stringify({
-      allTools: pi.getAllTools(),
-      activeTools: pi.getActiveTools(),
-    }));
-  });
-}
-"#;
 const DELEGATION_RULES: &str = "Delegated work is read-only.\n\n- Use in-session background tasks or subagents only for independent exploration, documentation lookup, test or log analysis, or review.\n- Explicitly tell every subagent not to edit tracked files or run jj commands.\n- Do not use detached sessions, nested delegation, or worktree or workspace creation.\n- Await all delegated work before finishing.\n- If delegation is unavailable or fails, continue the work directly.\n- The main agent alone owns tracked edits, jj operations, verification, and delivery.";
+
+/// Whether a persisted Agent Runtime value names the removed Pi runtime.
+///
+/// Normalizes exactly as [`AgentRuntime::from_configured`] does, so a value it
+/// would have selected as Pi is recognized here too.
+pub(crate) fn is_removed_runtime(value: &str) -> bool {
+    value.trim().eq_ignore_ascii_case(REMOVED_PI_RUNTIME)
+}
+
+/// The clear, actionable message for a persisted value that names the removed
+/// Pi Agent Runtime.
+pub(crate) fn removed_runtime_message(value: &str) -> String {
+    format!(
+        "the Pi Agent Runtime ({}) was removed; choose claude, codex, or opencode with `jjfx pool profile <runtime>`",
+        value.trim()
+    )
+}
 
 /// The Linear delivery guidance prepended to a TicketDelivery prompt, matched to
 /// the tools the selected Agent Runtime actually exposes.
 fn ticket_delivery_guidance(runtime: AgentRuntime) -> &'static str {
     match runtime {
-        AgentRuntime::Pi => PI_DIRECT_DISPATCH_GUIDANCE,
         AgentRuntime::Claude => CLAUDE_DISPATCH_GUIDANCE,
         AgentRuntime::Codex | AgentRuntime::OpenCode => NEUTRAL_DISPATCH_GUIDANCE,
     }
@@ -70,8 +68,6 @@ pub enum AgentRuntime {
     Claude,
     /// OpenAI's Codex runtime.
     Codex,
-    /// The Pi coding-agent runtime.
-    Pi,
     /// OpenCode's multi-provider coding-agent runtime.
     OpenCode,
 }
@@ -92,7 +88,7 @@ impl AgentModel {
         }
     }
 
-    /// Adds the provider required by runtimes such as Pi.
+    /// Adds the provider a runtime needs alongside the model.
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = Some(provider.into());
         self
@@ -258,7 +254,6 @@ pub struct AgentRuntimeInvocation {
     model: Option<AgentModel>,
     max_budget_usd: Option<u32>,
     session_id: Option<String>,
-    session_directory: Option<PathBuf>,
     name: Option<String>,
     agent: Option<String>,
     system_prompt: Option<String>,
@@ -273,7 +268,6 @@ impl AgentRuntimeInvocation {
             model: None,
             max_budget_usd: None,
             session_id: None,
-            session_directory: None,
             name: None,
             agent: None,
             system_prompt: None,
@@ -295,13 +289,6 @@ impl AgentRuntimeInvocation {
     /// Adds an Agent Session to resume.
     pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
         self.session_id = Some(session_id.into());
-        self
-    }
-
-    /// Selects the private session directory used by runtimes that persist
-    /// session state outside the Worker Run log.
-    pub fn with_session_directory(mut self, directory: impl Into<PathBuf>) -> Self {
-        self.session_directory = Some(directory.into());
         self
     }
 
@@ -420,13 +407,7 @@ impl RunSupervisor {
                 source,
             })?;
         let log = Arc::new(Mutex::new(log));
-        let agent = request
-            .runtime
-            .command(&request.invocation, capabilities)
-            .map_err(|source| RunSupervisorError::Command {
-                runtime: request.runtime,
-                source,
-            })?;
+        let agent = request.runtime.command(&request.invocation, capabilities);
         // A foreground Run owns its process group exactly like a background Run,
         // so a failed launch and a cross-process Reset can end its whole tree with
         // one group signal instead of leaking agent descendants. Owning its own
@@ -808,13 +789,7 @@ impl RunSupervisor {
                 path: request.log_path.clone(),
                 source,
             })?;
-        let mut command = request
-            .runtime
-            .command(&request.invocation, capabilities)
-            .map_err(|source| RunSupervisorError::Command {
-                runtime: request.runtime,
-                source,
-            })?;
+        let mut command = request.runtime.command(&request.invocation, capabilities);
         command
             .current_dir(&request.workspace)
             .stdin(Stdio::null())
@@ -989,15 +964,6 @@ pub enum RunSupervisorError {
     /// The Agent Runtime capability probe could not start.
     #[error(transparent)]
     Probe(#[from] AgentRuntimeProbeError),
-    /// The selected runtime rejected its typed invocation before spawning.
-    #[error("cannot build {runtime} Run command: {source}")]
-    Command {
-        /// Runtime whose command could not be built.
-        runtime: AgentRuntime,
-        /// Command validation failure.
-        #[source]
-        source: AgentRuntimeCommandError,
-    },
     /// The shared Run log could not be created or truncated.
     #[error("cannot create foreground Run log {path}: {source}")]
     Log {
@@ -1170,7 +1136,7 @@ fn reserved_request(reservation: &Reservation, invocation: AgentRuntimeInvocatio
     let repository = reservation.repository();
     RunRequest::new(
         reservation.agent_runtime(),
-        invocation.with_session_directory(repository.root().join(".jj/pool").join("pi-sessions")),
+        invocation,
         crate::engine::workspace::worker_path(repository.root(), &worker_id),
         repository
             .root()
@@ -1488,24 +1454,30 @@ impl AgentRuntime {
         match value.as_str() {
             "claude" => Some(Self::Claude),
             "codex" => Some(Self::Codex),
-            "pi" => Some(Self::Pi),
             "opencode" => Some(Self::OpenCode),
             _ => None,
         }
     }
 
     /// Selects the configured runtime, defaulting legacy pools to Claude.
+    ///
+    /// The error is a complete, actionable message: a removed runtime names the
+    /// removal, and an unknown one names the value and the supported set.
     pub fn from_configured(value: Option<&WireAgent>) -> Result<Self, String> {
         let configured = value.map_or("", WireAgent::as_str).trim();
         if configured.is_empty() {
             return Ok(Self::Claude);
         }
+        if is_removed_runtime(configured) {
+            return Err(removed_runtime_message(configured));
+        }
         match configured.to_ascii_lowercase().as_str() {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
-            "pi" => Ok(Self::Pi),
             "opencode" => Ok(Self::OpenCode),
-            _ => Err(configured.to_owned()),
+            _ => Err(format!(
+                "invalid configured Agent Runtime {configured:?} (expected claude, codex, or opencode)"
+            )),
         }
     }
 
@@ -1514,7 +1486,6 @@ impl AgentRuntime {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::Pi => "pi",
             Self::OpenCode => "opencode",
         }
     }
@@ -1527,54 +1498,12 @@ impl AgentRuntime {
         self,
         invocation: &AgentRuntimeInvocation,
         capabilities: AgentRuntimeCapabilities,
-    ) -> Result<Command, AgentRuntimeCommandError> {
+    ) -> Command {
         match self {
-            Self::Claude => Ok(claude_command(invocation, capabilities)),
-            Self::Codex => Ok(codex_command(invocation, capabilities)),
-            Self::Pi => pi_command(invocation),
-            Self::OpenCode => Ok(opencode_command(invocation)),
+            Self::Claude => claude_command(invocation, capabilities),
+            Self::Codex => codex_command(invocation, capabilities),
+            Self::OpenCode => opencode_command(invocation),
         }
-    }
-
-    pub(crate) fn preflight_dispatch(
-        self,
-        model: Option<&AgentModel>,
-        workspace: &Path,
-    ) -> Result<(), AgentRuntimePreflightError> {
-        self.preflight_dispatch_input(model)?;
-        self.preflight_dispatch_environment(workspace)
-    }
-
-    pub(crate) fn preflight_dispatch_input(
-        self,
-        model: Option<&AgentModel>,
-    ) -> Result<(), AgentRuntimePreflightError> {
-        if self == Self::Pi {
-            let model = model
-                .filter(|model| !model.model().trim().is_empty())
-                .ok_or_else(|| {
-                    AgentRuntimePreflightError::invalid_input("pi command requires a model")
-                })?;
-            if model
-                .provider()
-                .is_none_or(|provider| provider.trim().is_empty())
-            {
-                return Err(AgentRuntimePreflightError::invalid_input(
-                    "pi command requires a model provider",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn preflight_dispatch_environment(
-        self,
-        workspace: &Path,
-    ) -> Result<(), AgentRuntimePreflightError> {
-        if self == Self::Pi {
-            PiDispatchProfile::load()?.preflight(workspace)?;
-        }
-        Ok(())
     }
 
     /// Probes this runtime in `workspace`, requiring its executable to start.
@@ -1582,13 +1511,9 @@ impl AgentRuntime {
         self,
         workspace: impl AsRef<Path>,
     ) -> Result<AgentRuntimeCapabilities, AgentRuntimeProbeError> {
-        if self == Self::Pi {
-            return probe_pi(workspace.as_ref());
-        }
         let (arguments, capability) = match self {
             Self::Claude => (["--help"].as_slice(), Capability::ForwardSubagentText),
             Self::Codex => (["features", "list"].as_slice(), Capability::MultiAgent),
-            Self::Pi => unreachable!("Pi probes through probe_pi"),
             Self::OpenCode => (["--version"].as_slice(), Capability::ForwardSubagentText),
         };
         let output = Command::new(self.as_str())
@@ -1619,253 +1544,6 @@ impl AgentRuntime {
         Ok(AgentRuntimeCapabilities::from(capability, supported))
     }
 }
-
-#[derive(Debug, Deserialize)]
-struct PiPackageManifest {
-    name: String,
-    version: String,
-}
-
-#[derive(Debug)]
-struct PiDispatchProfile {
-    package: PathBuf,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct PiProfileProbe {
-    all_tools: Vec<PiProfileTool>,
-    active_tools: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct PiProfileTool {
-    name: String,
-    parameters: serde_json::Value,
-}
-
-impl PiDispatchProfile {
-    fn package_path() -> Result<PathBuf, PiDispatchProfileError> {
-        let agent_directory = env::var_os("PI_CODING_AGENT_DIR")
-            .filter(|directory| !directory.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| {
-                env::var_os("HOME")
-                    .filter(|home| !home.is_empty())
-                    .map(|home| PathBuf::from(home).join(".pi/agent"))
-            })
-            .ok_or(PiDispatchProfileError::MissingPiAgentDirectory)?;
-        Ok(agent_directory
-            .join("npm/node_modules")
-            .join(PI_MCP_ADAPTER_NAME))
-    }
-
-    fn load() -> Result<Self, PiDispatchProfileError> {
-        let package = Self::package_path()?;
-        let manifest_path = package.join("package.json");
-        let manifest = fs::read(&manifest_path).map_err(|source| {
-            if source.kind() == io::ErrorKind::NotFound {
-                PiDispatchProfileError::MissingPiMcpAdapter {
-                    version: PI_MCP_ADAPTER_VERSION,
-                }
-            } else {
-                PiDispatchProfileError::ReadPiMcpAdapterManifest { source }
-            }
-        })?;
-        let manifest: PiPackageManifest = serde_json::from_slice(&manifest)
-            .map_err(|source| PiDispatchProfileError::MalformedPiMcpAdapterManifest { source })?;
-        if manifest.name != PI_MCP_ADAPTER_NAME || manifest.version != PI_MCP_ADAPTER_VERSION {
-            return Err(PiDispatchProfileError::UnsupportedPiMcpAdapter {
-                found_name: manifest.name,
-                found_version: manifest.version,
-                required_version: PI_MCP_ADAPTER_VERSION,
-            });
-        }
-        if !package.join(PI_MCP_ADAPTER_ENTRY).is_file() {
-            return Err(PiDispatchProfileError::MissingPiMcpAdapter {
-                version: PI_MCP_ADAPTER_VERSION,
-            });
-        }
-        Ok(Self { package })
-    }
-
-    fn preflight(&self, workspace: &Path) -> Result<(), PiDispatchProfileError> {
-        let mut probe_extension = tempfile::NamedTempFile::new()
-            .map_err(|source| PiDispatchProfileError::PreparePiProfileProbe { source })?;
-        probe_extension
-            .write_all(PI_PROFILE_PROBE_EXTENSION.as_bytes())
-            .map_err(|source| PiDispatchProfileError::PreparePiProfileProbe { source })?;
-        let probe_output = tempfile::NamedTempFile::new()
-            .map_err(|source| PiDispatchProfileError::PreparePiProfileProbe { source })?;
-        let mut command = Command::new(AgentRuntime::Pi.as_str());
-        command.args([
-            "--mode",
-            "rpc",
-            "--no-session",
-            "--no-extensions",
-            "--extension",
-        ]);
-        command.arg(self.package.join(PI_MCP_ADAPTER_ENTRY));
-        command.arg("--extension").arg(probe_extension.path());
-        command.args([
-            "--no-skills",
-            "--no-prompt-templates",
-            "--no-themes",
-            "--no-context-files",
-            "--no-approve",
-            "--tools",
-            PI_DISPATCH_TOOLS,
-        ]);
-        command
-            .current_dir(workspace)
-            .env(PI_PROFILE_PROBE_OUTPUT_ENV, probe_output.path())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .process_group(0);
-        let mut child = command
-            .spawn()
-            .map_err(|source| PiDispatchProfileError::StartPiProfileProbe { source })?;
-        let deadline = Instant::now() + PI_PROFILE_PROBE_TIMEOUT;
-        let status = loop {
-            if let Some(status) = child
-                .try_wait()
-                .map_err(|source| PiDispatchProfileError::WaitForPiProfileProbe { source })?
-            {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                terminate_profile_probe(&mut child);
-                return Err(PiDispatchProfileError::PiProfileProbeTimeout);
-            }
-            thread::sleep(PROCESS_GROUP_POLL);
-        };
-        if !status.success() {
-            return Err(PiDispatchProfileError::PiProfileProbeFailed {
-                status: status.code(),
-            });
-        }
-        let output = fs::read(probe_output.path())
-            .map_err(|source| PiDispatchProfileError::ReadPiProfileProbe { source })?;
-        let probe: PiProfileProbe = serde_json::from_slice(&output)
-            .map_err(|source| PiDispatchProfileError::MalformedPiProfileProbe { source })?;
-        for required in PI_LINEAR_TOOLS {
-            if !probe.all_tools.iter().any(|tool| tool.name == required) {
-                return Err(PiDispatchProfileError::MissingPiLinearTool { tool: required });
-            }
-            if !probe.active_tools.iter().any(|tool| tool == required) {
-                return Err(PiDispatchProfileError::InactivePiLinearTool { tool: required });
-            }
-        }
-        let get_issue = profile_tool(&probe, "linear_get_issue");
-        require_profile_string_property(get_issue, "id")?;
-        let update_issue = profile_tool(&probe, "linear_update_issue");
-        require_profile_string_property(update_issue, "id")?;
-        require_profile_string_property(update_issue, "assignee")?;
-        if !profile_string_property(update_issue, "status")
-            && !profile_string_property(update_issue, "state")
-        {
-            return Err(PiDispatchProfileError::IncompatiblePiLinearTool {
-                tool: "linear_update_issue",
-                requirement: "string status or state",
-            });
-        }
-        let create_comment = profile_tool(&probe, "linear_create_comment");
-        require_profile_string_property(create_comment, "issueId")?;
-        require_profile_string_property(create_comment, "body")?;
-        Ok(())
-    }
-}
-
-fn profile_tool<'a>(probe: &'a PiProfileProbe, name: &'static str) -> &'a PiProfileTool {
-    probe
-        .all_tools
-        .iter()
-        .find(|tool| tool.name == name)
-        .expect("required Pi profile tool was checked before schema validation")
-}
-
-fn require_profile_string_property(
-    tool: &PiProfileTool,
-    property: &'static str,
-) -> Result<(), PiDispatchProfileError> {
-    if profile_string_property(tool, property) {
-        return Ok(());
-    }
-    Err(PiDispatchProfileError::IncompatiblePiLinearTool {
-        tool: match tool.name.as_str() {
-            "linear_get_issue" => "linear_get_issue",
-            "linear_update_issue" => "linear_update_issue",
-            "linear_create_comment" => "linear_create_comment",
-            _ => unreachable!("only required Pi profile tools are validated"),
-        },
-        requirement: match property {
-            "id" => "string id",
-            "assignee" => "string assignee",
-            "issueId" => "string issueId",
-            "body" => "string body",
-            _ => unreachable!("only required Pi profile properties are validated"),
-        },
-    })
-}
-
-fn profile_string_property(tool: &PiProfileTool, property: &str) -> bool {
-    if tool
-        .parameters
-        .get("type")
-        .and_then(serde_json::Value::as_str)
-        != Some("object")
-    {
-        return false;
-    }
-    tool.parameters
-        .get("properties")
-        .and_then(serde_json::Value::as_object)
-        .and_then(|properties| properties.get(property))
-        .is_some_and(schema_accepts_string)
-}
-
-fn schema_accepts_string(schema: &serde_json::Value) -> bool {
-    match schema.get("type") {
-        Some(serde_json::Value::String(value)) if value == "string" => true,
-        Some(serde_json::Value::Array(values)) => values.iter().any(|value| value == "string"),
-        _ => ["anyOf", "oneOf"].iter().any(|keyword| {
-            schema
-                .get(keyword)
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|choices| choices.iter().any(schema_accepts_string))
-        }),
-    }
-}
-
-fn terminate_profile_probe(child: &mut Child) {
-    if let Some(pid) = recorded_pid(child.id()) {
-        let _ = terminate_process_group(pid, PROCESS_GROUP_GRACE);
-    } else {
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
-const PI_WORKER_TOOLS: &str = "read,bash,edit,write,grep,find,ls";
-const PI_DISPATCH_TOOLS: &str =
-    "read,bash,edit,write,grep,find,ls,linear_get_issue,linear_update_issue,linear_create_comment";
-const PI_REQUIRED_FLAGS: &[&str] = &[
-    "--mode",
-    "--provider",
-    "--model",
-    "--session",
-    "--session-dir",
-    "--system-prompt",
-    "--name",
-    "--tools",
-    "--no-extensions",
-    "--no-skills",
-    "--no-prompt-templates",
-    "--no-themes",
-    "--no-context-files",
-    "--no-approve",
-];
 
 fn claude_command(
     invocation: &AgentRuntimeInvocation,
@@ -1955,52 +1633,6 @@ fn codex_command(
     command
 }
 
-fn pi_command(invocation: &AgentRuntimeInvocation) -> Result<Command, AgentRuntimeCommandError> {
-    if invocation.max_budget_usd.is_some() {
-        return Err(AgentRuntimeCommandError::UnsupportedBudget {
-            runtime: AgentRuntime::Pi,
-        });
-    }
-    let (provider, model) = pi_provider_and_model(invocation.model.as_ref())?;
-    let session_directory = required_pi_session_directory(invocation.session_directory.as_deref())?;
-    let (system_prompt, prompt) = invocation.session_prompts(AgentRuntime::Pi);
-    let mut command = Command::new(AgentRuntime::Pi.as_str());
-    command.args([
-        "--mode",
-        "json",
-        "--provider",
-        provider,
-        "--model",
-        model,
-        "--session-dir",
-    ]);
-    command.arg(session_directory);
-    if invocation.profile == AgentRuntimeInvocationProfile::TicketDelivery {
-        let package = PiDispatchProfile::package_path().map_err(|error| {
-            AgentRuntimeCommandError::InvalidDispatchProfile {
-                detail: error.to_string(),
-            }
-        })?;
-        add_pi_worker_policy(&mut command, Some(&package.join(PI_MCP_ADAPTER_ENTRY)));
-    } else {
-        add_pi_worker_policy(&mut command, None);
-    }
-    if let Some(name) = invocation.name.as_deref().filter(|name| !name.is_empty()) {
-        command.args(["--name", name]);
-    }
-    if let Some(session_id) = invocation
-        .session_id
-        .as_deref()
-        .filter(|session_id| !session_id.is_empty())
-    {
-        command.args(["--session", session_id]);
-    } else if let Some(system_prompt) = system_prompt.as_deref() {
-        command.args(["--system-prompt", system_prompt]);
-    }
-    command.arg(&prompt);
-    Ok(command)
-}
-
 fn opencode_command(invocation: &AgentRuntimeInvocation) -> Command {
     let (system_prompt, prompt) = invocation.session_prompts(AgentRuntime::OpenCode);
     let mut command = Command::new(AgentRuntime::OpenCode.as_str());
@@ -2043,131 +1675,6 @@ fn opencode_command(invocation: &AgentRuntimeInvocation) -> Command {
     command
 }
 
-pub(crate) fn pi_interactive_command(
-    model: Option<&AgentModel>,
-    session_directory: &Path,
-    session_id: Option<&str>,
-) -> Result<Command, AgentRuntimeCommandError> {
-    let (provider, model) = pi_provider_and_model(model)?;
-    let session_directory = required_pi_session_directory(Some(session_directory))?;
-    let mut command = Command::new(AgentRuntime::Pi.as_str());
-    command.args(["--provider", provider, "--model", model, "--session-dir"]);
-    command.arg(session_directory);
-    add_pi_worker_policy(&mut command, None);
-    if let Some(session_id) = session_id.filter(|session_id| !session_id.is_empty()) {
-        command.args(["--session", session_id]);
-    }
-    Ok(command)
-}
-
-fn pi_provider_and_model(
-    model: Option<&AgentModel>,
-) -> Result<(&str, &str), AgentRuntimeCommandError> {
-    let model = model
-        .filter(|model| !model.model().trim().is_empty())
-        .ok_or(AgentRuntimeCommandError::MissingModel {
-            runtime: AgentRuntime::Pi,
-        })?;
-    let provider = model
-        .provider()
-        .filter(|provider| !provider.trim().is_empty())
-        .ok_or(AgentRuntimeCommandError::MissingProvider {
-            runtime: AgentRuntime::Pi,
-        })?;
-    Ok((provider, model.model()))
-}
-
-fn required_pi_session_directory(
-    session_directory: Option<&Path>,
-) -> Result<&Path, AgentRuntimeCommandError> {
-    session_directory
-        .filter(|directory| !directory.as_os_str().is_empty())
-        .ok_or(AgentRuntimeCommandError::MissingSessionDirectory)
-}
-
-fn add_pi_worker_policy(command: &mut Command, dispatch_package: Option<&Path>) {
-    command.arg("--no-extensions");
-    if let Some(package) = dispatch_package {
-        command.arg("--extension").arg(package);
-    }
-    command.args([
-        "--no-skills",
-        "--no-prompt-templates",
-        "--no-themes",
-        "--no-context-files",
-        "--no-approve",
-        "--tools",
-        dispatch_package.map_or(PI_WORKER_TOOLS, |_| PI_DISPATCH_TOOLS),
-    ]);
-}
-
-fn probe_pi(workspace: &Path) -> Result<AgentRuntimeCapabilities, AgentRuntimeProbeError> {
-    let version = run_pi_probe(["--version"].as_slice(), workspace, "version")?;
-    let version_text = String::from_utf8_lossy(&version.stdout).trim().to_owned();
-    let mut segments = version_text.split('.');
-    let valid_version = segments.next() == Some("0")
-        && segments.next() == Some("84")
-        && segments
-            .next()
-            .is_some_and(|patch| patch.parse::<u64>().is_ok());
-    if !valid_version {
-        return Err(AgentRuntimeProbeError::MalformedCapabilities {
-            runtime: AgentRuntime::Pi,
-            detail: format!("unsupported version output {version_text:?}"),
-        });
-    }
-    let help = run_pi_probe(["--help"].as_slice(), workspace, "help")?;
-    let help_text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&help.stdout),
-        String::from_utf8_lossy(&help.stderr)
-    );
-    if let Some(flag) = PI_REQUIRED_FLAGS
-        .iter()
-        .find(|flag| !help_text.contains(**flag))
-    {
-        return Err(AgentRuntimeProbeError::Unsupported {
-            runtime: AgentRuntime::Pi,
-            capability: (*flag).to_owned(),
-        });
-    }
-    Ok(AgentRuntimeCapabilities::default())
-}
-
-fn run_pi_probe(
-    arguments: &[&str],
-    workspace: &Path,
-    operation: &'static str,
-) -> Result<std::process::Output, AgentRuntimeProbeError> {
-    let output = Command::new(AgentRuntime::Pi.as_str())
-        .args(arguments)
-        .current_dir(workspace)
-        .output()
-        .map_err(|source| {
-            if source.kind() == io::ErrorKind::NotFound {
-                AgentRuntimeProbeError::ExecutableNotFound {
-                    runtime: AgentRuntime::Pi,
-                }
-            } else {
-                AgentRuntimeProbeError::Spawn {
-                    runtime: AgentRuntime::Pi,
-                    source,
-                }
-            }
-        })?;
-    if output.status.success() {
-        return Ok(output);
-    }
-    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
-    Err(AgentRuntimeProbeError::Failed {
-        runtime: AgentRuntime::Pi,
-        operation,
-        status: output.status.code(),
-        detail,
-    })
-}
-
-#[derive(Debug, Clone, Copy)]
 enum Capability {
     MultiAgent,
     ForwardSubagentText,
@@ -2211,185 +1718,6 @@ impl AgentRuntimeCapabilities {
     pub fn forward_subagent_text(self) -> bool {
         self.forward_subagent_text
     }
-}
-
-/// Errors that prevent a typed Agent Runtime command from being built.
-#[derive(Debug, Error, PartialEq, Eq)]
-pub enum AgentRuntimeCommandError {
-    /// Pi requires a model selection.
-    #[error("{runtime} command requires a model")]
-    MissingModel { runtime: AgentRuntime },
-    /// Pi requires the provider portion of its model selection.
-    #[error("{runtime} command requires a model provider")]
-    MissingProvider { runtime: AgentRuntime },
-    /// Pi runs must be isolated from the user's global session directory.
-    #[error("Pi command requires an explicit session directory")]
-    MissingSessionDirectory,
-    /// Pi has no native aggregate budget command flag.
-    #[error("{runtime} does not support an aggregate budget override")]
-    UnsupportedBudget { runtime: AgentRuntime },
-    /// Pi's explicit Direct Dispatch profile path could not be resolved.
-    #[error("invalid Direct Dispatch runtime profile: {detail}")]
-    InvalidDispatchProfile { detail: String },
-}
-
-/// Provider-neutral categories for runtime profile preflight failures.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentRuntimePreflightErrorKind {
-    /// Caller-supplied runtime inputs are incomplete or invalid.
-    InvalidInput,
-    /// Required runtime configuration is absent or unsupported.
-    Configuration,
-    /// The runtime profile could not be prepared or executed.
-    RuntimeUnavailable,
-    /// The runtime profile exceeded its fixed deadline.
-    Timeout,
-    /// The runtime returned malformed profile metadata.
-    Protocol,
-    /// The runtime profile lacks a required delivery capability.
-    Capability,
-}
-
-/// A provider-neutral runtime profile preflight failure.
-#[derive(Debug, Error)]
-#[error("{detail}")]
-pub struct AgentRuntimePreflightError {
-    kind: AgentRuntimePreflightErrorKind,
-    detail: String,
-    #[source]
-    source: Option<Box<dyn std::error::Error + Send + Sync>>,
-}
-
-impl AgentRuntimePreflightError {
-    /// Returns the stable category callers can use without knowing provider details.
-    pub const fn kind(&self) -> AgentRuntimePreflightErrorKind {
-        self.kind
-    }
-
-    fn invalid_input(detail: impl Into<String>) -> Self {
-        Self {
-            kind: AgentRuntimePreflightErrorKind::InvalidInput,
-            detail: detail.into(),
-            source: None,
-        }
-    }
-}
-
-impl From<PiDispatchProfileError> for AgentRuntimePreflightError {
-    fn from(source: PiDispatchProfileError) -> Self {
-        let kind = match &source {
-            PiDispatchProfileError::MissingPiAgentDirectory
-            | PiDispatchProfileError::MissingPiMcpAdapter { .. }
-            | PiDispatchProfileError::UnsupportedPiMcpAdapter { .. } => {
-                AgentRuntimePreflightErrorKind::Configuration
-            }
-            PiDispatchProfileError::ReadPiMcpAdapterManifest { .. }
-            | PiDispatchProfileError::PreparePiProfileProbe { .. }
-            | PiDispatchProfileError::StartPiProfileProbe { .. }
-            | PiDispatchProfileError::WaitForPiProfileProbe { .. }
-            | PiDispatchProfileError::ReadPiProfileProbe { .. } => {
-                AgentRuntimePreflightErrorKind::RuntimeUnavailable
-            }
-            PiDispatchProfileError::PiProfileProbeTimeout => {
-                AgentRuntimePreflightErrorKind::Timeout
-            }
-            PiDispatchProfileError::MalformedPiMcpAdapterManifest { .. }
-            | PiDispatchProfileError::MalformedPiProfileProbe { .. } => {
-                AgentRuntimePreflightErrorKind::Protocol
-            }
-            PiDispatchProfileError::PiProfileProbeFailed { .. }
-            | PiDispatchProfileError::MissingPiLinearTool { .. }
-            | PiDispatchProfileError::InactivePiLinearTool { .. }
-            | PiDispatchProfileError::IncompatiblePiLinearTool { .. } => {
-                AgentRuntimePreflightErrorKind::Capability
-            }
-        };
-        let detail = source.to_string();
-        Self {
-            kind,
-            detail,
-            source: Some(Box::new(source)),
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-enum PiDispatchProfileError {
-    /// Pi's configuration root could not be resolved without guessing.
-    #[error("Pi Direct Dispatch requires PI_CODING_AGENT_DIR or HOME")]
-    MissingPiAgentDirectory,
-    /// The pinned Pi MCP adapter is not installed in Pi's package directory.
-    #[error("Pi Direct Dispatch requires pi-mcp-adapter {version}")]
-    MissingPiMcpAdapter { version: &'static str },
-    /// The installed package manifest could not be read.
-    #[error("cannot read the Pi Direct Dispatch adapter manifest: {source}")]
-    ReadPiMcpAdapterManifest {
-        #[source]
-        source: io::Error,
-    },
-    /// The installed package manifest is not valid JSON.
-    #[error("the Pi Direct Dispatch adapter manifest is malformed: {source}")]
-    MalformedPiMcpAdapterManifest {
-        #[source]
-        source: serde_json::Error,
-    },
-    /// The installed package does not match the pinned profile contract.
-    #[error(
-        "Pi Direct Dispatch requires pi-mcp-adapter {required_version}, found {found_name} {found_version}"
-    )]
-    UnsupportedPiMcpAdapter {
-        found_name: String,
-        found_version: String,
-        required_version: &'static str,
-    },
-    /// The private extension used to inspect Pi tools could not be prepared.
-    #[error("cannot prepare the Pi Direct Dispatch profile probe: {source}")]
-    PreparePiProfileProbe {
-        #[source]
-        source: io::Error,
-    },
-    /// Pi could not start the isolated profile probe.
-    #[error("cannot start the Pi Direct Dispatch profile probe: {source}")]
-    StartPiProfileProbe {
-        #[source]
-        source: io::Error,
-    },
-    /// Pi's isolated profile probe could not be observed to completion.
-    #[error("cannot wait for the Pi Direct Dispatch profile probe: {source}")]
-    WaitForPiProfileProbe {
-        #[source]
-        source: io::Error,
-    },
-    /// Pi's isolated profile probe exceeded its fixed deadline.
-    #[error("Pi Direct Dispatch profile probe timed out after 10 seconds")]
-    PiProfileProbeTimeout,
-    /// Pi rejected the explicit profile without exposing its private diagnostics.
-    #[error("Pi Direct Dispatch profile probe failed{status}", status = status.map_or(String::new(), |status| format!(" with status {status}")))]
-    PiProfileProbeFailed { status: Option<i32> },
-    /// The isolated profile probe result could not be read.
-    #[error("cannot read the Pi Direct Dispatch profile probe result: {source}")]
-    ReadPiProfileProbe {
-        #[source]
-        source: io::Error,
-    },
-    /// The isolated profile probe did not return its versioned tool metadata.
-    #[error("the Pi Direct Dispatch profile probe returned malformed data: {source}")]
-    MalformedPiProfileProbe {
-        #[source]
-        source: serde_json::Error,
-    },
-    /// The configured adapter did not register one required direct Linear tool.
-    #[error("Pi Direct Dispatch requires direct tool {tool}")]
-    MissingPiLinearTool { tool: &'static str },
-    /// A required direct Linear tool was registered but not activated.
-    #[error("Pi Direct Dispatch requires active direct tool {tool}")]
-    InactivePiLinearTool { tool: &'static str },
-    /// A direct Linear tool cannot satisfy the fixed delivery contract.
-    #[error("Pi Direct Dispatch requires direct tool {tool} schema field {requirement}")]
-    IncompatiblePiLinearTool {
-        tool: &'static str,
-        requirement: &'static str,
-    },
 }
 
 /// Errors that prevent an Agent Runtime capability probe from starting.

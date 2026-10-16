@@ -19,7 +19,6 @@ transitions and bounds with size-based rotation.
 | --- | --- | --- |
 | Claude Code | `~/.claude/settings.json` | Append-only JSON hooks |
 | Codex | `~/.codex/hooks.json` | Append-only JSON hooks |
-| Pi | `${PI_CODING_AGENT_DIR:-~/.pi/agent}/extensions/jjfx-lifecycle.ts` | jjfx-owned auto-discovered extension |
 | OpenCode | `${XDG_CONFIG_HOME:-~/.config}/opencode/plugins/jjfx-lifecycle.ts` | jjfx-owned plugin |
 
 The Claude and Codex hook files are both written unconditionally, so changing
@@ -60,20 +59,6 @@ reads the type:
 and `TeammateIdle` are recorded for live progress on long Runs; they never move
 the agent state.
 
-### Pi
-
-jjfx installs an owned, auto-discovered extension. Installation is additive and
-does not modify Pi settings, packages, sessions, project trust, or unrelated
-extensions. A conflicting non-jjfx file at that path is reported and never
-overwritten.
-
-The extension maps Pi session start and settled events to waiting, active agent
-and turn events to working, and graceful session shutdown to ended. Pi does not
-expose a native permission or attention event, so jjfx does not fabricate
-`NeedsAttention` from tool or provider failures. An abruptly terminated Pi
-process may remain waiting until a later lifecycle event because jjfx does not
-infer shutdown by polling or terminal scraping.
-
 ### OpenCode
 
 jjfx installs an owned plugin that writes the same versioned lifecycle contract.
@@ -86,7 +71,7 @@ reporting never interrupts an OpenCode session.
 
 - Installs are idempotent and additive. Existing Claude and Codex hooks are kept;
   the jjfx hook is appended alongside them.
-- Files jjfx owns (the Pi extension and OpenCode plugin) carry a marker and are
+- Files jjfx owns (the OpenCode plugin) carry a marker and are
   updated in place when they are outdated.
 - A conflicting non-jjfx file at an owned path is reported by
   `jjfx hooks status` and never overwritten.

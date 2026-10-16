@@ -1,8 +1,8 @@
 //! `jjfx hooks install` / `jjfx hooks status`: manage lifecycle integrations
-//! for Claude Code, Codex, and Pi (ADR 0002/0004). Claude and Codex use dumb
-//! append-only JSON hooks. Pi uses a jjfx-owned auto-discovered extension that
-//! normalizes its lifecycle events into the same log contract. State-machine
-//! logic remains in Rust (see `agent.rs`).
+//! for Claude Code, Codex, and OpenCode (ADR 0002/0004). Claude and Codex use
+//! dumb append-only JSON hooks; OpenCode uses a jjfx-owned plugin. Every source
+//! normalizes into the same log contract, and state-machine logic remains in
+//! Rust (see `agent.rs`).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -87,16 +87,9 @@ fn targets(paths: &IntegrationPaths) -> Vec<Target> {
 /// Substring that identifies a jjfx-installed hook command, for idempotent
 /// install and status checks.
 const MARKER: &str = "jjfx/events.jsonl";
-const PI_EXTENSION_SOURCE: &str = include_str!("../assets/pi/jjfx-lifecycle.ts");
-const PI_EXTENSION_MARKER: &str = "// jjfx-pi-lifecycle-extension:";
-const PI_EXTENSION_NAME: &str = "lifecycle extension";
 const OPENCODE_PLUGIN_SOURCE: &str = include_str!("../assets/opencode/jjfx-lifecycle.ts");
 const OPENCODE_PLUGIN_MARKER: &str = "// jjfx-opencode-lifecycle-plugin:";
 const OPENCODE_PLUGIN_NAME: &str = "lifecycle plugin";
-
-fn pi_extension_source() -> &'static str {
-    PI_EXTENSION_SOURCE
-}
 
 /// The dumb append command. It resolves the XDG state dir at hook time (matching
 /// [`events::log_path`]), and writes exactly one line via `printf '%s\n'
@@ -126,15 +119,6 @@ fn home_dir() -> PathBuf {
         .unwrap_or_default()
 }
 
-fn pi_extension_path() -> PathBuf {
-    std::env::var_os("PI_CODING_AGENT_DIR")
-        .map(PathBuf::from)
-        .filter(|path| !path.as_os_str().is_empty())
-        .unwrap_or_else(|| home_dir().join(".pi").join("agent"))
-        .join("extensions")
-        .join("jjfx-lifecycle.ts")
-}
-
 fn opencode_plugin_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -146,7 +130,6 @@ fn opencode_plugin_path() -> PathBuf {
 struct IntegrationPaths {
     claude_settings: PathBuf,
     codex_hooks: PathBuf,
-    pi_extension: PathBuf,
     opencode_plugin: PathBuf,
 }
 
@@ -155,7 +138,6 @@ impl IntegrationPaths {
         Self {
             claude_settings: claude_settings_path(),
             codex_hooks: codex_hooks_path(),
-            pi_extension: pi_extension_path(),
             opencode_plugin: opencode_plugin_path(),
         }
     }
@@ -197,14 +179,6 @@ pub fn install() -> anyhow::Result<Vec<InstallOutcome>> {
 }
 
 fn install_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<InstallOutcome>> {
-    let pi_status = pi_extension_status(&paths.pi_extension)?;
-    if !pi_status.conflicting.is_empty() {
-        bail!(
-            "refusing to overwrite non-jjfx Pi extension at {}",
-            paths.pi_extension.display()
-        );
-    }
-
     let command = hook_command();
     let mut outcomes: Vec<InstallOutcome> = targets(paths)
         .into_iter()
@@ -220,7 +194,6 @@ fn install_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<InstallOut
             })
         })
         .collect::<anyhow::Result<_>>()?;
-    outcomes.push(install_pi_extension(&paths.pi_extension)?);
     outcomes.push(install_opencode_plugin(&paths.opencode_plugin)?);
     Ok(outcomes)
 }
@@ -279,53 +252,6 @@ fn install_owned_source(
     })
 }
 
-fn install_pi_extension(path: &Path) -> anyhow::Result<InstallOutcome> {
-    let current = match fs::read_to_string(path) {
-        Ok(source) => Some(source),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    };
-
-    let (added, updated, already) = match current.as_deref() {
-        Some(source) if source == pi_extension_source() => {
-            (Vec::new(), Vec::new(), vec![PI_EXTENSION_NAME.to_owned()])
-        }
-        Some(source) if source.contains(PI_EXTENSION_MARKER) => {
-            write_pi_extension(path)?;
-            (Vec::new(), vec![PI_EXTENSION_NAME.to_owned()], Vec::new())
-        }
-        Some(_) => bail!(
-            "refusing to overwrite non-jjfx Pi extension at {}",
-            path.display()
-        ),
-        None => {
-            write_pi_extension(path)?;
-            (vec![PI_EXTENSION_NAME.to_owned()], Vec::new(), Vec::new())
-        }
-    };
-
-    Ok(InstallOutcome {
-        agent: "pi",
-        added,
-        updated,
-        already,
-    })
-}
-
-fn write_pi_extension(path: &Path) -> anyhow::Result<()> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| anyhow!("Pi extension path has no parent"))?;
-    fs::create_dir_all(dir)
-        .with_context(|| format!("creating Pi extension directory {}", dir.display()))?;
-    let tmp = dir.join(format!("jjfx-lifecycle.{}.tmp", std::process::id()));
-    fs::write(&tmp, pi_extension_source())
-        .with_context(|| format!("writing temporary Pi extension {}", tmp.display()))?;
-    fs::rename(&tmp, path)
-        .with_context(|| format!("installing Pi extension {}", path.display()))?;
-    Ok(())
-}
-
 /// Report, per agent, which events have the jjfx hook and which do not.
 pub fn status() -> anyhow::Result<Vec<StatusReport>> {
     status_with_paths(&IntegrationPaths::from_env())
@@ -358,7 +284,6 @@ fn status_with_paths(paths: &IntegrationPaths) -> anyhow::Result<Vec<StatusRepor
             })
         })
         .collect::<anyhow::Result<_>>()?;
-    reports.push(pi_extension_status(&paths.pi_extension)?);
     reports.push(opencode_plugin_status(&paths.opencode_plugin)?);
     Ok(reports)
 }
@@ -381,30 +306,6 @@ fn opencode_plugin_status(path: &Path) -> anyhow::Result<StatusReport> {
         Ok(_) => report.conflicting.push(OPENCODE_PLUGIN_NAME.to_owned()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             report.missing.push(OPENCODE_PLUGIN_NAME.to_owned())
-        }
-        Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
-    }
-    Ok(report)
-}
-
-fn pi_extension_status(path: &Path) -> anyhow::Result<StatusReport> {
-    let mut report = StatusReport {
-        agent: "pi",
-        installed: Vec::new(),
-        missing: Vec::new(),
-        outdated: Vec::new(),
-        conflicting: Vec::new(),
-    };
-    match fs::read_to_string(path) {
-        Ok(source) if source == pi_extension_source() => {
-            report.installed.push(PI_EXTENSION_NAME.to_owned());
-        }
-        Ok(source) if source.contains(PI_EXTENSION_MARKER) => {
-            report.outdated.push(PI_EXTENSION_NAME.to_owned());
-        }
-        Ok(_) => report.conflicting.push(PI_EXTENSION_NAME.to_owned()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            report.missing.push(PI_EXTENSION_NAME.to_owned());
         }
         Err(error) => return Err(error).with_context(|| format!("reading {}", path.display())),
     }
@@ -582,35 +483,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn pi_extension_emits_the_versioned_lifecycle_contract() {
-        let source = pi_extension_source();
-        for (pi_event, lifecycle_event) in [
-            ("session_start", "SessionStart"),
-            ("agent_start", "UserPromptSubmit"),
-            ("turn_start", "UserPromptSubmit"),
-            ("agent_settled", "Stop"),
-            ("session_shutdown", "SessionEnd"),
-        ] {
-            assert!(source.contains(pi_event), "missing Pi event {pi_event}");
-            assert!(
-                source.contains(lifecycle_event),
-                "missing normalized event {lifecycle_event}"
-            );
-        }
-        for field in [
-            "jjfx_event_version",
-            "hook_event_name",
-            "agent_kind",
-            "session_id",
-            "cwd",
-        ] {
-            assert!(source.contains(field), "missing envelope field {field}");
-        }
-        assert!(source.contains("appendFile"));
-        assert!(!source.contains("PermissionRequest"));
-    }
-
-    #[test]
     fn opencode_plugin_emits_the_versioned_lifecycle_contract() {
         for field in [
             "jjfx_event_version",
@@ -626,217 +498,6 @@ mod tests {
         }
         assert!(OPENCODE_PLUGIN_SOURCE.contains("session.status"));
         assert!(OPENCODE_PLUGIN_SOURCE.contains("permission.asked"));
-    }
-
-    #[test]
-    fn pi_extension_install_is_idempotent_and_preserves_other_state() {
-        let dir = tempfile::tempdir().unwrap();
-        let pi_dir = dir.path().join("pi-agent");
-        let paths = IntegrationPaths {
-            claude_settings: dir.path().join("claude/settings.json"),
-            codex_hooks: dir.path().join("codex/hooks.json"),
-            pi_extension: pi_dir.join("extensions/jjfx-lifecycle.ts"),
-            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
-        };
-        fs::create_dir_all(pi_dir.join("extensions")).unwrap();
-        fs::write(pi_dir.join("settings.json"), "{\"theme\":\"custom\"}\n").unwrap();
-        fs::write(pi_dir.join("trust.json"), "{\"/project\":\"yes\"}\n").unwrap();
-        fs::write(
-            pi_dir.join("extensions/other.ts"),
-            "export default () => {};\n",
-        )
-        .unwrap();
-
-        let first = install_with_paths(&paths).unwrap();
-        let pi = first.iter().find(|outcome| outcome.agent == "pi").unwrap();
-        assert_eq!(pi.added, ["lifecycle extension"]);
-        assert!(pi.already.is_empty());
-        assert_eq!(
-            fs::read_to_string(&paths.pi_extension).unwrap(),
-            pi_extension_source()
-        );
-        assert_eq!(
-            fs::read_to_string(pi_dir.join("settings.json")).unwrap(),
-            "{\"theme\":\"custom\"}\n"
-        );
-        assert_eq!(
-            fs::read_to_string(pi_dir.join("trust.json")).unwrap(),
-            "{\"/project\":\"yes\"}\n"
-        );
-        assert_eq!(
-            fs::read_to_string(pi_dir.join("extensions/other.ts")).unwrap(),
-            "export default () => {};\n"
-        );
-
-        let second = install_with_paths(&paths).unwrap();
-        let pi = second.iter().find(|outcome| outcome.agent == "pi").unwrap();
-        assert!(pi.added.is_empty());
-        assert_eq!(pi.already, ["lifecycle extension"]);
-    }
-
-    #[test]
-    fn pi_extension_status_distinguishes_missing_outdated_and_conflicting_files() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("extensions/jjfx-lifecycle.ts");
-
-        let missing = pi_extension_status(&path).unwrap();
-        assert_eq!(missing.missing, [PI_EXTENSION_NAME]);
-
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, "// jjfx-pi-lifecycle-extension:v0\n").unwrap();
-        let outdated = pi_extension_status(&path).unwrap();
-        assert_eq!(outdated.outdated, [PI_EXTENSION_NAME]);
-        let updated = install_pi_extension(&path).unwrap();
-        assert_eq!(updated.updated, [PI_EXTENSION_NAME]);
-        assert_eq!(fs::read_to_string(&path).unwrap(), pi_extension_source());
-
-        fs::write(&path, "export default () => {};\n").unwrap();
-        let conflicting = pi_extension_status(&path).unwrap();
-        assert_eq!(conflicting.conflicting, [PI_EXTENSION_NAME]);
-        let error = install_pi_extension(&path).unwrap_err();
-        assert!(error.to_string().contains("refusing to overwrite"));
-        assert_eq!(
-            fs::read_to_string(&path).unwrap(),
-            "export default () => {};\n"
-        );
-    }
-
-    #[test]
-    fn installed_pi_envelopes_replay_through_the_shared_log_contract() {
-        use crate::agent::{AgentKind, AgentState, AgentStates};
-
-        let dir = tempfile::tempdir().unwrap();
-        let workspace = dir.path().join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let paths = IntegrationPaths {
-            claude_settings: dir.path().join("claude/settings.json"),
-            codex_hooks: dir.path().join("codex/hooks.json"),
-            pi_extension: dir.path().join("pi-agent/extensions/jjfx-lifecycle.ts"),
-            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
-        };
-        install_with_paths(&paths).unwrap();
-
-        let log = dir.path().join("state/jjfx/events.jsonl");
-        fs::create_dir_all(log.parent().unwrap()).unwrap();
-        let lines = [
-            json!({
-                "jjfx_event_version": 1,
-                "hook_event_name": "SessionStart",
-                "agent_kind": "pi",
-                "session_id": "pi-integration",
-                "cwd": workspace,
-            }),
-            json!({
-                "jjfx_event_version": 1,
-                "hook_event_name": "UserPromptSubmit",
-                "agent_kind": "pi",
-                "session_id": "pi-integration",
-                "cwd": workspace,
-            }),
-            json!({
-                "jjfx_event_version": 1,
-                "hook_event_name": "Stop",
-                "agent_kind": "pi",
-                "session_id": "pi-integration",
-                "cwd": workspace,
-            }),
-        ];
-        let text = lines
-            .iter()
-            .map(Value::to_string)
-            .collect::<Vec<_>>()
-            .join("\n")
-            + "\n";
-        fs::write(&log, text).unwrap();
-
-        let states = AgentStates::replay(crate::events::replay(&log).0);
-        let agent = states.agent_for(&workspace);
-        assert_eq!(agent.kind, AgentKind::Pi);
-        assert_eq!(agent.state, AgentState::Waiting);
-    }
-
-    #[test]
-    fn installed_extension_observes_an_isolated_real_pi_when_available() {
-        use std::process::{Command, Stdio};
-        use std::thread;
-        use std::time::{Duration, Instant};
-
-        use crate::agent::{AgentKind, AgentState, AgentStates};
-
-        let Ok(probe) = Command::new("pi").arg("--version").output() else {
-            return;
-        };
-        if !probe.status.success()
-            || !String::from_utf8_lossy(&probe.stdout)
-                .trim()
-                .starts_with("0.84.")
-        {
-            return;
-        }
-
-        let dir = tempfile::tempdir().unwrap();
-        let home = dir.path().join("home");
-        let state = dir.path().join("state");
-        let pi_dir = dir.path().join("pi-agent");
-        let workspace = dir.path().join("workspace");
-        fs::create_dir_all(&workspace).unwrap();
-        let paths = IntegrationPaths {
-            claude_settings: home.join(".claude/settings.json"),
-            codex_hooks: home.join(".codex/hooks.json"),
-            pi_extension: pi_dir.join("extensions/jjfx-lifecycle.ts"),
-            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
-        };
-        install_with_paths(&paths).unwrap();
-
-        let mut child = Command::new("pi")
-            .args(["--mode", "rpc", "--no-session", "--offline"])
-            .current_dir(&workspace)
-            .env("HOME", &home)
-            .env("XDG_STATE_HOME", &state)
-            .env("PI_CODING_AGENT_DIR", &pi_dir)
-            .env("PI_OFFLINE", "1")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                break status;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("isolated Pi lifecycle smoke test timed out");
-            }
-            thread::sleep(Duration::from_millis(50));
-        };
-        assert!(status.success(), "isolated Pi exited with {status}");
-
-        let log = state.join("jjfx/events.jsonl");
-        let states = AgentStates::replay(crate::events::replay(&log).0);
-        let agent = states.agent_for(&workspace);
-        assert_eq!(agent.kind, AgentKind::Pi);
-        assert_eq!(agent.state, AgentState::Ended);
-    }
-
-    #[test]
-    fn conflicting_pi_extension_fails_before_other_integrations_are_written() {
-        let dir = tempfile::tempdir().unwrap();
-        let paths = IntegrationPaths {
-            claude_settings: dir.path().join("claude/settings.json"),
-            codex_hooks: dir.path().join("codex/hooks.json"),
-            pi_extension: dir.path().join("pi-agent/extensions/jjfx-lifecycle.ts"),
-            opencode_plugin: dir.path().join("opencode/plugins/jjfx-lifecycle.ts"),
-        };
-        fs::create_dir_all(paths.pi_extension.parent().unwrap()).unwrap();
-        fs::write(&paths.pi_extension, "export default () => {};\n").unwrap();
-
-        let error = install_with_paths(&paths).unwrap_err();
-        assert!(error.to_string().contains("refusing to overwrite"));
-        assert!(!paths.claude_settings.exists());
-        assert!(!paths.codex_hooks.exists());
     }
 
     #[test]
