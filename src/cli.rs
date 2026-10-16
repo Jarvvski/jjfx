@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
@@ -10,7 +11,7 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
     ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
-    RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS,
+    RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{MigrationsConfig, SpendConfig, TicketSource, TicketsConfig};
 use crate::engine::{
@@ -21,7 +22,7 @@ use crate::engine::{
     OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
     ReviewLoop, RunActivity, RunActivityKind, RunMode, StuckWindow, TerminalSettings,
     TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
     WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
@@ -72,6 +73,7 @@ pub enum Command {
     Logs {
         worker: String,
     },
+    Wait(WaitArgs),
     Mount {
         worker: String,
     },
@@ -151,6 +153,59 @@ pub struct DispatchArgs {
     pub input: Option<AdHocInput>,
 }
 
+/// The `wait` command's arguments: the Workers to wait for and what to wait for.
+#[derive(Debug, PartialEq, Eq)]
+pub struct WaitArgs {
+    /// Explicit Worker names; empty when `all` is set.
+    pub workers: Vec<String>,
+    /// Wait for every Worker in the pool rather than the named ones.
+    pub all: bool,
+    /// The condition to wait for. `terminal` unless `--until` says otherwise.
+    pub until: WaitCondition,
+    /// Give up after this many seconds, exiting with the timeout code. `None`
+    /// waits indefinitely, so "not done" is only ever reported on request.
+    pub timeout: Option<u64>,
+    /// Print the target Workers as JSON rather than prose.
+    pub json: bool,
+}
+
+/// What `jjfx wait` blocks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WaitCondition {
+    /// The Worker succeeded.
+    Done,
+    /// The Worker failed.
+    Failed,
+    /// The Worker reached any terminal state - done or failed. The default,
+    /// because it is the honest answer until a Ticket's resolution is certain.
+    Terminal,
+    /// The Worker's local Ticket is resolved: the end-to-end confirmation.
+    TicketResolved,
+}
+
+impl WaitCondition {
+    /// The condition named by an `--until` value, or `None` when unrecognized.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "done" => Some(Self::Done),
+            "failed" => Some(Self::Failed),
+            "terminal" => Some(Self::Terminal),
+            "ticket-resolved" => Some(Self::TicketResolved),
+            _ => None,
+        }
+    }
+
+    /// The spelling shown in help and diagnostics.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Terminal => "terminal",
+            Self::TicketResolved => "ticket-resolved",
+        }
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum PoolCommand {
     Resize {
@@ -210,6 +265,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|worker| Command::Logs { worker }),
+        "wait" => parse_wait(&args[1..]),
         "mount" | "m" => parse_worker_command(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " mount <worker>"),
             &args[1..],
@@ -400,6 +456,72 @@ fn parse_status(args: &[String]) -> Result<Command> {
         }
     }
     Ok(Command::Status { json })
+}
+
+/// Parse `wait <worker>... [--until CONDITION] [--timeout SECS] [--json] [--all]`.
+///
+/// The parser only shapes the request; the answer is the exit code. The
+/// condition defaults to `terminal`, and a missing `--timeout` means wait
+/// forever, so "not done" is only ever reported when the caller asked it to.
+fn parse_wait(args: &[String]) -> Result<Command> {
+    let usage = concat!(
+        "Usage: ",
+        env!("CARGO_PKG_NAME"),
+        " wait <worker>... [--until done|failed|terminal|ticket-resolved] [--timeout SECS] [--json] [--all]"
+    );
+    reject_unknown_flags("wait", WAIT_FLAGS, args)?;
+    let mut workers = Vec::new();
+    let mut all = false;
+    let mut until = None;
+    let mut timeout = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--all" => all = true,
+            "--json" => json = true,
+            "--until" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --until"))?;
+                until = Some(WaitCondition::parse(value).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "invalid --until: {value} (expected done, failed, terminal or ticket-resolved)"
+                    )
+                })?);
+                index += 1;
+            }
+            "--timeout" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --timeout"))?;
+                timeout = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| anyhow::anyhow!("invalid --timeout: {value}"))?,
+                );
+                index += 1;
+            }
+            value if value.starts_with('-') => bail!("unknown option for wait: {value}"),
+            value => workers.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    if all && !workers.is_empty() {
+        bail!("--all cannot be combined with explicit Workers");
+    }
+    if workers.is_empty() && !all {
+        bail!("{usage}");
+    }
+    Ok(Command::Wait(WaitArgs {
+        workers,
+        all,
+        until: until.unwrap_or(WaitCondition::Terminal),
+        timeout,
+        json,
+    }))
 }
 
 /// Parse `undo [workspace] [--force]`.
@@ -909,6 +1031,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         )?,
         Command::Review { worker, mode } => review_command(&repository(colocate)?, &worker, mode)?,
         Command::Logs { worker } => logs_command(&repository(colocate)?, &worker)?,
+        Command::Wait(args) => wait_command(&repository(colocate)?, &args)?,
         Command::Mount { worker } => {
             mount_command(&repository(colocate)?, &worker, terminal_settings)?
         }
@@ -1257,10 +1380,10 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
 
 fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     let config = crate::config::load()?;
-    let snapshot = repository.worker_pool().reconcile_runs();
     // `status`/`pool list` read Pool state, so they also reconcile local Tickets:
     // a finished Run resolves its Ticket here, with no Dispatch needed.
-    report_local_writeback(repository, &snapshot, &config.tickets);
+    let (snapshot, failures) = reconcile_pass(repository, &config.tickets);
+    report_writeback_failures(&failures);
     let pool = snapshot
         .pool()
         .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
@@ -1418,50 +1541,8 @@ fn pool_list_json_string(
         if index > 0 {
             out.push(',');
         }
-        let fields = [
-            ("worker", json_string(worker.worker_id().as_str())),
-            (
-                "name",
-                json_string(if worker.alias().is_empty() {
-                    "-"
-                } else {
-                    worker.alias()
-                }),
-            ),
-            ("status", json_string(worker.status().as_str())),
-            ("stuck", worker.health(now, watchdog).is_stuck().to_string()),
-            ("ticket", json_option(worker.ticket())),
-            (
-                "elapsed",
-                json_string(&elapsed_display(worker.started_at(), worker.completed_at())),
-            ),
-            ("error", json_option(worker.error())),
-            (
-                "exit_code",
-                worker
-                    .exit_code()
-                    .map_or_else(|| "null".to_owned(), |code| code.to_string()),
-            ),
-            ("log_file", json_option(worker.log_file())),
-            (
-                "cost_usd",
-                snapshot
-                    .cost()
-                    .and_then(|cost| cost.worker(worker.worker_id().as_str()))
-                    .map_or_else(
-                        || "null".to_owned(),
-                        |cost| format!("{:.6}", cost.cost_usd()),
-                    ),
-            ),
-        ];
-        out.push_str("\n    {\n");
-        for (field, (key, value)) in fields.iter().enumerate() {
-            if field > 0 {
-                out.push_str(",\n");
-            }
-            out.push_str(&format!("      \"{key}\": {value}"));
-        }
-        out.push_str("\n    }");
+        out.push_str("\n    ");
+        out.push_str(&worker_json(worker, snapshot, now, watchdog));
     }
     if snapshot.workers().is_empty() {
         out.push_str("],\n");
@@ -1476,6 +1557,63 @@ fn pool_list_json_string(
         out.push_str(&json_string(ticket));
     }
     out.push_str("]\n}");
+    out
+}
+
+/// One Worker's JSON object, the shape `status --json` emits per Worker.
+///
+/// The field set and its order live here alone, so `status --json` and
+/// `wait --json` cannot describe the same Worker differently.
+fn worker_json(
+    worker: &WorkerSnapshot,
+    snapshot: &WorkerPoolSnapshot,
+    now: Timestamp,
+    watchdog: StuckWindow,
+) -> String {
+    let fields = [
+        ("worker", json_string(worker.worker_id().as_str())),
+        (
+            "name",
+            json_string(if worker.alias().is_empty() {
+                "-"
+            } else {
+                worker.alias()
+            }),
+        ),
+        ("status", json_string(worker.status().as_str())),
+        ("stuck", worker.health(now, watchdog).is_stuck().to_string()),
+        ("ticket", json_option(worker.ticket())),
+        (
+            "elapsed",
+            json_string(&elapsed_display(worker.started_at(), worker.completed_at())),
+        ),
+        ("error", json_option(worker.error())),
+        (
+            "exit_code",
+            worker
+                .exit_code()
+                .map_or_else(|| "null".to_owned(), |code| code.to_string()),
+        ),
+        ("log_file", json_option(worker.log_file())),
+        (
+            "cost_usd",
+            snapshot
+                .cost()
+                .and_then(|cost| cost.worker(worker.worker_id().as_str()))
+                .map_or_else(
+                    || "null".to_owned(),
+                    |cost| format!("{:.6}", cost.cost_usd()),
+                ),
+        ),
+    ];
+    let mut out = String::from("{\n");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        out.push_str(&format!("      \"{key}\": {value}"));
+    }
+    out.push_str("\n    }");
     out
 }
 
@@ -1580,17 +1718,31 @@ fn configured_runtime(repository: &Repository) -> AgentRuntime {
 /// A no-op unless `[tickets] source = "local"`. The writeback is a side effect of
 /// a command that already succeeded, so a failure is reported rather than raised.
 fn write_back_local_tickets(repository: &Repository, tickets: &TicketsConfig) {
-    let snapshot = repository.worker_pool().reconcile_runs();
-    report_local_writeback(repository, &snapshot, tickets);
+    let (_, failures) = reconcile_pass(repository, tickets);
+    report_writeback_failures(&failures);
 }
 
-/// Reports the failures of one local Ticket writeback against `snapshot`.
-fn report_local_writeback(
+/// One reconciliation pass: observe Worker Runs, then write local Tickets back.
+///
+/// The single mechanism behind `status`/`pool list`, `ticket reconcile` and
+/// `wait`: a reconcile is one pass, and `wait` is this pass repeated until a
+/// condition holds. Returns the post-pass snapshot and any writeback failures,
+/// which the caller reports as loudly as its own contract requires.
+fn reconcile_pass(
     repository: &Repository,
-    snapshot: &WorkerPoolSnapshot,
     tickets: &TicketsConfig,
-) {
-    for failure in apply_local_writeback(repository, snapshot, tickets) {
+) -> (WorkerPoolSnapshot, Vec<String>) {
+    let snapshot = repository.worker_pool().reconcile_runs();
+    let failures = apply_local_writeback(repository, &snapshot, tickets);
+    (snapshot, failures)
+}
+
+/// Reports the failures of one local Ticket writeback.
+///
+/// A writeback is a side effect of a command that already succeeded, so a
+/// failure is reported rather than raised.
+fn report_writeback_failures(failures: &[String]) {
+    for failure in failures {
         eprintln!("local Ticket writeback failed: {failure}");
     }
 }
@@ -1611,8 +1763,7 @@ fn ticket_reconcile_command(
         eprintln!("Ticket source is not local; nothing to reconcile");
         return Ok(());
     }
-    let snapshot = repository.worker_pool().reconcile_runs();
-    let failures = apply_local_writeback(repository, &snapshot, &tickets);
+    let (_, failures) = reconcile_pass(repository, &tickets);
     if failures.is_empty() {
         eprintln!("Reconciled local Tickets");
         return Ok(());
@@ -2351,6 +2502,277 @@ fn worker_is_terminal(repository: &Repository, worker: &WorkerId) -> bool {
         .is_some_and(|worker| matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed))
 }
 
+/// The exit code `wait` returns when it gave up on time: the negative
+/// confirmation that the Worker is not done.
+const WAIT_EXIT_TIMED_OUT: i32 = 1;
+/// The exit code `wait` returns when a Worker reached a terminal state that does
+/// not satisfy `--until` (it failed while the wait wanted `done`).
+const WAIT_EXIT_UNSATISFIED: i32 = 2;
+
+/// How long `wait` sleeps between reconciliation passes.
+const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Tests a Worker's Ticket for resolution. A boxed closure rather than `impl Fn`
+/// because `wait` chooses between two closures at runtime.
+type TicketResolver = Box<dyn Fn(&str) -> bool>;
+
+/// Block until every target Worker satisfies `--until`, or give up.
+///
+/// The exit code carries the answer: `0` the condition was reached,
+/// [`WAIT_EXIT_TIMED_OUT`] the wait gave up, [`WAIT_EXIT_UNSATISFIED`] a Worker
+/// reached a terminal state that does not satisfy `--until`. Keeping the three
+/// distinct is the point: a caller tells "still working" from "broke" without
+/// parsing prose.
+///
+/// Every pass runs [`reconcile_pass`] - the same pass `status` and `ticket
+/// reconcile` run - so a Worker whose process died silently still advances to a
+/// terminal state instead of hanging the wait, and a finished Run still resolves
+/// its local Ticket. The condition is evaluated before the first sleep, so a
+/// Worker already in the waited-for state returns immediately: there is no lost
+/// wakeup.
+fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
+    let config = crate::config::load()?;
+    let targets = wait_targets(repository, args)?;
+    let ticket_resolved = wait_ticket_resolver(repository, args, &config.tickets, &targets)?;
+    let watchdog = config.watchdog.stuck_window();
+    let deadline = args
+        .timeout
+        .map(|seconds| Instant::now() + Duration::from_secs(seconds));
+    loop {
+        let (snapshot, failures) = reconcile_pass(repository, &config.tickets);
+        report_writeback_failures(&failures);
+        let now = Timestamp::now();
+        match wait_verdict(args.until, &targets, &snapshot, ticket_resolved.as_ref()) {
+            WaitVerdict::Satisfied => {
+                print_wait_workers(&targets, &snapshot, args.json, now, watchdog);
+                return Ok(());
+            }
+            WaitVerdict::Unsatisfied => {
+                print_wait_workers(&targets, &snapshot, args.json, now, watchdog);
+                eprintln!(
+                    "a Worker reached a terminal state that does not satisfy --until {}",
+                    args.until.as_str()
+                );
+                std::process::exit(WAIT_EXIT_UNSATISFIED);
+            }
+            WaitVerdict::Pending => {}
+        }
+        if let Some(deadline) = deadline
+            && Instant::now() >= deadline
+        {
+            print_wait_workers(&targets, &snapshot, args.json, now, watchdog);
+            eprintln!(
+                "timed out after {}s waiting for --until {}; still pending: {}",
+                args.timeout.unwrap_or_default(),
+                args.until.as_str(),
+                pending_workers(&targets, &snapshot).join(", ")
+            );
+            std::process::exit(WAIT_EXIT_TIMED_OUT);
+        }
+        std::thread::sleep(WAIT_POLL_INTERVAL);
+    }
+}
+
+/// The Workers `wait` blocks for: the named ones, or every Worker with `--all`.
+///
+/// Read without reconciling, so a Worker whose Run has not been observed yet is
+/// still a valid target. A named Worker that is not in the Pool is an error:
+/// waiting on a typo would otherwise block until the timeout.
+fn wait_targets(repository: &Repository, args: &WaitArgs) -> Result<Vec<WorkerId>> {
+    let snapshot = repository.worker_pool().snapshot();
+    if args.all {
+        let targets = snapshot
+            .workers()
+            .iter()
+            .map(|worker| worker.worker_id().clone())
+            .collect::<Vec<_>>();
+        if targets.is_empty() {
+            bail!("No Workers to wait for");
+        }
+        return Ok(targets);
+    }
+    let mut targets = Vec::new();
+    for name in &args.workers {
+        let worker = normalize_worker(name)?;
+        if snapshot.worker(worker.as_str()).is_none() {
+            bail!("no such Worker: {worker}");
+        }
+        if !targets.contains(&worker) {
+            targets.push(worker);
+        }
+    }
+    Ok(targets)
+}
+
+/// The predicate `wait_verdict` uses to test a Worker's Ticket for resolution.
+///
+/// `--until ticket-resolved` is the end-to-end confirmation, so it needs a local
+/// Ticket to read: the configured source must be `local`, and every target must
+/// carry a Ticket. Every other condition never consults the predicate, so the
+/// config is not validated for them and the predicate always says "not
+/// resolved".
+fn wait_ticket_resolver(
+    repository: &Repository,
+    args: &WaitArgs,
+    tickets: &TicketsConfig,
+    targets: &[WorkerId],
+) -> Result<TicketResolver> {
+    if args.until != WaitCondition::TicketResolved {
+        return Ok(Box::new(|_| false));
+    }
+    if tickets.source != TicketSource::Local {
+        bail!(
+            "--until ticket-resolved needs `[tickets] source = \"local\"`; \
+             only a local Ticket's resolution is observable"
+        );
+    }
+    let snapshot = repository.worker_pool().snapshot();
+    for target in targets {
+        if snapshot
+            .worker(target.as_str())
+            .and_then(|worker| worker.ticket())
+            .is_none()
+        {
+            bail!("{target} has no Ticket to wait for with --until ticket-resolved");
+        }
+    }
+    let local = crate::engine::LocalTickets::new(
+        repository.root().join(&tickets.local.root),
+        tickets.local.ready_status.clone(),
+        tickets.local.resolved_status.clone(),
+    );
+    let resolved_status = tickets.local.resolved_status.clone();
+    Ok(Box::new(move |ticket: &str| {
+        local
+            .ticket(ticket)
+            .ok()
+            .flatten()
+            .is_some_and(|ticket| ticket.status().eq_ignore_ascii_case(&resolved_status))
+    }))
+}
+
+/// The outcome of one evaluation of `--until` over the target Workers.
+enum WaitVerdict {
+    /// Every target satisfies the condition.
+    Satisfied,
+    /// A target reached a terminal state that does not satisfy the condition, so
+    /// waiting can only ever time out.
+    Unsatisfied,
+    /// No target has failed the condition, and at least one has not reached it.
+    Pending,
+}
+
+/// Evaluates `condition` over `targets` against one reconciled `snapshot`.
+///
+/// Failure wins: a terminal Worker that does not satisfy the condition decides
+/// the verdict immediately, rather than waiting on the rest.
+fn wait_verdict(
+    condition: WaitCondition,
+    targets: &[WorkerId],
+    snapshot: &WorkerPoolSnapshot,
+    ticket_resolved: &dyn Fn(&str) -> bool,
+) -> WaitVerdict {
+    let mut pending = false;
+    for target in targets {
+        let Some(worker) = snapshot.worker(target.as_str()) else {
+            // A target that left the Pool can never satisfy the condition.
+            return WaitVerdict::Unsatisfied;
+        };
+        let satisfied = match condition {
+            WaitCondition::Done => worker.status() == WorkerStatus::Done,
+            WaitCondition::Failed => worker.status() == WorkerStatus::Failed,
+            WaitCondition::Terminal => {
+                matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed)
+            }
+            WaitCondition::TicketResolved => worker.ticket().is_some_and(ticket_resolved),
+        };
+        if satisfied {
+            continue;
+        }
+        if matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed) {
+            return WaitVerdict::Unsatisfied;
+        }
+        pending = true;
+    }
+    if pending {
+        WaitVerdict::Pending
+    } else {
+        WaitVerdict::Satisfied
+    }
+}
+
+/// The target Workers that have not reached a terminal state, for the timeout
+/// diagnostic. On a timeout every target is non-terminal by construction.
+fn pending_workers(targets: &[WorkerId], snapshot: &WorkerPoolSnapshot) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| match snapshot.worker(target.as_str()) {
+            Some(worker) => !matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed),
+            None => true,
+        })
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// Prints the target Workers in the requested format.
+///
+/// `--json` prints the same per-Worker object `status --json` emits, wrapped in
+/// the same `{"workers": [ ... ]}` top level, so one parser reads both. Prose
+/// prints one line per Worker.
+fn print_wait_workers(
+    targets: &[WorkerId],
+    snapshot: &WorkerPoolSnapshot,
+    json: bool,
+    now: Timestamp,
+    watchdog: StuckWindow,
+) {
+    if json {
+        println!("{}", wait_workers_json(targets, snapshot, now, watchdog));
+        return;
+    }
+    for target in targets {
+        let Some(worker) = snapshot.worker(target.as_str()) else {
+            continue;
+        };
+        match worker.ticket() {
+            Some(ticket) => println!(
+                "{} {} {ticket}",
+                worker.worker_id(),
+                worker.status().as_str()
+            ),
+            None => println!("{} {}", worker.worker_id(), worker.status().as_str()),
+        }
+    }
+}
+
+/// The target Workers as `{"workers": [ ... ]}`, each object the shape
+/// `status --json` emits per Worker.
+fn wait_workers_json(
+    targets: &[WorkerId],
+    snapshot: &WorkerPoolSnapshot,
+    now: Timestamp,
+    watchdog: StuckWindow,
+) -> String {
+    let workers = targets
+        .iter()
+        .filter_map(|target| snapshot.worker(target.as_str()))
+        .collect::<Vec<_>>();
+    let mut out = String::from("{\n  \"workers\": [");
+    for (index, worker) in workers.iter().copied().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n    ");
+        out.push_str(&worker_json(worker, snapshot, now, watchdog));
+    }
+    if workers.is_empty() {
+        out.push_str("]\n}");
+    } else {
+        out.push_str("\n  ]\n}");
+    }
+    out
+}
+
 fn render_activity(activity: &RunActivity) -> String {
     match activity.kind() {
         RunActivityKind::SessionStarted => "session started".to_owned(),
@@ -2980,6 +3402,67 @@ mod tests {
         assert!(parse(&args(&["ticket"])).is_err());
         assert!(parse(&args(&["ticket", "wat"])).is_err());
         assert!(parse(&args(&["ticket", "reconcile", "extra"])).is_err());
+    }
+
+    #[test]
+    fn wait_parses_workers_condition_timeout_json_and_all() {
+        assert_eq!(
+            parse(&args(&["wait", "3"])).unwrap(),
+            Command::Wait(WaitArgs {
+                workers: vec!["3".to_owned()],
+                all: false,
+                until: WaitCondition::Terminal,
+                timeout: None,
+                json: false,
+            })
+        );
+        assert_eq!(
+            parse(&args(&[
+                "wait",
+                "3",
+                "worker-4",
+                "--until",
+                "done",
+                "--timeout",
+                "5",
+                "--json",
+            ]))
+            .unwrap(),
+            Command::Wait(WaitArgs {
+                workers: vec!["3".to_owned(), "worker-4".to_owned()],
+                all: false,
+                until: WaitCondition::Done,
+                timeout: Some(5),
+                json: true,
+            })
+        );
+        assert_eq!(
+            parse(&args(&["wait", "--all"])).unwrap(),
+            Command::Wait(WaitArgs {
+                workers: Vec::new(),
+                all: true,
+                until: WaitCondition::Terminal,
+                timeout: None,
+                json: false,
+            })
+        );
+    }
+
+    #[test]
+    fn wait_rejects_a_bad_request() {
+        // No Worker and no --all is a usage error.
+        assert!(parse(&args(&["wait"])).is_err());
+        // --all and explicit Workers are mutually exclusive.
+        assert!(parse(&args(&["wait", "3", "--all"])).is_err());
+        // An unknown condition or a non-numeric timeout is rejected.
+        assert!(parse(&args(&["wait", "3", "--until", "soon"])).is_err());
+        assert!(parse(&args(&["wait", "3", "--timeout", "soon"])).is_err());
+        // A missing value is not silently swallowed.
+        assert!(parse(&args(&["wait", "3", "--until"])).is_err());
+        assert!(parse(&args(&["wait", "3", "--timeout"])).is_err());
+        // An unknown flag is named.
+        let error = parse(&args(&["wait", "3", "--wat"])).unwrap_err();
+        assert!(error.to_string().contains("--wat"), "{error}");
     }
 
     #[test]

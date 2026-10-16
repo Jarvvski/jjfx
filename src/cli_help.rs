@@ -84,7 +84,26 @@ impl CommandHelp {
                 out.push_str(&format!("  {:<24} {}\n", flag.rendered(), flag.help));
             }
         }
+        out.push_str(notes(self.key));
         out
+    }
+}
+
+/// Extra prose for a page, beyond its usage, arguments and flags.
+///
+/// A couple of pages state something the flag list cannot - the conditions and
+/// exit codes `wait` returns, how `dispatch --fg` relates to `wait`. Kept out of
+/// [`CommandHelp`] so the many pages without notes need not spell out an empty
+/// one.
+fn notes(key: &str) -> &'static str {
+    match key {
+        "wait" => {
+            "\nConditions (--until):\n  done              the Worker succeeded\n  failed            the Worker failed\n  terminal          the Worker reached any terminal state (default)\n  ticket-resolved   the Worker's local Ticket is resolved\n\nExit codes:\n  0  the condition was reached\n  1  timed out: the Worker is not done\n  2  a Worker reached a terminal state that does not satisfy --until\n"
+        }
+        "dispatch" => {
+            "\n--fg blocks until every Run this Dispatch started has finished, inside\nthat one call. `jjfx wait` re-attaches to a Worker any session started, and\ncarries the answer in its exit code.\n"
+        }
+        _ => "",
     }
 }
 
@@ -283,6 +302,33 @@ pub(crate) const POOL_RESIZE_FLAGS: &[Flag] = &[Flag {
     help: "Pool size; the positional `<N>` is the usual form",
 }];
 
+pub(crate) const WAIT_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--until",
+        short: None,
+        value: Some("CONDITION"),
+        help: "Condition to wait for: done, failed, terminal, ticket-resolved (default terminal)",
+    },
+    Flag {
+        long: "--timeout",
+        short: None,
+        value: Some("SECS"),
+        help: "Give up after this many seconds and exit 1",
+    },
+    Flag {
+        long: "--all",
+        short: None,
+        value: None,
+        help: "Wait for every Worker in the pool",
+    },
+    Flag {
+        long: "--json",
+        short: None,
+        value: None,
+        help: "Print the target Workers as JSON",
+    },
+];
+
 /// The top-level command list, grouped. Each entry names a command that
 /// [`PAGES`] must document, which is what `every_top_level_command_has_a_page`
 /// enforces.
@@ -379,6 +425,11 @@ const TOP_LEVEL: &[Group] = &[
                 key: "dispatch",
                 args: "<TICKET>...",
                 summary: "Dispatch Tickets (d; --text/--from-file/--provider/--model/--json)",
+            },
+            Entry {
+                key: "wait",
+                args: "<worker>... [--until C] [--timeout S]",
+                summary: "Block until Workers finish; the exit code is the answer",
             },
             Entry {
                 key: "send",
@@ -626,6 +677,16 @@ const PAGES: &[CommandHelp] = &[
             },
         ],
         flags: DISPATCH_FLAGS,
+    },
+    CommandHelp {
+        key: "wait",
+        summary: "Block until Workers reach a condition, with the answer in the exit code",
+        usage: "wait <worker>... [--until done|failed|terminal|ticket-resolved] [--timeout SECS] [--json] [--all]",
+        arguments: &[Argument {
+            name: "<worker>...",
+            help: "Workers to wait for; use --all for every Worker in the pool",
+        }],
+        flags: WAIT_FLAGS,
     },
     CommandHelp {
         key: "send",
@@ -986,5 +1047,29 @@ mod tests {
             assert!(dispatch.contains(flag), "{dispatch}");
         }
         assert!(dispatch.contains("stdin"), "{dispatch}");
+    }
+
+    /// `wait` is a blocking command whose answer is the exit code, so its page
+    /// must document both the conditions a caller waits on and the exit codes a
+    /// caller switches on.
+    #[test]
+    fn the_wait_page_documents_conditions_and_exit_codes() {
+        let wait = text(Some("wait")).expect("wait has a page");
+        for condition in ["done", "failed", "terminal", "ticket-resolved"] {
+            assert!(wait.contains(condition), "{wait}");
+        }
+        assert!(wait.contains("Exit codes:"), "{wait}");
+        assert!(wait.contains("the condition was reached"), "{wait}");
+        assert!(wait.contains("timed out"), "{wait}");
+        assert!(wait.contains("does not satisfy --until"), "{wait}");
+    }
+
+    /// The dispatch page must say how `--fg` relates to `wait`: one blocks for
+    /// this Dispatch's Runs, the other re-attaches to any Worker.
+    #[test]
+    fn the_dispatch_page_relates_fg_to_wait() {
+        let dispatch = text(Some("dispatch")).expect("dispatch has a page");
+        assert!(dispatch.contains("--fg"), "{dispatch}");
+        assert!(dispatch.contains("wait"), "{dispatch}");
     }
 }
