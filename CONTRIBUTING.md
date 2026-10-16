@@ -65,5 +65,5 @@ and it is the authority on how a change lands.
 ## Releasing
 
 Releases are cut by dispatching the `Release` workflow. The versioning model,
-the dry-run-first flow, and recovery from a partial release are in
+when to dry-run, and recovery from a partial release are in
 [`docs/releasing.md`](docs/releasing.md).
