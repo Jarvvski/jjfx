@@ -138,6 +138,20 @@ pub struct Work {
 }
 
 impl WorkState {
+    /// Whether this state means the Workspace's work has left it.
+    ///
+    /// `Clean` has nothing to deliver, `Pushed` and `PrOpen` are on a real
+    /// remote, and `Merged` is in trunk. `Dirty` and `Conflicted` exist only in
+    /// the Workspace, and `Unknown` is a failed read - which must not read as
+    /// delivered, because "could not tell" and "safe to discard" are different
+    /// facts.
+    pub fn is_delivered(self) -> bool {
+        matches!(
+            self,
+            WorkState::Clean | WorkState::Pushed | WorkState::PrOpen { .. } | WorkState::Merged
+        )
+    }
+
     /// Short label for a list row.
     pub fn label(self) -> String {
         match self {
@@ -681,6 +695,38 @@ mod tests {
         );
         assert_eq!(WorkState::Merged.label(), "merged");
         assert_eq!(WorkState::Unknown.label(), "?");
+    }
+
+    /// `pool destroy` refuses to discard a Worker's branch unless the work has
+    /// already left the Workspace, so "delivered" must mean exactly that:
+    /// nothing to deliver (clean), on a real remote (pushed or an open PR), or
+    /// in trunk (merged). A failed read is not delivered - "could not tell" and
+    /// "safe to discard" are different facts.
+    #[test]
+    fn only_delivered_work_is_safe_to_discard() {
+        for delivered in [
+            WorkState::Clean,
+            WorkState::Pushed,
+            WorkState::Merged,
+            WorkState::PrOpen {
+                number: 7,
+                verdict: ReviewVerdict::Approved,
+            },
+        ] {
+            assert!(delivered.is_delivered(), "{delivered:?} is delivered");
+        }
+        for held in [
+            WorkState::Dirty {
+                added: 1,
+                removed: 0,
+            },
+            WorkState::Conflicted {
+                commit: ChangeId::short("kqxsylvyrwvq"),
+            },
+            WorkState::Unknown,
+        ] {
+            assert!(!held.is_delivered(), "{held:?} is held in the Workspace");
+        }
     }
 
     /// Build a `ChainCommit` for tests.

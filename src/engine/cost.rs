@@ -195,10 +195,12 @@ impl PoolCostSnapshot {
 }
 
 impl Repository {
-    /// Aggregates the Pool's recorded Run costs and usage.
+    /// Aggregates this handle's Pool recorded Run costs and usage.
     ///
-    /// Reads the durable per-Run record store; an absent store is an empty
-    /// aggregate, and a store that cannot be read is an error.
+    /// A handle from [`Repository::open`] reads `default`; one narrowed with
+    /// [`Repository::with_pool`] reads the named pool. Reads the durable
+    /// per-Run record store; an absent store is an empty aggregate, and a store
+    /// that cannot be read is an error.
     pub fn pool_cost(&self) -> Result<PoolCostSnapshot, StateError> {
         let records = self.state_store().runs().records()?;
         Ok(PoolCostSnapshot::from_records(&records, Timestamp::now()))

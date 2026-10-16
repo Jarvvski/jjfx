@@ -372,8 +372,13 @@ pub(crate) const POOL_CREATE_FLAGS: &[Flag] = &[
     },
 ];
 
-/// `pool destroy` takes only the pool name, so any option is a mistake.
-pub(crate) const POOL_DESTROY_FLAGS: &[Flag] = NO_FLAGS;
+/// `pool destroy` takes the pool name and `--force`, which discards work.
+pub(crate) const POOL_DESTROY_FLAGS: &[Flag] = &[Flag {
+    long: "--force",
+    short: Some("-f"),
+    value: None,
+    help: "Remove even a busy pool, discarding undelivered work",
+}];
 
 pub(crate) const WAIT_FLAGS: &[Flag] = &[
     Flag {
@@ -481,8 +486,8 @@ const TOP_LEVEL: &[Group] = &[
             },
             Entry {
                 key: "pool destroy",
-                args: "<name>",
-                summary: "Remove a named pool's declaration (`default` is refused)",
+                args: "[--force] <name>",
+                summary: "Remove a named pool, draining first (`default` is refused)",
             },
             Entry {
                 key: "pool resize",
@@ -730,8 +735,8 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "pool destroy",
-        summary: "Remove a named pool's declaration; `default` is refused",
-        usage: "pool destroy <name>",
+        summary: "Remove a named pool, draining first; `default` is refused",
+        usage: "pool destroy [--force] <name>",
         arguments: &[Argument {
             name: "<name>",
             help: "The pool to remove; `default` is never removable",

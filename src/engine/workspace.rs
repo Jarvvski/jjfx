@@ -11,7 +11,9 @@ use thiserror::Error;
 
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::locks::{self, ScopedLock};
-use crate::engine::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, WorkerState};
+use crate::engine::{
+    Expected, Loaded, Repository, StateChange, StateStore, WireStatus, WorkerId, WorkerState,
+};
 
 const CACHE_PATH: &str = ".jj/ws-cache";
 const CACHE_LOCK_PATH: &str = ".jj/ws-cache.lock";
@@ -1082,8 +1084,13 @@ where
 /// Worker state remains as the durable cleanup marker until the external jj,
 /// directory, and cache operations have succeeded. Repeating this operation is
 /// safe after either partial or complete cleanup.
+///
+/// The Pool's state store is the caller's: a Worker's state is pool-scoped
+/// (ADR 0013), so tearing down a named Pool's Worker must read and remove that
+/// Pool's state, not `default`'s.
 pub(crate) fn teardown_detached_with_progress<F>(
     repository: &Repository,
+    state_store: &StateStore,
     worker_id: &WorkerId,
     mut on_output: F,
 ) -> Result<(), WorkerWorkspaceError>
@@ -1093,7 +1100,7 @@ where
     let root = repository.root();
     let path = worker_path(root, worker_id);
     let resources = teardown_workspace_resources(root, worker_id, &path, &mut on_output);
-    let state = repository.state_store().worker(worker_id.clone());
+    let state = state_store.worker(worker_id.clone());
     let state_result = if resources.external_resources_succeeded {
         remove_detached_state(&state, None)
     } else {

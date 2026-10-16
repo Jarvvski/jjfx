@@ -53,6 +53,7 @@ use crate::engine::{
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
+use crate::work::WorkState;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
@@ -252,10 +253,12 @@ pub enum PoolCommand {
     },
     /// `pool create <name>`: write a `[pools.<name>]` declaration.
     Create(PoolCreateArgs),
-    /// `pool destroy [<name>]`: remove a `[pools.<name>]` declaration. No name
-    /// means `default`, which is refused.
+    /// `pool destroy [<name>] [--force]`: remove a `[pools.<name>]`
+    /// declaration together with its Workers' Workspaces. No name means
+    /// `default`, which is refused.
     Destroy {
         name: Option<String>,
+        force: bool,
     },
     Remove {
         worker: String,
@@ -747,22 +750,26 @@ fn parse_pool(args: &[String]) -> Result<Command> {
     }
 }
 
-/// Parse `pool destroy [<name>]`. No name targets `default`, which the verb
-/// refuses with its reason.
+/// Parse `pool destroy [<name>] [--force]`. No name targets `default`, which the
+/// verb refuses with its reason.
 fn parse_pool_destroy(args: &[String]) -> Result<Command> {
     reject_unknown_flags("pool destroy", POOL_DESTROY_FLAGS, args)?;
-    let name = match args.first() {
-        Some(name) if !name.starts_with('-') => Some(name.clone()),
-        _ => None,
-    };
-    if args.iter().filter(|value| !value.starts_with('-')).count() > 1 {
-        bail!(concat!(
-            "Usage: ",
-            env!("CARGO_PKG_NAME"),
-            " pool destroy [<name>]"
-        ));
+    let mut force = false;
+    let mut name = None;
+    for argument in args {
+        match argument.as_str() {
+            "--force" | "-f" => force = true,
+            value if !value.starts_with('-') && name.is_none() => name = Some(value.to_owned()),
+            value if value.starts_with('-') => {
+                bail!("unknown option for pool destroy: {value}");
+            }
+            value => bail!(format!(
+                "Usage: {} pool destroy [<name>] [--force] (unexpected argument: {value})",
+                env!("CARGO_PKG_NAME")
+            )),
+        }
     }
-    Ok(PoolCommand::Destroy { name }.into())
+    Ok(PoolCommand::Destroy { name, force }.into())
 }
 
 /// Parse `pool create <name> [--size N] [declaration flags]`.
@@ -1564,7 +1571,9 @@ fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
         }
         PoolCommand::List { json } => pool_list_command(repository, json),
         PoolCommand::Create(args) => create_pool_command(repository, &args),
-        PoolCommand::Destroy { name } => destroy_pool_command(repository, name.as_deref()),
+        PoolCommand::Destroy { name, force } => {
+            destroy_pool_command(repository, name.as_deref(), force)
+        }
         PoolCommand::Remove { worker } => remove_worker_command(repository, &worker),
         PoolCommand::Reset { worker } => reset_worker_command(repository, &worker),
         PoolCommand::Profile {
@@ -2181,18 +2190,25 @@ fn seconds_display(elapsed: jiff::SignedDuration) -> String {
     format!("{}m {}s", seconds / 60, seconds % 60)
 }
 
-/// `pool destroy [<name>]`: remove a pool's declaration.
+/// `pool destroy [<name>] [--force]`: remove a named pool.
 ///
 /// Removal is an undeclaration (ADR 0014): the declaration is the source of
-/// truth, so removing the pool is removing its `[pools.<name>]` table. Draining
-/// a pool - refusing while a Worker is busy, enumerating undelivered branches,
-/// and removing the Workers' Workspaces - is the removal ticket's job and is
-/// deliberately not here.
+/// truth, so removing the pool is removing its `[pools.<name>]` table. It is
+/// also more than that (ADR 0012): the pool's state directory and its Workers'
+/// Workspaces go with it, because leaving them would be a slower, quieter
+/// version of the same leak - nothing would ever come back for them.
+///
+/// Removal drains. It refuses while a Worker is busy, naming them, and refuses
+/// when a Worker holds work that is neither pushed nor merged, enumerating each
+/// Worker's branch and its state. `--force` is the only path that discards work,
+/// and it says so. Unlike `Clean`, which sweeps every non-default Workspace in
+/// the Repository, this touches only the removed pool's own Workers - which is
+/// what makes removing one lane safe while another keeps working.
 ///
 /// `default` is not removable: a Repository always has at least one pool and
 /// `jjfx pool <N>` targets it forever. A Repository that wants only named lanes
 /// resizes `default` to zero instead, which is explicit and reversible.
-fn destroy_pool_command(repository: &Repository, name: Option<&str>) -> Result<()> {
+fn destroy_pool_command(repository: &Repository, name: Option<&str>, force: bool) -> Result<()> {
     let name = name.unwrap_or(DEFAULT_POOL_NAME);
     if name == DEFAULT_POOL_NAME {
         bail!(
@@ -2200,12 +2216,150 @@ fn destroy_pool_command(repository: &Repository, name: Option<&str>) -> Result<(
              and `{PROGRAM} pool <N>` targets it. Resize it to zero instead: `{PROGRAM} pool 0`"
         );
     }
-    destroy_pool(repository, name, &crate::config::load()?)
+    destroy_pool(repository, name, force, &crate::config::load()?)
 }
 
-/// The undeclaration, with the user-global config handed in so a test can drive
-/// it without reading the developer's own config.
-fn destroy_pool(repository: &Repository, name: &str, user: &Config) -> Result<()> {
+/// One Worker's contribution to the removal report: its current branch, and how
+/// far that branch has been delivered.
+struct PoolRemovalWorker {
+    worker: WorkerId,
+    /// The Worker's current bookmark, when it has one.
+    branch: Option<String>,
+    /// The branch's work lifecycle - `pushed`, `merged`, `dirty`, and so on.
+    state: WorkState,
+}
+
+/// What removing a pool would touch, gathered before anything is touched.
+struct PoolRemovalPlan {
+    /// Workers whose Run is in progress. A drain refuses these.
+    busy: Vec<WorkerId>,
+    /// Every Worker in the pool, with its branch and delivery state.
+    workers: Vec<PoolRemovalWorker>,
+}
+
+impl PoolRemovalPlan {
+    /// The Workers holding work that is neither pushed nor merged.
+    fn undelivered(&self) -> impl Iterator<Item = &PoolRemovalWorker> {
+        self.workers
+            .iter()
+            .filter(|worker| !worker.state.is_delivered())
+    }
+
+    /// The report: every Worker, its branch, and whether that branch is pushed
+    /// or merged. Printed before anything is discarded, and named in the
+    /// refusals.
+    fn report(&self) -> String {
+        self.workers
+            .iter()
+            .map(|worker| {
+                let branch = worker.branch.as_deref().unwrap_or("-");
+                format!("  {}  {}  {}", worker.worker, branch, worker.state.label())
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Refuses the removal unless `force` overrides it, naming what stands in
+    /// the way: a busy Worker, or a branch that is neither pushed nor merged.
+    fn refuse_unless_forced(&self, name: &str, force: bool) -> Result<()> {
+        if force {
+            return Ok(());
+        }
+        if !self.busy.is_empty() {
+            let workers = self
+                .busy
+                .iter()
+                .map(WorkerId::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "pool `{name}` has busy Workers: {workers}. Wait for them to finish, or \
+                 re-run with --force to discard their work"
+            );
+        }
+        let undelivered = self.undelivered().collect::<Vec<_>>();
+        if !undelivered.is_empty() {
+            let workers = undelivered
+                .iter()
+                .map(|worker| worker.worker.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            // `?` is a failed read, not necessarily held work - say which, so
+            // the operator can tell "push this" from "I could not tell".
+            let unknown = undelivered
+                .iter()
+                .any(|worker| worker.state == WorkState::Unknown);
+            let unread = if unknown {
+                " A `?` marks a Worker whose branch state could not be read, not one known to \
+                 hold work."
+            } else {
+                ""
+            };
+            bail!(
+                "pool `{name}` holds work that is neither pushed nor merged:\n{}\n\
+                 Deliver it (or push the branch), or re-run with --force to discard it. \
+                 Undelivered Workers: {workers}.{unread}",
+                self.report()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Gathers what removing this handle's Pool would touch, without touching
+/// anything.
+///
+/// The Workers come from the Pool's own state, so the plan is scoped to this
+/// Pool and never to the Repository's other lanes. Each Worker's delivery state
+/// is the [`WorkState`] its Workspace already reports - the same read the list
+/// view uses, so the two cannot drift - and a Worker whose Workspace is not on
+/// disk has no chain to lose and reads `clean`.
+fn pool_removal_plan(repository: &Repository) -> Result<PoolRemovalPlan> {
+    let snapshot = repository.read_worker_pool_snapshot();
+    let busy = snapshot
+        .workers()
+        .iter()
+        .filter(|worker| worker.status() == WorkerStatus::Busy)
+        .map(|worker| worker.worker_id().clone())
+        .collect();
+    let present = snapshot
+        .workers()
+        .iter()
+        .filter(|worker| {
+            repository
+                .worker_workspace_path(worker.worker_id())
+                .is_dir()
+        })
+        .map(|worker| worker.worker_id().as_str().to_owned())
+        .collect::<Vec<_>>();
+    let states = crate::work::snapshot(
+        &crate::work::SystemWorkReads::new(repository.root().to_path_buf()),
+        &present,
+    );
+    let workers = snapshot
+        .workers()
+        .iter()
+        .map(|worker| {
+            // Every Worker with a Workspace on disk is in the snapshot's map;
+            // one without has no chain to lose and reads `clean` rather than a
+            // failed-read `?`, which would refuse a removal with nothing to
+            // refuse.
+            let state = states
+                .get(worker.worker_id().as_str())
+                .map_or(WorkState::Clean, |work| work.state);
+            PoolRemovalWorker {
+                worker: worker.worker_id().clone(),
+                branch: worker.branch_name().map(str::to_owned),
+                state,
+            }
+        })
+        .collect();
+    Ok(PoolRemovalPlan { busy, workers })
+}
+
+/// The removal, with the user-global config handed in so a test can drive it
+/// without reading the developer's own config.
+fn destroy_pool(repository: &Repository, name: &str, force: bool, user: &Config) -> Result<()> {
     let pool = PoolName::parse(name).map_err(|error| anyhow::anyhow!("{error}"))?;
     let existing = user.repo_config(repository.root())?;
     if !existing.pools.contains_key(name) {
@@ -2214,28 +2368,54 @@ fn destroy_pool(repository: &Repository, name: &str, user: &Config) -> Result<()
             repo_config_display(repository)
         );
     }
+    // One handle, narrowed to the pool being removed: the plan reads its state
+    // and the removal writes it, so the two cannot disagree about the lane.
+    let selected = repository.clone().with_pool(pool);
+
+    // Everything the removal would touch is gathered and reported before a
+    // single Workspace or state file moves, so a refusal costs nothing and a
+    // forced removal has already said what it discards.
+    let plan = pool_removal_plan(&selected)?;
+    plan.refuse_unless_forced(name, force)?;
+    if !plan.workers.is_empty() {
+        eprintln!("Pool `{name}` Workers and their branches:");
+        eprintln!("{}", plan.report());
+    }
+    if force {
+        let discarded = plan.undelivered().collect::<Vec<_>>();
+        if !discarded.is_empty() {
+            eprintln!(
+                "warning: --force discards {} Worker(s) holding work that is neither pushed nor \
+                 merged: {}",
+                discarded.len(),
+                discarded
+                    .iter()
+                    .map(|worker| worker.worker.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        if !plan.busy.is_empty() {
+            eprintln!(
+                "warning: --force terminates {} busy Worker(s): {}",
+                plan.busy.len(),
+                plan.busy
+                    .iter()
+                    .map(WorkerId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+
+    selected
+        .remove_pool_with_progress(print_hook_output)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
     crate::config::undeclare_pool(repository.root(), name, user)?;
     eprintln!(
         "Removed pool `{name}` from {}",
         repo_config_display(repository)
     );
-    // The declaration is gone, so any state directory left behind is an orphan.
-    // Report it rather than leave it silently; removing it is the removal
-    // ticket's job.
-    let declared: std::collections::BTreeSet<PoolName> = user
-        .repo_config(repository.root())?
-        .pools
-        .keys()
-        .filter_map(|name| PoolName::parse(name.clone()).ok())
-        .collect();
-    let orphaned = repository
-        .orphan_pool_directories(&declared)
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    if orphaned.contains(&pool) {
-        eprintln!(
-            "warning: pool `{name}` still has state; its Workers and Workspaces are left in place"
-        );
-    }
     Ok(())
 }
 
@@ -4544,17 +4724,36 @@ mod tests {
     }
 
     #[test]
-    fn pool_destroy_parses_a_name_and_defaults_to_default() {
+    fn pool_destroy_parses_a_name_force_and_defaults_to_default() {
         assert_eq!(
             parse(&args(&["pool", "destroy"])).unwrap(),
-            Command::Pool(PoolCommand::Destroy { name: None })
+            Command::Pool(PoolCommand::Destroy {
+                name: None,
+                force: false
+            })
         );
         assert_eq!(
             parse(&args(&["pool", "destroy", "bugs"])).unwrap(),
             Command::Pool(PoolCommand::Destroy {
                 name: Some("bugs".to_owned()),
+                force: false
             })
         );
+        // `--force` is accepted before or after the name, and has a short form.
+        for arguments in [
+            vec!["pool", "destroy", "bugs", "--force"],
+            vec!["pool", "destroy", "--force", "bugs"],
+            vec!["pool", "destroy", "bugs", "-f"],
+        ] {
+            assert_eq!(
+                parse(&args(&arguments)).unwrap(),
+                Command::Pool(PoolCommand::Destroy {
+                    name: Some("bugs".to_owned()),
+                    force: true
+                }),
+                "{arguments:?}"
+            );
+        }
         assert!(parse(&args(&["pool", "destroy", "bugs", "extra"])).is_err());
         assert!(parse(&args(&["pool", "destroy", "--wat"])).is_err());
     }
@@ -4650,26 +4849,209 @@ mod tests {
         let user = toml::from_str::<Config>("").expect("user config");
 
         // `default` is not removable, and both spellings say why.
-        let error =
-            destroy_pool_command(&repository, Some("default")).expect_err("default is refused");
+        let error = destroy_pool_command(&repository, Some("default"), false)
+            .expect_err("default is refused");
         let message = error.to_string();
         assert!(message.contains("default"), "{message}");
         assert!(message.contains("Resize"), "{message}");
-        let bare =
-            destroy_pool_command(&repository, None).expect_err("a bare destroy targets default");
+        let bare = destroy_pool_command(&repository, None, false)
+            .expect_err("a bare destroy targets default");
         assert!(bare.to_string().contains("default"), "{bare}");
 
         // The declaration was the file's only content, so removing it leaves no
         // empty file behind.
-        destroy_pool(&repository, "bugs", &user).expect("the pool is removed");
+        destroy_pool(&repository, "bugs", false, &user).expect("the pool is removed");
         assert!(
             !crate::config::repo_config_path(repository.root()).exists(),
             "the emptied config file is gone"
         );
 
         // Removing a pool that is not declared names it.
-        let error = destroy_pool(&repository, "ghost", &user).expect_err("no such pool");
+        let error = destroy_pool(&repository, "ghost", false, &user).expect_err("no such pool");
         assert!(error.to_string().contains("ghost"), "{error}");
+    }
+
+    /// The pool state a removal test reads: `[pools.<name>]` declared in the
+    /// repo config, with the pool's own state directory under `.jj/pools/`.
+    fn declare_pool_with_state(repo: &tempfile::TempDir, pool: &str, workers: &[(&str, &str)]) {
+        let directory = repo.path().join(".jjfx");
+        std::fs::create_dir_all(&directory).expect("creating .jjfx");
+        std::fs::write(
+            directory.join("config.toml"),
+            format!("[pools.{pool}]\nsize = {}\n", workers.len()),
+        )
+        .expect("writing the config");
+        let pool_directory = repo.path().join(".jj/pools").join(pool);
+        std::fs::create_dir_all(&pool_directory).expect("creating the pool directory");
+        let members = workers
+            .iter()
+            .map(|(worker, _)| format!("\"{worker}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        std::fs::write(
+            pool_directory.join("pool.json"),
+            format!(
+                "{{\"created_at\":\"2026-07-27T10:00:00Z\",\"gh_repo\":\"\",\"size\":{},\
+                 \"workers\":[{members}]}}",
+                workers.len()
+            ),
+        )
+        .expect("writing the pool state");
+        for (worker, status) in workers {
+            std::fs::write(
+                pool_directory.join(format!("{worker}.json")),
+                format!(
+                    "{{\"agent\":\"claude\",\"branch_name\":\"eng-101\",\"completed_at\":null,\
+                     \"error\":null,\"exit_code\":null,\"log_file\":null,\"pid\":null,\
+                     \"started_at\":null,\"status\":\"{status}\",\"ticket\":\"ENG-101\"}}"
+                ),
+            )
+            .expect("writing the worker state");
+        }
+    }
+
+    /// A drain refuses a busy Worker and names it, so a removal can never
+    /// silently kill work in progress.
+    #[test]
+    fn destroy_pool_refuses_a_busy_pool_and_names_the_workers() {
+        let repo = lifecycle_repo(None);
+        declare_pool_with_state(
+            &repo,
+            "bugs",
+            &[("worker-01", "busy"), ("worker-02", "idle")],
+        );
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+
+        let error =
+            destroy_pool(&repository, "bugs", false, &user).expect_err("a busy pool is refused");
+        let message = error.to_string();
+        assert!(message.contains("worker-01"), "{message}");
+        assert!(message.contains("busy"), "{message}");
+        assert!(
+            !message.contains("worker-02"),
+            "only the busy Worker is named: {message}"
+        );
+        // The refusal is a drain, not a partial removal: nothing moved.
+        assert!(repo.path().join(".jj/pools/bugs/pool.json").exists());
+        assert!(
+            crate::config::repo_config_path(repository.root()).exists(),
+            "the declaration survives a refusal"
+        );
+    }
+
+    /// A Worker holding work that is neither pushed nor merged is refused unless
+    /// forced, and the refusal enumerates the branch.
+    #[test]
+    fn pool_removal_refuses_undelivered_work_unless_forced() {
+        let plan = PoolRemovalPlan {
+            busy: Vec::new(),
+            workers: vec![
+                PoolRemovalWorker {
+                    worker: WorkerId::parse("worker-01").expect("worker id"),
+                    branch: Some("eng-101".to_owned()),
+                    state: WorkState::Merged,
+                },
+                PoolRemovalWorker {
+                    worker: WorkerId::parse("worker-02").expect("worker id"),
+                    branch: Some("eng-102".to_owned()),
+                    state: WorkState::Dirty {
+                        added: 12,
+                        removed: 4,
+                    },
+                },
+            ],
+        };
+
+        let error = plan
+            .refuse_unless_forced("bugs", false)
+            .expect_err("undelivered work is refused");
+        let message = error.to_string();
+        assert!(message.contains("worker-02"), "{message}");
+        assert!(message.contains("eng-102"), "{message}");
+        assert!(message.contains("dirty +12/-4"), "{message}");
+        assert!(
+            message.contains("eng-101"),
+            "the whole report is shown: {message}"
+        );
+        assert!(message.contains("merged"), "{message}");
+
+        // `--force` is the only path that discards it, and passes the drain.
+        plan.refuse_unless_forced("bugs", true)
+            .expect("--force overrides the drain");
+    }
+
+    /// A branch state that could not be read refuses too - "could not tell" and
+    /// "safe to discard" are different facts - and the refusal says which.
+    #[test]
+    fn pool_removal_refuses_an_unreadable_branch_and_says_so() {
+        let plan = PoolRemovalPlan {
+            busy: Vec::new(),
+            workers: vec![PoolRemovalWorker {
+                worker: WorkerId::parse("worker-01").expect("worker id"),
+                branch: Some("eng-101".to_owned()),
+                state: WorkState::Unknown,
+            }],
+        };
+
+        let error = plan
+            .refuse_unless_forced("bugs", false)
+            .expect_err("an unreadable branch is refused");
+        let message = error.to_string();
+        assert!(message.contains("could not be read"), "{message}");
+        assert!(message.contains('?'), "{message}");
+        plan.refuse_unless_forced("bugs", true)
+            .expect("--force overrides the drain");
+    }
+
+    /// A pool whose Workers have all delivered is removed without a refusal.
+    #[test]
+    fn pool_removal_allows_delivered_work() {
+        let plan = PoolRemovalPlan {
+            busy: Vec::new(),
+            workers: vec![
+                PoolRemovalWorker {
+                    worker: WorkerId::parse("worker-01").expect("worker id"),
+                    branch: Some("eng-101".to_owned()),
+                    state: WorkState::Merged,
+                },
+                PoolRemovalWorker {
+                    worker: WorkerId::parse("worker-02").expect("worker id"),
+                    branch: Some("eng-102".to_owned()),
+                    state: WorkState::Pushed,
+                },
+            ],
+        };
+        plan.refuse_unless_forced("bugs", false)
+            .expect("delivered work does not block removal");
+        assert!(plan.undelivered().next().is_none());
+    }
+
+    /// The report enumerates every Worker, its branch and whether that branch is
+    /// pushed or merged - including a Worker that never took a branch.
+    #[test]
+    fn pool_removal_report_enumerates_branches_and_delivery() {
+        let plan = PoolRemovalPlan {
+            busy: Vec::new(),
+            workers: vec![
+                PoolRemovalWorker {
+                    worker: WorkerId::parse("worker-01").expect("worker id"),
+                    branch: Some("eng-101".to_owned()),
+                    state: WorkState::Merged,
+                },
+                PoolRemovalWorker {
+                    worker: WorkerId::parse("worker-02").expect("worker id"),
+                    branch: None,
+                    state: WorkState::Clean,
+                },
+            ],
+        };
+        let report = plan.report();
+        assert!(report.contains("worker-01"), "{report}");
+        assert!(report.contains("eng-101"), "{report}");
+        assert!(report.contains("merged"), "{report}");
+        assert!(report.contains("worker-02"), "{report}");
+        assert!(report.contains("clean"), "{report}");
     }
 
     #[test]
