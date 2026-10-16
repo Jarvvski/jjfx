@@ -1257,10 +1257,10 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
 
 fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     let config = crate::config::load()?;
-    let snapshot = repository.worker_pool().reconcile_runs();
     // `status`/`pool list` read Pool state, so they also reconcile local Tickets:
     // a finished Run resolves its Ticket here, with no Dispatch needed.
-    report_local_writeback(repository, &snapshot, &config.tickets);
+    let (snapshot, failures) = reconcile_pass(repository, &config.tickets);
+    report_writeback_failures(&failures);
     let pool = snapshot
         .pool()
         .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
@@ -1580,17 +1580,31 @@ fn configured_runtime(repository: &Repository) -> AgentRuntime {
 /// A no-op unless `[tickets] source = "local"`. The writeback is a side effect of
 /// a command that already succeeded, so a failure is reported rather than raised.
 fn write_back_local_tickets(repository: &Repository, tickets: &TicketsConfig) {
-    let snapshot = repository.worker_pool().reconcile_runs();
-    report_local_writeback(repository, &snapshot, tickets);
+    let (_, failures) = reconcile_pass(repository, tickets);
+    report_writeback_failures(&failures);
 }
 
-/// Reports the failures of one local Ticket writeback against `snapshot`.
-fn report_local_writeback(
+/// One reconciliation pass: observe Worker Runs, then write local Tickets back.
+///
+/// The single mechanism behind `status`/`pool list`, `ticket reconcile` and
+/// `wait`: a reconcile is one pass, and `wait` is this pass repeated until a
+/// condition holds. Returns the post-pass snapshot and any writeback failures,
+/// which the caller reports as loudly as its own contract requires.
+fn reconcile_pass(
     repository: &Repository,
-    snapshot: &WorkerPoolSnapshot,
     tickets: &TicketsConfig,
-) {
-    for failure in apply_local_writeback(repository, snapshot, tickets) {
+) -> (WorkerPoolSnapshot, Vec<String>) {
+    let snapshot = repository.worker_pool().reconcile_runs();
+    let failures = apply_local_writeback(repository, &snapshot, tickets);
+    (snapshot, failures)
+}
+
+/// Reports the failures of one local Ticket writeback.
+///
+/// A writeback is a side effect of a command that already succeeded, so a
+/// failure is reported rather than raised.
+fn report_writeback_failures(failures: &[String]) {
+    for failure in failures {
         eprintln!("local Ticket writeback failed: {failure}");
     }
 }
@@ -1611,8 +1625,7 @@ fn ticket_reconcile_command(
         eprintln!("Ticket source is not local; nothing to reconcile");
         return Ok(());
     }
-    let snapshot = repository.worker_pool().reconcile_runs();
-    let failures = apply_local_writeback(repository, &snapshot, &tickets);
+    let (_, failures) = reconcile_pass(repository, &tickets);
     if failures.is_empty() {
         eprintln!("Reconciled local Tickets");
         return Ok(());
