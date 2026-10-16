@@ -1,6 +1,6 @@
 # `jjfx help <command>` ignores its argument
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -46,3 +46,4 @@ Derive the flag text from the same definitions the parser reads, so the two cann
 ## Comments
 
 - 2026-10-16: Filed from the `jjfx-dispatch` skill pass, which had to hard-code the flag surface because the CLI could not be asked for it.
+- 2026-10-16: Resolved. `src/cli_help.rs` now owns the command surface: the grouped top-level list and one page per command. `cli::parse` reads each command's flags from the same `Flag` slice its page renders and rejects any option the page omits (`cli::reject_unknown_flags`), so the parser and the help cannot drift in either direction. `jjfx help <command>` prints the page (joining multi-word keys, so `jjfx help pool list` works), an unknown command fails naming it, and the top-level list gained the Lifecycle group. Tests cover the top-level↔page mapping, page rendering, and both drift directions.

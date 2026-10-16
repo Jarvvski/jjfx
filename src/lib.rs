@@ -5,6 +5,7 @@ mod app;
 mod attention;
 mod checks;
 mod cli;
+mod cli_help;
 mod cmd;
 mod config;
 mod diff;
