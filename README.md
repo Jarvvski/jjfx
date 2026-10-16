@@ -118,21 +118,33 @@ prints alongside the per-Worker rows:
       "error": null,
       "exit_code": null,
       "log_file": null,
-      "cost_usd": null
+      "cost_usd": null,
+      "pool": "bugs"
     }
   ],
-  "waiting": ["AMBA-42"],
+  "waiting": [{ "ticket": "AMBA-42", "pool": "bugs" }],
   "pools": [
-    { "name": "default", "size": 1, "workers": 1, "implicit": true }
-  ]
+    { "name": "default", "size": 1, "workers": 1, "implicit": true, "spend": 0.0, "cap": null, "window": "week" },
+    { "name": "bugs", "size": 2, "workers": 1, "implicit": false, "spend": 1.5, "cap": 5.0, "window": "week" }
+  ],
+  "orphans": []
 }
 ```
 
-`workers` holds one object per Worker (the fields the table shows, plus `stuck`,
-`exit_code`, `error` and `log_file`). `waiting` lists the Tickets a capped
-Dispatch held back, in input order, and is `[]` when nothing was held. `pools`
-names every pool the Repository holds, including an implicit `default` when no
-`[pools]` declaration names one. Read it with `jq -r '.workers[] | ...'`.
+`workers` holds one object per Worker across every pool (the fields the table
+shows, plus `stuck`, `exit_code`, `error` and `log_file`), each naming its
+`pool`. Filter one lane with the documented query:
+
+```bash
+jjfx status --json | jq '.workers[] | select(.pool == "bugs")'
+```
+
+`waiting` lists the Tickets a capped Dispatch held back, each with the pool that
+held it, and is `[]` when nothing was held. `pools` names every pool the
+Repository holds, including an implicit `default` when no `[pools]` declaration
+names one, with its size and its recorded spend against its own `cap` and
+`window` - a subtotal under the Repository-wide `Spend:` line. `orphans` names
+pool directories no declaration claims, which jjfx reports and never adopts.
 
 ## Documentation
 

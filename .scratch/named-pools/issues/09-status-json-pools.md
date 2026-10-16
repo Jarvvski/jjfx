@@ -1,7 +1,7 @@
 # `status --json` reports pools
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 06
 
 ## Problem
@@ -16,11 +16,11 @@ Blocked by: 06
 
 ## Acceptance Criteria
 
-- [ ] `workers[]` and `waiting[]` keep their shape and gain a `pool` field.
-- [ ] A sibling `pools` key carries per-pool size and spend against its cap.
-- [ ] `jq '.workers[] | select(.pool == "bugs")'` works as the documented way to filter.
-- [ ] The prose output names the pool.
-- [ ] `mise run check` is green.
+- [x] `workers[]` and `waiting[]` keep their shape and gain a `pool` field.
+- [x] A sibling `pools` key carries per-pool size and spend against its cap.
+- [x] `jq '.workers[] | select(.pool == "bugs")'` works as the documented way to filter.
+- [x] The prose output names the pool.
+- [x] `mise run check` is green.
 
 ## References
 

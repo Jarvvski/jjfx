@@ -15,7 +15,7 @@ use std::collections::BTreeMap;
 use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp};
 
-use crate::engine::{Repository, RunRecord, StateError, WorkerId};
+use crate::engine::{PoolName, Repository, RunRecord, StateError, WorkerId};
 
 /// Cost and usage totalled over a set of recorded Runs.
 ///
@@ -192,6 +192,12 @@ impl PoolCostSnapshot {
             .find(|(id, _)| id.as_str() == worker)
             .map(|(_, cost)| *cost)
     }
+
+    /// The recorded cost in one spend window - the total a cap over that window
+    /// reads, and the number a frontend reports per pool.
+    pub fn window(&self, window: SpendWindow) -> PoolCost {
+        window.cost(self)
+    }
 }
 
 impl Repository {
@@ -203,6 +209,22 @@ impl Repository {
     /// that cannot be read is an error.
     pub fn pool_cost(&self) -> Result<PoolCostSnapshot, StateError> {
         let records = self.state_store().runs().records()?;
+        Ok(PoolCostSnapshot::from_records(&records, Timestamp::now()))
+    }
+
+    /// Aggregates the recorded Run costs of every pool in `pools` into one
+    /// Repository-wide snapshot.
+    ///
+    /// Each pool keeps its own Run Records, so the Repository total is their
+    /// union: the per-pool subtotals a frontend reports add up to it. The pool
+    /// names are the caller's, because the state layer does not read
+    /// `RepoConfig`; a store that cannot be read is an error rather than zero
+    /// spend.
+    pub fn repository_cost(&self, pools: &[PoolName]) -> Result<PoolCostSnapshot, StateError> {
+        let mut records = Vec::new();
+        for pool in pools {
+            records.extend(self.state_store_for_pool(pool.clone()).runs().records()?);
+        }
         Ok(PoolCostSnapshot::from_records(&records, Timestamp::now()))
     }
 }
@@ -311,6 +333,11 @@ impl SpendCap {
     /// The cap in millionths of one US dollar.
     pub const fn limit_micro_usd(self) -> u64 {
         self.limit_micro_usd
+    }
+
+    /// The cap formatted as `$d.dddd`, the form the spend views show.
+    pub fn limit_display(self) -> String {
+        usd(self.limit_micro_usd)
     }
 
     /// The window the cap totals over.
@@ -583,6 +610,73 @@ mod tests {
                 .total()
                 .cost_micro_usd(),
             1_000_000
+        );
+    }
+
+    #[test]
+    fn a_snapshot_reads_its_total_through_a_spend_window() {
+        let records = [record(
+            "worker-01",
+            Some("2026-10-15T09:00:00Z"),
+            Some(1_000_000),
+        )];
+        let snapshot = PoolCostSnapshot::from_records(&records, now());
+
+        assert_eq!(
+            snapshot.window(SpendWindow::Today).cost_micro_usd(),
+            1_000_000
+        );
+        assert_eq!(
+            snapshot.window(SpendWindow::Week).cost_micro_usd(),
+            1_000_000
+        );
+        assert_eq!(
+            snapshot.window(SpendWindow::Total).cost_micro_usd(),
+            1_000_000
+        );
+    }
+
+    #[test]
+    fn the_repository_total_unions_every_pools_records() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        let default = PoolName::default();
+        let bugs = PoolName::parse("bugs").expect("pool name");
+        repository
+            .state_store()
+            .runs()
+            .append(&record("worker-01", None, Some(1_000_000)))
+            .expect("append default");
+        repository
+            .state_store_for_pool(bugs.clone())
+            .runs()
+            .append(&record("worker-02", None, Some(2_000_000)))
+            .expect("append bugs");
+
+        let total = repository
+            .repository_cost(&[default.clone(), bugs.clone()])
+            .expect("repository cost");
+        assert_eq!(total.total().runs(), 2);
+        assert_eq!(total.total().cost_micro_usd(), 3_000_000);
+
+        // The subtotals add up to the total, one store per pool.
+        assert_eq!(
+            repository
+                .pool_cost()
+                .expect("default cost")
+                .total()
+                .cost_micro_usd(),
+            1_000_000
+        );
+        assert_eq!(
+            repository
+                .with_pool(bugs)
+                .pool_cost()
+                .expect("bugs cost")
+                .total()
+                .cost_micro_usd(),
+            2_000_000
         );
     }
 }
