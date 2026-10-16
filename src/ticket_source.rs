@@ -296,7 +296,10 @@ mod tests {
         discovery
             .dependency_graph(&parent, &repository)
             .expect("dependency graph");
-        discovery.ticket_details(&id).expect("Ticket details");
+        discovery
+            .ticket_details(&id)
+            .expect("Ticket details")
+            .expect("the Ticket has details");
 
         assert_eq!(
             *requests.lock().expect("recorded requests"),

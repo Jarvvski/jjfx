@@ -125,7 +125,10 @@ fn ticket_details_sends_a_typed_request_and_parses_the_body() {
         request: Arc::clone(&recorded),
     });
 
-    let details = discovery.ticket_details(&id).expect("Ticket details");
+    let details = discovery
+        .ticket_details(&id)
+        .expect("Ticket details")
+        .expect("the Ticket has details");
 
     assert_eq!(
         recorded.lock().expect("recorded request").as_ref(),
@@ -143,9 +146,25 @@ fn ticket_details_allows_a_missing_description() {
     ));
     let id = TicketId::parse("AMBA-42").expect("Ticket ID");
 
-    let details = discovery.ticket_details(&id).expect("Ticket details");
+    let details = discovery
+        .ticket_details(&id)
+        .expect("Ticket details")
+        .expect("the Ticket has details");
 
     assert_eq!(details.description(), "");
+}
+
+#[test]
+fn an_absent_details_payload_is_none_not_a_failure() {
+    // A source that positively has no such Ticket - a local feature Parent is a
+    // directory, not a Ticket file - answers with JSON `null`, which is an
+    // absence rather than a query failure.
+    let discovery = TicketDiscovery::new(StubQuery::returning("null"));
+    let id = TicketId::parse("widgets").expect("Ticket ID");
+
+    let details = discovery.ticket_details(&id).expect("Ticket details");
+
+    assert!(details.is_none(), "{details:?}");
 }
 
 #[test]

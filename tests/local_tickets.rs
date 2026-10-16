@@ -108,9 +108,41 @@ fn a_local_source_discovers_ready_tickets_and_inlines_the_body() {
     );
 
     let id = TicketId::parse("widgets--01-ship-the-widget").expect("Ticket id");
-    let details = discovery.ticket_details(&id).expect("Ticket details");
+    let details = discovery
+        .ticket_details(&id)
+        .expect("Ticket details")
+        .expect("a Ticket file has details");
     assert_eq!(details.title().as_str(), "Ship the widget");
     assert_eq!(details.description(), "## Problem\n\nInline this body.");
+}
+
+#[test]
+fn a_feature_parent_has_no_details_of_its_own() {
+    // A local feature Parent is a directory, not a Ticket file: its id must
+    // resolve to an absence rather than the hard "not found" error that used to
+    // stop orchestration before it could enumerate the feature's children.
+    let repository = TempDir::new().expect("temporary repository");
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-ship-the-widget.md",
+        "# Ship the widget\n\nStatus: ready-for-agent\n",
+    );
+    let discovery = TicketDiscovery::new(source(repository.path()));
+
+    let parent = TicketId::parse("widgets").expect("Parent id");
+    let details = discovery
+        .ticket_details(&parent)
+        .expect("a feature Parent is not a query failure");
+    assert!(details.is_none(), "{details:?}");
+
+    // An id that is neither a Ticket nor a feature is still a hard error, so a
+    // mistyped Ticket is not silently dispatched without its body.
+    let typo = TicketId::parse("nope-typo").expect("typo id");
+    let error = discovery
+        .ticket_details(&typo)
+        .expect_err("an unknown id must still fail");
+    assert!(error.to_string().contains("nope-typo"), "{error}");
 }
 
 #[test]

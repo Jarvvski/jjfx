@@ -5,10 +5,10 @@ use rustix::fs::{FlockOperation, flock};
 
 use jjfx::engine::{
     AgentModel, AgentRuntime, CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected,
-    OrchestrationEvent, OrchestrationOptions, OrchestrationRequest, ParentTicket, PoolState,
-    Repository, RepositoryIdentity, StateChange, SubIssueState, TicketDiscovery, TicketId,
-    TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus, WireTimestamp, WorkerId,
-    WorkerState,
+    LocalMarkdownQuery, OrchestrationEvent, OrchestrationOptions, OrchestrationRequest,
+    ParentTicket, PoolState, Repository, RepositoryIdentity, StateChange, SubIssueState,
+    TicketDiscovery, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, WireStatus,
+    WireTimestamp, WorkerId, WorkerState,
 };
 use tempfile::TempDir;
 
@@ -33,6 +33,13 @@ fn live_group_leader() -> std::process::Child {
         .process_group(0)
         .spawn()
         .expect("live group leader helper")
+}
+
+/// Writes one local markdown Ticket under `<root>/.scratch/<feature>/issues/`.
+fn write_local_ticket(root: &std::path::Path, feature: &str, file: &str, content: &str) {
+    let directory = root.join(".scratch").join(feature).join("issues");
+    fs::create_dir_all(&directory).expect("issues directory");
+    fs::write(directory.join(file), content).expect("Ticket file");
 }
 
 fn install_idle_worker(repository: &Repository, worker: &WorkerId) {
@@ -399,6 +406,64 @@ fn discovery_releases_placeholder_before_persisting_a_real_group() {
         jjfx::engine::Loaded::Missing => panic!("Worker missing"),
     };
     assert_eq!(worker_state.status.as_str(), "idle");
+}
+
+#[test]
+fn a_local_feature_parent_discovers_its_children_as_a_group() {
+    // The README's feature-as-Parent flow: `jjfx dispatch <feature>`. A local
+    // Parent is a directory rather than a Ticket file, so its id has no details
+    // and orchestration must fall through to the feature's Tickets in dependency
+    // order instead of failing the details fetch.
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker(&repository, &worker);
+    write_local_ticket(
+        directory.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: resolved\n",
+    );
+    write_local_ticket(
+        directory.path(),
+        "widgets",
+        "02-dependent.md",
+        "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+    );
+    let discovery = TicketDiscovery::new(LocalMarkdownQuery::new(
+        directory.path().join(".scratch"),
+        "ready-for-agent",
+        "resolved",
+    ));
+    let parent_id = TicketId::parse("widgets").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+
+    let start = repository
+        .orchestration_runner()
+        .discover(
+            &OrchestrationRequest::new(parent_id.clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+            &RepositoryIdentity::parse("owner/repo").expect("repository identity"),
+            "owner/repo",
+        )
+        .expect("a local feature Parent produces a group");
+    assert!(matches!(start, jjfx::engine::OrchestrationStart::Group));
+
+    let loaded = match repository
+        .state_store()
+        .dispatch_group(parent_id)
+        .load()
+        .expect("load group")
+    {
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("group missing"),
+    };
+    let foundation = TicketId::parse("widgets--01-foundation").expect("Foundation");
+    let dependent = TicketId::parse("widgets--02-dependent").expect("Dependent");
+    assert_eq!(loaded.sub_issues.len(), 2, "{:?}", loaded.sub_issues);
+    assert_eq!(loaded.sub_issues[&dependent].blocked_by, vec![foundation]);
 }
 
 #[test]

@@ -50,6 +50,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch exits non-zero when every Ticket failed, so a scripting caller can tell an all-failed batch from a successful one; a batch with a dispatched Ticket, or one deliberately held back under a cap, still exits zero, and the summary line now counts only Tickets actually dispatched.
 - A background `jjfx dispatch <parent>` now prepares the Parent synchronously, so a failure - an unresolvable Ticket, a missing Pool, a rejected discovery - exits non-zero and reports the error instead of printing `orchestrating` for a background child that dies at once; a started runner names its log in the dispatch result and the JSON detail.
 - jjfx logs stops following when the Worker's Run ends - it re-checks the terminal state on every pass and returns cleanly (printing why) instead of following a finished Worker forever, and it ends cleanly if the Run log or the Worker itself disappears mid-follow.
+- jjfx dispatch <feature> orchestrates a local feature's Tickets in dependency order: a local feature Parent is a directory rather than a Ticket file, so it now resolves to no details of its own instead of failing as a missing Ticket, and a failed Ticket-details fetch names the configured source - the local root, or Linear - instead of always Linear.
 
 ## [0.55.0] - 2026-10-16
 
