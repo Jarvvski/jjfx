@@ -131,7 +131,7 @@ development.
 
 Build instructions, the development task list, and where things live are in
 [`CONTRIBUTING.md`](CONTRIBUTING.md). Project conventions and agent guidance
-live in [`CLAUDE.md`](CLAUDE.md).
+live in [`AGENTS.md`](AGENTS.md).
 
 ## License
 

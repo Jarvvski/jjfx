@@ -59,7 +59,7 @@ cargo run -p jjfx -- pool list  # run a CLI command
 ## Conventions
 
 Landing rules, Rust conventions, and agent guidance live in
-[`CLAUDE.md`](CLAUDE.md). It is the project memory for humans and agents alike,
+[`AGENTS.md`](AGENTS.md). It is the project memory for humans and agents alike,
 and it is the authority on how a change lands.
 
 ## Releasing
