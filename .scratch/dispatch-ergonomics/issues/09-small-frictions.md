@@ -1,6 +1,6 @@
 # Small dispatch frictions: help, prompt and version
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -45,11 +45,11 @@ for a binary built from `main` after the 0.55.0 release, containing features 0.5
 
 ## Acceptance Criteria
 
-- [ ] `jjfx help pool create` and `jjfx help pool resize` print a page - or the recovery hint names a documented command.
-- [ ] The help drift test covers every command the parser accepts.
-- [ ] A non-interactive caller cannot grow the pool by not answering the prompt.
-- [ ] `jjfx version` distinguishes a development build from a release.
-- [ ] `mise run check` is green.
+- [x] `jjfx help pool create` and `jjfx help pool resize` print a page - or the recovery hint names a documented command.
+- [x] The help drift test covers every command the parser accepts.
+- [x] A non-interactive caller cannot grow the pool by not answering the prompt.
+- [x] `jjfx version` distinguishes a development build from a release.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -60,3 +60,15 @@ for a binary built from `main` after the 0.55.0 release, containing features 0.5
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive.
+- 2026-10-16: Resolved. `jjfx help` now resolves every spelling the parser
+  accepts through an `ALIASES` table in `cli_help.rs`, so `jjfx help pool
+  create` and `jjfx help pool resize` print the new `pool resize` page (which
+  finally uses `POOL_RESIZE_FLAGS`), the short aliases (`d`, `rb`, `pool
+  create`) answer, and `jjfx help` itself is documented. The recovery hint
+  names `jjfx pool <N>` rather than the undocumented `pool create --size N`.
+  Two drift tests hold the table to `text` and to `parse`. `confirm_growth`
+  refuses when stdin is not a terminal and only an explicit `y`/`yes` grows the
+  pool, so an empty answer can no longer grow it. `jjfx version` reports
+  `<version>-dev` for a build from a checkout (`build.rs` marks every build the
+  release pipeline did not produce), while the release archives and a
+  crates.io install report the clean version.
