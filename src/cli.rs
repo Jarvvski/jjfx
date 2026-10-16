@@ -1736,19 +1736,25 @@ fn render_profile(profile: &AgentRuntimeProfile) -> String {
 /// `default` (the bare form, or an explicit `--pool default`) is sized exactly
 /// as before - its Workers are provisioned and detached against its state. A
 /// named pool is sized in its *declaration*, because that is the source of
-/// truth; its state materialises when the pool is first used.
+/// truth (ADR 0014); when the lane has already materialised, the resize reaches
+/// its Workers first and the declaration is updated to agree, so the two never
+/// disagree about the size.
 fn resize_pool_command(repository: &Repository, value: &str, pool: Option<&str>) -> Result<()> {
     let size = value
         .parse::<usize>()
         .map_err(|_| anyhow::anyhow!("Invalid pool size: {value}"))?;
     match pool {
-        None | Some(DEFAULT_POOL_NAME) => resize_default_pool(repository, size),
+        None | Some(DEFAULT_POOL_NAME) => apply_pool_resize(repository, size),
         Some(name) => resize_declared_pool(repository, name, size, &crate::config::load()?),
     }
 }
 
-/// Resize the implicit `default` pool's state, exactly as `pool <N>` always has.
-fn resize_default_pool(repository: &Repository, size: usize) -> Result<()> {
+/// Resize a Pool's materialised state, provisioning new Workers or detaching its
+/// stable tail, exactly as `pool <N>` always has.
+///
+/// This is `default`'s whole path - an implicit pool with no declaration to move
+/// - and the state half of resizing a declared pool that has materialised.
+fn apply_pool_resize(repository: &Repository, size: usize) -> Result<()> {
     let capacity = PoolCapacity::new(size)?;
     let before = repository
         .worker_pool()
@@ -1774,7 +1780,17 @@ fn resize_default_pool(repository: &Repository, size: usize) -> Result<()> {
     Ok(())
 }
 
-/// Resize a declared pool by editing its `[pools.<name>] size`.
+/// Size a declared pool: resize its materialised lane, then move its declaration
+/// to agree.
+///
+/// The declaration is the source of truth, but a pool that has materialised has
+/// Workers of its own, and the declaration alone cannot change them (ticket 15).
+/// So a lane that exists is resized in place first - growing and shrinking under
+/// the same busy-Worker safety `default` has always had, so a shrink over a busy
+/// Worker is refused and nothing is written - and only then is the declaration
+/// updated. A pool that has not materialised has no state to resize, so only the
+/// declaration moves and the first Dispatch provisions the lane at that size
+/// (ticket 13). Either way the two agree, so `status` reports one true size.
 fn resize_declared_pool(
     repository: &Repository,
     name: &str,
@@ -1787,6 +1803,11 @@ fn resize_declared_pool(
             "no pool `{name}` is declared in {}; create it with `{PROGRAM} pool create {name}`",
             repo_config_display(repository)
         );
+    }
+    let pool = PoolName::parse(name).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let scoped = repository.clone().with_pool(pool);
+    if scoped.state_store().directory_exists() {
+        apply_pool_resize(&scoped, size)?;
     }
     crate::config::set_pool_size(repository.root(), name, size, user)?;
     eprintln!(

@@ -67,6 +67,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch no longer grows the pool when the capacity prompt cannot be answered: with no terminal (a script) or an empty answer the pool stays at its size and the batch dispatches to the available Workers, so the expensive option is never the default.
 - jjfx version now reports a -dev suffix for a build from a checkout, so a binary built from main after a release cannot be mistaken for the released version; the release archives and a crate installed from crates.io report the clean version.
 - jjfx logs stops following a Worker that has gone idle, so it no longer blocks forever on the log its last Run left behind: logs follows the current Run rather than the Worker, and a caller that wants the next Run re-attaches or uses jjfx wait.
+- jjfx pool resize <N> --pool <name> now reaches a materialised lane: it provisions or detaches the lane's Workers under the existing busy-Worker safety and moves the declaration to agree, so the size a user sets is the size jjfx status reports; previously it edited only the declaration, so a lane that had already materialised kept its old Workers and the edit looked like it worked but did nothing.
 
 ## [0.55.0] - 2026-10-16
 

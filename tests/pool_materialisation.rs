@@ -159,6 +159,36 @@ impl MaterialiseFixture {
             .map(|worker| worker.as_str().expect("a Worker id").to_owned())
             .collect()
     }
+
+    /// The repository-local config text, so a test can read back a declaration.
+    fn repo_config_text(&self) -> String {
+        fs::read_to_string(self.path().join(".jjfx/config.toml")).expect("the repository config")
+    }
+
+    /// Forces a Worker's persisted status, so a shrink test can drive a lane
+    /// deterministically rather than race the Run a Dispatch launched.
+    fn set_worker_status(&self, pool: &str, worker: &str, status: &str) {
+        let path = self.pool_state(pool).join(format!("{worker}.json"));
+        let text = fs::read_to_string(&path).expect("Worker state");
+        let mut value: Value = serde_json::from_str(&text).expect("Worker state is JSON");
+        value["status"] = Value::String(status.to_owned());
+        fs::write(&path, serde_json::to_string(&value).expect("Worker JSON"))
+            .expect("rewrite Worker state");
+    }
+
+    /// The `pools` entry for `name` from `status --json`.
+    fn status_pool(&self, name: &str) -> Value {
+        let output = self.jjfx(&["status", "--json"]);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let json: Value = serde_json::from_str(stdout(&output).trim()).expect("status JSON");
+        json["pools"]
+            .as_array()
+            .expect("a pools array")
+            .iter()
+            .find(|pool| pool["name"] == name)
+            .unwrap_or_else(|| panic!("no `{name}` pool in {json}"))
+            .clone()
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -290,5 +320,121 @@ fn a_removed_pool_is_not_resurrected_by_materialisation() {
     assert!(
         !fixture.pool_state("bugs").exists(),
         "materialisation must not resurrect a removed pool"
+    );
+}
+
+/// Ticket 15: a size edit after the lane materialises must reach the Workers it
+/// holds, not only its declaration. Growing provisions the new Workers and the
+/// declaration is moved to agree, so `status` reports one true size.
+#[test]
+fn resizing_a_materialised_lane_grows_its_workers_and_its_declaration() {
+    let fixture = declared_lane();
+    fixture.write_ticket("01-bug.md", &bug_ticket("Fix the crash"));
+    let dispatched = fixture.jjfx(&["dispatch", "--all", "--pool", "bugs", "--json"]);
+    assert!(dispatched.status.success(), "{}", stderr(&dispatched));
+    assert_eq!(
+        fixture.workers("bugs").len(),
+        1,
+        "the lane materialised at its declared size"
+    );
+
+    let resized = fixture.jjfx(&["pool", "resize", "3", "--pool", "bugs"]);
+    assert!(resized.status.success(), "{}", stderr(&resized));
+    assert_eq!(
+        fixture.workers("bugs").len(),
+        3,
+        "the size edit reached the materialised lane"
+    );
+    assert!(
+        fixture.repo_config_text().contains("size = 3"),
+        "the declaration agrees: {}",
+        fixture.repo_config_text()
+    );
+
+    // `status` reports the one size that is true: the lane's own.
+    let bugs = fixture.status_pool("bugs");
+    assert_eq!(bugs["size"], 3, "{bugs}");
+    assert_eq!(bugs["workers"], 3, "{bugs}");
+}
+
+/// A size edit before the lane has materialised has no state to move, so it
+/// moves the declaration only and leaves materialisation to the first Dispatch.
+#[test]
+fn resizing_a_declared_lane_before_it_materialises_moves_only_the_declaration() {
+    let fixture = declared_lane();
+
+    let resized = fixture.jjfx(&["pool", "resize", "4", "--pool", "bugs"]);
+    assert!(resized.status.success(), "{}", stderr(&resized));
+    assert!(
+        fixture.repo_config_text().contains("size = 4"),
+        "{}",
+        fixture.repo_config_text()
+    );
+    assert!(
+        !fixture.pool_state("bugs").exists(),
+        "sizing a declared lane must not materialise it"
+    );
+}
+
+/// Shrinking a materialised lane detaches its stable tail and moves the
+/// declaration with it.
+#[test]
+fn shrinking_a_materialised_lane_detaches_its_tail() {
+    let fixture = MaterialiseFixture::new();
+    fixture.write_repo_config("[pools.bugs]\nsize = 3\nlabel = \"bug\"\n");
+    fixture.write_ticket("01-bug.md", &bug_ticket("Fix the crash"));
+    let dispatched = fixture.jjfx(&["dispatch", "--all", "--pool", "bugs", "--json"]);
+    assert!(dispatched.status.success(), "{}", stderr(&dispatched));
+    let before = fixture.workers("bugs");
+    assert_eq!(before.len(), 3);
+    // The Run a Dispatch launches may still be in flight; settle it so the shrink
+    // tests the size edit rather than the Run's timing.
+    for worker in &before {
+        fixture.set_worker_status("bugs", worker, "idle");
+    }
+
+    let resized = fixture.jjfx(&["pool", "resize", "1", "--pool", "bugs"]);
+    assert!(resized.status.success(), "{}", stderr(&resized));
+    assert_eq!(fixture.workers("bugs"), before[..1].to_vec());
+    assert!(
+        fixture.repo_config_text().contains("size = 1"),
+        "{}",
+        fixture.repo_config_text()
+    );
+}
+
+/// Shrinking over a busy Worker keeps `default`'s safety: the whole resize is
+/// refused and neither the lane nor the declaration moves.
+#[test]
+fn shrinking_a_materialised_lane_over_a_busy_worker_is_refused() {
+    let fixture = MaterialiseFixture::new();
+    fixture.write_repo_config("[pools.bugs]\nsize = 2\nlabel = \"bug\"\n");
+    fixture.write_ticket("01-bug.md", &bug_ticket("Fix the crash"));
+    let dispatched = fixture.jjfx(&["dispatch", "--all", "--pool", "bugs", "--json"]);
+    assert!(dispatched.status.success(), "{}", stderr(&dispatched));
+    let before = fixture.workers("bugs");
+    assert_eq!(before.len(), 2);
+    // The shrink detaches the tail, so that is the Worker the safety must catch.
+    fixture.set_worker_status("bugs", &before[1], "busy");
+
+    let refused = fixture.jjfx(&["pool", "resize", "1", "--pool", "bugs"]);
+    assert!(
+        !refused.status.success(),
+        "a shrink over a busy Worker must be refused"
+    );
+    assert!(
+        stderr(&refused).to_lowercase().contains("busy"),
+        "the refusal names the reason: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        fixture.workers("bugs"),
+        before,
+        "a refused shrink changes nothing"
+    );
+    assert!(
+        fixture.repo_config_text().contains("size = 2"),
+        "the declaration is left alone: {}",
+        fixture.repo_config_text()
     );
 }
