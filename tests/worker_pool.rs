@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::HELPER_LIVENESS_TIMEOUT;
+use support::{HELPER_LIVENESS_TIMEOUT, wait_for_file_content};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
 fn fixture(name: &str) -> Vec<u8> {
@@ -106,18 +106,6 @@ fn destroy_live_process_helper() {
     fs::write(pid_path, child.id().to_string()).expect("write live PID");
     let status = child.wait().expect("wait for destroyed Run");
     assert!(status.success(), "Run should handle TERM successfully");
-}
-
-fn wait_for_file(path: &Path) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
-    while !path.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {}",
-            path.display()
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
 }
 
 fn local_repository_with_origin() -> (TempDir, Repository) {
@@ -571,7 +559,7 @@ fn destroy_terminates_a_live_recorded_process_group() {
         .args(["--exact", "destroy_live_process_helper", "--ignored"])
         .env("WSG_DESTROY_PID", &pid_path);
     let helper = helper.spawn().expect("spawn process owner");
-    wait_for_file(&pid_path);
+    wait_for_file_content(&pid_path);
     let pid = fs::read_to_string(&pid_path)
         .expect("read PID")
         .parse::<i64>()
