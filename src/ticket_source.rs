@@ -17,20 +17,29 @@ use crate::engine::{
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
 /// Agent Runtime running the pool.
 ///
+/// `ready_label` is the global label a local Ticket that declares no `Labels:` of
+/// its own is discovered by. It is the Dispatch's global value, never a pool's
+/// routing label: the fallback must not make an unlabelled Ticket match every
+/// lane a Repository holds.
+///
 /// Fails for a source this build cannot construct, so the setup error surfaces
 /// before any Worker reservation or Pool mutation.
 pub(crate) fn configured_ticket_query(
     workspace: &Path,
     tickets: &TicketsConfig,
     runtime: AgentRuntime,
+    ready_label: &str,
 ) -> Result<Box<dyn TicketQuery>, TicketQueryError> {
     match tickets.source {
         TicketSource::Linear => Ok(Box::new(AgentRuntimeQuery::new(runtime, workspace))),
-        TicketSource::Local => Ok(Box::new(LocalMarkdownQuery::new(
-            workspace.join(&tickets.local.root),
-            tickets.local.ready_status.clone(),
-            tickets.local.resolved_status.clone(),
-        ))),
+        TicketSource::Local => Ok(Box::new(
+            LocalMarkdownQuery::new(
+                workspace.join(&tickets.local.root),
+                tickets.local.ready_status.clone(),
+                tickets.local.resolved_status.clone(),
+            )
+            .with_ready_label(ready_label),
+        )),
     }
 }
 
@@ -98,8 +107,8 @@ mod tests {
 
     use super::*;
     use crate::engine::{
-        ParentTicket, ReadyTicketFilter, RepositoryIdentity, RunRecord, RunRecordConclusion,
-        TicketDiscovery, TicketId, TicketQueryRequest, TicketStatus, WorkerId,
+        DEFAULT_READY_LABEL, ParentTicket, ReadyTicketFilter, RepositoryIdentity, RunRecord,
+        RunRecordConclusion, TicketDiscovery, TicketId, TicketQueryRequest, TicketStatus, WorkerId,
     };
     use tempfile::TempDir;
 
@@ -126,7 +135,7 @@ mod tests {
             AgentRuntime::OpenCode,
         ] {
             assert!(
-                configured_ticket_query(workspace, &linear(), runtime).is_ok(),
+                configured_ticket_query(workspace, &linear(), runtime, DEFAULT_READY_LABEL).is_ok(),
                 "{runtime}"
             );
         }
@@ -143,7 +152,7 @@ mod tests {
             AgentRuntime::OpenCode,
         ] {
             assert!(
-                configured_ticket_query(workspace, &local(), runtime).is_ok(),
+                configured_ticket_query(workspace, &local(), runtime, DEFAULT_READY_LABEL).is_ok(),
                 "{runtime}"
             );
         }
@@ -162,7 +171,7 @@ mod tests {
             AgentRuntime::OpenCode,
         ] {
             assert!(
-                configured_ticket_query(workspace, &default, runtime).is_ok(),
+                configured_ticket_query(workspace, &default, runtime, DEFAULT_READY_LABEL).is_ok(),
                 "{runtime}"
             );
         }
@@ -237,8 +246,13 @@ mod tests {
         .expect("foundation Ticket");
         assert!(foundation.contains("Status: resolved"), "{foundation}");
         let discovery = TicketDiscovery::new(
-            configured_ticket_query(temporary.path(), &tickets, AgentRuntime::Claude)
-                .expect("query"),
+            configured_ticket_query(
+                temporary.path(),
+                &tickets,
+                AgentRuntime::Claude,
+                DEFAULT_READY_LABEL,
+            )
+            .expect("query"),
         );
         let filter = ReadyTicketFilter::new(
             "ready-for-agent",

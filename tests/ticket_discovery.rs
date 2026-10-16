@@ -442,7 +442,7 @@ fn ready_ticket_discovery_excludes_tickets_without_the_configured_label() {
     assert!(tickets.tickets().is_empty());
     assert_eq!(
         tickets.diagnostics()[0].reason(),
-        "missing label \"ready-for-agent\""
+        "missing label \"ready-for-agent\" (carries \"ready-for-human\")"
     );
 }
 

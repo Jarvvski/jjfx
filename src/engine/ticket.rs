@@ -169,6 +169,14 @@ fn extract_json_object(output: &str) -> Option<&str> {
     None
 }
 
+/// The label a local Ticket carries when it declares none of its own.
+///
+/// A local Ticket's readiness is its `Status:`, so its label is a routing tag
+/// rather than a tracker fact. This is the synthetic tag a Ticket that declares
+/// no `Labels:` line carries - the label a Repository that has never used labels
+/// discovers by, and the default a pool's routing label overrides.
+pub const DEFAULT_READY_LABEL: &str = "ready-for-agent";
+
 /// A provider-neutral request for read-only Ticket discovery.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TicketQueryRequest {
@@ -753,9 +761,24 @@ fn ready_ticket(
     let status = TicketStatus::parse(raw.status)
         .map_err(|error| DiscoveryDiagnostic::new(&subject, error.to_string()))?;
     if !raw.labels.iter().any(|label| label == expected_label) {
+        // Name the labels the Ticket does carry: for label routing, "why did
+        // this pool not take it" is answered by what it carried instead, and a
+        // bare "missing label" reads as a typo rather than a routing miss.
+        let carried = if raw.labels.is_empty() {
+            "carries no labels".to_owned()
+        } else {
+            format!(
+                "carries {}",
+                raw.labels
+                    .iter()
+                    .map(|label| format!("{label:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
         return Err(DiscoveryDiagnostic::new(
             subject,
-            format!("missing label {expected_label:?}"),
+            format!("missing label {expected_label:?} ({carried})"),
         ));
     }
     if status != *expected_status {

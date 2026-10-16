@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -36,19 +36,21 @@ use crate::cli_help::{
     STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{
-    Config, MigrationsConfig, PoolConfig, RepoConfig, SpendConfig, TicketSource, TicketsConfig,
+    Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, SpendConfig, TicketSource,
+    TicketsConfig,
 };
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
-    DEFAULT_POOL_NAME, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
-    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
-    DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, REPOSITORY_WIDE_MUTATION,
-    ReadyTicketFilter, Repository, ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode,
-    SpendCap, SpendCapMode, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
-    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
-    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
+    DEFAULT_POOL_NAME, DEFAULT_READY_LABEL, DirectDispatchError, DirectDispatchExecution,
+    DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
+    DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
+    FollowUpExecution, FollowUpOutcome, Loaded, OrchestrationEvent, PoolCapacity, PoolCostSnapshot,
+    PoolName, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets, Repository, ReviewLoop,
+    RunActivity, RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendWindow,
+    StuckWindow, SyncAction, TerminalSettings, TicketDetails, TicketDiscovery, TicketId,
+    TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent, WorkerActions, WorkerId,
+    WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -174,7 +176,10 @@ pub struct DispatchArgs {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub budget: Option<u32>,
-    pub label: String,
+    /// The label `--all` discovers by, overriding the selected pool's own
+    /// routing label. `None` leaves the pool's label in force, and a pool that
+    /// declares none falls back to the global ready label.
+    pub label: Option<String>,
     /// The Worker Pool this Dispatch fills. `None` means "the Repository's only
     /// pool", which is `default` for a Repository that declares none; several
     /// pools with no `--pool` is a loud refusal, never a silent choice.
@@ -926,7 +931,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     let mut provider = None;
     let mut model = None;
     let mut budget = None;
-    let mut label = "ready-for-agent".to_owned();
+    let mut label = None;
     let mut pool = None;
     let mut no_orchestrate = false;
     let mut force = false;
@@ -983,7 +988,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
                 match option {
                     "--provider" => provider = Some(value.clone()),
                     "--model" => model = Some(value.clone()),
-                    "--label" => label = value.clone(),
+                    "--label" => label = Some(value.clone()),
                     "--pool" => pool = Some(value.clone()),
                     "--budget" => {
                         let dollars = value
@@ -2694,13 +2699,18 @@ fn report_named_ticket_readiness(
     if tickets.source != TicketSource::Local || args.tickets.is_empty() {
         return Ok(());
     }
+    // Readiness, not routing: the report answers "is this Ticket ready to run",
+    // so it discovers by the global ready label rather than the selected pool's
+    // routing label. A Ticket tagged for another lane is still ready.
+    let label = global_ready_label(args.label.as_deref());
     let status = TicketStatus::parse(tickets.ready_status())?;
-    let filter = ReadyTicketFilter::new(&args.label, status)?;
+    let filter = ReadyTicketFilter::new(&label, status)?;
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(
         repository.root(),
         &tickets,
         runtime,
+        &label,
     )?);
     let ready = discovery.ready_tickets(&filter)?;
     for ticket in &args.tickets {
@@ -2756,6 +2766,221 @@ fn resolve_pool(available: &[PoolName], requested: Option<&str>) -> Result<PoolN
     }
 }
 
+/// The label a Dispatch discovers by when neither `--label` nor a pool's own
+/// declaration overrides it.
+///
+/// This is also the label a local Ticket that declares no `Labels:` of its own
+/// carries, so a Repository that never adopted labels discovers exactly the work
+/// it always did.
+fn global_ready_label(requested: Option<&str>) -> String {
+    requested.unwrap_or(DEFAULT_READY_LABEL).to_owned()
+}
+
+/// The ready label in force for one selected pool.
+///
+/// `--label` overrides the pool's declared routing label, which overrides the
+/// global default - the ready label is per pool, because each pool's source may
+/// select work by a different label.
+fn ready_label_for(requested: Option<&str>, pool: &PoolName, routes: &[PoolRoute]) -> String {
+    requested
+        .map(str::to_owned)
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|route| route.name() == pool)
+                .map(|route| route.label().to_owned())
+        })
+        .unwrap_or_else(|| DEFAULT_READY_LABEL.to_owned())
+}
+
+/// One Direct Dispatch request per ready Ticket, in request order.
+///
+/// The details fetch, the model, the budget and the dependency basis are the
+/// same whether one pool is filled or `--all` fans out by label, so both paths
+/// build their requests here and cannot drift apart.
+fn ready_ticket_requests<Q: TicketQuery>(
+    repository: &Repository,
+    args: &DispatchArgs,
+    discovery: &TicketDiscovery<Q>,
+    ready: &ReadyTickets,
+    ticket_hint: &str,
+    model: &Option<AgentModel>,
+) -> Result<Vec<DirectDispatchRequest>> {
+    ready
+        .tickets()
+        .iter()
+        .map(|ticket| {
+            let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
+            if let Some(details) = fetch_ticket_details(discovery, ticket.id(), ticket_hint)? {
+                request = request.with_ticket_details(details);
+            }
+            if let Some(model) = model.clone() {
+                request = request.with_model(model);
+            }
+            if let Some(dollars) = args.budget {
+                request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
+            }
+            // Base a dependent on its Blockers' branches, exactly as
+            // orchestration does, so a chain lands as a stack rather than as
+            // parallel branches off trunk. A Blocker with no branch to stack on
+            // is stated rather than left silent, so a dependent that is not fully
+            // stacked is never a surprise.
+            let basis = dependency_basis(ready.blockers(ticket.id()), |blocker| {
+                resolve_ticket_branch(repository.root(), blocker)
+            });
+            if let Some(context) = basis.context() {
+                request = request.with_dependency_context(context.clone());
+            }
+            let base = basis
+                .context()
+                .map_or("trunk", DispatchDependencyContext::pull_request_base);
+            for blocker in basis.unstacked() {
+                eprintln!(
+                    "Ticket {} is blocked by {blocker}, which has no branch; basing it on {base}",
+                    ticket.id()
+                );
+            }
+            Ok(request)
+        })
+        .collect()
+}
+
+/// Fans a `--all` Dispatch out across the pools that declare a routing label.
+///
+/// Each routable pool discovers its own ready work by its own label and the
+/// Tickets it returns are dispatched to it, so work lands in the right lane by
+/// itself instead of a human routing every Dispatch by hand.
+///
+/// A Ticket that matches no pool is **reported, not dropped**: the diagnostics
+/// every pool's discovery produced are folded together, the Tickets that did
+/// route are removed, and what is left is printed. Silence is the failure mode
+/// this whole path exists to remove, so an unroutable Ticket is never
+/// indistinguishable from one that was never filed.
+fn dispatch_all_across_pools(
+    repository: &Repository,
+    args: &DispatchArgs,
+    routes: &[PoolRoute],
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
+    spend_config: fn() -> Result<SpendConfig>,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
+    let tickets = tickets_config(repository)?;
+    let ticket_hint = ticket_source_hint(&tickets, repository);
+    let status = TicketStatus::parse(tickets.ready_status())?;
+    // The source is built once, with the global ready label: a Ticket that
+    // declares no `Labels:` carries that, never a pool's routing label, so an
+    // untagged Ticket cannot match every lane at once.
+    let runtime = configured_runtime(repository);
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository.root(),
+        &tickets,
+        runtime,
+        &global_ready_label(args.label.as_deref()),
+    )?);
+
+    let mut entries = Vec::new();
+    let mut routed = BTreeSet::new();
+    let mut reported: Vec<(String, String)> = Vec::new();
+
+    for route in routes {
+        let scoped = repository.clone().with_pool(route.name().clone());
+        // Reconcile this pool's finished Runs before discovering its ready work,
+        // so a Ticket whose Run completed since the last Dispatch resolves and
+        // readies its dependent in this same fan-out.
+        write_back_local_tickets(&scoped, &tickets);
+        if let Some(warning) = spend_gate(&scoped, spend_config)? {
+            eprintln!("{warning}");
+        }
+        eprintln!(
+            "Fetching tickets with label '{}' for pool '{}'...",
+            route.label(),
+            route.name()
+        );
+        let filter = ReadyTicketFilter::new(route.label(), status.clone())?;
+        let ready = discovery.ready_tickets(&filter)?;
+        // Fold by subject: every pool reports the same not-ready Ticket, and one
+        // reason is enough to say what stops it.
+        for diagnostic in ready.diagnostics() {
+            if !reported
+                .iter()
+                .any(|(subject, _)| subject == diagnostic.subject())
+            {
+                reported.push((
+                    diagnostic.subject().to_owned(),
+                    diagnostic.reason().to_owned(),
+                ));
+            }
+        }
+        if ready.tickets().is_empty() {
+            continue;
+        }
+        let requests =
+            ready_ticket_requests(&scoped, args, &discovery, &ready, &ticket_hint, &model)?;
+        let exclusions = dispatch_exclusions(&scoped, args.force, open_workspaces)?;
+        let result = dispatch_with_capacity_prompt(&scoped, &requests, &exclusions)?;
+        entries.extend(result.outcomes().iter().map(DispatchEntry::from_outcome));
+        routed.extend(
+            ready
+                .tickets()
+                .iter()
+                .map(|ticket| ticket.id().as_str().to_owned()),
+        );
+        write_back_local_tickets(&scoped, &tickets);
+    }
+
+    // A Ticket that matched no pool's label is reported with the reason, never
+    // silently skipped. A Ticket that did route is not reported, even though
+    // every pool it did not match named it.
+    let unrouted = reported
+        .into_iter()
+        .filter(|(subject, _)| !routed.contains(subject))
+        .collect::<Vec<_>>();
+
+    if entries.is_empty() {
+        let skipped = unrouted
+            .iter()
+            .map(|(ticket, detail)| DispatchEntry::Skipped {
+                ticket: ticket.clone(),
+                detail: detail.clone(),
+            })
+            .collect::<Vec<_>>();
+        if args.json {
+            render_dispatch_entries(&skipped, true);
+        } else if skipped.is_empty() {
+            eprintln!("No tickets matched any Worker Pool's routing label");
+        } else {
+            eprintln!("No routable tickets:");
+            eprint!("{}", dispatch_prose(&skipped));
+        }
+        return Ok(());
+    }
+
+    for (subject, reason) in &unrouted {
+        eprintln!("{subject}: {reason}");
+    }
+    render_dispatch_entries(&entries, args.json);
+    if !args.json {
+        let dispatched = entries.iter().filter(|entry| entry.dispatched()).count();
+        eprintln!("Dispatched {dispatched} ticket(s)");
+        let failed = entries.iter().filter(|entry| entry.failed()).count();
+        if failed > 0 {
+            eprintln!("{failed} ticket(s) failed to dispatch.");
+        }
+        let held = entries
+            .iter()
+            .filter(|entry| matches!(entry, DispatchEntry::Waiting { .. }))
+            .count();
+        if held > 0 {
+            eprintln!(
+                "Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes."
+            );
+        }
+    }
+    ensure_dispatch_progressed(&entries)?;
+    Ok(())
+}
+
 fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
@@ -2763,16 +2988,39 @@ fn dispatch_command(
     tickets_config: fn(&Repository) -> Result<TicketsConfig>,
     spend_config: fn() -> Result<SpendConfig>,
 ) -> Result<()> {
+    let config = crate::config::load()?;
+    let available = config.pool_names_for(repository.root())?;
+    let routes = config.pool_routes_for(repository.root())?;
+
+    // `--all` with no `--pool` fans out across the pools that declare a routing
+    // label, sending each Ticket to the pool whose label it carries. The
+    // convenience is opt-in: a Repository whose pools declare no labels keeps
+    // ticket 06's loud refusal, so an unqualified Dispatch is never a silent
+    // choice, and an explicit `--pool` always means "only this lane".
+    if args.all && args.pool.is_none() && available.len() > 1 && !routes.is_empty() {
+        return dispatch_all_across_pools(
+            repository,
+            args,
+            &routes,
+            tickets_config,
+            spend_config,
+            open_workspaces,
+        );
+    }
+
     // Resolve the pool this Dispatch fills before anything is gated, reserved or
     // launched. One pool implies it - every Repository that declares none has one
     // implicit `default` - while several require `--pool`, so an unqualified
     // Dispatch into a Repository with several pools refuses loudly, naming them,
     // rather than silently filling one. `--text` and `--from-file` follow the
     // same rule because they pass through here too.
-    let pool = resolve_pool(
-        &crate::config::load()?.pool_names_for(repository.root())?,
-        args.pool.as_deref(),
-    )?;
+    let pool = resolve_pool(&available, args.pool.as_deref())?;
+    // The ready label is per pool: `--label` overrides the pool's declared
+    // routing label, which overrides the global default. The source's fallback
+    // label is the global one, never the pool's: a Ticket that declares no
+    // `Labels:` carries that, so it cannot match every lane at once.
+    let ready_label = ready_label_for(args.label.as_deref(), &pool, &routes);
+    let source_label = global_ready_label(args.label.as_deref());
     // Every pool-scoped read and write below - the pool document, its Workers,
     // its Run Records, its locks, its spend - follows the handle, so Worker
     // reservation, Dispatch Eligibility and the pool's size are all the selected
@@ -2857,12 +3105,13 @@ fn dispatch_command(
         repository.root(),
         &tickets,
         runtime,
+        &source_label,
     )?);
 
     if args.all {
         let status = TicketStatus::parse(tickets.ready_status())?;
-        let filter = ReadyTicketFilter::new(&args.label, status)?;
-        eprintln!("Fetching tickets with label '{}'...", args.label);
+        let filter = ReadyTicketFilter::new(&ready_label, status)?;
+        eprintln!("Fetching tickets with label '{ready_label}'...");
         let ready = discovery.ready_tickets(&filter)?;
         if ready.tickets().is_empty() {
             // An empty ready set must explain itself: name every Ticket that was
@@ -2879,9 +3128,9 @@ fn dispatch_command(
             if args.json {
                 render_dispatch_entries(&skipped, true);
             } else if skipped.is_empty() {
-                eprintln!("No tickets found with label '{}'", args.label);
+                eprintln!("No tickets found with label '{ready_label}'");
             } else {
-                eprintln!("No ready tickets with label '{}':", args.label);
+                eprintln!("No ready tickets with label '{ready_label}':");
                 eprint!("{}", dispatch_prose(&skipped));
             }
             return Ok(());
@@ -2889,44 +3138,8 @@ fn dispatch_command(
         for diagnostic in ready.diagnostics() {
             eprintln!("{}: {}", diagnostic.subject(), diagnostic.reason());
         }
-        let requests = ready
-            .tickets()
-            .iter()
-            .map(|ticket| {
-                let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
-                if let Some(details) = fetch_ticket_details(&discovery, ticket.id(), &ticket_hint)?
-                {
-                    request = request.with_ticket_details(details);
-                }
-                if let Some(model) = model.clone() {
-                    request = request.with_model(model);
-                }
-                if let Some(dollars) = args.budget {
-                    request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
-                }
-                // Base a dependent on its Blockers' branches, exactly as
-                // orchestration does, so a chain lands as a stack rather than as
-                // parallel branches off trunk. A Blocker with no branch to stack
-                // on is stated rather than left silent, so a dependent that is
-                // not fully stacked is never a surprise.
-                let basis = dependency_basis(ready.blockers(ticket.id()), |blocker| {
-                    resolve_ticket_branch(repository.root(), blocker)
-                });
-                if let Some(context) = basis.context() {
-                    request = request.with_dependency_context(context.clone());
-                }
-                let base = basis
-                    .context()
-                    .map_or("trunk", DispatchDependencyContext::pull_request_base);
-                for blocker in basis.unstacked() {
-                    eprintln!(
-                        "Ticket {} is blocked by {blocker}, which has no branch; basing it on {base}",
-                        ticket.id()
-                    );
-                }
-                Ok(request)
-            })
-            .collect::<Result<Vec<_>>>()?;
+        let requests =
+            ready_ticket_requests(repository, args, &discovery, &ready, &ticket_hint, &model)?;
         let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
         let entries = render_dispatch_result(&result, requests.len(), true, args.json);
         write_back_local_tickets(repository, &tickets);
@@ -4240,6 +4453,7 @@ fn prepare_orchestration(
         repository.root(),
         &tickets,
         runtime,
+        DEFAULT_READY_LABEL,
     )?);
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the
     // no-children direct fallback inlines the Ticket body. A local feature Parent
@@ -4522,7 +4736,7 @@ mod tests {
                 provider: Some("anthropic".to_owned()),
                 model: Some("opus".to_owned()),
                 budget: Some(12),
-                label: "ready-for-agent".to_owned(),
+                label: None,
                 pool: None,
                 no_orchestrate: true,
                 force: false,
@@ -4559,7 +4773,7 @@ mod tests {
                 provider: None,
                 model: None,
                 budget: None,
-                label: "ready-for-agent".to_owned(),
+                label: None,
                 pool: None,
                 no_orchestrate: false,
                 force: false,
@@ -4724,6 +4938,36 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("ghost"), "{message}");
         assert!(message.contains("default"), "{message}");
+    }
+
+    /// The ready label is per pool: `--label` overrides the pool's declared
+    /// routing label, which overrides the global default.
+    #[test]
+    fn the_ready_label_falls_back_from_the_flag_to_the_pool_to_the_default() {
+        let bugs = PoolName::parse("bugs").expect("pool name");
+        let routes = [PoolRoute::new(bugs.clone(), "bug")];
+
+        assert_eq!(
+            ready_label_for(Some("urgent"), &bugs, &routes),
+            "urgent",
+            "an explicit --label wins"
+        );
+        assert_eq!(
+            ready_label_for(None, &bugs, &routes),
+            "bug",
+            "a pool's declared label is the next fallback"
+        );
+        assert_eq!(
+            ready_label_for(None, &PoolName::default(), &routes),
+            DEFAULT_READY_LABEL,
+            "a pool that declares none falls back to the global default"
+        );
+        assert_eq!(
+            global_ready_label(None),
+            DEFAULT_READY_LABEL,
+            "the global default is the ready label a local Ticket carries"
+        );
+        assert_eq!(global_ready_label(Some("urgent")), "urgent");
     }
 
     #[test]
@@ -5951,7 +6195,7 @@ mod tests {
                 provider: None,
                 model: None,
                 budget: None,
-                label: "needs-review".to_owned(),
+                label: Some("needs-review".to_owned()),
                 pool: None,
                 no_orchestrate: false,
                 force: false,
@@ -5972,7 +6216,7 @@ mod tests {
                 provider: None,
                 model: None,
                 budget: None,
-                label: "ready-for-agent".to_owned(),
+                label: None,
                 pool: None,
                 no_orchestrate: true,
                 force: false,

@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, PaneLayout, PoolCapacity, PoolName, SpendCap,
-    SpendCapMode, SpendWindow, WireAgent,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, DEFAULT_POOL_NAME, PaneLayout, PoolCapacity,
+    PoolName, SpendCap, SpendCapMode, SpendWindow, WireAgent,
 };
 use anyhow::Context;
 use serde::Deserialize;
@@ -194,12 +194,42 @@ impl Config {
     pub fn pool_names_for(&self, repo_root: &Path) -> anyhow::Result<Vec<PoolName>> {
         let mut names = vec![PoolName::default()];
         for name in self.repo_config(repo_root)?.pools.keys() {
-            if name == crate::engine::DEFAULT_POOL_NAME {
+            if name == DEFAULT_POOL_NAME {
                 continue;
             }
             names.push(PoolName::parse(name.clone())?);
         }
         Ok(names)
+    }
+
+    /// The routing table `repo_root` declares: one entry per Worker Pool that
+    /// names the Ticket label sending a Ticket to it, `default` first.
+    ///
+    /// A pool that declares no label is absent, because it is reachable only by
+    /// an explicit `--pool` - the declaration is what makes a lane routable,
+    /// never a magic `pool:<name>` string, so a lane can adopt a vocabulary the
+    /// Repository already uses (`.scratch/multi-pool/issues/04`). Two pools may
+    /// not declare the same label; that is refused at load, so a label appears
+    /// here at most once.
+    pub fn pool_routes_for(&self, repo_root: &Path) -> anyhow::Result<Vec<PoolRoute>> {
+        let pools = self.repo_config(repo_root)?.pools;
+        let mut routes = Vec::new();
+        if let Some(label) = pools
+            .get(DEFAULT_POOL_NAME)
+            .and_then(|pool| pool.label.as_deref())
+        {
+            routes.push(PoolRoute::new(PoolName::default(), label));
+        }
+        for (name, pool) in &pools {
+            if name == DEFAULT_POOL_NAME {
+                continue;
+            }
+            let Some(label) = pool.label.as_deref() else {
+                continue;
+            };
+            routes.push(PoolRoute::new(PoolName::parse(name.clone())?, label));
+        }
+        Ok(routes)
     }
 
     /// The settings the TUI and Dispatch both act on, loaded once and handed
@@ -883,6 +913,39 @@ impl RepoConfig {
     }
 }
 
+/// One Worker Pool that declares a routing label, and the label that routes to
+/// it - the row `dispatch --all` fans out over.
+///
+/// A pool absent from the table is not a routable lane: it is reachable only by
+/// an explicit `--pool`. Routing is by declaration, never by a magic
+/// `pool:<name>` string, so a lane adopts a vocabulary the Repository already
+/// uses rather than requiring a new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolRoute {
+    name: PoolName,
+    label: String,
+}
+
+impl PoolRoute {
+    /// Creates one routing-table row.
+    pub fn new(name: PoolName, label: impl Into<String>) -> Self {
+        Self {
+            name,
+            label: label.into(),
+        }
+    }
+
+    /// Returns the Worker Pool the label routes to.
+    pub fn name(&self) -> &PoolName {
+        &self.name
+    }
+
+    /// Returns the Ticket label that routes to the pool.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+}
+
 /// One repository-local Worker Pool declaration, from `[pools.<name>]`.
 ///
 /// Every field is optional but the name (the table key). A declaration may
@@ -1500,6 +1563,70 @@ mod tests {
             vec![
                 PoolName::default(),
                 PoolName::parse("bugs").expect("pool name"),
+            ]
+        );
+    }
+
+    /// The routing table `--all` fans out over: only the pools that declare a
+    /// label, because a declaration is what makes a lane routable - never a
+    /// magic `pool:<name>` string. A Repository that declares no labels has an
+    /// empty table, which is what leaves ticket 06's loud refusal in force.
+    #[test]
+    fn the_routing_table_is_the_pools_that_declare_a_label() {
+        let config = Config::from_toml("");
+
+        let bare = config
+            .pool_routes_for(repo_with_config(None).path())
+            .expect("no repository override");
+        assert!(bare.is_empty());
+
+        // A pool with no label is absent: it is reachable only by `--pool`.
+        let unlabelled = repo_with_config(Some("[pools.bugs]\n\n[pools.features]\n"));
+        assert!(
+            config
+                .pool_routes_for(unlabelled.path())
+                .expect("the repository config parses")
+                .is_empty()
+        );
+
+        let repo = repo_with_config(Some(
+            "[pools.bugs]\nlabel = \"bug\"\n\n[pools.features]\nlabel = \"feature\"\n\n[pools.manual]\n",
+        ));
+        let routes = config
+            .pool_routes_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (route.name().as_str().to_owned(), route.label().to_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("bugs".to_owned(), "bug".to_owned()),
+                ("features".to_owned(), "feature".to_owned()),
+            ]
+        );
+    }
+
+    /// `default` may declare a label like any other pool, and it comes first.
+    #[test]
+    fn a_declared_default_pool_routes_like_any_other() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some(
+            "[pools.default]\nlabel = \"triage\"\n\n[pools.bugs]\nlabel = \"bug\"\n",
+        ));
+
+        let routes = config
+            .pool_routes_for(repo.path())
+            .expect("the repository config parses");
+
+        assert_eq!(
+            routes
+                .iter()
+                .map(|route| (route.name().as_str().to_owned(), route.label().to_owned()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("default".to_owned(), "triage".to_owned()),
+                ("bugs".to_owned(), "bug".to_owned()),
             ]
         );
     }

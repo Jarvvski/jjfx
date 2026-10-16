@@ -101,7 +101,7 @@ fn notes(key: &str) -> &'static str {
             "\nConditions (--until):\n  done              the Worker succeeded\n  failed            the Worker failed\n  terminal          the Worker reached any terminal state (default)\n  ticket-resolved   the Worker's local Ticket is resolved\n\nExit codes:\n  0  the condition was reached\n  1  timed out: the Worker is not done\n  2  a Worker reached a terminal state that does not satisfy --until\n"
         }
         "dispatch" => {
-            "\n--fg blocks until every Run this Dispatch started has finished, inside\nthat one call. `jjfx wait` re-attaches to a Worker any session started, and\ncarries the answer in its exit code.\n\nA Repository with one Worker Pool implies it, so `--pool` is optional. A\nRepository with several requires it: an unqualified Dispatch refuses, naming\nthe pools that exist, rather than choosing one.\n"
+            "\n--fg blocks until every Run this Dispatch started has finished, inside\nthat one call. `jjfx wait` re-attaches to a Worker any session started, and\ncarries the answer in its exit code.\n\nA Repository with one Worker Pool implies it, so `--pool` is optional. A\nRepository with several requires it: an unqualified Dispatch refuses, naming\nthe pools that exist, rather than choosing one.\n\nThe exception is `--all`, which fans out across the pools that declare a\nrouting label (`[pools.bugs] label = \"bug\"`) and sends each Ticket to the pool\nwhose label it carries. A Ticket matching no pool is reported, not dropped,\nand an explicit `--pool` overrides routing to mean only that lane.\n"
         }
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
@@ -172,7 +172,7 @@ pub(crate) const DISPATCH_FLAGS: &[Flag] = &[
         long: "--all",
         short: None,
         value: None,
-        help: "Dispatch every discovered Ready Ticket",
+        help: "Dispatch every discovered Ready Ticket, routing each to its pool by label",
     },
     Flag {
         long: "--text",
@@ -196,13 +196,13 @@ pub(crate) const DISPATCH_FLAGS: &[Flag] = &[
         long: "--label",
         short: None,
         value: Some("LABEL"),
-        help: "Ticket label for `--all` discovery (default ready-for-agent)",
+        help: "Ticket label for `--all` discovery (default: the pool's label, else ready-for-agent)",
     },
     Flag {
         long: "--pool",
         short: None,
         value: Some("NAME"),
-        help: "Worker Pool to fill (required when the Repository holds several)",
+        help: "Worker Pool to fill; an explicit one means only this lane",
     },
     Flag {
         long: "--provider",

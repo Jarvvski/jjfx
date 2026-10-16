@@ -101,10 +101,10 @@ pub use state::{
     WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
-    AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
-    ParentTicket, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket, TicketDetails,
-    TicketDiscovery, TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryErrorKind,
-    TicketQueryRequest, TicketStatus, TicketTitle, TicketValueError,
+    AgentRuntimeQuery, Blocker, DEFAULT_READY_LABEL, DependencyGraph, DiscoveredSubIssue,
+    DiscoveryDiagnostic, ParentTicket, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket,
+    TicketDetails, TicketDiscovery, TicketDiscoveryError, TicketQuery, TicketQueryError,
+    TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle, TicketValueError,
 };
 pub use undo::{MutationCheckpoint, MutationGuard, UndoError, UndoOutcome};
 pub use watchdog::{RunHealth, RunProgress, StuckWindow};
