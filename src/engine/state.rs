@@ -2316,6 +2316,36 @@ impl RunRecordRepository {
             .filter_map(|line| serde_json::from_slice(line).ok())
             .collect())
     }
+
+    /// The Tickets whose most recent Run concluded successfully.
+    ///
+    /// This is the durable completion signal a local Ticket writeback resolves
+    /// from: a Run appends its record when it finalizes, and the record names the
+    /// Ticket, so a finished Run can still resolve its Ticket after `pool reset`
+    /// cleared the live Worker's Ticket association. Only the most recent record
+    /// per Ticket counts, so a Ticket re-dispatched after an earlier success is
+    /// not resolved from the stale record; a Ticket whose latest Run failed is not
+    /// resolved either. Returned in first-recorded order.
+    pub fn completed_tickets(&self) -> Result<Vec<String>, StateError> {
+        let mut latest: Vec<(String, RunRecordConclusion)> = Vec::new();
+        for record in self.records()? {
+            let Some(ticket) = record.ticket else {
+                continue;
+            };
+            match latest
+                .iter_mut()
+                .find(|(candidate, _)| candidate == &ticket)
+            {
+                Some(entry) => entry.1 = record.conclusion,
+                None => latest.push((ticket, record.conclusion)),
+            }
+        }
+        Ok(latest
+            .into_iter()
+            .filter(|(_, conclusion)| *conclusion == RunRecordConclusion::Succeeded)
+            .map(|(ticket, _)| ticket)
+            .collect())
+    }
 }
 
 impl MutationRecordRepository {
@@ -2731,6 +2761,64 @@ mod tests {
         let records = store.records().expect("records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].cost_micro_usd, None);
+    }
+
+    fn record_for(ticket: Option<&str>, conclusion: RunRecordConclusion) -> RunRecord {
+        let mut record = record("worker-01", "worker-01@1", Some(1));
+        record.ticket = ticket.map(str::to_owned);
+        record.conclusion = conclusion;
+        record
+    }
+
+    #[test]
+    fn completed_tickets_returns_the_latest_success_per_ticket() {
+        let (_temp, store) = store();
+        store
+            .append(&record_for(
+                Some("widgets--01-foundation"),
+                RunRecordConclusion::Succeeded,
+            ))
+            .expect("append");
+        store
+            .append(&record_for(
+                Some("widgets--02-dependent"),
+                RunRecordConclusion::Failed,
+            ))
+            .expect("append");
+        store
+            .append(&record_for(None, RunRecordConclusion::Succeeded))
+            .expect("append");
+
+        assert_eq!(
+            store.completed_tickets().expect("completed tickets"),
+            ["widgets--01-foundation"]
+        );
+    }
+
+    #[test]
+    fn a_ticket_whose_latest_run_failed_is_not_completed() {
+        let (_temp, store) = store();
+        store
+            .append(&record_for(
+                Some("widgets--01-foundation"),
+                RunRecordConclusion::Succeeded,
+            ))
+            .expect("append");
+        // A re-dispatch that failed: the latest record for the Ticket wins, so a
+        // stale success does not resolve it.
+        store
+            .append(&record_for(
+                Some("widgets--01-foundation"),
+                RunRecordConclusion::Failed,
+            ))
+            .expect("append");
+
+        assert!(
+            store
+                .completed_tickets()
+                .expect("completed tickets")
+                .is_empty()
+        );
     }
 
     #[test]

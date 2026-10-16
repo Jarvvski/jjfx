@@ -25,6 +25,56 @@ fn ready_filter() -> ReadyTicketFilter {
     .expect("Ready Ticket filter")
 }
 
+/// A `jj` repository plus a `[tickets] source = "local"` config home, the shape
+/// the CLI needs to reconcile local Tickets.
+fn jj_repository() -> (TempDir, TempDir) {
+    let repository = TempDir::new().expect("temporary repository");
+    let status = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
+        .arg(repository.path())
+        .status()
+        .expect("jj should be installed");
+    assert!(status.success(), "jj git init");
+    let config_home = TempDir::new().expect("temporary config home");
+    let config_directory = config_home.path().join("jjfx");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        "[tickets]\nsource = \"local\"\n",
+    )
+    .expect("config file");
+    (repository, config_home)
+}
+
+/// Append one succeeded Run Record for `ticket`, the durable completion signal a
+/// local Ticket writeback resolves from - and the only signal left after `pool
+/// reset` clears a Worker's Ticket association.
+fn write_run_record(root: &Path, ticket: &str) {
+    let pool = root.join(".jj").join("pool");
+    fs::create_dir_all(&pool).expect("pool directory");
+    let line = format!(
+        "{{\"run_id\":\"worker-1@2026-01-01T00:00:00Z\",\"worker\":\"worker-1\",\
+         \"ticket\":\"{ticket}\",\"conclusion\":\"succeeded\"}}\n"
+    );
+    fs::write(pool.join("runs.jsonl"), line).expect("run record");
+}
+
+fn ticket_status(root: &Path, feature: &str, file: &str) -> String {
+    fs::read_to_string(
+        root.join(".scratch")
+            .join(feature)
+            .join("issues")
+            .join(file),
+    )
+    .expect("Ticket file")
+}
+
 #[test]
 fn a_local_source_discovers_ready_tickets_and_inlines_the_body() {
     let repository = TempDir::new().expect("temporary repository");
@@ -183,4 +233,102 @@ fn dispatch_all_json_reports_an_empty_batch_as_an_empty_array() {
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+}
+
+#[test]
+fn dispatch_all_with_an_empty_ready_set_reconciles_finished_tickets() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: claimed\n",
+    );
+    write_run_record(repository.path(), "widgets--01-foundation");
+
+    // No ready Ticket and no live Worker: the only thing a Dispatch can do is
+    // reconcile. Before the fix it returned `[]` and left the Ticket `claimed`.
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["dispatch", "--all", "--json", "--force"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+    assert!(
+        ticket_status(repository.path(), "widgets", "01-foundation.md")
+            .contains("Status: resolved"),
+        "the finished Run must resolve its Ticket without a second Dispatch"
+    );
+}
+
+#[test]
+fn ticket_reconcile_resolves_a_finished_run_without_a_dispatch() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: claimed\n",
+    );
+    write_run_record(repository.path(), "widgets--01-foundation");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["ticket", "reconcile"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(output.status.success(), "{:?}", output);
+    assert!(
+        ticket_status(repository.path(), "widgets", "01-foundation.md")
+            .contains("Status: resolved"),
+        "an explicit reconcile must resolve a finished Run"
+    );
+}
+
+#[test]
+fn a_reconciled_blocker_readies_its_dependent_in_the_same_dispatch() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: claimed\n",
+    );
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "02-dependent.md",
+        "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+    );
+    write_run_record(repository.path(), "widgets--01-foundation");
+
+    // The reconcile before discovery resolves 01, so 02 becomes ready in the
+    // same Dispatch (which then fails on the absent Pool - the readiness is what
+    // this asserts).
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["dispatch", "--all", "--json", "--force"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        ticket_status(repository.path(), "widgets", "01-foundation.md")
+            .contains("Status: resolved"),
+        "the blocker must resolve"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("No tickets found"),
+        "the dependent must be discovered as ready, not the ready set read empty: {stderr}"
+    );
+    let discovery = TicketDiscovery::new(source(repository.path()));
+    let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+    assert_eq!(ready.tickets().len(), 1, "{:?}", ready.diagnostics());
+    assert_eq!(ready.tickets()[0].id().as_str(), "widgets--02-dependent");
 }

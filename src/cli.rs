@@ -12,7 +12,7 @@ use crate::cli_help::{
     ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
     RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS,
 };
-use crate::config::{MigrationsConfig, SpendConfig, TicketsConfig};
+use crate::config::{MigrationsConfig, SpendConfig, TicketSource, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
@@ -21,7 +21,7 @@ use crate::engine::{
     PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
     RunActivityKind, RunMode, StuckWindow, TerminalSettings, TicketDetails, TicketDiscovery,
     TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent, WorkerActions, WorkerId,
-    WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
+    WorkerPoolError, WorkerPoolSnapshot, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -108,6 +108,14 @@ pub enum Command {
         force: bool,
     },
     Pool(PoolCommand),
+    Ticket(TicketCommand),
+}
+
+/// The `ticket` subcommands: local Ticket state, reconciled on demand.
+#[derive(Debug, PartialEq, Eq)]
+pub enum TicketCommand {
+    /// `ticket reconcile`: resolve finished local Tickets without a Dispatch.
+    Reconcile,
 }
 
 /// Which colocation transition the `colocation` command performs.
@@ -237,6 +245,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         }),
         "__orchestrate" => parse_orchestrate(&args[1..]),
         "pool" => parse_pool(&args[1..]),
+        "ticket" => parse_ticket(&args[1..]),
         unknown => bail!("Unknown command: {unknown}. Run '{PROGRAM} help' for usage."),
     }
 }
@@ -289,6 +298,14 @@ fn parse_check(args: &[String]) -> Result<Command> {
             env!("CARGO_PKG_NAME"),
             " check migrations"
         )),
+    }
+}
+
+fn parse_ticket(args: &[String]) -> Result<Command> {
+    let usage = concat!("Usage: ", env!("CARGO_PKG_NAME"), " ticket reconcile");
+    match args.first().map(String::as_str) {
+        Some("reconcile") if args.len() == 1 => Ok(Command::Ticket(TicketCommand::Reconcile)),
+        _ => bail!("{usage}"),
     }
 }
 
@@ -926,6 +943,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
             tickets,
         )?,
         Command::Pool(command) => pool_command(&repository(colocate)?, command)?,
+        Command::Ticket(TicketCommand::Reconcile) => {
+            ticket_reconcile_command(&repository(colocate)?, tickets)?
+        }
     }
     Ok(())
 }
@@ -1235,14 +1255,18 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
 }
 
 fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
+    let config = crate::config::load()?;
     let snapshot = repository.worker_pool().reconcile_runs();
+    // `status`/`pool list` read Pool state, so they also reconcile local Tickets:
+    // a finished Run resolves its Ticket here, with no Dispatch needed.
+    report_local_writeback(repository, &snapshot, &config.tickets);
     let pool = snapshot
         .pool()
         .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
     // The watchdog's window is jjfx's own setting, read here rather than passed
     // down: `pool list` is the only CLI command that surfaces Run health, and
     // `cli::run` is already at the argument limit.
-    let watchdog = crate::config::load()?.watchdog.stuck_window();
+    let watchdog = config.watchdog.stuck_window();
     let now = Timestamp::now();
     if json {
         return pool_list_json(&snapshot, now, watchdog);
@@ -1553,12 +1577,49 @@ fn configured_runtime(repository: &Repository) -> AgentRuntime {
 /// Claims or resolves local Tickets for the current Worker Pool.
 ///
 /// A no-op unless `[tickets] source = "local"`. The writeback is a side effect of
-/// a Dispatch that already succeeded, so a failure is reported rather than raised.
+/// a command that already succeeded, so a failure is reported rather than raised.
 fn write_back_local_tickets(repository: &Repository, tickets: &TicketsConfig) {
     let snapshot = repository.worker_pool().reconcile_runs();
-    for failure in apply_local_writeback(repository, &snapshot, tickets) {
+    report_local_writeback(repository, &snapshot, tickets);
+}
+
+/// Reports the failures of one local Ticket writeback against `snapshot`.
+fn report_local_writeback(
+    repository: &Repository,
+    snapshot: &WorkerPoolSnapshot,
+    tickets: &TicketsConfig,
+) {
+    for failure in apply_local_writeback(repository, snapshot, tickets) {
         eprintln!("local Ticket writeback failed: {failure}");
     }
+}
+
+/// Reconcile local Ticket state on demand, with no Dispatch and no ready Ticket.
+///
+/// Resolves Tickets whose Run finished and claims those a live Worker is running,
+/// reading the durable Run Record store so a finished Run is reconciled even
+/// after `pool reset` cleared the Worker's Ticket association. Fails loudly: an
+/// explicit reconcile the operator asked for should not report success when a
+/// Ticket could not be written.
+fn ticket_reconcile_command(
+    repository: &Repository,
+    tickets_config: fn() -> Result<TicketsConfig>,
+) -> Result<()> {
+    let tickets = tickets_config()?;
+    if tickets.source != TicketSource::Local {
+        eprintln!("Ticket source is not local; nothing to reconcile");
+        return Ok(());
+    }
+    let snapshot = repository.worker_pool().reconcile_runs();
+    let failures = apply_local_writeback(repository, &snapshot, &tickets);
+    if failures.is_empty() {
+        eprintln!("Reconciled local Tickets");
+        return Ok(());
+    }
+    for failure in &failures {
+        eprintln!("local Ticket writeback failed: {failure}");
+    }
+    bail!("local Ticket reconcile failed")
 }
 
 fn dispatch_command(
@@ -1627,6 +1688,11 @@ fn dispatch_command(
 
     let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
     let tickets = tickets_config()?;
+    // Reconcile finished Tickets before discovering ready work, so a Ticket whose
+    // Run completed since the last Dispatch resolves and its dependents become
+    // ready in this same Dispatch. This is also the only reconciliation an empty
+    // ready set reaches: without it, a linear chain deadlocks at `claimed`.
+    write_back_local_tickets(repository, &tickets);
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(
         repository.root(),
@@ -2646,7 +2712,7 @@ _jjfx() {
     'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
     'resolve:Resolve a Workspace conflict'
     'absorb:Fold Worker edits into base commits'
-    'undo:Undo the last jjfx mutation' 'completion:Print shell completion' 'help:Show help'
+    'undo:Undo the last jjfx mutation' 'ticket:Reconcile local Tickets' 'completion:Print shell completion' 'help:Show help'
   _arguments -C '1:command:->command' '*::arg:->args'
   case $state in
     command) _describe 'command' commands ;;
@@ -2658,6 +2724,7 @@ _jjfx() {
         mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
+        ticket) _arguments '1:subcommand:(reconcile)' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--text[dispatch a one-off Ticket from text]:text:' '--from-file[dispatch a Ticket from a markdown file]:path:_files' '--id[Ticket id for ad-hoc input]:id:' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
@@ -2859,6 +2926,17 @@ mod tests {
         assert!(parse(&args(&["colocation"])).is_err());
         assert!(parse(&args(&["colocation", "wat"])).is_err());
         assert!(parse(&args(&["colocation", "enable", "extra"])).is_err());
+    }
+
+    #[test]
+    fn ticket_reconcile_parses_and_rejects_anything_else() {
+        assert_eq!(
+            parse(&args(&["ticket", "reconcile"])).unwrap(),
+            Command::Ticket(TicketCommand::Reconcile)
+        );
+        assert!(parse(&args(&["ticket"])).is_err());
+        assert!(parse(&args(&["ticket", "wat"])).is_err());
+        assert!(parse(&args(&["ticket", "reconcile", "extra"])).is_err());
     }
 
     #[test]

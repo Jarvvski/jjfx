@@ -1,6 +1,6 @@
 # Local Tickets must resolve without a later Dispatch
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -57,3 +57,4 @@ Drive the writeback from a durable record rather than from a Dispatch that happe
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive. The worst finding in the run.
+- 2026-10-16: Resolved. The completion signal is now the durable Run Record store: `RunRecordRepository::completed_tickets` returns the latest-succeeded Ticket per record, and the writeback resolves from that rather than live Worker state, so `pool reset` no longer destroys the signal. Dispatch reconciles before it discovers ready work (the empty-ready early return is now reached only after a reconcile), `jjfx status` / `jjfx pool list` reconcile on read, and `jjfx ticket reconcile` reconciles on demand with no Dispatch and no ready Ticket. Live `done` Workers are still folded in, so a Run whose record was never written (a runtime that finalizes lazily, the opencode case ticket 08 fixes) still resolves. An in-flight Ticket is never resolved from a stale record.
