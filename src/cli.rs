@@ -1868,6 +1868,51 @@ fn ticket_reconcile_command(
     bail!("local Ticket reconcile failed")
 }
 
+/// Reports why a Ticket the user named by hand is not in the Ready set, then lets
+/// the Dispatch proceed: naming a Ticket is deliberate, so naming it is the
+/// override.
+///
+/// The reason comes from the same seam the `--all` path uses -
+/// `ReadyTickets::diagnostics`, which the local source fills from
+/// `LocalTickets::not_ready_reason` - so the two paths cannot drift apart. Only
+/// the local source can explain a named Ticket it knows about but did not return
+/// as ready: the Linear query filters by label and status, so a named Ticket it
+/// does not return carries no reason to report, and asking would add a query and a
+/// failure mode to every named Dispatch for nothing.
+fn report_named_ticket_readiness(
+    repository: &Repository,
+    args: &DispatchArgs,
+    tickets_config: fn() -> Result<TicketsConfig>,
+) -> Result<()> {
+    let tickets = tickets_config()?;
+    if tickets.source != TicketSource::Local || args.tickets.is_empty() {
+        return Ok(());
+    }
+    let status = TicketStatus::parse(tickets.ready_status())?;
+    let filter = ReadyTicketFilter::new(&args.label, status)?;
+    let runtime = configured_runtime(repository);
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository.root(),
+        &tickets,
+        runtime,
+    )?);
+    let ready = discovery.ready_tickets(&filter)?;
+    for ticket in &args.tickets {
+        if let Some(diagnostic) = ready
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.subject() == ticket)
+        {
+            eprintln!(
+                "Ticket {} is not ready: {}; dispatching anyway",
+                ticket,
+                diagnostic.reason()
+            );
+        }
+    }
+    Ok(())
+}
+
 fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
@@ -1889,6 +1934,14 @@ fn dispatch_command(
     if let Some(input) = &args.input {
         let ticket = AdHocTicket::read(input)?;
         return dispatch_adhoc_ticket(repository, args, &ticket, model, open_workspaces);
+    }
+
+    // A Ticket named by hand is dispatched even when it is not ready - naming it
+    // is the override - but why it is not ready is reported first, from the same
+    // seam the `--all` path uses. This runs before the Orchestrator handoff below,
+    // so a named Ticket that falls back to a direct Dispatch reports too.
+    if !args.all {
+        report_named_ticket_readiness(repository, args, tickets_config)?;
     }
 
     // A single Ticket with orchestration enabled is handed to the Orchestrator.

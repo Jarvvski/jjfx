@@ -1,10 +1,12 @@
-//! Dispatch must not report success when nothing happened.
+//! Dispatch must not report success when nothing happened, and must say what it
+//! did with a Ticket.
 //!
 //! Each case drives the real binary, because the point is the exit code and the
 //! output a scripting caller sees: a batch where every Ticket failed must exit
-//! non-zero, a batch that dispatched (or held back) a Ticket must exit zero, and
-//! a background orchestration that fails must be reported as a failure rather
-//! than as `orchestrating`.
+//! non-zero, a batch that dispatched (or held back) a Ticket must exit zero, a
+//! background orchestration that fails must be reported as a failure rather than
+//! as `orchestrating`, and a Ticket named by hand that is not ready is dispatched
+//! anyway with the reason it was not ready reported first.
 #![cfg(unix)]
 
 use std::fs;
@@ -303,5 +305,122 @@ fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
             .contains_key(&TicketId::parse("gadgets--01-done").expect("child Ticket")),
         "{:?}",
         group.sub_issues
+    );
+}
+
+#[test]
+fn a_named_ticket_blocked_by_an_unresolved_sibling_says_why_and_dispatches_anyway() {
+    let fixture = DispatchFixture::new();
+    fixture.with_origin();
+    fixture.with_pool(1);
+    // 01 is ready but not resolved, so 02 is blocked by an unresolved sibling.
+    fixture.write_ticket(
+        "widgets",
+        "02-dependent.md",
+        "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+    );
+    let path = fixture.with_fake_agent();
+
+    // Default Dispatch orchestrates a single named Ticket, which falls back to a
+    // direct Dispatch because the Ticket is not a feature directory - so this
+    // covers the path `jjfx dispatch <TICKET>` actually takes.
+    let output = fixture
+        .jjfx(&["dispatch", "widgets--02-dependent", "--force"])
+        .env("PATH", path)
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let error = stderr(&output);
+    // The reason comes from the same seam `--all` uses, and naming the Ticket is
+    // the override, so the Dispatch proceeds rather than refusing.
+    assert!(
+        error.contains(
+            "Ticket widgets--02-dependent is not ready: blocked by widgets--01-ship-the-widget (ready-for-agent); dispatching anyway"
+        ),
+        "{error}"
+    );
+    assert!(
+        error.contains("-> widgets--02-dependent"),
+        "the named Ticket must still be dispatched:\n{error}"
+    );
+}
+
+#[test]
+fn a_named_ticket_with_the_wrong_status_reports_it_and_dispatches_anyway() {
+    let fixture = DispatchFixture::new();
+    fixture.with_origin();
+    fixture.with_pool(1);
+    // The Ticket is in flight, so its `Status:` is not the ready status.
+    fixture.write_ticket(
+        "widgets",
+        "01-ship-the-widget.md",
+        "# Ship the widget\n\nStatus: claimed\n\n## Problem\n\nDo it.\n",
+    );
+    let path = fixture.with_fake_agent();
+
+    let output = fixture
+        .jjfx(&[
+            "dispatch",
+            "widgets--01-ship-the-widget",
+            "--no-orchestrate",
+            "--json",
+            "--force",
+        ])
+        .env("PATH", path)
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let error = stderr(&output);
+    assert!(
+        error.contains(
+            "Ticket widgets--01-ship-the-widget is not ready: expected status \"ready-for-agent\", found \"claimed\"; dispatching anyway"
+        ),
+        "{error}"
+    );
+    // The reason is a diagnostic on stderr; the dispatch result on stdout is one
+    // object for the Ticket that was launched anyway.
+    let json = stdout(&output);
+    assert!(
+        json.contains("\"ticket\": \"widgets--01-ship-the-widget\""),
+        "{json}"
+    );
+    assert!(json.contains("\"outcome\": \"dispatched\""), "{json}");
+}
+
+#[test]
+fn a_ready_named_ticket_is_not_reported_as_not_ready() {
+    let fixture = DispatchFixture::new();
+    fixture.with_origin();
+    fixture.with_pool(1);
+    let path = fixture.with_fake_agent();
+
+    let output = fixture
+        .jjfx(&["dispatch", "widgets--01-ship-the-widget", "--force"])
+        .env("PATH", path)
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let error = stderr(&output);
+    assert!(
+        !error.contains("is not ready"),
+        "a ready Ticket must not be reported as not ready:\n{error}"
     );
 }

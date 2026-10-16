@@ -1,7 +1,7 @@
 # A named Ticket that is not ready must say why
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Question
@@ -19,4 +19,35 @@ The first reads truer to today's behaviour and to "report why"; the second is mo
 
 ## Answer
 
-<!-- recorded on resolution -->
+Resolved 2026-10-16. **Report and proceed.** Naming a Ticket by hand is a
+deliberate act, so naming it is the override: `jjfx dispatch <TICKET>` reports
+why the named Ticket is not ready and dispatches it anyway. Refusing would turn
+today's working Dispatch into an error for a case the user chose explicitly, and
+would need an override flag to restore the behaviour this ticket was filed to
+make audible.
+
+The reason comes from the same seam `--all` uses: `cli::dispatch_command` now
+calls `TicketDiscovery::ready_tickets` for the named path (through
+`report_named_ticket_readiness`) and reports each named Ticket found in
+`ReadyTickets::diagnostics`, which the local source fills from
+`LocalTickets::not_ready_reason`. So a blocked Ticket names its blocker and that
+blocker's status, and a wrong-status Ticket names both statuses, in the same
+wording `--all` prints - the two paths cannot drift apart. The check runs before
+the Orchestrator handoff, so a single named Ticket - which falls back to a direct
+Dispatch - reports too; it is skipped for `--all` (which reports its own) and for
+ad-hoc input (which has no source).
+
+The report is a stderr diagnostic printed alongside the dispatch result, for both
+prose and `--json`, mirroring how `--all` prints diagnostics when the ready set is
+non-empty: the Ticket was dispatched, not skipped, so the JSON array stays one
+object per Ticket - its real outcome - and no `Skipped` entry is fabricated, which
+would also mask ticket 04's all-failed exit code. It is gated to
+`source = "local"`: the Linear query filters by label and status, so a named
+Ticket it does not return carries no reason to report, and asking would add a
+query and a failure mode to every named Dispatch for nothing.
+
+Tests in `tests/dispatch_outcomes.rs` drive the real binary for a blocked named
+Ticket (orchestration path, prose), a wrong-status named Ticket
+(`--no-orchestrate`, `--json`), and a ready named Ticket (no false positive);
+all pass `--force` so they do not depend on the ambient terminal. `mise run
+check` is green.

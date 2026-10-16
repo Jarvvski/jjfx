@@ -54,6 +54,12 @@ A Ticket is **ready** when its `Status:` is `ready-for-agent` and every
 `resolved`. A Ticket with an unresolved Blocker is not ready; resolving the
 Blocker makes it ready on the next discovery.
 
+Naming a Ticket is the override. `jjfx dispatch <ticket-id>` reports why the
+Ticket is not ready - the wrong `Status:`, or the unresolved Blocker and its
+status - and dispatches it anyway; the reason comes from the same readiness
+check `--all` reports with, so the two paths cannot disagree. It is a
+diagnostic on stderr, alongside the dispatch result rather than in place of it.
+
 ## Dependencies
 
 `Blocked by:` maps onto the existing Dispatch Group. The **Parent** of a group is
