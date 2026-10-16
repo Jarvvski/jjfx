@@ -40,7 +40,7 @@ fn jj_repository() -> (TempDir, TempDir) {
     (repository, config_home)
 }
 
-/// Writes the Pool manifest naming `workers`.
+/// Writes the Worker Pool manifest naming `workers`.
 fn write_manifest(root: &Path, workers: &[&str]) {
     let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");
@@ -62,7 +62,7 @@ fn write_manifest(root: &Path, workers: &[&str]) {
 /// `<root>/.jj/pools/default/<id>.log` and writing `log` there when given.
 ///
 /// The state is replaced by rename, so a reader never observes a half-written
-/// document and mistakes the Worker for one that has left the Pool.
+/// document and mistakes the Worker for one that has left its Worker Pool.
 fn write_worker(root: &Path, id: &str, status: &str, log: Option<&str>) {
     let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");
@@ -316,7 +316,7 @@ fn logs_stops_cleanly_when_the_worker_leaves_the_pool() {
     assert_eq!(status.code(), Some(0), "a departed Worker is a clean end");
 
     let stderr = watcher.into_output();
-    assert!(stderr.contains("left the Pool"), "{stderr:?}");
+    assert!(stderr.contains("left its Worker Pool"), "{stderr:?}");
 }
 
 #[test]

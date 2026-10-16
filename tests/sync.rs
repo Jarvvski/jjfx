@@ -170,7 +170,7 @@ fn a_working_copy_behind_trunk_is_reported_by_root_where_and_status() {
         stderr(&where_output)
     );
 
-    // `status` reads the Pool, so give it one first.
+    // `status` reads the Worker Pool, so give it one first.
     let pool = fixture.jjfx(&["pool", "1"]);
     assert!(pool.status.success(), "{}", stderr(&pool));
     let status = fixture.jjfx(&["status"]);

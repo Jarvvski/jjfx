@@ -1014,16 +1014,16 @@ impl WorkerPool {
     ///
     /// A declared Pool with no state directory is normal, not a disagreement
     /// (ADR 0013): `[pools.<name>]` is the source of truth and
-    /// `.jj/pools/<name>/` is state, so the first operation that needs the Pool's
-    /// document creates it - provisioning the Workers the declaration names,
+    /// `.jj/pools/<name>/` is state, so the first operation that needs the Worker
+    /// Pool's document creates it - provisioning the Workers the declaration names,
     /// exactly as `jjfx pool <N>` does for `default`. That is what makes a
     /// committed declaration work on a fresh clone with nobody provisioning the
     /// lane by hand.
     ///
     /// Idempotent: a Pool whose state directory already exists is left untouched,
     /// so a second Dispatch never re-provisions it. Provisioning runs outside
-    /// state locks and adoption takes the Pool lock, so this is safe under the
-    /// repository-outermost lock order (ADR 0013).
+    /// state locks and adoption takes the Worker Pool lock, so this is safe under
+    /// the repository-outermost lock order (ADR 0013).
     pub fn materialise(&self, capacity: PoolCapacity) -> Result<Vec<WorkerId>, WorkerPoolError> {
         if self.repository.state_store().directory_exists() {
             return Ok(Vec::new());
@@ -1031,7 +1031,7 @@ impl WorkerPool {
         Ok(self.resize_to(capacity)?.added_workers().to_vec())
     }
 
-    /// Resizes the Pool, provisioning new Workers or detaching its stable tail.
+    /// Resizes the Worker Pool, provisioning new Workers or detaching its stable tail.
     pub fn resize_to(&self, capacity: PoolCapacity) -> Result<PoolResize, WorkerPoolError> {
         self.resize_to_with_progress(capacity, |_, _| {})
     }
@@ -1140,7 +1140,8 @@ impl WorkerPool {
         }
     }
 
-    /// Destroys the Pool, terminating recorded Runs and removing all Pool resources.
+    /// Destroys the Worker Pool, terminating recorded Runs and removing all its
+    /// resources.
     ///
     /// Membership is detached before any process or Workspace operation runs.
     /// Worker state and cleanup markers remain durable until external cleanup
@@ -1153,7 +1154,7 @@ impl WorkerPool {
         self.destroy_with_progress(|_, _| {})
     }
 
-    /// Destroys the Pool while reporting teardown hook output.
+    /// Destroys the Worker Pool while reporting teardown hook output.
     pub fn destroy_with_progress<F>(&self, mut on_output: F) -> Result<(), WorkerPoolError>
     where
         F: FnMut(crate::engine::workspace::WorkspaceHookStream, &str),
@@ -1294,8 +1295,9 @@ impl WorkerPool {
                     }
                     match state_store.finish_detached_cleanup(worker) {
                         Ok(true) => cleaned.push(worker.clone()),
-                        Ok(false) => failures
-                            .push(format!("{worker}: Worker rejoined the Pool during cleanup")),
+                        Ok(false) => failures.push(format!(
+                            "{worker}: Worker rejoined the Worker Pool during cleanup"
+                        )),
                         Err(error) => failures.push(format!("{worker}: {error}")),
                     }
                 }
@@ -1454,7 +1456,7 @@ where
             Ok(false) => {
                 residual.push(worker.clone());
                 failures.push(format!(
-                    "{worker}: Worker rejoined the Pool during destruction"
+                    "{worker}: Worker rejoined the Worker Pool during destruction"
                 ));
             }
             Err(error) => {
@@ -1981,7 +1983,7 @@ impl WorkerPoolSnapshot {
     pub fn diagnostics(&self) -> &[SnapshotDiagnostic] {
         &self.diagnostics
     }
-    /// Returns the Pool's recorded cost and usage, or `None` when the record
+    /// Returns the Worker Pool's recorded cost and usage, or `None` when the record
     /// store could not be read.
     pub fn cost(&self) -> Option<&PoolCostSnapshot> {
         self.cost.as_ref()
@@ -2127,7 +2129,7 @@ impl Repository {
     }
 
     /// Removes this handle's Worker Pool: terminates its recorded Runs, removes
-    /// every Worker's Workspace, and removes the Pool's state directory.
+    /// every Worker's Workspace, and removes the Worker Pool's state directory.
     ///
     /// This is the forced path - it does not drain. `pool destroy` refuses a
     /// Pool with a busy Worker or undelivered work before it reaches here unless
@@ -2135,7 +2137,7 @@ impl Repository {
     /// is a no-op.
     ///
     /// Unlike [`WorkerPool::destroy`], which leaves a Pool that is recreated in
-    /// place, this removes the state directory outright: the Pool is gone, so
+    /// place, this removes the state directory outright: the Worker Pool is gone, so
     /// leaving it (and its locks) behind would be a leak that
     /// `orphan_pool_directories` would then have to report.
     pub fn remove_pool_with_progress<F>(&self, mut on_output: F) -> Result<(), WorkerPoolError>
@@ -2181,8 +2183,8 @@ fn worker_snapshot(
     ) {
         Ok(profile) => profile,
         // A Worker recorded under a removed runtime stays observable, with no
-        // usable profile, so reconciliation can finalize its Run and the Pool
-        // view can show why it cannot run. Any other malformed runtime is
+        // usable profile, so reconciliation can finalize its Run and the Worker
+        // Pool view can show why it cannot run. Any other malformed runtime is
         // still reported.
         Err(_) if is_removed_worker_runtime(&state) => None,
         Err(message) => return Err(message),
@@ -2219,7 +2221,7 @@ fn worker_snapshot(
 /// Reports whether the recorded PID still leads a live process group.
 ///
 /// This is the same group-based probe reconciliation uses for the runtimes
-/// whose work the PID owns (claude, codex), so the Pool view and
+/// whose work the PID owns (claude, codex), so the Worker Pool view and
 /// reconciliation agree for them. An opencode Run is judged from its session
 /// instead, because its recorded PID is only a daemon client - for opencode
 /// this probe answers about the client, not the work.

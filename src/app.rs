@@ -558,7 +558,7 @@ impl App {
         std::mem::take(&mut self.effects)
     }
 
-    /// Fold one Workspace Dispatch event through the Pool session's
+    /// Fold one Workspace Dispatch event through the Worker Pool session's
     /// operation-identity rules, then act on what it asks for.
     fn on_workspace_dispatch(&mut self, event: WorkspaceDispatchEvent) {
         for update in self.pool.apply(event) {
@@ -2664,7 +2664,7 @@ impl App {
         render::pool::draw(frame, &view, footer);
     }
 
-    /// Project the Pool session and focused pane into the read-only pool view.
+    /// Project the Worker Pool session and focused pane into the read-only pool view.
     fn pool_view(&self) -> PoolView<'_> {
         let pane = match self.pool_mode() {
             Some(PoolMode::DispatchPreview { tickets, selected }) => PoolPane::DispatchPreview {
@@ -4660,7 +4660,7 @@ mod tests {
             })
         });
 
-        // The completed action is reported, and the Pool refreshes so the
+        // The completed action is reported, and the Worker Pool refreshes so the
         // Worker's attention follows the answered request.
         let operation = app.pool.active_operation.expect("permission operation");
         app.handle(Msg::WorkspaceDispatch(

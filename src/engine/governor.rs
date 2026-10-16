@@ -1,10 +1,10 @@
 //! The dispatch capacity governor: an optional ceiling on how many Runs may be
 //! in flight at once.
 //!
-//! `pool N` sizes the Pool and `dispatch --all` fires the whole batch, so a
-//! large Pool plus a large batch can trip a provider's rate limit in one go.
-//! A cap paces a batch instead: the first `limit - in_flight` Tickets fire, and
-//! the rest are held back in a waiting state the owner can see.
+//! `pool N` sizes the `default` pool and `dispatch --all` fires the whole batch,
+//! so a large Worker Pool plus a large batch can trip a provider's rate limit in
+//! one go. A cap paces a batch instead: the first `limit - in_flight` Tickets
+//! fire, and the rest are held back in a waiting state the owner can see.
 //!
 //! The cap is a *ceiling on concurrent Runs*, not a batch size: it counts the
 //! Runs already in flight, so repeated Dispatches stay under the same limit

@@ -2041,7 +2041,7 @@ fn reconcile_runs_reports_a_pool_member_whose_workspace_is_gone() {
 
     let snapshot = repository.worker_pool().reconcile_runs();
 
-    // The member is still in the Pool, but it can never run: the snapshot must
+    // The member is still in the Worker Pool, but it can never run: the snapshot must
     // say so rather than present it as a healthy idle Worker.
     assert!(snapshot.worker(worker.as_str()).is_some());
     let diagnostic = snapshot

@@ -200,7 +200,7 @@ impl ResetAdapterResult {
 /// How a Dismiss operation changed Worker capacity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkerDismissDisposition {
-    /// The idle Worker was removed from the Pool.
+    /// The idle Worker was removed from its Worker Pool.
     Removed { capacity: usize },
     /// The terminal Worker was cleared in place.
     Reset,
@@ -291,12 +291,12 @@ impl WorkerCommandResult {
 pub enum WorkspaceDispatchCommand {
     /// Reconcile recorded Runs and read a complete immutable Pool snapshot.
     Refresh { operation: OperationId },
-    /// Set the exact Pool capacity, creating the Pool when necessary.
+    /// Set the exact Worker Pool capacity, creating it when necessary.
     Resize {
         operation: OperationId,
         capacity: usize,
     },
-    /// Destroy the Pool after the caller has obtained confirmation.
+    /// Destroy the Worker Pool after the caller has obtained confirmation.
     Destroy { operation: OperationId },
     /// Dispatch one or more Ticket IDs, optionally targeting one exact Worker.
     Dispatch {
@@ -542,7 +542,7 @@ pub struct DispatchCapacityShortage {
 }
 
 impl DispatchCapacityShortage {
-    /// Creates a shortage from counts observed under the Pool lock.
+    /// Creates a shortage from counts observed under the Worker Pool lock.
     #[cfg(test)]
     pub const fn new(requested: usize, available: usize) -> Self {
         Self {
@@ -555,7 +555,7 @@ impl DispatchCapacityShortage {
     pub const fn requested(self) -> usize {
         self.requested
     }
-    /// Returns the idle Worker count observed under the Pool lock.
+    /// Returns the idle Worker count observed under the Worker Pool lock.
     pub const fn available(self) -> usize {
         self.available
     }
@@ -719,7 +719,7 @@ pub enum WorkspaceDispatchEvent {
         parent: String,
         resumed: bool,
     },
-    /// A durable orchestration update was projected for the Pool view.
+    /// A durable orchestration update was projected for the Worker Pool view.
     OrchestrationProgress {
         operation: OperationId,
         progress: DispatchGroupProgress,

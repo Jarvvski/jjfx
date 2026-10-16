@@ -9,7 +9,7 @@ only a Worker's most recent Run would survive.
 ## Where it lives
 
 The store is `.jj/pools/<name>/runs.jsonl`, inside the pool's own state
-directory. It is jjfx-owned and deliberately kept out of the Pool and Worker
+directory. It is jjfx-owned and deliberately kept out of the pool and Worker
 documents.
 
 It is one JSON object per line, in append order. The store is **append-only and

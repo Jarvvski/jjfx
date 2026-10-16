@@ -1454,9 +1454,10 @@ fn check_migrations_command(repository: &Repository, migrations: &MigrationsConf
 }
 
 fn path_command(repository: &Repository, name: &str) -> Result<()> {
-    // Dispatch and the Pool list use the short Worker id, while the Workspace
-    // is named `worker-<id>`. Resolve either form against the real projection so
-    // `path <short-id>` returns the directory that actually exists.
+    // Dispatch and the `pool list` output use the short Worker id, while the
+    // Workspace is named `worker-<id>`. Resolve either form against the real
+    // projection so `path <short-id>` returns the directory that actually
+    // exists.
     println!("{}", workspace_path(repository, name).display());
     Ok(())
 }
@@ -2619,8 +2620,8 @@ impl PoolRemovalPlan {
 /// Gathers what removing this handle's Pool would touch, without touching
 /// anything.
 ///
-/// The Workers come from the Pool's own state, so the plan is scoped to this
-/// Pool and never to the Repository's other lanes. Each Worker's delivery state
+/// The Workers come from the Worker Pool's own state, so the plan is scoped to
+/// this Pool and never to the Repository's other lanes. Each Worker's delivery state
 /// is the [`WorkState`] its Workspace already reports - the same read the list
 /// view uses, so the two cannot drift - and a Worker whose Workspace is not on
 /// disk has no chain to lose and reads `clean`.
@@ -3971,7 +3972,7 @@ enum FollowStop {
     RunFinished(WorkerStatus),
     /// The Worker is idle, so it has no Run and nothing is being written.
     Idle,
-    /// The Worker left the Pool, so nothing more can be written.
+    /// The Worker left its Worker Pool, so nothing more can be written.
     WorkerGone,
     /// The Run log vanished, so there is nothing left to read.
     LogGone,
@@ -3986,7 +3987,9 @@ impl FollowStop {
                 eprintln!("Stopped following {worker}: Run is {}", status.as_str());
             }
             Self::Idle => eprintln!("Stopped following {worker}: the Worker is idle"),
-            Self::WorkerGone => eprintln!("Stopped following {worker}: the Worker left the Pool"),
+            Self::WorkerGone => {
+                eprintln!("Stopped following {worker}: the Worker left its Worker Pool");
+            }
             Self::LogGone => eprintln!("Stopped following {worker}: the log is gone"),
         }
     }
@@ -4074,7 +4077,7 @@ fn print_log_tail(path: &std::path::Path) -> Result<()> {
 ///
 /// Re-read on every pass: the Run can end at any moment after the command
 /// attaches, so the terminal states (`Done` and `Failed`) end the follow. A
-/// Worker that has left the Pool will never write again either, so it ends the
+/// Worker that has left its Worker Pool will never write again either, so it ends the
 /// follow too rather than hanging on a log nothing can append to.
 ///
 /// `logs` follows the current Run, not the Worker: `Idle` means there is no Run
@@ -4172,7 +4175,7 @@ fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
 /// The Workers `wait` blocks for: the named ones, or every Worker with `--all`.
 ///
 /// Read without reconciling, so a Worker whose Run has not been observed yet is
-/// still a valid target. A named Worker that is not in the Pool is an error:
+/// still a valid target. A named Worker that is not in the Worker Pool is an error:
 /// waiting on a typo would otherwise block until the timeout.
 fn wait_targets(repository: &Repository, args: &WaitArgs) -> Result<Vec<WorkerId>> {
     let snapshot = repository.worker_pool().snapshot();
@@ -4271,7 +4274,7 @@ fn wait_verdict(
     let mut pending = false;
     for target in targets {
         let Some(worker) = snapshot.worker(target.as_str()) else {
-            // A target that left the Pool can never satisfy the condition.
+            // A target that left its Worker Pool can never satisfy the condition.
             return WaitVerdict::Unsatisfied;
         };
         let satisfied = match condition {
@@ -4801,7 +4804,8 @@ fn spawn_background_orchestration(
     Ok(log)
 }
 
-/// The log a detached orchestration runner writes to, under the Pool directory.
+/// The log a detached orchestration runner writes to, under the Worker Pool's
+/// directory.
 ///
 /// A [`TicketId`] is a safe filename component, so it needs no escaping. The
 /// name is lowercased to match the orchestration lock, which is case-folded

@@ -266,7 +266,7 @@ impl DirectDispatch {
         result.with_waiting(waiting)
     }
 
-    /// The Runs already in flight: every Worker the Pool records as busy.
+    /// The Runs already in flight: every Worker the Worker Pool records as busy.
     fn in_flight(&self) -> usize {
         self.repository
             .worker_pool()

@@ -61,7 +61,7 @@ Workspace's work.
 When any operation has happened since - another Workspace's Forge, an agent's
 commit, a fetch - the undo is refused and the refusal reports how many later
 operations a restore would discard. `jjfx undo <workspace> --force` is the
-explicit, warned override; the Pool view never forces.
+explicit, warned override; the Worker Pool view never forces.
 
 Because jj does not record who created an operation, an operation created by
 another process *inside* a mutation's own window is indistinguishable from jjfx's
@@ -76,9 +76,9 @@ recorded for that Workspace, accepting a Worker in either spelling (`3` or
 `worker-3`), any Workspace name, or `*`/`repo` for a repository-wide mutation.
 `--force` discards the later operations the refusal names.
 
-In the TUI, `u` in the Pool view asks for confirmation and then submits the same
-undo for the selected Worker, reporting the outcome - including a refusal and its
-reason - in the status line.
+In the TUI, `u` in the Worker Pool view asks for confirmation and then submits
+the same undo for the selected Worker, reporting the outcome - including a
+refusal and its reason - in the status line.
 
 The restore is itself an operation, so an undo can be undone with `jj op log` and
 `jj op restore` exactly as any other jj mutation.

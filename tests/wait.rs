@@ -62,7 +62,7 @@ fn jj_repository() -> (TempDir, TempDir) {
     (repository, config_home)
 }
 
-/// Writes the Pool manifest naming `workers`.
+/// Writes the Worker Pool manifest naming `workers`.
 fn write_manifest(root: &Path, workers: &[&str]) {
     let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");

@@ -123,7 +123,7 @@ impl ResetOutcome {
 /// The compatibility outcome of dismissing one Worker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DismissOutcome {
-    /// An idle Worker was removed from the Pool.
+    /// An idle Worker was removed from its Worker Pool.
     Removed { capacity: usize },
     /// A terminal Worker was cleared in place and kept its Workspace.
     Reset,
@@ -633,7 +633,7 @@ impl WorkerActions {
         Ok(ResetOutcome { run, restoration })
     }
 
-    /// Dismisses an idle Worker from the Pool or clears a terminal Worker in place.
+    /// Dismisses an idle Worker from its Worker Pool or clears a terminal Worker in place.
     ///
     /// Busy Workers are rejected. Terminal Workers are deliberately cleared
     /// without Workspace restoration so their failed or completed contents can
@@ -1497,7 +1497,7 @@ pub enum WorkerActionError {
     /// No idle Worker was available for an arbitrary task.
     #[error("no idle Worker is available")]
     NoIdleWorker,
-    /// The requested Worker was not present in the Pool snapshot.
+    /// The requested Worker was not present in the Worker Pool snapshot.
     #[error("Worker {worker} not found")]
     WorkerNotFound { worker: WorkerId },
     /// Review and repository actions require a resolved Worker bookmark.
