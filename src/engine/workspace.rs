@@ -17,6 +17,7 @@ const CACHE_LOCK_PATH: &str = ".jj/ws-cache.lock";
 const DEFAULT_WORKSPACE: &str = "default";
 const SETUP_HOOK_PATH: &str = ".jjfx/setup.sh";
 const TEARDOWN_HOOK_PATH: &str = ".jjfx/teardown.sh";
+const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
 /// The output stream used by a repository Workspace lifecycle hook.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,6 +164,112 @@ impl WorkspaceCleanPlan {
 #[derive(Debug, Clone)]
 pub struct Workspaces {
     repository: Repository,
+}
+
+/// How far a Workspace's working copy has fallen behind trunk.
+///
+/// jj has no "current branch": a fetch that advances `main` leaves `@` where it
+/// was, so `@` and `main` become *siblings* and the files on disk are the old
+/// tree with nothing to say so. [`Workspaces::trunk_drift`] reports that state
+/// (`None` means the "`@` is one above trunk" invariant holds) and
+/// [`Workspaces::sync_to_trunk`] is the remedy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkDrift {
+    behind: u32,
+    carries_changes: bool,
+}
+
+impl TrunkDrift {
+    /// How many trunk commits the working copy does not contain.
+    pub fn behind(&self) -> u32 {
+        self.behind
+    }
+
+    /// Whether the working copy commit carries changes of its own, so re-syncing
+    /// must rebase it rather than replace it with a fresh commit.
+    pub fn carries_changes(&self) -> bool {
+        self.carries_changes
+    }
+
+    /// The one-line warning a state-reading command prints: how far behind the
+    /// working copy is, and the command that re-syncs it.
+    ///
+    /// Shape-neutral on purpose: a state-reading command must not snapshot the
+    /// working copy (ADR 0006), so it cannot tell an empty `@` from one carrying
+    /// changes - and `sync` decides that itself, from a fresh snapshot.
+    pub fn warning(&self) -> String {
+        let behind = match self.behind {
+            1 => "1 commit".to_owned(),
+            count => format!("{count} commits"),
+        };
+        format!(
+            "this working copy is {behind} behind trunk; \
+             run `{PROGRAM} sync` to re-sync it onto trunk"
+        )
+    }
+}
+
+/// How [`Workspaces::sync_to_trunk`] moved the working copy onto trunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncAction {
+    /// The working copy was already above trunk; nothing moved.
+    AlreadyOnTrunk,
+    /// An empty working copy was replaced with a fresh commit above trunk
+    /// (`jj new`).
+    MovedEmpty,
+    /// A working copy carrying changes was rebased onto trunk (`jj rebase`).
+    Rebased,
+}
+
+/// The result of re-syncing a working copy onto trunk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrunkSync {
+    action: SyncAction,
+    behind: u32,
+    conflicts: Vec<String>,
+    warning: Option<String>,
+}
+
+impl TrunkSync {
+    /// How the working copy was moved onto trunk.
+    pub fn action(&self) -> SyncAction {
+        self.action
+    }
+
+    /// How many trunk commits the working copy was behind before the move.
+    pub fn behind(&self) -> u32 {
+        self.behind
+    }
+
+    /// The change ids of the commits the move left conflicted, deepest first.
+    ///
+    /// A rebase that hits a conflict still succeeds, so this (not the exit code)
+    /// is how a caller learns a conflict must be resolved. jj records the
+    /// conflict; nothing here resolves it.
+    pub fn conflicts(&self) -> &[String] {
+        &self.conflicts
+    }
+
+    /// A non-fatal problem during the sync - a fetch that failed - for the caller
+    /// to surface without treating the move itself as failed.
+    pub fn warning(&self) -> Option<&str> {
+        self.warning.as_deref()
+    }
+}
+
+/// An error reading or re-syncing a working copy against trunk.
+#[derive(Debug, Error)]
+#[error("{message}")]
+pub struct TrunkSyncError {
+    message: String,
+}
+
+impl TrunkSyncError {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+        }
+    }
 }
 
 impl Workspaces {
@@ -417,6 +524,164 @@ impl Workspaces {
         }
         Ok(())
     }
+
+    /// Reads how far the working copy at `workspace_dir` has fallen behind trunk.
+    ///
+    /// `None` when trunk is an ancestor of `@` - the "`@` is one above trunk"
+    /// invariant holds - and `Some` when it is not, carrying how many trunk
+    /// commits are missing and whether the working copy carries changes of its
+    /// own. Trunk is [`crate::trunk::as_revset`], the same base the `behind`
+    /// indicator and `tidyws` use, so the three cannot disagree.
+    ///
+    /// A read failure is an error, never a silent `None`: "in sync" and "could
+    /// not tell" must not look alike.
+    pub fn trunk_drift(&self, workspace_dir: &Path) -> Result<Option<TrunkDrift>, TrunkSyncError> {
+        let trunk = crate::trunk::as_revset();
+        if count_in_dir(workspace_dir, &format!("({trunk}) & ::@"))? > 0 {
+            return Ok(None);
+        }
+        let behind = u32::try_from(count_in_dir(workspace_dir, &format!("::({trunk}) ~ ::@"))?)
+            .map_err(|_| {
+                TrunkSyncError::new("trunk is implausibly far ahead of the working copy")
+            })?;
+        if behind == 0 {
+            return Ok(None);
+        }
+        // An empty working copy can be replaced outright; one with changes has to
+        // be rebased, so which shape this is decides the fix.
+        let carries_changes = count_in_dir(workspace_dir, "@ & empty()")? == 0;
+        Ok(Some(TrunkDrift {
+            behind,
+            carries_changes,
+        }))
+    }
+
+    /// Fetches (when the repository has a remote) and moves the working copy at
+    /// `workspace_dir` onto trunk.
+    ///
+    /// An empty working copy is replaced with a fresh commit above trunk
+    /// (`jj new`); one carrying changes is rebased onto trunk (`jj rebase`),
+    /// which jj records as a conflict rather than resolving. Conflicts are
+    /// returned for the caller to surface - they are never silently resolved. A
+    /// fetch that fails is a warning, not an error: the move onto trunk is the
+    /// local remedy and must not be blocked by the network.
+    pub fn sync_to_trunk(&self, workspace_dir: &Path) -> Result<TrunkSync, TrunkSyncError> {
+        let warning = self.fetch_for_sync()?;
+        // Snapshot before classifying: `--ignore-working-copy` would miss an edit
+        // that is on disk but not yet in `@`, misclassify a dirty working copy as
+        // empty, and then move it out from under the edit. Sync is about to move
+        // the working copy anyway, so snapshotting here is a legitimate effect.
+        run_in_dir(
+            workspace_dir,
+            &["log", "-r", "@", "--no-graph", "-T", "commit_id"],
+            "snapshot the working copy",
+        )?;
+        let Some(drift) = self.trunk_drift(workspace_dir)? else {
+            return Ok(TrunkSync {
+                action: SyncAction::AlreadyOnTrunk,
+                behind: 0,
+                conflicts: Vec::new(),
+                warning,
+            });
+        };
+        let trunk = crate::trunk::as_revset();
+        let action = if drift.carries_changes {
+            run_in_dir(
+                workspace_dir,
+                &["rebase", "-d", &trunk],
+                "rebase the working copy onto trunk",
+            )?;
+            SyncAction::Rebased
+        } else {
+            run_in_dir(
+                workspace_dir,
+                &["new", &trunk],
+                "start a fresh working copy above trunk",
+            )?;
+            SyncAction::MovedEmpty
+        };
+        let conflicts = conflicted_since_trunk(workspace_dir, &trunk)?;
+        Ok(TrunkSync {
+            action,
+            behind: drift.behind,
+            conflicts,
+            warning,
+        })
+    }
+
+    /// Fetches `origin` before a sync, returning a warning instead of failing
+    /// when it cannot, and `None` when there is no remote to fetch.
+    fn fetch_for_sync(&self) -> Result<Option<String>, TrunkSyncError> {
+        let root = self.repository.root();
+        let remotes = git_remotes(root)
+            .map_err(|error| TrunkSyncError::new(format!("read git remotes: {error}")))?;
+        if !remotes.status.success() || remotes.stdout.iter().all(u8::is_ascii_whitespace) {
+            return Ok(None);
+        }
+        match crate::jj::fetch(root) {
+            Ok(()) => Ok(None),
+            Err(error) => Ok(Some(format!(
+                "could not fetch before syncing ({error:#}); moved onto the current trunk"
+            ))),
+        }
+    }
+}
+
+/// Count the revisions matching `revset` in `dir`, through jj's own `--count` -
+/// a structured number, not a scraped line count. A jj failure is an error, so a
+/// broken revset never reads as "nothing matched".
+fn count_in_dir(dir: &Path, revset: &str) -> Result<usize, TrunkSyncError> {
+    let out = crate::jj::read_in_dir(dir, &["log", "-r", revset, "--count"])
+        .map_err(|error| TrunkSyncError::new(format!("count `{revset}`: {error:#}")))?;
+    out.trim().parse().map_err(|_| {
+        TrunkSyncError::new(format!(
+            "unexpected `jj log --count` output for `{revset}`: {out:?}"
+        ))
+    })
+}
+
+/// Run a mutating jj command in `dir`, surfacing jj's stderr on failure.
+fn run_in_dir(dir: &Path, args: &[&str], operation: &str) -> Result<(), TrunkSyncError> {
+    let output = crate::jj::command()
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .map_err(|error| TrunkSyncError::new(format!("{operation}: {error}")))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+    Err(TrunkSyncError::new(if detail.is_empty() {
+        format!("{operation}: jj exited with {}", output.status)
+    } else {
+        format!("{operation}: {detail}")
+    }))
+}
+
+/// The change ids of the commits between trunk and `@` that hold a conflict,
+/// deepest first. jj logs newest first; the conflict's owner is the deepest.
+fn conflicted_since_trunk(dir: &Path, trunk: &str) -> Result<Vec<String>, TrunkSyncError> {
+    let revset = format!("({trunk})..@ & conflicts()");
+    let out = crate::jj::read_in_dir(
+        dir,
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\\n\"",
+        ],
+    )
+    .map_err(|error| TrunkSyncError::new(format!("list conflicted commits: {error:#}")))?;
+    let mut ids: Vec<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    ids.reverse();
+    Ok(ids)
 }
 
 fn validate_workspace_name(name: &str) -> Result<(), AdHocWorkspaceError> {
@@ -1840,5 +2105,208 @@ mod tests {
             .output()
             .expect("jj log");
         String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// Run a jj command in `root`, returning trimmed stdout. Identity and signing
+    /// are pinned so the result never depends on the developer's own jj config.
+    fn jj_text(root: &Path, args: &[&str]) -> String {
+        let output = Command::new("jj")
+            .args([
+                "--config",
+                "signing.behavior=drop",
+                "--config",
+                "user.name=jjfx test",
+                "--config",
+                "user.email=jjfx@example.com",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
+    /// A repository whose `main` has advanced past the working copy's base, so
+    /// `@` and `main` are siblings and `@` is one commit behind trunk.
+    ///
+    /// `carries_changes` leaves an edit in `@` (the rebase shape, deliberately
+    /// not snapshotted); otherwise `@` is empty (the replace shape).
+    fn working_copy_beside_advanced_main(tag: &str, carries_changes: bool) -> PathBuf {
+        let repo = temp_repo(tag);
+        let root = repo.canonicalize().unwrap();
+        fs::write(root.join("f.txt"), "base\n").unwrap();
+        jj_text(&root, &["commit", "-m", "base"]);
+        let base = jj_text(&root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+        jj_text(&root, &["bookmark", "create", "main", "-r", &base]);
+        // Advance `main` along a sibling line of `base`.
+        jj_text(&root, &["new", "-r", "main", "-m", "advance"]);
+        fs::write(root.join("g.txt"), "advance\n").unwrap();
+        jj_text(&root, &["commit", "-m", "advance"]);
+        let advanced = jj_text(&root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+        jj_text(&root, &["bookmark", "set", "main", "-r", &advanced]);
+        // A fresh working copy on the old base, left behind by the advance.
+        jj_text(&root, &["new", &base]);
+        if carries_changes {
+            fs::write(root.join("f.txt"), "edited\n").unwrap();
+        }
+        repo
+    }
+
+    /// Like [`working_copy_beside_advanced_main`], but `main` also rewrites the
+    /// file `@` edits, so re-syncing must conflict.
+    fn working_copy_beside_conflicting_main(tag: &str) -> PathBuf {
+        let repo = temp_repo(tag);
+        let root = repo.canonicalize().unwrap();
+        fs::write(root.join("f.txt"), "base\n").unwrap();
+        jj_text(&root, &["commit", "-m", "base"]);
+        let base = jj_text(&root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+        jj_text(&root, &["bookmark", "create", "main", "-r", &base]);
+        jj_text(&root, &["new", "-r", "main", "-m", "advance"]);
+        fs::write(root.join("f.txt"), "theirs\n").unwrap();
+        jj_text(&root, &["commit", "-m", "advance"]);
+        let advanced = jj_text(&root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]);
+        jj_text(&root, &["bookmark", "set", "main", "-r", &advanced]);
+        jj_text(&root, &["new", &base]);
+        fs::write(root.join("f.txt"), "mine\n").unwrap();
+        repo
+    }
+
+    #[test]
+    fn trunk_drift_warning_names_how_far_behind_and_the_fix() {
+        let one = TrunkDrift {
+            behind: 1,
+            carries_changes: false,
+        };
+        assert_eq!(
+            one.warning(),
+            "this working copy is 1 commit behind trunk; \
+             run `jjfx sync` to re-sync it onto trunk"
+        );
+
+        let many = TrunkDrift {
+            behind: 3,
+            carries_changes: true,
+        };
+        assert!(many.warning().contains("3 commits"), "{}", many.warning());
+        assert!(many.warning().contains("jjfx sync"), "{}", many.warning());
+    }
+
+    #[test]
+    fn trunk_drift_is_none_when_the_working_copy_sits_above_trunk() {
+        let repo = temp_repo("drift-in-sync");
+        let root = repo.canonicalize().unwrap();
+        jj_text(&root, &["commit", "-m", "base"]);
+        jj_text(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        jj_text(&root, &["new", "main"]);
+
+        let workspaces = Repository::open(&root).unwrap().workspaces();
+        assert_eq!(workspaces.trunk_drift(&root).unwrap(), None);
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn trunk_drift_counts_the_commits_trunk_is_ahead() {
+        let repo = working_copy_beside_advanced_main("drift-behind", false);
+        let root = repo.canonicalize().unwrap();
+
+        let drift = Repository::open(&root)
+            .unwrap()
+            .workspaces()
+            .trunk_drift(&root)
+            .unwrap()
+            .expect("the working copy is behind trunk");
+        assert_eq!(drift.behind(), 1);
+        assert!(!drift.carries_changes(), "an empty @ carries no changes");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn trunk_drift_reports_a_working_copy_that_carries_changes() {
+        let repo = working_copy_beside_advanced_main("drift-changes", true);
+        let root = repo.canonicalize().unwrap();
+        // Snapshot the edit: the read-only drift check does not snapshot, and the
+        // snapshot is what `sync` takes before it classifies the shape.
+        jj_text(&root, &["log", "-r", "@"]);
+
+        let drift = Repository::open(&root)
+            .unwrap()
+            .workspaces()
+            .trunk_drift(&root)
+            .unwrap()
+            .expect("the working copy is behind trunk");
+        assert!(drift.carries_changes());
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn sync_replaces_an_empty_working_copy_with_one_above_trunk() {
+        let repo = working_copy_beside_advanced_main("sync-empty", false);
+        let root = repo.canonicalize().unwrap();
+        let workspaces = Repository::open(&root).unwrap().workspaces();
+
+        let outcome = workspaces.sync_to_trunk(&root).unwrap();
+
+        assert_eq!(outcome.action(), SyncAction::MovedEmpty);
+        assert_eq!(outcome.behind(), 1);
+        assert!(outcome.conflicts().is_empty(), "{:?}", outcome.conflicts());
+        assert!(outcome.warning().is_none(), "{:?}", outcome.warning());
+        assert!(
+            workspaces.trunk_drift(&root).unwrap().is_none(),
+            "the working copy is in sync after the move"
+        );
+        assert_eq!(
+            jj_text(&root, &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]),
+            jj_text(
+                &root,
+                &["log", "-r", "main", "--no-graph", "-T", "commit_id"]
+            ),
+            "the fresh working copy sits directly above main"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn sync_rebases_a_working_copy_that_carries_changes_without_losing_them() {
+        let repo = working_copy_beside_advanced_main("sync-changes", true);
+        let root = repo.canonicalize().unwrap();
+        let workspaces = Repository::open(&root).unwrap().workspaces();
+
+        let outcome = workspaces.sync_to_trunk(&root).unwrap();
+
+        assert_eq!(outcome.action(), SyncAction::Rebased);
+        assert!(outcome.conflicts().is_empty(), "{:?}", outcome.conflicts());
+        assert!(workspaces.trunk_drift(&root).unwrap().is_none());
+        // The edit that was only on disk before the sync is still here, now above
+        // the advanced main alongside its own change.
+        assert_eq!(fs::read_to_string(root.join("f.txt")).unwrap(), "edited\n");
+        assert_eq!(fs::read_to_string(root.join("g.txt")).unwrap(), "advance\n");
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn sync_reports_a_conflict_rather_than_resolving_it() {
+        let repo = working_copy_beside_conflicting_main("sync-conflict");
+        let root = repo.canonicalize().unwrap();
+        let workspaces = Repository::open(&root).unwrap().workspaces();
+
+        let outcome = workspaces.sync_to_trunk(&root).unwrap();
+
+        assert_eq!(outcome.action(), SyncAction::Rebased);
+        assert_eq!(outcome.conflicts().len(), 1, "{:?}", outcome.conflicts());
+        // jj recorded the conflict in the commit; nothing here resolved it.
+        let content = fs::read_to_string(root.join("f.txt")).unwrap();
+        assert!(content.contains("<<<<<<<"), "{content}");
+
+        std::fs::remove_dir_all(&repo).ok();
     }
 }
