@@ -15,7 +15,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{HELPER_LIVENESS_TIMEOUT, wait_for_file_content};
+use support::{HELPER_LIVENESS_TIMEOUT, HelperGuard, wait_for_file_content};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state");
 fn fixture(name: &str) -> Vec<u8> {
@@ -557,7 +557,7 @@ fn destroy_terminates_a_live_recorded_process_group() {
     helper
         .args(["--exact", "destroy_live_process_helper", "--ignored"])
         .env("JJFX_DESTROY_PID", &pid_path);
-    let helper = helper.spawn().expect("spawn process owner");
+    let helper = HelperGuard::spawn(&mut helper, None, &[&pid_path]);
     wait_for_file_content(&pid_path);
     let pid = fs::read_to_string(&pid_path)
         .expect("read PID")
@@ -582,7 +582,7 @@ fn destroy_terminates_a_live_recorded_process_group() {
         .destroy()
         .expect("destroy should terminate the live Run");
 
-    let output = helper.wait_with_output().expect("wait for process owner");
+    let output = helper.wait_with_output();
     assert!(
         output.status.success(),
         "process owner failed: {}",

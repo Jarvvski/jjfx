@@ -8,9 +8,13 @@
 //! so dead-code analysis is off here rather than worked around per crate.
 #![allow(dead_code)]
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
+
+use rustix::process::{Pid, Signal, kill_process_group};
 
 /// Liveness budget for waiting on a helper subprocess.
 ///
@@ -45,7 +49,7 @@ pub const HELPER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
 pub fn wait_for_file_content(path: &Path) -> String {
     let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
     loop {
-        if let Ok(contents) = std::fs::read_to_string(path)
+        if let Ok(contents) = fs::read_to_string(path)
             && !contents.trim().is_empty()
         {
             return contents;
@@ -57,4 +61,125 @@ pub fn wait_for_file_content(path: &Path) -> String {
         );
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// How long a guard waits for a helper to record the Agent Runtime's process
+/// group before reaping only the helper itself.
+///
+/// This runs on the failure path alone - a test that returns normally has
+/// already disarmed its guard - so a short wait is invisible, and it covers the
+/// window where a test panics before the runtime has written its PID.
+const HELPER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Owns a helper subprocess and the Agent process groups it starts, so neither
+/// outlives the test that spawned them.
+///
+/// A process/timing test runs the real supervisor in a separate process: it
+/// spawns this test binary as a helper, and the helper spawns an Agent Runtime
+/// into a process group of its own. Nothing reaps either on the failure path,
+/// because a `Child` is not killed when it drops and a stubborn runtime ignores
+/// `TERM`, so an assertion that panics part-way through a test leaves the
+/// helper blocked on a runtime that never exits - a live `claude` process that
+/// outlives the suite. The guard closes that hole: while it is armed it kills
+/// the recorded process group(s) and then kills and reaps the helper, whether
+/// the test returns or unwinds.
+///
+/// Waiting for the helper through [`HelperGuard::wait_with_output`] disarms the
+/// guard, so a test that has observed the product clean up can still assert on
+/// it: cleanup then belongs to the test, not the guard.
+#[must_use = "the guard reaps its helper only while it is alive"]
+pub struct HelperGuard {
+    child: Option<Child>,
+    release: Option<PathBuf>,
+    process_groups: Vec<PathBuf>,
+}
+
+impl HelperGuard {
+    /// Takes ownership of `command`'s child.
+    ///
+    /// `release`, when given, is written on drop so a helper blocked on a
+    /// barrier can exit on its own. `process_groups` name files holding the PID
+    /// of an Agent Runtime the helper started; the group of the first PID found
+    /// is killed on drop.
+    pub fn spawn(command: &mut Command, release: Option<&Path>, process_groups: &[&Path]) -> Self {
+        Self {
+            child: Some(command.spawn().expect("helper process")),
+            release: release.map(Path::to_owned),
+            process_groups: process_groups
+                .iter()
+                .map(|path| (*path).to_owned())
+                .collect(),
+        }
+    }
+
+    /// Reports whether the helper is still running.
+    pub fn is_running(&mut self) -> bool {
+        self.child
+            .as_mut()
+            .expect("helper process")
+            .try_wait()
+            .expect("helper status")
+            .is_none()
+    }
+
+    /// Waits for the helper and disarms the guard.
+    pub fn wait_with_output(mut self) -> Output {
+        self.child
+            .take()
+            .expect("helper process")
+            .wait_with_output()
+            .expect("helper output")
+    }
+
+    /// The process group an Agent Runtime the helper started leads, if it can be
+    /// told within [`HELPER_REAP_TIMEOUT`].
+    fn recorded_process_group(&self) -> Option<Pid> {
+        if self.process_groups.is_empty() {
+            return None;
+        }
+        let deadline = Instant::now() + HELPER_REAP_TIMEOUT;
+        loop {
+            if let Some(pid) = self
+                .process_groups
+                .iter()
+                .find_map(|path| recorded_pid(path))
+            {
+                return Some(pid);
+            }
+            if Instant::now() >= deadline {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for HelperGuard {
+    fn drop(&mut self) {
+        // A consumed guard has already reaped its helper and handed cleanup back
+        // to the test, so there is nothing left to own.
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if let Some(release) = &self.release {
+            let _ = fs::write(release, []);
+        }
+        if let Some(pid) = self.recorded_process_group() {
+            let _ = kill_process_group(pid, Signal::KILL);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Reads the PID a helper recorded in `path` and treats it as the process-group
+/// it leads.
+fn recorded_pid(path: &Path) -> Option<Pid> {
+    let raw = fs::read_to_string(path)
+        .ok()?
+        .split_whitespace()
+        .next()?
+        .parse::<i32>()
+        .ok()?;
+    Pid::from_raw(raw)
 }
