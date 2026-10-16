@@ -12,10 +12,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
-use jjfx::engine::{
-    DispatchGroupOptions, DispatchGroupState, Expected, Repository, StateChange, SubIssueState,
-    TicketId, WireStatus, WireTimestamp,
-};
+use jjfx::engine::{Repository, TicketId};
 use tempfile::TempDir;
 
 /// A jj repository with one local ready Ticket and a `[tickets] source = "local"`
@@ -140,29 +137,6 @@ impl DispatchFixture {
             .env("JJ_CONFIG", self.jj_config_path());
         command
     }
-
-    /// Persists a terminal Dispatch Group for `parent`, so orchestration resumes
-    /// it rather than discovering children - which a local Ticket source cannot
-    /// do for a Parent that is also a Ticket.
-    fn persist_terminal_group(&self, parent: &str) {
-        let repository = Repository::open(self.path()).expect("open repository");
-        let parent = TicketId::parse(parent).expect("Parent Ticket");
-        let mut group = DispatchGroupState::new(
-            parent.clone(),
-            WireTimestamp::new("2026-08-04T12:00:00Z"),
-            "owner/repo",
-            DispatchGroupOptions::new(""),
-        );
-        group.sub_issues.insert(
-            TicketId::parse("widgets--02-dependent").expect("Sub-issue"),
-            SubIssueState::new("Failed", WireStatus::new("failed"), Vec::new()),
-        );
-        repository
-            .state_store()
-            .dispatch_group(parent)
-            .commit(Expected::Missing, StateChange::Replace(group))
-            .expect("save group");
-    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -265,23 +239,28 @@ fn a_background_orchestration_for_an_unresolvable_ticket_is_a_failure() {
         "a Ticket that cannot be resolved must not print orchestrating:\n{}",
         stdout(&output)
     );
-    assert!(
-        stderr(&output).contains("cannot fetch Ticket nope-typo"),
-        "{}",
-        stderr(&output)
-    );
+    let error = stderr(&output);
+    assert!(error.contains("cannot fetch Ticket nope-typo"), "{error}");
+    // The hint is keyed off the configured source: a local repository never
+    // consults Linear, so the message must name the root it searched instead.
+    assert!(!error.contains("Linear"), "{error}");
+    assert!(error.contains(".scratch"), "{error}");
 }
 
 #[test]
-fn a_prepared_background_orchestration_names_the_child_log() {
+fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
     let fixture = DispatchFixture::new();
+    // The origin must precede the Pool, so the Pool records the owner/name
+    // identity orchestration resolves before it discovers children.
+    fixture.with_origin();
     fixture.with_pool(1);
-    // A persisted group makes `prepare` resume rather than discover, so the
-    // handoff reaches a real background child without a tracker.
-    fixture.persist_terminal_group("widgets--01-ship-the-widget");
+    // The feature is a Parent directory, not a Ticket file. Its one child is
+    // already resolved, so the group is terminal and the child exits without
+    // launching an Agent Runtime.
+    fixture.write_ticket("gadgets", "01-done.md", "# Done\n\nStatus: resolved\n");
 
     let output = fixture
-        .jjfx(&["dispatch", "widgets--01-ship-the-widget", "--json"])
+        .jjfx(&["dispatch", "gadgets", "--json"])
         .output()
         .expect("jjfx should run");
 
@@ -293,9 +272,7 @@ fn a_prepared_background_orchestration_names_the_child_log() {
     );
     let json = stdout(&output);
     assert!(json.contains("\"outcome\": \"orchestrating\""), "{json}");
-    let log = fixture
-        .path()
-        .join(".jj/pool/orchestrate-widgets--01-ship-the-widget.log");
+    let log = fixture.path().join(".jj/pool/orchestrate-gadgets.log");
     assert!(
         json.contains(&log.display().to_string()),
         "the JSON must name the child log:\n{json}"
@@ -304,5 +281,24 @@ fn a_prepared_background_orchestration_names_the_child_log() {
         log.is_file(),
         "the child log must exist at {}",
         log.display()
+    );
+    // The handoff came from real local discovery: the persisted group names the
+    // feature's child rather than a pre-persisted placeholder.
+    let group = match Repository::open(fixture.path())
+        .expect("open repository")
+        .state_store()
+        .dispatch_group(TicketId::parse("gadgets").expect("Parent Ticket"))
+        .load()
+        .expect("load group")
+    {
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("a local feature Parent must persist a group"),
+    };
+    assert!(
+        group
+            .sub_issues
+            .contains_key(&TicketId::parse("gadgets--01-done").expect("child Ticket")),
+        "{:?}",
+        group.sub_issues
     );
 }

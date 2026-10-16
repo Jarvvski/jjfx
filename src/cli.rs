@@ -1839,6 +1839,7 @@ fn dispatch_command(
 
     let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
     let tickets = tickets_config()?;
+    let ticket_hint = ticket_source_hint(&tickets, repository);
     // Reconcile finished Tickets before discovering ready work, so a Ticket whose
     // Run completed since the last Dispatch resolves and its dependents become
     // ready in this same Dispatch. This is also the only reconciliation an empty
@@ -1886,7 +1887,8 @@ fn dispatch_command(
             .iter()
             .map(|ticket| {
                 let mut request = DirectDispatchRequest::new(ticket.clone(), args.mode);
-                if let Some(details) = fetch_ticket_details(&discovery, ticket.id())? {
+                if let Some(details) = fetch_ticket_details(&discovery, ticket.id(), &ticket_hint)?
+                {
                     request = request.with_ticket_details(details);
                 }
                 if let Some(model) = model.clone() {
@@ -1931,7 +1933,7 @@ fn dispatch_command(
         .map(|ticket| {
             let id = TicketId::parse(ticket.clone())?;
             let mut request = DirectDispatchRequest::for_ticket_id(id.clone(), args.mode)?;
-            if let Some(details) = fetch_ticket_details(&discovery, &id)? {
+            if let Some(details) = fetch_ticket_details(&discovery, &id, &ticket_hint)? {
                 request = request.with_ticket_details(details);
             }
             if let Some(model) = model.clone() {
@@ -2049,15 +2051,34 @@ fn exclusions_provider(
 
 /// Fetch a Ticket's details to inline into the Dispatch prompt, failing before
 /// any Pool or Workspace mutation when the runtime cannot reach the tracker.
+///
+/// `Ok(None)` is not a failure: the source has no Ticket with that id, which is
+/// exactly the local feature Parent - a directory rather than a Ticket file - so
+/// orchestration proceeds to its children.
 fn fetch_ticket_details<Q: TicketQuery>(
     discovery: &TicketDiscovery<Q>,
     id: &TicketId,
+    hint: &str,
 ) -> Result<Option<TicketDetails>> {
-    discovery.ticket_details(id).map(Some).with_context(|| {
-        format!(
-            "cannot fetch Ticket {id} to inline into the Dispatch prompt; ensure the pool runtime can reach Linear"
-        )
+    discovery.ticket_details(id).with_context(|| {
+        format!("cannot fetch Ticket {id} to inline into the Dispatch prompt; {hint}")
     })
+}
+
+/// The recovery hint for a failed Ticket-details fetch, keyed off the configured
+/// source.
+///
+/// A local source names the root it searched, so the message points at the
+/// subsystem that actually failed rather than at Linear - which a repository
+/// configured `source = "local"` never consults.
+fn ticket_source_hint(tickets: &TicketsConfig, repository: &Repository) -> String {
+    match tickets.source {
+        TicketSource::Linear => "ensure the pool runtime can reach Linear".to_owned(),
+        TicketSource::Local => format!(
+            "ensure the local Ticket source under {} can resolve it",
+            repository.root().join(&tickets.local.root).display()
+        ),
+    }
 }
 
 fn dispatch_with_capacity_prompt(
@@ -3164,6 +3185,7 @@ fn prepare_orchestration(
     // closes while the group runs changes the next decision (ADR-0011).
     let exclusions = exclusions_provider(repository, force, open_workspaces);
     let tickets = tickets_config()?;
+    let ticket_hint = ticket_source_hint(&tickets, repository);
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(
         repository.root(),
@@ -3171,8 +3193,9 @@ fn prepare_orchestration(
         runtime,
     )?);
     // Fetch the Parent's details before `prepare` reserves a placeholder, so the
-    // no-children direct fallback inlines the Ticket body.
-    let details = fetch_ticket_details(&discovery, &id)?;
+    // no-children direct fallback inlines the Ticket body. A local feature Parent
+    // has none - it is a directory, not a Ticket file - and resolves to `None`.
+    let details = fetch_ticket_details(&discovery, &id, &ticket_hint)?;
     let mut request = crate::engine::OrchestrationRequest::new(id.clone(), runtime);
     if let Some(details) = details {
         request = request.with_ticket_details(details);
@@ -3717,11 +3740,33 @@ mod tests {
         let discovery = TicketDiscovery::new(FailingQuery);
         let id = TicketId::parse("AMBA-42").expect("Ticket ID");
 
-        let error = fetch_ticket_details(&discovery, &id)
-            .expect_err("a runtime that cannot fetch the Ticket must abort Dispatch");
+        let error =
+            fetch_ticket_details(&discovery, &id, "ensure the pool runtime can reach Linear")
+                .expect_err("a runtime that cannot fetch the Ticket must abort Dispatch");
         let message = error.to_string();
         assert!(message.contains("AMBA-42"), "{message}");
         assert!(message.contains("Linear"), "{message}");
+    }
+
+    #[test]
+    fn the_details_hint_names_the_local_root_rather_than_linear() {
+        let directory = tempfile::tempdir().expect("temporary repository");
+        std::fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(directory.path()).expect("open repository");
+        let local = TicketsConfig {
+            source: TicketSource::Local,
+            ..TicketsConfig::default()
+        };
+
+        let hint = ticket_source_hint(&local, &repository);
+
+        assert!(hint.contains(".scratch"), "{hint}");
+        assert!(!hint.contains("Linear"), "{hint}");
+        let linear = TicketsConfig::default();
+        assert!(
+            ticket_source_hint(&linear, &repository).contains("Linear"),
+            "the default source still names Linear"
+        );
     }
 
     #[test]

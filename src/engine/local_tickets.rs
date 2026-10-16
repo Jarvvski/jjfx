@@ -286,19 +286,36 @@ impl LocalTickets {
     }
 
     /// Builds one Ticket's title and body for prompt inlining.
+    ///
+    /// A local feature Parent is a directory rather than a Ticket file, so it has
+    /// no details of its own: the id resolves to the JSON `null` sentinel, which
+    /// `TicketDiscovery` reads as "no such Ticket" and orchestration then
+    /// proceeds to the Parent's children. An id that is neither a Ticket nor a
+    /// feature directory stays a hard error, so a mistyped Ticket is not silently
+    /// dispatched without its body.
     fn details_payload(&self, id: &TicketId) -> Result<String, TicketQueryError> {
         let tickets = self.scan().map_err(TicketQueryError::from)?;
-        let Some(ticket) = tickets.iter().find(|ticket| ticket.id == id.as_str()) else {
-            return Err(TicketQueryError::permanent(format!(
-                "local Ticket {id} was not found under {}",
-                self.root.display()
-            )));
-        };
-        Ok(json!({
-            "title": ticket.title,
-            "description": ticket.body,
-        })
-        .to_string())
+        if let Some(ticket) = tickets.iter().find(|ticket| ticket.id == id.as_str()) {
+            return Ok(json!({
+                "title": ticket.title,
+                "description": ticket.body,
+            })
+            .to_string());
+        }
+        if self.is_feature(id.as_str()) {
+            return Ok("null".to_owned());
+        }
+        Err(TicketQueryError::permanent(format!(
+            "local Ticket {id} was not found under {}",
+            self.root.display()
+        )))
+    }
+
+    /// Whether `name` is one of the feature directories the scanner enumerates -
+    /// the local Parent, which owns `<root>/<name>/issues/*.md` rather than a
+    /// Ticket file of its own.
+    fn is_feature(&self, name: &str) -> bool {
+        self.root.join(name).join(ISSUES_DIRECTORY).is_dir()
     }
 
     /// Builds the dependency graph of one feature, whose id is the Parent.
@@ -891,7 +908,10 @@ mod tests {
         let discovery = TicketDiscovery::new(source(temporary.path()));
         let id = TicketId::parse("widgets--01-ready").expect("Ticket id");
 
-        let details = discovery.ticket_details(&id).expect("Ticket details");
+        let details = discovery
+            .ticket_details(&id)
+            .expect("Ticket details")
+            .expect("a Ticket file has details");
 
         assert_eq!(details.title().as_str(), "Ready");
         assert_eq!(details.description(), "## Solution\n\nInline me.");

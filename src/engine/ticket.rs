@@ -612,16 +612,29 @@ where
     /// Fetches one Ticket's title and description for prompt inlining.
     ///
     /// The description carries the acceptance criteria; a blank description is
-    /// valid (the Ticket simply has none).
-    pub fn ticket_details(&self, id: &TicketId) -> Result<TicketDetails, TicketDiscoveryError> {
+    /// valid (the Ticket simply has none). `None` means the source positively has
+    /// no such Ticket: a local feature Parent is a directory rather than a Ticket
+    /// file, so it has no details of its own and orchestration proceeds to the
+    /// Parent's children.
+    pub fn ticket_details(
+        &self,
+        id: &TicketId,
+    ) -> Result<Option<TicketDetails>, TicketDiscoveryError> {
         let request = TicketQueryRequest::TicketDetails { id: id.clone() };
-        let payload: RawTicketDetails = self.query_payload(&request)?;
+        let payload: Option<RawTicketDetails> = self.query_payload(&request)?;
+        let Some(payload) = payload else {
+            return Ok(None);
+        };
         let title = TicketTitle::parse(payload.title).map_err(|error| {
             TicketDiscoveryError::QueryFailed {
                 error: TicketQueryError::permanent(error.to_string()),
             }
         })?;
-        Ok(TicketDetails::new(id.clone(), title, payload.description))
+        Ok(Some(TicketDetails::new(
+            id.clone(),
+            title,
+            payload.description,
+        )))
     }
 
     fn query_payload<T>(&self, request: &TicketQueryRequest) -> Result<T, TicketDiscoveryError>

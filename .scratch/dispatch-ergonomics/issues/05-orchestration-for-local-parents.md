@@ -1,6 +1,6 @@
 # Orchestration must work for a local feature Parent
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -37,11 +37,11 @@ Note the background path hides this entirely - the same call in background mode 
 
 ## Acceptance Criteria
 
-- [ ] `jjfx dispatch <feature>` orchestrates a local feature's Tickets in dependency order.
-- [ ] A Parent with no Ticket file of its own is not an error.
-- [ ] No error message mentions Linear when `source = "local"`.
-- [ ] Tests cover orchestrating a local feature.
-- [ ] `mise run check` is green.
+- [x] `jjfx dispatch <feature>` orchestrates a local feature's Tickets in dependency order.
+- [x] A Parent with no Ticket file of its own is not an error.
+- [x] No error message mentions Linear when `source = "local"`.
+- [x] Tests cover orchestrating a local feature.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -53,3 +53,4 @@ Note the background path hides this entirely - the same call in background mode 
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive, where this made the advertised flow unusable.
+- 2026-10-16: Resolved. `LocalTickets::details_payload` now returns the JSON `null` sentinel when the id names a feature directory (the local Parent) rather than a Ticket file, and `TicketDiscovery::ticket_details` reads that as `Ok(None)` - so orchestration falls through to `dependency_payload` and the feature's Tickets in dependency order. An id that is neither a Ticket nor a feature stays a hard error, so a mistyped Ticket is still caught rather than silently dispatched without its body. The fetch-details hint is now keyed off the configured source through a new `ticket_source_hint`: `source = "local"` names the root it searched (`.scratch`), `linear` keeps the Linear wording, so no message mentions Linear in a local repository. Tests: `tests/local_tickets.rs` covers a feature Parent resolving to no details while an unknown id still fails; `tests/orchestration.rs` discovers a local feature Parent into a real Dispatch Group with its child's blocker; `tests/dispatch_outcomes.rs` drives the real binary for the background handoff, and its pre-persisted terminal group (the ticket-04 shortcut) is replaced with real local discovery, plus the unresolvable-Ticket case asserts the hint names `.scratch` and not Linear. `mise run check` is green and `momo fix` records the change.
