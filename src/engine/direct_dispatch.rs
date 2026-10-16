@@ -5,12 +5,11 @@ use std::thread;
 use thiserror::Error;
 
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimePreflightError,
-    AgentRuntimeProfile, CompletedRun, ConcurrencyCap, DeliveryContract, DispatchBudget,
-    DispatchExclusions, DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError,
-    Repository, RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError,
-    Ticket, TicketDetails, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError,
-    WorkerStatus, WorkerWorkspaceError,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProfile, CompletedRun,
+    ConcurrencyCap, DeliveryContract, DispatchBudget, DispatchExclusions, DispatchPromptBuilder,
+    DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
+    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketDetails, TicketId, TicketStatus,
+    TicketTitle, WorkerId, WorkerPoolError, WorkerStatus, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -436,15 +435,7 @@ impl DirectDispatch {
             };
             return Err(release_before_launch(&reservation, mismatch));
         }
-        let preflight = self
-            .preflight_input(reservation.profile(), request)
-            .and_then(|()| {
-                reservation
-                    .agent_runtime()
-                    .preflight_dispatch_environment(self.repository.root())
-                    .map_err(DirectDispatchError::Preflight)
-            });
-        if let Err(error) = preflight {
+        if let Err(error) = self.preflight_input(reservation.profile(), request) {
             return Err(release_before_launch(&reservation, error));
         }
         self.dispatch_preflighted(reservation, request)
@@ -508,7 +499,6 @@ impl DirectDispatch {
     ) -> Result<Vec<AgentRuntimeProfile>, DirectDispatchError> {
         let configured = self.configured_profile();
         let mut profiles = Vec::with_capacity(requests.len());
-        let mut runtimes = Vec::new();
         for request in requests {
             let profile = request
                 .profile()
@@ -516,15 +506,7 @@ impl DirectDispatch {
                 .unwrap_or_else(|| configured.clone())
                 .with_model_override(request.model());
             self.preflight_input(&profile, request)?;
-            if !runtimes.contains(&profile.runtime()) {
-                runtimes.push(profile.runtime());
-            }
             profiles.push(profile);
-        }
-        for runtime in runtimes {
-            runtime
-                .preflight_dispatch_environment(self.repository.root())
-                .map_err(DirectDispatchError::Preflight)?;
         }
         Ok(profiles)
     }
@@ -539,10 +521,6 @@ impl DirectDispatch {
             .unwrap_or_else(|| self.configured_profile())
             .with_model_override(request.model());
         self.preflight_input(&profile, request)?;
-        profile
-            .runtime()
-            .preflight_dispatch_environment(self.repository.root())
-            .map_err(DirectDispatchError::Preflight)?;
         Ok(profile)
     }
 
@@ -568,10 +546,7 @@ impl DirectDispatch {
             }
             .into());
         }
-        profile
-            .runtime()
-            .preflight_dispatch_input(profile.model())
-            .map_err(DirectDispatchError::Preflight)
+        Ok(())
     }
 
     fn dispatch_claimed(
@@ -724,7 +699,6 @@ fn failure_phase(error: &DirectDispatchError) -> DirectDispatchFailurePhase {
         DirectDispatchError::Workspace(_) => DirectDispatchFailurePhase::Workspace,
         DirectDispatchError::Identity(_) => DirectDispatchFailurePhase::Identity,
         DirectDispatchError::Prompt(_) => DirectDispatchFailurePhase::Prompt,
-        DirectDispatchError::Preflight(_) => DirectDispatchFailurePhase::Launch,
         DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(_)) => {
             DirectDispatchFailurePhase::Capacity
         }
@@ -772,9 +746,6 @@ pub enum DirectDispatchError {
     /// The Reservation belongs to another Ticket.
     #[error("Reservation belongs to Ticket {reserved}, not requested Ticket {requested}")]
     ReservationTicketMismatch { reserved: String, requested: String },
-    /// Runtime profile validation failed before Worker mutation.
-    #[error(transparent)]
-    Preflight(#[from] AgentRuntimePreflightError),
     /// Typed initial prompt construction failed.
     #[error(transparent)]
     Prompt(#[from] DispatchPromptError),

@@ -144,17 +144,12 @@ pub(crate) const CODEX_FRAMES: [char; 6] = [
     '\u{f0ac8}', // 󰫈 hexagon_slice_6
 ];
 
-/// Pi's working animation pulses from a dim dot to a filled center and back.
-pub(crate) const PI_FRAMES: [char; 6] = ['·', '∙', '•', '●', '•', '∙'];
-
 /// Claude's spinner orange - the colour jj-wsx gave the working animation.
 pub(crate) const CLAUDE_ORANGE: Color = Color::Rgb(255, 149, 0);
 
 /// Codex's cyan.
 pub(crate) const CODEX_CYAN: Color = Color::Rgb(34, 211, 238);
 
-/// Pi's violet identity.
-pub(crate) const PI_VIOLET: Color = Color::Rgb(168, 85, 247);
 /// OpenCode's green identity.
 pub(crate) const OPENCODE_GREEN: Color = Color::Rgb(74, 222, 128);
 
@@ -164,7 +159,6 @@ pub(crate) fn brand_color(kind: AgentKind) -> Color {
     match kind {
         AgentKind::Claude => CLAUDE_ORANGE,
         AgentKind::Codex => CODEX_CYAN,
-        AgentKind::Pi => PI_VIOLET,
         AgentKind::OpenCode => OPENCODE_GREEN,
         AgentKind::Unknown => Color::DarkGray,
     }
@@ -181,7 +175,6 @@ pub(crate) fn working_frame(kind: AgentKind, tick: u64) -> char {
             CLAUDE_FRAMES[idx as usize]
         }
         AgentKind::Codex => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
-        AgentKind::Pi => PI_FRAMES[(tick % PI_FRAMES.len() as u64) as usize],
         AgentKind::OpenCode => CODEX_FRAMES[(tick % CODEX_FRAMES.len() as u64) as usize],
         AgentKind::Unknown => '?',
     }
@@ -220,7 +213,6 @@ pub(crate) fn paused_glyph(kind: AgentKind) -> char {
     match kind {
         AgentKind::Claude => '✻',
         AgentKind::Codex => '\u{f02d9}', // 󰋙 hexagon_outline
-        AgentKind::Pi => 'π',
         AgentKind::OpenCode => 'O',
         AgentKind::Unknown => '?',
     }
@@ -439,7 +431,6 @@ mod tests {
     fn brand_colour_is_provider_specific() {
         assert_eq!(brand_color(AgentKind::Claude), CLAUDE_ORANGE);
         assert_eq!(brand_color(AgentKind::Codex), CODEX_CYAN);
-        assert_eq!(brand_color(AgentKind::Pi), PI_VIOLET);
         assert_eq!(brand_color(AgentKind::OpenCode), OPENCODE_GREEN);
         assert_eq!(brand_color(AgentKind::Unknown), Color::DarkGray);
     }

@@ -1495,7 +1495,7 @@ fn reservation_normalizes_configured_codex_runtime_before_persisting_it() {
 }
 
 #[test]
-fn reservation_accepts_and_persists_configured_pi_runtime() {
+fn reservation_rejects_a_removed_pi_pool_profile_with_a_clear_message() {
     let (temp, repository) = repository_with_pool();
     let pool_path = temp.path().join(".jj/pool.json");
     let mut pool: Value =
@@ -1506,18 +1506,23 @@ fn reservation_accepts_and_persists_configured_pi_runtime() {
         serde_json::to_vec(&pool).expect("pool JSON serialization"),
     )
     .expect("configured pool state");
+    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let before = fs::read(&worker_path).expect("Worker state");
 
-    let reservation = repository
+    let error = repository
         .worker_pool()
         .reserve("ENG-213")
-        .expect("configured Pi runtime should be accepted");
+        .expect_err("the removed Pi runtime must be rejected");
 
-    assert_eq!(reservation.agent_runtime(), AgentRuntime::Pi);
-    let worker_json: Value = serde_json::from_slice(
-        &fs::read(temp.path().join(".jj/pool/worker-01.json")).expect("persisted Worker"),
-    )
-    .expect("Worker JSON");
-    assert_eq!(worker_json["agent"], "pi");
+    let message = error.to_string();
+    assert!(message.contains("Pi Agent Runtime"), "{message}");
+    assert!(message.contains("removed"), "{message}");
+    assert!(message.contains("claude"), "{message}");
+    assert_eq!(
+        fs::read(worker_path).expect("Worker state"),
+        before,
+        "a rejected runtime must not mutate the Worker"
+    );
 }
 
 #[test]
@@ -1542,7 +1547,8 @@ fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
 
     assert!(matches!(
         error,
-        jjfx::engine::WorkerPoolError::InvalidAgentRuntime { value } if value == "other"
+        jjfx::engine::WorkerPoolError::InvalidAgentRuntime { message }
+            if message.contains("other")
     ));
     assert_eq!(fs::read(worker_path).expect("Worker state"), before);
 }
@@ -1954,6 +1960,35 @@ fn reconcile_runs_finalizes_busy_worker_with_dead_pid_once() {
         fs::read(&worker_path).expect("reconciled Worker state"),
         written
     );
+}
+
+#[test]
+fn reconcile_runs_finalizes_a_busy_worker_recorded_under_the_removed_pi_runtime() {
+    let (temp, repository) = repository_with_pool();
+    let worker_path = temp.path().join(".jj/pool/worker-02.json");
+    let mut worker: Value =
+        serde_json::from_slice(&fs::read(&worker_path).expect("busy Worker state"))
+            .expect("Worker JSON");
+    // A Worker stranded under the removed runtime, with no live PID to probe.
+    worker["agent"] = "pi".into();
+    worker["pid"] = Value::Null;
+    fs::write(
+        &worker_path,
+        serde_json::to_vec(&worker).expect("Worker JSON"),
+    )
+    .expect("Worker state");
+
+    let snapshot = repository.worker_pool().reconcile_runs();
+
+    let worker = snapshot.worker("worker-02").expect("reconciled Worker");
+    assert_eq!(
+        worker.status(),
+        WorkerStatus::Failed,
+        "a Worker under a removed runtime must not stay busy"
+    );
+    let error = worker.error().expect("removal message");
+    assert!(error.contains("Pi Agent Runtime"), "{error}");
+    assert!(error.contains("removed"), "{error}");
 }
 
 #[test]

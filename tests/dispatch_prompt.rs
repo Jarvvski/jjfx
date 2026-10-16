@@ -1,16 +1,14 @@
 use std::ffi::OsStr;
 
 use jjfx::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
-    AgentRuntimeInvocation, DeliveryContract, DispatchBudget, DispatchPromptBuilder,
-    DispatchPromptContext, RepositoryIdentity, Ticket, TicketDetails, TicketId, TicketStatus,
-    TicketTitle,
+    AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, DeliveryContract,
+    DispatchBudget, DispatchPromptBuilder, DispatchPromptContext, RepositoryIdentity, Ticket,
+    TicketDetails, TicketId, TicketStatus, TicketTitle,
 };
 
 fn prompt_args(runtime: AgentRuntime, invocation: &AgentRuntimeInvocation) -> Vec<String> {
     runtime
         .command(invocation, AgentRuntimeCapabilities::default())
-        .expect("runtime command should build")
         .get_args()
         .map(OsStr::to_string_lossy)
         .map(|argument| argument.into_owned())
@@ -27,9 +25,7 @@ fn fresh_and_resumed_agent_sessions_receive_the_same_delegation_contract() {
             AgentRuntimeInvocation::new("continue the Ticket").with_session_id("session-42");
 
         for invocation in [fresh, resumed] {
-            let command = runtime
-                .command(&invocation, AgentRuntimeCapabilities::default())
-                .expect("runtime command should build");
+            let command = runtime.command(&invocation, AgentRuntimeCapabilities::default());
             let prompt = command
                 .get_args()
                 .map(OsStr::to_string_lossy)
@@ -52,9 +48,7 @@ fn provider_managed_model_and_budget_add_no_command_overrides() {
     let invocation = DispatchPromptBuilder::new()
         .initial(context)
         .expect("provider-managed Dispatch prompt");
-    let command = AgentRuntime::Codex
-        .command(&invocation, AgentRuntimeCapabilities::default())
-        .expect("Codex command should build");
+    let command = AgentRuntime::Codex.command(&invocation, AgentRuntimeCapabilities::default());
     let args = command
         .get_args()
         .map(OsStr::to_string_lossy)
@@ -62,62 +56,6 @@ fn provider_managed_model_and_budget_add_no_command_overrides() {
 
     assert!(!args.iter().any(|argument| argument == "--model"));
     assert!(!args.iter().any(|argument| argument == "--max-budget-usd"));
-}
-
-#[test]
-fn pi_dispatch_prompt_preserves_provider_aware_model_selection() {
-    let invocation = DispatchPromptBuilder::new()
-        .initial(
-            dispatch_context(AgentRuntime::Pi)
-                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
-        )
-        .expect("Pi Dispatch prompt");
-
-    let error = AgentRuntime::Pi
-        .command(&invocation, AgentRuntimeCapabilities::default())
-        .expect_err("the prompt seam should preserve the model before session setup");
-
-    assert_eq!(error, AgentRuntimeCommandError::MissingSessionDirectory);
-}
-
-#[test]
-fn pi_dispatch_prompt_selects_the_explicit_trusted_linear_profile() {
-    let invocation = DispatchPromptBuilder::new()
-        .initial(
-            dispatch_context(AgentRuntime::Pi)
-                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
-        )
-        .expect("Pi Dispatch prompt")
-        .with_session_directory("/tmp/jjfx-pi-session");
-
-    let command = AgentRuntime::Pi
-        .command(&invocation, AgentRuntimeCapabilities::default())
-        .expect("Pi Direct Dispatch command");
-    let args = command
-        .get_args()
-        .map(OsStr::to_string_lossy)
-        .collect::<Vec<_>>();
-
-    assert!(args.iter().any(|argument| argument == "--no-extensions"));
-    assert!(args.iter().any(|argument| argument == "--extension"));
-    assert!(
-        args.iter()
-            .any(|argument| argument.ends_with("pi-mcp-adapter/index.ts"))
-    );
-    assert!(args.iter().any(|argument| argument == "--no-skills"));
-    assert!(args.iter().any(|argument| argument == "--no-context-files"));
-    assert!(args.iter().any(|argument| argument == "--no-approve"));
-    assert!(
-        args.iter().any(|argument| {
-            argument
-                == "read,bash,edit,write,grep,find,ls,linear_get_issue,linear_update_issue,linear_create_comment"
-        }),
-        "unexpected Pi command arguments: {args:?}"
-    );
-    assert!(
-        args.iter()
-            .any(|argument| argument.contains("Call linear_get_issue directly"))
-    );
 }
 
 #[test]
@@ -136,38 +74,6 @@ fn inlined_ticket_details_replace_the_fetch_step_and_soften_status_updates() {
     assert!(prompt.contains("inline the body"));
     assert!(!prompt.contains("Fetch the Ticket through Linear tools"));
     assert!(prompt.contains("otherwise note the summary in the Pull Request"));
-}
-
-#[test]
-fn only_pi_receives_pi_specific_tool_guidance() {
-    for runtime in [
-        AgentRuntime::Claude,
-        AgentRuntime::Codex,
-        AgentRuntime::OpenCode,
-    ] {
-        let invocation = DispatchPromptBuilder::new()
-            .initial(dispatch_context(runtime))
-            .expect("Dispatch prompt");
-        let prompt = prompt_args(runtime, &invocation).join("\n");
-        assert!(
-            !prompt.contains("Call linear_get_issue directly"),
-            "{runtime:?} must not receive Pi-only guidance"
-        );
-        assert!(
-            !prompt.contains("direct Pi tools"),
-            "{runtime:?} must not receive Pi-only guidance"
-        );
-    }
-
-    let invocation = DispatchPromptBuilder::new()
-        .initial(
-            dispatch_context(AgentRuntime::Pi)
-                .with_model(AgentModel::new("gpt-5.4").with_provider("openai")),
-        )
-        .expect("Pi Dispatch prompt")
-        .with_session_directory("/tmp/jjfx-pi-session");
-    let prompt = prompt_args(AgentRuntime::Pi, &invocation).join("\n");
-    assert!(prompt.contains("Call linear_get_issue directly"));
 }
 
 #[test]
@@ -194,9 +100,7 @@ fn initial_dispatch_prompt_pins_delivery_obligations_and_supported_overrides() {
     let invocation = DispatchPromptBuilder::new()
         .initial(context)
         .expect("initial Dispatch prompt");
-    let command = AgentRuntime::Claude
-        .command(&invocation, AgentRuntimeCapabilities::default())
-        .expect("Claude command should build");
+    let command = AgentRuntime::Claude.command(&invocation, AgentRuntimeCapabilities::default());
     let args = command
         .get_args()
         .map(OsStr::to_string_lossy)

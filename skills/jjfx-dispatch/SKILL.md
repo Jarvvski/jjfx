@@ -5,7 +5,7 @@ description: Dispatch work to background agents with jjfx. Use when the user wan
 
 # jjfx dispatch
 
-jjfx runs background agents as **Workers**. A Worker is one reusable slot backed by its own jj workspace (a colocated Git worktree) running a single coding agent — Claude, Codex, Pi, or opencode. A **Ticket** is the unit of work, and **Dispatch** assigns tickets to idle Workers. You drive all of it from the `jjfx` CLI (the `wsg` binary exposes the same commands).
+jjfx runs background agents as **Workers**. A Worker is one reusable slot backed by its own jj workspace (a colocated Git worktree) running a single coding agent — Claude, Codex, or opencode. A **Ticket** is the unit of work, and **Dispatch** assigns tickets to idle Workers. You drive all of it from the `jjfx` CLI (the `wsg` binary exposes the same commands).
 
 ## Before dispatching
 
@@ -13,7 +13,7 @@ Settle three things first, so a dispatch does not fail on setup:
 
 1. **Repository** — `jjfx root` prints the repo jjfx creates Workers beside. Run from inside it.
 2. **Colocation** — `jjfx colocation status`. Colocated Workers carry a working `.git`, which `gh stack` and other Git tools need. If it reports not colocated, run `jjfx colocation enable`.
-3. **Runtime** — `jjfx pool profile <runtime> [--provider P --model M]` sets the agent every Worker runs. `claude`, `codex`, `pi`, and `opencode` are supported; provider and model are optional where the runtime picks them itself.
+3. **Runtime** — `jjfx pool profile <runtime> [--provider P --model M]` sets the agent every Worker runs. `claude`, `codex`, and `opencode` are supported; provider and model are optional where the runtime picks them itself.
 
 ## Steps
 
@@ -33,7 +33,7 @@ jjfx pool list       # WORKER  NAME  STATUS  TICKET  ELAPSED
 Name tickets directly, or let jjfx discover them:
 
 - **Direct** — `jjfx dispatch <TICKET>...` takes tracker ids you supply.
-- **Discovered** — `jjfx dispatch --all [--label <label>]` fetches every ticket carrying that label (default `ready-for-agent`) with status `Todo`. Discovery needs the Pi runtime with `JJFX_PI_LINEAR_HELPER` configured; on any other runtime, name the tickets yourself.
+- **Discovered** — `jjfx dispatch --all [--label <label>]` fetches every ticket carrying that label (default `ready-for-agent`) with status `Todo`. Discovery runs a short-lived read-only Linear query through the pool runtime, so the runtime must be able to reach Linear; otherwise name the tickets yourself.
 
 **Done when** you hold the exact ticket ids to dispatch.
 
@@ -51,7 +51,7 @@ Dispatch runs **in the background** by default; `--fg` runs it in the foreground
 | `--all` | Dispatch every discovered ready ticket |
 | `--label <label>` | Label used for discovery (default `ready-for-agent`) |
 | `--provider P` / `--model M` | Override the pool profile for this dispatch |
-| `--budget <usd>` | Cap spend for this dispatch (Pi rejects it) |
+| `--budget <usd>` | Cap spend for this dispatch (Claude only) |
 | `--no-orchestrate` | Dispatch each ticket directly, skipping Parent orchestration |
 | `--force` | Dispatch even to a Worker whose Workspace is open (see below) |
 
@@ -59,7 +59,7 @@ Dispatch runs **in the background** by default; `--fg` runs it in the foreground
 
 A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues as a Dispatch Group in dependency order and reports each one's progress, rather than handing the Parent itself to one Worker.
 
-Before launching, jjfx fetches each Ticket's title and description through the pool runtime and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the runtime cannot reach Linear, Dispatch fails before anything is reserved. Pi Workers instead fetch the Ticket through their pinned direct Linear tools.
+Before launching, jjfx fetches each Ticket's title and description through the pool runtime and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the runtime cannot reach Linear, Dispatch fails before anything is reserved.
 
 **Done when** every ticket prints an outcome naming the Worker that took it. A ticket with no free Worker reports the capacity gap rather than waiting silently.
 
@@ -111,4 +111,3 @@ jjfx pool destroy          # tear down the pool
 - **Never merge.** Dispatch produces pull requests; landing them is the user's call.
 - **Leave open Workspaces alone.** jjfx will not dispatch to (or `send` into) a Workspace that is open in a terminal. If a headless run reports it cannot see the terminal, re-run with `--force`; otherwise do not force past a Workspace a human is using.
 - **Set the runtime deliberately.** The pool profile is repository state that survives a restart — set it with `jjfx pool profile`, not per dispatch, unless the user asks for a one-off `--provider`/`--model` override.
-- **Pi is stricter.** Pi rejects `--budget` and needs the pinned adapter plus a Linear MCP server; its setup failures are reported as errors, never a fallback to another runtime. The jjfx repo documents the Pi specifics in `docs/pi-workers.md`.

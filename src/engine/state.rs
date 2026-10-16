@@ -753,7 +753,7 @@ pub(crate) enum ReservationOutcome {
         worker: WorkerId,
     },
     InvalidAgentRuntime {
-        value: String,
+        message: String,
     },
 }
 
@@ -791,7 +791,7 @@ pub(crate) enum ReservationsOutcome {
         worker: WorkerId,
     },
     InvalidAgentRuntime {
-        value: String,
+        message: String,
     },
 }
 
@@ -799,7 +799,7 @@ pub(crate) enum GrowReservationsOutcome {
     Reserved(Vec<ReservedWorker>),
     Conflict,
     NoIdle { available: usize },
-    InvalidAgentRuntime { value: String },
+    InvalidAgentRuntime { message: String },
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -814,7 +814,7 @@ pub(crate) enum FollowUpOutcome {
     WorkerBusy,
     WorkerStateMissing,
     InvalidAgentRuntime {
-        value: String,
+        message: String,
     },
 }
 
@@ -1472,11 +1472,13 @@ impl StateStore {
                         Ok(Some(profile)) => profile,
                         Ok(None) => match configured_pool_profile(&pool) {
                             Ok(profile) => profile,
-                            Err(value) => {
-                                return Ok(FollowUpOutcome::InvalidAgentRuntime { value });
+                            Err(message) => {
+                                return Ok(FollowUpOutcome::InvalidAgentRuntime { message });
                             }
                         },
-                        Err(value) => return Ok(FollowUpOutcome::InvalidAgentRuntime { value }),
+                        Err(message) => {
+                            return Ok(FollowUpOutcome::InvalidAgentRuntime { message });
+                        }
                     },
                 };
                 let prior_log = state.log_file.clone();
@@ -1577,8 +1579,8 @@ impl StateStore {
                                 format!("unexpected targeted Worker {worker}"),
                             ));
                         }
-                        ReservationsOutcome::InvalidAgentRuntime { value } => {
-                            return Ok(GrowReservationsOutcome::InvalidAgentRuntime { value });
+                        ReservationsOutcome::InvalidAgentRuntime { message } => {
+                            return Ok(GrowReservationsOutcome::InvalidAgentRuntime { message });
                         }
                     };
                 if let Err(primary) = write_atomic(&self.root.join(POOL_PATH), &next, pool_subject)
@@ -1750,8 +1752,8 @@ impl StateStore {
                     Some(profile) => profile,
                     None => match configured_pool_profile(&pool) {
                         Ok(profile) => profile,
-                        Err(value) => {
-                            return Ok(ReservationOutcome::InvalidAgentRuntime { value });
+                        Err(message) => {
+                            return Ok(ReservationOutcome::InvalidAgentRuntime { message });
                         }
                     },
                 };
@@ -1868,7 +1870,7 @@ fn reserve_batch_locked(
     let default_profile = if inputs.iter().any(|input| input.profile.is_none()) {
         match configured_pool_profile(pool) {
             Ok(profile) => Some(profile),
-            Err(value) => return Ok(ReservationsOutcome::InvalidAgentRuntime { value }),
+            Err(message) => return Ok(ReservationsOutcome::InvalidAgentRuntime { message }),
         }
     } else {
         None

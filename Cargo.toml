@@ -23,7 +23,6 @@ exclude = [
   ".github/",
   ".mise/",
   ".momo/",
-  ".pi-subagents/",
   ".scratch/",
   "crates/",
   "momo.toml",

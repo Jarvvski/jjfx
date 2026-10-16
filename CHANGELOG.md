@@ -27,6 +27,10 @@ markers on their entries; they are preserved as history and carry no meaning now
 
 ## [Unreleased]
 
+### Breaking
+
+- Remove the Pi Agent Runtime: a persisted `"agent": "pi"` pool profile or Worker is now rejected with a message naming the removal, and a Worker recorded as `pi` is reconciled to a terminal state instead of being stranded busy; claude, codex, and opencode are unchanged.
+
 ### Added
 
 - The ticket source Dispatch discovers work from is now configured with a `[tickets]` section (`source = "linear" | "local"`) rather than implied by the Agent Runtime, so an opencode pool can pull work through a configured source; `source = "linear"` is unchanged.

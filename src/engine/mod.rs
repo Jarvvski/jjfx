@@ -83,8 +83,7 @@ pub use run_log::{
     RunUsage, resolve_agent_session, resolve_agent_session_for_runtime,
 };
 pub use runtime::{
-    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeCommandError,
-    AgentRuntimeInvocation, AgentRuntimePreflightError, AgentRuntimePreflightErrorKind,
+    AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation,
     AgentRuntimeProbeError, AgentRuntimeProfile, BackgroundRun, CompletedRun, RunOutcome,
     RunRequest, RunReset, RunSupervisor, RunSupervisorError,
 };
@@ -99,10 +98,9 @@ pub use state::{
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
-    PI_DISCOVERY_HELPER_ENV, ParentTicket, PiDiscoveryHelper, ReadyTicketFilter, ReadyTickets,
-    RepositoryIdentity, Ticket, TicketDetails, TicketDiscovery, TicketDiscoveryError, TicketQuery,
-    TicketQueryError, TicketQueryErrorKind, TicketQueryRequest, TicketStatus, TicketTitle,
-    TicketValueError,
+    ParentTicket, ReadyTicketFilter, ReadyTickets, RepositoryIdentity, Ticket, TicketDetails,
+    TicketDiscovery, TicketDiscoveryError, TicketQuery, TicketQueryError, TicketQueryErrorKind,
+    TicketQueryRequest, TicketStatus, TicketTitle, TicketValueError,
 };
 pub use undo::{MutationCheckpoint, MutationGuard, UndoError, UndoOutcome};
 pub use watchdog::{RunHealth, RunProgress, StuckWindow};

@@ -43,8 +43,6 @@ pub enum AgentKind {
     Claude,
     /// OpenAI Codex.
     Codex,
-    /// Pi coding agent.
-    Pi,
     /// OpenCode coding agent.
     OpenCode,
 }
@@ -55,7 +53,6 @@ impl AgentKind {
         match self {
             AgentKind::Claude => "claude",
             AgentKind::Codex => "codex",
-            AgentKind::Pi => "pi",
             AgentKind::OpenCode => "opencode",
             AgentKind::Unknown => "agent",
         }
@@ -66,7 +63,6 @@ impl AgentKind {
         match name {
             "claude" => AgentKind::Claude,
             "codex" => AgentKind::Codex,
-            "pi" => AgentKind::Pi,
             "opencode" => AgentKind::OpenCode,
             _ => AgentKind::Unknown,
         }
@@ -317,13 +313,13 @@ mod tests {
 
     #[test]
     fn parses_versioned_lifecycle_envelopes() {
-        let line = r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-session","cwd":"/w/a","hook_event_name":"SessionStart"}"#;
+        let line = r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-session","cwd":"/w/a","hook_event_name":"SessionStart"}"#;
         let ev = parse_line(line).unwrap();
         assert_eq!(ev.jjfx_event_version, Some(1));
-        assert_eq!(ev.agent_kind.as_deref(), Some("pi"));
-        assert_eq!(ev.session_id.as_deref(), Some("pi-session"));
+        assert_eq!(ev.agent_kind.as_deref(), Some("opencode"));
+        assert_eq!(ev.session_id.as_deref(), Some("oc-session"));
 
-        let unsupported = r#"{"jjfx_event_version":2,"agent_kind":"pi","session_id":"pi-session","cwd":"/w/a","hook_event_name":"SessionStart"}"#;
+        let unsupported = r#"{"jjfx_event_version":2,"agent_kind":"opencode","session_id":"oc-session","cwd":"/w/a","hook_event_name":"SessionStart"}"#;
         assert!(parse_line(unsupported).is_none());
     }
 
@@ -344,18 +340,18 @@ mod tests {
     }
 
     #[test]
-    fn explicit_identity_selects_pi_without_transcript_fallback() {
+    fn explicit_identity_selects_opencode_without_transcript_fallback() {
         let mut states = AgentStates::default();
         states.apply(
             &parse_line(
-                r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart","transcript_path":"/u/.claude/session.jsonl"}"#,
+                r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"SessionStart","transcript_path":"/u/.claude/session.jsonl"}"#,
             )
             .unwrap(),
         );
 
         let agent = states.agent_for(Path::new("/w/a"));
-        assert_eq!(agent.kind, AgentKind::Pi);
-        assert_eq!(agent.kind.label(), "pi");
+        assert_eq!(agent.kind, AgentKind::OpenCode);
+        assert_eq!(agent.kind.label(), "opencode");
     }
 
     #[test]
@@ -418,25 +414,25 @@ mod tests {
     #[test]
     fn stale_events_from_a_replaced_session_do_not_change_state() {
         let lines = [
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-2","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-2","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"Stop"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-2","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-2","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"Stop"}"#,
         ];
 
         let states = AgentStates::replay(lines.into_iter().filter_map(parse_line));
         let agent = states.agent_for(Path::new("/w/a"));
         assert_eq!(agent.state, AgentState::Working);
-        assert_eq!(agent.kind, AgentKind::Pi);
+        assert_eq!(agent.kind, AgentKind::OpenCode);
     }
 
     #[test]
     fn partial_versioned_event_cannot_mutate_a_known_session() {
         let lines = [
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","cwd":"/w/a","hook_event_name":"Stop"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","cwd":"/w/a","hook_event_name":"Stop"}"#,
         ];
 
         let states = AgentStates::replay(lines.into_iter().filter_map(parse_line));
@@ -447,12 +443,12 @@ mod tests {
     }
 
     #[test]
-    fn pi_replay_and_live_application_are_equivalent() {
+    fn opencode_replay_and_live_application_are_equivalent() {
         let lines = [
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"Stop"}"#,
-            r#"{"jjfx_event_version":1,"agent_kind":"pi","session_id":"pi-1","cwd":"/w/a","hook_event_name":"SessionEnd"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"SessionStart"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"UserPromptSubmit"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"Stop"}"#,
+            r#"{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"oc-1","cwd":"/w/a","hook_event_name":"SessionEnd"}"#,
         ];
         let events: Vec<_> = lines.into_iter().filter_map(parse_line).collect();
         let replayed = AgentStates::replay(events.clone());
@@ -469,7 +465,7 @@ mod tests {
             replayed.agent_for(Path::new("/w/a")),
             Agent {
                 state: AgentState::Ended,
-                kind: AgentKind::Pi,
+                kind: AgentKind::OpenCode,
             }
         );
     }

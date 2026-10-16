@@ -4,7 +4,7 @@
 tickets instead of Linear. It reads the convention this repository already uses
 for its own work - `.scratch/<feature>/issues/<NN>-<slug>.md`, with `Key: value`
 metadata lines ([issue tracker conventions](agents/issue-tracker.md)) - and needs
-no Agent Runtime, no Linear, and no Pi helper.
+no Agent Runtime and no Linear.
 
 ```toml
 [tickets]
