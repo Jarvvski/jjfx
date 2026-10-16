@@ -20,10 +20,11 @@ use crate::engine::{
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
     DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
     OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
-    ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode, StuckWindow, TerminalSettings,
-    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
-    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
+    ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode, StuckWindow, SyncAction,
+    TerminalSettings, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
+    TrunkDrift, UndoOutcome, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
+    WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
+    dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -53,6 +54,7 @@ pub enum Command {
         name: String,
     },
     Refresh,
+    Sync,
     Colocation {
         action: ColocationAction,
     },
@@ -249,7 +251,8 @@ pub fn parse(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|name| Command::Path { name }),
-        "refresh" | "sync" => Ok(Command::Refresh),
+        "refresh" => Ok(Command::Refresh),
+        "sync" => Ok(Command::Sync),
         "colocation" | "colocate" => parse_colocation(&args[1..]),
         "status" => parse_status(&args[1..]),
         "reset" => parse_single_exact(
@@ -1001,6 +1004,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Where => where_command(&repository(colocate)?)?,
         Command::Path { name } => path_command(&repository(colocate)?, &name)?,
         Command::Refresh => refresh_command(&repository(colocate)?)?,
+        Command::Sync => sync_command(&repository(colocate)?)?,
         Command::Colocation { action } => colocation_command(&repository(colocate)?, &action)?,
         Command::Add { name, revision } => {
             add_command(&repository(colocate)?, &name, revision.as_deref())?
@@ -1095,18 +1099,86 @@ fn print_hook_output(_stream: WorkspaceHookStream, line: &str) {
     }
 }
 
+/// Warn on stderr when the working copy in the current directory has fallen
+/// behind trunk, so a stale on-disk tree is never silent.
+///
+/// The warning names how far behind it is and the command that re-syncs it; it
+/// is only a warning, because the stale state is legitimate mid-edit. A read
+/// failure is surfaced too - "in sync" and "could not tell" must not look alike.
+fn warn_when_behind_trunk(repository: &Repository) {
+    match current_workspace_drift(repository) {
+        Ok(Some(drift)) => eprintln!("warning: {}", drift.warning()),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!(
+                "warning: could not check whether this working copy is behind trunk: {error:#}"
+            )
+        }
+    }
+}
+
+/// How far the working copy in the current directory has fallen behind trunk.
+fn current_workspace_drift(repository: &Repository) -> Result<Option<TrunkDrift>> {
+    let dir = std::env::current_dir().context("reading the current directory")?;
+    Ok(repository.workspaces().trunk_drift(&dir)?)
+}
+
 fn root_command(repository: &Repository) -> Result<()> {
+    warn_when_behind_trunk(repository);
     println!("{}", repository.root().display());
     Ok(())
 }
 
 fn where_command(repository: &Repository) -> Result<()> {
+    warn_when_behind_trunk(repository);
     println!("repo:       {}", repository.root().display());
     println!(
         "workspaces: {}",
         repository.workspaces().base_dir().display()
     );
     Ok(())
+}
+
+/// Fetch and move the current workspace's working copy onto trunk.
+///
+/// Distinct from `refresh` (rebuild the workspace cache; nothing moves) and
+/// `rebase <worker>` (rebase and push a named Worker's bookmark): `sync` pushes
+/// nothing and touches no Worker, it only re-syncs the working copy in the
+/// current directory. A rebase that conflicts is reported, never resolved.
+fn sync_command(repository: &Repository) -> Result<()> {
+    let dir = std::env::current_dir().context("reading the current directory")?;
+    let outcome = repository.workspaces().sync_to_trunk(&dir)?;
+    if let Some(warning) = outcome.warning() {
+        eprintln!("warning: {warning}");
+    }
+    match outcome.action() {
+        SyncAction::AlreadyOnTrunk => eprintln!("Already on trunk"),
+        SyncAction::MovedEmpty => eprintln!(
+            "Moved the empty working copy onto trunk (was {} behind)",
+            commits_behind(outcome.behind())
+        ),
+        SyncAction::Rebased => eprintln!(
+            "Rebased the working copy onto trunk (was {} behind)",
+            commits_behind(outcome.behind())
+        ),
+    }
+    if !outcome.conflicts().is_empty() {
+        anyhow::bail!(
+            "re-syncing left {} conflicted commit(s): {}; resolve them with \
+             `{PROGRAM} resolve <workspace>` or `jj resolve`, then continue",
+            outcome.conflicts().len(),
+            outcome.conflicts().join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// `1 commit` / `3 commits`, so a count reads as prose.
+fn commits_behind(count: u32) -> String {
+    match count {
+        1 => "1 commit".to_owned(),
+        count => format!("{count} commits"),
+    }
 }
 
 /// Run the read-only cross-workspace migration-order check and print its report.
@@ -1379,6 +1451,7 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
 }
 
 fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
+    warn_when_behind_trunk(repository);
     let config = crate::config::load()?;
     // `status`/`pool list` read Pool state, so they also reconcile local Tickets:
     // a finished Run resolves its Ticket here, with no Dispatch needed.

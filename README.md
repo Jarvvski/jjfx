@@ -91,7 +91,7 @@ The same binary carries the non-interactive command surface alongside the TUI:
 
 | Group | Commands |
 | --- | --- |
-| Workspaces | `add`, `rm`, `list`, `clean`, `root`, `where`, `path`, `refresh`, `colocation` |
+| Workspaces | `add`, `rm`, `list`, `clean`, `root`, `where`, `path`, `refresh`, `sync`, `colocation` |
 | Pool | `pool <N>`, `pool list`, `pool rm`, `pool reset`, `pool profile`, `pool destroy` |
 | Dispatch & sessions | `dispatch`, `send`, `review`, `logs`, `mount`, `rebase`, `absorb`, `open-pr` |
 | Lifecycle | `hooks install`, `hooks status` |

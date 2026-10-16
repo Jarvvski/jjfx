@@ -39,6 +39,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch --all bases a dependent Ticket on its blocker's branch (resolved from the blocker's bookmark), so a chain of Tickets lands as a real stack instead of parallel branches off trunk; a dependent whose blocker has no branch is stated and based on trunk rather than left silent.
 - jjfx dispatch --all names every Ticket it skipped and why when the ready set is empty - a blocked Ticket reports its blocker and that blocker's status, a Ticket with the wrong Status: reports it, and a malformed file keeps its diagnostic - on both the prose and --json paths, so an empty batch reads as nothing to do or nothing can be done instead of a bare [].
 - jjfx wait blocks until Workers reach a condition - done, failed, terminal (default) or ticket-resolved - and carries the answer in its exit code (0 reached, 1 timed out, 2 terminal-but-unsatisfied), so an agent waits on a Worker instead of polling with sleep.
+- jjfx sync fetches (when the repository has a remote) and moves the working copy in the current directory onto trunk - jj new for an empty @, jj rebase when it carries changes - reporting conflicts rather than resolving them, and jjfx status, where and root now warn when that working copy has fallen behind trunk, naming how far behind and the fix; the undocumented sync alias for refresh is gone, so sync no longer rebuilds the workspace cache.
 
 ### Fixed
 
