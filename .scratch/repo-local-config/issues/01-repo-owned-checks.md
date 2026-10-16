@@ -1,6 +1,6 @@
 # `[checks]` is repo-owned but can only be configured user-globally
 
-Status: needs-triage
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -38,13 +38,13 @@ Recommendation: 1 (scoped, no new ADR) or 3 (no layering). Not 2 in this ticket.
 
 ## Acceptance Criteria
 
-- [ ] `[checks]` can be configured per repository, and the repo's value wins over the user-global one.
-- [ ] A repo with no repo-local check keeps today's behaviour: the user-global `[checks]`, or no check at all.
-- [ ] The chosen trust story is stated in `docs/configuration.md`, including whether a repo-local file is read by default.
-- [ ] An unknown or invalid key in a repo-local file fails loudly, naming the file.
-- [ ] Tests cover: repo value overrides user value; the user value applies when the repo sets none; no config anywhere is a no-op; an invalid repo-local file is an error.
-- [ ] `docs/configuration.md` §`[checks]` is updated, and the "the only file jjfx itself owns" sentence at the top no longer contradicts it.
-- [ ] `mise run check` is green.
+- [x] `[checks]` can be configured per repository, and the repo's value wins over the user-global one.
+- [x] A repo with no repo-local check keeps today's behaviour: the user-global `[checks]`, or no check at all.
+- [x] The chosen trust story is stated in `docs/configuration.md`, including whether a repo-local file is read by default.
+- [x] An unknown or invalid key in a repo-local file fails loudly, naming the file.
+- [x] Tests cover: repo value overrides user value; the user value applies when the repo sets none; no config anywhere is a no-op; an invalid repo-local file is an error.
+- [x] `docs/configuration.md` §`[checks]` is updated, and the "the only file jjfx itself owns" sentence at the top no longer contradicts it.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -62,3 +62,4 @@ Recommendation: 1 (scoped, no new ADR) or 3 (no layering). Not 2 in this ticket.
 ## Comments
 
 - 2026-10-16: Filed from the `mono` workspace-provisioning change. `mono` wants `./gradlew :app:backend:compileKotlin` as its forge check (its own merge-side rule), and there is no way to set it for `mono` alone - the global file would then run Gradle in every other repository.
+- 2026-10-16: Resolved as option 1, read by default. `src/config.rs` gains `RepoConfig` (`<repo>/.jjfx/config.toml`, with `deny_unknown_fields` so only `[checks]` is settable and any other section is a loud error naming the file) and `Config::checks_for`, which the forge settings are built from in `src/lib.rs`. A repository's `[checks]` replaces the user-global one wholesale; with no repository file the user config is unchanged. Trust: read by default, because the file sits next to `setup.sh` / `teardown.sh`, which jjfx already executes when it creates a workspace in the repository - so it grants no capability the repository did not already have. Documented in `docs/configuration.md` (§"Repository-local checks") and pointed at from `docs/workspace-hooks.md`. `config::tests` covers repository-over-user, user-when-the-repository-sets-none, unconfigured-is-a-no-op, a repository disabling a global check, and the three rejection paths (unknown section, unknown checks key, blank command). `momo add` records the change.
