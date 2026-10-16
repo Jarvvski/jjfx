@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::HELPER_LIVENESS_TIMEOUT;
+use support::{HELPER_LIVENESS_TIMEOUT, wait_for_file_content};
 
 const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "WSG_AGENT_RUNTIME_HELPER_PATH";
@@ -420,7 +420,7 @@ fn reserved_background_run_persists_pid_before_returning() {
         .stderr(Stdio::piped());
     let child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
 
-    wait_for_file(&result);
+    wait_for_file_content(&result);
     wait_for_file(&process);
     let pid: u32 = fs::read_to_string(&result)
         .expect("background PID")
@@ -616,7 +616,7 @@ fn reserved_background_run_releases_worker_when_runtime_probe_fails() {
     wait_for_file(&reserved);
     fs::remove_file(bin_directory.join("claude")).expect("remove runtime before spawn");
     fs::write(&proceed, []).expect("allow launch to continue");
-    wait_for_file(&result);
+    wait_for_file_content(&result);
     let output = child.wait_with_output();
     assert!(
         output.status.success(),
@@ -736,8 +736,8 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
     .expect("replace Worker state with a directory");
     fs::write(&proceed, []).expect("allow launch to continue");
 
-    wait_for_file(&process);
-    wait_for_file(&result);
+    wait_for_file_content(&process);
+    wait_for_file_content(&result);
     let error = fs::read_to_string(&result).expect("persistence error");
     assert!(error.contains("Is a directory"), "{error}");
     let pid: i32 = fs::read_to_string(&process)
@@ -754,6 +754,7 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
         "helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    wait_for_process_exit(pid);
     let process_alive = test_kill_process(pid).is_ok();
     if process_alive {
         let _ = kill_process_group(pid, Signal::KILL);
@@ -871,14 +872,14 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
     assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
     fs::write(&proceed, []).expect("allow launch to continue");
     wait_for_file(&diagnostic);
-    wait_for_file(&descendant);
+    wait_for_file_content(&descendant);
     fs::write(&worker_state_path, b"not-json").expect("release blocked Worker state read");
     fs::remove_file(&worker_state_path).expect("remove Worker state FIFO");
     fs::write(&worker_state_path, b"not-json").expect("preserve failed Worker state for release");
     fs::write(&launch, []).expect("allow runtime launch to continue");
 
-    wait_for_file(&process);
-    wait_for_file(&result);
+    wait_for_file_content(&process);
+    wait_for_file_content(&result);
     let error = fs::read_to_string(&result).expect("persistence error");
     assert!(error.contains("cannot persist PID"), "{error}");
     wait_for_file(&term);
@@ -960,8 +961,8 @@ fn background_run_returns_process_group_leader_with_child_owned_log() {
         .stderr(Stdio::piped());
     let mut child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
 
-    wait_for_file(&result);
-    wait_for_file(&process);
+    wait_for_file_content(&result);
+    wait_for_file_content(&process);
     assert!(
         child.is_running(),
         "background launch should return before the runtime exits"
@@ -3166,9 +3167,9 @@ fn reset_run_terminates_the_run_process_group_and_returns_the_worker_to_idle() {
         .stderr(Stdio::piped());
     let helper = BackgroundHelperGuard::spawn(&mut helper, &release, [&process, &result]);
 
-    wait_for_file(&result);
+    wait_for_file_content(&result);
     wait_for_file(&diagnostic);
-    wait_for_file(&descendant);
+    wait_for_file_content(&descendant);
     let leader = read_pid(&result);
     let descendant_pid = read_pid(&descendant);
 
@@ -3179,10 +3180,12 @@ fn reset_run_terminates_the_run_process_group_and_returns_the_worker_to_idle() {
         matches!(reset, RunReset::Abandoned { terminated_pid } if terminated_pid == Some(leader)),
         "unexpected Reset outcome: {reset:?}"
     );
+    wait_for_process_group_exit(unix_pid(leader));
     assert!(
         test_kill_process_group(unix_pid(leader)).is_err(),
         "Run process group should be gone once Reset returns"
     );
+    wait_for_process_exit(unix_pid(descendant_pid));
     assert!(
         test_kill_process(unix_pid(descendant_pid)).is_err(),
         "stubborn descendant should be gone once Reset returns"
@@ -3566,8 +3569,8 @@ fn cross_process_reset_terminates_a_live_foreground_run() {
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let child = helper.spawn().expect("foreground Reset helper");
-    wait_for_file(&process);
-    wait_for_file(&descendant);
+    wait_for_file_content(&process);
+    wait_for_file_content(&descendant);
     let leader = read_pid(&process);
     let descendant_pid = read_pid(&descendant);
     wait_for_busy_pid(&repository, &worker_id, leader);
@@ -3575,6 +3578,8 @@ fn cross_process_reset_terminates_a_live_foreground_run() {
     let reset = RunSupervisor::new()
         .reset_run(&repository, &worker_id)
         .expect("Reset should abandon the foreground Run");
+    wait_for_process_group_exit(unix_pid(leader));
+    wait_for_process_exit(unix_pid(descendant_pid));
     let group_gone = test_kill_process_group(unix_pid(leader)).is_err();
     let descendant_gone = test_kill_process(unix_pid(descendant_pid)).is_err();
     if !group_gone || !descendant_gone {
@@ -3666,8 +3671,8 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
     assert!(fifo_status.success(), "mkfifo failed: {fifo_status}");
     fs::write(&proceed, []).expect("allow launch to continue");
 
-    wait_for_file(&process);
-    wait_for_file(&descendant);
+    wait_for_file_content(&process);
+    wait_for_file_content(&descendant);
     let leader = read_pid(&process);
     let descendant_pid = read_pid(&descendant);
     fs::write(&worker_path, b"not-json").expect("release blocked Worker state read");
@@ -3676,6 +3681,7 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
 
     let output = child.wait_with_output().expect("foreground helper output");
     let error = fs::read_to_string(&result).expect("foreground launch error");
+    wait_for_process_exit(unix_pid(descendant_pid));
     let descendant_alive = test_kill_process(unix_pid(descendant_pid)).is_ok();
     if descendant_alive {
         let _ = kill_process(unix_pid(leader), Signal::KILL);
@@ -3692,6 +3698,7 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
         !descendant_alive,
         "a failed foreground launch must not leave a surviving descendant"
     );
+    wait_for_process_group_exit(unix_pid(leader));
     assert!(
         test_kill_process_group(unix_pid(leader)).is_err(),
         "the failed foreground Run's process group should be gone"
@@ -3765,7 +3772,7 @@ fn reset_run_does_not_signal_a_group_whose_recorded_leader_is_gone() {
         .expect("group leader helper");
     let leader_pid = leader.id();
     leader.wait().expect("group leader should exit");
-    wait_for_file(&descendant_path);
+    wait_for_file_content(&descendant_path);
     let descendant_pid = read_pid(&descendant_path);
     assert!(
         test_kill_process_group(unix_pid(leader_pid)).is_ok(),
@@ -4271,7 +4278,7 @@ impl StubbornRun {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let helper = BackgroundHelperGuard::spawn(&mut helper, &release, [&process, &result]);
-        wait_for_file(&result);
+        wait_for_file_content(&result);
         wait_for_file(&diagnostic);
         wait_for_file(&descendant);
         let leader = read_pid(&result);
@@ -4300,6 +4307,7 @@ impl StubbornRun {
     }
 
     fn expect_clean_shutdown(self) {
+        wait_for_process_group_exit(unix_pid(self.leader));
         assert!(
             test_kill_process_group(unix_pid(self.leader)).is_err(),
             "Run process group should be gone once Reset returns"
@@ -4534,6 +4542,28 @@ fn wait_for_file(path: &std::path::Path) {
         thread::sleep(Duration::from_millis(20));
     }
     assert!(path.exists(), "{} should be created", path.display());
+}
+
+/// Blocks until `pid` is gone, so an assertion that a Run's process ended does
+/// not race the kernel's reaping of it.
+///
+/// A killed process stays a zombie until its parent - or, once orphaned, init -
+/// reaps it, and `test_kill_process` still reports a zombie as present. The
+/// process-group probe ignores zombies, so a group can read as gone while one of
+/// its members is still observable; poll the member itself to a bounded deadline.
+fn wait_for_process_exit(pid: Pid) {
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    while test_kill_process(pid).is_ok() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// The same reaping race for a whole process group.
+fn wait_for_process_group_exit(pid: Pid) {
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn helper_command(path: &std::path::Path, result: &std::path::Path, mode: &str) -> Command {
