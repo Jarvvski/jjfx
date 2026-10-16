@@ -91,6 +91,30 @@ fn write_worker(root: &Path, id: &str, status: &str, log: Option<&str>) {
     fs::rename(&temporary, &path).expect("worker state rename");
 }
 
+/// Returns a Worker to idle the way a Reset does: status `idle` with the Run
+/// fields cleared, including `log_file`. The log file the abandoned Run wrote is
+/// left in place, as a Reset leaves it.
+fn write_idle_worker(root: &Path, id: &str) {
+    let pool = root.join(".jj").join("pool");
+    fs::create_dir_all(&pool).expect("pool directory");
+    let state = serde_json::json!({
+        "agent": null,
+        "branch_name": null,
+        "completed_at": null,
+        "error": null,
+        "exit_code": null,
+        "log_file": null,
+        "pid": null,
+        "started_at": null,
+        "status": "idle",
+        "ticket": null,
+    });
+    let path = pool.join(format!("{id}.json"));
+    let temporary = pool.join(format!("{id}.json.tmp"));
+    fs::write(&temporary, serde_json::to_vec(&state).expect("worker json")).expect("worker state");
+    fs::rename(&temporary, &path).expect("worker state rename");
+}
+
 /// A `jjfx logs` invocation against `repository`, with `config_home` as XDG home.
 fn logs_command(repository: &Path, config_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
@@ -286,4 +310,58 @@ fn logs_stops_cleanly_when_the_worker_leaves_the_pool() {
 
     let stderr = watcher.into_output();
     assert!(stderr.contains("left the Pool"), "{stderr:?}");
+}
+
+#[test]
+fn logs_returns_immediately_for_an_idle_worker() {
+    let (repository, config_home) = jj_repository();
+    write_manifest(repository.path(), &["worker-1"]);
+    // An idle Worker has no Run, so the log its last Run left behind will never
+    // grow again: `logs` prints the tail and returns rather than following it.
+    write_worker(
+        repository.path(),
+        "worker-1",
+        "idle",
+        Some("previous run\n"),
+    );
+
+    let output = run_bounded(
+        logs_command(repository.path(), config_home.path(), &["1"]),
+        LOGS_LIVENESS_TIMEOUT,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("previous run"),
+        "the tail is still printed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    // There is nothing to follow, so the banner is not printed.
+    assert!(
+        !String::from_utf8_lossy(&output.stderr).contains("Following"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn logs_returns_when_a_running_worker_is_reset_to_idle() {
+    let (repository, config_home) = jj_repository();
+    write_manifest(repository.path(), &["worker-1"]);
+    write_worker(repository.path(), "worker-1", "busy", Some("thinking\n"));
+
+    let (mut child, watcher) =
+        spawn_following(logs_command(repository.path(), config_home.path(), &["1"]));
+    watcher.wait_for_banner();
+
+    // A Reset abandons the Run and returns the Worker to idle, leaving the log
+    // file in place. Nothing will append to it again, so the follow loop must
+    // notice the Worker has no Run and return rather than spin on a stale log.
+    write_idle_worker(repository.path(), "worker-1");
+
+    let status = wait_bounded(&mut child, LOGS_LIVENESS_TIMEOUT);
+    assert_eq!(status.code(), Some(0), "an idle Worker is a clean end");
+
+    let stderr = watcher.into_output();
+    assert!(stderr.contains("the Worker is idle"), "{stderr:?}");
 }

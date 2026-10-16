@@ -2682,6 +2682,8 @@ const LOG_FOLLOW_INTERVAL: Duration = Duration::from_millis(200);
 enum FollowStop {
     /// The Run reached a terminal state, so its log is complete.
     RunFinished(WorkerStatus),
+    /// The Worker is idle, so it has no Run and nothing is being written.
+    Idle,
     /// The Worker left the Pool, so nothing more can be written.
     WorkerGone,
     /// The Run log vanished, so there is nothing left to read.
@@ -2696,6 +2698,7 @@ impl FollowStop {
             Self::RunFinished(status) => {
                 eprintln!("Stopped following {worker}: Run is {}", status.as_str());
             }
+            Self::Idle => eprintln!("Stopped following {worker}: the Worker is idle"),
             Self::WorkerGone => eprintln!("Stopped following {worker}: the Worker left the Pool"),
             Self::LogGone => eprintln!("Stopped following {worker}: the log is gone"),
         }
@@ -2709,8 +2712,9 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     // terminal Worker whose log does not parse would otherwise follow forever
     // with no output.
     print_log_tail(logs.path())?;
-    // A Worker that is already finished has a complete log, so return at once
-    // rather than follow a Run that will never write again.
+    // A Worker that is already terminal has a complete log, and an idle Worker
+    // has no Run at all, so return at once rather than follow a log that will
+    // never write again.
     if follow_stop(repository, &worker).is_some() {
         return Ok(());
     }
@@ -2741,8 +2745,9 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
         // Give the loop an exit: a Worker that was running when the command
-        // attached must not keep it alive after the Run ends. The check is one
-        // more reconciliation on a pass that already sleeps.
+        // attached must not keep it alive once there is no Run left to follow -
+        // because the Run ended, or because the Worker was reset to idle. The
+        // check is one more reconciliation on a pass that already sleeps.
         if let Some(stop) = follow_stop(repository, &worker) {
             stop.report(&worker);
             return Ok(());
@@ -2784,14 +2789,21 @@ fn print_log_tail(path: &std::path::Path) -> Result<()> {
 /// attaches, so the terminal states (`Done` and `Failed`) end the follow. A
 /// Worker that has left the Pool will never write again either, so it ends the
 /// follow too rather than hanging on a log nothing can append to.
+///
+/// `logs` follows the current Run, not the Worker: `Idle` means there is no Run
+/// to follow, so it ends the follow as well. A Worker reset between Runs keeps
+/// the log file its last Run wrote but stops writing to it, so following through
+/// `idle` would block forever on output that can never grow again. A caller that
+/// wants the next Run re-attaches, and `wait` is the command that blocks for one.
 fn follow_stop(repository: &Repository, worker: &WorkerId) -> Option<FollowStop> {
     let snapshot = repository.worker_pool().reconcile_runs();
     let Some(state) = snapshot.worker(worker.as_str()) else {
         return Some(FollowStop::WorkerGone);
     };
     match state.status() {
+        WorkerStatus::Busy => None,
+        WorkerStatus::Idle => Some(FollowStop::Idle),
         WorkerStatus::Done | WorkerStatus::Failed => Some(FollowStop::RunFinished(state.status())),
-        WorkerStatus::Idle | WorkerStatus::Busy => None,
     }
 }
 
