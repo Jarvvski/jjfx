@@ -18,6 +18,7 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
+use crate::engine::locks::{self, ScopedLock};
 use crate::engine::{AgentRuntimeProfile, DispatchExclusions, Repository};
 
 /// The directory holding every Worker Pool's own state, one directory per pool.
@@ -1030,8 +1031,8 @@ impl StateStore {
         self.directory().join(POOL_DOCUMENT)
     }
 
-    fn pool_lock(&self) -> PathBuf {
-        self.directory().join(POOL_LOCK_NAME)
+    fn pool_lock(&self) -> ScopedLock {
+        ScopedLock::pool(self.directory().join(POOL_LOCK_NAME))
     }
 
     fn destroy_marker(&self) -> PathBuf {
@@ -1042,8 +1043,8 @@ impl StateStore {
         self.directory().join(format!("{worker}.json"))
     }
 
-    fn worker_lock(&self, worker: &WorkerId) -> PathBuf {
-        sidecar(&self.worker_path(worker))
+    fn worker_lock(&self, worker: &WorkerId) -> ScopedLock {
+        ScopedLock::pool(sidecar(&self.worker_path(worker)))
     }
 
     /// Opens the Worker Pool state repository.
@@ -1172,11 +1173,10 @@ impl StateStore {
                 return Ok(Vec::new());
             }
             let workers = pool.workers.clone();
-            let mut locks = workers
+            let locks = workers
                 .iter()
                 .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
-            locks.sort();
             with_locks(&locks, subject, || {
                 let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                     Loaded::Present(versioned) => versioned.value,
@@ -1221,11 +1221,9 @@ impl StateStore {
                     .extension()
                     .is_some_and(|extension| extension == "json")
                 {
-                    locks.push(sidecar(&path));
+                    locks.push(ScopedLock::pool(sidecar(&path)));
                 }
             }
-            locks.sort();
-            locks.dedup();
             with_locks(&locks, subject, || {
                 let entries = fs::read_dir(&directory)
                     .map_err(|error| StateError::new("inspect destroy", subject, error))?;
@@ -1301,7 +1299,7 @@ impl StateStore {
         let subject = format!("Worker {worker}");
         with_locks(&[self.pool_lock()], &subject, || {
             let worker_path = self.worker_path(worker);
-            let worker_lock = sidecar(&worker_path);
+            let worker_lock = ScopedLock::pool(sidecar(&worker_path));
             with_locks(&[worker_lock], &subject, || {
                 let current = load_state(&worker_path, &subject, &validate_worker)?;
                 let pool = load_state(&self.pool_document(), "Worker Pool", &validate_pool)?;
@@ -1350,11 +1348,10 @@ impl StateStore {
                 return Ok(PoolMembershipOutcome::NoChange { capacity: current });
             }
             let selected = pool.workers[requested..].to_vec();
-            let mut locks = selected
+            let locks = selected
                 .iter()
                 .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
-            locks.sort();
             with_locks(&locks, subject, || {
                 let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                     Loaded::Present(versioned) => versioned.value,
@@ -2128,7 +2125,7 @@ repository_methods!(
     PoolStateRepository,
     PoolState,
     |s: &PoolStateRepository| s.directory.join(POOL_DOCUMENT),
-    |s: &PoolStateRepository| vec![s.directory.join(POOL_LOCK_NAME)],
+    |s: &PoolStateRepository| vec![ScopedLock::pool(s.directory.join(POOL_LOCK_NAME))],
     |_s: &PoolStateRepository| "Worker Pool".to_owned(),
     validate_pool
 );
@@ -2136,7 +2133,11 @@ repository_methods!(
     WorkerStateRepository,
     WorkerState,
     |s: &WorkerStateRepository| s.directory.join(format!("{}.json", s.worker)),
-    |s: &WorkerStateRepository| vec![s.directory.join(format!("{}.json.lock", s.worker))],
+    |s: &WorkerStateRepository| {
+        vec![ScopedLock::pool(
+            s.directory.join(format!("{}.json.lock", s.worker)),
+        )]
+    },
     |s: &WorkerStateRepository| format!("Worker {}", s.worker),
     validate_worker
 );
@@ -2144,7 +2145,7 @@ repository_methods!(
     InUseStateRepository,
     InUseState,
     |s: &InUseStateRepository| s.root.join(IN_USE_PATH),
-    |s: &InUseStateRepository| vec![s.root.join(IN_USE_LOCK)],
+    |s: &InUseStateRepository| vec![ScopedLock::repository(s.root.join(IN_USE_LOCK))],
     |_s: &InUseStateRepository| "Worker Occupancy".to_owned(),
     validate_in_use
 );
@@ -2152,7 +2153,7 @@ repository_methods!(
     SessionStateRepository,
     SessionState,
     |s: &SessionStateRepository| s.directory.join(SESSION_NAME),
-    |s: &SessionStateRepository| vec![s.directory.join(SESSION_LOCK_NAME)],
+    |s: &SessionStateRepository| vec![ScopedLock::pool(s.directory.join(SESSION_LOCK_NAME))],
     |_s: &SessionStateRepository| "Worker Sessions".to_owned(),
     validate_sessions
 );
@@ -2160,7 +2161,7 @@ repository_methods!(
     MutationRecordRepository,
     UndoState,
     |s: &MutationRecordRepository| s.root.join(UNDO_PATH),
-    |s: &MutationRecordRepository| vec![s.root.join(UNDO_LOCK)],
+    |s: &MutationRecordRepository| vec![ScopedLock::repository(s.root.join(UNDO_LOCK))],
     |_s: &MutationRecordRepository| "Undo Records".to_owned(),
     validate_undo
 );
@@ -2168,7 +2169,7 @@ repository_methods!(
     WaitingStateRepository,
     WaitingState,
     |s: &WaitingStateRepository| s.directory.join(WAITING_NAME),
-    |s: &WaitingStateRepository| vec![s.directory.join(WAITING_LOCK_NAME)],
+    |s: &WaitingStateRepository| vec![ScopedLock::pool(s.directory.join(WAITING_LOCK_NAME))],
     |_s: &WaitingStateRepository| "Waiting Tickets".to_owned(),
     validate_waiting
 );
@@ -2191,24 +2192,28 @@ impl WaitingStateRepository {
     /// Dispatch does not rewrite the record.
     pub fn replace(&self, tickets: Vec<String>) -> Result<(), StateError> {
         let subject = "Waiting Tickets";
-        with_locks(&[self.directory.join(WAITING_LOCK_NAME)], subject, || {
-            let current = match load_state(
-                &self.directory.join(WAITING_NAME),
-                subject,
-                &validate_waiting,
-            )? {
-                Loaded::Present(versioned) => versioned.value.tickets,
-                Loaded::Missing => Vec::new(),
-            };
-            if current == tickets {
-                return Ok(());
-            }
-            write_atomic(
-                &self.directory.join(WAITING_NAME),
-                &WaitingState { tickets },
-                subject,
-            )
-        })
+        with_locks(
+            &[ScopedLock::pool(self.directory.join(WAITING_LOCK_NAME))],
+            subject,
+            || {
+                let current = match load_state(
+                    &self.directory.join(WAITING_NAME),
+                    subject,
+                    &validate_waiting,
+                )? {
+                    Loaded::Present(versioned) => versioned.value.tickets,
+                    Loaded::Missing => Vec::new(),
+                };
+                if current == tickets {
+                    return Ok(());
+                }
+                write_atomic(
+                    &self.directory.join(WAITING_NAME),
+                    &WaitingState { tickets },
+                    subject,
+                )
+            },
+        )
     }
 }
 
@@ -2241,30 +2246,38 @@ impl InUseStateRepository {
     /// rewrite the marker on every refresh.
     pub fn replace(&self, workers: BTreeSet<WorkerId>) -> Result<(), StateError> {
         let subject = "Worker Occupancy";
-        with_locks(&[self.root.join(IN_USE_LOCK)], subject, || {
-            let current = match load_state(&self.root.join(IN_USE_PATH), subject, &validate_in_use)?
-            {
-                Loaded::Present(versioned) => versioned.value.workers,
-                Loaded::Missing => BTreeSet::new(),
-            };
-            if current == workers {
-                return Ok(());
-            }
-            self.write(workers, subject)
-        })
+        with_locks(
+            &[ScopedLock::repository(self.root.join(IN_USE_LOCK))],
+            subject,
+            || {
+                let current =
+                    match load_state(&self.root.join(IN_USE_PATH), subject, &validate_in_use)? {
+                        Loaded::Present(versioned) => versioned.value.workers,
+                        Loaded::Missing => BTreeSet::new(),
+                    };
+                if current == workers {
+                    return Ok(());
+                }
+                self.write(workers, subject)
+            },
+        )
     }
 
     fn update(&self, edit: impl FnOnce(&mut BTreeSet<WorkerId>)) -> Result<(), StateError> {
         let subject = "Worker Occupancy";
-        with_locks(&[self.root.join(IN_USE_LOCK)], subject, || {
-            let mut workers =
-                match load_state(&self.root.join(IN_USE_PATH), subject, &validate_in_use)? {
-                    Loaded::Present(versioned) => versioned.value.workers,
-                    Loaded::Missing => BTreeSet::new(),
-                };
-            edit(&mut workers);
-            self.write(workers, subject)
-        })
+        with_locks(
+            &[ScopedLock::repository(self.root.join(IN_USE_LOCK))],
+            subject,
+            || {
+                let mut workers =
+                    match load_state(&self.root.join(IN_USE_PATH), subject, &validate_in_use)? {
+                        Loaded::Present(versioned) => versioned.value.workers,
+                        Loaded::Missing => BTreeSet::new(),
+                    };
+                edit(&mut workers);
+                self.write(workers, subject)
+            },
+        )
     }
 
     fn write(&self, workers: BTreeSet<WorkerId>, subject: &str) -> Result<(), StateError> {
@@ -2314,24 +2327,28 @@ impl SessionStateRepository {
         edit: impl FnOnce(&mut BTreeMap<WorkerId, String>) -> bool,
     ) -> Result<(), StateError> {
         let subject = "Worker Sessions";
-        with_locks(&[self.directory.join(SESSION_LOCK_NAME)], subject, || {
-            let mut sessions = match load_state(
-                &self.directory.join(SESSION_NAME),
-                subject,
-                &validate_sessions,
-            )? {
-                Loaded::Present(versioned) => versioned.value.sessions,
-                Loaded::Missing => BTreeMap::new(),
-            };
-            if !edit(&mut sessions) {
-                return Ok(());
-            }
-            write_atomic(
-                &self.directory.join(SESSION_NAME),
-                &SessionState { sessions },
-                subject,
-            )
-        })
+        with_locks(
+            &[ScopedLock::pool(self.directory.join(SESSION_LOCK_NAME))],
+            subject,
+            || {
+                let mut sessions = match load_state(
+                    &self.directory.join(SESSION_NAME),
+                    subject,
+                    &validate_sessions,
+                )? {
+                    Loaded::Present(versioned) => versioned.value.sessions,
+                    Loaded::Missing => BTreeMap::new(),
+                };
+                if !edit(&mut sessions) {
+                    return Ok(());
+                }
+                write_atomic(
+                    &self.directory.join(SESSION_NAME),
+                    &SessionState { sessions },
+                    subject,
+                )
+            },
+        )
     }
 }
 
@@ -2345,7 +2362,7 @@ impl RunRecordRepository {
     pub fn append(&self, record: &RunRecord) -> Result<(), StateError> {
         let subject = "Run Records";
         with_locks(
-            &[self.directory.join(RUN_RECORDS_LOCK_NAME)],
+            &[ScopedLock::pool(self.directory.join(RUN_RECORDS_LOCK_NAME))],
             subject,
             || {
                 let mut line = serde_json::to_vec(record)
@@ -2452,21 +2469,25 @@ impl MutationRecordRepository {
         edit: impl FnOnce(&mut BTreeMap<String, MutationRecord>) -> bool,
     ) -> Result<(), StateError> {
         let subject = "Undo Records";
-        with_locks(&[self.root.join(UNDO_LOCK)], subject, || {
-            let mut mutations =
-                match load_state(&self.root.join(UNDO_PATH), subject, &validate_undo)? {
-                    Loaded::Present(versioned) => versioned.value.mutations,
-                    Loaded::Missing => BTreeMap::new(),
-                };
-            if !edit(&mut mutations) {
-                return Ok(());
-            }
-            write_atomic(
-                &self.root.join(UNDO_PATH),
-                &UndoState { mutations },
-                subject,
-            )
-        })
+        with_locks(
+            &[ScopedLock::repository(self.root.join(UNDO_LOCK))],
+            subject,
+            || {
+                let mut mutations =
+                    match load_state(&self.root.join(UNDO_PATH), subject, &validate_undo)? {
+                        Loaded::Present(versioned) => versioned.value.mutations,
+                        Loaded::Missing => BTreeMap::new(),
+                    };
+                if !edit(&mut mutations) {
+                    return Ok(());
+                }
+                write_atomic(
+                    &self.root.join(UNDO_PATH),
+                    &UndoState { mutations },
+                    subject,
+                )
+            },
+        )
     }
 }
 
@@ -2487,7 +2508,7 @@ impl WorkerStateRepository {
     ) -> Result<bool, StateError> {
         let path = self.directory.join(format!("{}.json", self.worker));
         let subject = format!("Worker {}", self.worker);
-        with_locks(&[sidecar(&path)], &subject, || {
+        with_locks(&[ScopedLock::pool(sidecar(&path))], &subject, || {
             let current = load_state(&path, &subject, &validate_worker)?;
             if let Some(expected) = expected
                 && !matches!(
@@ -2536,7 +2557,10 @@ impl DispatchGroupStateRepository {
         let subject = format!("Dispatch Group {}", self.parent);
         commit_state(
             &path,
-            &[self.directory.join(POOL_LOCK_NAME), sidecar(&path)],
+            &[
+                ScopedLock::pool(self.directory.join(POOL_LOCK_NAME)),
+                ScopedLock::pool(sidecar(&path)),
+            ],
             &subject,
             expected,
             change,
@@ -2568,18 +2592,22 @@ pub(crate) fn convert_legacy_layout(root: &Path) -> Result<(), StateError> {
         return Ok(());
     }
     let subject = "Worker Pool state conversion";
-    with_locks(&[root.join(MIGRATION_LOCK)], subject, || {
-        // Another process may have converted between the check above and the
-        // lock being taken.
-        if !legacy_layout_present(root) {
-            return Ok(());
-        }
-        let destination = root.join(POOLS_DIRECTORY).join(DEFAULT_POOL_NAME);
-        copy_legacy_document(root, &destination, subject)?;
-        copy_legacy_directory(root, &destination, subject)?;
-        verify_conversion(root, &destination, subject)?;
-        remove_legacy_layout(root, subject)
-    })
+    with_locks(
+        &[ScopedLock::repository(root.join(MIGRATION_LOCK))],
+        subject,
+        || {
+            // Another process may have converted between the check above and the
+            // lock being taken.
+            if !legacy_layout_present(root) {
+                return Ok(());
+            }
+            let destination = root.join(POOLS_DIRECTORY).join(DEFAULT_POOL_NAME);
+            copy_legacy_document(root, &destination, subject)?;
+            copy_legacy_directory(root, &destination, subject)?;
+            verify_conversion(root, &destination, subject)?;
+            remove_legacy_layout(root, subject)
+        },
+    )
 }
 
 /// The names of pool directories under `.jj/pools/` that `declared` does not
@@ -2898,7 +2926,7 @@ fn decode<T: for<'de> Deserialize<'de>>(
 
 fn commit_state<T: Serialize + for<'de> Deserialize<'de>>(
     path: &Path,
-    locks: &[PathBuf],
+    locks: &[ScopedLock],
     subject: &str,
     expected: Expected<T>,
     change: StateChange<T>,
@@ -2932,26 +2960,23 @@ fn commit_state<T: Serialize + for<'de> Deserialize<'de>>(
     })
 }
 
+/// Runs `operation` holding `locks` in the fixed repository-then-pool order.
+///
+/// The ordering itself lives in [`locks::lock_scoped`], which takes repository
+/// locks before pool locks however the caller lists them.
 fn with_locks<T>(
-    paths: &[PathBuf],
+    locks: &[ScopedLock],
     subject: &str,
     operation: impl FnOnce() -> Result<T, StateError>,
 ) -> Result<T, StateError> {
-    let mut paths = paths.to_vec();
-    paths.sort();
-    paths.dedup();
-    let mut files = Vec::with_capacity(paths.len());
-    for path in &paths {
-        let file = atomic::lock_exclusive(path).map_err(|error| {
-            let operation = match &error {
-                LockError::CreateDirectory(_) => "create lock directory for",
-                LockError::Open(_) => "open lock for",
-                LockError::Lock(_) => "lock",
-            };
-            StateError::new(operation, subject, error.source())
-        })?;
-        files.push(file);
-    }
+    let _held = locks::lock_scoped(locks).map_err(|error| {
+        let operation = match &error {
+            LockError::CreateDirectory(_) => "create lock directory for",
+            LockError::Open(_) => "open lock for",
+            LockError::Lock(_) => "lock",
+        };
+        StateError::new(operation, subject, error.source())
+    })?;
     operation()
 }
 

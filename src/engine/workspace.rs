@@ -10,10 +10,17 @@ use std::sync::OnceLock;
 use thiserror::Error;
 
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
+use crate::engine::locks::{self, ScopedLock};
 use crate::engine::{Expected, Loaded, Repository, StateChange, WireStatus, WorkerId, WorkerState};
 
 const CACHE_PATH: &str = ".jj/ws-cache";
 const CACHE_LOCK_PATH: &str = ".jj/ws-cache.lock";
+/// The repository-wide lock for Workspace creation, removal and colocation.
+///
+/// jj's Workspace store is repository-level, so a Workspace mutation is
+/// repository-scoped whatever pool asked for it. It is taken before any pool
+/// lock; [`locks::lock_scoped`] enforces that order.
+const REPOSITORY_LOCK_PATH: &str = ".jj/.repository.lock";
 const DEFAULT_WORKSPACE: &str = "default";
 const SETUP_HOOK_PATH: &str = ".jjfx/setup.sh";
 const TEARDOWN_HOOK_PATH: &str = ".jjfx/teardown.sh";
@@ -850,7 +857,7 @@ impl WorkerWorkspaceError {
 
 /// Exclusive ownership of one Worker's external Workspace operations.
 pub(crate) struct WorkspaceOperationGuard {
-    _lock: std::fs::File,
+    _lock: locks::LockSet,
 }
 
 /// A prepared Workspace whose operation lock remains held for Run handoff.
@@ -864,19 +871,8 @@ pub(crate) fn lock_worker_operation(
     worker: &WorkerId,
 ) -> Result<WorkspaceOperationGuard, WorkerWorkspaceError> {
     let path = repository.state_store().worker_operation_lock(worker);
-    let lock = atomic::lock_exclusive(&path).map_err(|error| match error {
-        LockError::CreateDirectory(source) => {
-            WorkerWorkspaceError::new(format!("create Worker operation lock directory: {source}"))
-        }
-        LockError::Open(source) => WorkerWorkspaceError::new(format!(
-            "open Worker operation lock {}: {source}",
-            path.display()
-        )),
-        LockError::Lock(source) => WorkerWorkspaceError::new(format!(
-            "lock Worker operation sidecar {}: {source}",
-            path.display()
-        )),
-    })?;
+    let lock = locks::lock_scoped(&[ScopedLock::pool(path)])
+        .map_err(|error| lock_error(error, "Worker operation"))?;
     Ok(WorkspaceOperationGuard { _lock: lock })
 }
 
@@ -1421,26 +1417,28 @@ fn add_workspace_with_revision(
     revision: Option<&str>,
     colocate: bool,
 ) -> Result<(), WorkerWorkspaceError> {
-    let mut command = crate::jj::command();
-    command.args(["workspace", "add", "--name", name]);
-    if let Some(flag) = colocation_flag(root, colocate)? {
-        command.arg(flag);
-    }
-    if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
-        command.args(["--revision", revision]);
-    }
-    let output = command
-        .arg(path)
-        .current_dir(root)
-        .output()
-        .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace add: {error}")))?;
-    if !output.status.success() {
-        return Err(WorkerWorkspaceError::new(format!(
-            "run jj workspace add: {}",
-            command_error(&output)
-        )));
-    }
-    Ok(())
+    with_repository_lock(root, || {
+        let mut command = crate::jj::command();
+        command.args(["workspace", "add", "--name", name]);
+        if let Some(flag) = colocation_flag(root, colocate)? {
+            command.arg(flag);
+        }
+        if let Some(revision) = revision.filter(|revision| !revision.is_empty()) {
+            command.args(["--revision", revision]);
+        }
+        let output = command
+            .arg(path)
+            .current_dir(root)
+            .output()
+            .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace add: {error}")))?;
+        if !output.status.success() {
+            return Err(WorkerWorkspaceError::new(format!(
+                "run jj workspace add: {}",
+                command_error(&output)
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Forget one Workspace through jj. When the Workspace is colocated, jj removes
@@ -1448,18 +1446,22 @@ fn add_workspace_with_revision(
 /// separate Git step. (`jj workspace remove` is deliberately not used: it
 /// snapshots the working copy into a commit first, which is wrong for a delete.)
 fn forget_workspace(root: &Path, name: &str) -> Result<(), WorkerWorkspaceError> {
-    let output = crate::jj::command()
-        .args(["workspace", "forget", name])
-        .current_dir(root)
-        .output()
-        .map_err(|error| WorkerWorkspaceError::new(format!("run jj workspace forget: {error}")))?;
-    if !output.status.success() {
-        return Err(WorkerWorkspaceError::new(format!(
-            "run jj workspace forget: {}",
-            command_error(&output)
-        )));
-    }
-    Ok(())
+    with_repository_lock(root, || {
+        let output = crate::jj::command()
+            .args(["workspace", "forget", name])
+            .current_dir(root)
+            .output()
+            .map_err(|error| {
+                WorkerWorkspaceError::new(format!("run jj workspace forget: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(WorkerWorkspaceError::new(format!(
+                "run jj workspace forget: {}",
+                command_error(&output)
+            )));
+        }
+        Ok(())
+    })
 }
 
 /// Read the repository's git remotes.
@@ -1693,21 +1695,43 @@ fn cache_path(root: &Path) -> PathBuf {
     root.join(CACHE_PATH)
 }
 
+/// Runs `operation` holding the repository-wide lock for Workspace mutation.
+///
+/// jj's Workspace store is repository-level, so creation, removal and colocation
+/// are repository-scoped and take this lock. It is the outermost lock: an
+/// operation that also needs a Worker Pool's state hands both to
+/// [`locks::lock_scoped`], which fixes repository-before-pool.
+fn with_repository_lock<T>(
+    root: &Path,
+    operation: impl FnOnce() -> Result<T, WorkerWorkspaceError>,
+) -> Result<T, WorkerWorkspaceError> {
+    let lock = ScopedLock::repository(root.join(REPOSITORY_LOCK_PATH));
+    let _held = locks::lock_scoped(std::slice::from_ref(&lock))
+        .map_err(|error| lock_error(error, "repository"))?;
+    operation()
+}
+
 fn with_cache_lock<T>(
     root: &Path,
     operation: impl FnOnce() -> Result<T, WorkerWorkspaceError>,
 ) -> Result<T, WorkerWorkspaceError> {
-    let path = root.join(CACHE_LOCK_PATH);
-    let _lock = atomic::lock_exclusive(&path).map_err(|error| match error {
+    let lock = ScopedLock::repository(root.join(CACHE_LOCK_PATH));
+    let _held = locks::lock_scoped(std::slice::from_ref(&lock))
+        .map_err(|error| lock_error(error, "ws-cache"))?;
+    operation()
+}
+
+/// Phrases a lock failure for `label`'s lock.
+fn lock_error(error: LockError, label: &str) -> WorkerWorkspaceError {
+    match error {
         LockError::CreateDirectory(source) => {
-            WorkerWorkspaceError::new(format!("create ws-cache lock directory: {source}"))
+            WorkerWorkspaceError::new(format!("create {label} lock directory: {source}"))
         }
         LockError::Open(source) => {
-            WorkerWorkspaceError::new(format!("open ws-cache lock: {source}"))
+            WorkerWorkspaceError::new(format!("open {label} lock: {source}"))
         }
-        LockError::Lock(source) => WorkerWorkspaceError::new(format!("lock ws-cache: {source}")),
-    })?;
-    operation()
+        LockError::Lock(source) => WorkerWorkspaceError::new(format!("lock {label}: {source}")),
+    }
 }
 
 fn read_cache(path: &Path) -> Result<Vec<(String, PathBuf)>, WorkerWorkspaceError> {

@@ -1,7 +1,7 @@
 # Locks: per-pool inside a repository-wide lock
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02
 
 ## Problem
@@ -23,11 +23,11 @@ Today there is one pool and one set of locks, so lock *scope* has never had to b
 
 ## Acceptance Criteria
 
-- [ ] Each pool's state is guarded by locks inside its own directory.
-- [ ] Repository-scoped operations take the repository-wide lock.
-- [ ] The acquisition order is repository-then-pool everywhere, with a test that would catch the reverse.
-- [ ] Two pools provisioning Workspaces concurrently neither deadlock nor corrupt each other's state.
-- [ ] `mise run check` is green.
+- [x] Each pool's state is guarded by locks inside its own directory.
+- [x] Repository-scoped operations take the repository-wide lock.
+- [x] The acquisition order is repository-then-pool everywhere, with a test that would catch the reverse.
+- [x] Two pools provisioning Workspaces concurrently neither deadlock nor corrupt each other's state.
+- [x] `mise run check` is green.
 
 ## References
 

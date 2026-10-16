@@ -20,6 +20,7 @@ mod foreground;
 mod governor;
 mod layout;
 mod local_tickets;
+mod locks;
 mod opencode_api;
 mod orchestration;
 mod pool;
