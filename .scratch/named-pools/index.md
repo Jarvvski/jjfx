@@ -28,6 +28,7 @@ The implementation backlog for **running several named Worker Pools in one Repos
 | 12 | A repository-local `[tickets]` source selection | 01 |
 | 13 | A declared pool's state is never materialised | - |
 | 14 | The per-pool `ready_status` is declared but unused | 07 |
+| 15 | `pool resize --pool <name>` does not resize a materialised pool | - |
 
 ## Suggested order
 
@@ -37,7 +38,7 @@ The implementation backlog for **running several named Worker Pools in one Repos
 
 **12 is a follow-on, not a prerequisite.** Nothing here needs it; it exists because ADR 0014's capability rule makes it possible, and it is the wall the `todo-md` test-drive hit.
 
-**13 and 14 were filed while implementing the rest**, and both are gaps the effort left rather than new scope. **13 is the last mile**: nothing materialises a declared pool's state, so a named lane can be declared and never used - every other ticket is plumbing until it lands. 14 is the smaller half of the same honesty rule: a configuration key that parses and does nothing.
+**13, 14 and 15 were filed while implementing the rest**, and all three are gaps the effort left rather than new scope. **13 was the last mile**: nothing materialised a declared pool's state, so a named lane could be declared and never used - every other ticket was plumbing until it landed. 14 and 15 are the same failure in miniature, and they are a pair worth reading together: **a declaration that does not reach the thing it describes.** 14 is a configuration key that parses and does nothing; 15 is a size edit that looks like it worked and changes nothing once the lane exists. Three instances of one shape is a signal about how these tickets were written, not three coincidences.
 
 ## Out of scope
 
