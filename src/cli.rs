@@ -1459,7 +1459,7 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     report_writeback_failures(&failures);
     let pool = snapshot
         .pool()
-        .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
+        .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool <N>"))?;
     // The watchdog's window is jjfx's own setting, read here rather than passed
     // down: `pool list` is the only CLI command that surfaces Run health, and
     // `cli::run` is already at the argument limit.
@@ -4067,6 +4067,23 @@ mod tests {
             "{prose}"
         );
         assert!(prose.contains("orchestrate-ENG-100.log"), "{prose}");
+    }
+
+    /// The other half of the help drift check: every spelling `jjfx help`
+    /// answers for must be one the parser accepts. The probe is the bare word,
+    /// which a command that needs arguments answers with its usage - only an
+    /// unknown word says `Unknown command`.
+    #[test]
+    fn the_parser_accepts_every_documented_alias() {
+        for (alias, _) in crate::cli_help::ALIASES {
+            let arguments = args(&alias.split(' ').collect::<Vec<_>>());
+            if let Err(error) = parse(&arguments) {
+                assert!(
+                    !error.to_string().contains("Unknown command"),
+                    "`{alias}` is documented but the parser rejects it: {error}"
+                );
+            }
+        }
     }
 
     #[test]
