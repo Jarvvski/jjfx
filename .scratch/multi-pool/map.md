@@ -15,10 +15,13 @@ A locked design for running **several Worker Pools in one Repository** — each 
 - **Standing preference — additive, not a redesign.** `jjfx pool <N>` should keep working, and `status --json` should keep its flat `workers[]` gaining a `pool` field rather than nesting. That JSON shape changed *hours* before this effort began; breaking it again would be the worst kind of churn. See the additive-or-redesign ticket.
 - **Skills**: `/grilling` and `/domain-modeling` for the decision tickets. Vocabulary lands in `CONTEXT.md` as it is settled; a decision that is hard to reverse, surprising to a future reader, and a genuine trade-off earns an ADR.
 - **Provenance**: the idea came from the owner while reviewing the `todo-md` test-drive, and the sharpest fork (where pools are declared) is the same wall that test-drive hit wanting `[tickets] source = "local"` per repository.
+- **`wsg` is dead (owner ruling, 2026-10-16).** The Go project was archived 2026-08-19, the Rust compatibility binary has been removed, and the cutover evidence was waived. The compatibility promise in `.scratch/wsg-migration/PRD.md` no longer constrains the persisted state — **do not treat it as a contract**, and do not let it narrow a layout option. See [the research ticket's asset](assets/01-wsg-compat-contract.md).
 
 ## Decisions so far
 
 <!-- the index — one line per closed ticket: enough to judge relevance, then zoom the link for the detail the ticket holds -->
+
+- [Is the persisted Pool state a `wsg` compatibility contract?](issues/01-is-pool-state-a-wsg-contract.md) — **Ours.** The Go project is archived, the Rust compatibility binary is removed, and the cutover evidence was waived, so the persisted state is jjfx's to reshape. Two things carry forward: additive fields were *always* allowed, and the dead contract's residue (fixtures, ADR 0011's constraint, three sidecar documents) is still live — retired separately by *Retire the dead `wsg` compatibility residue*.
 
 ## Not yet specified
 
