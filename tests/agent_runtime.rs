@@ -1198,14 +1198,18 @@ fn foreground_run_reads_the_terminal_and_returns_it() {
     let bin_directory = temporary_directory.path().join("bin");
     let workspace = temporary_directory.path().join("workspace");
     let log = temporary_directory.path().join("worker.log");
+    let process = temporary_directory.path().join("process");
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     fs::create_dir(&workspace).expect("Worker Workspace");
     // The Agent reads the terminal. While the Run sat in a background process
     // group that read stopped on SIGTTIN, so the Run never finished. It exits
-    // non-zero so the wrapper's exit-code passthrough is covered too.
+    // non-zero so the wrapper's exit-code passthrough is covered too. It records
+    // its process group before it blocks, so a test that unwinds before the Run
+    // ends still reaps the group: the read blocks on a terminal the drain thread
+    // keeps open, so the Agent would otherwise never return.
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf 'agent-ready\\n'\nread line\nprintf 'agent-read:%s\\n' \"$line\"\nexit 7\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$(ps -o pgid= -p $$ | tr -d ' ')\" \"$$\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf 'agent-ready\\n'\nread line\nprintf 'agent-read:%s\\n' \"$line\"\nexit 7\n",
     );
 
     let pty = open_pty();
@@ -1221,6 +1225,7 @@ fn foreground_run_reads_the_terminal_and_returns_it() {
         .env("PATH", runtime_path(&bin_directory))
         .env(HELPER_WORKSPACE, &workspace)
         .env(HELPER_LOG, &log)
+        .env(HELPER_PROCESS, &process)
         .env(HELPER_PTY_SLAVE, &pty.slave_path)
         // The supervisor re-invokes its own executable as the wrapper; this test
         // binary is not that executable, so point it at the real one.
@@ -1231,7 +1236,7 @@ fn foreground_run_reads_the_terminal_and_returns_it() {
         .stdin(Stdio::from(slave.try_clone().expect("PTY slave stdin")))
         .stdout(Stdio::from(slave.try_clone().expect("PTY slave stdout")))
         .stderr(Stdio::from(slave));
-    let mut child = helper.spawn().expect("foreground helper");
+    let helper = HelperGuard::spawn(&mut helper, None, &[&process]);
     let mut terminal = PtyOutput::drain(&pty.master);
 
     // The Run owns its own process group, yet the Agent still reads the terminal.
@@ -1253,9 +1258,9 @@ fn foreground_run_reads_the_terminal_and_returns_it() {
     rustix::io::write(&pty.master, b"input-after\n").expect("write after the Run");
     terminal.wait_for("after-read:input-after");
 
-    let status = child.wait().expect("foreground helper");
+    let output = helper.wait_with_output();
     assert!(
-        status.success(),
+        output.status.success(),
         "foreground helper failed: {}",
         terminal.buffer()
     );
@@ -3812,23 +3817,31 @@ fn reset_run_does_not_signal_a_group_whose_recorded_leader_is_gone() {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let repository = initialize_repository(temporary_directory.path());
     let worker_id = grow_one_worker(&repository);
+    let leader_path = temporary_directory.path().join("orphan-leader");
     let descendant_path = temporary_directory.path().join("orphan-descendant");
 
     // A leader that spawns a TERM-ignoring descendant and exits, leaving the
-    // descendant as the only member of the recorded process group.
-    let mut leader = Command::new("sh")
+    // descendant as the only member of the recorded process group. The guard
+    // owns the group the leader leaves behind: an assertion that unwinds before
+    // the test's own cleanup would otherwise strand a `sh` that ignores TERM and
+    // loops forever.
+    let mut command = Command::new("sh");
+    command
         .arg("-c")
-        .arg("( trap '' TERM; while :; do sleep 0.05; done ) & echo $! > \"$1\"; exit 0")
+        .arg(
+            "( trap '' TERM; while :; do sleep 0.05; done ) & echo $! > \"$1\"; echo $$ > \"$2\"; exit 0",
+        )
         .arg("sh")
         .arg(&descendant_path)
+        .arg(&leader_path)
         .process_group(0)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("group leader helper");
-    let leader_pid = leader.id();
-    leader.wait().expect("group leader should exit");
+        .stderr(Stdio::null());
+    let mut leader = HelperGuard::spawn(&mut command, None, &[&leader_path]);
+    leader.reap();
+    wait_for_file_content(&leader_path);
+    let leader_pid = read_pid(&leader_path);
     wait_for_file_content(&descendant_path);
     let descendant_pid = read_pid(&descendant_path);
     assert!(
@@ -3848,10 +3861,6 @@ fn reset_run_does_not_signal_a_group_whose_recorded_leader_is_gone() {
         .reset_run(&repository, &worker_id)
         .expect("Reset should abandon the Run");
     let descendant_alive = test_kill_process(unix_pid(descendant_pid)).is_ok();
-    if descendant_alive {
-        let _ = kill_process_group(unix_pid(leader_pid), Signal::KILL);
-        let _ = kill_process(unix_pid(descendant_pid), Signal::KILL);
-    }
 
     assert!(
         matches!(
