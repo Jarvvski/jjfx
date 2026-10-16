@@ -86,12 +86,15 @@ const HELPER_REAP_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Waiting for the helper through [`HelperGuard::wait_with_output`] disarms the
 /// guard, so a test that has observed the product clean up can still assert on
-/// it: cleanup then belongs to the test, not the guard.
+/// it: cleanup then belongs to the test, not the guard. [`HelperGuard::reap`]
+/// reaps a helper that exits on its own while keeping the guard armed for the
+/// process group it left behind.
 #[must_use = "the guard reaps its helper only while it is alive"]
 pub struct HelperGuard {
     child: Option<Child>,
     release: Option<PathBuf>,
     process_groups: Vec<PathBuf>,
+    disarmed: bool,
 }
 
 impl HelperGuard {
@@ -109,6 +112,7 @@ impl HelperGuard {
                 .iter()
                 .map(|path| (*path).to_owned())
                 .collect(),
+            disarmed: false,
         }
     }
 
@@ -124,11 +128,26 @@ impl HelperGuard {
 
     /// Waits for the helper and disarms the guard.
     pub fn wait_with_output(mut self) -> Output {
+        self.disarmed = true;
         self.child
             .take()
             .expect("helper process")
             .wait_with_output()
             .expect("helper output")
+    }
+
+    /// Reaps the helper without disarming the guard.
+    ///
+    /// For a helper that exits on its own but leaves a process group behind: a
+    /// recorded leader that spawned a descendant and then exited. The group
+    /// must still be killed if the test later unwinds, so unlike
+    /// [`HelperGuard::wait_with_output`] this leaves cleanup with the guard. The
+    /// child handle is dropped once reaped, so Drop never signals a PID the
+    /// kernel has already released.
+    pub fn reap(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.wait();
+        }
     }
 
     /// The process group an Agent Runtime the helper started leads, if it can be
@@ -158,17 +177,19 @@ impl Drop for HelperGuard {
     fn drop(&mut self) {
         // A consumed guard has already reaped its helper and handed cleanup back
         // to the test, so there is nothing left to own.
-        let Some(mut child) = self.child.take() else {
+        if self.disarmed {
             return;
-        };
+        }
         if let Some(release) = &self.release {
             let _ = fs::write(release, []);
         }
         if let Some(pid) = self.recorded_process_group() {
             let _ = kill_process_group(pid, Signal::KILL);
         }
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 }
 
