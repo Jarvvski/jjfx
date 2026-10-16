@@ -131,7 +131,7 @@ fn send_waits_for_the_workspace_operation_lock() {
     // Hold the same sidecar lock `lock_worker_operation` uses, across processes.
     let lock_path = repository
         .root()
-        .join(format!(".jj/pool/{worker}.workspace.lock"));
+        .join(format!(".jj/pools/default/{worker}.workspace.lock"));
     fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock directory");
     let lock_file = OpenOptions::new()
         .create(true)
@@ -202,7 +202,7 @@ fn rebase_waits_for_the_workspace_operation_lock() {
     // Hold the same sidecar lock `lock_worker_operation` uses, across processes.
     let lock_path = repository
         .root()
-        .join(format!(".jj/pool/{worker}.workspace.lock"));
+        .join(format!(".jj/pools/default/{worker}.workspace.lock"));
     fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock directory");
     let lock_file = OpenOptions::new()
         .create(true)
@@ -1163,7 +1163,7 @@ fn send_resumes_the_prior_claude_session_and_reports_it() {
     let worker = grow_one_worker(&repository);
     let prior_log = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{worker}.log"));
     fs::write(
         &prior_log,

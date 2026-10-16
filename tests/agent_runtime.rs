@@ -730,7 +730,7 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
     fs::create_dir(
         temporary_directory
             .path()
-            .join(".jj/pool")
+            .join(".jj/pools/default")
             .join(format!("{worker_id}.json")),
     )
     .expect("replace Worker state with a directory");
@@ -863,7 +863,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
     assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
     let worker_state_path = temporary_directory
         .path()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{worker_id}.json"));
     let fifo_status = Command::new("mkfifo")
         .arg(&worker_state_path)
@@ -1631,7 +1631,9 @@ fn opencode_session_fixture() -> OpencodeSessionFixture {
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
     // Configure the Pool for opencode so the Reservation selects it.
-    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let pool_path = temporary_directory
+        .path()
+        .join(".jj/pools/default/pool.json");
     let mut pool: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     pool["agent"] = "opencode".into();
@@ -1999,7 +2001,7 @@ impl OpencodeControlFixture {
     /// Writes a busy Run for this Worker, so a stop or a reconciliation has
     /// something to act on.
     fn write_busy_worker(&self, agent: &str, pid: u32, ticket: &str) {
-        self.write_busy_worker_with_log(agent, pid, ticket, "/repo/.jj/pool/worker.log");
+        self.write_busy_worker_with_log(agent, pid, ticket, "/repo/.jj/pools/default/worker.log");
     }
 
     /// The same, with the Run log pointed somewhere a test can populate.
@@ -2458,7 +2460,9 @@ fn opencode_send_fixture() -> OpencodeSendFixture {
     let repository = initialize_repository(temporary_directory.path());
     let worker_id = grow_one_worker(&repository);
     // Configure the Pool for opencode so the Follow-up selects it.
-    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let pool_path = temporary_directory
+        .path()
+        .join(".jj/pools/default/pool.json");
     let mut pool: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     pool["agent"] = "opencode".into();
@@ -2629,7 +2633,7 @@ fn opencode_send_clears_a_stale_run_log_result() {
     let log = fixture
         .repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{}.log", fixture.worker_id));
     fs::create_dir_all(log.parent().expect("pool directory")).expect("pool directory");
     fs::write(
@@ -3251,7 +3255,7 @@ fn reset_run_clears_a_terminal_run_and_preserves_unknown_fields_and_aliases() {
             "pid": dead_pid(),
             "started_at": "2026-07-30T10:00:00Z",
             "completed_at": "2026-07-30T10:05:00Z",
-            "log_file": "/repo/.jj/pool/worker.log",
+            "log_file": "/repo/.jj/pools/default/worker.log",
             "branch_name": "eng-219",
             "exit_code": 1,
             "error": "tests failed",
@@ -3325,7 +3329,7 @@ fn reset_run_clears_a_busy_run_whose_process_group_is_already_gone() {
             "pid": dead_pid(),
             "started_at": "2026-07-30T10:00:00Z",
             "completed_at": Value::Null,
-            "log_file": "/repo/.jj/pool/worker.log",
+            "log_file": "/repo/.jj/pools/default/worker.log",
             "branch_name": "eng-220",
             "exit_code": Value::Null,
             "error": Value::Null
@@ -4336,7 +4340,7 @@ fn busy_run_state(pid: u32, ticket: &str) -> Value {
         "pid": pid,
         "started_at": "2026-07-30T10:00:00Z",
         "completed_at": Value::Null,
-        "log_file": "/repo/.jj/pool/worker.log",
+        "log_file": "/repo/.jj/pools/default/worker.log",
         "branch_name": ticket.to_lowercase(),
         "exit_code": Value::Null,
         "error": Value::Null
@@ -4413,7 +4417,8 @@ fn grow_one_worker(repository: &Repository) -> WorkerId {
 }
 
 fn worker_state_path(root: &std::path::Path, worker: &WorkerId) -> PathBuf {
-    root.join(".jj/pool").join(format!("{worker}.json"))
+    root.join(".jj/pools/default")
+        .join(format!("{worker}.json"))
 }
 
 fn write_worker_json(path: &std::path::Path, state: Value) {

@@ -429,10 +429,10 @@ mod tests {
     /// A one-Worker Pool snapshot, optionally recorded as open in a terminal.
     fn snapshot(occupied: bool) -> WorkerPoolSnapshot {
         let temp = tempfile::tempdir().expect("temp repository");
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).expect("pool directory");
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
         )
         .expect("pool state");
@@ -456,10 +456,10 @@ mod tests {
     /// `started_at`, optionally with a Run log at `log_file`.
     fn snapshot_busy(started_at: &str, log_file: Option<&std::path::Path>) -> WorkerPoolSnapshot {
         let temp = tempfile::tempdir().expect("temp repository");
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).expect("pool directory");
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
         )
         .expect("pool state");
@@ -566,10 +566,10 @@ mod tests {
     /// A one-Worker Pool snapshot whose Worker has one recorded Run.
     fn snapshot_with_recorded_cost() -> WorkerPoolSnapshot {
         let temp = tempfile::tempdir().expect("temp repository");
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).expect("pool directory");
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
         )
         .expect("pool state");

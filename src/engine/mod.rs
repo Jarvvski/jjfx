@@ -89,13 +89,14 @@ pub use runtime::{
     RunRequest, RunReset, RunSupervisor, RunSupervisorError,
 };
 pub use state::{
-    CommitOutcome, DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository,
-    Expected, IdentifierError, InUseState, InUseStateRepository, Loaded, MutationKind,
-    MutationRecord, MutationRecordRepository, PoolState, PoolStateRepository,
-    REPOSITORY_WIDE_MUTATION, RunRecord, RunRecordConclusion, RunRecordRepository, RunRecordUsage,
-    SessionState, SessionStateRepository, StateChange, StateError, StateRevision, StateStore,
-    SubIssueState, TicketId, UndoState, Versioned, WaitingState, WaitingStateRepository, WireAgent,
-    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
+    CommitOutcome, DEFAULT_POOL_NAME, DispatchGroupOptions, DispatchGroupState,
+    DispatchGroupStateRepository, Expected, IdentifierError, InUseState, InUseStateRepository,
+    Loaded, MutationKind, MutationRecord, MutationRecordRepository, PoolName, PoolState,
+    PoolStateRepository, REPOSITORY_WIDE_MUTATION, RunRecord, RunRecordConclusion,
+    RunRecordRepository, RunRecordUsage, SessionState, SessionStateRepository, StateChange,
+    StateError, StateRevision, StateStore, SubIssueState, TicketId, UndoState, Versioned,
+    WaitingState, WaitingStateRepository, WireAgent, WireStatus, WireTimestamp, WorkerId,
+    WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DependencyGraph, DiscoveredSubIssue, DiscoveryDiagnostic,
@@ -167,6 +168,16 @@ impl Repository {
                 let root = default_workspace_root(&directory).map_err(|source| {
                     RepositoryError::PathResolution {
                         path: start.clone(),
+                        source,
+                    }
+                })?;
+                // A Repository that still holds its single-pool layout converts
+                // here, before any pool lock can be taken: the conversion takes a
+                // repository-wide lock, and taking it inside a pool lock would
+                // invert the fixed repository-outermost ordering.
+                state::convert_legacy_layout(&root).map_err(|source| {
+                    RepositoryError::StateConversion {
+                        path: root.clone(),
                         source,
                     }
                 })?;
@@ -335,5 +346,15 @@ pub enum RepositoryError {
     NotFound {
         /// The path supplied to [`Repository::open`].
         start: PathBuf,
+    },
+    /// The single-pool legacy layout could not be converted to the per-pool
+    /// layout. The legacy layout is left untouched.
+    #[error("cannot convert the Worker Pool state layout under {path}")]
+    StateConversion {
+        /// The repository root whose layout could not be converted.
+        path: PathBuf,
+        /// The conversion failure.
+        #[source]
+        source: StateError,
     },
 }

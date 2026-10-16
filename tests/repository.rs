@@ -669,7 +669,7 @@ fn worker_setup_failure_rolls_back_the_worker_and_runs_teardown() {
     assert!(error.to_string().contains("setup.sh"), "{error}");
     assert!(!workspace_names(root).contains(&worker_id.to_owned()));
     assert!(!worker_path.exists());
-    assert!(!root.join(".jj/pool/worker-01.json").exists());
+    assert!(!root.join(".jj/pools/default/worker-01.json").exists());
     if let Ok(cache) = fs::read_to_string(root.join(".jj/ws-cache")) {
         assert!(!cache.lines().any(|line| line.starts_with("worker-01\\t")));
     }
@@ -882,7 +882,12 @@ fn provisioning_rejects_a_claimed_worker_without_touching_it() {
     );
     assert!(existing.is_dir());
     assert!(!workspace_names(repository.root()).contains(&"worker-01".to_owned()));
-    assert!(!repository.root().join(".jj/pool/worker-01.json").exists());
+    assert!(
+        !repository
+            .root()
+            .join(".jj/pools/default/worker-01.json")
+            .exists()
+    );
 }
 
 #[test]
@@ -895,7 +900,7 @@ fn provisioning_compensates_when_cache_projection_fails() {
     // then let the setup hook take write permission off `.jj` so the cache's
     // temporary file cannot be created. The teardown hook restores it so
     // compensation can finish.
-    fs::create_dir_all(root.join(".jj/pool")).expect("pool directory should be created");
+    fs::create_dir_all(root.join(".jj/pools/default")).expect("pool directory should be created");
     fs::write(root.join(".jj/ws-cache.lock"), "").expect("cache lock sidecar should be created");
     let jj = root.join(".jj");
     install_lifecycle_hooks_with_scripts(
@@ -912,6 +917,11 @@ fn provisioning_compensates_when_cache_projection_fails() {
     assert!(error.to_string().contains("write ws-cache temporary file"));
     assert!(!workspace_names(repository.root()).contains(&"worker-01".to_owned()));
     assert!(!default_worker_path(repository.root(), "worker-01").exists());
-    assert!(!repository.root().join(".jj/pool/worker-01.json").exists());
+    assert!(
+        !repository
+            .root()
+            .join(".jj/pools/default/worker-01.json")
+            .exists()
+    );
     assert!(!repository.root().join(".jj/ws-cache").exists());
 }

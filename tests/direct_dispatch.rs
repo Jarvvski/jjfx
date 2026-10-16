@@ -442,7 +442,7 @@ fn production_direct_dispatch_helper() {
     };
     let state_path = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{}.json", background.worker()));
     fs::copy(
         state_path,
@@ -792,7 +792,7 @@ fn direct_dispatch_prepares_the_worker_workspace_on_main_under_an_operation_lock
     assert!(
         repository
             .root()
-            .join(".jj/pool")
+            .join(".jj/pools/default")
             .join(format!("{worker}.workspace.lock"))
             .is_file()
     );

@@ -863,10 +863,7 @@ pub(crate) fn lock_worker_operation(
     repository: &Repository,
     worker: &WorkerId,
 ) -> Result<WorkspaceOperationGuard, WorkerWorkspaceError> {
-    let path = repository
-        .root()
-        .join(".jj/pool")
-        .join(format!("{worker}.workspace.lock"));
+    let path = repository.state_store().worker_operation_lock(worker);
     let lock = atomic::lock_exclusive(&path).map_err(|error| match error {
         LockError::CreateDirectory(source) => {
             WorkerWorkspaceError::new(format!("create Worker operation lock directory: {source}"))

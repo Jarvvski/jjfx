@@ -86,8 +86,9 @@ Only the `Status:` line and the appended comment are written, so the rest of the
 file is preserved byte for byte. Both steps are idempotent: a repeated reconcile
 never appends the comment twice.
 
-The completion signal is the durable Run Record store (`.jj/pool/runs.jsonl`), not
-live Worker state: a Run appends its record when it finalizes, and the record
+The completion signal is the durable Run Record store
+(`.jj/pools/<name>/runs.jsonl`), not live Worker state: a Run appends its record
+when it finalizes, and the record
 names the Ticket, so a finished Run still resolves its Ticket after `pool reset`
 cleared the Worker's Ticket association. Reconciliation runs before Dispatch
 discovers ready work (so a resolved blocker readies its dependent in the same

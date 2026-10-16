@@ -334,7 +334,9 @@ fn competing_parent_runner_returns_already_running_without_waiting() {
     fs::create_dir(directory.path().join(".jj")).expect("repository marker");
     let repository = Repository::open(directory.path()).expect("open repository");
     let parent = TicketId::parse("ENG-100").expect("Parent Ticket");
-    let lock_path = directory.path().join(".jj/pool/orchestrate-eng-100.lock");
+    let lock_path = directory
+        .path()
+        .join(".jj/pools/default/orchestrate-eng-100.lock");
     fs::create_dir_all(lock_path.parent().expect("lock parent")).expect("lock directory");
     let lock_file = OpenOptions::new()
         .create(true)

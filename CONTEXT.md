@@ -176,8 +176,8 @@ _Avoid_: outcome
 **Run record**:
 The durable, append-only record of one finalized Run - its identity, Worker,
 workspace and change, runtime and model, cost, usage, duration, turns, and
-conclusion - kept in `.jj/pool/runs.jsonl`. The Run result is the in-memory
-completion the record is built from.
+conclusion - kept in `.jj/pools/<name>/runs.jsonl`, the pool's own state
+directory. The Run result is the in-memory completion the record is built from.
 _Avoid_: run log
 
 **Agent Runtime**:

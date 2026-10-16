@@ -1161,10 +1161,7 @@ impl OrchestrationRunner {
     }
 
     fn acquire_lock(&self, parent: &TicketId) -> Result<File, OrchestrationError> {
-        let path = self.repository.root().join(".jj/pool").join(format!(
-            "orchestrate-{}.lock",
-            parent.as_str().to_ascii_lowercase()
-        ));
+        let path = self.repository.state_store().orchestration_lock(parent);
         match atomic::try_lock_exclusive(&path) {
             Ok(LockOutcome::Acquired(file)) => Ok(file),
             Ok(LockOutcome::Busy) => Err(OrchestrationError::AlreadyRunning {
