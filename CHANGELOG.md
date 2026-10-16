@@ -39,6 +39,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Fixed
 
 - The `jjfx-dispatch` skill is corrected for 0.55.0 and made deterministic to drive: it reads terminal state from `jjfx status --json` (status, stuck, exit_code, error) rather than prose, documents both ticket sources (`[tickets] source = "linear" | "local"`), and covers `hooks install`, `--fg`/`--bg`, `absorb`, `resolve`, `undo`, and the repository build check that `open-pr` runs before pushing.
+- The jjfx-dispatch skill stops transcribing the CLI's flag surface: it points agents at `jjfx help <command>` for a command's flags and reads what a Dispatch did from `jjfx dispatch --json` (one object per Ticket, including the ones it did not dispatch), so a flag or outcome the CLI changes cannot leave the skill teaching a stale one.
 
 ## [0.55.0] - 2026-10-16
 

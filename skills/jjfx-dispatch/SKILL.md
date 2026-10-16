@@ -7,7 +7,9 @@ description: Dispatch work to background agents with jjfx. Use when the user wan
 
 jjfx runs background agents as **Workers**. A Worker is one reusable slot backed by its own jj workspace (a colocated Git worktree) running a single coding agent — Claude, Codex, or opencode. A **Ticket** is the unit of work, and **Dispatch** assigns tickets to idle Workers. You drive all of it from the `jjfx` CLI (the `wsg` binary exposes the same commands).
 
-Every step ends on a checkable condition, and every condition is read from `jjfx status --json` rather than from prose output — so the same command decides the same way on every run.
+`jjfx help <command>` is the command surface: it prints a command's usage, arguments and flags, derived from the same definitions the parser validates against, so the two cannot drift. Take the flag surface from there — `jjfx help dispatch`, `jjfx help pool list`, `jjfx help send` — rather than transcribing it here. This skill carries the judgement a help page cannot: when to dispatch, what a flag *means* for how you drive the pool, and how to read the state back.
+
+Every step ends on a checkable condition, and every condition is read from a command's `--json` output rather than from its prose — so the same command decides the same way on every run.
 
 ## Before dispatching
 
@@ -50,21 +52,13 @@ The source is `[tickets] source` in jjfx's user config, `${XDG_CONFIG_HOME:-~/.c
 ### 3. Dispatch
 
 ```bash
-jjfx dispatch AMBA-42 AMBA-43
-jjfx dispatch --all
+jjfx dispatch --json AMBA-42 AMBA-43
+jjfx dispatch --json --all
 ```
 
-Dispatch runs **in the background** by default; `--fg` waits for each Worker's agent runtime before returning.
+Dispatch runs **in the background** by default, and `jjfx help dispatch` lists every flag. The one flag whose meaning a help page cannot carry is `--force`, in the open-Workspace rule below.
 
-| Flag | Effect |
-| --- | --- |
-| `--all` | Dispatch every discovered ready ticket |
-| `--label <label>` | Label used for Linear discovery (default `ready-for-agent`) |
-| `--provider P` / `--model M` | Override the pool profile for this dispatch |
-| `--budget <usd>` | Cap spend for this dispatch (Claude only) |
-| `--no-orchestrate` | Dispatch each ticket directly, skipping Parent orchestration |
-| `--force` | Dispatch even to a Worker whose Workspace is open (see below) |
-| `--fg` / `--bg` | Wait for the Run, or return once its pid is persisted (the default) |
+Read what a Dispatch did from its `--json`: one object per Ticket in the order you gave them, **including the Tickets it did not dispatch**. `outcome` is `dispatched`, `failed`, `waiting` or `orchestrating`; `worker` names the Worker that took it (null when none did); `phase`, `pid` and `detail` carry the failure phase, the background process id, and the prose detail. The objects go to stdout and the human prose to stderr, so `jjfx dispatch --json | jq` reads a batch result without parsing sentences.
 
 **jjfx will not dispatch into a Workspace you have open in a terminal.** A Worker whose tab is open is not idle capacity, so jjfx skips it (implicit selection) or refuses it (an explicit Worker). When jjfx cannot see the terminal at all - a headless or off-kitty run - it cannot tell which Workspaces are open and **fails closed**, printing a message that names `--force`. Add `--force` to dispatch anyway. An agent running inside the terminal jjfx drives (or with `terminal.listen_on` configured) sees the open tabs, so it needs no flag and will correctly leave your open Workspaces alone.
 
@@ -72,7 +66,7 @@ A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues a
 
 Before launching, jjfx fetches each Ticket's title and description through the configured source and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the source cannot be read, Dispatch fails before anything is reserved.
 
-**Done when** every ticket prints an outcome naming the Worker that took it. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` in the user config can hold one back deliberately - `jjfx status` prints the waiting set under `Waiting:`, and `jjfx status --json` carries it in the `waiting` array.
+**Done when** every Ticket you named has an object in the JSON: `dispatched` or `orchestrating` naming what took it, or `waiting` / `failed` naming why. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` in the user config can hold one back deliberately - its object reads `"outcome": "waiting"`, and `jjfx status --json` carries the held set in its pool-level `waiting` array.
 
 ### 4. Watch
 
