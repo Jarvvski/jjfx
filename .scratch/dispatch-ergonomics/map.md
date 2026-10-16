@@ -39,6 +39,11 @@ Wave 1 (dispatched 2026-10-16): **01, 02, 03, 08** — the owner's two prioritie
 
 Wave 2 (queued): **04, 05, 06, 07, 09, 10, 11, 12, 13**.
 
+**Sequencing, from the multi-pool map (2026-10-16).** Two wave-2 tickets interact with named Worker Pools, and both were settled by the multi-pool map's *Does the queued dispatch-ergonomics batch wait for this design?*:
+
+- **06 (`--all` must base a dependent on its blocker) must land before or with the pools implementation.** Pools multiply parallel branches in one Repository, and this is what stops that multiplication becoming an integration-conflict generator. Otherwise orthogonal to pools.
+- **11 (`jjfx wait`) needs no amendment.** The pool dimension it would need follows the same rule as `dispatch` — one pool implies the target, several require `--pool` — so its flag surface narrows rather than changes. Build it as written.
+
 Wave 1 is deliberately narrow. Almost every ticket here edits `src/cli.rs`, and the test-drive's own integration pain came from parallel workers in one file, so tickets that share `dispatch_command` — 03, 04 and 05 — are spread across waves rather than stacked.
 
 **11 is `Blocked by: 03` on purpose.** It is the same reconciliation mechanism seen from the other side — `reconcile` is one pass, `wait` is reconcile-until-a-condition — so it should be built after 03 rather than racing it. That is also a live test of the readiness gate this batch is partly about.
@@ -46,7 +51,7 @@ Wave 1 is deliberately narrow. Almost every ticket here edits `src/cli.rs`, and 
 ## Deliberately not filed
 
 - **Addressing a historical Run.** After `jjfx pool reset`, a Worker's earlier branches are unreachable from `open-pr`/`rebase`/`absorb`. Real, but it is a design decision about Worker identity rather than a bug, so it wants an owner ruling before an agent guesses. Filed separately if wanted.
-- **`[tickets]` cannot be repository-local.** Ticket 01 works around it; whether `.jjfx/config.toml` should grow a second section is an owner decision, because `deny_unknown_fields` there is deliberate.
+- **`[tickets]` cannot be repository-local.** Ticket 01 works around it; whether `.jjfx/config.toml` should grow a second section is an owner decision, because `deny_unknown_fields` there is deliberate. **Resolved 2026-10-16** by the multi-pool map's *Where are pools declared?*: `RepoConfig` grows to `{checks, pools}`, and the capability rule there permits a repository to *select* a configured Ticket source — so a repo-local `[tickets] source = "local"` is within policy, because it references something the user config defines and grants nothing. The wall is removable; it is not yet implemented.
 
 ## Note on parallelism
 
