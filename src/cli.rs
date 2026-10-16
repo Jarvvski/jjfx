@@ -1596,16 +1596,39 @@ fn clean_command(repository: &Repository, pool: Option<&str>) -> Result<()> {
     for entry in plan.entries() {
         println!("  {}", entry.name());
     }
-    print!("Confirm? (y/n) ");
-    let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input)?;
-    let decision = if input.trim().eq_ignore_ascii_case("y") {
+    let decision = confirm_clean()?;
+    workspaces.clean_with_progress(&plan, decision, print_hook_output)?;
+    Ok(())
+}
+
+/// Whether a typed answer confirms a clean sweep.
+///
+/// Only an explicit `y` does, matching the contract `clean` has always had; an
+/// `n`, an empty answer, or anything else declines and exits 0.
+fn answer_confirms_clean(answer: &str) -> bool {
+    answer.trim().eq_ignore_ascii_case("y")
+}
+
+/// Asks whether to apply a clean plan, reading the answer from stdin.
+///
+/// The prompt goes to stderr so stdout carries only the plan's listing, and a
+/// caller that never answers - stdin at EOF, as a non-interactive script gets -
+/// is refused loudly rather than treated as a decline. The distinction matters:
+/// a user typing `n` chose not to act, but a process that never answered did
+/// not choose anything, and a silent success would make "nothing happened"
+/// indistinguishable from "nothing needed doing". An explicit non-`y` answer
+/// declines and exits 0, the contract `clean` already had.
+fn confirm_clean() -> Result<CleanDecision> {
+    eprint!("Confirm? (y/n) ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer)? == 0 {
+        bail!("no confirmation received; nothing was removed");
+    }
+    Ok(if answer_confirms_clean(&answer) {
         CleanDecision::Confirmed
     } else {
         CleanDecision::Declined
-    };
-    workspaces.clean_with_progress(&plan, decision, print_hook_output)?;
-    Ok(())
+    })
 }
 
 fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
@@ -6408,6 +6431,18 @@ mod tests {
         }
         for answer in ["", "\n", "n", "no", "nope", "maybe", "y n"] {
             assert!(!answer_approves_growth(answer), "`{answer}` should refuse");
+        }
+    }
+
+    /// Only an explicit `y` confirms a clean sweep, matching the contract
+    /// `clean` has always had: an `n` or an empty answer declines.
+    #[test]
+    fn only_an_explicit_yes_confirms_a_clean() {
+        for answer in ["y", "Y", " y \n"] {
+            assert!(answer_confirms_clean(answer), "`{answer}` should confirm");
+        }
+        for answer in ["", "\n", "n", "no", "nope", "maybe", "y n"] {
+            assert!(!answer_confirms_clean(answer), "`{answer}` should decline");
         }
     }
 

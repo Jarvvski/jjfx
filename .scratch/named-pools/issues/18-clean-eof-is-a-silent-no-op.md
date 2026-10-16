@@ -1,7 +1,7 @@
 # `clean`'s confirmation on EOF removes nothing and exits 0 without saying so
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -29,10 +29,10 @@ The distinction that matters: a user typing `n` chose not to act. A process that
 
 ## Acceptance Criteria
 
-- [ ] `clean` with stdin at EOF removes nothing and fails loudly with a reason.
-- [ ] The confirmation prompt is written to stderr, not stdout.
-- [ ] An interactive `y` still removes, and an interactive `n` still does not.
-- [ ] `mise run check` is green.
+- [x] `clean` with stdin at EOF removes nothing and fails loudly with a reason.
+- [x] The confirmation prompt is written to stderr, not stdout.
+- [x] An interactive `y` still removes, and an interactive `n` still does not.
+- [x] `mise run check` is green.
 
 ## References
 
