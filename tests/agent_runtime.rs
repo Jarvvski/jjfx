@@ -3710,6 +3710,58 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
     );
 }
 
+/// A test that panics must not leave its helper, or the Agent Runtime process
+/// group that helper started, behind. The guard owns both, so unwinding reaps
+/// them exactly as a normal return would.
+#[test]
+fn a_panicking_test_reaps_its_helper_and_the_agent_process_group() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    let process = temporary_directory.path().join("process");
+    let descendant = temporary_directory.path().join("descendant");
+    let diagnostic = temporary_directory.path().join("diagnostic");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(&bin_directory.join("claude"), STUBBORN_RUNTIME);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut helper = Command::new(env::current_exe().expect("test executable"));
+        helper
+            .args(["--exact", "foreground_run_helper", "--ignored"])
+            .env("PATH", runtime_path(&bin_directory))
+            .env(HELPER_WORKSPACE, &workspace)
+            .env(HELPER_LOG, &log)
+            .env(HELPER_RESULT, &result)
+            .env(HELPER_PROCESS, &process)
+            .env(HELPER_DESCENDANT, &descendant)
+            .env(HELPER_DIAGNOSTIC, &diagnostic)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _helper = HelperGuard::spawn(&mut helper, None, &[&process]);
+        wait_for_file_content(&process);
+        wait_for_file_content(&descendant);
+        panic!("simulated test failure");
+    }));
+
+    assert!(unwound.is_err(), "the simulated failure should unwind");
+    let leader = read_pid(&process);
+    let descendant_pid = read_pid(&descendant);
+    wait_for_process_group_exit(unix_pid(leader));
+    wait_for_process_exit(unix_pid(descendant_pid));
+    assert!(
+        test_kill_process_group(unix_pid(leader)).is_err(),
+        "unwinding must end the Agent Runtime process group"
+    );
+    assert!(
+        test_kill_process(unix_pid(descendant_pid)).is_err(),
+        "unwinding must end the Agent Runtime's descendant"
+    );
+}
+
 /// A recorded PID that is alive but does not lead a process group is not a Run
 /// identity: it must never be signalled, and the unrelated process must survive.
 #[test]
