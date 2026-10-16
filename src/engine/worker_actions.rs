@@ -988,10 +988,7 @@ impl WorkerActions {
 /// Best-effort: a missing or unwritable log must not fail the Follow-up, because
 /// the Run's liveness still follows its session.
 fn truncate_run_log(repository: &Repository, worker: &WorkerId) {
-    let path = repository
-        .root()
-        .join(".jj/pool")
-        .join(format!("{worker}.log"));
+    let path = repository.state_store().worker_log(worker);
     let _ = fs::OpenOptions::new()
         .create(true)
         .truncate(true)

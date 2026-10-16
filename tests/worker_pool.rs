@@ -168,10 +168,10 @@ fn provision_workspaces(root: &Path, workers: &[&str]) {
 
 fn legacy_repository_with_pool() -> (TempDir, Repository) {
     let (temp, repository) = local_repository_with_origin();
-    let pool = temp.path().join(".jj/pool");
+    let pool = temp.path().join(".jj/pools/default");
     fs::create_dir_all(&pool).expect("pool directory");
     fs::write(
-        temp.path().join(".jj/pool.json"),
+        temp.path().join(".jj/pools/default/pool.json"),
         fixture("pool-workers.json"),
     )
     .expect("pool state");
@@ -190,10 +190,10 @@ fn legacy_repository_with_pool() -> (TempDir, Repository) {
 
 fn repository_with_pool() -> (TempDir, Repository) {
     let temp = tempfile::tempdir().expect("temp repository");
-    let pool = temp.path().join(".jj/pool");
+    let pool = temp.path().join(".jj/pools/default");
     fs::create_dir_all(&pool).expect("pool directory");
     fs::write(
-        temp.path().join(".jj/pool.json"),
+        temp.path().join(".jj/pools/default/pool.json"),
         fixture("pool-workers.json"),
     )
     .expect("pool state");
@@ -280,7 +280,12 @@ fn destroy_is_idempotent_for_a_missing_or_empty_pool() {
         .expect("repeated destroy should succeed");
 
     assert!(repository.worker_pool().snapshot().is_missing());
-    assert!(repository.root().join(".jj/pool/.dispatch.lock").exists());
+    assert!(
+        repository
+            .root()
+            .join(".jj/pools/default/.dispatch.lock")
+            .exists()
+    );
 }
 
 #[test]
@@ -293,7 +298,7 @@ fn destroy_ignores_a_cleanup_marker_that_cannot_name_a_worker() {
     // A junk file ending in the cleanup suffix whose stem is not a valid Worker
     // id (it is empty). It cannot name a Pool member, so it must not abort
     // discovery and with it the whole destroy.
-    let junk = repository.root().join(".jj/pool").join(".cleanup");
+    let junk = repository.root().join(".jj/pools/default").join(".cleanup");
     fs::write(&junk, []).expect("junk cleanup marker");
 
     repository
@@ -338,7 +343,7 @@ fn destroy_removes_worker_workspaces_state_and_cache_entries() {
         assert!(
             !repository
                 .root()
-                .join(".jj/pool")
+                .join(".jj/pools/default")
                 .join(format!("{worker}.json"))
                 .exists()
         );
@@ -381,7 +386,7 @@ fn destroy_removes_dispatch_and_unknown_artifacts_but_preserves_lock_sidecars() 
             jjfx::engine::StateChange::Replace(group),
         )
         .expect("Dispatch Group state");
-    let pool_directory = repository.root().join(".jj/pool");
+    let pool_directory = repository.root().join(".jj/pools/default");
     fs::write(pool_directory.join("unknown.tmp"), "unknown").expect("unknown file");
     fs::create_dir(pool_directory.join("unknown-dir")).expect("unknown directory");
     fs::write(pool_directory.join("unknown-dir/value"), "unknown").expect("unknown value");
@@ -389,7 +394,7 @@ fn destroy_removes_dispatch_and_unknown_artifacts_but_preserves_lock_sidecars() 
     repository.worker_pool().destroy().expect("destroy Pool");
 
     for artifact in [
-        repository.root().join(".jj/pool.json"),
+        repository.root().join(".jj/pools/default/pool.json"),
         pool_directory.join(".destroying"),
         pool_directory.join(format!("{worker}.cleanup")),
         pool_directory.join("dispatch-amba-99.json"),
@@ -418,7 +423,7 @@ fn destroy_marker_blocks_growth_until_destroy_completes() {
     let pool = repository.worker_pool();
     pool.resize_to(jjfx::engine::PoolCapacity::new(0).expect("empty capacity"))
         .expect("create empty Pool");
-    fs::write(repository.root().join(".jj/pool/.destroying"), "")
+    fs::write(repository.root().join(".jj/pools/default/.destroying"), "")
         .expect("interrupted destroy marker");
 
     let error = pool
@@ -429,7 +434,12 @@ fn destroy_marker_blocks_growth_until_destroy_completes() {
     assert_eq!(pool.snapshot().pool().expect("empty Pool").size(), 0);
     pool.destroy()
         .expect("destroy should remove its durable marker");
-    assert!(!repository.root().join(".jj/pool/.destroying").exists());
+    assert!(
+        !repository
+            .root()
+            .join(".jj/pools/default/.destroying")
+            .exists()
+    );
 
     let growth = pool
         .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
@@ -472,14 +482,14 @@ fn repeated_destroy_retries_interrupted_workspace_cleanup() {
     assert!(
         repository
             .root()
-            .join(".jj/pool")
+            .join(".jj/pools/default")
             .join(format!("{worker}.json"))
             .exists()
     );
     assert!(
         repository
             .root()
-            .join(".jj/pool")
+            .join(".jj/pools/default")
             .join(format!("{worker}.cleanup"))
             .exists()
     );
@@ -494,7 +504,7 @@ fn repeated_destroy_retries_interrupted_workspace_cleanup() {
     assert!(
         !repository
             .root()
-            .join(".jj/pool")
+            .join(".jj/pools/default")
             .join(format!("{worker}.cleanup"))
             .exists()
     );
@@ -650,7 +660,8 @@ fn growing_to_current_capacity_does_not_change_the_pool() {
     let first = pool
         .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
         .expect("initial pool should grow");
-    let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
+    let before =
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool bytes");
 
     let second = pool
         .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
@@ -660,7 +671,7 @@ fn growing_to_current_capacity_does_not_change_the_pool() {
     assert_eq!(second.capacity().as_usize(), 1);
     assert_eq!(second.capacity(), first.capacity());
     assert_eq!(
-        fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool bytes"),
         before
     );
 }
@@ -688,7 +699,7 @@ fn shrinking_removes_the_stable_pool_tail_and_reports_it() {
         assert!(
             !repository
                 .root()
-                .join(".jj/pool")
+                .join(".jj/pools/default")
                 .join(format!("{worker}.json"))
                 .exists()
         );
@@ -728,7 +739,8 @@ fn shrinking_rejects_the_whole_tail_when_a_selected_worker_is_busy() {
     let busy = grown.added_workers()[2].clone();
     pool.reserve_named(busy.clone(), "AMBA-7")
         .expect("tail Worker should reserve");
-    let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
+    let before =
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool bytes");
 
     let error = pool
         .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity"))
@@ -739,7 +751,7 @@ fn shrinking_rejects_the_whole_tail_when_a_selected_worker_is_busy() {
         jjfx::engine::WorkerPoolError::WorkersBusy { workers } if workers == vec![busy]
     ));
     assert_eq!(
-        fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool bytes"),
         before
     );
     assert_eq!(pool.snapshot().pool().expect("manifest").size(), 3);
@@ -782,7 +794,8 @@ fn named_removal_rejects_unknown_and_busy_workers_without_mutation() {
         .expect("grow");
     let busy = grown.added_workers()[0].clone();
     pool.reserve_named(busy.clone(), "AMBA-8").expect("reserve");
-    let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes");
+    let before =
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool bytes");
 
     let busy_error = pool
         .remove(busy.clone())
@@ -801,7 +814,7 @@ fn named_removal_rejects_unknown_and_busy_workers_without_mutation() {
         jjfx::engine::WorkerPoolError::WorkerNotInPool { worker } if worker == unknown
     ));
     assert_eq!(
-        fs::read(repository.root().join(".jj/pool.json")).expect("pool bytes"),
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool bytes"),
         before
     );
 }
@@ -864,11 +877,11 @@ fn repeated_resize_retries_detached_worker_cleanup() {
     assert_eq!(pool.snapshot().pool().expect("manifest").size(), 1);
     let state = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{detached}.json"));
     let marker = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{detached}.cleanup"));
     assert!(
         state.exists(),
@@ -909,7 +922,7 @@ fn repeated_named_removal_retries_detached_worker_cleanup() {
     assert!(matches!(error, jjfx::engine::WorkerPoolError::Cleanup(_)));
     let marker = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{worker}.cleanup"));
     assert!(marker.exists());
     fs::rename(&disabled, &repo_state).expect("restore jj repository");
@@ -932,7 +945,7 @@ fn no_op_resize_preserves_nonmember_state_without_a_cleanup_marker() {
     let in_flight = jjfx::engine::WorkerId::parse("worker-in-flight").expect("Worker ID");
     let state = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{in_flight}.json"));
     fs::write(&state, fixture("worker-idle-claude.json")).expect("in-flight Worker state");
 
@@ -956,7 +969,7 @@ fn named_removal_preserves_unknown_state_without_a_cleanup_marker() {
     let unknown = jjfx::engine::WorkerId::parse("worker-unknown-state").expect("Worker ID");
     let state = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{unknown}.json"));
     fs::write(&state, fixture("worker-idle-claude.json")).expect("unknown Worker state");
 
@@ -988,11 +1001,11 @@ fn busy_detached_cleanup_marker_is_not_torn_down() {
     fs::rename(&disabled, &repo_state).expect("restore jj repository");
     let state = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{worker}.json"));
     let marker = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{worker}.cleanup"));
     fs::write(&state, fixture("worker-busy-claude.json")).expect("busy detached state");
 
@@ -1019,7 +1032,7 @@ fn shrinking_permits_a_missing_tail_worker_state() {
     fs::remove_file(
         repository
             .root()
-            .join(".jj/pool")
+            .join(".jj/pools/default")
             .join(format!("{missing}.json")),
     )
     .expect("remove Worker state");
@@ -1043,7 +1056,7 @@ fn worker_alias_is_trimmed_persisted_and_cosmetic() {
         .clone();
     let state_path = repository
         .root()
-        .join(".jj/pool")
+        .join(".jj/pools/default")
         .join(format!("{worker}.json"));
     let worker_state_before = fs::read(&state_path).expect("Worker state");
     let workspace_before = workspace_names(repository.root());
@@ -1090,7 +1103,7 @@ fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
             .alias(),
         ""
     );
-    let pool_path = repository.root().join(".jj/pool.json");
+    let pool_path = repository.root().join(".jj/pools/default/pool.json");
     let cleared: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     assert!(
@@ -1114,7 +1127,9 @@ fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
 #[test]
 fn worker_alias_mutates_a_legacy_pool_without_losing_compatible_metadata() {
     let (temporary_directory, repository) = legacy_repository_with_pool();
-    let pool_path = temporary_directory.path().join(".jj/pool.json");
+    let pool_path = temporary_directory
+        .path()
+        .join(".jj/pools/default/pool.json");
     let mut state: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     state["foreground"] = Value::Bool(false);
@@ -1125,7 +1140,9 @@ fn worker_alias_mutates_a_legacy_pool_without_losing_compatible_metadata() {
         serde_json::to_vec_pretty(&state).expect("pool JSON"),
     )
     .expect("pool state");
-    let worker_state_path = temporary_directory.path().join(".jj/pool/worker-01.json");
+    let worker_state_path = temporary_directory
+        .path()
+        .join(".jj/pools/default/worker-01.json");
     let worker_state_before = fs::read(&worker_state_path).expect("Worker state");
     let worker = jjfx::engine::WorkerId::parse("worker-01").expect("Worker ID");
 
@@ -1259,7 +1276,8 @@ fn alias_rejects_while_pool_destruction_is_in_progress() {
     fs::rename(&repo_state, &disabled).expect("disable jj repository");
     pool.destroy()
         .expect_err("Workspace cleanup should leave destruction resumable");
-    let before = fs::read(repository.root().join(".jj/pool.json")).expect("pool state");
+    let before =
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool state");
 
     let error = pool
         .set_alias(worker, "backend")
@@ -1267,7 +1285,7 @@ fn alias_rejects_while_pool_destruction_is_in_progress() {
 
     assert!(matches!(error, jjfx::engine::WorkerPoolError::Conflict));
     assert_eq!(
-        fs::read(repository.root().join(".jj/pool.json")).expect("pool state"),
+        fs::read(repository.root().join(".jj/pools/default/pool.json")).expect("pool state"),
         before
     );
     fs::rename(&disabled, &repo_state).expect("restore jj repository");
@@ -1278,7 +1296,9 @@ fn alias_rejects_while_pool_destruction_is_in_progress() {
 fn named_removal_clears_a_legacy_worker_alias() {
     let (temporary_directory, repository) = legacy_repository_with_pool();
     fs::write(
-        temporary_directory.path().join(".jj/pool/worker-02.json"),
+        temporary_directory
+            .path()
+            .join(".jj/pools/default/worker-02.json"),
         fixture("worker-idle-claude.json"),
     )
     .expect("make aliased Worker idle");
@@ -1420,7 +1440,7 @@ fn reservation_and_shrink_never_claim_and_remove_the_same_worker() {
 fn reservation_defaults_missing_pool_runtime_to_claude_and_persists_it() {
     let (temp, repository) = repository_with_pool();
     fs::write(
-        temp.path().join(".jj/pool/worker-01.json"),
+        temp.path().join(".jj/pools/default/worker-01.json"),
         fixture("worker-legacy-omits-runtime.json"),
     )
     .expect("make Worker omit its legacy runtime");
@@ -1440,7 +1460,7 @@ fn reservation_defaults_missing_pool_runtime_to_claude_and_persists_it() {
         Some(AgentRuntime::Claude)
     );
     let worker_json: Value = serde_json::from_slice(
-        &fs::read(temp.path().join(".jj/pool/worker-01.json")).expect("persisted Worker"),
+        &fs::read(temp.path().join(".jj/pools/default/worker-01.json")).expect("persisted Worker"),
     )
     .expect("Worker JSON");
     assert_eq!(worker_json["agent"], "claude");
@@ -1449,7 +1469,7 @@ fn reservation_defaults_missing_pool_runtime_to_claude_and_persists_it() {
 #[test]
 fn reservation_normalizes_configured_codex_runtime_before_persisting_it() {
     let (temp, repository) = repository_with_pool();
-    let pool_path = temp.path().join(".jj/pool.json");
+    let pool_path = temp.path().join(".jj/pools/default/pool.json");
     let mut pool: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     pool["agent"] = "  CODEX  ".into();
@@ -1466,7 +1486,7 @@ fn reservation_normalizes_configured_codex_runtime_before_persisting_it() {
 
     assert_eq!(reservation.agent_runtime(), AgentRuntime::Codex);
     let worker_json: Value = serde_json::from_slice(
-        &fs::read(temp.path().join(".jj/pool/worker-01.json")).expect("persisted Worker"),
+        &fs::read(temp.path().join(".jj/pools/default/worker-01.json")).expect("persisted Worker"),
     )
     .expect("Worker JSON");
     assert_eq!(worker_json["agent"], "codex");
@@ -1484,7 +1504,7 @@ fn reservation_normalizes_configured_codex_runtime_before_persisting_it() {
 #[test]
 fn reservation_rejects_a_removed_pi_pool_profile_with_a_clear_message() {
     let (temp, repository) = repository_with_pool();
-    let pool_path = temp.path().join(".jj/pool.json");
+    let pool_path = temp.path().join(".jj/pools/default/pool.json");
     let mut pool: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     pool["agent"] = " PI ".into();
@@ -1493,7 +1513,7 @@ fn reservation_rejects_a_removed_pi_pool_profile_with_a_clear_message() {
         serde_json::to_vec(&pool).expect("pool JSON serialization"),
     )
     .expect("configured pool state");
-    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-01.json");
     let before = fs::read(&worker_path).expect("Worker state");
 
     let error = repository
@@ -1515,7 +1535,7 @@ fn reservation_rejects_a_removed_pi_pool_profile_with_a_clear_message() {
 #[test]
 fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
     let (temp, repository) = repository_with_pool();
-    let pool_path = temp.path().join(".jj/pool.json");
+    let pool_path = temp.path().join(".jj/pools/default/pool.json");
     let mut pool: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     pool["agent"] = "other".into();
@@ -1524,7 +1544,7 @@ fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
         serde_json::to_vec(&pool).expect("pool JSON serialization"),
     )
     .expect("configured pool state");
-    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-01.json");
     let before = fs::read(&worker_path).expect("Worker state");
 
     let error = repository
@@ -1543,7 +1563,7 @@ fn invalid_configured_runtime_fails_without_mutating_the_reserved_worker() {
 #[test]
 fn reservation_replaces_previous_runtime_while_preserving_worker_state() {
     let (temp, repository) = repository_with_pool();
-    let pool_path = temp.path().join(".jj/pool.json");
+    let pool_path = temp.path().join(".jj/pools/default/pool.json");
     let mut pool: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
     pool["agent"] = "codex".into();
@@ -1552,7 +1572,7 @@ fn reservation_replaces_previous_runtime_while_preserving_worker_state() {
         serde_json::to_vec(&pool).expect("pool JSON serialization"),
     )
     .expect("configured pool state");
-    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-01.json");
     let mut worker: Value = serde_json::from_slice(&fs::read(&worker_path).expect("Worker state"))
         .expect("Worker JSON");
     worker["future"] = serde_json::json!({"enabled": true});
@@ -1639,7 +1659,7 @@ fn bulk_reservation_reports_exact_shortage_without_writing_any_worker() {
         .map(|worker| {
             repository
                 .root()
-                .join(".jj/pool")
+                .join(".jj/pools/default")
                 .join(format!("{worker}.json"))
         })
         .collect::<Vec<_>>();
@@ -1676,7 +1696,7 @@ fn caller_approved_growth_adopts_and_reserves_only_the_reported_gap() {
         .clone();
     pool.reserve_named(original, "ENG-BUSY")
         .expect("seed busy Worker");
-    let pool_path = repository.root().join(".jj/pool.json");
+    let pool_path = repository.root().join(".jj/pools/default/pool.json");
     let before_rejection = fs::read(&pool_path).expect("Pool before rejected growth");
 
     let error = pool
@@ -1735,7 +1755,7 @@ fn reserves_the_first_idle_worker_for_a_ticket() {
     assert_eq!(worker.branch_name(), Some("eng-201"));
     let expected_log = repository
         .root()
-        .join(".jj/pool/worker-01.log")
+        .join(".jj/pools/default/worker-01.log")
         .to_string_lossy()
         .into_owned();
     assert_eq!(worker.log_file(), Some(expected_log.as_str()));
@@ -1746,7 +1766,7 @@ fn reserves_the_first_idle_worker_for_a_ticket() {
 fn reserves_a_named_idle_worker_without_using_pool_order() {
     let (temp, repository) = repository_with_pool();
     fs::write(
-        temp.path().join(".jj/pool/worker-04.json"),
+        temp.path().join(".jj/pools/default/worker-04.json"),
         fixture("worker-idle-claude.json"),
     )
     .expect("make named Worker idle");
@@ -1807,7 +1827,7 @@ fn named_reservation_rejects_unknown_or_busy_workers_without_mutation() {
 fn concurrent_reservations_allocate_distinct_idle_workers() {
     let (temp, repository) = repository_with_pool();
     fs::write(
-        temp.path().join(".jj/pool/worker-04.json"),
+        temp.path().join(".jj/pools/default/worker-04.json"),
         fixture("worker-idle-claude.json"),
     )
     .expect("make second Worker idle");
@@ -1833,7 +1853,7 @@ fn concurrent_reservations_allocate_distinct_idle_workers() {
 fn reservation_reports_no_idle_capacity_without_mutation() {
     let (temp, repository) = repository_with_pool();
     fs::write(
-        temp.path().join(".jj/pool/worker-01.json"),
+        temp.path().join(".jj/pools/default/worker-01.json"),
         fixture("worker-busy-claude.json"),
     )
     .expect("make every Worker non-idle");
@@ -1859,7 +1879,7 @@ fn reservation_reports_no_idle_capacity_without_mutation() {
 #[test]
 fn reservation_preserves_go_worker_extensions_and_null_fields() {
     let (temp, repository) = repository_with_pool();
-    let worker_path = temp.path().join(".jj/pool/worker-01.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-01.json");
     let mut worker: Value =
         serde_json::from_slice(&fs::read(&worker_path).expect("legacy Worker state"))
             .expect("Worker JSON");
@@ -1891,7 +1911,7 @@ fn reservation_preserves_go_worker_extensions_and_null_fields() {
 #[test]
 fn reconcile_runs_returns_snapshot_without_mutating_worker_without_pid() {
     let (temp, repository) = repository_with_pool();
-    let worker_path = temp.path().join(".jj/pool/worker-02.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-02.json");
     let mut worker: Value =
         serde_json::from_slice(&fs::read(&worker_path).expect("busy Worker state"))
             .expect("Worker JSON");
@@ -1913,7 +1933,7 @@ fn reconcile_runs_returns_snapshot_without_mutating_worker_without_pid() {
 #[test]
 fn reconcile_runs_finalizes_busy_worker_with_dead_pid_once() {
     let (temp, repository) = repository_with_pool();
-    let worker_path = temp.path().join(".jj/pool/worker-02.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-02.json");
     let mut exited = Command::new("sh")
         .args(["-c", "exit 0"])
         .spawn()
@@ -1952,7 +1972,7 @@ fn reconcile_runs_finalizes_busy_worker_with_dead_pid_once() {
 #[test]
 fn reconcile_runs_finalizes_a_busy_worker_recorded_under_the_removed_pi_runtime() {
     let (temp, repository) = repository_with_pool();
-    let worker_path = temp.path().join(".jj/pool/worker-02.json");
+    let worker_path = temp.path().join(".jj/pools/default/worker-02.json");
     let mut worker: Value =
         serde_json::from_slice(&fs::read(&worker_path).expect("busy Worker state"))
             .expect("Worker JSON");
@@ -1981,7 +2001,7 @@ fn reconcile_runs_finalizes_a_busy_worker_recorded_under_the_removed_pi_runtime(
 #[test]
 fn reconcile_runs_continues_past_missing_and_malformed_workers() {
     let (temp, repository) = repository_with_pool();
-    let pool = temp.path().join(".jj/pool");
+    let pool = temp.path().join(".jj/pools/default");
     fs::remove_file(pool.join("worker-03.json")).expect("remove Worker");
     fs::write(pool.join("worker-04.json"), b"{ not json").expect("malformed Worker");
     let worker_path = pool.join("worker-02.json");
@@ -2058,7 +2078,7 @@ fn reads_go_pool_workers_as_an_immutable_snapshot() {
 #[test]
 fn missing_and_malformed_worker_state_do_not_hide_healthy_workers() {
     let (_temp, repository) = repository_with_pool();
-    let pool = repository.root().join(".jj/pool");
+    let pool = repository.root().join(".jj/pools/default");
     fs::remove_file(pool.join("worker-04.json")).expect("remove Worker");
     fs::write(pool.join("worker-03.json"), b"{ not json").expect("malformed Worker");
     let snapshot = repository.read_worker_pool_snapshot();
@@ -2086,15 +2106,20 @@ fn missing_pool_is_not_invented_as_empty() {
 #[test]
 fn snapshot_read_changes_no_file_and_creates_no_lock() {
     let (_temp, repository) = repository_with_pool();
-    let pool_file = repository.root().join(".jj/pool.json");
+    let pool_file = repository.root().join(".jj/pools/default/pool.json");
     let before = fs::read(&pool_file).expect("pool bytes");
     let _ = repository.read_worker_pool_snapshot();
     assert_eq!(fs::read(pool_file).expect("pool bytes"), before);
-    assert!(!repository.root().join(".jj/pool/.dispatch.lock").exists());
     assert!(
         !repository
             .root()
-            .join(".jj/pool/worker-01.json.lock")
+            .join(".jj/pools/default/.dispatch.lock")
+            .exists()
+    );
+    assert!(
+        !repository
+            .root()
+            .join(".jj/pools/default/worker-01.json.lock")
             .exists()
     );
 }
@@ -2103,7 +2128,7 @@ fn snapshot_read_changes_no_file_and_creates_no_lock() {
 fn worker_without_agent_remains_readable() {
     let (temp, repository) = repository_with_pool();
     fs::write(
-        temp.path().join(".jj/pool/worker-01.json"),
+        temp.path().join(".jj/pools/default/worker-01.json"),
         fixture("worker-legacy-omits-runtime.json"),
     )
     .expect("legacy Worker");

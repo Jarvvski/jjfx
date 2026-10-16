@@ -9,8 +9,8 @@ the tool rather than by reasoning about `jj op log` by hand.
 
 Before a jjfx-initiated mutation, jjfx records the repository's newest operation
 id; when the mutation finishes it records the operation it finished at. The pair
-lives in a jjfx-owned sidecar, `.jj/pool/undo.json`, beside jjfx's other owned
-state (`sessions.json`, `runs.jsonl`, `in-use.json`). A missing file means
+lives in a jjfx-owned sidecar, `.jj/undo.json`, at the root of jjfx's state
+because the restore it drives is repository-wide. A missing file means
 "nothing recorded to undo".
 
 One record is kept per Workspace - the latest mutation - because an undo restores

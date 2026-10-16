@@ -3460,7 +3460,8 @@ fn orchestrate_command(
 
 /// Spawns the detached orchestration runner for a prepared Parent Ticket.
 ///
-/// The child's stdout and stderr go to a per-Parent log under `.jj/pool`, and
+/// The child's stdout and stderr go to a per-Parent log under the pool
+/// directory (`.jj/pools/<name>/`), and
 /// the log path is returned so the Dispatch result can name it: a failure after
 /// the handoff is reachable even though the parent has already returned.
 fn spawn_background_orchestration(
@@ -3505,10 +3506,7 @@ fn spawn_background_orchestration(
 /// name is lowercased to match the orchestration lock, which is case-folded
 /// because the filesystem may be case-insensitive.
 fn orchestration_log_path(repository: &Repository, parent: &TicketId) -> PathBuf {
-    repository.root().join(".jj/pool").join(format!(
-        "orchestrate-{}.log",
-        parent.as_str().to_ascii_lowercase()
-    ))
+    repository.state_store().orchestration_log(parent)
 }
 
 fn render_orchestration_event(event: &OrchestrationEvent) {
@@ -3960,13 +3958,13 @@ mod tests {
     }
 
     /// A one-Worker Pool snapshot whose waiting set is `waiting`, as a capped
-    /// Dispatch would have persisted it to `.jj/pool/waiting.json`.
+    /// Dispatch would have persisted it to `.jj/pools/default/waiting.json`.
     fn snapshot_with_waiting(waiting: &[&str]) -> crate::engine::WorkerPoolSnapshot {
         let temp = tempfile::tempdir().expect("temp repository");
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).expect("pool directory");
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
         )
         .expect("pool state");
@@ -4157,7 +4155,7 @@ mod tests {
     fn a_background_orchestration_names_its_log_in_json_and_prose() {
         let entries = [DispatchEntry::Orchestrating {
             ticket: "ENG-100".to_owned(),
-            detail: "log: /repo/.jj/pool/orchestrate-ENG-100.log".to_owned(),
+            detail: "log: /repo/.jj/pools/default/orchestrate-ENG-100.log".to_owned(),
         }];
 
         let value: serde_json::Value =
@@ -4165,7 +4163,7 @@ mod tests {
         assert_eq!(value[0]["outcome"], "orchestrating");
         assert_eq!(
             value[0]["detail"],
-            "log: /repo/.jj/pool/orchestrate-ENG-100.log"
+            "log: /repo/.jj/pools/default/orchestrate-ENG-100.log"
         );
 
         let prose = dispatch_prose(&entries);

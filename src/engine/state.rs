@@ -6,6 +6,7 @@
 //! replacement and locking are delegated to [`super::atomic`].
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
@@ -19,21 +20,46 @@ use thiserror::Error;
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::{AgentRuntimeProfile, DispatchExclusions, Repository};
 
-const POOL_PATH: &str = ".jj/pool.json";
-const POOL_DIRECTORY: &str = ".jj/pool";
-const POOL_LOCK: &str = ".jj/pool/.dispatch.lock";
-const DESTROY_MARKER: &str = ".jj/pool/.destroying";
+/// The directory holding every Worker Pool's own state, one directory per pool.
+const POOLS_DIRECTORY: &str = ".jj/pools";
+
+/// The root of jjfx's persisted state, repository-scoped documents included.
+const STATE_ROOT: &str = ".jj";
+
+/// The name of the pool a Repository holds when it declares none. A Repository
+/// always has one lane, so `default` is always present even though nothing
+/// declares it.
+pub const DEFAULT_POOL_NAME: &str = "default";
+
+/// The pool document, inside the pool's own directory.
+const POOL_DOCUMENT: &str = "pool.json";
+const POOL_LOCK_NAME: &str = ".dispatch.lock";
+const DESTROY_MARKER_NAME: &str = ".destroying";
 const CLEANUP_SUFFIX: &str = ".cleanup";
-const IN_USE_PATH: &str = ".jj/pool/in-use.json";
-const IN_USE_LOCK: &str = ".jj/pool/.in-use.lock";
-const SESSION_PATH: &str = ".jj/pool/sessions.json";
-const SESSION_LOCK: &str = ".jj/pool/.sessions.lock";
-const WAITING_PATH: &str = ".jj/pool/waiting.json";
-const WAITING_LOCK: &str = ".jj/pool/.waiting.lock";
-const RUN_RECORDS_PATH: &str = ".jj/pool/runs.jsonl";
-const RUN_RECORDS_LOCK: &str = ".jj/pool/.runs.lock";
-const UNDO_PATH: &str = ".jj/pool/undo.json";
-const UNDO_LOCK: &str = ".jj/pool/.undo.lock";
+const SESSION_NAME: &str = "sessions.json";
+const SESSION_LOCK_NAME: &str = ".sessions.lock";
+const WAITING_NAME: &str = "waiting.json";
+const WAITING_LOCK_NAME: &str = ".waiting.lock";
+const RUN_RECORDS_NAME: &str = "runs.jsonl";
+const RUN_RECORDS_LOCK_NAME: &str = ".runs.lock";
+
+// Repository-scoped state stays at the root of `.jj/`: occupancy is one
+// reconcile over the whole terminal and spans pools, and undo is `jj op
+// restore`, which is repository-wide.
+const IN_USE_PATH: &str = ".jj/in-use.json";
+const IN_USE_LOCK: &str = ".jj/.in-use.lock";
+const UNDO_PATH: &str = ".jj/undo.json";
+const UNDO_LOCK: &str = ".jj/.undo.lock";
+
+// The layout a Repository had while it held exactly one pool. The automatic,
+// one-time conversion reads it, verifies the result, and only then removes it.
+const LEGACY_POOL_PATH: &str = ".jj/pool.json";
+const LEGACY_POOL_DIRECTORY: &str = ".jj/pool";
+const LEGACY_IN_USE_NAME: &str = "in-use.json";
+const LEGACY_IN_USE_LOCK_NAME: &str = ".in-use.lock";
+const LEGACY_UNDO_NAME: &str = "undo.json";
+const LEGACY_UNDO_LOCK_NAME: &str = ".undo.lock";
+const MIGRATION_LOCK: &str = ".jj/.migration.lock";
 
 /// The Workspace key a repository-wide jjfx mutation is recorded under.
 ///
@@ -143,6 +169,50 @@ impl fmt::Display for WorkerId {
 }
 
 impl<'de> Deserialize<'de> for WorkerId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::parse(String::deserialize(deserializer)?).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A validated Worker Pool name that is safe as one filename component.
+///
+/// A pool is a directory (`.jj/pools/<name>/`), so its name is validated exactly
+/// as a Worker id is: a single, normal path component.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+#[serde(transparent)]
+pub struct PoolName(String);
+
+impl PoolName {
+    /// Validates a persisted Worker Pool name.
+    pub fn parse(value: impl Into<String>) -> Result<Self, IdentifierError> {
+        let value = value.into();
+        validate_component(&value, "Worker Pool")?;
+        Ok(Self(value))
+    }
+
+    /// Returns the persisted name.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for PoolName {
+    /// The pool a Repository holds when it declares none.
+    fn default() -> Self {
+        Self(DEFAULT_POOL_NAME.to_owned())
+    }
+}
+
+impl fmt::Display for PoolName {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for PoolName {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: Deserializer<'de>,
@@ -363,7 +433,7 @@ pub struct WaitingState {
 /// them nowhere else: `apply_run_result` persists only status, exit code and
 /// error, and the Run log is opened with `.truncate(true)`, so each Run
 /// overwrites the previous Run's cost data. This record is where that data is
-/// kept instead - one JSON object per line in `.jj/pool/runs.jsonl`, appended
+/// kept instead - one JSON object per line in `.jj/pools/<name>/runs.jsonl`, appended
 /// and never truncated, the same shape the Agent Runtime hooks already write.
 ///
 /// This is jjfx-owned state, deliberately kept out of the Pool and Worker
@@ -723,10 +793,17 @@ impl StateError {
     }
 }
 
-/// Repository-scoped access to all persisted Workspace Dispatch state.
+/// Access to all persisted Workspace Dispatch state for one Worker Pool.
+///
+/// A store is bound to one pool, because nearly every state path is now
+/// pool-scoped: the pool document, its Workers, Run Records, the waiting set,
+/// sessions and its locks all live under `.jj/pools/<name>/`. The
+/// repository-scoped documents - occupancy and undo - ignore the pool and stay
+/// at the root of `.jj/`.
 #[derive(Debug, Clone)]
 pub struct StateStore {
     root: PathBuf,
+    pool: PoolName,
 }
 
 /// Result of the repository-owned atomic Worker Reservation transition.
@@ -857,18 +934,18 @@ pub(crate) enum PoolAliasOutcome {
 /// Pool state repository.
 #[derive(Debug, Clone)]
 pub struct PoolStateRepository {
-    root: PathBuf,
+    directory: PathBuf,
 }
 /// Worker state repository.
 #[derive(Debug, Clone)]
 pub struct WorkerStateRepository {
-    root: PathBuf,
+    directory: PathBuf,
     worker: WorkerId,
 }
 /// Dispatch Group state repository.
 #[derive(Debug, Clone)]
 pub struct DispatchGroupStateRepository {
-    root: PathBuf,
+    directory: PathBuf,
     parent: TicketId,
 }
 /// The jjfx-owned Occupancy (in-use) state repository.
@@ -879,17 +956,17 @@ pub struct InUseStateRepository {
 /// The jjfx-owned Agent Runtime Session sidecar repository.
 #[derive(Debug, Clone)]
 pub struct SessionStateRepository {
-    root: PathBuf,
+    directory: PathBuf,
 }
 /// The jjfx-owned record of Tickets the Dispatch capacity governor held back.
 #[derive(Debug, Clone)]
 pub struct WaitingStateRepository {
-    root: PathBuf,
+    directory: PathBuf,
 }
 /// The jjfx-owned, append-only per-Run cost record store.
 #[derive(Debug, Clone)]
 pub struct RunRecordRepository {
-    root: PathBuf,
+    directory: PathBuf,
 }
 /// The jjfx-owned undo record store: the operation the repository was at before
 /// each jjfx-initiated mutation.
@@ -899,32 +976,93 @@ pub struct MutationRecordRepository {
 }
 
 impl Repository {
-    /// Opens the compatible state repository facade.
+    /// Opens the state facade for the pool a Repository holds by default.
     pub fn state_store(&self) -> StateStore {
+        self.state_store_for_pool(PoolName::default())
+    }
+
+    /// Opens the state facade for one named Worker Pool.
+    pub fn state_store_for_pool(&self, pool: PoolName) -> StateStore {
         StateStore {
             root: self.root().to_owned(),
+            pool,
         }
     }
 }
 
+/// The filename the detached orchestration runner uses for `parent`.
+fn orchestration_file_name(parent: &TicketId, extension: &str) -> String {
+    format!(
+        "orchestrate-{}.{extension}",
+        parent.as_str().to_ascii_lowercase()
+    )
+}
+
 impl StateStore {
+    /// The pool's own state directory, `.jj/pools/<name>`.
+    fn directory(&self) -> PathBuf {
+        self.root.join(POOLS_DIRECTORY).join(self.pool.as_str())
+    }
+
+    /// The structured Run log path for `worker`, inside the pool directory.
+    pub fn worker_log(&self, worker: &WorkerId) -> PathBuf {
+        self.directory().join(format!("{worker}.log"))
+    }
+
+    /// The detached orchestration runner's log path for `parent`.
+    pub fn orchestration_log(&self, parent: &TicketId) -> PathBuf {
+        self.directory()
+            .join(orchestration_file_name(parent, "log"))
+    }
+
+    /// The detached orchestration runner's lock path for `parent`.
+    pub fn orchestration_lock(&self, parent: &TicketId) -> PathBuf {
+        self.directory()
+            .join(orchestration_file_name(parent, "lock"))
+    }
+
+    /// The Worker operation lock path for `worker`.
+    pub fn worker_operation_lock(&self, worker: &WorkerId) -> PathBuf {
+        self.directory().join(format!("{worker}.workspace.lock"))
+    }
+
+    fn pool_document(&self) -> PathBuf {
+        self.directory().join(POOL_DOCUMENT)
+    }
+
+    fn pool_lock(&self) -> PathBuf {
+        self.directory().join(POOL_LOCK_NAME)
+    }
+
+    fn destroy_marker(&self) -> PathBuf {
+        self.directory().join(DESTROY_MARKER_NAME)
+    }
+
+    fn worker_path(&self, worker: &WorkerId) -> PathBuf {
+        self.directory().join(format!("{worker}.json"))
+    }
+
+    fn worker_lock(&self, worker: &WorkerId) -> PathBuf {
+        sidecar(&self.worker_path(worker))
+    }
+
     /// Opens the Worker Pool state repository.
     pub fn pool(&self) -> PoolStateRepository {
         PoolStateRepository {
-            root: self.root.clone(),
+            directory: self.directory(),
         }
     }
     /// Opens one Worker state repository.
     pub fn worker(&self, worker: WorkerId) -> WorkerStateRepository {
         WorkerStateRepository {
-            root: self.root.clone(),
+            directory: self.directory(),
             worker,
         }
     }
     /// Opens one Dispatch Group state repository.
     pub fn dispatch_group(&self, parent: TicketId) -> DispatchGroupStateRepository {
         DispatchGroupStateRepository {
-            root: self.root.clone(),
+            directory: self.directory(),
             parent,
         }
     }
@@ -939,21 +1077,21 @@ impl StateStore {
     /// Opens the jjfx-owned Agent Runtime Session sidecar repository.
     pub fn sessions(&self) -> SessionStateRepository {
         SessionStateRepository {
-            root: self.root.clone(),
+            directory: self.directory(),
         }
     }
 
     /// Opens the jjfx-owned Waiting (governor-held) Ticket repository.
     pub fn waiting(&self) -> WaitingStateRepository {
         WaitingStateRepository {
-            root: self.root.clone(),
+            directory: self.directory(),
         }
     }
 
     /// Opens the jjfx-owned, append-only per-Run cost record store.
     pub fn runs(&self) -> RunRecordRepository {
         RunRecordRepository {
-            root: self.root.clone(),
+            directory: self.directory(),
         }
     }
 
@@ -967,15 +1105,15 @@ impl StateStore {
     /// Sets or clears cosmetic Worker metadata under the compatible Pool lock.
     pub(crate) fn set_pool_profile(&self, profile: &AgentRuntimeProfile) -> Result<(), StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
-            if self.root.join(DESTROY_MARKER).exists() {
+        with_locks(&[self.pool_lock()], subject, || {
+            if self.destroy_marker().exists() {
                 return Err(StateError::new(
                     "set profile",
                     subject,
                     "Pool destruction is in progress",
                 ));
             }
-            let mut pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+            let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
                     return Err(StateError::new("set profile", subject, "state is missing"));
@@ -984,7 +1122,7 @@ impl StateStore {
             pool.agent = Some(WireAgent::new(profile.runtime().as_str()));
             pool.provider = profile.provider_value();
             pool.model = profile.model_value();
-            write_atomic(&self.root.join(POOL_PATH), &pool, subject)
+            write_atomic(&self.pool_document(), &pool, subject)
         })
     }
 
@@ -995,14 +1133,14 @@ impl StateStore {
         alias: Option<String>,
     ) -> Result<PoolAliasOutcome, StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
-            let mut pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+        with_locks(&[self.pool_lock()], subject, || {
+            let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
                     return Err(StateError::new("set alias", subject, "state is missing"));
                 }
             };
-            if self.root.join(DESTROY_MARKER).exists() {
+            if self.destroy_marker().exists() {
                 return Ok(PoolAliasOutcome::Destroying);
             }
             if !pool.workers.iter().any(|member| member == worker) {
@@ -1016,7 +1154,7 @@ impl StateStore {
                     pool.names.remove(worker);
                 }
             }
-            write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+            write_atomic(&self.pool_document(), &pool, subject)?;
             Ok(PoolAliasOutcome::Updated)
         })
     }
@@ -1024,9 +1162,9 @@ impl StateStore {
     /// Atomically detaches every current Worker while retaining durable cleanup state.
     pub(crate) fn detach_pool_for_destroy(&self) -> Result<Vec<WorkerId>, StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
-            write_destroy_marker(&self.root, subject)?;
-            let pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+        with_locks(&[self.pool_lock()], subject, || {
+            write_destroy_marker(&self.directory(), subject)?;
+            let pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => return Ok(Vec::new()),
             };
@@ -1036,27 +1174,22 @@ impl StateStore {
             let workers = pool.workers.clone();
             let mut locks = workers
                 .iter()
-                .map(|worker| {
-                    self.root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json.lock"))
-                })
+                .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
             locks.sort();
             with_locks(&locks, subject, || {
-                let mut pool =
-                    match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
-                        Loaded::Present(versioned) => versioned.value,
-                        Loaded::Missing => return Ok(Vec::new()),
-                    };
+                let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
+                    Loaded::Present(versioned) => versioned.value,
+                    Loaded::Missing => return Ok(Vec::new()),
+                };
                 let workers = pool.workers.clone();
                 for worker in &workers {
-                    write_cleanup_marker(&self.root, worker, subject)?;
+                    write_cleanup_marker(&self.directory(), worker, subject)?;
                 }
                 pool.workers.clear();
                 pool.names.clear();
                 pool.size = 0;
-                write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                write_atomic(&self.pool_document(), &pool, subject)?;
                 Ok(workers)
             })
         })
@@ -1065,9 +1198,9 @@ impl StateStore {
     /// Removes Pool state and every non-lock Pool artifact under compatible locks.
     pub(crate) fn finish_pool_destroy(&self) -> Result<(), StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
+        with_locks(&[self.pool_lock()], subject, || {
             if let Loaded::Present(pool) =
-                load_state(&self.root.join(POOL_PATH), subject, &validate_pool)?
+                load_state(&self.pool_document(), subject, &validate_pool)?
                 && !pool.value.workers.is_empty()
             {
                 return Err(StateError::new(
@@ -1076,7 +1209,7 @@ impl StateStore {
                     "Pool membership changed during destruction",
                 ));
             }
-            let directory = self.root.join(POOL_DIRECTORY);
+            let directory = self.directory();
             let entries = fs::read_dir(&directory)
                 .map_err(|error| StateError::new("inspect destroy", subject, error))?;
             let mut locks = Vec::new();
@@ -1100,7 +1233,7 @@ impl StateStore {
                     let entry = entry
                         .map_err(|error| StateError::new("inspect destroy", subject, error))?;
                     let path = entry.path();
-                    if path == self.root.join(DESTROY_MARKER)
+                    if path == self.destroy_marker()
                         || path
                             .file_name()
                             .is_some_and(|name| name.to_string_lossy().ends_with(".lock"))
@@ -1126,8 +1259,8 @@ impl StateStore {
                         ));
                     }
                 }
-                remove_file_if_present(&self.root.join(POOL_PATH), "remove", subject)?;
-                remove_file_if_present(&self.root.join(DESTROY_MARKER), "finish destroy", subject)
+                remove_file_if_present(&self.pool_document(), "remove", subject)?;
+                remove_file_if_present(&self.destroy_marker(), "finish destroy", subject)
             })
         })
     }
@@ -1139,9 +1272,9 @@ impl StateStore {
         next: PoolState,
     ) -> Result<CommitOutcome<PoolState>, StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
-            let current = load_state(&self.root.join(POOL_PATH), subject, &validate_pool)?;
-            if self.root.join(DESTROY_MARKER).exists() {
+        with_locks(&[self.pool_lock()], subject, || {
+            let current = load_state(&self.pool_document(), subject, &validate_pool)?;
+            if self.destroy_marker().exists() {
                 return Ok(CommitOutcome::Conflict(current));
             }
             let matches = matches!(
@@ -1153,9 +1286,8 @@ impl StateStore {
             }
             validate_pool(&next)
                 .map_err(|error| StateError::new("validate growth for", subject, error))?;
-            write_atomic(&self.root.join(POOL_PATH), &next, subject)?;
-            load_state(&self.root.join(POOL_PATH), subject, &validate_pool)
-                .map(CommitOutcome::Applied)
+            write_atomic(&self.pool_document(), &next, subject)?;
+            load_state(&self.pool_document(), subject, &validate_pool).map(CommitOutcome::Applied)
         })
     }
 
@@ -1167,21 +1299,18 @@ impl StateStore {
         pid: u32,
     ) -> Result<CommitOutcome<WorkerState>, StateError> {
         let subject = format!("Worker {worker}");
-        with_locks(&[self.root.join(POOL_LOCK)], &subject, || {
-            let worker_path = self
-                .root
-                .join(POOL_DIRECTORY)
-                .join(format!("{worker}.json"));
+        with_locks(&[self.pool_lock()], &subject, || {
+            let worker_path = self.worker_path(worker);
             let worker_lock = sidecar(&worker_path);
             with_locks(&[worker_lock], &subject, || {
                 let current = load_state(&worker_path, &subject, &validate_worker)?;
-                let pool = load_state(&self.root.join(POOL_PATH), "Worker Pool", &validate_pool)?;
+                let pool = load_state(&self.pool_document(), "Worker Pool", &validate_pool)?;
                 let owns_capacity = matches!(
                     pool,
                     Loaded::Present(ref versioned)
                         if versioned.value.workers.iter().any(|member| member == worker)
-                ) && !self.root.join(DESTROY_MARKER).exists()
-                    && !cleanup_marker_path(&self.root, worker).exists();
+                ) && !self.destroy_marker().exists()
+                    && !cleanup_marker_path(&self.directory(), worker).exists();
                 let revision_matches = matches!(
                     &current,
                     Loaded::Present(versioned) if versioned.revision.bytes == expected.bytes
@@ -1205,8 +1334,8 @@ impl StateStore {
         requested: usize,
     ) -> Result<PoolMembershipOutcome, StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
-            let pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+        with_locks(&[self.pool_lock()], subject, || {
+            let pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
                     return Err(StateError::new("resize", subject, "state is missing"));
@@ -1223,27 +1352,19 @@ impl StateStore {
             let selected = pool.workers[requested..].to_vec();
             let mut locks = selected
                 .iter()
-                .map(|worker| {
-                    self.root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json.lock"))
-                })
+                .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
             locks.sort();
             with_locks(&locks, subject, || {
-                let mut pool =
-                    match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
-                        Loaded::Present(versioned) => versioned.value,
-                        Loaded::Missing => {
-                            return Err(StateError::new("resize", subject, "state is missing"));
-                        }
-                    };
+                let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
+                    Loaded::Present(versioned) => versioned.value,
+                    Loaded::Missing => {
+                        return Err(StateError::new("resize", subject, "state is missing"));
+                    }
+                };
                 let mut busy = Vec::new();
                 for worker in &selected {
-                    let path = self
-                        .root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json"));
+                    let path = self.worker_path(worker);
                     match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
                         Loaded::Present(versioned) if versioned.value.status.as_str() == "busy" => {
                             busy.push(worker.clone());
@@ -1260,13 +1381,13 @@ impl StateStore {
                 pool.workers.truncate(requested);
                 pool.size = i64::try_from(requested)
                     .map_err(|_| StateError::new("resize", subject, "size is too large"))?;
-                write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                write_atomic(&self.pool_document(), &pool, subject)?;
                 // Mark the detached Workers *after* the manifest. A partial write
                 // must never leave a Pool member carrying a cleanup marker: that
                 // member would fail `persist_reserved_pid` forever, so no Run
                 // could start on it.
                 for worker in &selected {
-                    write_cleanup_marker(&self.root, worker, subject)?;
+                    write_cleanup_marker(&self.directory(), worker, subject)?;
                 }
                 Ok(PoolMembershipOutcome::Changed {
                     capacity: requested,
@@ -1282,8 +1403,8 @@ impl StateStore {
         requested: &WorkerId,
     ) -> Result<PoolMembershipOutcome, StateError> {
         let subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], subject, || {
-            let mut pool = match load_state(&self.root.join(POOL_PATH), subject, &validate_pool)? {
+        with_locks(&[self.pool_lock()], subject, || {
+            let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
                     return Err(StateError::new("remove", subject, "state is missing"));
@@ -1294,15 +1415,9 @@ impl StateStore {
                     worker: requested.clone(),
                 });
             };
-            let lock = self
-                .root
-                .join(POOL_DIRECTORY)
-                .join(format!("{requested}.json.lock"));
+            let lock = self.worker_lock(requested);
             with_locks(&[lock], subject, || {
-                let path = self
-                    .root
-                    .join(POOL_DIRECTORY)
-                    .join(format!("{requested}.json"));
+                let path = self.worker_path(requested);
                 if let Loaded::Present(versioned) =
                     load_state(&path, &format!("Worker {requested}"), &validate_worker)?
                     && versioned.value.status.as_str() == "busy"
@@ -1315,10 +1430,10 @@ impl StateStore {
                 pool.names.remove(requested);
                 pool.size = i64::try_from(pool.workers.len())
                     .map_err(|_| StateError::new("remove", subject, "size is too large"))?;
-                write_atomic(&self.root.join(POOL_PATH), &pool, subject)?;
+                write_atomic(&self.pool_document(), &pool, subject)?;
                 // As in `shrink_pool`: mark the detached Worker only after the
                 // manifest, so a failed write cannot strand a member.
-                write_cleanup_marker(&self.root, requested, subject)?;
+                write_cleanup_marker(&self.directory(), requested, subject)?;
                 Ok(PoolMembershipOutcome::Changed {
                     capacity: pool.workers.len(),
                     removed: vec![requested.clone()],
@@ -1329,7 +1444,7 @@ impl StateStore {
 
     /// Finds durable markers left by interrupted detached Worker cleanup.
     pub(crate) fn detached_cleanup_markers(&self) -> Result<Vec<WorkerId>, StateError> {
-        let directory = self.root.join(POOL_DIRECTORY);
+        let directory = self.directory();
         let entries = match fs::read_dir(&directory) {
             Ok(entries) => entries,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -1363,17 +1478,14 @@ impl StateStore {
         worker: &WorkerId,
     ) -> Result<DetachedCleanupStatus, StateError> {
         let subject = format!("Worker {worker}");
-        with_locks(&[self.root.join(POOL_LOCK)], &subject, || {
-            let worker_lock = self
-                .root
-                .join(POOL_DIRECTORY)
-                .join(format!("{worker}.json.lock"));
+        with_locks(&[self.pool_lock()], &subject, || {
+            let worker_lock = self.worker_lock(worker);
             with_locks(&[worker_lock], &subject, || {
-                let marker = cleanup_marker_path(&self.root, worker);
+                let marker = cleanup_marker_path(&self.directory(), worker);
                 if !marker.exists() {
                     return Ok(DetachedCleanupStatus::NotDetached);
                 }
-                let pool = load_state(&self.root.join(POOL_PATH), "Worker Pool", &validate_pool)?;
+                let pool = load_state(&self.pool_document(), "Worker Pool", &validate_pool)?;
                 if matches!(
                     pool,
                     Loaded::Present(ref versioned)
@@ -1382,10 +1494,7 @@ impl StateStore {
                     remove_file_if_present(&marker, "remove stale cleanup marker", &subject)?;
                     return Ok(DetachedCleanupStatus::NotDetached);
                 }
-                let path = self
-                    .root
-                    .join(POOL_DIRECTORY)
-                    .join(format!("{worker}.json"));
+                let path = self.worker_path(worker);
                 match load_state(&path, &subject, &validate_worker)? {
                     Loaded::Present(versioned) if versioned.value.status.as_str() == "busy" => {
                         Ok(DetachedCleanupStatus::Busy {
@@ -1406,13 +1515,10 @@ impl StateStore {
     /// Removes a completed cleanup marker if the Worker remains detached.
     pub(crate) fn finish_detached_cleanup(&self, worker: &WorkerId) -> Result<bool, StateError> {
         let subject = format!("Worker {worker}");
-        with_locks(&[self.root.join(POOL_LOCK)], &subject, || {
-            let worker_lock = self
-                .root
-                .join(POOL_DIRECTORY)
-                .join(format!("{worker}.json.lock"));
+        with_locks(&[self.pool_lock()], &subject, || {
+            let worker_lock = self.worker_lock(worker);
             with_locks(&[worker_lock], &subject, || {
-                let pool = load_state(&self.root.join(POOL_PATH), "Worker Pool", &validate_pool)?;
+                let pool = load_state(&self.pool_document(), "Worker Pool", &validate_pool)?;
                 if matches!(
                     pool,
                     Loaded::Present(ref versioned)
@@ -1421,7 +1527,7 @@ impl StateStore {
                     return Ok(false);
                 }
                 remove_file_if_present(
-                    &cleanup_marker_path(&self.root, worker),
+                    &cleanup_marker_path(&self.directory(), worker),
                     "finish cleanup",
                     &subject,
                 )?;
@@ -1439,23 +1545,17 @@ impl StateStore {
         profile_override: Option<AgentRuntimeProfile>,
     ) -> Result<FollowUpOutcome, StateError> {
         let pool_subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
-            let pool = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+        with_locks(&[self.pool_lock()], pool_subject, || {
+            let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => return Ok(FollowUpOutcome::WorkerNotInPool),
             };
             if !pool.workers.iter().any(|candidate| candidate == worker) {
                 return Ok(FollowUpOutcome::WorkerNotInPool);
             }
-            let worker_lock = self
-                .root
-                .join(POOL_DIRECTORY)
-                .join(format!("{worker}.json.lock"));
+            let worker_lock = self.worker_lock(worker);
             with_locks(&[worker_lock], &format!("Worker {worker}"), || {
-                let path = self
-                    .root
-                    .join(POOL_DIRECTORY)
-                    .join(format!("{worker}.json"));
+                let path = self.worker_path(worker);
                 let mut state =
                     match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
                         Loaded::Present(versioned) => versioned.value,
@@ -1520,16 +1620,15 @@ impl StateStore {
         excluded: &DispatchExclusions,
     ) -> Result<GrowReservationsOutcome, StateError> {
         let pool_subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
-            if self.root.join(DESTROY_MARKER).exists() {
+        with_locks(&[self.pool_lock()], pool_subject, || {
+            if self.destroy_marker().exists() {
                 return Err(StateError::new(
                     "grow and reserve",
                     pool_subject,
                     "Pool destruction is in progress",
                 ));
             }
-            let loaded = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)?
-            {
+            let loaded = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned,
                 Loaded::Missing => return Ok(GrowReservationsOutcome::Conflict),
             };
@@ -1541,55 +1640,52 @@ impl StateStore {
             let worker_locks = next
                 .workers
                 .iter()
-                .map(|worker| {
-                    self.root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json.lock"))
-                })
+                .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
             with_locks(&worker_locks, pool_subject, || {
-                let loaded =
-                    match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
-                        Loaded::Present(versioned) => versioned,
-                        Loaded::Missing => return Ok(GrowReservationsOutcome::Conflict),
-                    };
+                let loaded = match load_state(&self.pool_document(), pool_subject, &validate_pool)?
+                {
+                    Loaded::Present(versioned) => versioned,
+                    Loaded::Missing => return Ok(GrowReservationsOutcome::Conflict),
+                };
                 if loaded.revision() != &expected {
                     return Ok(GrowReservationsOutcome::Conflict);
                 }
-                let reserved =
-                    match reserve_batch_locked(&self.root, &next, inputs, false, excluded)? {
-                        ReservationsOutcome::Reserved {
-                            workers,
-                            unavailable,
-                        } => {
-                            debug_assert!(unavailable.is_empty());
-                            workers
-                        }
-                        ReservationsOutcome::NoIdle { available } => {
-                            return Ok(GrowReservationsOutcome::NoIdle { available });
-                        }
-                        ReservationsOutcome::WorkerNotInPool { worker }
-                        | ReservationsOutcome::WorkerNotIdle { worker }
-                        | ReservationsOutcome::WorkerNotEligible { worker } => {
-                            return Err(StateError::new(
-                                "grow and reserve",
-                                pool_subject,
-                                format!("unexpected targeted Worker {worker}"),
-                            ));
-                        }
-                        ReservationsOutcome::InvalidAgentRuntime { message } => {
-                            return Ok(GrowReservationsOutcome::InvalidAgentRuntime { message });
-                        }
-                    };
-                if let Err(primary) = write_atomic(&self.root.join(POOL_PATH), &next, pool_subject)
-                {
+                let reserved = match reserve_batch_locked(
+                    &self.directory(),
+                    &next,
+                    inputs,
+                    false,
+                    excluded,
+                )? {
+                    ReservationsOutcome::Reserved {
+                        workers,
+                        unavailable,
+                    } => {
+                        debug_assert!(unavailable.is_empty());
+                        workers
+                    }
+                    ReservationsOutcome::NoIdle { available } => {
+                        return Ok(GrowReservationsOutcome::NoIdle { available });
+                    }
+                    ReservationsOutcome::WorkerNotInPool { worker }
+                    | ReservationsOutcome::WorkerNotIdle { worker }
+                    | ReservationsOutcome::WorkerNotEligible { worker } => {
+                        return Err(StateError::new(
+                            "grow and reserve",
+                            pool_subject,
+                            format!("unexpected targeted Worker {worker}"),
+                        ));
+                    }
+                    ReservationsOutcome::InvalidAgentRuntime { message } => {
+                        return Ok(GrowReservationsOutcome::InvalidAgentRuntime { message });
+                    }
+                };
+                if let Err(primary) = write_atomic(&self.pool_document(), &next, pool_subject) {
                     let rollback_failures = reserved
                         .iter()
                         .filter_map(|reserved| {
-                            let path = self
-                                .root
-                                .join(POOL_DIRECTORY)
-                                .join(format!("{}.json", reserved.worker));
+                            let path = self.directory().join(format!("{}.json", reserved.worker));
                             write_atomic(
                                 &path,
                                 &reserved.rollback,
@@ -1643,15 +1739,15 @@ impl StateStore {
         excluded: &DispatchExclusions,
     ) -> Result<ReservationsOutcome, StateError> {
         let pool_subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
-            if self.root.join(DESTROY_MARKER).exists() {
+        with_locks(&[self.pool_lock()], pool_subject, || {
+            if self.destroy_marker().exists() {
                 return Err(StateError::new(
                     "reserve",
                     pool_subject,
                     "Pool destruction is in progress",
                 ));
             }
-            let pool = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+            let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
                     return Err(StateError::new("reserve", pool_subject, "state is missing"));
@@ -1660,25 +1756,16 @@ impl StateStore {
             let worker_locks = pool
                 .workers
                 .iter()
-                .map(|worker| {
-                    self.root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json.lock"))
-                })
+                .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
             with_locks(&worker_locks, pool_subject, || {
-                let pool =
-                    match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
-                        Loaded::Present(versioned) => versioned.value,
-                        Loaded::Missing => {
-                            return Err(StateError::new(
-                                "reserve",
-                                pool_subject,
-                                "state is missing",
-                            ));
-                        }
-                    };
-                reserve_batch_locked(&self.root, &pool, inputs, allow_partial, excluded)
+                let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
+                    Loaded::Present(versioned) => versioned.value,
+                    Loaded::Missing => {
+                        return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                    }
+                };
+                reserve_batch_locked(&self.directory(), &pool, inputs, allow_partial, excluded)
             })
         })
     }
@@ -1697,15 +1784,15 @@ impl StateStore {
         excluded: &DispatchExclusions,
     ) -> Result<ReservationOutcome, StateError> {
         let pool_subject = "Worker Pool";
-        with_locks(&[self.root.join(POOL_LOCK)], pool_subject, || {
-            if self.root.join(DESTROY_MARKER).exists() {
+        with_locks(&[self.pool_lock()], pool_subject, || {
+            if self.destroy_marker().exists() {
                 return Err(StateError::new(
                     "reserve",
                     pool_subject,
                     "Pool destruction is in progress",
                 ));
             }
-            let pool = match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
+            let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
                     return Err(StateError::new("reserve", pool_subject, "state is missing"));
@@ -1714,24 +1801,15 @@ impl StateStore {
             let worker_locks = pool
                 .workers
                 .iter()
-                .map(|worker| {
-                    self.root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json.lock"))
-                })
+                .map(|worker| self.worker_lock(worker))
                 .collect::<Vec<_>>();
             with_locks(&worker_locks, pool_subject, || {
-                let pool =
-                    match load_state(&self.root.join(POOL_PATH), pool_subject, &validate_pool)? {
-                        Loaded::Present(versioned) => versioned.value,
-                        Loaded::Missing => {
-                            return Err(StateError::new(
-                                "reserve",
-                                pool_subject,
-                                "state is missing",
-                            ));
-                        }
-                    };
+                let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
+                    Loaded::Present(versioned) => versioned.value,
+                    Loaded::Missing => {
+                        return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                    }
+                };
                 if let Some(requested) = requested
                     && !pool.workers.iter().any(|worker| worker == requested)
                 {
@@ -1770,10 +1848,7 @@ impl StateStore {
                         // An occupied Worker is not eligible capacity.
                         continue;
                     }
-                    let path = self
-                        .root
-                        .join(POOL_DIRECTORY)
-                        .join(format!("{worker}.json"));
+                    let path = self.worker_path(&worker);
                     let state =
                         match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
                             Loaded::Present(versioned) => versioned.value,
@@ -1804,8 +1879,7 @@ impl StateStore {
                 state.ticket = Some(ticket);
                 state.started_at = Some(started_at);
                 state.log_file = Some(
-                    self.root
-                        .join(POOL_DIRECTORY)
+                    self.directory()
                         .join(format!("{worker}.log"))
                         .to_string_lossy()
                         .into_owned(),
@@ -1815,10 +1889,7 @@ impl StateStore {
                 state.pid = None;
                 state.exit_code = None;
                 state.error = None;
-                let path = self
-                    .root
-                    .join(POOL_DIRECTORY)
-                    .join(format!("{worker}.json"));
+                let path = self.worker_path(&worker);
                 write_atomic(&path, &state, &format!("Worker {worker}"))?;
                 let revision =
                     match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
@@ -1843,7 +1914,7 @@ impl StateStore {
 }
 
 fn reserve_batch_locked(
-    root: &Path,
+    directory: &Path,
     pool: &PoolState,
     inputs: Vec<ReservationInput>,
     allow_partial: bool,
@@ -1875,7 +1946,7 @@ fn reserve_batch_locked(
     };
     let mut workers = Vec::with_capacity(pool.workers.len());
     for worker in &pool.workers {
-        let path = root.join(POOL_DIRECTORY).join(format!("{worker}.json"));
+        let path = directory.join(format!("{worker}.json"));
         let state = match load_state(&path, &format!("Worker {worker}"), &validate_worker)? {
             Loaded::Present(versioned) => versioned.value,
             Loaded::Missing => {
@@ -1962,7 +2033,7 @@ fn reserve_batch_locked(
         state.ticket = Some(ticket.clone());
         state.started_at = Some(input.started_at);
         state.log_file = Some(
-            root.join(POOL_DIRECTORY)
+            directory
                 .join(format!("{worker}.log"))
                 .to_string_lossy()
                 .into_owned(),
@@ -1972,7 +2043,7 @@ fn reserve_batch_locked(
         state.pid = None;
         state.exit_code = None;
         state.error = None;
-        let path = root.join(POOL_DIRECTORY).join(format!("{worker}.json"));
+        let path = directory.join(format!("{worker}.json"));
         if let Err(primary) = write_atomic(&path, &state, &format!("Worker {worker}")) {
             return Err(rollback_reservation_writes(&written, primary));
         }
@@ -2056,23 +2127,16 @@ macro_rules! repository_methods {
 repository_methods!(
     PoolStateRepository,
     PoolState,
-    |s: &PoolStateRepository| s.root.join(POOL_PATH),
-    |s: &PoolStateRepository| vec![s.root.join(POOL_LOCK)],
+    |s: &PoolStateRepository| s.directory.join(POOL_DOCUMENT),
+    |s: &PoolStateRepository| vec![s.directory.join(POOL_LOCK_NAME)],
     |_s: &PoolStateRepository| "Worker Pool".to_owned(),
     validate_pool
 );
 repository_methods!(
     WorkerStateRepository,
     WorkerState,
-    |s: &WorkerStateRepository| s
-        .root
-        .join(POOL_DIRECTORY)
-        .join(format!("{}.json", s.worker)),
-    |s: &WorkerStateRepository| vec![
-        s.root
-            .join(POOL_DIRECTORY)
-            .join(format!("{}.json.lock", s.worker))
-    ],
+    |s: &WorkerStateRepository| s.directory.join(format!("{}.json", s.worker)),
+    |s: &WorkerStateRepository| vec![s.directory.join(format!("{}.json.lock", s.worker))],
     |s: &WorkerStateRepository| format!("Worker {}", s.worker),
     validate_worker
 );
@@ -2087,8 +2151,8 @@ repository_methods!(
 repository_methods!(
     SessionStateRepository,
     SessionState,
-    |s: &SessionStateRepository| s.root.join(SESSION_PATH),
-    |s: &SessionStateRepository| vec![s.root.join(SESSION_LOCK)],
+    |s: &SessionStateRepository| s.directory.join(SESSION_NAME),
+    |s: &SessionStateRepository| vec![s.directory.join(SESSION_LOCK_NAME)],
     |_s: &SessionStateRepository| "Worker Sessions".to_owned(),
     validate_sessions
 );
@@ -2103,8 +2167,8 @@ repository_methods!(
 repository_methods!(
     WaitingStateRepository,
     WaitingState,
-    |s: &WaitingStateRepository| s.root.join(WAITING_PATH),
-    |s: &WaitingStateRepository| vec![s.root.join(WAITING_LOCK)],
+    |s: &WaitingStateRepository| s.directory.join(WAITING_NAME),
+    |s: &WaitingStateRepository| vec![s.directory.join(WAITING_LOCK_NAME)],
     |_s: &WaitingStateRepository| "Waiting Tickets".to_owned(),
     validate_waiting
 );
@@ -2127,17 +2191,20 @@ impl WaitingStateRepository {
     /// Dispatch does not rewrite the record.
     pub fn replace(&self, tickets: Vec<String>) -> Result<(), StateError> {
         let subject = "Waiting Tickets";
-        with_locks(&[self.root.join(WAITING_LOCK)], subject, || {
-            let current =
-                match load_state(&self.root.join(WAITING_PATH), subject, &validate_waiting)? {
-                    Loaded::Present(versioned) => versioned.value.tickets,
-                    Loaded::Missing => Vec::new(),
-                };
+        with_locks(&[self.directory.join(WAITING_LOCK_NAME)], subject, || {
+            let current = match load_state(
+                &self.directory.join(WAITING_NAME),
+                subject,
+                &validate_waiting,
+            )? {
+                Loaded::Present(versioned) => versioned.value.tickets,
+                Loaded::Missing => Vec::new(),
+            };
             if current == tickets {
                 return Ok(());
             }
             write_atomic(
-                &self.root.join(WAITING_PATH),
+                &self.directory.join(WAITING_NAME),
                 &WaitingState { tickets },
                 subject,
             )
@@ -2247,17 +2314,20 @@ impl SessionStateRepository {
         edit: impl FnOnce(&mut BTreeMap<WorkerId, String>) -> bool,
     ) -> Result<(), StateError> {
         let subject = "Worker Sessions";
-        with_locks(&[self.root.join(SESSION_LOCK)], subject, || {
-            let mut sessions =
-                match load_state(&self.root.join(SESSION_PATH), subject, &validate_sessions)? {
-                    Loaded::Present(versioned) => versioned.value.sessions,
-                    Loaded::Missing => BTreeMap::new(),
-                };
+        with_locks(&[self.directory.join(SESSION_LOCK_NAME)], subject, || {
+            let mut sessions = match load_state(
+                &self.directory.join(SESSION_NAME),
+                subject,
+                &validate_sessions,
+            )? {
+                Loaded::Present(versioned) => versioned.value.sessions,
+                Loaded::Missing => BTreeMap::new(),
+            };
             if !edit(&mut sessions) {
                 return Ok(());
             }
             write_atomic(
-                &self.root.join(SESSION_PATH),
+                &self.directory.join(SESSION_NAME),
                 &SessionState { sessions },
                 subject,
             )
@@ -2274,26 +2344,30 @@ impl RunRecordRepository {
     /// store is never truncated or rewritten.
     pub fn append(&self, record: &RunRecord) -> Result<(), StateError> {
         let subject = "Run Records";
-        with_locks(&[self.root.join(RUN_RECORDS_LOCK)], subject, || {
-            let mut line = serde_json::to_vec(record)
-                .map_err(|error| StateError::new("serialize", subject, error))?;
-            line.push(b'\n');
-            let path = self.root.join(RUN_RECORDS_PATH);
-            if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent).map_err(|error| {
-                    StateError::new("create store directory for", subject, error)
-                })?;
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .map_err(|error| StateError::new("open", subject, error))?;
-            file.write_all(&line)
-                .map_err(|error| StateError::new("append", subject, error))?;
-            file.sync_data()
-                .map_err(|error| StateError::new("sync", subject, error))
-        })
+        with_locks(
+            &[self.directory.join(RUN_RECORDS_LOCK_NAME)],
+            subject,
+            || {
+                let mut line = serde_json::to_vec(record)
+                    .map_err(|error| StateError::new("serialize", subject, error))?;
+                line.push(b'\n');
+                let path = self.directory.join(RUN_RECORDS_NAME);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent).map_err(|error| {
+                        StateError::new("create store directory for", subject, error)
+                    })?;
+                }
+                let mut file = OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&path)
+                    .map_err(|error| StateError::new("open", subject, error))?;
+                file.write_all(&line)
+                    .map_err(|error| StateError::new("append", subject, error))?;
+                file.sync_data()
+                    .map_err(|error| StateError::new("sync", subject, error))
+            },
+        )
     }
 
     /// Reads every recorded Run in append order.
@@ -2303,7 +2377,7 @@ impl RunRecordRepository {
     /// skipped so one bad line never hides the rest.
     pub fn records(&self) -> Result<Vec<RunRecord>, StateError> {
         let subject = "Run Records";
-        let bytes = match fs::read(self.root.join(RUN_RECORDS_PATH)) {
+        let bytes = match fs::read(self.directory.join(RUN_RECORDS_NAME)) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(StateError::new("read", subject, error)),
@@ -2399,7 +2473,7 @@ impl MutationRecordRepository {
 impl WorkerStateRepository {
     /// Reports whether Pool membership removal left a durable cleanup marker.
     pub(crate) fn cleanup_marker_exists(&self) -> bool {
-        cleanup_marker_path(&self.root, &self.worker).exists()
+        cleanup_marker_path(&self.directory, &self.worker).exists()
     }
 
     /// Removes detached Worker state and its log together under the Worker lock.
@@ -2411,10 +2485,7 @@ impl WorkerStateRepository {
         &self,
         expected: Option<StateRevision<WorkerState>>,
     ) -> Result<bool, StateError> {
-        let path = self
-            .root
-            .join(POOL_DIRECTORY)
-            .join(format!("{}.json", self.worker));
+        let path = self.directory.join(format!("{}.json", self.worker));
         let subject = format!("Worker {}", self.worker);
         with_locks(&[sidecar(&path)], &subject, || {
             let current = load_state(&path, &subject, &validate_worker)?;
@@ -2426,10 +2497,7 @@ impl WorkerStateRepository {
             {
                 return Ok(false);
             }
-            let log = self
-                .root
-                .join(POOL_DIRECTORY)
-                .join(format!("{}.log", self.worker));
+            let log = self.directory.join(format!("{}.log", self.worker));
             for target in [&log, &path] {
                 match fs::remove_file(target) {
                     Ok(()) => {}
@@ -2444,7 +2512,7 @@ impl WorkerStateRepository {
 
 impl DispatchGroupStateRepository {
     fn path(&self) -> PathBuf {
-        self.root.join(POOL_DIRECTORY).join(format!(
+        self.directory.join(format!(
             "dispatch-{}.json",
             self.parent.as_str().to_lowercase()
         ))
@@ -2468,7 +2536,7 @@ impl DispatchGroupStateRepository {
         let subject = format!("Dispatch Group {}", self.parent);
         commit_state(
             &path,
-            &[self.root.join(POOL_LOCK), sidecar(&path)],
+            &[self.directory.join(POOL_LOCK_NAME), sidecar(&path)],
             &subject,
             expected,
             change,
@@ -2477,13 +2545,283 @@ impl DispatchGroupStateRepository {
     }
 }
 
-fn cleanup_marker_path(root: &Path, worker: &WorkerId) -> PathBuf {
-    root.join(POOL_DIRECTORY)
-        .join(format!("{worker}{CLEANUP_SUFFIX}"))
+fn cleanup_marker_path(directory: &Path, worker: &WorkerId) -> PathBuf {
+    directory.join(format!("{worker}{CLEANUP_SUFFIX}"))
 }
 
-fn write_destroy_marker(root: &Path, subject: &str) -> Result<(), StateError> {
-    let marker = root.join(DESTROY_MARKER);
+/// Converts a Repository's single-pool legacy layout to the per-pool layout.
+///
+/// The legacy layout held exactly one pool: the document `.jj/pool.json` beside
+/// the directory `.jj/pool/`. This builds the new layout - the pool document and
+/// everything pool-scoped under `.jj/pools/default/`, with the repository-scoped
+/// documents (`in-use.json`, `undo.json` and their locks) moving to `.jj/` -
+/// **verifies** the result, and only then removes the old layout.
+///
+/// The conversion copies before it removes, and refuses if it cannot verify the
+/// result: a Repository whose new layout cannot be proven complete and readable
+/// is left exactly as it was, and the failure is loud. A Worker Pool is never
+/// destroyed by a conversion that could not finish. It is safe to run
+/// concurrently - a repository-wide lock serialises it - and safe to re-run,
+/// because a destination that already holds the source bytes is accepted.
+pub(crate) fn convert_legacy_layout(root: &Path) -> Result<(), StateError> {
+    if !legacy_layout_present(root) {
+        return Ok(());
+    }
+    let subject = "Worker Pool state conversion";
+    with_locks(&[root.join(MIGRATION_LOCK)], subject, || {
+        // Another process may have converted between the check above and the
+        // lock being taken.
+        if !legacy_layout_present(root) {
+            return Ok(());
+        }
+        let destination = root.join(POOLS_DIRECTORY).join(DEFAULT_POOL_NAME);
+        copy_legacy_document(root, &destination, subject)?;
+        copy_legacy_directory(root, &destination, subject)?;
+        verify_conversion(root, &destination, subject)?;
+        remove_legacy_layout(root, subject)
+    })
+}
+
+/// The names of pool directories under `.jj/pools/` that `declared` does not
+/// claim.
+///
+/// A directory that appeared without a declaration is either a crash's
+/// leftovers or a hand-edit, so jjfx reports it and leaves it: it is never
+/// adopted as a pool, and it never blocks another pool.
+fn orphan_pool_directories(
+    root: &Path,
+    declared: &BTreeSet<PoolName>,
+) -> Result<Vec<PoolName>, StateError> {
+    let subject = "Worker Pool directories";
+    let entries = match fs::read_dir(root.join(POOLS_DIRECTORY)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(StateError::new("inspect", subject, error)),
+    };
+    let mut orphans = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| StateError::new("inspect", subject, error))?;
+        let is_directory = entry
+            .file_type()
+            .map_err(|error| StateError::new("inspect", subject, error))?
+            .is_dir();
+        if !is_directory {
+            continue;
+        }
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        // A directory whose name is not a valid pool name cannot name a pool, so
+        // it is not an orphan to report either.
+        let Ok(name) = PoolName::parse(name) else {
+            continue;
+        };
+        if !declared.contains(&name) {
+            orphans.push(name);
+        }
+    }
+    orphans.sort();
+    Ok(orphans)
+}
+
+impl Repository {
+    /// Names of pool directories under `.jj/pools/` that no declaration claims.
+    pub fn orphan_pool_directories(
+        &self,
+        declared: &BTreeSet<PoolName>,
+    ) -> Result<Vec<PoolName>, StateError> {
+        orphan_pool_directories(self.root(), declared)
+    }
+}
+
+fn legacy_layout_present(root: &Path) -> bool {
+    root.join(LEGACY_POOL_PATH).is_file() || root.join(LEGACY_POOL_DIRECTORY).is_dir()
+}
+
+fn copy_legacy_document(root: &Path, destination: &Path, subject: &str) -> Result<(), StateError> {
+    let source = root.join(LEGACY_POOL_PATH);
+    if !source.is_file() {
+        return Ok(());
+    }
+    copy_verified(&source, &destination.join(POOL_DOCUMENT), subject)
+}
+
+fn copy_legacy_directory(root: &Path, destination: &Path, subject: &str) -> Result<(), StateError> {
+    let legacy = root.join(LEGACY_POOL_DIRECTORY);
+    let entries = match fs::read_dir(&legacy) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(StateError::new("read", subject, error)),
+    };
+    for entry in entries {
+        let entry = entry.map_err(|error| StateError::new("read", subject, error))?;
+        let name = entry.file_name();
+        let target = legacy_destination(root, destination, &name);
+        copy_verified(&entry.path(), &target, subject)?;
+    }
+    Ok(())
+}
+
+/// Where a legacy `.jj/pool/` entry belongs in the new layout.
+///
+/// Occupancy and undo are repository-scoped, so they move to the root of `.jj/`;
+/// everything else is the pool's and moves under the pool directory. The
+/// filename is unchanged in both cases.
+fn legacy_destination(root: &Path, destination: &Path, name: &OsStr) -> PathBuf {
+    if matches!(
+        name.to_str(),
+        Some(
+            LEGACY_IN_USE_NAME | LEGACY_IN_USE_LOCK_NAME | LEGACY_UNDO_NAME | LEGACY_UNDO_LOCK_NAME
+        )
+    ) {
+        root.join(STATE_ROOT).join(name)
+    } else {
+        destination.join(name)
+    }
+}
+
+/// Copies `source` to `destination` and verifies the copy byte for byte.
+///
+/// A destination that already holds the same bytes is accepted, so a conversion
+/// interrupted between the copy and the removal can be re-run. A destination
+/// that exists with *different* bytes is refused: jjfx cannot know which copy is
+/// authoritative, and overwriting either would destroy state.
+fn copy_verified(source: &Path, destination: &Path, subject: &str) -> Result<(), StateError> {
+    let metadata =
+        fs::symlink_metadata(source).map_err(|error| StateError::new("read", subject, error))?;
+    if metadata.is_dir() {
+        fs::create_dir_all(destination)
+            .map_err(|error| StateError::new("create directory for", subject, error))?;
+        let entries =
+            fs::read_dir(source).map_err(|error| StateError::new("read", subject, error))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| StateError::new("read", subject, error))?;
+            copy_verified(&entry.path(), &destination.join(entry.file_name()), subject)?;
+        }
+        return Ok(());
+    }
+    let bytes = fs::read(source).map_err(|error| StateError::new("read", subject, error))?;
+    match fs::read(destination) {
+        Ok(existing) if existing == bytes => return Ok(()),
+        Ok(_) => {
+            return Err(StateError::new(
+                "convert",
+                subject,
+                format!(
+                    "{} already exists with different content",
+                    destination.display()
+                ),
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(StateError::new("read", subject, error)),
+    }
+    write_bytes_atomic(destination, &bytes, subject)?;
+    let written =
+        fs::read(destination).map_err(|error| StateError::new("verify", subject, error))?;
+    if written != bytes {
+        return Err(StateError::new(
+            "verify",
+            subject,
+            format!(
+                "{} does not match {}",
+                destination.display(),
+                source.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Proves the new layout holds everything the legacy layout did, and that the
+/// pool document it holds is readable, before anything is removed.
+fn verify_conversion(root: &Path, destination: &Path, subject: &str) -> Result<(), StateError> {
+    let document = root.join(LEGACY_POOL_PATH);
+    if document.is_file() {
+        verify_copy(&document, &destination.join(POOL_DOCUMENT), subject)?;
+    }
+    let legacy = root.join(LEGACY_POOL_DIRECTORY);
+    if legacy.is_dir() {
+        verify_legacy_directory(&legacy, root, destination, subject)?;
+    }
+    let pool_document = destination.join(POOL_DOCUMENT);
+    if pool_document.is_file() {
+        load_state(&pool_document, subject, &validate_pool)?;
+    }
+    Ok(())
+}
+
+fn verify_legacy_directory(
+    legacy: &Path,
+    root: &Path,
+    destination: &Path,
+    subject: &str,
+) -> Result<(), StateError> {
+    let entries =
+        fs::read_dir(legacy).map_err(|error| StateError::new("verify", subject, error))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| StateError::new("verify", subject, error))?;
+        let path = entry.path();
+        let is_directory = entry
+            .file_type()
+            .map_err(|error| StateError::new("verify", subject, error))?
+            .is_dir();
+        if is_directory {
+            verify_legacy_directory(
+                &path,
+                root,
+                &legacy_destination(root, destination, &entry.file_name()),
+                subject,
+            )?;
+        } else {
+            verify_copy(
+                &path,
+                &legacy_destination(root, destination, &entry.file_name()),
+                subject,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn verify_copy(source: &Path, destination: &Path, subject: &str) -> Result<(), StateError> {
+    let bytes = fs::read(source).map_err(|error| StateError::new("verify", subject, error))?;
+    let copied =
+        fs::read(destination).map_err(|error| StateError::new("verify", subject, error))?;
+    if copied != bytes {
+        return Err(StateError::new(
+            "verify",
+            subject,
+            format!(
+                "{} does not match {}",
+                destination.display(),
+                source.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Removes the legacy layout once the new one has been verified.
+fn remove_legacy_layout(root: &Path, subject: &str) -> Result<(), StateError> {
+    remove_file_if_present(
+        &root.join(LEGACY_POOL_PATH),
+        "remove legacy pool document",
+        subject,
+    )?;
+    match fs::remove_dir_all(root.join(LEGACY_POOL_DIRECTORY)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(StateError::new(
+            "remove legacy pool directory",
+            subject,
+            error,
+        )),
+    }
+}
+
+fn write_destroy_marker(directory: &Path, subject: &str) -> Result<(), StateError> {
+    let marker = directory.join(DESTROY_MARKER_NAME);
     let file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -2494,8 +2832,12 @@ fn write_destroy_marker(root: &Path, subject: &str) -> Result<(), StateError> {
         .map_err(|error| StateError::new("sync destroy marker", subject, error))
 }
 
-fn write_cleanup_marker(root: &Path, worker: &WorkerId, subject: &str) -> Result<(), StateError> {
-    let marker = cleanup_marker_path(root, worker);
+fn write_cleanup_marker(
+    directory: &Path,
+    worker: &WorkerId,
+    subject: &str,
+) -> Result<(), StateError> {
+    let marker = cleanup_marker_path(directory, worker);
     let file = OpenOptions::new()
         .create(true)
         .truncate(true)
@@ -2617,7 +2959,11 @@ fn write_atomic<T: Serialize>(path: &Path, value: &T, subject: &str) -> Result<(
     let mut bytes = serde_json::to_vec_pretty(value)
         .map_err(|error| StateError::new("serialize", subject, error))?;
     bytes.push(b'\n');
-    atomic::write_atomic_bytes(path, &bytes).map_err(|error| match &error {
+    write_bytes_atomic(path, &bytes, subject)
+}
+
+fn write_bytes_atomic(path: &Path, bytes: &[u8], subject: &str) -> Result<(), StateError> {
+    atomic::write_atomic_bytes(path, bytes).map_err(|error| match &error {
         AtomicWriteError::MissingParent => {
             StateError::new("replace", subject, "state path has no parent")
         }
@@ -2746,7 +3092,7 @@ mod tests {
         assert_eq!(records[1].cost_micro_usd, Some(200));
 
         // The store is never truncated: the raw file still carries both lines.
-        let bytes = fs::read(store.root.join(RUN_RECORDS_PATH)).expect("store bytes");
+        let bytes = fs::read(store.directory.join(RUN_RECORDS_NAME)).expect("store bytes");
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
     }
 
@@ -2825,7 +3171,7 @@ mod tests {
         store
             .append(&record("worker-01", "worker-01@1", Some(100)))
             .expect("append");
-        let path = store.root.join(RUN_RECORDS_PATH);
+        let path = store.directory.join(RUN_RECORDS_NAME);
         let mut bytes = fs::read(&path).expect("store bytes");
         bytes.extend_from_slice(b"{\"torn\":");
         bytes.push(b'\n');

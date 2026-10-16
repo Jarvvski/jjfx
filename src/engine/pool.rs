@@ -599,11 +599,7 @@ impl WorkerPool {
         profile: AgentRuntimeProfile,
     ) -> Result<(Reservation, Option<PathBuf>), WorkerPoolError> {
         let started_at = current_timestamp()?;
-        let log_path = self
-            .repository
-            .root()
-            .join(".jj/pool")
-            .join(format!("{worker}.log"));
+        let log_path = self.repository.state_store().worker_log(worker);
         match self.repository.state_store().begin_follow_up(
             worker,
             started_at,

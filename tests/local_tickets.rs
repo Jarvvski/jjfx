@@ -74,7 +74,7 @@ fn jj_repository() -> (TempDir, TempDir) {
 /// local Ticket writeback resolves from - and the only signal left after `pool
 /// reset` clears a Worker's Ticket association.
 fn write_run_record(root: &Path, ticket: &str) {
-    let pool = root.join(".jj").join("pool");
+    let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");
     let line = format!(
         "{{\"run_id\":\"worker-1@2026-01-01T00:00:00Z\",\"worker\":\"worker-1\",\

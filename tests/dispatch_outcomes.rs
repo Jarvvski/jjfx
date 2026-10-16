@@ -284,7 +284,9 @@ fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
     );
     let json = stdout(&output);
     assert!(json.contains("\"outcome\": \"orchestrating\""), "{json}");
-    let log = fixture.path().join(".jj/pool/orchestrate-gadgets.log");
+    let log = fixture
+        .path()
+        .join(".jj/pools/default/orchestrate-gadgets.log");
     assert!(
         json.contains(&log.display().to_string()),
         "the JSON must name the child log:\n{json}"

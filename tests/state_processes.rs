@@ -268,7 +268,7 @@ fn independent_rust_repository_writers_detect_lost_updates() {
 #[test]
 fn an_independent_rust_process_serializes_pool_commits() {
     let (temp, repository) = repository();
-    let lock = temp.path().join(".jj/pool/.dispatch.lock");
+    let lock = temp.path().join(".jj/pools/default/.dispatch.lock");
     let ready = temp.path().join("ready");
     let mut command = Command::new(env::current_exe().expect("test executable"));
     command
@@ -314,7 +314,7 @@ fn an_independent_rust_process_serializes_pool_commits() {
 #[test]
 fn an_independent_rust_process_serializes_worker_commits() {
     let (temp, repository) = repository();
-    let lock = temp.path().join(".jj/pool/worker-01.json.lock");
+    let lock = temp.path().join(".jj/pools/default/worker-01.json.lock");
     let ready = temp.path().join("worker-ready");
     let mut command = Command::new(env::current_exe().expect("test executable"));
     command
@@ -358,7 +358,9 @@ fn an_independent_rust_process_serializes_worker_commits() {
 #[test]
 fn an_independent_rust_process_serializes_dispatch_group_commits() {
     let (temp, repository) = repository();
-    let lock = temp.path().join(".jj/pool/dispatch-eng-100.json.lock");
+    let lock = temp
+        .path()
+        .join(".jj/pools/default/dispatch-eng-100.json.lock");
     let ready = temp.path().join("group-ready");
     let mut command = Command::new(env::current_exe().expect("test executable"));
     command

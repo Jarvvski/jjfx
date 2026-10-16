@@ -3979,10 +3979,10 @@ mod tests {
     #[test]
     fn ticket_input_preserves_order_until_dispatch_preview() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
@@ -4016,10 +4016,10 @@ mod tests {
     /// A one-Worker Pool whose only Worker is recorded as open in a terminal.
     fn occupied_pool_snapshot() -> crate::engine::WorkerPoolSnapshot {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
         )
         .unwrap();
@@ -4160,10 +4160,10 @@ mod tests {
     #[test]
     fn pool_send_editor_submits_a_prompt_without_blocking_input() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"},"agent":"claude"}"#,
         )
         .unwrap();
@@ -4246,10 +4246,10 @@ mod tests {
     #[test]
     fn pool_any_send_editor_submits_without_a_worker_target() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{},"agent":"claude"}"#,
         )
         .unwrap();
@@ -4312,10 +4312,10 @@ mod tests {
     #[test]
     fn pool_any_send_requires_an_idle_worker() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{},"agent":"claude"}"#,
         )
         .unwrap();
@@ -4410,16 +4410,16 @@ mod tests {
     #[test]
     fn pool_profile_renders_runtime_capability_without_provider_details() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-08-17T10:00:00Z","agent":"codex","provider":"openai","model":"gpt-5.4"}"#,
         )
         .unwrap();
         std::fs::write(
             pool.join("worker-01.json"),
-            br#"{"status":"busy","agent":"codex","provider":"openai","model":"gpt-5.4","ticket":"ENG-42","pid":42,"started_at":"2026-08-17T10:00:00Z","completed_at":null,"log_file":".jj/pool/worker-01.log","branch_name":"eng-42","exit_code":null,"error":null}"#,
+            br#"{"status":"busy","agent":"codex","provider":"openai","model":"gpt-5.4","ticket":"ENG-42","pid":42,"started_at":"2026-08-17T10:00:00Z","completed_at":null,"log_file":".jj/pools/default/worker-01.log","branch_name":"eng-42","exit_code":null,"error":null}"#,
         )
         .unwrap();
         let mut app = app_with(&["default", "worker-01"]);
@@ -4451,10 +4451,10 @@ mod tests {
     #[test]
     fn pool_worker_actions_use_keys_confirmation_and_visible_results() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"},"agent":"claude"}"#,
         )
         .unwrap();
@@ -4607,10 +4607,10 @@ mod tests {
     #[test]
     fn pool_permission_key_chooses_a_decision_and_answers_through_the_controller() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","agent":"opencode"}"#,
         )
         .unwrap();
@@ -5144,10 +5144,10 @@ mod tests {
     #[test]
     fn pool_capacity_input_survives_refresh_and_cancel_submits_no_resize() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
@@ -5247,10 +5247,10 @@ mod tests {
     #[test]
     fn idle_unassigned_worker_workspace_stays_on_one_line_without_placeholders() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
@@ -5298,10 +5298,10 @@ mod tests {
     #[test]
     fn active_pool_editor_folds_refresh_and_renders_worker_lifecycle() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
@@ -5358,10 +5358,10 @@ mod tests {
     #[test]
     fn narrow_workspace_rows_keep_worker_identity_status_and_ticket() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
@@ -5397,16 +5397,16 @@ mod tests {
     #[test]
     fn worker_pool_snapshot_joins_by_workspace_and_renders_worker_metadata() {
         let temp = tempfile::tempdir().unwrap();
-        let pool = temp.path().join(".jj/pool");
+        let pool = temp.path().join(".jj/pools/default");
         std::fs::create_dir_all(&pool).unwrap();
         std::fs::write(
-            temp.path().join(".jj/pool.json"),
+            temp.path().join(".jj/pools/default/pool.json"),
             br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{"worker-01":"alpha"}}"#,
         )
         .unwrap();
         std::fs::write(
             pool.join("worker-01.json"),
-            br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":"2026-07-21T10:00:00Z","completed_at":null,"log_file":"/repo/.jj/pool/worker-01.log","branch_name":"eng-101","exit_code":null,"error":null}"#,
+            br#"{"status":"busy","agent":"claude","ticket":"ENG-101","pid":null,"started_at":"2026-07-21T10:00:00Z","completed_at":null,"log_file":"/repo/.jj/pools/default/worker-01.log","branch_name":"eng-101","exit_code":null,"error":null}"#,
         )
         .unwrap();
         let snapshot = crate::engine::Repository::open(temp.path())

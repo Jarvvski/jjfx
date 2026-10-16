@@ -1,7 +1,7 @@
 # Persist a directory per pool, converting an existing one
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -24,12 +24,12 @@ The persisted state was built for exactly one pool: a pool document at `.jj/pool
 
 ## Acceptance Criteria
 
-- [ ] State lives at `.jj/pools/<name>/`, with `ws-cache` and `undo.json` still at `.jj/`.
-- [ ] An existing Repository converts automatically on first access, and the conversion is verified before the old layout is removed.
-- [ ] A conversion that cannot be verified leaves the old layout intact and fails loudly.
-- [ ] No `.jj/pools.json` is written or read.
-- [ ] An orphan pool directory is reported, not adopted.
-- [ ] `mise run check` is green.
+- [x] State lives at `.jj/pools/<name>/`, with `ws-cache` and `undo.json` still at `.jj/`.
+- [x] An existing Repository converts automatically on first access, and the conversion is verified before the old layout is removed.
+- [x] A conversion that cannot be verified leaves the old layout intact and fails loudly.
+- [x] No `.jj/pools.json` is written or read.
+- [x] An orphan pool directory is reported, not adopted.
+- [x] `mise run check` is green.
 
 ## References
 

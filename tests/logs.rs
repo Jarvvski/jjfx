@@ -42,7 +42,8 @@ fn jj_repository() -> (TempDir, TempDir) {
 
 /// Writes the Pool manifest naming `workers`.
 fn write_manifest(root: &Path, workers: &[&str]) {
-    fs::create_dir_all(root.join(".jj").join("pool")).expect("pool directory");
+    let pool = root.join(".jj").join("pools").join("default");
+    fs::create_dir_all(&pool).expect("pool directory");
     let manifest = serde_json::json!({
         "created_at": "2026-07-27T10:00:00Z",
         "gh_repo": "Jarvvski/jjfx",
@@ -51,19 +52,19 @@ fn write_manifest(root: &Path, workers: &[&str]) {
         "workers": workers,
     });
     fs::write(
-        root.join(".jj").join("pool.json"),
+        pool.join("pool.json"),
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("pool manifest");
 }
 
 /// Writes one Worker state document with the given status, pointing its log at
-/// `<root>/.jj/pool/<id>.log` and writing `log` there when given.
+/// `<root>/.jj/pools/default/<id>.log` and writing `log` there when given.
 ///
 /// The state is replaced by rename, so a reader never observes a half-written
 /// document and mistakes the Worker for one that has left the Pool.
 fn write_worker(root: &Path, id: &str, status: &str, log: Option<&str>) {
-    let pool = root.join(".jj").join("pool");
+    let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");
     let log_path = pool.join(format!("{id}.log"));
     if let Some(contents) = log {
@@ -95,7 +96,7 @@ fn write_worker(root: &Path, id: &str, status: &str, log: Option<&str>) {
 /// fields cleared, including `log_file`. The log file the abandoned Run wrote is
 /// left in place, as a Reset leaves it.
 fn write_idle_worker(root: &Path, id: &str) {
-    let pool = root.join(".jj").join("pool");
+    let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");
     let state = serde_json::json!({
         "agent": null,
@@ -210,12 +211,18 @@ fn spawn_following(mut command: Command) -> (Child, FollowWatcher) {
 
 /// The Worker state path, for a test that removes it mid-follow.
 fn worker_state(root: &Path, id: &str) -> std::path::PathBuf {
-    root.join(".jj").join("pool").join(format!("{id}.json"))
+    root.join(".jj")
+        .join("pools")
+        .join("default")
+        .join(format!("{id}.json"))
 }
 
 /// The Worker log path, for a test that removes it mid-follow.
 fn worker_log(root: &Path, id: &str) -> std::path::PathBuf {
-    root.join(".jj").join("pool").join(format!("{id}.log"))
+    root.join(".jj")
+        .join("pools")
+        .join("default")
+        .join(format!("{id}.log"))
 }
 
 #[test]

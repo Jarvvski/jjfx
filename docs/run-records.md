@@ -8,14 +8,15 @@ only a Worker's most recent Run would survive.
 
 ## Where it lives
 
-The store is `.jj/pool/runs.jsonl`, beside jjfx's other owned state
-(`sessions.json`, `in-use.json`). It is jjfx-owned and deliberately kept out of
-the Pool and Worker documents.
+The store is `.jj/pools/<name>/runs.jsonl`, inside the pool's own state
+directory. It is jjfx-owned and deliberately kept out of the Pool and Worker
+documents.
 
 It is one JSON object per line, in append order. The store is **append-only and
 never truncated or rewritten**: each line is written under the store's own
-sidecar lock (`.jj/pool/.runs.lock`) and flushed before the lock is released, so
-concurrent Workers append whole records rather than interleaving a partial line.
+sidecar lock (`.jj/pools/<name>/.runs.lock`) and flushed before the lock is
+released, so concurrent Workers append whole records rather than interleaving a
+partial line.
 
 A line that cannot be decoded - a torn tail from a process that died mid-append,
 or a foreign writer - is skipped when reading, so one bad line never hides the
@@ -50,7 +51,7 @@ The store is readable without the TUI. It is the input to the pool cost/usage
 view, and to anything else that needs Run history:
 
 ```bash
-jq -s 'map(.cost_micro_usd // 0) | add / 1000000' .jj/pool/runs.jsonl
+jq -s 'map(.cost_micro_usd // 0) | add / 1000000' .jj/pools/<name>/runs.jsonl
 ```
 
 Because the store is append-only and carries `completed_at`, a reader can total

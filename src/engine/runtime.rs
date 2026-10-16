@@ -840,9 +840,8 @@ impl RunCompletion {
         let log_path = self
             .reservation
             .repository()
-            .root()
-            .join(".jj/pool")
-            .join(format!("{worker}.log"));
+            .state_store()
+            .worker_log(&worker);
         let (result, source) = result_for_completion(
             &log_path,
             self.reservation.agent_runtime(),
@@ -1147,10 +1146,7 @@ fn reserved_request(reservation: &Reservation, invocation: AgentRuntimeInvocatio
         reservation.agent_runtime(),
         invocation,
         crate::engine::workspace::worker_path(repository.root(), &worker_id),
-        repository
-            .root()
-            .join(".jj/pool")
-            .join(format!("{worker_id}.log")),
+        repository.state_store().worker_log(&worker_id),
     )
 }
 

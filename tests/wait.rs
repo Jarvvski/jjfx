@@ -64,7 +64,8 @@ fn jj_repository() -> (TempDir, TempDir) {
 
 /// Writes the Pool manifest naming `workers`.
 fn write_manifest(root: &Path, workers: &[&str]) {
-    fs::create_dir_all(root.join(".jj").join("pool")).expect("pool directory");
+    let pool = root.join(".jj").join("pools").join("default");
+    fs::create_dir_all(&pool).expect("pool directory");
     let manifest = serde_json::json!({
         "created_at": "2026-07-27T10:00:00Z",
         "gh_repo": "Jarvvski/jjfx",
@@ -73,7 +74,7 @@ fn write_manifest(root: &Path, workers: &[&str]) {
         "workers": workers,
     });
     fs::write(
-        root.join(".jj").join("pool.json"),
+        pool.join("pool.json"),
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("pool manifest");
@@ -81,7 +82,8 @@ fn write_manifest(root: &Path, workers: &[&str]) {
 
 /// Writes one Worker state document with the given status and Ticket.
 fn write_worker(root: &Path, id: &str, status: &str, ticket: Option<&str>) {
-    fs::create_dir_all(root.join(".jj").join("pool")).expect("pool directory");
+    let pool = root.join(".jj").join("pools").join("default");
+    fs::create_dir_all(&pool).expect("pool directory");
     let exit_code = match status {
         "done" => Some(0),
         "failed" => Some(1),
@@ -93,14 +95,17 @@ fn write_worker(root: &Path, id: &str, status: &str, ticket: Option<&str>) {
         "completed_at": matches!(status, "done" | "failed").then_some("2026-07-27T10:10:00Z"),
         "error": (status == "failed").then_some("the Run failed"),
         "exit_code": exit_code,
-        "log_file": format!("/repo/.jj/pool/{id}.log"),
+        "log_file": format!("/repo/.jj/pools/default/{id}.log"),
         "pid": null,
         "started_at": (status != "idle").then_some("2026-07-27T10:02:00Z"),
         "status": status,
         "ticket": ticket,
     });
     fs::write(
-        root.join(".jj").join("pool").join(format!("{id}.json")),
+        root.join(".jj")
+            .join("pools")
+            .join("default")
+            .join(format!("{id}.json")),
         serde_json::to_vec(&state).expect("worker json"),
     )
     .expect("worker state");
@@ -109,12 +114,13 @@ fn write_worker(root: &Path, id: &str, status: &str, ticket: Option<&str>) {
 /// Appends one succeeded Run Record, the durable completion signal a local
 /// Ticket writeback resolves from.
 fn write_run_record(root: &Path, worker: &str, ticket: &str) {
-    fs::create_dir_all(root.join(".jj").join("pool")).expect("pool directory");
+    let pool = root.join(".jj").join("pools").join("default");
+    fs::create_dir_all(&pool).expect("pool directory");
     let line = format!(
         "{{\"run_id\":\"{worker}@2026-01-01T00:00:00Z\",\"worker\":\"{worker}\",\
          \"ticket\":\"{ticket}\",\"conclusion\":\"succeeded\"}}\n"
     );
-    fs::write(root.join(".jj").join("pool").join("runs.jsonl"), line).expect("run record");
+    fs::write(pool.join("runs.jsonl"), line).expect("run record");
 }
 
 /// Writes one local Ticket file under `<root>/.scratch/<feature>/issues/`.
