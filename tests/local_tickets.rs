@@ -250,7 +250,7 @@ fn dispatch_all_with_a_local_source_discovers_from_scratch() {
 }
 
 #[test]
-fn dispatch_all_json_reports_an_empty_batch_as_an_empty_array() {
+fn dispatch_all_json_explains_an_empty_repository() {
     let repository = TempDir::new().expect("temporary repository");
     let status = Command::new("jj")
         .args([
@@ -280,7 +280,24 @@ fn dispatch_all_json_reports_an_empty_batch_as_an_empty_array() {
     );
 
     assert!(output.status.success(), "{:?}", output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+    // A repository with no Tickets is not a bare `[]`: the batch names the
+    // search - the label it looked for and the root it looked under - so a
+    // caller can tell an empty repository from a wrong root or a stray label.
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("valid JSON");
+    let entries = value.as_array().expect("an array");
+    let search = entries
+        .iter()
+        .find(|entry| entry["ticket"].is_null())
+        .expect("a search entry");
+    assert_eq!(search["outcome"], "skipped");
+    assert_eq!(search["label"], "ready-for-agent");
+    assert!(
+        search["root"]
+            .as_str()
+            .is_some_and(|root| root.ends_with(".scratch")),
+        "{value}"
+    );
 }
 
 #[test]
@@ -378,7 +395,17 @@ fn dispatch_all_with_an_empty_ready_set_reconciles_finished_tickets() {
     );
 
     assert!(output.status.success(), "{:?}", output);
-    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+    // The batch explains the empty ready set rather than printing a bare `[]`.
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("valid JSON");
+    assert!(
+        value
+            .as_array()
+            .expect("an array")
+            .iter()
+            .any(|entry| entry["ticket"].is_null() && entry["label"] == "ready-for-agent"),
+        "{value}"
+    );
     assert!(
         ticket_status(repository.path(), "widgets", "01-foundation.md")
             .contains("Status: resolved"),

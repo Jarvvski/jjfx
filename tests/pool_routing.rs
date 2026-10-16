@@ -563,3 +563,88 @@ fn pools_that_declare_no_label_keep_the_refusal() {
     assert!(error.contains("features"), "{error}");
     assert!(error.contains("--pool"), "{error}");
 }
+
+/// A fan-out that finds nothing names every label it searched and the root it
+/// searched under, so the empty batch explains itself instead of printing a
+/// bare `[]`.
+#[test]
+fn a_fan_out_that_finds_nothing_names_every_searched_label() {
+    let fixture = RoutingFixture::new();
+    declare_two_lanes(&fixture);
+    // No Tickets at all: every lane's search comes up empty.
+    let output = fixture.jjfx(&["dispatch", "--all", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    let entries = json.as_array().expect("a batch");
+    let searches = entries
+        .iter()
+        .filter(|entry| entry["ticket"].is_null())
+        .collect::<Vec<_>>();
+    let labels = searches
+        .iter()
+        .filter_map(|entry| entry["label"].as_str())
+        .collect::<Vec<_>>();
+    assert!(labels.contains(&"bug"), "{json}");
+    assert!(labels.contains(&"features"), "{json}");
+    // Every search names the same root it looked under.
+    for search in searches {
+        assert_eq!(search["outcome"], "skipped");
+        assert!(
+            search["root"]
+                .as_str()
+                .is_some_and(|root| root.ends_with(".scratch")),
+            "{json}"
+        );
+    }
+}
+
+/// A pool-scoped `--all` that finds nothing names that lane's own label, exactly
+/// as the single-pool path names the global one.
+#[test]
+fn a_pool_scoped_empty_ready_set_carries_that_lanes_label() {
+    let fixture = RoutingFixture::new();
+    declare_two_lanes(&fixture);
+    // A Ticket no lane routes: found by discovery, routed nowhere.
+    fixture.write_ticket(
+        "01-ui.md",
+        "# Polish the panel\n\nStatus: ready-for-agent\nLabels: ui\n\n## Problem\n\nDo it.\n",
+    );
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--pool", "bugs", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    let entries = json.as_array().expect("a batch");
+    let search = entries
+        .iter()
+        .find(|entry| entry["ticket"].is_null())
+        .expect("the batch names the search that found nothing");
+    // The lane's routing label, not the global default.
+    assert_eq!(search["label"], "bug", "{json}");
+    assert!(
+        search["root"]
+            .as_str()
+            .is_some_and(|root| root.ends_with(".scratch")),
+        "{json}"
+    );
+    // The discovered-but-unrouted Ticket is still named.
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["ticket"] == "widgets--01-ui"),
+        "{json}"
+    );
+}
