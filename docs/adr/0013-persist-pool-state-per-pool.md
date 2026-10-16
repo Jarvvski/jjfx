@@ -28,3 +28,5 @@ ADR 0012 made a Repository hold several named Worker Pools. The persisted state 
 - Removing a pool becomes a directory operation, which is what makes *What happens when a Worker Pool is removed?* a tractable question.
 - The index and the directories can disagree. Which is authoritative is a separate decision, deliberately not settled here.
 - Every path in the state layer moves, and the migration is one-way — which is why this is an ADR rather than a ticket comment.
+
+**Superseded in part.** The index (`.jj/pools.json`) is dropped: the `[pools]` declaration (ADR 0014) is the source of truth and a pool directory is state, so there is nothing for the index to disagree with. Everything else above stands.
