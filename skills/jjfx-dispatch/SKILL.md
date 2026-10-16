@@ -26,7 +26,7 @@ Settle four things first, so a dispatch does not fail on setup:
 
 ```bash
 jjfx pool 4          # set the pool to 4 Workers (creates it if absent)
-jjfx status --json   # one object per Worker
+jjfx status --json   # {"workers": [one object per Worker], "waiting": [held Tickets]}
 ```
 
 `jjfx pool <N>` is a **safe shrink**: it removes only idle Workers. `jjfx status` is an alias for `jjfx pool list`.
@@ -72,7 +72,7 @@ A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues a
 
 Before launching, jjfx fetches each Ticket's title and description through the configured source and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the source cannot be read, Dispatch fails before anything is reserved.
 
-**Done when** every ticket prints an outcome naming the Worker that took it. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` in the user config can hold one back deliberately - `jjfx status` prints the waiting set under `Waiting:`.
+**Done when** every ticket prints an outcome naming the Worker that took it. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` in the user config can hold one back deliberately - `jjfx status` prints the waiting set under `Waiting:`, and `jjfx status --json` carries it in the `waiting` array.
 
 ### 4. Watch
 
@@ -81,10 +81,10 @@ jjfx status --json                                  # the whole pool, machine-re
 jjfx logs worker-01                                 # follow one Worker's activity
 ```
 
-Poll `jjfx status --json` and read each Worker's `status`; `done` and `failed` are the only terminal values, and `done` means its Run finished with its changes sitting in its workspace. `exit_code` and `error` say why a Worker failed, `stuck` is true when the Run has made no progress inside the watchdog window, and `log_file` is the file `jjfx logs` follows.
+The output is an object: `workers` is one entry per Worker, and `waiting` lists the Tickets a capped Dispatch held back (empty when nothing was held). Poll it and read each Worker's `status`; `done` and `failed` are the only terminal values, and `done` means its Run finished with its changes sitting in its workspace. `exit_code` and `error` say why a Worker failed, `stuck` is true when the Run has made no progress inside the watchdog window, and `log_file` is the file `jjfx logs` follows.
 
 ```bash
-jjfx status --json | jq -r '.[] | select(.status != "done" and .status != "failed") | .worker'
+jjfx status --json | jq -r '.workers[] | select(.status != "done" and .status != "failed") | .worker'
 ```
 
 **Done when** every dispatched Worker reads `done` or `failed`.
@@ -128,7 +128,7 @@ jjfx pool destroy          # tear down the pool
 ## Rules
 
 - **Dispatch real tickets.** Never invent an id; jjfx reads the Parent's sub-issues and each Worker's ticket back from the source.
-- **Read state from `jjfx status --json`.** `status`, `stuck`, `exit_code` and `error` are the terminal-state and failure signals; do not infer them from `jjfx logs` prose.
+- **Read state from `jjfx status --json`.** `workers[]` carries each Worker's `status`, `stuck`, `exit_code` and `error` (the terminal-state and failure signals), and `waiting` carries the Tickets a capped Dispatch held back; do not infer any of it from `jjfx logs` prose.
 - **Never merge.** Dispatch produces pull requests; landing them is the user's call.
 - **Leave open Workspaces alone.** jjfx will not dispatch to (or `send` into) a Workspace that is open in a terminal. If a headless run reports it cannot see the terminal, re-run with `--force`; otherwise do not force past a Workspace a human is using.
 - **Set the runtime deliberately.** The pool profile is repository state that survives a restart — set it with `jjfx pool profile`, not per dispatch, unless the user asks for a one-off `--provider`/`--model` override.

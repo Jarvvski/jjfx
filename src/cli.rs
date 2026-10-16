@@ -1314,17 +1314,31 @@ fn short_worker_id(worker_id: &str) -> &str {
 }
 
 /// Machine-readable Pool status, including the failure fields the table omits.
-///
-/// Encoded by hand so the emitted field order is fixed.
 fn pool_list_json(
     snapshot: &crate::engine::WorkerPoolSnapshot,
     now: Timestamp,
     watchdog: StuckWindow,
 ) -> Result<()> {
-    let mut out = String::from("[\n");
+    println!("{}", pool_list_json_string(snapshot, now, watchdog));
+    Ok(())
+}
+
+/// The Pool status JSON document: `{"workers": [ ... ], "waiting": [ ... ]}`.
+///
+/// A top-level object rather than the bare Worker array: the human table prints
+/// state that is not per-Worker (the `Waiting:` line), and a bare array has
+/// nowhere to put it. The wrapper is the seam for that state and for the next
+/// line the table grows, so the JSON can always carry what the table prints.
+/// Encoded by hand so the emitted field order is fixed.
+fn pool_list_json_string(
+    snapshot: &crate::engine::WorkerPoolSnapshot,
+    now: Timestamp,
+    watchdog: StuckWindow,
+) -> String {
+    let mut out = String::from("{\n  \"workers\": [");
     for (index, worker) in snapshot.workers().iter().enumerate() {
         if index > 0 {
-            out.push_str(",\n");
+            out.push(',');
         }
         let fields = [
             ("worker", json_string(worker.worker_id().as_str())),
@@ -1362,18 +1376,29 @@ fn pool_list_json(
                     ),
             ),
         ];
-        out.push_str("  {\n");
+        out.push_str("\n    {\n");
         for (field, (key, value)) in fields.iter().enumerate() {
             if field > 0 {
                 out.push_str(",\n");
             }
-            out.push_str(&format!("    \"{key}\": {value}"));
+            out.push_str(&format!("      \"{key}\": {value}"));
         }
-        out.push_str("\n  }");
+        out.push_str("\n    }");
     }
-    out.push_str("\n]");
-    println!("{out}");
-    Ok(())
+    if snapshot.workers().is_empty() {
+        out.push_str("],\n");
+    } else {
+        out.push_str("\n  ],\n");
+    }
+    out.push_str("  \"waiting\": [");
+    for (index, ticket) in snapshot.waiting().iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&json_string(ticket));
+    }
+    out.push_str("]\n}");
+    out
 }
 
 /// Encode a string as a JSON string literal.
@@ -2496,6 +2521,56 @@ mod tests {
         assert_eq!(json_string("\u{1}"), "\"\\u0001\"");
         assert_eq!(json_option(None), "null");
         assert_eq!(json_option(Some("x")), "\"x\"");
+    }
+
+    /// A one-Worker Pool snapshot whose waiting set is `waiting`, as a capped
+    /// Dispatch would have persisted it to `.jj/pool/waiting.json`.
+    fn snapshot_with_waiting(waiting: &[&str]) -> crate::engine::WorkerPoolSnapshot {
+        let temp = tempfile::tempdir().expect("temp repository");
+        let pool = temp.path().join(".jj/pool");
+        std::fs::create_dir_all(&pool).expect("pool directory");
+        std::fs::write(
+            temp.path().join(".jj/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
+        )
+        .expect("pool state");
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .expect("worker state");
+        if !waiting.is_empty() {
+            let tickets = waiting
+                .iter()
+                .map(|ticket| json_string(ticket))
+                .collect::<Vec<_>>()
+                .join(", ");
+            std::fs::write(
+                pool.join("waiting.json"),
+                format!("{{\"tickets\":[{tickets}]}}"),
+            )
+            .expect("waiting state");
+        }
+        crate::engine::Repository::open(temp.path())
+            .expect("repository")
+            .read_worker_pool_snapshot()
+    }
+
+    #[test]
+    fn status_json_carries_the_waiting_set() {
+        let held = snapshot_with_waiting(&["AMBA-42", "AMBA-43"]);
+        let json = pool_list_json_string(&held, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["waiting"], serde_json::json!(["AMBA-42", "AMBA-43"]));
+        assert_eq!(value["workers"][0]["worker"], "worker-01");
+    }
+
+    #[test]
+    fn status_json_waiting_is_empty_without_a_capped_dispatch() {
+        let idle = snapshot_with_waiting(&[]);
+        let json = pool_list_json_string(&idle, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["waiting"], serde_json::json!([]));
     }
 
     #[test]

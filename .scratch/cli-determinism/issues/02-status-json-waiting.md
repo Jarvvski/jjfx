@@ -1,6 +1,6 @@
 # `jjfx status --json` omits the held-back Tickets
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -27,11 +27,11 @@ Recommend 1. Whatever is chosen, the JSON should be able to carry every line the
 
 ## Acceptance Criteria
 
-- [ ] The held-back Tickets are readable from `jjfx status --json` (or the documented replacement for it).
-- [ ] The chosen shape is documented in `README.md` / the help, and the changelog records a break if the shape changed.
-- [ ] A test asserts the JSON carries the waiting set when a Dispatch held tickets back, and is empty/absent when it did not.
-- [ ] The human table output is unchanged.
-- [ ] `mise run check` is green.
+- [x] The held-back Tickets are readable from `jjfx status --json` (or the documented replacement for it).
+- [x] The chosen shape is documented in `README.md` / the help, and the changelog records a break if the shape changed.
+- [x] A test asserts the JSON carries the waiting set when a Dispatch held tickets back, and is empty/absent when it did not.
+- [x] The human table output is unchanged.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -47,3 +47,4 @@ Recommend 1. Whatever is chosen, the JSON should be able to carry every line the
 ## Comments
 
 - 2026-10-16: Filed from the `jjfx-dispatch` skill pass: the skill now points agents at `jjfx status --json` for state, and the waiting set is the one piece of state that is not there.
+- 2026-10-16: Chose **option 1 (wrap)** - `jjfx status --json` now emits `{"workers": [...], "waiting": [...]}`. The bare array had nowhere to put the waiting set, which is pool-level rather than per-Worker, and the wrapper is the seam for the next line the human table grows (pool counts, spend summary) without another breaking change. The break is cheap pre-1.0 and recorded with `momo break`; the `jjfx-dispatch` skill and `README.md` were updated to read `.workers[]`. `waiting` is `[]` when no Dispatch held a ticket back. Human table output is unchanged.

@@ -271,8 +271,8 @@ Held 2 ticket(s) back under the dispatch cap; re-run once a Run finishes.
 ```
 
 The waiting set is recorded in jjfx's own `.jj/pool/waiting.json` and shown by
-`jjfx status` (a `Waiting:` line) and the Pool view, so the backlog is visible
-after the Dispatch that held it. It is jjfx-owned presentation state, kept out of
+`jjfx status` (a `Waiting:` line, and the `waiting` array in `jjfx status --json`)
+and the Pool view, so the backlog is visible after the Dispatch that held it. It is jjfx-owned presentation state, kept out of
 the Go-compatible Pool and Worker documents, and it is rewritten by every
 Dispatch - including an uncapped one, which clears it - so it always describes
 the last Dispatch rather than accumulating Tickets you have since dispatched by

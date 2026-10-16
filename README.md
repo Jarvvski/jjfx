@@ -97,6 +97,35 @@ The same binary carries the non-interactive command surface alongside the TUI:
 
 Run `jjfx help` for usage.
 
+`jjfx status --json` (alias `jjfx pool list --json`) emits a single JSON object
+rather than a bare array, so it can carry the pool-level state the human table
+prints alongside the per-Worker rows:
+
+```json
+{
+  "workers": [
+    {
+      "worker": "worker-01",
+      "name": "-",
+      "status": "idle",
+      "stuck": false,
+      "ticket": null,
+      "elapsed": "-",
+      "error": null,
+      "exit_code": null,
+      "log_file": null,
+      "cost_usd": null
+    }
+  ],
+  "waiting": ["AMBA-42"]
+}
+```
+
+`workers` holds one object per Worker (the fields the table shows, plus `stuck`,
+`exit_code`, `error` and `log_file`). `waiting` lists the Tickets a capped
+Dispatch held back, in input order, and is `[]` when nothing was held. Read it
+with `jq -r '.workers[] | ...'`.
+
 ## Documentation
 
 - [Configuration](docs/configuration.md) - the `config.toml` reference: agent,
