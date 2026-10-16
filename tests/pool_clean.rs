@@ -277,3 +277,77 @@ fn clean_pool_leaves_a_workspace_that_belongs_to_no_pool() {
         "an Ad Hoc Workspace belongs to no pool and is not swept"
     );
 }
+
+/// A caller that never answers - stdin at EOF, as `clean </dev/null` gets - is
+/// refused loudly and removes nothing, so "nothing happened" cannot be mistaken
+/// for "nothing needed doing".
+#[test]
+fn clean_at_eof_refuses_loudly_and_removes_nothing() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"])]);
+    fixture.write_pool_state("bugs", &["worker-01"]);
+    fixture.provision_worker("worker-01");
+
+    // An empty write leaves stdin at EOF: the answer never arrives.
+    let output = fixture.jjfx_with_input(&["clean", "--pool", "bugs"], "");
+
+    assert!(
+        !output.status.success(),
+        "a clean with no answer must fail: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no confirmation"),
+        "the refusal says no confirmation was received: {stderr}"
+    );
+    assert!(
+        fixture.worker_workspace("worker-01").is_dir(),
+        "nothing is removed at EOF"
+    );
+}
+
+/// An explicit `n` declines and exits 0, the contract `clean` already had: the
+/// user chose not to act, which is not the same as never answering.
+#[test]
+fn clean_declined_with_n_removes_nothing_and_succeeds() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"])]);
+    fixture.write_pool_state("bugs", &["worker-01"]);
+    fixture.provision_worker("worker-01");
+
+    let output = fixture.jjfx_with_input(&["clean", "--pool", "bugs"], "n\n");
+
+    assert!(
+        output.status.success(),
+        "an explicit decline still succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        fixture.worker_workspace("worker-01").is_dir(),
+        "a declined clean removes nothing"
+    );
+}
+
+/// The confirmation prompt is written to stderr, so stdout carries only the
+/// plan's listing and `jjfx clean > out.txt` captures no prompt.
+#[test]
+fn clean_prompt_goes_to_stderr_not_stdout() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"])]);
+    fixture.write_pool_state("bugs", &["worker-01"]);
+    fixture.provision_worker("worker-01");
+
+    let output = fixture.jjfx_with_input(&["clean", "--pool", "bugs"], "y\n");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Confirm?"),
+        "the prompt is on stderr: {stderr}"
+    );
+    assert!(
+        !stdout.contains("Confirm?"),
+        "the prompt is not on stdout: {stdout}"
+    );
+}
