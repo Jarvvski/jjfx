@@ -106,14 +106,40 @@ jobs:
         run: |
           set -euo pipefail
           version="${{ steps.version.outputs.version }}"
+          branch="${{ github.ref_name }}"
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add Cargo.toml Cargo.lock CHANGELOG.md .momo/version
           git commit -m "Release $version"
-          # momo tags the version its ledger just minted, anchored to HEAD - the
-          # commit above.
-          momo tag
-          git push origin "HEAD:${{ github.ref_name }}" "refs/tags/v$version"
+
+          # The gate and the cross-compile above take roughly 13 minutes, so a
+          # concurrent session can land commits on the branch while this run is
+          # in flight. Rebase the release commit onto the latest tip and push,
+          # retrying a bounded number of times when another commit wins the race
+          # between the fetch and the push.
+          attempts=5
+          for attempt in $(seq 1 "$attempts"); do
+            git fetch origin "$branch"
+            if ! git rebase "origin/$branch"; then
+              git rebase --abort || true
+              echo "error: could not rebase the release commit onto origin/$branch" >&2
+              echo "error: a concurrently recorded CHANGELOG.md entry most likely conflicts; resolve it by hand and re-dispatch - never force the push, which would drop that entry" >&2
+              exit 1
+            fi
+            # Push the branch before the tag: a rejected branch push must never
+            # orphan the tag, which would otherwise point at a commit that is
+            # not on the branch and block a clean re-run.
+            if git push origin "HEAD:$branch"; then
+              # momo tags the version its ledger just minted, anchored to HEAD -
+              # the rebased release commit.
+              momo tag
+              git push origin "refs/tags/v$version"
+              exit 0
+            fi
+            echo "push to $branch was rejected; retrying ($attempt/$attempts)" >&2
+          done
+          echo "error: could not push the release commit to $branch after $attempts attempts" >&2
+          exit 1
 
       # Publish before creating the Release: a failed publish then leaves a tag
       # but no release, which is recoverable. The reverse would leave a public

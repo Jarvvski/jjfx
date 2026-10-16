@@ -95,22 +95,29 @@ before it can reach the crates.io token.
    needs the workspace version entry in sync.
 4. `cargo publish --dry-run --locked`.
 5. `mise run release aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl`.
-6. Commit, `momo tag`, push.
+6. Commit, rebase onto the latest `main`, push the branch, `momo tag`, push the
+   tag.
 7. `cargo publish --locked`.
 8. `gh release create` with the archives and `momo notes` as notes.
 
-Two orderings are deliberate. Archives are built **before** the commit, so a
-failed cross-compile leaves a dirty checkout rather than a tag. The crate is
-published **before** the GitHub Release, so a failed publish leaves a tag but no
-release - which is recoverable - rather than a public release pointing at a crate
-version that does not exist.
+Three orderings are deliberate. Archives are built **before** the commit, so a
+failed cross-compile leaves a dirty checkout rather than a tag. The release
+commit is **rebased onto the latest `main` and the push retried** (a bounded
+number of times), because the ~13 minutes of gate and cross-compile give
+concurrent sessions time to move the branch; a rebase conflict on `CHANGELOG.md`
+fails the run loudly rather than dropping the other session's entry. The branch
+is pushed **before** the tag, so a rejected branch push cannot orphan the tag,
+and the crate is published **before** the GitHub Release, so a failed publish
+leaves a tag but no release - which is recoverable - rather than a public release
+pointing at a crate version that does not exist.
 
 ## Recovering from a partial release
 
 | Failed at | State | Recovery |
 | --- | --- | --- |
 | Archive build | dirty checkout, nothing published | re-dispatch |
-| Commit or tag push | dirty checkout | re-dispatch |
+| Commit, rebase or branch push | release commit local, nothing published | resolve any reported `CHANGELOG.md` conflict, then re-dispatch |
+| Tag push | branch pushed, tag not published | re-dispatch, or `momo tag` and push the tag by hand |
 | `cargo publish` | tag pushed, crate not published | re-dispatch, or publish by hand |
 | `gh release create` | tag and crate published, no release | `gh release create v<version> --notes-file <(momo notes --version <version>) dist/*` |
 
