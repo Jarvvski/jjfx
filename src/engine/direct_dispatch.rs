@@ -829,6 +829,19 @@ pub enum DirectDispatchFailurePhase {
     Capacity,
 }
 
+impl DirectDispatchFailurePhase {
+    /// Returns the stable lowercase name used in machine-readable output.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Workspace => "workspace",
+            Self::Identity => "identity",
+            Self::Prompt => "prompt",
+            Self::Launch => "launch",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
 /// One failed per-Ticket Direct Dispatch outcome.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectDispatchFailure {
