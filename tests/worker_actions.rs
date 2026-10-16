@@ -14,16 +14,16 @@ use jjfx::engine::{
 use rustix::fs::{FlockOperation, flock};
 use tempfile::TempDir;
 
-const HELPER_REPOSITORY: &str = "WSG_ACTION_REPOSITORY";
-const HELPER_WORKER: &str = "WSG_ACTION_WORKER";
-const HELPER_RESULT: &str = "WSG_ACTION_RESULT";
-const HELPER_CAPTURE: &str = "WSG_ACTION_CAPTURE";
-const HELPER_MODE: &str = "WSG_ACTION_MODE";
-const HELPER_PROVIDER: &str = "WSG_ACTION_PROVIDER";
-const HELPER_MODEL: &str = "WSG_ACTION_MODEL";
-const HELPER_PANE_COMMAND: &str = "WSG_ACTION_PANE_COMMAND";
-const HELPER_LAYOUT: &str = "WSG_ACTION_LAYOUT";
-const HELPER_EXIT: &str = "WSG_ACTION_EXIT";
+const HELPER_REPOSITORY: &str = "JJFX_ACTION_REPOSITORY";
+const HELPER_WORKER: &str = "JJFX_ACTION_WORKER";
+const HELPER_RESULT: &str = "JJFX_ACTION_RESULT";
+const HELPER_CAPTURE: &str = "JJFX_ACTION_CAPTURE";
+const HELPER_MODE: &str = "JJFX_ACTION_MODE";
+const HELPER_PROVIDER: &str = "JJFX_ACTION_PROVIDER";
+const HELPER_MODEL: &str = "JJFX_ACTION_MODEL";
+const HELPER_PANE_COMMAND: &str = "JJFX_ACTION_PANE_COMMAND";
+const HELPER_LAYOUT: &str = "JJFX_ACTION_LAYOUT";
+const HELPER_EXIT: &str = "JJFX_ACTION_EXIT";
 
 #[test]
 fn send_rejects_a_busy_worker_through_the_actions_facade() {
@@ -190,7 +190,7 @@ fn rebase_waits_for_the_workspace_operation_lock() {
     let bin = temporary_directory.path().join("rebase-lock-bin");
     fs::create_dir(&bin).expect("fake command directory");
     let command_script =
-        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n";
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n";
     write_executable(&bin.join("jj"), command_script);
     write_executable(&bin.join("gh"), command_script);
     let path = format!(
@@ -356,7 +356,7 @@ fn rebase_and_open_pull_request_use_compatible_typed_actions() {
     let bin = temporary_directory.path().join("bin");
     fs::create_dir(&bin).expect("fake command directory");
     let command_script =
-        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n";
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n";
     write_executable(&bin.join("jj"), command_script);
     write_executable(&bin.join("gh"), command_script);
     let capture = temporary_directory.path().join("commands");
@@ -411,7 +411,7 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
         &bin.join("jj"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "if [ \"$1\" = absorb ]; then\n",
             "  printf 'Absorbed changes into 2 revisions:\\n  aaa111 A: add x\\n  bbb222 B: bump y\\n' >&2\n",
             "fi\n"
@@ -465,7 +465,7 @@ fn absorb_that_moves_nothing_skips_the_push() {
         &bin.join("jj"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "if [ \"$1\" = absorb ]; then printf 'Nothing changed.\\n' >&2; fi\n"
         ),
     );
@@ -513,7 +513,7 @@ fn absorb_reports_hunks_that_stayed_in_the_working_copy() {
         &bin.join("jj"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "if [ \"$1\" = absorb ]; then\n",
             "  printf 'Absorbed changes into 1 revisions:\\n  aaa111 A: add x\\nRemaining changes:\\nA new.rs\\n' >&2\n",
             "fi\n"
@@ -559,7 +559,7 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
         &bin.join("jj"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "if [ \"$1\" = absorb ]; then printf 'Absorbed changes into 1 revisions:\\n' >&2; fi\n",
             "if [ \"$1\" = git ] && [ \"$2\" = push ]; then echo rejected >&2; exit 1; fi\n"
         ),
@@ -614,7 +614,7 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
         &bin.join("jj"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "if [ \"$1\" = git ] && [ \"$2\" = push ]; then echo rejected >&2; exit 1; fi\n"
         ),
     );
@@ -744,7 +744,7 @@ fn mount_opens_a_resumable_provider_session_and_reports_the_tab() {
         &bin.join("kitten"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \"$*\" in\n",
             "  *--type=tab*) echo 42 ;;\n",
             "  *--location=vsplit*) echo 43 ;;\n",
@@ -812,7 +812,7 @@ fn mount_runs_the_configured_command_in_the_first_pane() {
         &bin.join("kitten"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \"$*\" in\n",
             "  *--type=tab*) echo 42 ;;\n",
             "  *--location=vsplit*) echo 43 ;;\n",
@@ -883,7 +883,7 @@ fn mount_builds_the_configured_layout_from_the_plan() {
         &bin.join("kitten"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \"$*\" in\n",
             "  *--type=tab*) echo 42 ;;\n",
             "  *--location=vsplit*) echo 43 ;;\n",
@@ -972,7 +972,7 @@ fn mount_honors_a_single_pane_layout() {
         &bin.join("kitten"),
         concat!(
             "#!/bin/sh\n",
-            "printf 'kitten %s\\n' \"$*\" >> \"$WSG_ACTION_CAPTURE\"\n",
+            "printf 'kitten %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \"$*\" in\n",
             "  *--type=tab*) echo 42 ;;\n",
             "esac\n"

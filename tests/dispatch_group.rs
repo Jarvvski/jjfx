@@ -46,7 +46,7 @@ fn group_from_response(response: &str) -> DispatchGroup {
     .expect("Dispatch Group")
 }
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state");
 
 fn fixture(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).expect("fixture")

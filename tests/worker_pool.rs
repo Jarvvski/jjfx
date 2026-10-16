@@ -17,7 +17,7 @@ mod support;
 
 use support::{HELPER_LIVENESS_TIMEOUT, wait_for_file_content};
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state");
 fn fixture(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).expect("fixture")
 }
@@ -97,7 +97,7 @@ fn stale_reservation_after_destroy_helper() {
 #[test]
 #[ignore]
 fn destroy_live_process_helper() {
-    let pid_path = env::var_os("WSG_DESTROY_PID").expect("PID path");
+    let pid_path = env::var_os("JJFX_DESTROY_PID").expect("PID path");
     let mut child = Command::new("sh")
         .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done"])
         .process_group(0)
@@ -156,18 +156,17 @@ fn worker_workspace(root: &Path, worker: &str) -> PathBuf {
 
 /// Create the Worker Workspaces a provisioned Pool member is expected to have.
 ///
-/// A real Pool - Go-created or jjfx-created - keeps each Worker Workspace beside
-/// the repository (`JJ_WS_DIR`, else `<repo>-workspaces/<worker>`; the Go tool
-/// uses the same convention). Reconciliation reports a member whose directory is
-/// absent as a missing Workspace, so a Pool fixture that means "provisioned"
-/// must lay them down.
+/// A real Pool keeps each Worker Workspace beside the repository (`JJ_WS_DIR`,
+/// else `<repo>-workspaces/<worker>`). Reconciliation reports a member whose
+/// directory is absent as a missing Workspace, so a Pool fixture that means
+/// "provisioned" must lay them down.
 fn provision_workspaces(root: &Path, workers: &[&str]) {
     for worker in workers {
         fs::create_dir_all(worker_workspace(root, worker)).expect("Worker Workspace");
     }
 }
 
-fn go_repository_with_pool() -> (TempDir, Repository) {
+fn legacy_repository_with_pool() -> (TempDir, Repository) {
     let (temp, repository) = local_repository_with_origin();
     let pool = temp.path().join(".jj/pool");
     fs::create_dir_all(&pool).expect("pool directory");
@@ -557,7 +556,7 @@ fn destroy_terminates_a_live_recorded_process_group() {
     let mut helper = Command::new(env::current_exe().expect("test executable"));
     helper
         .args(["--exact", "destroy_live_process_helper", "--ignored"])
-        .env("WSG_DESTROY_PID", &pid_path);
+        .env("JJFX_DESTROY_PID", &pid_path);
     let helper = helper.spawn().expect("spawn process owner");
     wait_for_file_content(&pid_path);
     let pid = fs::read_to_string(&pid_path)
@@ -808,13 +807,13 @@ fn named_removal_rejects_unknown_and_busy_workers_without_mutation() {
 }
 
 #[test]
-fn grows_a_go_created_pool_without_replacing_its_membership_or_metadata() {
-    let (_temporary_directory, repository) = go_repository_with_pool();
+fn grows_a_legacy_pool_without_replacing_its_membership_or_metadata() {
+    let (_temporary_directory, repository) = legacy_repository_with_pool();
     let pool = repository.worker_pool();
 
     let growth = pool
         .resize_to(jjfx::engine::PoolCapacity::new(5).expect("capacity should be valid"))
-        .expect("Go-created pool should grow");
+        .expect("legacy pool should grow");
 
     assert_eq!(growth.added_workers().len(), 1);
     let snapshot = pool.snapshot();
@@ -829,8 +828,8 @@ fn grows_a_go_created_pool_without_replacing_its_membership_or_metadata() {
 }
 
 #[test]
-fn shrinks_a_go_created_pool_by_removing_a_terminal_tail_worker() {
-    let (_temporary_directory, repository) = go_repository_with_pool();
+fn shrinks_a_legacy_pool_by_removing_a_terminal_tail_worker() {
+    let (_temporary_directory, repository) = legacy_repository_with_pool();
     let pool = repository.worker_pool();
 
     let resized = pool
@@ -1113,8 +1112,8 @@ fn blank_alias_clears_the_name_and_unknown_worker_does_not_mutate_pool() {
 }
 
 #[test]
-fn worker_alias_mutates_a_go_created_pool_without_losing_compatible_metadata() {
-    let (temporary_directory, repository) = go_repository_with_pool();
+fn worker_alias_mutates_a_legacy_pool_without_losing_compatible_metadata() {
+    let (temporary_directory, repository) = legacy_repository_with_pool();
     let pool_path = temporary_directory.path().join(".jj/pool.json");
     let mut state: Value =
         serde_json::from_slice(&fs::read(&pool_path).expect("pool state")).expect("pool JSON");
@@ -1133,7 +1132,7 @@ fn worker_alias_mutates_a_go_created_pool_without_losing_compatible_metadata() {
     repository
         .worker_pool()
         .set_alias(worker.clone(), "primary")
-        .expect("set alias on Go-created Pool");
+        .expect("set alias on legacy Pool");
 
     let snapshot = repository.worker_pool().snapshot();
     assert_eq!(
@@ -1276,8 +1275,8 @@ fn alias_rejects_while_pool_destruction_is_in_progress() {
 }
 
 #[test]
-fn named_removal_clears_a_go_created_worker_alias() {
-    let (temporary_directory, repository) = go_repository_with_pool();
+fn named_removal_clears_a_legacy_worker_alias() {
+    let (temporary_directory, repository) = legacy_repository_with_pool();
     fs::write(
         temporary_directory.path().join(".jj/pool/worker-02.json"),
         fixture("worker-idle-claude.json"),
@@ -1862,7 +1861,7 @@ fn reservation_preserves_go_worker_extensions_and_null_fields() {
     let (temp, repository) = repository_with_pool();
     let worker_path = temp.path().join(".jj/pool/worker-01.json");
     let mut worker: Value =
-        serde_json::from_slice(&fs::read(&worker_path).expect("Go Worker state"))
+        serde_json::from_slice(&fs::read(&worker_path).expect("legacy Worker state"))
             .expect("Worker JSON");
     worker["future"] = serde_json::json!({"enabled": true});
     fs::write(
@@ -1874,7 +1873,7 @@ fn reservation_preserves_go_worker_extensions_and_null_fields() {
     repository
         .worker_pool()
         .reserve("ENG-208")
-        .expect("Go-created Worker should be reservable");
+        .expect("legacy Worker should be reservable");
 
     let written: Value =
         serde_json::from_slice(&fs::read(&worker_path).expect("reserved Worker state"))

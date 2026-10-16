@@ -13,10 +13,10 @@ use jjfx::engine::{
 };
 use tempfile::TempDir;
 
-const HELPER_RUNTIME: &str = "WSG_TICKET_QUERY_HELPER_RUNTIME";
-const HELPER_WORKSPACE: &str = "WSG_TICKET_QUERY_HELPER_WORKSPACE";
-const HELPER_RESULT: &str = "WSG_TICKET_QUERY_HELPER_RESULT";
-const HELPER_ARGS: &str = "WSG_TICKET_QUERY_HELPER_ARGS";
+const HELPER_RUNTIME: &str = "JJFX_TICKET_QUERY_HELPER_RUNTIME";
+const HELPER_WORKSPACE: &str = "JJFX_TICKET_QUERY_HELPER_WORKSPACE";
+const HELPER_RESULT: &str = "JJFX_TICKET_QUERY_HELPER_RESULT";
+const HELPER_ARGS: &str = "JJFX_TICKET_QUERY_HELPER_ARGS";
 
 struct StubQuery {
     responses: Mutex<VecDeque<Result<String, TicketQueryError>>>,
@@ -172,12 +172,12 @@ fn ready_tickets_are_discovered_through_either_configured_agent_runtime() {
         fs::create_dir(&workspace).expect("query workspace");
         let response = if runtime == AgentRuntime::Claude {
             r#"#!/bin/sh
-printf '%s\n' "$@" > "$WSG_TICKET_QUERY_HELPER_ARGS"
+printf '%s\n' "$@" > "$JJFX_TICKET_QUERY_HELPER_ARGS"
 printf '%s\n' '{"result":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Claude result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}]}"}'
 "#
         } else {
             r#"#!/bin/sh
-printf '%s\n' "$@" > "$WSG_TICKET_QUERY_HELPER_ARGS"
+printf '%s\n' "$@" > "$JJFX_TICKET_QUERY_HELPER_ARGS"
 printf '%s\n' '{"type":"thread.started","thread_id":"thread-42"}'
 printf '%s\n' '{"type":"item.completed","item":{"id":"item-1","type":"agent_message","text":"{\"tickets\":[{\"id\":\"AMBA-42\",\"title\":\"Codex result\",\"status\":\"Todo\",\"labels\":[\"ready-for-agent\"]}]}"}}'
 printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":5}}'

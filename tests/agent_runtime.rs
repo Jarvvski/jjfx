@@ -27,35 +27,35 @@ mod support;
 
 use support::{HELPER_LIVENESS_TIMEOUT, wait_for_file_content};
 
-const HELPER_MODE: &str = "WSG_AGENT_RUNTIME_HELPER_MODE";
-const HELPER_PATH: &str = "WSG_AGENT_RUNTIME_HELPER_PATH";
-const HELPER_RESULT: &str = "WSG_AGENT_RUNTIME_HELPER_RESULT";
-const HELPER_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_WORKSPACE";
-const HELPER_LOG: &str = "WSG_AGENT_RUNTIME_HELPER_LOG";
-const HELPER_EXECUTED: &str = "WSG_AGENT_RUNTIME_HELPER_EXECUTED";
-const HELPER_RUNTIME: &str = "WSG_AGENT_RUNTIME_HELPER_RUNTIME";
-const HELPER_PROCESS: &str = "WSG_AGENT_RUNTIME_HELPER_PROCESS";
-const HELPER_RELEASE: &str = "WSG_AGENT_RUNTIME_HELPER_RELEASE";
-const HELPER_EXIT: &str = "WSG_AGENT_RUNTIME_HELPER_EXIT";
-const HELPER_REPOSITORY: &str = "WSG_AGENT_RUNTIME_HELPER_REPOSITORY";
-const HELPER_WORKER: &str = "WSG_AGENT_RUNTIME_HELPER_WORKER";
-const HELPER_RESERVED: &str = "WSG_AGENT_RUNTIME_HELPER_RESERVED";
-const HELPER_PROCEED: &str = "WSG_AGENT_RUNTIME_HELPER_PROCEED";
-const HELPER_GRACEFUL: &str = "WSG_AGENT_RUNTIME_HELPER_GRACEFUL";
-const HELPER_DIAGNOSTIC: &str = "WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC";
-const HELPER_TERM: &str = "WSG_AGENT_RUNTIME_HELPER_TERM";
-const HELPER_LAUNCH: &str = "WSG_AGENT_RUNTIME_HELPER_LAUNCH";
-const HELPER_DESCENDANT: &str = "WSG_AGENT_RUNTIME_HELPER_DESCENDANT";
-const HELPER_PTY_SLAVE: &str = "WSG_AGENT_RUNTIME_HELPER_PTY_SLAVE";
-const HELPER_OPENCODE_WORKSPACE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE";
-const HELPER_OPENCODE_GET_DIRECTORY: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY";
-const HELPER_OPENCODE_SESSION_ID: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_ID";
-const HELPER_OPENCODE_ACTION: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_ACTION";
-const HELPER_OPENCODE_INTERRUPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_INTERRUPT";
-const HELPER_OPENCODE_UNAVAILABLE: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE";
-const HELPER_OPENCODE_OUTCOME: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME";
-const HELPER_OPENCODE_SEND_PROMPT: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_SEND_PROMPT";
-const HELPER_OPENCODE_PERMISSIONS: &str = "WSG_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS";
+const HELPER_MODE: &str = "JJFX_AGENT_RUNTIME_HELPER_MODE";
+const HELPER_PATH: &str = "JJFX_AGENT_RUNTIME_HELPER_PATH";
+const HELPER_RESULT: &str = "JJFX_AGENT_RUNTIME_HELPER_RESULT";
+const HELPER_WORKSPACE: &str = "JJFX_AGENT_RUNTIME_HELPER_WORKSPACE";
+const HELPER_LOG: &str = "JJFX_AGENT_RUNTIME_HELPER_LOG";
+const HELPER_EXECUTED: &str = "JJFX_AGENT_RUNTIME_HELPER_EXECUTED";
+const HELPER_RUNTIME: &str = "JJFX_AGENT_RUNTIME_HELPER_RUNTIME";
+const HELPER_PROCESS: &str = "JJFX_AGENT_RUNTIME_HELPER_PROCESS";
+const HELPER_RELEASE: &str = "JJFX_AGENT_RUNTIME_HELPER_RELEASE";
+const HELPER_EXIT: &str = "JJFX_AGENT_RUNTIME_HELPER_EXIT";
+const HELPER_REPOSITORY: &str = "JJFX_AGENT_RUNTIME_HELPER_REPOSITORY";
+const HELPER_WORKER: &str = "JJFX_AGENT_RUNTIME_HELPER_WORKER";
+const HELPER_RESERVED: &str = "JJFX_AGENT_RUNTIME_HELPER_RESERVED";
+const HELPER_PROCEED: &str = "JJFX_AGENT_RUNTIME_HELPER_PROCEED";
+const HELPER_GRACEFUL: &str = "JJFX_AGENT_RUNTIME_HELPER_GRACEFUL";
+const HELPER_DIAGNOSTIC: &str = "JJFX_AGENT_RUNTIME_HELPER_DIAGNOSTIC";
+const HELPER_TERM: &str = "JJFX_AGENT_RUNTIME_HELPER_TERM";
+const HELPER_LAUNCH: &str = "JJFX_AGENT_RUNTIME_HELPER_LAUNCH";
+const HELPER_DESCENDANT: &str = "JJFX_AGENT_RUNTIME_HELPER_DESCENDANT";
+const HELPER_PTY_SLAVE: &str = "JJFX_AGENT_RUNTIME_HELPER_PTY_SLAVE";
+const HELPER_OPENCODE_WORKSPACE: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE";
+const HELPER_OPENCODE_GET_DIRECTORY: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY";
+const HELPER_OPENCODE_SESSION_ID: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_ID";
+const HELPER_OPENCODE_ACTION: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_ACTION";
+const HELPER_OPENCODE_INTERRUPT: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_INTERRUPT";
+const HELPER_OPENCODE_UNAVAILABLE: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE";
+const HELPER_OPENCODE_OUTCOME: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME";
+const HELPER_OPENCODE_SEND_PROMPT: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SEND_PROMPT";
+const HELPER_OPENCODE_PERMISSIONS: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS";
 
 #[test]
 fn removed_pi_runtime_is_rejected_with_a_clear_message() {
@@ -322,7 +322,7 @@ fn probe_runs_in_the_worker_workspace() {
     let workspace_result = temporary_directory.path().join("workspace-result");
     write_executable(
         &temporary_directory.path().join("claude"),
-        "#!/bin/sh\npwd > \"$WSG_AGENT_RUNTIME_HELPER_WORKSPACE\"\n",
+        "#!/bin/sh\npwd > \"$JJFX_AGENT_RUNTIME_HELPER_WORKSPACE\"\n",
     );
     let result = temporary_directory.path().join("result");
     let output = helper_command(temporary_directory.path(), &result, "workspace")
@@ -397,7 +397,7 @@ fn reserved_background_run_persists_pid_before_returning() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\nwhile [ ! -f \"$JJFX_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -492,7 +492,7 @@ fn reserved_background_run_uses_the_worker_workspace_as_cwd() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\npwd > \"$WSG_AGENT_RUNTIME_HELPER_WORKSPACE\"\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\npwd > \"$JJFX_AGENT_RUNTIME_HELPER_WORKSPACE\"\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -689,7 +689,7 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\nwhile [ ! -f \"$JJFX_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -820,7 +820,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/bash\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\n( trap '' TERM; while :; do :; done ) &\nprintf '%s\\n' \"$!\" > \"$WSG_AGENT_RUNTIME_HELPER_DESCENDANT\"\ntrap 'printf term > \"$WSG_AGENT_RUNTIME_HELPER_TERM\"; deadline=$(( ${EPOCHREALTIME/./} + 600000 )); while (( ${EPOCHREALTIME/./} < deadline )); do :; done; printf graceful > \"$WSG_AGENT_RUNTIME_HELPER_GRACEFUL\"; exit 0' TERM\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf started > \"$WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_LAUNCH\" ]; do :; done\nwhile :; do :; done\n",
+        "#!/bin/bash\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\n( trap '' TERM; while :; do :; done ) &\nprintf '%s\\n' \"$!\" > \"$JJFX_AGENT_RUNTIME_HELPER_DESCENDANT\"\ntrap 'printf term > \"$JJFX_AGENT_RUNTIME_HELPER_TERM\"; deadline=$(( ${EPOCHREALTIME/./} + 600000 )); while (( ${EPOCHREALTIME/./} < deadline )); do :; done; printf graceful > \"$JJFX_AGENT_RUNTIME_HELPER_GRACEFUL\"; exit 0' TERM\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf started > \"$JJFX_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\nwhile [ ! -f \"$JJFX_AGENT_RUNTIME_HELPER_LAUNCH\" ]; do :; done\nwhile :; do :; done\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -938,7 +938,7 @@ fn background_run_returns_process_group_leader_with_child_owned_log() {
     fs::write(&log, "stale output\n").expect("stale log");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf 'stdout-before\\n'\nprintf 'stderr-before\\n' >&2\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\nprintf 'stdout-after\\n'\nprintf 'stderr-after\\n' >&2\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s %s\\n' \"$$\" \"$(ps -o pgid= -p $$ | tr -d ' ')\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\nprintf 'stdout-before\\n'\nprintf 'stderr-before\\n' >&2\nwhile [ ! -f \"$JJFX_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\nprintf 'stdout-after\\n'\nprintf 'stderr-after\\n' >&2\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -1020,7 +1020,7 @@ fn background_run_log_setup_failure_prevents_workload_spawn() {
     fs::create_dir(&workspace).expect("Worker Workspace");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ntouch \"$WSG_AGENT_RUNTIME_HELPER_EXECUTED\"\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ntouch \"$JJFX_AGENT_RUNTIME_HELPER_EXECUTED\"\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -1317,7 +1317,7 @@ fn foreground_run_log_setup_failure_prevents_workload_spawn() {
     fs::create_dir(&workspace).expect("Worker Workspace");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ntouch \"$WSG_AGENT_RUNTIME_HELPER_EXECUTED\"\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\ntouch \"$JJFX_AGENT_RUNTIME_HELPER_EXECUTED\"\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -1570,7 +1570,7 @@ fn reserved_background_run_finalizes_worker_after_wait() {
 ///
 /// `session.create` records the request body and reports `ses_test` anchored to
 /// the Worker Workspace; `session.get` reports it anchored to the directory in
-/// `WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`; `run` records its cwd and
+/// `JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`; `run` records its cwd and
 /// arguments.
 const OPENCODE_SESSION_SCRIPT: &str = r#"#!/bin/sh
 case "$1" in
@@ -1579,10 +1579,10 @@ case "$1" in
     case "$2" in
       session.create)
         printf '%s' "$4" > "__CREATE_BODY__"
-        printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
+        printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
         exit 0 ;;
       session.get)
-        printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
+        printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
         exit 0 ;;
     esac
     exit 1 ;;
@@ -1916,30 +1916,30 @@ const OPENCODE_CONTROL_SCRIPT: &str = r#"#!/bin/sh
 case "$1" in
   --version) printf '%s\n' '2.0.29'; exit 0 ;;
   api)
-    if [ -n "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE" ]; then
+    if [ -n "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE" ]; then
       printf '%s\n' 'Error: Could not reach server' >&2
       exit 1
     fi
     case "$2" in
       session.get)
-        if [ -n "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME" ]; then
-          printf '{"data":{"id":"ses_test","outcome":"%s"}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME"
+        if [ -n "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME" ]; then
+          printf '{"data":{"id":"ses_test","outcome":"%s"}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME"
         else
           printf '{"data":{"id":"ses_test"}}'
         fi
         exit 0 ;;
       session.active)
-        printf '{"data":%s}' "${WSG_AGENT_RUNTIME_HELPER_OPENCODE_ACTIVE:-{}}"
+        printf '{"data":%s}' "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_ACTIVE:-{}}"
         exit 0 ;;
       session.list)
-        printf '{"data":%s}' "${WSG_AGENT_RUNTIME_HELPER_OPENCODE_LIST:-[]}"
+        printf '{"data":%s}' "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_LIST:-[]}"
         exit 0 ;;
       session.interrupt)
         printf '%s' "$4" > "__INTERRUPT__"
         printf '{"interrupted":true}'
         exit 0 ;;
       session.permission.list)
-        printf '{"data":%s}' "${WSG_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS:-[]}"
+        printf '{"data":%s}' "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS:-[]}"
         exit 0 ;;
       session.permission.reply)
         printf '%s\n' "$@" > "__PERMISSION_REPLY__"
@@ -2410,7 +2410,7 @@ const OPENCODE_SEND_SCRIPT: &str = r#"#!/bin/sh
 case "$1" in
   --version) printf '%s\n' '2.0.29'; exit 0 ;;
   api)
-    if [ -n "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE" ]; then
+    if [ -n "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_UNAVAILABLE" ]; then
       printf '%s\n' 'Error: Could not reach server' >&2
       exit 1
     fi
@@ -2421,10 +2421,10 @@ case "$1" in
         exit 0 ;;
       session.create)
         printf '%s' "$4" > "__CREATE_BODY__"
-        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
+        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
         exit 0 ;;
       session.get)
-        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$WSG_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
+        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
         exit 0 ;;
     esac
     exit 1 ;;
@@ -2993,7 +2993,7 @@ fn stale_background_waiter_cannot_finalize_newer_run() {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     write_executable(
         &bin_directory.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nwhile [ ! -f \"$WSG_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\nexit 0\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nwhile [ ! -f \"$JJFX_AGENT_RUNTIME_HELPER_RELEASE\" ]; do sleep 0.02; done\nexit 0\n",
     );
     let path = env::join_paths([
         bin_directory.as_os_str(),
@@ -4235,10 +4235,10 @@ const TERM_REPORTING_RUNTIME: &str = concat!(
     "#!/bin/bash\n",
     "if [ \"$1\" = \"--help\" ]; then exit 0; fi\n",
     "( trap '' TERM; while :; do sleep 0.05; done ) &\n",
-    "printf '%s\\n' \"$!\" > \"$WSG_AGENT_RUNTIME_HELPER_DESCENDANT\"\n",
-    "trap 'printf term > \"$WSG_AGENT_RUNTIME_HELPER_TERM\"' TERM\n",
-    "printf '%s\\n' \"$$\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\n",
-    "printf started > \"$WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\n",
+    "printf '%s\\n' \"$!\" > \"$JJFX_AGENT_RUNTIME_HELPER_DESCENDANT\"\n",
+    "trap 'printf term > \"$JJFX_AGENT_RUNTIME_HELPER_TERM\"' TERM\n",
+    "printf '%s\\n' \"$$\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\n",
+    "printf started > \"$JJFX_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\n",
     "while :; do sleep 0.05; done\n",
 );
 
@@ -4389,10 +4389,10 @@ const STUBBORN_RUNTIME: &str = concat!(
     "#!/bin/bash\n",
     "if [ \"$1\" = \"--help\" ]; then exit 0; fi\n",
     "( trap '' TERM; while :; do sleep 0.05; done ) &\n",
-    "printf '%s\\n' \"$!\" > \"$WSG_AGENT_RUNTIME_HELPER_DESCENDANT\"\n",
+    "printf '%s\\n' \"$!\" > \"$JJFX_AGENT_RUNTIME_HELPER_DESCENDANT\"\n",
     "trap '' TERM\n",
-    "printf '%s\\n' \"$$\" > \"$WSG_AGENT_RUNTIME_HELPER_PROCESS\"\n",
-    "printf started > \"$WSG_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\n",
+    "printf '%s\\n' \"$$\" > \"$JJFX_AGENT_RUNTIME_HELPER_PROCESS\"\n",
+    "printf started > \"$JJFX_AGENT_RUNTIME_HELPER_DIAGNOSTIC\"\n",
     "while :; do sleep 0.05; done\n",
 );
 

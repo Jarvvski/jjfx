@@ -24,12 +24,12 @@ mod support;
 
 use support::HELPER_LIVENESS_TIMEOUT;
 
-const HELPER_REPOSITORY: &str = "WSG_DIRECT_DISPATCH_REPOSITORY";
-const HELPER_RESULT: &str = "WSG_DIRECT_DISPATCH_RESULT";
-const HELPER_CAPTURE: &str = "WSG_DIRECT_DISPATCH_CAPTURE";
-const HELPER_COMPATIBILITY: &str = "WSG_DIRECT_DISPATCH_COMPATIBILITY";
-const HELPER_RELEASE: &str = "WSG_DIRECT_DISPATCH_RELEASE";
-const HELPER_CAP: &str = "WSG_DIRECT_DISPATCH_CAP";
+const HELPER_REPOSITORY: &str = "JJFX_DIRECT_DISPATCH_REPOSITORY";
+const HELPER_RESULT: &str = "JJFX_DIRECT_DISPATCH_RESULT";
+const HELPER_CAPTURE: &str = "JJFX_DIRECT_DISPATCH_CAPTURE";
+const HELPER_BUSY_STATE: &str = "JJFX_DIRECT_DISPATCH_BUSY_STATE";
+const HELPER_RELEASE: &str = "JJFX_DIRECT_DISPATCH_RELEASE";
+const HELPER_CAP: &str = "JJFX_DIRECT_DISPATCH_CAP";
 
 #[test]
 fn request_for_ticket_id_constructs_a_valid_direct_request() {
@@ -345,13 +345,11 @@ fn production_direct_dispatch_launches_foreground_and_background_fake_runtimes()
     fs::create_dir(&bin).expect("runtime bin directory");
     let release = temporary_directory.path().join("release-background");
     let capture = temporary_directory.path().join("captured-arguments");
-    let compatibility = temporary_directory
-        .path()
-        .join("compatible-busy-state.json");
+    let busy_state = temporary_directory.path().join("busy-state.json");
     let result = temporary_directory.path().join("dispatch-result");
     write_executable(
         &bin.join("claude"),
-        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$WSG_DIRECT_DISPATCH_CAPTURE\"\ncase \"$*\" in *ENG-501*) while [ ! -f \"$WSG_DIRECT_DISPATCH_RELEASE\" ]; do sleep 0.02; done ;; esac\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
+        "#!/bin/sh\nif [ \"$1\" = \"--help\" ]; then exit 0; fi\nprintf '%s\\n' \"$@\" >> \"$JJFX_DIRECT_DISPATCH_CAPTURE\"\ncase \"$*\" in *ENG-501*) while [ ! -f \"$JJFX_DIRECT_DISPATCH_RELEASE\" ]; do sleep 0.02; done ;; esac\nprintf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"done\"}'\n",
     );
     let mut paths = vec![bin];
     paths.extend(env::split_paths(&env::var_os("PATH").unwrap_or_default()));
@@ -362,7 +360,7 @@ fn production_direct_dispatch_launches_foreground_and_background_fake_runtimes()
         .env(HELPER_REPOSITORY, repository.root())
         .env(HELPER_RESULT, &result)
         .env(HELPER_CAPTURE, &capture)
-        .env(HELPER_COMPATIBILITY, &compatibility)
+        .env(HELPER_BUSY_STATE, &busy_state)
         .env(HELPER_RELEASE, &release)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -386,15 +384,15 @@ fn production_direct_dispatch_launches_foreground_and_background_fake_runtimes()
     assert!(captured.contains("STACKED BRANCH"));
     assert!(captured.contains("--model"));
     assert!(captured.contains("opus"));
-    let compatible: Value =
-        serde_json::from_slice(&fs::read(&compatibility).expect("compatible busy Worker state"))
-            .expect("Go-compatible Worker JSON");
-    assert_eq!(compatible["status"], "busy");
-    assert_eq!(compatible["agent"], "claude");
-    assert_eq!(compatible["ticket"], "ENG-501");
-    assert!(compatible["pid"].as_u64().is_some_and(|pid| pid > 0));
-    assert!(compatible["started_at"].is_string());
-    assert!(compatible["log_file"].is_string());
+    let worker_state: Value =
+        serde_json::from_slice(&fs::read(&busy_state).expect("busy Worker state"))
+            .expect("legacy Worker JSON");
+    assert_eq!(worker_state["status"], "busy");
+    assert_eq!(worker_state["agent"], "claude");
+    assert_eq!(worker_state["ticket"], "ENG-501");
+    assert!(worker_state["pid"].as_u64().is_some_and(|pid| pid > 0));
+    assert!(worker_state["started_at"].is_string());
+    assert!(worker_state["log_file"].is_string());
 }
 
 #[test]
@@ -448,9 +446,9 @@ fn production_direct_dispatch_helper() {
         .join(format!("{}.json", background.worker()));
     fs::copy(
         state_path,
-        env::var_os(HELPER_COMPATIBILITY).expect("compatibility result"),
+        env::var_os(HELPER_BUSY_STATE).expect("busy state result"),
     )
-    .expect("capture Go-compatible busy state");
+    .expect("capture busy Worker state");
     fs::write(env::var_os(HELPER_RELEASE).expect("background release"), [])
         .expect("release background Runtime");
     let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;

@@ -89,8 +89,8 @@ fn default_worker_path(root: &Path, worker: &str) -> std::path::PathBuf {
 #[test]
 #[ignore]
 fn workspace_path_environment_helper() -> Result<(), Box<dyn std::error::Error>> {
-    let root = PathBuf::from(env::var_os("WSG_TEST_ROOT").ok_or("test root should be set")?);
-    let result = PathBuf::from(env::var_os("WSG_TEST_RESULT").ok_or("test result should be set")?);
+    let root = PathBuf::from(env::var_os("JJFX_TEST_ROOT").ok_or("test root should be set")?);
+    let result = PathBuf::from(env::var_os("JJFX_TEST_RESULT").ok_or("test result should be set")?);
     let worker = WorkerId::parse("worker-env")?;
     let repository = Repository::open(root)?;
     let workspace = repository.provision_worker_workspace(&worker)?;
@@ -396,8 +396,8 @@ fn assert_workspace_directory_environment(
     command
         .args(["--exact", "workspace_path_environment_helper", "--ignored"])
         .env("JJ_WS_DIR", value)
-        .env("WSG_TEST_ROOT", repository.root())
-        .env("WSG_TEST_RESULT", &result);
+        .env("JJFX_TEST_ROOT", repository.root())
+        .env("JJFX_TEST_RESULT", &result);
     let output = command.output().expect("workspace helper should run");
     assert!(
         output.status.success(),
