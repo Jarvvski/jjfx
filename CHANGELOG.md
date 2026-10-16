@@ -27,6 +27,10 @@ markers on their entries; they are preserved as history and carry no meaning now
 
 ## [Unreleased]
 
+### Breaking
+
+- jjfx status --json now emits an object (`workers` plus `waiting`) instead of a bare array, so the waiting set a capped Dispatch held back is machine-readable; consumers reading the array must read `.workers[]`.
+
 ### Fixed
 
 - The `jjfx-dispatch` skill is corrected for 0.55.0 and made deterministic to drive: it reads terminal state from `jjfx status --json` (status, stuck, exit_code, error) rather than prose, documents both ticket sources (`[tickets] source = "linear" | "local"`), and covers `hooks install`, `--fg`/`--bg`, `absorb`, `resolve`, `undo`, and the repository build check that `open-pr` runs before pushing.
