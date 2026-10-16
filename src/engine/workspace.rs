@@ -257,7 +257,7 @@ impl Workspaces {
         Ok(snapshot)
     }
 
-    /// Adds a Workspace, preserving the Go-compatible idempotent behavior.
+    /// Adds a Workspace, preserving the idempotent behavior.
     pub fn add(
         &self,
         requested_name: &str,
@@ -692,7 +692,7 @@ pub(crate) fn prepare_for_dispatch(
     })
 }
 
-/// Provisions one Go-compatible Worker Workspace and its idle Worker state.
+/// Provisions one Worker Workspace and its idle Worker state.
 pub(crate) fn provision(
     repository: &Repository,
     worker_id: &WorkerId,

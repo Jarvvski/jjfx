@@ -2,7 +2,7 @@
 
 Every Run jjfx finalizes appends one durable record of what it cost and used. The
 record exists because jjfx parses a Run's cost, usage, duration and turns and
-would otherwise keep them nowhere: the compatible Worker document holds only
+would otherwise keep them nowhere: the Worker document holds only
 status, exit code and error, and the Run log is truncated by the next Run, so
 only a Worker's most recent Run would survive.
 
@@ -10,7 +10,7 @@ only a Worker's most recent Run would survive.
 
 The store is `.jj/pool/runs.jsonl`, beside jjfx's other owned state
 (`sessions.json`, `in-use.json`). It is jjfx-owned and deliberately kept out of
-the Go-compatible Pool and Worker documents, so a compatibility peer ignores it.
+the Pool and Worker documents.
 
 It is one JSON object per line, in append order. The store is **append-only and
 never truncated or rewritten**: each line is written under the store's own

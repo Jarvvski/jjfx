@@ -9,7 +9,7 @@ use jjfx::engine::{
 use serde_json::Value;
 use tempfile::TempDir;
 
-const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/compatibility");
+const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state");
 fn fixture(name: &str) -> Vec<u8> {
     fs::read(Path::new(FIXTURES).join(name)).expect("fixture")
 }
@@ -25,7 +25,8 @@ fn pool_repository_creates_replaces_conflicts_and_removes() {
     let (_temp, repository) = repository();
     let pool = repository.state_store().pool();
     assert!(matches!(pool.load().expect("load"), Loaded::Missing));
-    let state: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("Go pool");
+    let state: PoolState =
+        serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
     let applied = pool
         .commit(Expected::Missing, StateChange::Replace(state))
         .expect("create");
@@ -71,7 +72,7 @@ fn worker_repository_round_trips_go_state_and_unknown_fields() {
     let path = temp.path().join(".jj/pool/worker-01.json");
     fs::create_dir_all(path.parent().expect("parent")).expect("pool directory");
     let mut source: Value =
-        serde_json::from_slice(&fixture("worker-busy-claude.json")).expect("Go Worker");
+        serde_json::from_slice(&fixture("worker-busy-claude.json")).expect("legacy Worker");
     source["future"] = serde_json::json!({"enabled": true});
     fs::write(&path, serde_json::to_vec(&source).expect("json")).expect("Worker state");
     let repository = repository.state_store().worker(worker);
@@ -116,7 +117,8 @@ fn dispatch_group_repository_uses_lowercase_compatible_name() {
 fn invalid_replacement_preserves_previous_valid_file() {
     let (temp, repository) = repository();
     let pool = repository.state_store().pool();
-    let state: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("Go pool");
+    let state: PoolState =
+        serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
     pool.commit(Expected::Missing, StateChange::Replace(state))
         .expect("create");
     let path = temp.path().join(".jj/pool.json");
@@ -185,7 +187,8 @@ fn public_state_models_accept_forward_compatible_wire_values() {
 #[test]
 fn go_omitempty_and_branch_null_semantics_are_preserved() {
     let (temp, repository) = repository();
-    let mut pool: PoolState = serde_json::from_slice(&fixture("pool-empty.json")).expect("Go pool");
+    let mut pool: PoolState =
+        serde_json::from_slice(&fixture("pool-empty.json")).expect("legacy pool");
     pool.agent = Some(jjfx::engine::WireAgent::new(""));
     repository
         .state_store()
@@ -324,7 +327,7 @@ fn session_sidecar_records_reads_and_replaces_worker_sessions() {
         Some("ses_three")
     );
 
-    // It is jjfx-owned sidecar state, not part of the Go-compatible documents.
+    // It is jjfx-owned sidecar state, not part of the Pool and Worker documents.
     let path = temp.path().join(".jj/pool/sessions.json");
     let value: Value =
         serde_json::from_slice(&fs::read(&path).expect("session sidecar")).expect("JSON");

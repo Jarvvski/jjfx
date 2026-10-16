@@ -207,7 +207,7 @@ pub struct IdentifierError {
     value: String,
 }
 
-/// The exact Go-compatible pool configuration.
+/// The exact persisted Pool configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PoolState {
     /// Number of configured Workers.
@@ -260,7 +260,7 @@ impl PoolState {
     }
 }
 
-/// The exact Go-compatible Worker state.
+/// The exact persisted Worker state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerState {
     /// Persisted Worker Status.
@@ -318,9 +318,9 @@ impl WorkerState {
 /// The set of Worker Workspaces jjfx currently considers in use (open in a
 /// terminal).
 ///
-/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
-/// Worker documents so their shape is preserved. A compatibility peer ignores
-/// it; a missing or unreadable file means "nothing known to be in use".
+/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// documents so their shape is preserved. A missing or unreadable file means
+/// "nothing known to be in use".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InUseState {
     /// Worker identifiers whose Workspaces are currently occupied.
@@ -330,12 +330,11 @@ pub struct InUseState {
 
 /// The Agent Runtime session each Worker's current Run drives.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
-/// Worker documents so their shape is preserved. jjfx records the session id an
+/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// documents so their shape is preserved. jjfx records the session id an
 /// opencode Run created here so a later, different process can identify that
 /// Run's session - for example to interrupt it - without re-deriving it. A
-/// compatibility peer ignores it; a missing or unreadable file means "no
-/// session recorded".
+/// missing or unreadable file means "no session recorded".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionState {
     /// Session identifier keyed by the Worker whose current Run drives it.
@@ -345,9 +344,9 @@ pub struct SessionState {
 
 /// The Tickets the Dispatch capacity governor held back rather than fired.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
-/// Worker documents so their shape is preserved. A compatibility peer ignores
-/// it; a missing or unreadable file means "nothing was held back". The set is
+/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// documents so their shape is preserved. A missing or unreadable file means
+/// "nothing was held back". The set is
 /// rewritten by each capped Dispatch, so it always describes the last one: a
 /// Ticket the owner dispatched by hand (or that a later, uncapped Dispatch
 /// fired) is no longer waiting.
@@ -367,9 +366,8 @@ pub struct WaitingState {
 /// kept instead - one JSON object per line in `.jj/pool/runs.jsonl`, appended
 /// and never truncated, the same shape the Agent Runtime hooks already write.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
-/// Worker documents so their shape is preserved. A compatibility peer ignores
-/// it, and it is readable without the TUI.
+/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// documents so their shape is preserved, and it is readable without the TUI.
 ///
 /// A value the provider reported unusably - a negative, non-finite or
 /// out-of-range cost, as bug-hunt ticket 28 handles - is recorded as absent,
@@ -511,9 +509,9 @@ pub struct MutationRecord {
 
 /// The latest jjfx-initiated mutation per Workspace.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Go-compatible Pool and
-/// Worker documents so their shape is preserved. A compatibility peer ignores it;
-/// a missing or unreadable file means "nothing recorded to undo".
+/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// documents so their shape is preserved. A missing or unreadable file means
+/// "nothing recorded to undo".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UndoState {
     /// The latest recorded mutation, keyed by the Workspace it mutated (or
@@ -593,7 +591,7 @@ impl DispatchGroupOptions {
     }
 }
 
-/// The exact Go-compatible Dispatch Group state.
+/// The exact persisted Dispatch Group state.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DispatchGroupState {
     /// Parent Ticket that owns this Dispatch Group.

@@ -1,8 +1,8 @@
 //! The workspace-dispatch engine: repository discovery, Workspaces, the Worker
 //! Pool, agent runtimes, run logs, tickets, and dispatch.
 //!
-//! Absorbed from the former `wsg-core` crate so `jjfx` ships as a single crate.
-//! The CLI reaches it through [`crate::engine`].
+//! The engine lives in this crate rather than a separate one, so `jjfx` ships
+//! as a single crate. The CLI reaches it through [`crate::engine`].
 
 use std::fs;
 use std::io;
@@ -249,11 +249,11 @@ impl Repository {
 
     /// Provisions the Worker Workspace and idle Worker state for `worker_id`.
     ///
-    /// This is a blocking operation. It creates the Go-compatible Workspace
-    /// path, projects `.jj/ws-cache`, and writes an idle Worker document. If a
-    /// later step fails, resources created by this call are compensated before
-    /// the error is returned. Missing optional setup sources are valid; a
-    /// failure copying a source that exists fails the operation.
+    /// This is a blocking operation. It creates the Workspace path, projects
+    /// `.jj/ws-cache`, and writes an idle Worker document. If a later step
+    /// fails, resources created by this call are compensated before the error
+    /// is returned. Missing optional setup sources are valid; a failure copying
+    /// a source that exists fails the operation.
     pub fn provision_worker_workspace(
         &self,
         worker_id: &WorkerId,

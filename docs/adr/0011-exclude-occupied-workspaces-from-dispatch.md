@@ -17,6 +17,12 @@ compatibility promise (`.scratch/wsg-migration/PRD.md`) forbids changing the
 Go-compatible Pool and Worker documents, so occupancy cannot be a new field on
 `WorkerState`.
 
+The compatibility promise this second constraint rested on has lapsed. The Go
+project is archived, the compatibility binary has been removed, and the
+multi-pool effort ruled that the persisted state is jjfx's to reshape, so
+occupancy is no longer barred from `WorkerState`. The reasoning above is kept as
+the constraint of its time.
+
 ## Decision
 
 Introduce **Dispatch Eligibility**: a Worker is eligible when it is a Pool

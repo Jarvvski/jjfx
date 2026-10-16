@@ -19,14 +19,14 @@ mod support;
 
 use support::HELPER_LIVENESS_TIMEOUT;
 
-const MODE: &str = "WSG_RUST_STATE_HELPER_MODE";
-const LOCK: &str = "WSG_RUST_STATE_HELPER_LOCK";
-const READY: &str = "WSG_RUST_STATE_HELPER_READY";
-const RELEASE: &str = "WSG_RUST_STATE_HELPER_RELEASE";
-const RESULT: &str = "WSG_RUST_STATE_HELPER_RESULT";
-const ROOT: &str = "WSG_RUST_STATE_HELPER_ROOT";
-const KIND: &str = "WSG_RUST_STATE_HELPER_KIND";
-const VALUE: &str = "WSG_RUST_STATE_HELPER_VALUE";
+const MODE: &str = "JJFX_RUST_STATE_HELPER_MODE";
+const LOCK: &str = "JJFX_RUST_STATE_HELPER_LOCK";
+const READY: &str = "JJFX_RUST_STATE_HELPER_READY";
+const RELEASE: &str = "JJFX_RUST_STATE_HELPER_RELEASE";
+const RESULT: &str = "JJFX_RUST_STATE_HELPER_RESULT";
+const ROOT: &str = "JJFX_RUST_STATE_HELPER_ROOT";
+const KIND: &str = "JJFX_RUST_STATE_HELPER_KIND";
+const VALUE: &str = "JJFX_RUST_STATE_HELPER_VALUE";
 
 struct ChildGuard(Option<Child>);
 impl Drop for ChildGuard {

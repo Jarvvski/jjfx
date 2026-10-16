@@ -21,9 +21,9 @@ mod support;
 
 use support::HELPER_LIVENESS_TIMEOUT;
 
-const HELPER_MODE: &str = "WSG_UNIX_SPIKE_MODE";
-const HELPER_LOCK_PATH: &str = "WSG_UNIX_SPIKE_LOCK_PATH";
-const HELPER_RESULT_PATH: &str = "WSG_UNIX_SPIKE_RESULT_PATH";
+const HELPER_MODE: &str = "JJFX_UNIX_SPIKE_MODE";
+const HELPER_LOCK_PATH: &str = "JJFX_UNIX_SPIKE_LOCK_PATH";
+const HELPER_RESULT_PATH: &str = "JJFX_UNIX_SPIKE_RESULT_PATH";
 
 struct ChildGuard {
     child: Option<Child>,

@@ -19,7 +19,7 @@ use crate::engine::{
 /// natural finalization.
 const CLEAR_RUN_ATTEMPTS: usize = 3;
 
-/// A Go-compatible number of reusable Worker slots, including an empty Pool.
+/// A number of reusable Worker slots, including an empty Pool.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct PoolCapacity(usize);
 
@@ -1968,7 +1968,7 @@ impl WorkerPoolSnapshot {
 }
 
 impl Repository {
-    /// Reads the existing Go-compatible Worker Pool without changing any file.
+    /// Reads the existing Worker Pool without changing any file.
     pub fn read_worker_pool_snapshot(&self) -> WorkerPoolSnapshot {
         let state = self.state_store();
         // The in-use marker is jjfx-owned presentation state, read without
