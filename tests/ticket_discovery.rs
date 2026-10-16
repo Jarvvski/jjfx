@@ -482,6 +482,79 @@ fn ready_ticket_discovery_reports_a_repeated_ticket_once() {
 }
 
 #[test]
+fn ready_ticket_discovery_carries_the_blockers_a_source_declares() {
+    // `--all` bases a dependent on its Blocker's branch, so the Blockers have to
+    // survive ready discovery rather than being left to the agent to guess.
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"tickets":[{"id":"AMBA-42","title":"Dependent","status":"Todo","labels":["ready-for-agent"],"blocked_by":["AMBA-41"]}]}"#,
+    ));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+
+    let dependent = TicketId::parse("AMBA-42").expect("Ticket ID");
+    assert_eq!(
+        tickets.blockers(&dependent),
+        &[TicketId::parse("AMBA-41").expect("Blocker ID")]
+    );
+}
+
+#[test]
+fn ready_ticket_discovery_reports_no_blockers_when_none_are_declared() {
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"tickets":[{"id":"AMBA-42","title":"Standalone","status":"Todo","labels":["ready-for-agent"]}]}"#,
+    ));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+
+    let standalone = TicketId::parse("AMBA-42").expect("Ticket ID");
+    assert!(tickets.blockers(&standalone).is_empty());
+}
+
+#[test]
+fn ready_ticket_discovery_rejects_an_unusable_blocker_id() {
+    // A Blocker jjfx cannot name cannot be resolved to a branch, so the
+    // dependent is excluded with a diagnostic rather than silently based on
+    // trunk - the failure this path exists to prevent.
+    let discovery = TicketDiscovery::new(StubQuery::returning(
+        r#"{"tickets":[{"id":"AMBA-42","title":"Dependent","status":"Todo","labels":["ready-for-agent"],"blocked_by":["../escape"]}]}"#,
+    ));
+    let filter = ReadyTicketFilter::new(
+        "ready-for-agent",
+        TicketStatus::parse("Todo").expect("expected workflow status"),
+    )
+    .expect("Ready Ticket filter");
+
+    let tickets = discovery
+        .ready_tickets(&filter)
+        .expect("Ready Ticket discovery");
+
+    assert!(tickets.tickets().is_empty());
+    assert_eq!(tickets.diagnostics().len(), 1);
+    assert_eq!(tickets.diagnostics()[0].subject(), "AMBA-42");
+    assert!(
+        tickets.diagnostics()[0]
+            .reason()
+            .contains("invalid Blocker"),
+        "{:?}",
+        tickets.diagnostics()[0]
+    );
+}
+
+#[test]
 fn ticket_values_preserve_valid_linear_identity_and_relationships() {
     let id = TicketId::parse("AMBA-42").expect("Ticket ID");
     let ticket = Ticket::new(

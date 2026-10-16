@@ -17,11 +17,12 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
     DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
-    DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded, OrchestrationEvent,
-    PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
-    RunActivityKind, RunMode, StuckWindow, TerminalSettings, TicketDetails, TicketDiscovery,
-    TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent, WorkerActions, WorkerId,
-    WorkerPoolError, WorkerPoolSnapshot, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
+    DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
+    OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
+    ReviewLoop, RunActivity, RunActivityKind, RunMode, StuckWindow, TerminalSettings,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
+    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -1729,6 +1730,26 @@ fn dispatch_command(
                 }
                 if let Some(dollars) = args.budget {
                     request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
+                }
+                // Base a dependent on its Blockers' branches, exactly as
+                // orchestration does, so a chain lands as a stack rather than as
+                // parallel branches off trunk. A Blocker with no branch to stack
+                // on is stated rather than left silent, so a dependent that is
+                // not fully stacked is never a surprise.
+                let basis = dependency_basis(ready.blockers(ticket.id()), |blocker| {
+                    resolve_ticket_branch(repository.root(), blocker)
+                });
+                if let Some(context) = basis.context() {
+                    request = request.with_dependency_context(context.clone());
+                }
+                let base = basis
+                    .context()
+                    .map_or("trunk", DispatchDependencyContext::pull_request_base);
+                for blocker in basis.unstacked() {
+                    eprintln!(
+                        "Ticket {} is blocked by {blocker}, which has no branch; basing it on {base}",
+                        ticket.id()
+                    );
                 }
                 Ok(request)
             })

@@ -15,13 +15,13 @@ use crate::engine::atomic::{self, LockOutcome};
 use crate::engine::pool::current_timestamp;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
-    DirectDispatchRequest, DirectDispatchSuccess, DispatchExclusions, DispatchGroup,
-    DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent, DispatchGroupOptions,
-    DispatchGroupProgress, DispatchGroupState, DispatchGroupStatusCounts, ExclusionsProvider,
-    Expected, Loaded, ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode,
-    StateChange, StateRevision, SubIssueStatus, Ticket, TicketDetails, TicketDiscovery, TicketId,
-    TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId,
-    WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    DirectDispatchRequest, DirectDispatchSuccess, DispatchDependencyContext, DispatchExclusions,
+    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent,
+    DispatchGroupOptions, DispatchGroupProgress, DispatchGroupState, DispatchGroupStatusCounts,
+    ExclusionsProvider, Expected, Loaded, ParentTicket, Repository, RepositoryIdentity,
+    Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket, TicketDetails,
+    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -665,7 +665,11 @@ fn revision_exists(root: &Path, revision: &str) -> bool {
         .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
 }
 
-fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
+/// The bookmark a Worker delivered for `ticket`, when one exists.
+///
+/// Shared by orchestration's branch repair and the `--all` path's stacked base:
+/// both answer "which branch carries this Ticket's work?" the same way.
+pub(crate) fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
     // Match on the Ticket, not a hardcoded namespace. The branch prefix comes
     // from the operator's `jj user.name`, which dispatch reads at dispatch time
     // and which may change before a group is resumed; hardcoding it made the
@@ -689,6 +693,62 @@ fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
             })
         })
         .map(str::to_owned)
+}
+
+/// The stacked base resolved for a dependent Ticket from its Blockers' branches.
+///
+/// A dependent can build on several Blockers at once, so the
+/// [`context`](Self::context) carries every stackable branch in Blocker order.
+/// The Blockers with no branch to stack on are reported in
+/// [`unstacked`](Self::unstacked) rather than dropped: the caller states them so
+/// a dependent based on trunk - or on fewer branches than it has Blockers - is
+/// never silent about it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DependencyBasis {
+    context: Option<DispatchDependencyContext>,
+    unstacked: Vec<TicketId>,
+}
+
+impl DependencyBasis {
+    /// Returns the stacked base, or `None` when no Blocker has a branch.
+    pub(crate) const fn context(&self) -> Option<&DispatchDependencyContext> {
+        self.context.as_ref()
+    }
+
+    /// Returns the Blockers that had no branch to stack on, in declared order.
+    pub(crate) fn unstacked(&self) -> &[TicketId] {
+        &self.unstacked
+    }
+}
+
+/// Resolves the stacked base for a dependent Ticket from its Blockers' branches.
+///
+/// `branch_of` returns the bookmark a Blocker delivered, or `None`. A `main`
+/// branch counts as no branch: a Blocker merged to trunk must not be used as a
+/// base, or the dependent's Pull Request would open against trunk and silently
+/// swallow an unmerged prerequisite's diff. Such a Blocker is reported in
+/// [`DependencyBasis::unstacked`] instead.
+pub(crate) fn dependency_basis(
+    blockers: &[TicketId],
+    branch_of: impl Fn(&TicketId) -> Option<String>,
+) -> DependencyBasis {
+    let mut base_revisions = Vec::new();
+    let mut description = Vec::new();
+    let mut unstacked = Vec::new();
+    for blocker in blockers {
+        match branch_of(blocker) {
+            Some(branch) if branch != "main" => {
+                description.push(format!("- Branch: {branch} (implements {blocker})"));
+                base_revisions.push(branch);
+            }
+            _ => unstacked.push(blocker.clone()),
+        }
+    }
+    let pull_request_base = base_revisions.first().cloned();
+    let context = pull_request_base.map(|pull_request_base| {
+        DispatchDependencyContext::new(base_revisions, description.join("\n"), pull_request_base)
+    });
+    DependencyBasis { context, unstacked }
 }
 
 struct LiveExecution {
@@ -1493,6 +1553,63 @@ mod tests {
         );
         assert_eq!(dependency.pull_request_base(), "adam/eng-101-foundation");
         assert!(dependency.description().contains("ENG-101"));
+    }
+
+    #[test]
+    fn a_dependent_with_a_blocker_branch_stacks_on_it() {
+        let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+        let basis = dependency_basis(std::slice::from_ref(&blocker), |ticket| {
+            (ticket == &blocker).then(|| "adam/eng-101-foundation".to_owned())
+        });
+
+        let context = basis.context().expect("stacked dependency context");
+        assert_eq!(
+            context.base_revisions(),
+            &["adam/eng-101-foundation".to_owned()]
+        );
+        assert_eq!(context.pull_request_base(), "adam/eng-101-foundation");
+        assert!(context.description().contains("ENG-101"));
+        assert!(basis.unstacked().is_empty());
+    }
+
+    #[test]
+    fn a_dependent_with_no_blocker_branch_is_reported_unstacked() {
+        let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| None);
+
+        assert!(
+            basis.context().is_none(),
+            "no branch means no stack to build on"
+        );
+        assert_eq!(basis.unstacked(), &[blocker]);
+    }
+
+    #[test]
+    fn a_merged_blocker_is_unstacked_rather_than_a_trunk_base() {
+        // A merged Blocker carries `main`. Using it as the base would open the
+        // dependent's Pull Request against trunk and silently swallow an
+        // unmerged prerequisite, so it is reported as unstacked instead.
+        let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| Some("main".to_owned()));
+
+        assert!(basis.context().is_none());
+        assert_eq!(basis.unstacked(), &[blocker]);
+    }
+
+    #[test]
+    fn mixed_blockers_stack_on_the_real_branch_and_report_the_rest() {
+        let merged = TicketId::parse("ENG-101").expect("merged Blocker");
+        let stacked = TicketId::parse("ENG-102").expect("stacked Blocker");
+        let basis = dependency_basis(&[merged.clone(), stacked.clone()], |ticket| {
+            (ticket == &stacked).then(|| "adam/eng-102-foundation".to_owned())
+        });
+
+        let context = basis.context().expect("stacked dependency context");
+        assert_eq!(
+            context.base_revisions(),
+            &["adam/eng-102-foundation".to_owned()]
+        );
+        assert_eq!(basis.unstacked(), &[merged]);
     }
 
     #[test]
