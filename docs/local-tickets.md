@@ -72,13 +72,23 @@ same way a Linear title and description are, so a Worker needs no tracker tools.
 jjfx keeps the files in step with the Worker Pool:
 
 - A Worker that reserves a local Ticket sets its `Status:` to `claimed`.
-- A Worker whose Run finishes sets its `Status:` to `resolved` and appends a
+- A Ticket whose Run finishes sets its `Status:` to `resolved` and appends a
   dated line under the file's `## Comments` heading, adding the heading when the
   file has none.
 
 Only the `Status:` line and the appended comment are written, so the rest of the
 file is preserved byte for byte. Both steps are idempotent: a repeated reconcile
 never appends the comment twice.
+
+The completion signal is the durable Run Record store (`.jj/pool/runs.jsonl`), not
+live Worker state: a Run appends its record when it finalizes, and the record
+names the Ticket, so a finished Run still resolves its Ticket after `pool reset`
+cleared the Worker's Ticket association. Reconciliation runs before Dispatch
+discovers ready work (so a resolved blocker readies its dependent in the same
+Dispatch), on the state-reading commands (`jjfx status`, `jjfx pool list`), and
+on demand with `jjfx ticket reconcile`, which needs no ready Ticket and no
+Dispatch. A Ticket a live Worker is still running is in flight, not finished, so
+it is never resolved from a stale record.
 
 ## Diagnostics
 

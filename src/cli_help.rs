@@ -407,6 +407,11 @@ const TOP_LEVEL: &[Group] = &[
                 args: "[<worker>] [--force]",
                 summary: "Undo the last jjfx mutation on a Worker (list when omitted)",
             },
+            Entry {
+                key: "ticket reconcile",
+                args: "",
+                summary: "Resolve finished local Tickets without a Dispatch",
+            },
         ],
     },
     Group {
@@ -693,6 +698,13 @@ const PAGES: &[CommandHelp] = &[
             help: "Worker id, workspace name, or `repo`/`*` for a repository-wide mutation; omit to list what can be undone",
         }],
         flags: UNDO_FLAGS,
+    },
+    CommandHelp {
+        key: "ticket reconcile",
+        summary: "Resolve finished local Tickets from the durable Run Record store",
+        usage: "ticket reconcile",
+        arguments: &[],
+        flags: NO_FLAGS,
     },
     CommandHelp {
         key: "hooks install",

@@ -18,7 +18,7 @@ use serde_json::json;
 use thiserror::Error;
 
 use crate::engine::{
-    ReadyTicketFilter, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest, WorkerStatus,
+    ReadyTicketFilter, TicketId, TicketQuery, TicketQueryError, TicketQueryRequest,
 };
 
 /// The `issues` directory holding one feature's Ticket files.
@@ -102,23 +102,33 @@ impl LocalTickets {
         Ok(tickets)
     }
 
-    /// Claims or resolves the Tickets the given Workers own.
+    /// Claims the Tickets in-flight Workers own and resolves the Tickets whose
+    /// latest durable Run Record succeeded.
     ///
-    /// A `Busy` Worker claims its Ticket and a `Done` Worker resolves it; every
-    /// other Worker state is left alone. Failures are collected rather than
-    /// raised: the writeback is a side effect of a Dispatch that already
-    /// succeeded, so the caller decides how loudly to report it. A Ticket that is
-    /// not a local file is skipped - a Worker can own a Ticket named by hand, or
-    /// one left over from another source.
-    pub fn write_back(&self, workers: &[(&str, WorkerStatus)]) -> Vec<LocalTicketError> {
+    /// The completion signal comes from the Run Record store (`completed`), not
+    /// live Worker state, because `pool reset` clears a Worker's Ticket
+    /// association: a Worker that finished and was reset would otherwise never
+    /// resolve its Ticket. A Ticket a live Worker still owns is in flight, not
+    /// finished, so a claim wins and a re-dispatched Ticket is never resolved from
+    /// a stale record. Failures are collected rather than raised: the writeback is
+    /// a side effect of a command that already succeeded, so the caller decides
+    /// how loudly to report it. A Ticket that is not a local file is skipped - a
+    /// Worker can own a Ticket named by hand, or one left over from another
+    /// source.
+    pub fn write_back(&self, in_flight: &[&str], completed: &[&str]) -> Vec<LocalTicketError> {
         let mut failures = Vec::new();
-        for (ticket, status) in workers {
-            let update = match status {
-                WorkerStatus::Busy => self.claim(ticket),
-                WorkerStatus::Done => self.resolve(ticket),
-                WorkerStatus::Idle | WorkerStatus::Failed => continue,
-            };
-            match update {
+        for ticket in in_flight {
+            match self.claim(ticket) {
+                Ok(_) => {}
+                Err(LocalTicketError::NotFound { .. }) => {}
+                Err(error) => failures.push(error),
+            }
+        }
+        for ticket in completed {
+            if in_flight.contains(ticket) {
+                continue;
+            }
+            match self.resolve(ticket) {
                 Ok(_) => {}
                 Err(LocalTicketError::NotFound { .. }) => {}
                 Err(error) => failures.push(error),
@@ -1132,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn write_back_claims_busy_workers_and_resolves_done_ones() {
+    fn write_back_claims_in_flight_tickets_and_resolves_completed_ones() {
         let temporary = TempDir::new().expect("temporary directory");
         write_ticket(
             temporary.path(),
@@ -1148,12 +1158,10 @@ mod tests {
         );
         let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
 
-        let failures = tickets.write_back(&[
-            ("widgets--01-running", WorkerStatus::Busy),
-            ("widgets--02-finished", WorkerStatus::Done),
-            ("widgets--03-not-local", WorkerStatus::Busy),
-            ("widgets--04-idle", WorkerStatus::Idle),
-        ]);
+        let failures = tickets.write_back(
+            &["widgets--01-running", "widgets--03-not-local"],
+            &["widgets--02-finished", "widgets--04-not-local"],
+        );
 
         assert!(failures.is_empty(), "{failures:?}");
         let running = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-running.md"))
@@ -1167,5 +1175,31 @@ mod tests {
             finished.contains("Resolved by jjfx dispatch."),
             "{finished}"
         );
+    }
+
+    #[test]
+    fn an_in_flight_ticket_is_never_resolved_from_a_stale_completion() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-redispatched.md",
+            "# Redispatched\n\nStatus: ready-for-agent\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        // The same Ticket is both in flight (a live Worker owns it) and named by a
+        // stale succeeded Run Record; the claim wins, so it is not resolved.
+        let failures =
+            tickets.write_back(&["widgets--01-redispatched"], &["widgets--01-redispatched"]);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        let redispatched = fs::read_to_string(ticket_path(
+            temporary.path(),
+            "widgets",
+            "01-redispatched.md",
+        ))
+        .expect("redispatched file");
+        assert!(redispatched.contains("Status: claimed"), "{redispatched}");
     }
 }

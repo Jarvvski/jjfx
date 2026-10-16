@@ -11,7 +11,7 @@ use std::path::Path;
 use crate::config::{TicketSource, TicketsConfig};
 use crate::engine::{
     AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, Repository, TicketQuery,
-    TicketQueryError, WorkerPoolSnapshot,
+    TicketQueryError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
@@ -35,11 +35,16 @@ pub(crate) fn configured_ticket_query(
 }
 
 /// Writes local Tickets back for the reconciled Worker Pool: a Worker running a
-/// local Ticket claims it, and a Worker whose Run finished resolves it.
+/// local Ticket claims it, and a Ticket whose Run finished is resolved.
 ///
-/// A no-op for every other source. The failures are returned rather than raised:
-/// the writeback is a side effect of a Dispatch that already succeeded, and the
-/// caller decides how loudly to report it.
+/// The completion signal is the durable Run Record store, not live Worker state:
+/// `pool reset` clears a Worker's Ticket association, so a finished Worker that
+/// was reset would otherwise never resolve its Ticket. Live `done` Workers are
+/// folded in as well, so a Run whose record was never written - a runtime that
+/// finalizes lazily - still resolves while its Worker is intact. A no-op for
+/// every other source. The failures are returned rather than raised: the
+/// writeback is a side effect of a command that already succeeded, and the caller
+/// decides how loudly to report it.
 pub(crate) fn apply_local_writeback(
     repository: &Repository,
     snapshot: &WorkerPoolSnapshot,
@@ -53,27 +58,50 @@ pub(crate) fn apply_local_writeback(
         tickets.local.ready_status.clone(),
         tickets.local.resolved_status.clone(),
     );
-    let workers = snapshot
+    let in_flight = snapshot
         .workers()
         .iter()
-        .filter_map(|worker| worker.ticket().map(|ticket| (ticket, worker.status())))
+        .filter(|worker| worker.status() == WorkerStatus::Busy)
+        .filter_map(|worker| worker.ticket())
         .collect::<Vec<_>>();
-    local
-        .write_back(&workers)
-        .into_iter()
-        .map(|error| error.to_string())
-        .collect()
+    let mut completed = snapshot
+        .workers()
+        .iter()
+        .filter(|worker| worker.status() == WorkerStatus::Done)
+        .filter_map(|worker| worker.ticket().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let mut failures = Vec::new();
+    match repository.state_store().runs().completed_tickets() {
+        Ok(recorded) => {
+            for ticket in recorded {
+                if !completed.contains(&ticket) {
+                    completed.push(ticket);
+                }
+            }
+        }
+        Err(error) => failures.push(format!("cannot read Run Records: {error}")),
+    }
+    let completed = completed.iter().map(String::as_str).collect::<Vec<_>>();
+    failures.extend(
+        local
+            .write_back(&in_flight, &completed)
+            .into_iter()
+            .map(|error| error.to_string()),
+    );
+    failures
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::sync::{Arc, Mutex};
 
     use super::*;
     use crate::engine::{
-        ParentTicket, ReadyTicketFilter, RepositoryIdentity, TicketDiscovery, TicketId,
-        TicketQueryRequest, TicketStatus,
+        ParentTicket, ReadyTicketFilter, RepositoryIdentity, RunRecord, RunRecordConclusion,
+        TicketDiscovery, TicketId, TicketQueryRequest, TicketStatus, WorkerId,
     };
+    use tempfile::TempDir;
 
     fn linear() -> TicketsConfig {
         TicketsConfig {
@@ -140,6 +168,87 @@ mod tests {
         }
     }
 
+    fn write_local_ticket(root: &Path, feature: &str, file: &str, content: &str) {
+        let directory = root.join(".scratch").join(feature).join("issues");
+        fs::create_dir_all(&directory).expect("issues directory");
+        fs::write(directory.join(file), content).expect("Ticket file");
+    }
+
+    fn completed_record(ticket: &str) -> RunRecord {
+        RunRecord {
+            run_id: "worker-1@1".to_owned(),
+            worker: WorkerId::parse("worker-1").expect("worker id"),
+            ticket: Some(ticket.to_owned()),
+            workspace: None,
+            branch: None,
+            runtime: None,
+            provider: None,
+            model: None,
+            cost_micro_usd: None,
+            usage: None,
+            duration_ms: None,
+            turns: None,
+            conclusion: RunRecordConclusion::Succeeded,
+            error: None,
+            started_at: None,
+            completed_at: None,
+        }
+    }
+
+    /// The chain the deadlock broke: a finished Run resolves its local Ticket and
+    /// makes its dependent ready, driven by the durable Run Record alone.
+    ///
+    /// The snapshot has no live Worker - exactly the state after `pool reset` -
+    /// so this proves the completion signal survives reset rather than depending
+    /// on live Worker state.
+    #[test]
+    fn a_finished_run_resolves_its_ticket_and_readies_its_dependent() {
+        let temporary = TempDir::new().expect("temporary repository");
+        fs::create_dir(temporary.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temporary.path()).expect("repository");
+        write_local_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: claimed\n",
+        );
+        write_local_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        repository
+            .state_store()
+            .runs()
+            .append(&completed_record("widgets--01-foundation"))
+            .expect("append");
+        let tickets = local();
+        let snapshot = repository.worker_pool().snapshot();
+
+        let failures = apply_local_writeback(&repository, &snapshot, &tickets);
+
+        assert!(failures.is_empty(), "{failures:?}");
+        let foundation = fs::read_to_string(
+            temporary
+                .path()
+                .join(".scratch/widgets/issues/01-foundation.md"),
+        )
+        .expect("foundation Ticket");
+        assert!(foundation.contains("Status: resolved"), "{foundation}");
+        let discovery = TicketDiscovery::new(
+            configured_ticket_query(temporary.path(), &tickets, AgentRuntime::Claude)
+                .expect("query"),
+        );
+        let filter = ReadyTicketFilter::new(
+            "ready-for-agent",
+            TicketStatus::parse("ready-for-agent").expect("ready status"),
+        )
+        .expect("Ready Ticket filter");
+        let ready = discovery.ready_tickets(&filter).expect("ready Tickets");
+        assert_eq!(ready.tickets().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.tickets()[0].id().as_str(), "widgets--02-dependent");
+    }
     /// A non-runtime `TicketQuery` stands in for a configured source: it proves
     /// discovery, the dependency graph, and ticket details all route through
     /// whichever source is selected, with no Agent Runtime involved.
