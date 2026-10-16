@@ -1,6 +1,6 @@
 # Capture Run Records and spend
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -29,11 +29,11 @@ Take care that a Run reconciled later is recorded exactly once.
 
 ## Acceptance Criteria
 
-- [ ] A completed opencode Run appends one Run Record to `.jj/pool/runs.jsonl`.
-- [ ] `status` and `status --json` report a non-zero cost after a run that reported one.
-- [ ] A Run finalized by reconciliation rather than by the supervisor still produces a record, and no Run produces two.
-- [ ] Tests cover record-once semantics.
-- [ ] `mise run check` is green.
+- [x] A completed opencode Run appends one Run Record to `.jj/pool/runs.jsonl`.
+- [x] `status` and `status --json` report a non-zero cost after a run that reported one.
+- [x] A Run finalized by reconciliation rather than by the supervisor still produces a record, and no Run produces two.
+- [x] Tests cover record-once semantics.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -45,3 +45,4 @@ Take care that a Run reconciled later is recorded exactly once.
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive, where the report noted the costs were visible in the raw logs but absent from jjfx.
+- 2026-10-16: Root cause was two-fold. (1) A background Dispatch spawns a waiter thread in the CLI process, but the CLI exits before the Run ends, so the Run is always finalized by the lazy `reconcile_runs` path - and `reconcile_worker` applied the terminal result to Worker state without appending a Run Record. It now appends on the `Applied` commit only, so the supervisor and reconciliation paths record each Run exactly once. (2) The opencode log parser never read the per-step `step_finish` cost/tokens, so even a recorded Run carried no cost; the Run's totals are now summed from its own event log in both the supervisor and reconciliation paths.
