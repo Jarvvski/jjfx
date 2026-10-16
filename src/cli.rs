@@ -2181,22 +2181,43 @@ fn dispatch_with_capacity_prompt(
     }
 }
 
+/// The capacity question, without the answer hint: `Grow pool by 3?`.
 fn growth_question(shortage: CapacityShortage) -> String {
     format!(
-        "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Grow pool by {}? [Y/n] ",
+        "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Grow pool by {}?",
         shortage.available(),
         shortage.requested(),
         shortage.gap()
     )
 }
 
+/// Whether a typed answer approves growing the pool.
+///
+/// Only an explicit `y`/`yes` does. An empty answer, an EOF, or anything else
+/// refuses, so the prompt's default is the cheap option.
+fn answer_approves_growth(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Ask whether to grow the pool to fit a whole batch.
+///
+/// A prompt that cannot be answered must not default to the expensive option:
+/// a non-interactive caller - no terminal, or stdin at EOF - refuses, so
+/// `jjfx dispatch` in a script can never grow the pool by not answering.
 fn confirm_growth(shortage: CapacityShortage) -> bool {
-    eprint!("{}", growth_question(shortage));
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    let question = growth_question(shortage);
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{question} Not a terminal, so not growing the pool; run `{PROGRAM} pool <N>` to grow it."
+        );
         return false;
     }
-    !input.trim().eq_ignore_ascii_case("n") && !input.trim().eq_ignore_ascii_case("no")
+    eprint!("{question} [y/N] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    answer_approves_growth(&answer)
 }
 
 /// Renders one Dispatch batch and returns the shared model the caller inspects
@@ -4265,8 +4286,21 @@ mod tests {
         let shortage = CapacityShortage::new(5, 2);
         assert_eq!(
             growth_question(shortage),
-            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Grow pool by 3? [Y/n] "
+            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Grow pool by 3?"
         );
+    }
+
+    /// A prompt that cannot be answered must not default to the expensive
+    /// option: only an explicit `y`/`yes` grows the pool, so an empty answer or
+    /// an EOF refuses it.
+    #[test]
+    fn only_an_explicit_yes_grows_the_pool() {
+        for answer in ["y", "Y", "yes", "YES", " y \n"] {
+            assert!(answer_approves_growth(answer), "`{answer}` should approve");
+        }
+        for answer in ["", "\n", "n", "no", "nope", "maybe", "y n"] {
+            assert!(!answer_approves_growth(answer), "`{answer}` should refuse");
+        }
     }
 
     #[test]

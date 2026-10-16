@@ -53,6 +53,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx logs stops following when the Worker's Run ends - it re-checks the terminal state on every pass and returns cleanly (printing why) instead of following a finished Worker forever, and it ends cleanly if the Run log or the Worker itself disappears mid-follow.
 - jjfx dispatch <feature> orchestrates a local feature's Tickets in dependency order: a local feature Parent is a directory rather than a Ticket file, so it now resolves to no details of its own instead of failing as a missing Ticket, and a failed Ticket-details fetch names the configured source - the local root, or Linear - instead of always Linear.
 - jjfx help now answers for every spelling the parser accepts - the short aliases (d, rb, pool create) and the pool synonyms - so the recovery hint command is documented instead of rejected as an unknown command, and the top-level list documents jjfx help itself.
+- jjfx dispatch no longer grows the pool when the capacity prompt cannot be answered: with no terminal (a script) or an empty answer the pool stays at its size and the batch dispatches to the available Workers, so the expensive option is never the default.
 
 ## [0.55.0] - 2026-10-16
 
