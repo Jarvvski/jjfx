@@ -37,6 +37,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Every command has a help page: `jjfx help <command>` prints a command's usage, arguments and flags (derived from the same definitions the parser reads, so the two cannot drift), an unknown command fails naming it, and the top-level help now lists the Lifecycle group (`hooks install` / `hooks status`).
 - jjfx dispatch can take a Ticket handed in directly - `--text`, `--from-file <path>`, or stdin (`-`) - with an optional `--id`, so an ad-hoc Dispatch consults no Ticket source and works in a repository with no `[tickets]` configuration, no Linear key, and no `.scratch/` tree.
 - jjfx dispatch --all bases a dependent Ticket on its blocker's branch (resolved from the blocker's bookmark), so a chain of Tickets lands as a real stack instead of parallel branches off trunk; a dependent whose blocker has no branch is stated and based on trunk rather than left silent.
+- jjfx dispatch --all names every Ticket it skipped and why when the ready set is empty - a blocked Ticket reports its blocker and that blocker's status, a Ticket with the wrong Status: reports it, and a malformed file keeps its diagnostic - on both the prose and --json paths, so an empty batch reads as nothing to do or nothing can be done instead of a bare [].
 
 ### Fixed
 
