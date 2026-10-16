@@ -2101,6 +2101,13 @@ fn missing_pool_is_not_invented_as_empty() {
     let snapshot = repository.read_worker_pool_snapshot();
     assert!(snapshot.pool().is_none());
     assert!(snapshot.is_missing());
+    // Absence is the normal state of a lane that has never run, so it is not a
+    // diagnostic: a frontend narrating `diagnostics()` must stay silent.
+    assert!(
+        snapshot.diagnostics().is_empty(),
+        "{:?}",
+        snapshot.diagnostics()
+    );
 }
 
 #[test]

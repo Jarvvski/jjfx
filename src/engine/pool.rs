@@ -1924,7 +1924,6 @@ impl WorkerSnapshot {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotDiagnosticKind {
-    MissingPool,
     MalformedPool,
     MissingWorker,
     MalformedWorker,
@@ -2003,12 +2002,19 @@ impl WorkerPoolSnapshot {
             .iter()
             .any(|worker| worker.as_str() == worker_id)
     }
+    /// Reports whether this Pool has no state on disk at all.
+    ///
+    /// That is the normal state of a lane declared but never used, which
+    /// materialises on first use (ADR 0013), so absence is not a diagnostic:
+    /// it is inferred from the absence of a readable pool document. A pool
+    /// whose state exists but could not be read is a
+    /// [`SnapshotDiagnosticKind::MalformedPool`] instead, and is not missing.
     pub fn is_missing(&self) -> bool {
         self.pool.is_none()
-            && self
+            && !self
                 .diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.kind == SnapshotDiagnosticKind::MissingPool)
+                .any(|diagnostic| diagnostic.kind == SnapshotDiagnosticKind::MalformedPool)
     }
 }
 
@@ -2033,13 +2039,13 @@ impl Repository {
         let cost = self.pool_cost().ok();
         let mut diagnostics = Vec::new();
         let pool = match state.pool().load() {
+            // A Pool with no state is normal - a declared lane materialises on
+            // first use (ADR 0013) - so absence is not a diagnostic. Only a
+            // pool document that exists but cannot be read is reported; the
+            // `WORKERS` column already shows `-` for a lane that has not run,
+            // and narrating absence once per lane is noise on a successful
+            // command.
             Ok(Loaded::Missing) => {
-                diagnostics.push(diagnostic(
-                    self.root(),
-                    SnapshotDiagnosticKind::MissingPool,
-                    None,
-                    "pool state is absent",
-                ));
                 return WorkerPoolSnapshot {
                     pool: None,
                     workers: Vec::new(),
