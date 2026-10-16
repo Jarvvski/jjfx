@@ -1,6 +1,6 @@
 # `jjfx wait`: block until a Worker is done, with the answer in the exit code
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: 03
 
@@ -67,3 +67,4 @@ Precedent for the shape: `kubectl wait --for=condition=...`, `docker wait`, `doc
 ## Comments
 
 - 2026-10-16: Filed at the owner's request, after the `todo-md` test-drive in which an agent had to poll with sleeps.
+- 2026-10-16: Resolved. `jjfx wait <worker>... [--until done|failed|terminal|ticket-resolved] [--timeout SECS] [--json] [--all]` blocks until the condition holds and carries the answer in its exit code: `0` reached, `1` timed out, `2` a Worker reached a terminal state that does not satisfy `--until`. It is reconcile-until-a-condition, sharing the one reconcile pass (`reconcile_pass`: `reconcile_runs` then the local Ticket writeback) with `status` and `ticket reconcile`, so a Worker whose process died silently still advances and a finished Run still resolves its local Ticket. The condition is evaluated before the first sleep, so an already-terminal Worker returns at once. `--until ticket-resolved` needs `[tickets] source = "local"` and a Ticket on every target.
