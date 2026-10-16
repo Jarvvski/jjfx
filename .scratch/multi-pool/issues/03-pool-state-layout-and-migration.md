@@ -1,7 +1,7 @@
 # Where do pools live on disk, and how does today's pool migrate?
 
 Type: grilling
-Status: ready-for-human
+Status: resolved
 Blocked by: 01, 02
 
 ## Question
@@ -24,4 +24,16 @@ Blocked by the `wsg` compatibility research — if the layout is a contract, thi
 
 ## Answer
 
-<!-- recorded on resolution -->
+Resolved with the owner, 2026-10-16. Four decisions.
+
+**1. A directory per pool, plus a small index.** `.jj/pools.json` lists the pools that exist; `.jj/pools/<name>/` holds everything pool-scoped — the pool document, its Workers, Run Records, the waiting set, occupancy, sessions and its locks. The split is the principle: **pool-scoped state lives under the pool, repository-scoped state at the root.** So `.jj/ws-cache` and `undo.json` stay at `.jj/` — undo because it is `jj op restore`, refused unless the mutation is still the repository's tip, "because the restore is repository-wide". This also collapses today's awkward `.jj/pool.json` file sitting beside a `.jj/pool/` directory.
+
+**2. The jjfx-owned sidecars stay files.** `sessions.json` per pool (it is per-Worker); `in-use.json` at the repository root (occupancy is one reconcile over all the terminal's tabs, and spans pools). The deciding fact is shape: occupancy is written **wholesale**, so as a file it is one atomic replace and as per-Worker fields it would be N read-modify-writes with no single point of consistency. The glossary's insistence that the Agent and Work lifecycles stay orthogonal points the same way.
+
+**3. Automatic one-time conversion on first access.** Detect the legacy layout, build the new one, verify it, then remove the old — one code path afterwards, and it works out of the box on an existing Repository. Safe because the Go peer is dead (ticket 01's ruling) and because the conversion copies before it removes and refuses if it cannot verify the result. ADR 0009's "does not authorize destructive state conversion" was written to protect that peer; "never destroy a Worker Pool" survives it on its own merits.
+
+**4. Locks are both, repository outermost.** Per-pool locks inside each pool directory for dispatch, workers, runs, waiting and sessions; a repository-wide lock for Workspace creation and removal, `ws-cache`, undo, `clean` and colocation. The ordering rule — repository lock outermost, never pool-then-repository — is the part that must be written down, or two pools provisioning at once deadlock.
+
+`jjfx pool <N>` keeps sizing `default`, per the additive stance.
+
+Landed as **ADR 0013**, which records the scoping principle, the lock ordering and the one-way migration. This ticket graduates *Is the pool index or the pool directories the source of truth?* — a directory and an index that can disagree is a recovery question this ticket did not settle.
