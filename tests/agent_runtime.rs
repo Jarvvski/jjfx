@@ -25,7 +25,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{HELPER_LIVENESS_TIMEOUT, wait_for_file_content};
+use support::{HELPER_LIVENESS_TIMEOUT, HelperGuard, wait_for_file_content};
 
 const HELPER_MODE: &str = "JJFX_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "JJFX_AGENT_RUNTIME_HELPER_PATH";
@@ -418,7 +418,7 @@ fn reserved_background_run_persists_pid_before_returning() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
+    let child = HelperGuard::spawn(&mut helper, Some(&release), &[&result, &process]);
 
     wait_for_file_content(&result);
     wait_for_file(&process);
@@ -612,7 +612,7 @@ fn reserved_background_run_releases_worker_when_runtime_probe_fails() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
+    let child = HelperGuard::spawn(&mut helper, Some(&release), &[&result, &process]);
     wait_for_file(&reserved);
     fs::remove_file(bin_directory.join("claude")).expect("remove runtime before spawn");
     fs::write(&proceed, []).expect("allow launch to continue");
@@ -712,7 +712,7 @@ fn reserved_background_run_cleans_up_when_worker_state_disappears_before_pid_per
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
+    let child = HelperGuard::spawn(&mut helper, Some(&release), &[&result, &process]);
 
     wait_for_file(&reserved);
     let worker_state = repository.state_store().worker(worker_id.clone());
@@ -846,7 +846,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let helper = BackgroundHelperGuard::spawn(&mut helper, &proceed, [&process, &result]);
+    let helper = HelperGuard::spawn(&mut helper, Some(&proceed), &[&process, &result]);
 
     wait_for_file(&reserved);
     let worker_state = repository.state_store().worker(worker_id.clone());
@@ -959,7 +959,7 @@ fn background_run_returns_process_group_leader_with_child_owned_log() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let mut child = BackgroundHelperGuard::spawn(&mut helper, &release, [&result, &process]);
+    let mut child = HelperGuard::spawn(&mut helper, Some(&release), &[&result, &process]);
 
     wait_for_file_content(&result);
     wait_for_file_content(&process);
@@ -3014,7 +3014,7 @@ fn stale_background_waiter_cannot_finalize_newer_run() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let helper = BackgroundHelperGuard::spawn(&mut helper, &release, [&process, &result]);
+    let helper = HelperGuard::spawn(&mut helper, Some(&release), &[&process, &result]);
     wait_for_file(&reserved);
 
     let worker_state = repository.state_store().worker(worker_id.clone());
@@ -3165,7 +3165,7 @@ fn reset_run_terminates_the_run_process_group_and_returns_the_worker_to_idle() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let helper = BackgroundHelperGuard::spawn(&mut helper, &release, [&process, &result]);
+    let helper = HelperGuard::spawn(&mut helper, Some(&release), &[&process, &result]);
 
     wait_for_file_content(&result);
     wait_for_file(&diagnostic);
@@ -3568,7 +3568,7 @@ fn cross_process_reset_terminates_a_live_foreground_run() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let child = helper.spawn().expect("foreground Reset helper");
+    let helper = HelperGuard::spawn(&mut helper, None, &[&process]);
     wait_for_file_content(&process);
     wait_for_file_content(&descendant);
     let leader = read_pid(&process);
@@ -3588,7 +3588,7 @@ fn cross_process_reset_terminates_a_live_foreground_run() {
         let _ = kill_process(unix_pid(leader), Signal::KILL);
         let _ = kill_process(unix_pid(descendant_pid), Signal::KILL);
     }
-    let output = child.wait_with_output().expect("foreground helper output");
+    let output = helper.wait_with_output();
 
     assert!(
         matches!(reset, RunReset::Abandoned { terminated_pid } if terminated_pid == Some(leader)),
@@ -3645,7 +3645,7 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
-    let child = helper.spawn().expect("foreground helper");
+    let helper = HelperGuard::spawn(&mut helper, None, &[&process]);
 
     wait_for_file(&reserved);
     // Replace the reserved Worker state with a FIFO so the PID persistence read
@@ -3679,14 +3679,20 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
     fs::remove_file(&worker_path).expect("remove Worker state FIFO");
     fs::write(&worker_path, b"not-json").expect("preserve failed Worker state for release");
 
-    let output = child.wait_with_output().expect("foreground helper output");
-    let error = fs::read_to_string(&result).expect("foreground launch error");
+    // The product must end the whole group before the helper reports back, so
+    // wait for the descendant while the guard is still armed: a failure here
+    // panics through the guard rather than stranding the runtime.
     wait_for_process_exit(unix_pid(descendant_pid));
     let descendant_alive = test_kill_process(unix_pid(descendant_pid)).is_ok();
     if descendant_alive {
         let _ = kill_process(unix_pid(leader), Signal::KILL);
         let _ = kill_process(unix_pid(descendant_pid), Signal::KILL);
     }
+    wait_for_process_group_exit(unix_pid(leader));
+    let group_gone = test_kill_process_group(unix_pid(leader)).is_err();
+
+    let output = helper.wait_with_output();
+    let error = fs::read_to_string(&result).expect("foreground launch error");
 
     assert!(error.contains("cannot persist PID"), "{error}");
     assert!(
@@ -3698,10 +3704,61 @@ fn failed_foreground_launch_leaves_no_surviving_descendants() {
         !descendant_alive,
         "a failed foreground launch must not leave a surviving descendant"
     );
+    assert!(
+        group_gone,
+        "the failed foreground Run's process group should be gone"
+    );
+}
+
+/// A test that panics must not leave its helper, or the Agent Runtime process
+/// group that helper started, behind. The guard owns both, so unwinding reaps
+/// them exactly as a normal return would.
+#[test]
+fn a_panicking_test_reaps_its_helper_and_the_agent_process_group() {
+    let temporary_directory = TempDir::new().expect("temporary directory");
+    let bin_directory = temporary_directory.path().join("bin");
+    let workspace = temporary_directory.path().join("workspace");
+    let log = temporary_directory.path().join("worker.log");
+    let result = temporary_directory.path().join("result");
+    let process = temporary_directory.path().join("process");
+    let descendant = temporary_directory.path().join("descendant");
+    let diagnostic = temporary_directory.path().join("diagnostic");
+    fs::create_dir(&bin_directory).expect("runtime bin directory");
+    fs::create_dir(&workspace).expect("Worker Workspace");
+    write_executable(&bin_directory.join("claude"), STUBBORN_RUNTIME);
+
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut helper = Command::new(env::current_exe().expect("test executable"));
+        helper
+            .args(["--exact", "foreground_run_helper", "--ignored"])
+            .env("PATH", runtime_path(&bin_directory))
+            .env(HELPER_WORKSPACE, &workspace)
+            .env(HELPER_LOG, &log)
+            .env(HELPER_RESULT, &result)
+            .env(HELPER_PROCESS, &process)
+            .env(HELPER_DESCENDANT, &descendant)
+            .env(HELPER_DIAGNOSTIC, &diagnostic)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _helper = HelperGuard::spawn(&mut helper, None, &[&process]);
+        wait_for_file_content(&process);
+        wait_for_file_content(&descendant);
+        panic!("simulated test failure");
+    }));
+
+    assert!(unwound.is_err(), "the simulated failure should unwind");
+    let leader = read_pid(&process);
+    let descendant_pid = read_pid(&descendant);
     wait_for_process_group_exit(unix_pid(leader));
+    wait_for_process_exit(unix_pid(descendant_pid));
     assert!(
         test_kill_process_group(unix_pid(leader)).is_err(),
-        "the failed foreground Run's process group should be gone"
+        "unwinding must end the Agent Runtime process group"
+    );
+    assert!(
+        test_kill_process(unix_pid(descendant_pid)).is_err(),
+        "unwinding must end the Agent Runtime's descendant"
     );
 }
 
@@ -4170,65 +4227,6 @@ fn agent_runtime_probe_helper() {
     assert!(path.is_dir(), "helper PATH should be a directory");
 }
 
-struct BackgroundHelperGuard {
-    child: Option<Child>,
-    release: PathBuf,
-    process_ids: [PathBuf; 2],
-}
-
-impl BackgroundHelperGuard {
-    fn spawn(
-        command: &mut Command,
-        release: &std::path::Path,
-        process_ids: [&std::path::Path; 2],
-    ) -> Self {
-        Self {
-            child: Some(command.spawn().expect("background helper")),
-            release: release.to_owned(),
-            process_ids: process_ids.map(std::path::Path::to_owned),
-        }
-    }
-
-    fn is_running(&mut self) -> bool {
-        self.child
-            .as_mut()
-            .expect("background helper")
-            .try_wait()
-            .expect("background helper status")
-            .is_none()
-    }
-
-    fn wait_with_output(mut self) -> std::process::Output {
-        self.child
-            .take()
-            .expect("background helper")
-            .wait_with_output()
-            .expect("background helper output")
-    }
-}
-
-impl Drop for BackgroundHelperGuard {
-    fn drop(&mut self) {
-        let Some(mut child) = self.child.take() else {
-            return;
-        };
-        let _ = fs::write(&self.release, []);
-        for path in &self.process_ids {
-            let Some(pid) = fs::read_to_string(path)
-                .ok()
-                .and_then(|contents| contents.split_whitespace().next()?.parse::<i32>().ok())
-                .and_then(Pid::from_raw)
-            else {
-                continue;
-            };
-            let _ = kill_process_group(pid, Signal::KILL);
-            break;
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-    }
-}
-
 /// A stubborn runtime whose leader records the TERM it ignores, so a test can
 /// act inside the Reset grace window before the forced kill lands.
 const TERM_REPORTING_RUNTIME: &str = concat!(
@@ -4245,7 +4243,7 @@ const TERM_REPORTING_RUNTIME: &str = concat!(
 /// One stubborn background Run launched by a separate process, so the leader is
 /// reaped by its own launcher exactly as it is in production.
 struct StubbornRun {
-    helper: BackgroundHelperGuard,
+    helper: HelperGuard,
     leader: u32,
     term: PathBuf,
 }
@@ -4277,7 +4275,7 @@ impl StubbornRun {
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let helper = BackgroundHelperGuard::spawn(&mut helper, &release, [&process, &result]);
+        let helper = HelperGuard::spawn(&mut helper, Some(&release), &[&process, &result]);
         wait_for_file_content(&result);
         wait_for_file(&diagnostic);
         wait_for_file(&descendant);

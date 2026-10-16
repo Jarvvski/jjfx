@@ -1,6 +1,6 @@
 # Stop the test suite leaking agent processes
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -41,3 +41,21 @@ If the reproduction shows the leak is in product code rather than test code, fix
 ## Comments
 
 - 2026-10-16: Found while setting up the `todo-md` test-drive: a dozen orphaned stubs, `reserved foreground test` / `reset foreground test`.
+- 2026-10-16: Resolved. Reproduced first: 27 leaked stub groups (54 `/bin/bash
+  .../bin/claude` processes, in leader/descendant pairs) plus 27 orphaned
+  `agent_runtime` helpers, all reparented to PID 1 and alive since earlier runs.
+  Root cause: `cross_process_reset_terminates_a_live_foreground_run` and
+  `failed_foreground_launch_leaves_no_surviving_descendants` spawned their
+  helper with a raw `Child`. The helper runs the real supervisor, which spawns
+  the stub runtime into its own process group, and both the helper and the stub
+  ignore TERM. A `Child` is not killed when it drops, so any panic before the
+  test's own cleanup left the helper blocked on a runtime that never exits, and
+  both stayed resident forever - the product was not at fault.
+  Fix: `tests/support/mod.rs` gains `HelperGuard`, generalised from the local
+  `BackgroundHelperGuard`, which owns the helper and the recorded process
+  group(s) and reaps both on every exit path, including unwinding. The two
+  foreground tests and `worker_pool`'s live-process destroy test use it.
+  Regression test: `a_panicking_test_reaps_its_helper_and_the_agent_process_group`
+  panics inside `catch_unwind` and asserts the group is gone; it fails and
+  leaks without the guard, and passes with it. `mise run check` green, and the
+  full suite leaves no `claude` / `codex` / `opencode` process behind.
