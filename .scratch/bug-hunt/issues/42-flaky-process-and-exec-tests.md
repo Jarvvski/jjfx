@@ -1,6 +1,6 @@
 # Process- and exec-timing tests are flaky under CI and load
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -81,3 +81,27 @@ Make the timing/exec assertions deterministic rather than instantaneous:
 - 2026-10-16: Filed from the `opinionated-loop` batch, which surfaced it: two of
   the batch's merges left red *main* runs (`#16`, `#17`) on tests unrelated to
   the change. Reopens this effort for one ticket.
+- 2026-10-16: Resolved. Reproduced red under 4-way parallel full-suite load (plus
+  24 CPU burners) on a 12-core machine: `background_run_returns_process_group_leader_with_child_owned_log`
+  and `cross_process_reset_terminates_a_live_foreground_run` panicked on an empty
+  `process`/`descendant` read, and `reserved_background_run_allows_graceful_group_shutdown_before_forcing`
+  on an empty `result` read - 11 of 48 full runs failed; separately
+  `reset_terminates_a_background_pi_follow_up_and_its_descendant` failed 7 of 40
+  runs on an empty PID read. Fix: `tests/support/mod.rs` gains
+  `wait_for_file_content`, which polls a helper-written file to the liveness
+  deadline instead of reading it the instant the path appears - the file exists
+  before it is written, so existence is not enough. The read sites in
+  `agent_runtime.rs` and `worker_pool.rs` use it, and the `agent_runtime.rs`
+  "process is gone" assertions now poll for the process to be reaped (a
+  just-killed descendant is a zombie that `test_kill_process` still reports). No
+  production timing changed. Evidence: 64 full-suite runs (4-way parallel) and 80
+  concurrent `agent_runtime`+`worker_actions` runs failed 0 (pre-fix: 11/48 and
+  7/40), each surviving named test 30/30 green under load, and `mise run check`
+  green.
+- 2026-10-16: Two of the five named tests were retired mid-flight: PR #24
+  (`Remove the Pi Agent Runtime`) deleted `reset_terminates_a_background_pi_follow_up_and_its_descendant`
+  (`worker_actions.rs`) and `pi_helper_spawn_survives_an_executable_that_is_open_for_write`
+  (`ticket_discovery.rs`, reproduced in CI run `38820834406`) along with the Pi
+  helper, so the ETXTBSY write-hold fix that targeted the latter is moot. The
+  rebase onto `main` drops both; the three surviving `agent_runtime.rs` tests -
+  and the same-class read/reaping races in `worker_pool.rs` - are fixed.
