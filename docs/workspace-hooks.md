@@ -11,6 +11,10 @@ They run for every Workspace lifecycle path - CLI, TUI, and Worker Workspaces -
 so a repository can carry its own provisioning without jjfx hard-coding it. A
 hook is optional; when the file is absent the step is a no-op.
 
+The same directory also holds the repository's own build check, in
+`.jjfx/config.toml` - see
+[Configuration](configuration.md#repository-local-checks).
+
 Because each workspace is a checkout of the repository, the hook files must be
 tracked in jj (for example `jj file track root:.jjfx/setup.sh`) so they are
 present inside every workspace.

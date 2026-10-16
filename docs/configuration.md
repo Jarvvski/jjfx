@@ -1,12 +1,14 @@
 # Configuration
 
-jjfx reads its own settings once at startup from
-`${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`. This file is distinct from jj
-config (read through the `jj` CLI) and the lifecycle event log - it is the only
-file jjfx itself owns. A missing file means defaults; a file that exists but
-fails to parse is a startup error naming the offending key, surfaced before the
-TUI takes over the screen. Unknown keys are rejected, so a typo fails loudly
-rather than being silently ignored.
+jjfx reads its own settings from two files. The **user config**,
+`${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, is read once at startup and
+applies everywhere. The **repository config**, `<repo>/.jjfx/config.toml`, is read
+per repository and may set only the settings that are a property of the
+repository - today just [`[checks]`](#checks). Both are distinct from jj config
+(read through the `jj` CLI) and the lifecycle event log. A missing file means
+defaults; a file that exists but fails to parse is an error naming the offending
+key and file, surfaced before the TUI takes over the screen. Unknown keys are
+rejected, so a typo fails loudly rather than being silently ignored.
 
 Every section is optional. This is a complete example:
 
@@ -392,6 +394,32 @@ and pushing it is what makes the pair invisible. So does a check that cannot run
 at all: a command that does not exist (a shell reports exit 127) or one that
 outruns `timeout_secs` is a loud failure, never a silent pass. The forge names the
 command and the last line of its output.
+
+### Repository-local checks
+
+`[checks]` is also the one setting a repository may own. When the forge runs,
+jjfx reads `<repo>/.jjfx/config.toml`, and a `[checks]` section there **replaces**
+the user-global one for that repository - a repository either owns its check or
+inherits the user's. Any other section in that file is rejected, so a repository
+cannot silently configure the agent, the terminal, or anything else.
+
+```toml
+# <repo>/.jjfx/config.toml
+[checks]
+command = "./gradlew :app:backend:compileKotlin"
+timeout_secs = 1200
+```
+
+A check is a property of the repository's build, and the user config is read once
+and applied to every repository jjfx is pointed at - so a check set there would
+run in all of them, and in a repository whose build does not understand it that
+is a loud failure, not a no-op.
+
+The file is read by default, and it sits next to the `setup.sh` / `teardown.sh`
+hooks, which jjfx already executes when it creates a workspace in the repository -
+so a repository-local check grants no capability the repository did not already
+have. Track it in jj (`jj file track root:.jjfx/config.toml`) so it is present in
+a fresh clone.
 
 ## Legacy `[workspace]`
 Earlier releases configured new-workspace provisioning with a `[workspace]`

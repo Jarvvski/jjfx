@@ -51,6 +51,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - Show the Tickets a capped Dispatch held back in `jjfx status` and the Pool view, from jjfx's own `.jj/pool/waiting.json`
 - Surface a conflicted change chain as a needs-you Work state naming the commit that owns the conflict, and resolve it from the tool with `jjfx resolve <workspace>` (or `C` in the list)
 - Run the repo's own build check between Weld and Push, before the forge pushes: configure a command and timeout with `[checks]` (`command`, `enabled`, `timeout_secs`) and a change that does not build against merged trunk fails the Check step, naming the command and its output. With no check configured the pipeline is unchanged; a check that cannot run (missing command, timeout) fails loudly rather than passing silently.
+- A repository can now own its forge build check: a `[checks]` section in `<repo>/.jjfx/config.toml` replaces the user-global `[checks]` for that repository, so a build command that is a property of one repository no longer runs in every repository jjfx is pointed at. Any other section in that file is rejected, and a missing file leaves the user config in charge.
 
 ### Fixed
 

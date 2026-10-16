@@ -1,11 +1,13 @@
-//! jjfx's own settings, read once at startup from a TOML file. Distinct from jj
-//! config (read via the `jj` CLI) and the event log - this is the only file
-//! jjfx itself owns. Absent file -> defaults; malformed file -> a startup error
-//! surfaced before the TUI takes over the screen.
+//! jjfx's own settings. The user-global file is read once at startup; the
+//! repository-local file (`<repo>/.jjfx/config.toml`) is read per repository,
+//! for the settings whose correct value is a property of the repository rather
+//! than the user. Both are distinct from jj config (read via the `jj` CLI) and
+//! the event log. Absent file -> defaults; malformed file -> an error naming the
+//! offending file, surfaced before the TUI takes over the screen.
 
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::engine::{PaneLayout, SpendCap, SpendCapMode, SpendWindow};
 use anyhow::Context;
@@ -130,6 +132,19 @@ impl Config {
         }
         self.checks.validate()?;
         Ok(())
+    }
+
+    /// The build check the forge runs for `repo_root`: the repository's own
+    /// `[checks]` when it sets one, otherwise the user-global value.
+    ///
+    /// `[checks]` is the one setting whose correct value belongs to the
+    /// repository - its build command - and the user config is loaded once and
+    /// applied to every repository jjfx is pointed at, so a check configured for
+    /// one repository would otherwise run in all of them.
+    pub fn checks_for(&self, repo_root: &Path) -> anyhow::Result<ChecksConfig> {
+        Ok(load_repo(repo_root)?
+            .checks
+            .unwrap_or_else(|| self.checks.clone()))
     }
 
     /// The settings the TUI and Dispatch both act on, loaded once and handed
@@ -671,6 +686,58 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
     Ok(config)
 }
 
+/// A repository's own settings, from `<repo>/.jjfx/config.toml` - alongside the
+/// lifecycle hooks, because a value that is a property of the repository cannot
+/// live in a file read once for every repository.
+///
+/// Only `[checks]` is repo-owned. `deny_unknown_fields` is deliberate: a
+/// repository must not be able to silently configure jjfx beyond its build
+/// check, so any other section is a loud error rather than a quiet ignore.
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepoConfig {
+    /// The repository's build check, replacing the user-global `[checks]`
+    /// wholesale when present. `None` (no `[checks]` section) leaves the
+    /// user-global value in place.
+    pub checks: Option<ChecksConfig>,
+}
+
+/// `<repo>/.jjfx/config.toml` - the repository-local settings file, next to the
+/// `setup.sh` / `teardown.sh` lifecycle hooks.
+pub fn repo_config_path(repo_root: &Path) -> PathBuf {
+    repo_root.join(".jjfx").join("config.toml")
+}
+
+/// Read the repository-local settings. A missing file is no overrides; a file
+/// that exists but fails to parse, names a section a repository may not set, or
+/// holds invalid values is an error naming the file - the same loud-failure rule
+/// as the user-global config.
+pub fn load_repo(repo_root: &Path) -> anyhow::Result<RepoConfig> {
+    let path = repo_config_path(repo_root);
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(RepoConfig::default());
+        }
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading config {}", path.display()));
+        }
+    };
+    let config: RepoConfig = toml::from_str(&text).with_context(|| {
+        format!(
+            "parsing config {} - only [checks] is repository-local; every other setting belongs \
+             in the user config",
+            path.display()
+        )
+    })?;
+    if let Some(checks) = &config.checks {
+        checks
+            .validate()
+            .with_context(|| format!("validating config {}", path.display()))?;
+    }
+    Ok(config)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -757,6 +824,99 @@ mod tests {
 
         let zero: Config = toml::from_str("[checks]\ntimeout_secs = 0\n").expect("toml parses");
         assert!(zero.validate().is_err());
+    }
+
+    /// A repository directory carrying a `.jjfx/config.toml`, or none at all when
+    /// `text` is `None`, for the repository-local precedence tests.
+    fn repo_with_config(text: Option<&str>) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("a temporary repository");
+        if let Some(text) = text {
+            let dir = repo.path().join(".jjfx");
+            fs::create_dir_all(&dir).expect("creating .jjfx");
+            fs::write(dir.join("config.toml"), text).expect("writing the repository config");
+        }
+        repo
+    }
+
+    #[test]
+    fn a_repository_check_overrides_the_user_global_one() {
+        let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
+        let repo = repo_with_config(Some(
+            "[checks]\ncommand = \"./gradlew :app:backend:compileKotlin\"\ntimeout_secs = 1200\n",
+        ));
+        let checks = config
+            .checks_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(
+            checks.command.as_deref(),
+            Some("./gradlew :app:backend:compileKotlin")
+        );
+        assert_eq!(checks.timeout_secs, 1200);
+    }
+
+    #[test]
+    fn the_user_global_check_applies_when_the_repository_sets_none() {
+        let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
+        // No repository file at all, and one that sets nothing (a comment only -
+        // any section other than `[checks]` is rejected, not ignored).
+        for repo in [
+            repo_with_config(None),
+            repo_with_config(Some("# nothing repo-owned here yet\n")),
+        ] {
+            let checks = config
+                .checks_for(repo.path())
+                .expect("no repository override");
+            assert_eq!(checks.command.as_deref(), Some("cargo check"));
+        }
+    }
+
+    #[test]
+    fn an_unconfigured_repository_has_no_check() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(None);
+        let checks = config
+            .checks_for(repo.path())
+            .expect("no repository override");
+        assert_eq!(checks.command(), None);
+    }
+
+    #[test]
+    fn a_repository_may_disable_a_user_global_check() {
+        let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
+        let repo = repo_with_config(Some("[checks]\nenabled = false\n"));
+        let checks = config
+            .checks_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(checks.command(), None);
+    }
+
+    #[test]
+    fn an_invalid_repository_config_is_an_error_naming_the_file() {
+        let config = Config::from_toml("");
+
+        // `[checks]` is the only repo-owned section, so a repository cannot
+        // reconfigure the agent, the terminal, or anything else.
+        let repo = repo_with_config(Some("[agent]\ncommand = \"rm -rf /\"\n"));
+        let error = config
+            .checks_for(repo.path())
+            .expect_err("an unknown section must be rejected");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("agent"), "{message}");
+
+        // A typo inside the section it may set.
+        let repo = repo_with_config(Some("[checks]\ncomand = \"cargo check\"\n"));
+        let error = config
+            .checks_for(repo.path())
+            .expect_err("an unknown checks key must be rejected");
+        assert!(format!("{error:?}").contains("comand"), "{error:?}");
+
+        // A value the check cannot run with.
+        let repo = repo_with_config(Some("[checks]\ncommand = \"  \"\n"));
+        let error = config
+            .checks_for(repo.path())
+            .expect_err("a blank command must be rejected");
+        assert!(format!("{error:?}").contains("checks.command"), "{error:?}");
     }
 
     #[test]
