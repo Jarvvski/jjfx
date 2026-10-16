@@ -1,7 +1,7 @@
 # Do the maintenance verbs need a pool scope?
 
 Type: grilling
-Status: ready-for-human
+Status: resolved
 Blocked by: none
 
 ## Question
@@ -17,4 +17,11 @@ The likely answer is "Repository-scoped still, because a Workspace is a Workspac
 
 ## Answer
 
-<!-- recorded on resolution -->
+Resolved 2026-10-16. One principle decides all four: **a verb is pool-scoped when its blast radius is Workers, and Repository-scoped when it is trunk.**
+
+- **`Clean` gains an optional pool scope.** It removes every non-default Workspace in one sweep, which in a Repository with lanes means one lane's tidy-up destroys another lane's work in progress. That is the one genuine case here: `clean --pool <name>` scopes it, the Repository-wide form stays as the explicit "everything", and the default stays Repository-wide so nothing existing changes (*Is this additive, or a redesign?*).
+- **`Tidy workspaces` stays Repository-scoped.** It moves every *idle* Workspace onto the latest trunk, and trunk is shared — which pool a Worker belongs to does not move trunk. A pool scope would add a filter and no safety, because idle is already the guard.
+- **`Lift` stays Repository-scoped.** It rebases one Workspace's chain, or all of them; a chain is a chain and its base is trunk.
+- **`Reset` and `Dismiss` need nothing** — confirmed rather than assumed. `Reset` is per-Worker and `Dismiss` is per-pool by construction, so both already operate below the granularity a pool scope would add.
+
+The ticket's guess holds for three of the four and fails for `Clean`, which is the only one that can disturb a neighbour.
