@@ -1,5 +1,6 @@
 //! Shared jjfx application implementation and interactive launcher.
 
+mod adhoc_ticket;
 mod agent;
 mod app;
 mod attention;

@@ -61,6 +61,7 @@ jjfx runs background agents as **Workers**, each backed by its own jj workspace:
 jjfx pool profile claude   # the agent every Worker runs (claude | codex | opencode)
 jjfx pool 2                # two Workers, ready for dispatch
 jjfx dispatch AMBA-42      # hand a ticket to an idle Worker
+jjfx dispatch --text "Fix the login bug"   # or hand in the work directly
 jjfx status                # WORKER  NAME  STATUS  TICKET  ELAPSED
 ```
 

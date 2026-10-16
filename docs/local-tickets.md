@@ -87,3 +87,28 @@ unparseable `Blocked by:` - is reported as a `DiscoveryDiagnostic` naming the
 file, never silently skipped. A discovery that returns no Ready Tickets still
 reports them, so an empty ready list is never indistinguishable from files that
 were dropped.
+
+## Ad-hoc tickets
+
+Not every piece of work is a tracker item, and a repository that has never been
+set up for jjfx should still be able to dispatch. `dispatch` takes a Ticket
+handed in directly, with no source at all:
+
+```bash
+jjfx dispatch --text "Fix the login bug; it fails on Safari"
+jjfx dispatch --from-file notes/plan.md      # any markdown file, wherever it lives
+git log --format=%B -1 | jjfx dispatch -     # or stdin
+```
+
+An ad-hoc Ticket never consults `[tickets]`, so it works with no configuration -
+the default `linear` source wants an API key a bare repository does not have.
+It is dispatched straight to a Worker, the same Direct Dispatch path a resolved
+Ticket takes: it has no Parent to orchestrate and no file to write back, so it is
+always a single direct request.
+
+`--id` names it explicitly. Without one the id is derived: `ad-hoc--<slug>`,
+slugged from the file stem for `--from-file`, or the first words of the text
+otherwise. The title and body are read the same way as a local Ticket's - the
+first `# ` heading is the title and the rest is the body, so the Worker prompt is
+identical whichever input was used.
+

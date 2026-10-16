@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
+use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
     ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
     RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS,
@@ -136,6 +137,9 @@ pub struct DispatchArgs {
     pub no_orchestrate: bool,
     pub force: bool,
     pub json: bool,
+    /// A Ticket handed in directly (`--text`, `--from-file`, or stdin) rather
+    /// than resolved through a configured source. `None` for the ordinary path.
+    pub input: Option<AdHocInput>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -262,6 +266,10 @@ fn reject_unknown_flags(command: &str, flags: &[Flag], args: &[String]) -> Resul
             // unknown option.
             Some(flag) if flag.value.is_some() => index += 1,
             Some(_) => {}
+            // A bare `-` is the conventional stdin marker, not an option, so it
+            // is never an unknown flag. The command that accepts it gives it
+            // meaning (see `parse_dispatch`).
+            None if argument == "-" => {}
             None if argument.starts_with('-') => {
                 bail!("unknown option for {command}: {argument}");
             }
@@ -581,6 +589,8 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     let mut no_orchestrate = false;
     let mut force = false;
     let mut json = false;
+    let mut input = None;
+    let mut id = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -589,6 +599,37 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
             "--no-orchestrate" => no_orchestrate = true,
             "--force" => force = true,
             "--json" => json = true,
+            "--text" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --text"))?;
+                set_adhoc_source(&mut input, AdHocSource::Text(value.clone()))?;
+                index += 1;
+            }
+            "--from-file" => {
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --from-file"))?;
+                let source = if value == "-" {
+                    AdHocSource::Stdin
+                } else {
+                    AdHocSource::File(PathBuf::from(value))
+                };
+                set_adhoc_source(&mut input, source)?;
+                index += 1;
+            }
+            "--id" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --id"))?;
+                id = Some(value.clone());
+                index += 1;
+            }
+            // A bare `-` reads the Ticket from stdin, so a paragraph can be
+            // piped straight in without dressing it up as a tracker item.
+            "-" => set_adhoc_source(&mut input, AdHocSource::Stdin)?,
             "--provider" | "--model" | "--label" | "--budget" => {
                 let option = args[index].as_str();
                 let value = args
@@ -622,7 +663,16 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     if all && !tickets.is_empty() {
         bail!("--all cannot be combined with explicit Tickets");
     }
-    if tickets.is_empty() && !all {
+    if input.is_some() && all {
+        bail!("--text/--from-file cannot be combined with --all");
+    }
+    if input.is_some() && !tickets.is_empty() {
+        bail!("--text/--from-file cannot be combined with explicit Tickets");
+    }
+    if id.is_some() && input.is_none() {
+        bail!("--id requires --text, --from-file or -");
+    }
+    if tickets.is_empty() && !all && input.is_none() {
         bail!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
@@ -643,7 +693,18 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         no_orchestrate,
         force,
         json,
+        input: input.map(|source| AdHocInput { source, id }),
     }))
+}
+
+/// Records an ad-hoc Ticket input, rejecting a second one: a Dispatch carries
+/// exactly one Ticket when it is handed in directly.
+fn set_adhoc_source(input: &mut Option<AdHocSource>, source: AdHocSource) -> Result<()> {
+    if input.is_some() {
+        bail!("only one of --text, --from-file or - may supply the Ticket");
+    }
+    *input = Some(source);
+    Ok(())
 }
 
 fn parse_send(args: &[String]) -> Result<Command> {
@@ -1515,6 +1576,14 @@ fn dispatch_command(
         eprintln!("{warning}");
     }
 
+    // A Ticket handed in directly is an input to Direct Dispatch, not a source
+    // lookup: it is dispatched here, before any `[tickets]` config is read, so
+    // an ad-hoc Dispatch works in a repository that has never been set up.
+    if let Some(input) = &args.input {
+        let ticket = AdHocTicket::read(input)?;
+        return dispatch_adhoc_ticket(repository, args, &ticket, model, open_workspaces);
+    }
+
     // A single Ticket with orchestration enabled fetches its own details before
     // reserving a placeholder, so hand off before building direct requests.
     if !args.all && !args.no_orchestrate && args.tickets.len() == 1 {
@@ -1625,6 +1694,34 @@ fn dispatch_command(
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
     render_dispatch_result(&result, requests.len(), false, args.json);
     write_back_local_tickets(repository, &tickets);
+    Ok(())
+}
+
+/// Dispatches a Ticket that was handed in directly.
+///
+/// It goes down the same Direct Dispatch path as a resolved Ticket: the ad-hoc
+/// Ticket carries its own id, title, and body, so nothing is fetched and no
+/// source is consulted. There is no Ticket file to write back, and an ad-hoc
+/// Ticket has no Parent to orchestrate, so it is always a single direct request.
+fn dispatch_adhoc_ticket(
+    repository: &Repository,
+    args: &DispatchArgs,
+    ticket: &AdHocTicket,
+    model: Option<AgentModel>,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+) -> Result<()> {
+    let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
+    let mut request = DirectDispatchRequest::new(ticket.ticket(), args.mode)
+        .with_ticket_details(ticket.details());
+    if let Some(model) = model {
+        request = request.with_model(model);
+    }
+    if let Some(dollars) = args.budget {
+        request = request.with_budget(DispatchBudget::maximum_usd(dollars)?);
+    }
+    let requests = [request];
+    let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
+    render_dispatch_result(&result, requests.len(), false, args.json);
     Ok(())
 }
 
@@ -2562,7 +2659,7 @@ _jjfx() {
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
-        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
+        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--text[dispatch a one-off Ticket from text]:text:' '--from-file[dispatch a Ticket from a markdown file]:path:_files' '--id[Ticket id for ad-hoc input]:id:' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
   esac
@@ -2615,6 +2712,7 @@ mod tests {
                 no_orchestrate: true,
                 force: false,
                 json: false,
+                input: None,
             })
         );
     }
@@ -2623,6 +2721,99 @@ mod tests {
     fn parser_rejects_unknown_dispatch_options_and_budgeted_orchestration() {
         assert!(parse(&args(&["dispatch", "AMBA-42", "--wat"])).is_err());
         assert!(parse(&args(&["dispatch", "AMBA-42", "--budget", "12"])).is_err());
+    }
+
+    /// The ad-hoc Ticket inputs: free text, a file, and stdin, each with an
+    /// optional explicit id.
+    #[test]
+    fn dispatch_parser_reads_ad_hoc_ticket_inputs() {
+        let text = parse(&args(&[
+            "dispatch",
+            "--text",
+            "fix the bug",
+            "--id",
+            "ENG-7",
+        ]))
+        .expect("--text should parse");
+        assert_eq!(
+            text,
+            Command::Dispatch(DispatchArgs {
+                tickets: Vec::new(),
+                all: false,
+                mode: RunMode::Background,
+                provider: None,
+                model: None,
+                budget: None,
+                label: "ready-for-agent".to_owned(),
+                no_orchestrate: false,
+                force: false,
+                json: false,
+                input: Some(AdHocInput {
+                    source: AdHocSource::Text("fix the bug".to_owned()),
+                    id: Some("ENG-7".to_owned()),
+                }),
+            })
+        );
+
+        let file = parse(&args(&["dispatch", "--from-file", "notes/thing.md"]))
+            .expect("--from-file should parse");
+        assert!(matches!(
+            file,
+            Command::Dispatch(DispatchArgs {
+                input: Some(AdHocInput {
+                    source: AdHocSource::File(path),
+                    id: None,
+                }),
+                ..
+            }) if path.to_str() == Some("notes/thing.md")
+        ));
+
+        for stdin in [
+            args(&["dispatch", "--from-file", "-"]),
+            args(&["dispatch", "-"]),
+        ] {
+            let command = parse(&stdin).expect("stdin should parse");
+            assert!(matches!(
+                command,
+                Command::Dispatch(DispatchArgs {
+                    input: Some(AdHocInput {
+                        source: AdHocSource::Stdin,
+                        ..
+                    }),
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn dispatch_parser_rejects_conflicting_ad_hoc_inputs() {
+        // One Ticket at a time: a second input, or a positional Ticket
+        // alongside one, is ambiguous.
+        assert!(parse(&args(&["dispatch", "--text", "a", "--from-file", "b.md"])).is_err());
+        assert!(parse(&args(&["dispatch", "--text", "a", "--text", "b"])).is_err());
+        assert!(parse(&args(&["dispatch", "-", "-"])).is_err());
+        assert!(parse(&args(&["dispatch", "--text", "a", "AMBA-42"])).is_err());
+        // `--all` discovers from a source, which an ad-hoc Ticket bypasses.
+        assert!(parse(&args(&["dispatch", "--all", "--text", "a"])).is_err());
+        // `--id` names the ad-hoc Ticket, so it needs one.
+        assert!(parse(&args(&["dispatch", "AMBA-42", "--id", "ENG-7"])).is_err());
+        assert!(parse(&args(&["dispatch", "--id", "ENG-7"])).is_err());
+    }
+
+    #[test]
+    fn dispatch_parser_accepts_a_budget_for_an_ad_hoc_ticket() {
+        // Ad-hoc Tickets are always direct, so the single-Ticket budget guard
+        // (which exists for orchestration) does not apply.
+        let command = parse(&args(&["dispatch", "--text", "a", "--budget", "5"]))
+            .expect("--budget with --text should parse");
+        assert!(matches!(
+            command,
+            Command::Dispatch(DispatchArgs {
+                budget: Some(5),
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -3058,6 +3249,7 @@ mod tests {
                 no_orchestrate: false,
                 force: false,
                 json: false,
+                input: None,
             })
         );
     }
@@ -3077,6 +3269,7 @@ mod tests {
                 no_orchestrate: true,
                 force: false,
                 json: false,
+                input: None,
             })
         );
         assert_eq!(
