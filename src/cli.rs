@@ -20,7 +20,7 @@ use crate::engine::{
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
     DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
     OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
-    ReviewLoop, RunActivity, RunActivityKind, RunMode, StuckWindow, TerminalSettings,
+    ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode, StuckWindow, TerminalSettings,
     TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
     WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
     WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
@@ -2485,6 +2485,34 @@ fn truncate_prompt(prompt: &str) -> String {
 /// How much of a Worker Run log `logs` prints before following.
 const LOG_TAIL_BYTES: u64 = 64 * 1024;
 
+/// How long `logs` waits between follow passes.
+const LOG_FOLLOW_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Why following a Worker's log stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowStop {
+    /// The Run reached a terminal state, so its log is complete.
+    RunFinished(WorkerStatus),
+    /// The Worker left the Pool, so nothing more can be written.
+    WorkerGone,
+    /// The Run log vanished, so there is nothing left to read.
+    LogGone,
+}
+
+impl FollowStop {
+    /// Prints why follow mode returned, so a caller reads the reason instead of
+    /// inferring it from a bare exit.
+    fn report(self, worker: &WorkerId) {
+        match self {
+            Self::RunFinished(status) => {
+                eprintln!("Stopped following {worker}: Run is {}", status.as_str());
+            }
+            Self::WorkerGone => eprintln!("Stopped following {worker}: the Worker left the Pool"),
+            Self::LogGone => eprintln!("Stopped following {worker}: the log is gone"),
+        }
+    }
+}
+
 fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let logs = WorkerActions::new(repository.clone()).logs(&worker)?;
@@ -2492,20 +2520,45 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     // terminal Worker whose log does not parse would otherwise follow forever
     // with no output.
     print_log_tail(logs.path())?;
-    if worker_is_terminal(repository, &worker) {
+    // A Worker that is already finished has a complete log, so return at once
+    // rather than follow a Run that will never write again.
+    if follow_stop(repository, &worker).is_some() {
         return Ok(());
     }
     eprintln!("Following {} log for {worker}", logs.runtime());
     let mut last = None;
     loop {
-        if let Some(activity) = logs.open().current_activity()? {
-            let rendered = render_activity(&activity);
-            if last.as_deref() != Some(rendered.as_str()) {
-                println!("{rendered}");
-                last = Some(rendered);
+        // Read the latest activity first, so a Run that ends between passes still
+        // prints its final line before the loop exits.
+        match logs.open().current_activity() {
+            Ok(Some(activity)) => {
+                let rendered = render_activity(&activity);
+                if last.as_deref() != Some(rendered.as_str()) {
+                    println!("{rendered}");
+                    last = Some(rendered);
+                }
             }
+            Ok(None) => {}
+            // A log that vanishes mid-follow is a clean end, not a failure:
+            // there is nothing left to watch.
+            Err(RunLogError::Io { source, .. })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                FollowStop::LogGone.report(&worker);
+                return Ok(());
+            }
+            // Anything else is a log the command was asked to show but cannot
+            // read, which is worth reporting.
+            Err(error) => return Err(error.into()),
         }
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        // Give the loop an exit: a Worker that was running when the command
+        // attached must not keep it alive after the Run ends. The check is one
+        // more reconciliation on a pass that already sleeps.
+        if let Some(stop) = follow_stop(repository, &worker) {
+            stop.report(&worker);
+            return Ok(());
+        }
+        std::thread::sleep(LOG_FOLLOW_INTERVAL);
     }
 }
 
@@ -2535,13 +2588,22 @@ fn print_log_tail(path: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Whether a Worker has reached a terminal state, so its log will not grow.
-fn worker_is_terminal(repository: &Repository, worker: &WorkerId) -> bool {
-    repository
-        .worker_pool()
-        .reconcile_runs()
-        .worker(worker.as_str())
-        .is_some_and(|worker| matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed))
+/// Why `logs` should stop following a Worker's log, or `None` while the Run is
+/// still going.
+///
+/// Re-read on every pass: the Run can end at any moment after the command
+/// attaches, so the terminal states (`Done` and `Failed`) end the follow. A
+/// Worker that has left the Pool will never write again either, so it ends the
+/// follow too rather than hanging on a log nothing can append to.
+fn follow_stop(repository: &Repository, worker: &WorkerId) -> Option<FollowStop> {
+    let snapshot = repository.worker_pool().reconcile_runs();
+    let Some(state) = snapshot.worker(worker.as_str()) else {
+        return Some(FollowStop::WorkerGone);
+    };
+    match state.status() {
+        WorkerStatus::Done | WorkerStatus::Failed => Some(FollowStop::RunFinished(state.status())),
+        WorkerStatus::Idle | WorkerStatus::Busy => None,
+    }
 }
 
 /// The exit code `wait` returns when it gave up on time: the negative
