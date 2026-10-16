@@ -259,8 +259,11 @@ fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
     // launching an Agent Runtime.
     fixture.write_ticket("gadgets", "01-done.md", "# Done\n\nStatus: resolved\n");
 
+    // `--force` bypasses the Dispatch Eligibility terminal check, which fails
+    // closed when no terminal can be queried (ADR 0011). Without it this test
+    // passes only on a machine running kitty and fails on CI.
     let output = fixture
-        .jjfx(&["dispatch", "gadgets", "--json"])
+        .jjfx(&["dispatch", "gadgets", "--json", "--force"])
         .output()
         .expect("jjfx should run");
 
