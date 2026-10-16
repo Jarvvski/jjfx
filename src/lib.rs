@@ -201,11 +201,15 @@ pub fn colocate_setting() -> anyhow::Result<bool> {
     Ok(config::load()?.colocate)
 }
 
-/// The `[tickets]` settings the CLI uses to discover Ready Tickets. Loaded
-/// lazily, and only by `dispatch` and `orchestrate`, so a bad source surfaces
-/// before any Worker reservation or Pool mutation.
-fn tickets_setting() -> anyhow::Result<config::TicketsConfig> {
-    Ok(config::load()?.tickets)
+/// The `[tickets]` settings the CLI uses to discover Ready Tickets, resolved for
+/// the Repository the command is acting on so its own `[tickets]` source
+/// selection is honoured. Loaded lazily, and only by `dispatch` and
+/// `orchestrate`, so a bad source surfaces before any Worker reservation or Pool
+/// mutation.
+fn tickets_setting(
+    repository: &crate::engine::Repository,
+) -> anyhow::Result<config::TicketsConfig> {
+    config::load()?.tickets_for(repository.root())
 }
 
 /// Resolve the aggregate spend cap Dispatch is gated on.
@@ -307,7 +311,7 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         terminal,
         ui.world_pane,
         tx,
-        config.dispatch_settings(),
+        config.dispatch_settings(&repo_root)?,
     );
     // A `jj`/`jj-lib` version mismatch degrades the graph read. Surface it up
     // front, before the first load, so it is visible even if that load errors

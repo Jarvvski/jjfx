@@ -997,8 +997,9 @@ pub struct Settings {
     pub colocate: fn() -> Result<bool>,
     /// The workspaces currently open in the terminal jjfx drives.
     pub open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
-    /// Where Dispatch discovers Ready Tickets.
-    pub tickets: fn() -> Result<TicketsConfig>,
+    /// Where Dispatch discovers Ready Tickets, resolved for the Repository the
+    /// command acts on so its own `[tickets]` selection is honoured.
+    pub tickets: fn(&Repository) -> Result<TicketsConfig>,
     /// The aggregate spend cap Dispatch is gated on.
     pub spend: fn() -> Result<SpendConfig>,
     /// How the migration-order check finds migrations.
@@ -1475,8 +1476,11 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     warn_when_behind_trunk(repository);
     let config = crate::config::load()?;
     // `status`/`pool list` read Pool state, so they also reconcile local Tickets:
-    // a finished Run resolves its Ticket here, with no Dispatch needed.
-    let (snapshot, failures) = reconcile_pass(repository, &config.tickets);
+    // a finished Run resolves its Ticket here, with no Dispatch needed. The
+    // source is resolved for this Repository, so its own `[tickets]` selection
+    // is honoured.
+    let tickets = config.tickets_for(repository.root())?;
+    let (snapshot, failures) = reconcile_pass(repository, &tickets);
     report_writeback_failures(&failures);
     let pool = snapshot
         .pool()
@@ -1850,9 +1854,9 @@ fn report_writeback_failures(failures: &[String]) {
 /// Ticket could not be written.
 fn ticket_reconcile_command(
     repository: &Repository,
-    tickets_config: fn() -> Result<TicketsConfig>,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
 ) -> Result<()> {
-    let tickets = tickets_config()?;
+    let tickets = tickets_config(repository)?;
     if tickets.source != TicketSource::Local {
         eprintln!("Ticket source is not local; nothing to reconcile");
         return Ok(());
@@ -1882,9 +1886,9 @@ fn ticket_reconcile_command(
 fn report_named_ticket_readiness(
     repository: &Repository,
     args: &DispatchArgs,
-    tickets_config: fn() -> Result<TicketsConfig>,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
 ) -> Result<()> {
-    let tickets = tickets_config()?;
+    let tickets = tickets_config(repository)?;
     if tickets.source != TicketSource::Local || args.tickets.is_empty() {
         return Ok(());
     }
@@ -1917,7 +1921,7 @@ fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
-    tickets_config: fn() -> Result<TicketsConfig>,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
     spend_config: fn() -> Result<SpendConfig>,
 ) -> Result<()> {
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
@@ -1985,7 +1989,7 @@ fn dispatch_command(
     }
 
     let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
-    let tickets = tickets_config()?;
+    let tickets = tickets_config(repository)?;
     let ticket_hint = ticket_source_hint(&tickets, repository);
     // Reconcile finished Tickets before discovering ready work, so a Ticket whose
     // Run completed since the last Dispatch resolves and its dependents become
@@ -2837,14 +2841,15 @@ type TicketResolver = Box<dyn Fn(&str) -> bool>;
 /// wakeup.
 fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
     let config = crate::config::load()?;
+    let tickets = config.tickets_for(repository.root())?;
     let targets = wait_targets(repository, args)?;
-    let ticket_resolved = wait_ticket_resolver(repository, args, &config.tickets, &targets)?;
+    let ticket_resolved = wait_ticket_resolver(repository, args, &tickets, &targets)?;
     let watchdog = config.watchdog.stuck_window();
     let deadline = args
         .timeout
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
     loop {
-        let (snapshot, failures) = reconcile_pass(repository, &config.tickets);
+        let (snapshot, failures) = reconcile_pass(repository, &tickets);
         report_writeback_failures(&failures);
         let now = Timestamp::now();
         match wait_verdict(args.until, &targets, &snapshot, ticket_resolved.as_ref()) {
@@ -3358,13 +3363,13 @@ fn prepare_orchestration(
     model: Option<AgentModel>,
     force: bool,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
-    tickets_config: fn() -> Result<TicketsConfig>,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
 ) -> Result<OrchestrationHandoff> {
     let id = TicketId::parse(parent.to_owned())?;
     // The runner re-queries occupancy per claim, so a Workspace a human opens or
     // closes while the group runs changes the next decision (ADR-0011).
     let exclusions = exclusions_provider(repository, force, open_workspaces);
-    let tickets = tickets_config()?;
+    let tickets = tickets_config(repository)?;
     let ticket_hint = ticket_source_hint(&tickets, repository);
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(
@@ -3410,7 +3415,7 @@ fn orchestrate_command(
     force: bool,
     json: bool,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
-    tickets_config: fn() -> Result<TicketsConfig>,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
 ) -> Result<()> {
     let handoff = prepare_orchestration(
         repository,

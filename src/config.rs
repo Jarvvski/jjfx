@@ -163,22 +163,39 @@ impl Config {
 
     /// The repository-local settings for `repo_root`, read and validated against
     /// this user-global config. The single entry point for the repository file,
-    /// so `[checks]` and `[pools]` are read - and fail - together.
+    /// so `[checks]`, `[pools]` and `[tickets]` are read - and fail - together.
     pub fn repo_config(&self, repo_root: &Path) -> anyhow::Result<RepoConfig> {
         load_repo(repo_root, self)
+    }
+
+    /// The Ticket settings in force for `repo_root`: the Repository's own
+    /// `[tickets]` source selection when it makes one, otherwise the user-global
+    /// `[tickets]`.
+    ///
+    /// A Repository may **select** a configured source and may never define one
+    /// (ADR 0014). Only `source` is read from the repository file, so the local
+    /// root, the Linear status and any credentials stay user-global; an attempt
+    /// to set one is a loud error at load, naming the file.
+    pub fn tickets_for(&self, repo_root: &Path) -> anyhow::Result<TicketsConfig> {
+        let mut tickets = self.tickets.clone();
+        if let Some(selection) = self.repo_config(repo_root)?.tickets {
+            tickets.source = selection.source;
+        }
+        Ok(tickets)
     }
 
     /// The settings the TUI and Dispatch both act on, loaded once and handed
     /// together: where Ready Tickets come from, what Dispatch may spend, how many
     /// Runs it may keep in flight, and how long a Run may stall before the list
-    /// surfaces it as stuck.
-    pub fn dispatch_settings(&self) -> DispatchSettings {
-        DispatchSettings {
-            tickets: self.tickets.clone(),
+    /// surfaces it as stuck. The Ticket source is resolved for `repo_root`, so a
+    /// Repository's own `[tickets]` selection is honoured.
+    pub fn dispatch_settings(&self, repo_root: &Path) -> anyhow::Result<DispatchSettings> {
+        Ok(DispatchSettings {
+            tickets: self.tickets_for(repo_root)?,
             spend: self.spend,
             dispatch: self.dispatch,
             watchdog: self.watchdog,
-        }
+        })
     }
 }
 
@@ -186,7 +203,8 @@ impl Config {
 ///
 /// These are the settings Dispatch and the Worker Pool list both need, so they
 /// travel as one value rather than as a growing argument list. Each carries its
-/// own validation; [`Config::dispatch_settings`] only collects them.
+/// own validation; [`Config::dispatch_settings`] collects them, resolving the
+/// Ticket source for the Repository it is given.
 #[derive(Debug, Clone, Default)]
 pub struct DispatchSettings {
     /// Where Ready Tickets are discovered.
@@ -778,13 +796,16 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
 /// lifecycle hooks, because a value that is a property of the repository cannot
 /// live in a file read once for every repository.
 ///
-/// `[checks]` and `[pools]` are the repo-owned sections. `deny_unknown_fields` is
-/// deliberate: a repository must not be able to silently configure jjfx beyond
-/// its build check and its Worker Pools, so any other section is a loud error
-/// rather than a quiet ignore. A pool may only *select* - reference a user-global
-/// Agent Runtime Profile and Ticket source, set a size, cap a spend, name a
-/// routing label - and `deny_unknown_fields` on [`PoolConfig`] is what makes an
-/// attempt to *define* an agent command, a model or credentials a loud error.
+/// `[checks]`, `[pools]` and `[tickets]` are the repo-owned sections.
+/// `deny_unknown_fields` is deliberate: a repository must not be able to
+/// silently configure jjfx beyond its build check, its Worker Pools and its
+/// Ticket source, so any other section is a loud error rather than a quiet
+/// ignore. A pool may only *select* - reference a user-global Agent Runtime
+/// Profile and Ticket source, set a size, cap a spend, name a routing label -
+/// and `deny_unknown_fields` on [`PoolConfig`] is what makes an attempt to
+/// *define* an agent command, a model or credentials a loud error. `[tickets]`
+/// may likewise only select a configured source: `deny_unknown_fields` on
+/// [`RepoTicketsConfig`] makes defining one a loud error.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
@@ -796,6 +817,9 @@ pub struct RepoConfig {
     /// means the Repository's single implicit `default` pool and today's
     /// behaviour, unchanged.
     pub pools: BTreeMap<String, PoolConfig>,
+    /// The Ticket source this Repository selects for itself. `None` (no
+    /// `[tickets]` section) leaves the user-global selection in place.
+    pub tickets: Option<RepoTicketsConfig>,
 }
 
 impl RepoConfig {
@@ -903,6 +927,20 @@ impl PoolConfig {
     }
 }
 
+/// A repository-local `[tickets]` selection, from `<repo>/.jjfx/config.toml`.
+///
+/// A Repository may **select** which configured Ticket source it uses, and may
+/// never **define** one (ADR 0014): `source` names a source the user-global
+/// config already provides. The source's details - the local root, the Linear
+/// status, any credentials - stay user-global, so a key that would set one is an
+/// unknown field here and a loud error naming the file.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RepoTicketsConfig {
+    /// Which configured Ticket source this Repository uses.
+    pub source: TicketSource,
+}
+
 /// `<repo>/.jjfx/config.toml` - the repository-local settings file, next to the
 /// `setup.sh` / `teardown.sh` lifecycle hooks.
 pub fn repo_config_path(repo_root: &Path) -> PathBuf {
@@ -927,8 +965,9 @@ pub fn load_repo(repo_root: &Path, user: &Config) -> anyhow::Result<RepoConfig> 
     };
     let config: RepoConfig = toml::from_str(&text).with_context(|| {
         format!(
-            "parsing config {} - a repository may set only [checks] and [pools]; a pool may \
-             select a user-global profile and Ticket source, never define one",
+            "parsing config {} - a repository may set only [checks], [pools] and [tickets]; a \
+             pool and a [tickets] selection may select a user-global profile and Ticket source, \
+             never define one",
             path.display()
         )
     })?;
@@ -1058,8 +1097,8 @@ mod tests {
     fn the_user_global_check_applies_when_the_repository_sets_none() {
         let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
         // No repository file at all, and one that sets nothing (a comment only -
-        // any section other than `[checks]` and `[pools]` is rejected, not
-        // ignored).
+        // any section other than `[checks]`, `[pools]` and `[tickets]` is
+        // rejected, not ignored).
         for repo in [
             repo_with_config(None),
             repo_with_config(Some("# nothing repo-owned here yet\n")),
@@ -1095,8 +1134,9 @@ mod tests {
     fn an_invalid_repository_config_is_an_error_naming_the_file() {
         let config = Config::from_toml("");
 
-        // `[checks]` and `[pools]` are the repo-owned sections, so a repository
-        // cannot reconfigure the agent, the terminal, or anything else.
+        // `[checks]`, `[pools]` and `[tickets]` are the repo-owned sections, so a
+        // repository cannot reconfigure the agent, the terminal, or anything
+        // else.
         let repo = repo_with_config(Some("[agent]\ncommand = \"rm -rf /\"\n"));
         let error = config
             .checks_for(repo.path())
@@ -1331,6 +1371,101 @@ mod tests {
             let message = format!("{error:?}");
             assert!(message.contains("config.toml"), "{defining:?}: {message}");
         }
+    }
+
+    #[test]
+    fn a_repository_may_select_its_ticket_source() {
+        // The user-global source is the default, `linear`; the Repository selects
+        // `local` for itself without touching the user config.
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[tickets]\nsource = \"local\"\n"));
+        let tickets = config
+            .tickets_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(tickets.source, TicketSource::Local);
+
+        // A repository may move the other way too, over a user-global `local`.
+        let config = Config::from_toml("[tickets]\nsource = \"local\"\n");
+        let repo = repo_with_config(Some("[tickets]\nsource = \"linear\"\n"));
+        let tickets = config
+            .tickets_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(tickets.source, TicketSource::Linear);
+
+        // With no `[tickets]` section the user-global selection stands.
+        let repo = repo_with_config(None);
+        let tickets = config
+            .tickets_for(repo.path())
+            .expect("no repository override");
+        assert_eq!(tickets.source, TicketSource::Local);
+    }
+
+    #[test]
+    fn a_repository_selecting_a_source_keeps_the_user_global_details() {
+        let config = Config::from_toml(
+            r#"
+            [tickets]
+            source = "linear"
+
+            [tickets.local]
+            root = ".tickets"
+            ready_status = "todo"
+            "#,
+        );
+        let repo = repo_with_config(Some("[tickets]\nsource = \"local\"\n"));
+        let tickets = config
+            .tickets_for(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(tickets.source, TicketSource::Local);
+        // The details a Repository may not define stay the user's.
+        assert_eq!(tickets.local.root, ".tickets");
+        assert_eq!(tickets.ready_status(), "todo");
+    }
+
+    #[test]
+    fn a_repository_may_select_but_never_define_a_ticket_source() {
+        let config = Config::from_toml("");
+        // A selection names a source the user config provides; defining one -
+        // its details, credentials, or a new source kind - is a loud error
+        // naming the file (ADR 0014).
+        for defining in [
+            "[tickets.local]\nroot = \".tickets\"\n",
+            "[tickets.linear]\nstatus = \"Ready\"\n",
+            "[tickets]\nsource = \"local\"\nroot = \".tickets\"\n",
+            "[tickets]\nsource = \"local\"\napi_key = \"sk-secret\"\n",
+            "[tickets]\nsource = \"jira\"\n",
+        ] {
+            let repo = repo_with_config(Some(defining));
+            let error = config
+                .tickets_for(repo.path())
+                .expect_err("defining rather than selecting must fail");
+            let message = format!("{error:?}");
+            assert!(message.contains("config.toml"), "{defining:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_repository_tickets_section_without_a_source_is_rejected() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[tickets]\n"));
+        let error = config
+            .tickets_for(repo.path())
+            .expect_err("a source-less selection is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("source"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_repository_tickets_section_is_rejected() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[tickets]\nsorce = \"local\"\n"));
+        let error = config
+            .tickets_for(repo.path())
+            .expect_err("a typo is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("sorce"), "{message}");
     }
 
     #[test]
