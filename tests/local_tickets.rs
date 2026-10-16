@@ -7,6 +7,24 @@ use jjfx::engine::{
 };
 use tempfile::TempDir;
 
+mod support;
+
+/// Runs `jjfx` with a stub terminal on `PATH`, so a Dispatch test does not
+/// depend on kitty being present and does not need `--force` (ADR 0011): the
+/// stub answers the Dispatch Eligibility terminal check with an empty workspace
+/// list.
+fn run_jjfx(repository: &Path, config_home: &Path, args: &[&str]) -> std::process::Output {
+    let bin = TempDir::new().expect("temporary stub bin");
+    let path = support::stub_terminal(bin.path());
+    Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(args)
+        .current_dir(repository)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("PATH", path)
+        .output()
+        .expect("jjfx should run")
+}
+
 fn write_ticket(root: &Path, feature: &str, file: &str, content: &str) {
     let directory = root.join(".scratch").join(feature).join("issues");
     fs::create_dir_all(&directory).expect("issues directory");
@@ -214,12 +232,11 @@ fn dispatch_all_with_a_local_source_discovers_from_scratch() {
     )
     .expect("config file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(["dispatch", "--all", "--force"])
-        .current_dir(repository.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .output()
-        .expect("jjfx should run");
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all"],
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -256,12 +273,11 @@ fn dispatch_all_json_reports_an_empty_batch_as_an_empty_array() {
     )
     .expect("config file");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(["dispatch", "--all", "--json", "--force"])
-        .current_dir(repository.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .output()
-        .expect("jjfx should run");
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all", "--json"],
+    );
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
@@ -285,12 +301,11 @@ fn dispatch_all_json_explains_an_empty_ready_set() {
 
     // Nothing is ready: 01 is in flight and 02 is blocked by it. The batch must
     // not read as a bare `[]` - each Ticket it skipped and why is in the JSON.
-    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(["dispatch", "--all", "--json", "--force"])
-        .current_dir(repository.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .output()
-        .expect("jjfx should run");
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all", "--json"],
+    );
 
     assert!(output.status.success(), "{:?}", output);
     let value: serde_json::Value =
@@ -325,12 +340,11 @@ fn dispatch_all_prose_explains_an_empty_ready_set() {
         "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
     );
 
-    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(["dispatch", "--all", "--force"])
-        .current_dir(repository.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .output()
-        .expect("jjfx should run");
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all"],
+    );
 
     assert!(output.status.success(), "{:?}", output);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -357,12 +371,11 @@ fn dispatch_all_with_an_empty_ready_set_reconciles_finished_tickets() {
 
     // No ready Ticket and no live Worker: the only thing a Dispatch can do is
     // reconcile. Before the fix it returned `[]` and left the Ticket `claimed`.
-    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(["dispatch", "--all", "--json", "--force"])
-        .current_dir(repository.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .output()
-        .expect("jjfx should run");
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all", "--json"],
+    );
 
     assert!(output.status.success(), "{:?}", output);
     assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
@@ -419,12 +432,11 @@ fn a_reconciled_blocker_readies_its_dependent_in_the_same_dispatch() {
     // The reconcile before discovery resolves 01, so 02 becomes ready in the
     // same Dispatch (which then fails on the absent Pool - the readiness is what
     // this asserts).
-    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(["dispatch", "--all", "--json", "--force"])
-        .current_dir(repository.path())
-        .env("XDG_CONFIG_HOME", config_home.path())
-        .output()
-        .expect("jjfx should run");
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all", "--json"],
+    );
 
     assert!(
         ticket_status(repository.path(), "widgets", "01-foundation.md")

@@ -9,6 +9,7 @@
 //! anyway with the reason it was not ready reported first.
 #![cfg(unix)]
 
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -17,6 +18,8 @@ use std::process::{Command, Output};
 use jjfx::engine::{Repository, TicketId};
 use tempfile::TempDir;
 
+mod support;
+
 /// A jj repository with one local ready Ticket and a `[tickets] source = "local"`
 /// config home. The Pool and remote are added per case, because they are what
 /// decide which phase a Dispatch fails in.
@@ -24,6 +27,9 @@ struct DispatchFixture {
     root: TempDir,
     config_home: TempDir,
     bin: TempDir,
+    /// `PATH` with the fixture's `bin` ahead of the inherited one, so the stub
+    /// `kitten` (and any fake Agent) is what the binary under test finds.
+    env_path: OsString,
 }
 
 impl DispatchFixture {
@@ -31,10 +37,16 @@ impl DispatchFixture {
         let root = TempDir::new().expect("temporary repository");
         let config_home = TempDir::new().expect("temporary config home");
         let bin = TempDir::new().expect("temporary bin");
+        // A stub terminal on `PATH` keeps Dispatch deterministic: without it the
+        // Dispatch Eligibility terminal check fails closed when no kitty can be
+        // queried (ADR 0011), so every test here would need `--force` to pass on
+        // CI. The stub answers `kitten @ ls` with an empty workspace list.
+        let env_path = support::stub_terminal(bin.path());
         let fixture = Self {
             root,
             config_home,
             bin,
+            env_path,
         };
         fixture.jj(&["git", "init", "--no-colocate"]);
         fixture.write_ticket(
@@ -113,9 +125,9 @@ impl DispatchFixture {
         );
     }
 
-    /// Puts a fake `claude` on PATH that exits successfully, so a Dispatch can
-    /// launch a Run without a real Agent Runtime. Returns the PATH to use.
-    fn with_fake_agent(&self) -> std::ffi::OsString {
+    /// Puts a fake `claude` on the fixture's `PATH` that exits successfully, so a
+    /// Dispatch can launch a Run without a real Agent Runtime.
+    fn with_fake_agent(&self) {
         let agent = self.bin.path().join("claude");
         fs::write(
             &agent,
@@ -123,11 +135,6 @@ impl DispatchFixture {
         )
         .expect("fake agent");
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("executable agent");
-        let mut paths = vec![self.bin.path().to_path_buf()];
-        paths.extend(std::env::split_paths(
-            &std::env::var_os("PATH").unwrap_or_default(),
-        ));
-        std::env::join_paths(paths).expect("runtime PATH")
     }
 
     fn jjfx(&self, args: &[&str]) -> Command {
@@ -136,7 +143,8 @@ impl DispatchFixture {
             .args(args)
             .current_dir(self.path())
             .env("XDG_CONFIG_HOME", self.config_home.path())
-            .env("JJ_CONFIG", self.jj_config_path());
+            .env("JJ_CONFIG", self.jj_config_path())
+            .env("PATH", &self.env_path);
         command
     }
 }
@@ -156,7 +164,7 @@ fn a_batch_where_every_ticket_failed_exits_non_zero() {
     // No origin remote, so the only Ticket fails at the identity phase - the
     // exact shape that used to exit 0.
     let output = fixture
-        .jjfx(&["dispatch", "--all", "--json", "--force"])
+        .jjfx(&["dispatch", "--all", "--json"])
         .output()
         .expect("jjfx should run");
 
@@ -183,10 +191,9 @@ fn a_batch_with_a_dispatched_ticket_exits_zero() {
     let fixture = DispatchFixture::new();
     fixture.with_pool(1);
     fixture.with_origin();
-    let path = fixture.with_fake_agent();
+    fixture.with_fake_agent();
     let output = fixture
-        .jjfx(&["dispatch", "--all", "--json", "--force"])
-        .env("PATH", path)
+        .jjfx(&["dispatch", "--all", "--json"])
         .output()
         .expect("jjfx should run");
 
@@ -261,11 +268,11 @@ fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
     // launching an Agent Runtime.
     fixture.write_ticket("gadgets", "01-done.md", "# Done\n\nStatus: resolved\n");
 
-    // `--force` bypasses the Dispatch Eligibility terminal check, which fails
-    // closed when no terminal can be queried (ADR 0011). Without it this test
-    // passes only on a machine running kitty and fails on CI.
+    // No `--force`: the fixture's stub `kitten` answers the Dispatch Eligibility
+    // terminal check (ADR 0011) with an empty workspace list, so this exercises
+    // the real seam without depending on the ambient terminal.
     let output = fixture
-        .jjfx(&["dispatch", "gadgets", "--json", "--force"])
+        .jjfx(&["dispatch", "gadgets", "--json"])
         .output()
         .expect("jjfx should run");
 
@@ -319,14 +326,13 @@ fn a_named_ticket_blocked_by_an_unresolved_sibling_says_why_and_dispatches_anywa
         "02-dependent.md",
         "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
     );
-    let path = fixture.with_fake_agent();
+    fixture.with_fake_agent();
 
     // Default Dispatch orchestrates a single named Ticket, which falls back to a
     // direct Dispatch because the Ticket is not a feature directory - so this
     // covers the path `jjfx dispatch <TICKET>` actually takes.
     let output = fixture
-        .jjfx(&["dispatch", "widgets--02-dependent", "--force"])
-        .env("PATH", path)
+        .jjfx(&["dispatch", "widgets--02-dependent"])
         .output()
         .expect("jjfx should run");
 
@@ -362,7 +368,7 @@ fn a_named_ticket_with_the_wrong_status_reports_it_and_dispatches_anyway() {
         "01-ship-the-widget.md",
         "# Ship the widget\n\nStatus: claimed\n\n## Problem\n\nDo it.\n",
     );
-    let path = fixture.with_fake_agent();
+    fixture.with_fake_agent();
 
     let output = fixture
         .jjfx(&[
@@ -370,9 +376,7 @@ fn a_named_ticket_with_the_wrong_status_reports_it_and_dispatches_anyway() {
             "widgets--01-ship-the-widget",
             "--no-orchestrate",
             "--json",
-            "--force",
         ])
-        .env("PATH", path)
         .output()
         .expect("jjfx should run");
 
@@ -404,11 +408,10 @@ fn a_ready_named_ticket_is_not_reported_as_not_ready() {
     let fixture = DispatchFixture::new();
     fixture.with_origin();
     fixture.with_pool(1);
-    let path = fixture.with_fake_agent();
+    fixture.with_fake_agent();
 
     let output = fixture
-        .jjfx(&["dispatch", "widgets--01-ship-the-widget", "--force"])
-        .env("PATH", path)
+        .jjfx(&["dispatch", "widgets--01-ship-the-widget"])
         .output()
         .expect("jjfx should run");
 
