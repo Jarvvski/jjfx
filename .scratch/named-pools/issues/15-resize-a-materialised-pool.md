@@ -1,7 +1,7 @@
 # `pool resize --pool <name>` does not resize a materialised pool
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -23,10 +23,10 @@ Whichever is chosen, `status` must report **one** size, and it must be the size 
 
 ## Acceptance Criteria
 
-- [ ] A size edit after materialisation either takes effect on the lane, or is refused with a reason.
-- [ ] `status` reports a single size, and it matches the lane's Workers.
-- [ ] Shrinking a materialised lane keeps the existing busy-Worker safety.
-- [ ] `mise run check` is green.
+- [x] A size edit after materialisation either takes effect on the lane, or is refused with a reason.
+- [x] `status` reports a single size, and it matches the lane's Workers.
+- [x] Shrinking a materialised lane keeps the existing busy-Worker safety.
+- [x] `mise run check` is green.
 
 ## References
 
