@@ -617,3 +617,104 @@ fn an_explicit_pool_fills_that_lane_not_default() {
         stderr(&default)
     );
 }
+
+/// When nothing is ready, the `--json` batch explains why instead of printing a
+/// bare `[]`: the label it searched and the root it searched under, so a caller
+/// can tell a wrong root or a label that matched nothing from a Repository that
+/// simply has no work.
+#[test]
+fn an_empty_ready_set_carries_the_search_in_json() {
+    let fixture = DispatchFixture::new();
+    fixture.with_pool(1);
+    // The only Ticket is finished, so the ready set is genuinely empty and no
+    // per-Ticket diagnostic explains it - exactly the case that used to be `[]`.
+    fixture.write_ticket(
+        "widgets",
+        "01-ship-the-widget.md",
+        "# Ship the widget\n\nStatus: resolved\n",
+    );
+
+    let output = fixture
+        .jjfx(&["dispatch", "--all", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    let entries = json.as_array().expect("a batch is an array");
+    let search = entries
+        .iter()
+        .find(|entry| entry["ticket"].is_null())
+        .expect("the batch names the search that found nothing");
+    assert_eq!(search["outcome"], "skipped");
+    assert_eq!(search["label"], "ready-for-agent");
+    let root = search["root"]
+        .as_str()
+        .expect("the search names the root it looked under");
+    assert!(root.ends_with(".scratch"), "{root}");
+
+    // The prose path is unchanged: it still names the label on stderr.
+    let prose = fixture
+        .jjfx(&["dispatch", "--all"])
+        .output()
+        .expect("jjfx should run");
+    assert!(prose.status.success(), "{}", stderr(&prose));
+    assert!(
+        stderr(&prose).contains("No tickets found with label 'ready-for-agent'"),
+        "{}",
+        stderr(&prose)
+    );
+}
+
+/// A Ticket that was discovered but did not qualify is named alongside the
+/// search, so the batch says both where it looked and what it found there.
+#[test]
+fn a_not_ready_ticket_is_named_alongside_the_search_in_json() {
+    let fixture = DispatchFixture::new();
+    fixture.with_pool(1);
+    // A status that is not the ready status, so the Ticket is found but does not
+    // qualify.
+    fixture.write_ticket(
+        "widgets",
+        "01-ship-the-widget.md",
+        "# Ship the widget\n\nStatus: claimed\n",
+    );
+
+    let output = fixture
+        .jjfx(&["dispatch", "--all", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    let entries = json.as_array().expect("a batch is an array");
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry["ticket"].is_null() && entry["label"] == "ready-for-agent"),
+        "{json}"
+    );
+    let skipped = entries
+        .iter()
+        .find(|entry| entry["ticket"] == "widgets--01-ship-the-widget")
+        .expect("the discovered Ticket is named");
+    assert_eq!(skipped["outcome"], "skipped");
+    assert!(
+        skipped["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("claimed")),
+        "{json}"
+    );
+}

@@ -3113,7 +3113,15 @@ fn dispatch_all_across_pools(
             })
             .collect::<Vec<_>>();
         if args.json {
-            render_dispatch_entries(&skipped, true);
+            // Name every search the fan-out ran - one label per routable pool -
+            // ahead of the Tickets that were found but routed nowhere, so an
+            // empty batch says which labels it looked for and under which root.
+            let mut batch = routes
+                .iter()
+                .map(|route| search_entry(route.label(), &tickets, repository))
+                .collect::<Vec<_>>();
+            batch.extend(skipped);
+            render_dispatch_entries(&batch, true);
         } else if skipped.is_empty() {
             eprintln!("No tickets matched any Worker Pool's routing label");
         } else {
@@ -3320,9 +3328,10 @@ fn dispatch_command(
         eprintln!("Fetching tickets with label '{ready_label}'...");
         let ready = discovery.ready_tickets(&filter)?;
         if ready.tickets().is_empty() {
-            // An empty ready set must explain itself: name every Ticket that was
-            // discovered but not ready (blocked, wrong status, or malformed), so
-            // a caller can tell "nothing to do" from "nothing can be done".
+            // An empty ready set must explain itself: name the search (the
+            // label and root) and every Ticket that was discovered but not
+            // ready (blocked, wrong status, or malformed), so a caller can tell
+            // "nothing to do" from "nothing can be done".
             let skipped = ready
                 .diagnostics()
                 .iter()
@@ -3332,7 +3341,9 @@ fn dispatch_command(
                 })
                 .collect::<Vec<_>>();
             if args.json {
-                render_dispatch_entries(&skipped, true);
+                let mut batch = vec![search_entry(&ready_label, &tickets, repository)];
+                batch.extend(skipped);
+                render_dispatch_entries(&batch, true);
             } else if skipped.is_empty() {
                 eprintln!("No tickets found with label '{ready_label}'");
             } else {
@@ -3656,7 +3667,7 @@ fn ensure_dispatch_progressed(entries: &[DispatchEntry]) -> Result<()> {
     }
     let tickets = entries
         .iter()
-        .map(DispatchEntry::ticket)
+        .filter_map(DispatchEntry::ticket)
         .collect::<Vec<_>>()
         .join(", ");
     bail!("every Ticket failed to dispatch: {tickets}")
@@ -3690,6 +3701,15 @@ enum DispatchEntry {
     Waiting { ticket: String, detail: String },
     /// The Ticket was discovered but is not ready to run; the detail says why.
     Skipped { ticket: String, detail: String },
+    /// The search found nothing at all: the label it looked for and the root it
+    /// looked under. Emitted in a `--json` batch in place of a bare `[]`, so a
+    /// caller can tell a wrong root or a label that matched nothing from a
+    /// Repository that simply has no work.
+    Search {
+        label: String,
+        root: Option<String>,
+        detail: String,
+    },
     /// The Ticket was handed to the Orchestrator rather than a single Worker.
     Orchestrating { ticket: String, detail: String },
 }
@@ -3729,14 +3749,16 @@ impl DispatchEntry {
         }
     }
 
-    /// Returns the Ticket identifier.
-    fn ticket(&self) -> &str {
+    /// Returns the Ticket identifier, or `None` for a search entry, which names
+    /// no Ticket because it describes the discovery itself.
+    fn ticket(&self) -> Option<&str> {
         match self {
             Self::Dispatched { ticket, .. }
             | Self::Failed { ticket, .. }
             | Self::Waiting { ticket, .. }
             | Self::Skipped { ticket, .. }
-            | Self::Orchestrating { ticket, .. } => ticket,
+            | Self::Orchestrating { ticket, .. } => Some(ticket),
+            Self::Search { .. } => None,
         }
     }
 
@@ -3747,6 +3769,7 @@ impl DispatchEntry {
             Self::Failed { .. } => "failed",
             Self::Waiting { .. } => "waiting",
             Self::Skipped { .. } => "skipped",
+            Self::Search { .. } => "skipped",
             Self::Orchestrating { .. } => "orchestrating",
         }
     }
@@ -3756,7 +3779,10 @@ impl DispatchEntry {
         match self {
             Self::Dispatched { worker, .. } => Some(worker),
             Self::Failed { worker, .. } => worker.as_deref(),
-            Self::Waiting { .. } | Self::Skipped { .. } | Self::Orchestrating { .. } => None,
+            Self::Waiting { .. }
+            | Self::Skipped { .. }
+            | Self::Search { .. }
+            | Self::Orchestrating { .. } => None,
         }
     }
 
@@ -3783,7 +3809,17 @@ impl DispatchEntry {
             | Self::Failed { detail, .. }
             | Self::Waiting { detail, .. }
             | Self::Skipped { detail, .. }
+            | Self::Search { detail, .. }
             | Self::Orchestrating { detail, .. } => detail,
+        }
+    }
+
+    /// Returns the label a search entry looked for and the root it looked
+    /// under, or `None` for a per-Ticket entry.
+    fn search(&self) -> Option<(&str, Option<&str>)> {
+        match self {
+            Self::Search { label, root, .. } => Some((label, root.as_deref())),
+            _ => None,
         }
     }
 
@@ -3841,6 +3877,9 @@ fn dispatch_prose(entries: &[DispatchEntry]) -> String {
             DispatchEntry::Skipped { ticket, detail } => {
                 out.push_str(&format!("  {ticket} {detail}\n"));
             }
+            DispatchEntry::Search { detail, .. } => {
+                out.push_str(&format!("  {detail}\n"));
+            }
             DispatchEntry::Orchestrating { ticket, detail } => {
                 out.push_str(&format!("Orchestrating {ticket} in background\n"));
                 if !detail.is_empty() {
@@ -3853,6 +3892,31 @@ fn dispatch_prose(entries: &[DispatchEntry]) -> String {
         }
     }
     out
+}
+
+/// The `--json` entry naming one discovery's search: the label it looked for
+/// and the root it looked under.
+///
+/// Emitted when a `--all` discovery finds nothing, so the batch carries the
+/// reason it is empty as structure a caller reads rather than a stderr aside it
+/// would have to parse. The root is the local markdown root for a local source
+/// and absent for Linear, which has no filesystem root to name.
+fn search_entry(label: &str, tickets: &TicketsConfig, repository: &Repository) -> DispatchEntry {
+    let root = match tickets.source {
+        TicketSource::Linear => None,
+        TicketSource::Local => Some(
+            repository
+                .root()
+                .join(&tickets.local.root)
+                .display()
+                .to_string(),
+        ),
+    };
+    DispatchEntry::Search {
+        label: label.to_owned(),
+        root,
+        detail: format!("no ready tickets with label '{label}'"),
+    }
 }
 
 /// The machine-readable rendering of one Dispatch batch, one object per Ticket
@@ -3868,8 +3932,8 @@ fn dispatch_json(entries: &[DispatchEntry]) -> String {
         if index > 0 {
             out.push_str(",\n");
         }
-        let fields = [
-            ("ticket", json_string(entry.ticket())),
+        let mut fields = vec![
+            ("ticket", json_option(entry.ticket())),
             ("outcome", json_string(entry.outcome())),
             ("worker", json_option(entry.worker())),
             ("phase", json_option(entry.phase())),
@@ -3879,8 +3943,15 @@ fn dispatch_json(entries: &[DispatchEntry]) -> String {
                     .pid()
                     .map_or_else(|| "null".to_owned(), |pid| pid.to_string()),
             ),
-            ("detail", json_string(entry.detail())),
         ];
+        // A search entry carries the discovery it describes as structure - the
+        // label looked for and the root looked under - so an empty batch says
+        // *why* it is empty rather than only that it is.
+        if let Some((label, root)) = entry.search() {
+            fields.push(("label", json_string(label)));
+            fields.push(("root", json_option(root)));
+        }
+        fields.push(("detail", json_string(entry.detail())));
         out.push_str("  {\n");
         for (field, (key, value)) in fields.iter().enumerate() {
             if field > 0 {
@@ -6140,6 +6211,58 @@ mod tests {
             entries[0]["detail"],
             "blocked by widgets--01-foundation (claimed)"
         );
+    }
+
+    #[test]
+    fn dispatch_json_names_the_search_alongside_the_skipped_tickets() {
+        let entries = vec![
+            DispatchEntry::Search {
+                label: "ready-for-agent".to_owned(),
+                root: Some("/repo/.scratch".to_owned()),
+                detail: "no ready tickets with label 'ready-for-agent'".to_owned(),
+            },
+            DispatchEntry::Skipped {
+                ticket: "widgets--02-dependent".to_owned(),
+                detail: "blocked by widgets--01-foundation (claimed)".to_owned(),
+            },
+        ];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&entries)).expect("valid JSON");
+
+        let entries = value.as_array().expect("one object per entry");
+        assert_eq!(entries.len(), 2);
+        let search = &entries[0];
+        assert!(search["ticket"].is_null());
+        assert_eq!(search["outcome"], "skipped");
+        assert_eq!(search["label"], "ready-for-agent");
+        assert_eq!(search["root"], "/repo/.scratch");
+        assert_eq!(
+            search["detail"],
+            "no ready tickets with label 'ready-for-agent'"
+        );
+        // A search with no filesystem root - a Linear source - omits it as null.
+        assert!(search["worker"].is_null());
+        // The per-Ticket diagnostic keeps its own shape and carries no search.
+        assert_eq!(entries[1]["ticket"], "widgets--02-dependent");
+        assert_eq!(entries[1]["outcome"], "skipped");
+        assert!(entries[1]["label"].is_null());
+        assert!(entries[1]["root"].is_null());
+    }
+
+    #[test]
+    fn dispatch_json_search_root_is_null_for_a_linear_source() {
+        let entries = vec![DispatchEntry::Search {
+            label: "ready-for-agent".to_owned(),
+            root: None,
+            detail: "no ready tickets with label 'ready-for-agent'".to_owned(),
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&entries)).expect("valid JSON");
+
+        assert!(value[0]["root"].is_null());
+        assert_eq!(value[0]["label"], "ready-for-agent");
     }
 
     #[test]
