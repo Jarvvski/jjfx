@@ -266,8 +266,15 @@ impl LocalTickets {
     }
 
     /// Builds the Ready Ticket payload for the shared discovery filter.
+    ///
+    /// Readiness is judged by the filter's status, not the source's own: the
+    /// filter is the per-discovery value a Worker Pool's declared `ready_status`
+    /// reaches the source through, so a lane that defines readiness differently
+    /// draws its work by that status while the source's own value stays the
+    /// user-global default.
     fn ready_payload(&self, filter: &ReadyTicketFilter) -> Result<String, TicketQueryError> {
         let tickets = self.scan().map_err(TicketQueryError::from)?;
+        let ready_status = filter.status().as_str();
         let mut entries = Vec::new();
         let mut diagnostics = Vec::new();
         for ticket in &tickets {
@@ -278,7 +285,7 @@ impl LocalTickets {
                 entries.push(ticket.malformed_entry(filter, malformation));
                 continue;
             }
-            if self.is_ready(ticket, &tickets) {
+            if self.is_ready(ticket, &tickets, ready_status) {
                 entries.push(json!({
                     "id": ticket.id,
                     "title": ticket.title,
@@ -291,7 +298,7 @@ impl LocalTickets {
             // A well-formed Ticket that is not ready is the case the bare `[]`
             // used to hide: name it and say what stops it, so a caller can tell
             // "nothing to do" from "nothing can be done".
-            if let Some(reason) = self.not_ready_reason(ticket, &tickets) {
+            if let Some(reason) = self.not_ready_reason(ticket, &tickets, ready_status) {
                 diagnostics.push(json!({ "subject": ticket.id, "reason": reason }));
             }
         }
@@ -398,10 +405,12 @@ impl LocalTickets {
         }
     }
 
-    /// Whether one Ticket is ready for Dispatch: its status is the ready status
-    /// and every Blocker resolves to a resolved sibling in the same feature.
-    fn is_ready(&self, ticket: &LocalTicket, tickets: &[LocalTicket]) -> bool {
-        if !status_eq(&ticket.status, &self.ready_status) {
+    /// Whether one Ticket is ready for Dispatch: its status is `ready_status` -
+    /// the value the discovering filter carries, which is the pool's own when it
+    /// declares one - and every Blocker resolves to a resolved sibling in the
+    /// same feature.
+    fn is_ready(&self, ticket: &LocalTicket, tickets: &[LocalTicket], ready_status: &str) -> bool {
+        if !status_eq(&ticket.status, ready_status) {
             return false;
         }
         let Some(blockers) = ticket.blockers.as_ref() else {
@@ -424,14 +433,19 @@ impl LocalTickets {
     /// explanation and it is not reported. Every other Ticket is a candidate that
     /// cannot run right now, and the reason names what stops it: a `Status:` that
     /// is not the ready status, or the unresolved sibling(s) blocking it.
-    fn not_ready_reason(&self, ticket: &LocalTicket, tickets: &[LocalTicket]) -> Option<String> {
+    fn not_ready_reason(
+        &self,
+        ticket: &LocalTicket,
+        tickets: &[LocalTicket],
+        ready_status: &str,
+    ) -> Option<String> {
         if status_eq(&ticket.status, &self.resolved_status) {
             return None;
         }
-        if !status_eq(&ticket.status, &self.ready_status) {
+        if !status_eq(&ticket.status, ready_status) {
             return Some(format!(
                 "expected status {:?}, found {:?}",
-                self.ready_status, ticket.status
+                ready_status, ticket.status
             ));
         }
         let unresolved = ticket
@@ -1021,6 +1035,48 @@ mod tests {
         assert_eq!(
             ready.diagnostics()[0].reason(),
             "missing label \"bug\" (carries \"ready-for-agent\")"
+        );
+    }
+
+    /// A Worker Pool's declared `ready_status` reaches the source through the
+    /// filter, so the same `.scratch/` tree draws different work for lanes that
+    /// define readiness differently - the source's own value is only the global
+    /// fallback.
+    #[test]
+    fn the_filter_status_drives_readiness_not_the_sources_own() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-review.md",
+            "# Review\n\nStatus: ready-for-review\nLabels: review\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-agent.md",
+            "# Agent\n\nStatus: ready-for-agent\nLabels: review\n",
+        );
+        // The source's own ready status is the global `ready-for-agent`; the
+        // review lane's filter carries a different one, and it is what decides.
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+        let review = ReadyTicketFilter::new(
+            "review",
+            TicketStatus::parse("ready-for-review").expect("ready status"),
+        )
+        .expect("filter");
+
+        let ready = discovery.ready_tickets(&review).expect("discovery");
+
+        assert_eq!(ready.tickets().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.tickets()[0].id().as_str(), "widgets--01-review");
+        // The Ticket ready for the *other* lane is reported with the status this
+        // lane expects, so a lane that draws nothing says why.
+        assert_eq!(ready.diagnostics().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.diagnostics()[0].subject(), "widgets--02-agent");
+        assert_eq!(
+            ready.diagnostics()[0].reason(),
+            "expected status \"ready-for-review\", found \"ready-for-agent\""
         );
     }
 

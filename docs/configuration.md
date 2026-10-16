@@ -545,7 +545,7 @@ Every key is optional but the pool's name (the table key).
 | `profile` | unset | The name of an Agent Runtime Profile the user-global [`[profiles]`](#profiles) defines. Naming one the user config does not define is a loud error. Absent leaves the Repository default in place. |
 | `source` | unset | Which configured Ticket source discovers this pool's work: `linear` or `local`. Absent means the pool has **no** Ticket source and is reachable only by an explicit `--pool`. |
 | `label` | unset | The Ticket label that routes a Ticket to this pool, which `jjfx dispatch --all` fans out over. A pool that declares none is reachable only by an explicit `--pool`. Two pools declaring the same label is an error at load, naming both. |
-| `ready_status` | the global value | The `Status:` value marking a Ticket ready for this pool, defaulting to the user-global value. |
+| `ready_status` | the global value | The `Status:` value a Ticket must be in to be ready for this pool's discovery, defaulting to the user-global value. |
 | `cap_usd` | unset | The pool's spend cap in US dollars, under the Repository-wide ceiling. Must be a positive, finite amount; absent means the ceiling is the only limit. |
 | `window` | the global value | The window the pool's cap totals over, defaulting to `spend.window`. |
 | `on_exceed` | the global value | What Dispatch does once the pool's cap is reached, defaulting to `spend.on_exceed`. |
@@ -594,6 +594,15 @@ own label and dispatching each Ticket to the pool whose label it carries. The
 ready label is per pool - `--label` overrides the pool's declared label, which
 overrides the global `ready-for-agent` - because each pool's source may select
 work by a different label.
+
+The **ready status** is per pool as well. A pool may declare the `Status:` a
+Ticket must be in for that lane (`[pools.review] ready_status =
+"ready-for-review"`), defaulting to the user-global value, so a review lane
+draws `ready-for-review` while a lane that declares none keeps drawing the
+global status - from the same `.scratch/` tree. The status filters that pool's
+discovery exactly as its label routes it: the `--all` fan-out draws each lane by
+its own status, an explicit `--pool` uses the selected lane's, and a Ticket
+named by hand reports its readiness against the selected pool's status.
 
 Routing is by declaration, never by a magic `pool:<name>` string, so a lane can
 adopt a vocabulary the Repository already uses. A pool that declares no label is
