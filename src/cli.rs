@@ -10,13 +10,13 @@ const PROGRAM: &str = env!("CARGO_PKG_NAME");
 use crate::config::{MigrationsConfig, SpendConfig, TicketsConfig};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
-    DirectDispatchError, DirectDispatchExecution, DirectDispatchOutcome, DirectDispatchRequest,
-    DispatchBudget, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
-    ReviewLoop, RunActivity, RunActivityKind, RunMode, StuckWindow, TerminalSettings,
-    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceAddOutcome,
-    WorkspaceHookStream,
+    DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
+    DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
+    DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded, OrchestrationEvent,
+    PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository, ReviewLoop, RunActivity,
+    RunActivityKind, RunMode, StuckWindow, TerminalSettings, TicketDetails, TicketDiscovery,
+    TicketId, TicketQuery, TicketStatus, UndoOutcome, WireAgent, WorkerActions, WorkerId,
+    WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -58,7 +58,7 @@ pub const HELP: &str = concat!(
     env!("CARGO_PKG_NAME"),
     " pool destroy              Tear down all workers and remove pool\n\nDispatch and sessions:\n  ",
     env!("CARGO_PKG_NAME"),
-    " dispatch <TICKET>...     Dispatch Tickets (d; --provider/--model/--force)\n  ",
+    " dispatch <TICKET>...     Dispatch Tickets (d; --provider/--model/--force/--json)\n  ",
     env!("CARGO_PKG_NAME"),
     " send <worker> <prompt>   Send a Follow-up (s; --force)\n  ",
     env!("CARGO_PKG_NAME"),
@@ -195,6 +195,7 @@ pub struct DispatchArgs {
     pub label: String,
     pub no_orchestrate: bool,
     pub force: bool,
+    pub json: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -593,6 +594,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     let mut label = "ready-for-agent".to_owned();
     let mut no_orchestrate = false;
     let mut force = false;
+    let mut json = false;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
@@ -600,6 +602,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
             "--all" => all = true,
             "--no-orchestrate" => no_orchestrate = true,
             "--force" => force = true,
+            "--json" => json = true,
             "--provider" | "--model" | "--label" | "--budget" => {
                 let option = args[index].as_str();
                 let value = args
@@ -637,7 +640,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         bail!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
-            " dispatch <TICKET>... [--fg|--bg] [--provider PROVIDER] [--model MODEL]"
+            " dispatch <TICKET>... [--fg|--bg] [--provider PROVIDER] [--model MODEL] [--json]"
         ));
     }
     if budget.is_some() && tickets.len() == 1 && !no_orchestrate {
@@ -653,6 +656,7 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
         label,
         no_orchestrate,
         force,
+        json,
     }))
 }
 
@@ -866,9 +870,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         } => orchestrate_command(
             &repository(colocate)?,
             &parent,
-            provider.as_deref(),
-            model.as_deref(),
+            selected_model(provider.as_deref(), model.as_deref())?,
             force,
+            false,
             open_workspaces,
             tickets,
         )?,
@@ -1530,9 +1534,9 @@ fn dispatch_command(
             return orchestrate_command(
                 repository,
                 &args.tickets[0],
-                args.provider.as_deref(),
-                args.model.as_deref(),
+                model.clone(),
                 args.force,
+                args.json,
                 open_workspaces,
                 tickets_config,
             );
@@ -1554,10 +1558,12 @@ fn dispatch_command(
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()?;
-        eprintln!("Orchestrating {} in background", args.tickets[0]);
-        eprintln!(
-            "  Re-run '{PROGRAM} dispatch {}' to check progress",
-            args.tickets[0]
+        render_dispatch_entries(
+            &[DispatchEntry::Orchestrating {
+                ticket: args.tickets[0].clone(),
+                detail: "orchestrating in background".to_owned(),
+            }],
+            args.json,
         );
         return Ok(());
     }
@@ -1580,7 +1586,11 @@ fn dispatch_command(
             eprintln!("{}: {}", diagnostic.subject(), diagnostic.reason());
         }
         if ready.tickets().is_empty() {
-            eprintln!("No tickets found with label '{}'", args.label);
+            if args.json {
+                render_dispatch_entries(&[], true);
+            } else {
+                eprintln!("No tickets found with label '{}'", args.label);
+            }
             return Ok(());
         }
         let requests = ready
@@ -1601,7 +1611,7 @@ fn dispatch_command(
             })
             .collect::<Result<Vec<_>>>()?;
         let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-        render_dispatch_result(&result, requests.len(), true);
+        render_dispatch_result(&result, requests.len(), true, args.json);
         write_back_local_tickets(repository, &tickets);
         return Ok(());
     }
@@ -1625,7 +1635,7 @@ fn dispatch_command(
         })
         .collect::<Result<Vec<_>>>()?;
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-    render_dispatch_result(&result, requests.len(), false);
+    render_dispatch_result(&result, requests.len(), false, args.json);
     write_back_local_tickets(repository, &tickets);
     Ok(())
 }
@@ -1760,42 +1770,18 @@ fn render_dispatch_result(
     result: &crate::engine::DirectDispatchResult,
     requested: usize,
     all: bool,
+    json: bool,
 ) {
-    let mut fired = 0usize;
-    for outcome in result.outcomes() {
-        match outcome {
-            DirectDispatchOutcome::Succeeded(success) => {
-                fired += 1;
-                match success.execution() {
-                    DirectDispatchExecution::Background { pid } => eprintln!(
-                        "  {} (PID {}) -> {}",
-                        success.worker(),
-                        pid,
-                        success.ticket().id()
-                    ),
-                    DirectDispatchExecution::Foreground(completed) => {
-                        eprintln!(
-                            "  {} completed {:?}",
-                            success.worker(),
-                            completed.result().conclusion()
-                        )
-                    }
-                }
-            }
-            DirectDispatchOutcome::Failed(failure) => {
-                fired += 1;
-                eprintln!(
-                    "  {} failed at {:?}: {}",
-                    failure.ticket().id(),
-                    failure.phase(),
-                    failure.detail()
-                );
-            }
-            DirectDispatchOutcome::Waiting(waiting) => {
-                eprintln!("  {} waiting: {}", waiting.ticket().id(), waiting.detail())
-            }
-        }
+    let entries: Vec<DispatchEntry> = result
+        .outcomes()
+        .iter()
+        .map(DispatchEntry::from_outcome)
+        .collect();
+    render_dispatch_entries(&entries, json);
+    if json {
+        return;
     }
+    let fired = entries.iter().filter(|entry| entry.attempted()).count();
     if result.is_partial() {
         if fired == 0 && !all {
             eprintln!("No idle workers. Run: {PROGRAM} pool list");
@@ -1809,6 +1795,216 @@ fn render_dispatch_result(
     if held > 0 {
         eprintln!("Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes.");
     }
+}
+
+/// The result for one Ticket in a Dispatch, the shared model both the prose and
+/// the JSON renderings are built from.
+///
+/// [`DispatchEntry::from_outcome`] is the only place that matches
+/// [`DirectDispatchOutcome`], so a new engine outcome breaks compilation here
+/// rather than reaching one rendering and being forgotten in the other.
+#[derive(Debug, PartialEq, Eq)]
+enum DispatchEntry {
+    /// The Ticket was launched on its selected Worker.
+    Dispatched {
+        ticket: String,
+        worker: String,
+        /// The background process identifier, absent for a foreground Run.
+        pid: Option<u32>,
+        /// The human detail the prose prints after the Worker.
+        detail: String,
+    },
+    /// The Ticket failed before a usable Run was launched.
+    Failed {
+        ticket: String,
+        worker: Option<String>,
+        phase: DirectDispatchFailurePhase,
+        detail: String,
+    },
+    /// The capacity governor held the Ticket back; nothing was attempted.
+    Waiting { ticket: String, detail: String },
+    /// The Ticket was handed to the Orchestrator rather than a single Worker.
+    Orchestrating { ticket: String, detail: String },
+}
+
+impl DispatchEntry {
+    /// Builds the shared entry for one Direct Dispatch outcome.
+    fn from_outcome(outcome: &DirectDispatchOutcome) -> Self {
+        match outcome {
+            DirectDispatchOutcome::Succeeded(success) => Self::from_success(success),
+            DirectDispatchOutcome::Failed(failure) => Self::Failed {
+                ticket: failure.ticket().id().as_str().to_owned(),
+                worker: failure.worker().map(|worker| worker.as_str().to_owned()),
+                phase: failure.phase(),
+                detail: failure.detail().to_owned(),
+            },
+            DirectDispatchOutcome::Waiting(waiting) => Self::Waiting {
+                ticket: waiting.ticket().id().as_str().to_owned(),
+                detail: waiting.detail().to_owned(),
+            },
+        }
+    }
+
+    /// Builds the shared entry for one successful Direct Dispatch.
+    fn from_success(success: &DirectDispatchSuccess) -> Self {
+        let (pid, detail) = match success.execution() {
+            DirectDispatchExecution::Background { pid } => (Some(*pid), format!("PID {pid}")),
+            DirectDispatchExecution::Foreground(completed) => (
+                None,
+                format!("completed {:?}", completed.result().conclusion()),
+            ),
+        };
+        Self::Dispatched {
+            ticket: success.ticket().id().as_str().to_owned(),
+            worker: success.worker().as_str().to_owned(),
+            pid,
+            detail,
+        }
+    }
+
+    /// Returns the Ticket identifier.
+    fn ticket(&self) -> &str {
+        match self {
+            Self::Dispatched { ticket, .. }
+            | Self::Failed { ticket, .. }
+            | Self::Waiting { ticket, .. }
+            | Self::Orchestrating { ticket, .. } => ticket,
+        }
+    }
+
+    /// Returns the stable machine-readable outcome name.
+    const fn outcome(&self) -> &'static str {
+        match self {
+            Self::Dispatched { .. } => "dispatched",
+            Self::Failed { .. } => "failed",
+            Self::Waiting { .. } => "waiting",
+            Self::Orchestrating { .. } => "orchestrating",
+        }
+    }
+
+    /// Returns the Worker that took the Ticket, when one did.
+    fn worker(&self) -> Option<&str> {
+        match self {
+            Self::Dispatched { worker, .. } => Some(worker),
+            Self::Failed { worker, .. } => worker.as_deref(),
+            Self::Waiting { .. } | Self::Orchestrating { .. } => None,
+        }
+    }
+
+    /// Returns the stable machine-readable failure phase, when the Ticket failed.
+    const fn phase(&self) -> Option<&'static str> {
+        match self {
+            Self::Failed { phase, .. } => Some(phase.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Returns the background process identifier, when one was launched.
+    const fn pid(&self) -> Option<u32> {
+        match self {
+            Self::Dispatched { pid, .. } => *pid,
+            _ => None,
+        }
+    }
+
+    /// Returns the human detail the prose prints for this outcome.
+    fn detail(&self) -> &str {
+        match self {
+            Self::Dispatched { detail, .. }
+            | Self::Failed { detail, .. }
+            | Self::Waiting { detail, .. }
+            | Self::Orchestrating { detail, .. } => detail,
+        }
+    }
+
+    /// Whether Dispatch attempted this Ticket (launched or failed), as opposed
+    /// to holding it back.
+    const fn attempted(&self) -> bool {
+        matches!(self, Self::Dispatched { .. } | Self::Failed { .. })
+    }
+}
+
+/// Renders one Dispatch batch: JSON on stdout when `json`, else the prose lines
+/// on stderr.
+fn render_dispatch_entries(entries: &[DispatchEntry], json: bool) {
+    if json {
+        println!("{}", dispatch_json(entries));
+    } else {
+        eprint!("{}", dispatch_prose(entries));
+    }
+}
+
+/// The prose rendering of one Dispatch batch, one line per Ticket.
+fn dispatch_prose(entries: &[DispatchEntry]) -> String {
+    let mut out = String::new();
+    for entry in entries {
+        match entry {
+            DispatchEntry::Dispatched {
+                ticket,
+                worker,
+                pid: Some(pid),
+                ..
+            } => out.push_str(&format!("  {worker} (PID {pid}) -> {ticket}\n")),
+            DispatchEntry::Dispatched { worker, detail, .. } => {
+                out.push_str(&format!("  {worker} {detail}\n"));
+            }
+            DispatchEntry::Failed {
+                ticket,
+                phase,
+                detail,
+                ..
+            } => out.push_str(&format!("  {ticket} failed at {phase:?}: {detail}\n")),
+            DispatchEntry::Waiting { ticket, detail } => {
+                out.push_str(&format!("  {ticket} waiting: {detail}\n"));
+            }
+            DispatchEntry::Orchestrating { ticket, .. } => {
+                out.push_str(&format!("Orchestrating {ticket} in background\n"));
+                out.push_str(&format!(
+                    "  Re-run '{PROGRAM} dispatch {ticket}' to check progress\n"
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// The machine-readable rendering of one Dispatch batch, one object per Ticket
+/// in request order.
+///
+/// Encoded by hand so the emitted field order is fixed.
+fn dispatch_json(entries: &[DispatchEntry]) -> String {
+    if entries.is_empty() {
+        return "[]".to_owned();
+    }
+    let mut out = String::from("[\n");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            out.push_str(",\n");
+        }
+        let fields = [
+            ("ticket", json_string(entry.ticket())),
+            ("outcome", json_string(entry.outcome())),
+            ("worker", json_option(entry.worker())),
+            ("phase", json_option(entry.phase())),
+            (
+                "pid",
+                entry
+                    .pid()
+                    .map_or_else(|| "null".to_owned(), |pid| pid.to_string()),
+            ),
+            ("detail", json_string(entry.detail())),
+        ];
+        out.push_str("  {\n");
+        for (field, (key, value)) in fields.iter().enumerate() {
+            if field > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str(&format!("    \"{key}\": {value}"));
+        }
+        out.push_str("\n  }");
+    }
+    out.push_str("\n]");
+    out
 }
 
 fn send_command(
@@ -2217,9 +2413,9 @@ fn internal_complete_command(mode: &str) -> Result<()> {
 fn orchestrate_command(
     repository: &Repository,
     parent: &str,
-    provider: Option<&str>,
-    model: Option<&str>,
+    model: Option<AgentModel>,
     force: bool,
+    json: bool,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
     tickets_config: fn() -> Result<TicketsConfig>,
 ) -> Result<()> {
@@ -2241,8 +2437,7 @@ fn orchestrate_command(
     if let Some(details) = details {
         request = request.with_ticket_details(details);
     }
-    let request = selected_model(provider, model)?
-        .map_or(request.clone(), |selection| request.with_model(selection));
+    let request = model.map_or(request.clone(), |selection| request.with_model(selection));
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();
@@ -2251,26 +2446,40 @@ fn orchestrate_command(
         .orchestration_runner()
         .with_exclusions(exclusions);
     let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;
-    render_orchestration_event(&OrchestrationEvent::Started {
-        parent: id.clone(),
-        resumed: preparation.resumed(),
-    });
+    if !json {
+        render_orchestration_event(&OrchestrationEvent::Started {
+            parent: id.clone(),
+            resumed: preparation.resumed(),
+        });
+    }
     if let crate::engine::OrchestrationStart::Direct(success) = preparation.into_start() {
-        if let DirectDispatchExecution::Background { pid } = success.execution() {
-            eprintln!(
-                "  {} (PID {}) -> {}",
-                success.worker(),
-                pid,
-                success.ticket().id()
-            );
-        }
+        render_dispatch_entries(&[DispatchEntry::from_success(&success)], json);
         return Ok(());
     }
     let options = crate::engine::OrchestrationOptions::new();
     let summary = runner.run(&request, &options, |event| {
-        render_orchestration_event(&event);
+        if !json {
+            render_orchestration_event(&event);
+        }
     })?;
-    render_orchestration_event(&OrchestrationEvent::Terminal(summary));
+    if json {
+        let counts = summary.counts();
+        render_dispatch_entries(
+            &[DispatchEntry::Orchestrating {
+                ticket: id.as_str().to_owned(),
+                detail: format!(
+                    "{} done, {} failed, {} skipped, {} blocked",
+                    counts.done(),
+                    counts.failed(),
+                    counts.skipped(),
+                    counts.blocked()
+                ),
+            }],
+            true,
+        );
+    } else {
+        render_orchestration_event(&OrchestrationEvent::Terminal(summary));
+    }
     write_back_local_tickets(repository, &tickets);
     Ok(())
 }
@@ -2365,7 +2574,7 @@ _jjfx() {
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
-        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
+        dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
   esac
@@ -2417,6 +2626,7 @@ mod tests {
                 label: "ready-for-agent".to_owned(),
                 no_orchestrate: true,
                 force: false,
+                json: false,
             })
         );
     }
@@ -2425,6 +2635,16 @@ mod tests {
     fn parser_rejects_unknown_dispatch_options_and_budgeted_orchestration() {
         assert!(parse(&args(&["dispatch", "AMBA-42", "--wat"])).is_err());
         assert!(parse(&args(&["dispatch", "AMBA-42", "--budget", "12"])).is_err());
+    }
+
+    #[test]
+    fn dispatch_parser_accepts_json() {
+        let command =
+            parse(&args(&["dispatch", "AMBA-42", "--json"])).expect("dispatch --json should parse");
+        assert!(matches!(
+            command,
+            Command::Dispatch(DispatchArgs { json: true, .. })
+        ));
     }
 
     #[test]
@@ -2571,6 +2791,83 @@ mod tests {
         let json = pool_list_json_string(&idle, Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["waiting"], serde_json::json!([]));
+    }
+
+    fn ticket(id: &str) -> crate::engine::Ticket {
+        crate::engine::Ticket::new(
+            TicketId::parse(id).expect("Ticket ID"),
+            crate::engine::TicketTitle::parse(id).expect("Ticket title"),
+            TicketStatus::parse("Todo").expect("Ticket status"),
+        )
+    }
+
+    /// A batch exercising all three Direct Dispatch outcomes: a launched Ticket,
+    /// a failure, and one the capacity governor held back.
+    fn dispatch_entries() -> Vec<DispatchEntry> {
+        crate::engine::DirectDispatchResult::new(
+            vec![
+                DirectDispatchOutcome::Succeeded(crate::engine::DirectDispatchSuccess::new(
+                    ticket("ENG-401"),
+                    WorkerId::parse("worker-01").expect("Worker ID"),
+                    DirectDispatchExecution::Background { pid: 4242 },
+                )),
+                DirectDispatchOutcome::Failed(crate::engine::DirectDispatchFailure::new(
+                    ticket("ENG-402"),
+                    Some(WorkerId::parse("worker-02").expect("Worker ID")),
+                    DirectDispatchFailurePhase::Workspace,
+                    "cannot prepare Workspace",
+                )),
+            ],
+            true,
+        )
+        .with_waiting(vec![crate::engine::DirectDispatchWaiting::new(
+            ticket("ENG-403"),
+            "waiting for capacity",
+        )])
+        .outcomes()
+        .iter()
+        .map(DispatchEntry::from_outcome)
+        .collect()
+    }
+
+    #[test]
+    fn dispatch_json_names_each_ticket_outcome_worker_and_detail() {
+        let value: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&dispatch_entries())).expect("valid JSON");
+
+        let entries = value.as_array().expect("one object per Ticket");
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["ticket"], "ENG-401");
+        assert_eq!(entries[0]["outcome"], "dispatched");
+        assert_eq!(entries[0]["worker"], "worker-01");
+        assert_eq!(entries[0]["pid"], 4242);
+        assert_eq!(entries[0]["detail"], "PID 4242");
+        assert_eq!(entries[1]["ticket"], "ENG-402");
+        assert_eq!(entries[1]["outcome"], "failed");
+        assert_eq!(entries[1]["worker"], "worker-02");
+        assert_eq!(entries[1]["phase"], "workspace");
+        assert_eq!(entries[1]["detail"], "cannot prepare Workspace");
+        assert_eq!(entries[2]["ticket"], "ENG-403");
+        assert_eq!(entries[2]["outcome"], "waiting");
+        assert!(entries[2]["worker"].is_null());
+        assert_eq!(entries[2]["detail"], "waiting for capacity");
+    }
+
+    #[test]
+    fn dispatch_json_is_an_empty_array_when_no_ticket_was_requested() {
+        assert_eq!(dispatch_json(&[]), "[]");
+    }
+
+    #[test]
+    fn dispatch_prose_is_unchanged_by_the_shared_model() {
+        assert_eq!(
+            dispatch_prose(&dispatch_entries()),
+            concat!(
+                "  worker-01 (PID 4242) -> ENG-401\n",
+                "  ENG-402 failed at Workspace: cannot prepare Workspace\n",
+                "  ENG-403 waiting: waiting for capacity\n",
+            )
+        );
     }
 
     #[test]
@@ -2772,6 +3069,7 @@ mod tests {
                 label: "needs-review".to_owned(),
                 no_orchestrate: false,
                 force: false,
+                json: false,
             })
         );
     }
@@ -2790,6 +3088,7 @@ mod tests {
                 label: "ready-for-agent".to_owned(),
                 no_orchestrate: true,
                 force: false,
+                json: false,
             })
         );
         assert_eq!(

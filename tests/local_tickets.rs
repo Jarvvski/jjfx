@@ -149,3 +149,38 @@ fn dispatch_all_with_a_local_source_discovers_from_scratch() {
     // A ready Ticket was found, so discovery did not collapse to an empty set.
     assert!(!stderr.contains("No tickets found"), "{stderr}");
 }
+
+#[test]
+fn dispatch_all_json_reports_an_empty_batch_as_an_empty_array() {
+    let repository = TempDir::new().expect("temporary repository");
+    let status = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
+        .arg(repository.path())
+        .status()
+        .expect("jj should be installed");
+    assert!(status.success(), "jj git init");
+    let config_home = TempDir::new().expect("temporary config home");
+    let config_directory = config_home.path().join("jjfx");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        "[tickets]\nsource = \"local\"\n",
+    )
+    .expect("config file");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["dispatch", "--all", "--json", "--force"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "[]");
+}

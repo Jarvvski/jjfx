@@ -1,6 +1,6 @@
 # `jjfx dispatch` has no `--json`
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -44,3 +44,4 @@ Build it from the same outcome model the prose is rendered from (`DirectDispatch
 ## Comments
 
 - 2026-10-16: Filed from the `jjfx-dispatch` skill pass, so an agent can read what a dispatch did instead of parsing its prose.
+- 2026-10-16: Implemented `dispatch --json`. `DispatchEntry` in `src/cli.rs` is the shared outcome model both the prose and JSON renderings read, built once from `DirectDispatchOutcome`, so a new engine outcome breaks compilation in `from_outcome` rather than reaching only one rendering. Each object carries `ticket`, `outcome` (`dispatched`/`failed`/`waiting`/`orchestrating`), `worker` (null when none took it), `phase`, `pid` and `detail`. The single-Ticket orchestration handoff also reports JSON, and `--json` with no discovered Tickets prints `[]`. Unit tests cover a dispatched, a failed and a held-back Ticket plus the unchanged prose; an integration test asserts the empty batch on stdout.
