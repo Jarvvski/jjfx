@@ -494,8 +494,13 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             TicketStatus::parse(self.tickets.ready_status()).map_err(|error| error.to_string())?;
         let filter = ReadyTicketFilter::new(label, status).map_err(|error| error.to_string())?;
         let discovery = TicketDiscovery::new(
-            configured_ticket_query(self.repository_root.as_path(), &self.tickets, runtime, label)
-                .map_err(|error| error.to_string())?,
+            configured_ticket_query(
+                self.repository_root.as_path(),
+                &self.tickets,
+                runtime,
+                label,
+            )
+            .map_err(|error| error.to_string())?,
         );
         let ready = discovery
             .ready_tickets(&filter)

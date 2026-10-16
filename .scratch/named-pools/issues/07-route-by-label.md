@@ -1,7 +1,7 @@
 # Route a Ticket to its pool by label
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 06
 
 ## Problem
@@ -26,11 +26,11 @@ Requiring `--pool` on every Dispatch makes lanes capacity buckets that a human h
 
 ## Acceptance Criteria
 
-- [ ] The local convention parses `Labels:`, and an existing ticket without the line is unaffected.
-- [ ] `dispatch --all` routes each Ticket to the pool whose label it carries.
-- [ ] A Ticket matching no pool is reported, not silently skipped.
-- [ ] An explicit `--pool` overrides label routing.
-- [ ] `mise run check` is green.
+- [x] The local convention parses `Labels:`, and an existing ticket without the line is unaffected.
+- [x] `dispatch --all` routes each Ticket to the pool whose label it carries.
+- [x] A Ticket matching no pool is reported, not silently skipped.
+- [x] An explicit `--pool` overrides label routing.
+- [x] `mise run check` is green.
 
 ## References
 

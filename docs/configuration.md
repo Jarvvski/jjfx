@@ -544,7 +544,7 @@ Every key is optional but the pool's name (the table key).
 | `size` | unset | The number of Workers the pool holds. Absent leaves the Repository's configured size in place. |
 | `profile` | unset | The name of an Agent Runtime Profile the user-global [`[profiles]`](#profiles) defines. Naming one the user config does not define is a loud error. Absent leaves the Repository default in place. |
 | `source` | unset | Which configured Ticket source discovers this pool's work: `linear` or `local`. Absent means the pool has **no** Ticket source and is reachable only by an explicit `--pool`. |
-| `label` | unset | The Ticket label that routes a Ticket to this pool. Two pools declaring the same label is an error at load, naming both. |
+| `label` | unset | The Ticket label that routes a Ticket to this pool, which `jjfx dispatch --all` fans out over. A pool that declares none is reachable only by an explicit `--pool`. Two pools declaring the same label is an error at load, naming both. |
 | `ready_status` | the global value | The `Status:` value marking a Ticket ready for this pool, defaulting to the user-global value. |
 | `cap_usd` | unset | The pool's spend cap in US dollars, under the Repository-wide ceiling. Must be a positive, finite amount; absent means the ceiling is the only limit. |
 | `window` | the global value | The window the pool's cap totals over, defaulting to `spend.window`. |
@@ -572,6 +572,37 @@ Naming a pool the Repository does not hold is refused the same way. Worker
 reservation, Dispatch Eligibility and the pool's size are all evaluated against
 the selected pool, so `jjfx dispatch --pool bugs` fills `bugs` and leaves every
 other lane alone.
+
+### Routing a Ticket to its pool by label
+
+`--pool` on every Dispatch makes lanes capacity buckets a human has to route by
+hand, so a pool may declare the **label that routes to it**
+(`[pools.bugs] label = "bug"`). With one declared, `jjfx dispatch --all` fans out
+across the pools that declare a label, discovering each pool's ready work by its
+own label and dispatching each Ticket to the pool whose label it carries. The
+ready label is per pool - `--label` overrides the pool's declared label, which
+overrides the global `ready-for-agent` - because each pool's source may select
+work by a different label.
+
+Routing is by declaration, never by a magic `pool:<name>` string, so a lane can
+adopt a vocabulary the Repository already uses. A pool that declares no label is
+not routable: it is reachable only by an explicit `--pool`, and a Repository
+whose pools declare no labels keeps the unqualified refusal above rather than
+guessing.
+
+Two rules keep the convenience from becoming a silent choice:
+
+- **A Ticket that matches no pool is reported, not dropped.** A Ticket whose
+  labels no pool routes is named on stderr with what it carried, and in a
+  `--json` batch as a `skipped` entry, so an unroutable Ticket is never
+  indistinguishable from one that was never filed.
+- **An explicit `--pool` still wins, and still means "only this lane".** It
+  overrides label routing entirely rather than narrowing the fan-out.
+
+A local Ticket declares its labels with a `Labels:` line; one written before
+that line existed carries the ready label alone, so a Repository that never
+adopted labels discovers exactly the work it always did. See
+[local tickets](local-tickets.md).
 
 ### The verbs edit the declaration
 

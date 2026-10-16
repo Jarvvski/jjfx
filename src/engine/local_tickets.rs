@@ -1007,9 +1007,8 @@ mod tests {
             "01-untagged.md",
             "# Untagged\n\nStatus: ready-for-agent\n",
         );
-        let discovery = TicketDiscovery::new(
-            source(temporary.path()).with_ready_label("ready-for-agent"),
-        );
+        let discovery =
+            TicketDiscovery::new(source(temporary.path()).with_ready_label("ready-for-agent"));
         let bug = ReadyTicketFilter::new(
             "bug",
             TicketStatus::parse("ready-for-agent").expect("ready status"),

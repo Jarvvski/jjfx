@@ -252,7 +252,7 @@ mod tests {
                 AgentRuntime::Claude,
                 DEFAULT_READY_LABEL,
             )
-                .expect("query"),
+            .expect("query"),
         );
         let filter = ReadyTicketFilter::new(
             "ready-for-agent",
