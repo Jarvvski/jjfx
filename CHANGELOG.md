@@ -47,6 +47,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - A Run finalized by reconciliation now appends its Run Record - exactly once - and an opencode Run records the cost and tokens its own event log reports, so `jjfx status` shows real spend instead of `$0.0000 across 0 Run(s)`.
 - jjfx dispatch works in a repository with no `main` bookmark - a Worker Workspace bases on `main` (then `master`, then the default Workspace's working copy) instead of failing - and a repository with no `origin` remote fails naming the fix (`jj git remote add origin <url>`, or the pool's `gh_repo`) instead of a bare owner/name format error about an empty slug.
 - A finished Worker's local Ticket is now resolved from the durable Run Record store rather than live Worker state, so a linear dependency chain no longer deadlocks at claimed: Dispatch reconciles before it discovers ready work, jjfx status and jjfx pool list reconcile on read, and jjfx ticket reconcile resolves finished Tickets on demand with no Dispatch and no ready Ticket.
+- jjfx dispatch exits non-zero when every Ticket failed, so a scripting caller can tell an all-failed batch from a successful one; a batch with a dispatched Ticket, or one deliberately held back under a cap, still exits zero, and the summary line now counts only Tickets actually dispatched.
 
 ## [0.55.0] - 2026-10-16
 

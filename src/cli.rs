@@ -1920,8 +1920,9 @@ fn dispatch_command(
             })
             .collect::<Result<Vec<_>>>()?;
         let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-        render_dispatch_result(&result, requests.len(), true, args.json);
+        let entries = render_dispatch_result(&result, requests.len(), true, args.json);
         write_back_local_tickets(repository, &tickets);
+        ensure_dispatch_progressed(&entries)?;
         return Ok(());
     }
 
@@ -1944,8 +1945,9 @@ fn dispatch_command(
         })
         .collect::<Result<Vec<_>>>()?;
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-    render_dispatch_result(&result, requests.len(), false, args.json);
+    let entries = render_dispatch_result(&result, requests.len(), false, args.json);
     write_back_local_tickets(repository, &tickets);
+    ensure_dispatch_progressed(&entries)?;
     Ok(())
 }
 
@@ -1973,7 +1975,8 @@ fn dispatch_adhoc_ticket(
     }
     let requests = [request];
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-    render_dispatch_result(&result, requests.len(), false, args.json);
+    let entries = render_dispatch_result(&result, requests.len(), false, args.json);
+    ensure_dispatch_progressed(&entries)?;
     Ok(())
 }
 
@@ -2103,12 +2106,14 @@ fn confirm_growth(shortage: CapacityShortage) -> bool {
     !input.trim().eq_ignore_ascii_case("n") && !input.trim().eq_ignore_ascii_case("no")
 }
 
+/// Renders one Dispatch batch and returns the shared model the caller inspects
+/// to decide the exit code.
 fn render_dispatch_result(
     result: &crate::engine::DirectDispatchResult,
     requested: usize,
     all: bool,
     json: bool,
-) {
+) -> Vec<DispatchEntry> {
     let entries: Vec<DispatchEntry> = result
         .outcomes()
         .iter()
@@ -2116,22 +2121,46 @@ fn render_dispatch_result(
         .collect();
     render_dispatch_entries(&entries, json);
     if json {
-        return;
+        return entries;
     }
-    let fired = entries.iter().filter(|entry| entry.attempted()).count();
+    let dispatched = entries.iter().filter(|entry| entry.dispatched()).count();
+    let failed = entries.iter().filter(|entry| entry.failed()).count();
     if result.is_partial() {
-        if fired == 0 && !all {
+        if dispatched == 0 && !all {
             eprintln!("No idle workers. Run: {PROGRAM} pool list");
         } else {
-            eprintln!("No more idle workers. Dispatched {fired}/{requested} ticket(s).");
+            eprintln!("No more idle workers. Dispatched {dispatched}/{requested} ticket(s).");
         }
     } else if all {
-        eprintln!("Dispatched {fired} ticket(s)");
+        eprintln!("Dispatched {dispatched} ticket(s)");
+    }
+    if failed > 0 {
+        eprintln!("{failed} ticket(s) failed to dispatch.");
     }
     let held = result.waiting().len();
     if held > 0 {
         eprintln!("Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes.");
     }
+    entries
+}
+
+/// Turns an all-failed Dispatch batch into an error, so a scripting caller can
+/// tell "nothing happened" from "it worked".
+///
+/// A batch where every Ticket failed exits non-zero. A batch with at least one
+/// dispatched Ticket, or one deliberately held back under a cap, is still a
+/// success: some of the work was done or queued. An empty batch is left alone -
+/// it is "nothing was requested", not "everything failed".
+fn ensure_dispatch_progressed(entries: &[DispatchEntry]) -> Result<()> {
+    if entries.is_empty() || entries.iter().any(DispatchEntry::progressed) {
+        return Ok(());
+    }
+    let tickets = entries
+        .iter()
+        .map(DispatchEntry::ticket)
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("every Ticket failed to dispatch: {tickets}")
 }
 
 /// The result for one Ticket in a Dispatch, the shared model both the prose and
@@ -2259,10 +2288,21 @@ impl DispatchEntry {
         }
     }
 
-    /// Whether Dispatch attempted this Ticket (launched or failed), as opposed
-    /// to holding it back.
-    const fn attempted(&self) -> bool {
-        matches!(self, Self::Dispatched { .. } | Self::Failed { .. })
+    /// Whether the Ticket was launched on a Worker.
+    const fn dispatched(&self) -> bool {
+        matches!(self, Self::Dispatched { .. })
+    }
+
+    /// Whether the Ticket failed before a usable Run was launched.
+    const fn failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    /// Whether this outcome means the Dispatch did something: launched a Run,
+    /// held a Ticket back under a cap, or handed a Parent to the Orchestrator.
+    /// Only a failed Ticket did not.
+    const fn progressed(&self) -> bool {
+        !self.failed()
     }
 }
 
@@ -3674,6 +3714,50 @@ mod tests {
                 "  ENG-403 waiting: waiting for capacity\n",
             )
         );
+    }
+
+    fn failed_entry(ticket: &str) -> DispatchEntry {
+        DispatchEntry::Failed {
+            ticket: ticket.to_owned(),
+            worker: None,
+            phase: DirectDispatchFailurePhase::Workspace,
+            detail: "cannot prepare Workspace".to_owned(),
+        }
+    }
+
+    fn dispatched_entry() -> DispatchEntry {
+        DispatchEntry::Dispatched {
+            ticket: "ENG-1".to_owned(),
+            worker: "worker-01".to_owned(),
+            pid: Some(4242),
+            detail: "PID 4242".to_owned(),
+        }
+    }
+
+    fn waiting_entry() -> DispatchEntry {
+        DispatchEntry::Waiting {
+            ticket: "ENG-2".to_owned(),
+            detail: "concurrency cap 1 reached (1 Run(s) in flight)".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_all_failed_dispatch_is_an_error_but_a_dispatched_or_held_batch_is_not() {
+        // Nothing requested is not "everything failed".
+        assert!(ensure_dispatch_progressed(&[]).is_ok());
+
+        // One dispatched or deliberately held-back Ticket is a success.
+        assert!(ensure_dispatch_progressed(&[dispatched_entry()]).is_ok());
+        assert!(ensure_dispatch_progressed(&[waiting_entry()]).is_ok());
+        assert!(ensure_dispatch_progressed(&[failed_entry("ENG-1"), waiting_entry()]).is_ok());
+
+        // Every Ticket failing is the case a scripting caller must be able to
+        // tell apart from success, and the message names the Tickets.
+        let error = ensure_dispatch_progressed(&[failed_entry("ENG-1"), failed_entry("ENG-2")])
+            .expect_err("every Ticket failed");
+        let message = error.to_string();
+        assert!(message.contains("ENG-1"), "{message}");
+        assert!(message.contains("ENG-2"), "{message}");
     }
 
     #[test]
