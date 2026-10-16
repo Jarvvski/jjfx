@@ -34,6 +34,7 @@ mod watchdog;
 mod worker_actions;
 mod workspace;
 
+pub(crate) use atomic::write_atomic_bytes;
 pub use cost::{PoolCost, PoolCostSnapshot, SpendCap, SpendCapMode, SpendDecision, SpendWindow};
 pub use direct_dispatch::{
     DirectDispatch, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,

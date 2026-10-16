@@ -31,21 +31,24 @@ const fn version_string(development: bool) -> &'static str {
 
 use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
-    ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
-    RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
+    ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS, POOL_DESTROY_FLAGS, POOL_LIST_FLAGS,
+    POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS,
+    STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
-use crate::config::{MigrationsConfig, SpendConfig, TicketSource, TicketsConfig};
+use crate::config::{
+    Config, MigrationsConfig, PoolConfig, SpendConfig, TicketSource, TicketsConfig,
+};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
-    DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
+    DEFAULT_POOL_NAME, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailurePhase,
     DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchSuccess, DispatchBudget,
     DispatchDependencyContext, DispatchExclusions, FollowUpExecution, FollowUpOutcome, Loaded,
-    OrchestrationEvent, PoolCapacity, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, Repository,
-    ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode, StuckWindow, SyncAction,
-    TerminalSettings, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
-    TrunkDrift, UndoOutcome, WireAgent, WorkerActions, WorkerId, WorkerPoolError,
-    WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream,
-    dependency_basis, resolve_ticket_branch,
+    OrchestrationEvent, PoolCapacity, PoolName, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter,
+    Repository, ReviewLoop, RunActivity, RunActivityKind, RunLogError, RunMode, SpendCapMode,
+    SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails, TicketDiscovery,
+    TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent, WorkerActions,
+    WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
+    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -231,11 +234,21 @@ impl WaitCondition {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum PoolCommand {
+    /// `pool <N>` / `pool resize <N>`: size the `default` pool, or the named one
+    /// `--pool` selects.
     Resize {
         size: String,
+        pool: Option<String>,
     },
     List {
         json: bool,
+    },
+    /// `pool create <name>`: write a `[pools.<name>]` declaration.
+    Create(PoolCreateArgs),
+    /// `pool destroy [<name>]`: remove a `[pools.<name>]` declaration. No name
+    /// means `default`, which is refused.
+    Destroy {
+        name: Option<String>,
     },
     Remove {
         worker: String,
@@ -248,8 +261,86 @@ pub enum PoolCommand {
         provider: Option<String>,
         model: Option<String>,
     },
-    Destroy,
     Help,
+}
+
+/// The declaration `pool create` writes, as parsed from the command line.
+///
+/// The fields mirror the `[pools.<name>]` keys one for one; each is optional, so
+/// a bare `pool create bugs` writes a bare `[pools.bugs]` and the Repository
+/// default applies. Values that name a profile, a source or a cap are kept as
+/// the raw strings the parser read and validated into the declaration.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct PoolCreateArgs {
+    pub name: String,
+    pub size: Option<String>,
+    pub profile: Option<String>,
+    pub source: Option<String>,
+    pub label: Option<String>,
+    pub ready_status: Option<String>,
+    pub cap_usd: Option<String>,
+    pub window: Option<String>,
+    pub on_exceed: Option<String>,
+}
+
+impl PoolCreateArgs {
+    /// The declaration this parses to, rejecting a value the config could not
+    /// hold so the failure happens here rather than in the written file.
+    fn declaration(&self) -> Result<PoolConfig> {
+        Ok(PoolConfig {
+            size: self.size.as_deref().map(parse_pool_size).transpose()?,
+            profile: self.profile.clone(),
+            source: self
+                .source
+                .as_deref()
+                .map(|value| {
+                    TicketSource::parse(value).ok_or_else(|| {
+                        anyhow::anyhow!("unknown Ticket source: {value} (expected linear or local)")
+                    })
+                })
+                .transpose()?,
+            label: self.label.clone(),
+            ready_status: self.ready_status.clone(),
+            cap_usd: self.cap_usd.as_deref().map(parse_cap_usd).transpose()?,
+            window: self
+                .window
+                .as_deref()
+                .map(|value| {
+                    SpendWindow::parse(value).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown spend window: {value} (expected today, week or total)"
+                        )
+                    })
+                })
+                .transpose()?,
+            on_exceed: self
+                .on_exceed
+                .as_deref()
+                .map(|value| {
+                    SpendCapMode::parse(value).ok_or_else(|| {
+                        anyhow::anyhow!("unknown spend mode: {value} (expected block or warn)")
+                    })
+                })
+                .transpose()?,
+        })
+    }
+}
+
+/// Parse a pool size, rejecting one the persisted size cannot hold.
+fn parse_pool_size(value: &str) -> Result<usize> {
+    let size = value
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("Invalid pool size: {value}"))?;
+    PoolCapacity::new(size)?;
+    Ok(size)
+}
+
+/// Parse a `--cap-usd` value. The positivity and finiteness rules are the
+/// config's, so a bad value is rejected by the write's own validation.
+fn parse_cap_usd(value: &str) -> Result<f64> {
+    value
+        .parse::<f64>()
+        .map_err(|_| anyhow::anyhow!("Invalid spend cap: {value}"))
 }
 
 pub fn parse(args: &[String]) -> Result<Command> {
@@ -629,7 +720,7 @@ fn parse_pool(args: &[String]) -> Result<Command> {
     };
     match subcommand {
         "list" | "ls" | "status" => parse_pool_list(&args[1..]),
-        "destroy" => Ok(PoolCommand::Destroy.into()),
+        "destroy" => parse_pool_destroy(&args[1..]),
         "help" | "-h" | "--help" => Ok(PoolCommand::Help.into()),
         "rm" | "remove" => parse_single(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " pool rm <worker>"),
@@ -642,10 +733,77 @@ fn parse_pool(args: &[String]) -> Result<Command> {
         )
         .map(|worker| PoolCommand::Reset { worker }.into()),
         "profile" => parse_pool_profile(&args[1..]),
-        "create" | "c" | "resize" | "r" => parse_pool_size(&args[1..]),
-        value if value.parse::<i64>().is_ok() => parse_pool_size(args),
+        "create" | "c" => parse_pool_create(&args[1..]),
+        "resize" | "r" => parse_pool_resize(&args[1..]),
+        value if value.parse::<i64>().is_ok() => parse_pool_resize(args),
         unknown => bail!("Unknown pool command: {unknown}"),
     }
+}
+
+/// Parse `pool destroy [<name>]`. No name targets `default`, which the verb
+/// refuses with its reason.
+fn parse_pool_destroy(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("pool destroy", POOL_DESTROY_FLAGS, args)?;
+    let name = match args.first() {
+        Some(name) if !name.starts_with('-') => Some(name.clone()),
+        _ => None,
+    };
+    if args.iter().filter(|value| !value.starts_with('-')).count() > 1 {
+        bail!(concat!(
+            "Usage: ",
+            env!("CARGO_PKG_NAME"),
+            " pool destroy [<name>]"
+        ));
+    }
+    Ok(PoolCommand::Destroy { name }.into())
+}
+
+/// Parse `pool create <name> [--size N] [declaration flags]`.
+fn parse_pool_create(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("pool create", POOL_CREATE_FLAGS, args)?;
+    let usage = concat!(
+        "Usage: ",
+        env!("CARGO_PKG_NAME"),
+        " pool create <name> [--size N] [--profile NAME] [--source linear|local] \
+         [--label LABEL] [--ready-status STATUS] [--cap-usd USD] [--window WINDOW] \
+         [--on-exceed block|warn]"
+    );
+    let mut create = PoolCreateArgs::default();
+    let mut index = 0;
+    while index < args.len() {
+        let argument = args[index].as_str();
+        let destination = match argument {
+            "--size" | "-s" => &mut create.size,
+            "--profile" => &mut create.profile,
+            "--source" => &mut create.source,
+            "--label" => &mut create.label,
+            "--ready-status" => &mut create.ready_status,
+            "--cap-usd" => &mut create.cap_usd,
+            "--window" => &mut create.window,
+            "--on-exceed" => &mut create.on_exceed,
+            value if !value.starts_with('-') && create.name.is_empty() => {
+                create.name = value.to_owned();
+                index += 1;
+                continue;
+            }
+            value if value.starts_with('-') => {
+                bail!("unknown option for pool create: {value}");
+            }
+            value => bail!("unexpected argument for pool create: {value}"),
+        };
+        let value = args
+            .get(index + 1)
+            .filter(|value| !value.starts_with('-'))
+            .ok_or_else(|| anyhow::anyhow!("missing value for {argument}"))?;
+        if destination.replace(value.clone()).is_some() {
+            bail!("duplicate option for pool create: {argument}");
+        }
+        index += 2;
+    }
+    if create.name.is_empty() {
+        bail!(usage);
+    }
+    Ok(PoolCommand::Create(create).into())
 }
 
 fn parse_pool_profile(args: &[String]) -> Result<Command> {
@@ -685,14 +843,19 @@ fn parse_pool_profile(args: &[String]) -> Result<Command> {
     .into())
 }
 
-fn parse_pool_size(args: &[String]) -> Result<Command> {
+fn parse_pool_resize(args: &[String]) -> Result<Command> {
     reject_unknown_flags("pool resize", POOL_RESIZE_FLAGS, args)?;
     let mut size = None;
+    let mut pool = None;
     let mut index = 0;
     while index < args.len() {
         match args[index].as_str() {
             "--size" | "-s" => {
                 size = args.get(index + 1).cloned();
+                index += 2;
+            }
+            "--pool" => {
+                pool = args.get(index + 1).cloned();
                 index += 2;
             }
             value if !value.starts_with('-') => {
@@ -706,10 +869,10 @@ fn parse_pool_size(args: &[String]) -> Result<Command> {
         anyhow::anyhow!(concat!(
             "Usage: ",
             env!("CARGO_PKG_NAME"),
-            " pool resize <N>"
+            " pool resize <N> [--pool <name>]"
         ))
     })?;
-    Ok(PoolCommand::Resize { size }.into())
+    Ok(PoolCommand::Resize { size, pool }.into())
 }
 
 fn parse_single(usage: &str, args: &[String]) -> Result<String> {
@@ -1375,8 +1538,12 @@ fn clean_command(repository: &Repository) -> Result<()> {
 
 fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
     match command {
-        PoolCommand::Resize { size } => resize_pool_command(repository, &size),
+        PoolCommand::Resize { size, pool } => {
+            resize_pool_command(repository, &size, pool.as_deref())
+        }
         PoolCommand::List { json } => pool_list_command(repository, json),
+        PoolCommand::Create(args) => create_pool_command(repository, &args),
+        PoolCommand::Destroy { name } => destroy_pool_command(repository, name.as_deref()),
         PoolCommand::Remove { worker } => remove_worker_command(repository, &worker),
         PoolCommand::Reset { worker } => reset_worker_command(repository, &worker),
         PoolCommand::Profile {
@@ -1384,12 +1551,60 @@ fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
             provider,
             model,
         } => pool_profile_command(repository, &runtime, provider.as_deref(), model.as_deref()),
-        PoolCommand::Destroy => destroy_pool_command(repository),
         PoolCommand::Help => {
             print!("{}", crate::cli_help::text(Some("pool"))?);
             Ok(())
         }
     }
+}
+
+/// The repository-local config file a lifecycle verb edits, for its message.
+fn repo_config_display(repository: &Repository) -> String {
+    crate::config::repo_config_path(repository.root())
+        .display()
+        .to_string()
+}
+
+/// `pool create <name>`: write a `[pools.<name>]` declaration.
+fn create_pool_command(repository: &Repository, args: &PoolCreateArgs) -> Result<()> {
+    create_pool(repository, args, &crate::config::load()?)
+}
+
+/// The declaration write, with the user-global config handed in so a test can
+/// drive it without reading the developer's own config.
+///
+/// The declaration is the source of truth (ADR 0014), so creating a pool is
+/// writing the section - no parallel state, and nothing to reconcile. A pool
+/// that is already declared is refused rather than silently replaced, so a typo
+/// cannot clobber a lane's settings.
+fn create_pool(repository: &Repository, args: &PoolCreateArgs, user: &Config) -> Result<()> {
+    // `pool create <N>` used to be a synonym for `pool <N>`. It now names a pool,
+    // so a numeric argument would silently mean something else; refuse it and
+    // name the sizing verb instead. A pool genuinely called `3` is hand-declared.
+    if args.name.trim().parse::<i64>().is_ok() {
+        bail!(
+            "`{}` is a size, not a pool name; `{PROGRAM} pool {}` sizes `default`, and \
+             `{PROGRAM} pool resize {} --pool <name>` sizes a named pool",
+            args.name.trim(),
+            args.name.trim(),
+            args.name.trim()
+        );
+    }
+    let name = PoolName::parse(args.name.trim()).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let existing = user.repo_config(repository.root())?;
+    if existing.pools.contains_key(name.as_str()) {
+        bail!(
+            "pool `{name}` is already declared in {}",
+            repo_config_display(repository)
+        );
+    }
+    let declaration = args.declaration()?;
+    crate::config::declare_pool(repository.root(), name.as_str(), &declaration, user)?;
+    eprintln!(
+        "Declared pool `{name}` in {}",
+        repo_config_display(repository)
+    );
+    Ok(())
 }
 
 fn pool_profile_command(
@@ -1443,10 +1658,24 @@ fn render_profile(profile: &AgentRuntimeProfile) -> String {
     }
 }
 
-fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
+/// `pool <N>` / `pool resize <N>`: size a pool.
+///
+/// `default` (the bare form, or an explicit `--pool default`) is sized exactly
+/// as before - its Workers are provisioned and detached against its state. A
+/// named pool is sized in its *declaration*, because that is the source of
+/// truth; its state materialises when the pool is first used.
+fn resize_pool_command(repository: &Repository, value: &str, pool: Option<&str>) -> Result<()> {
     let size = value
         .parse::<usize>()
         .map_err(|_| anyhow::anyhow!("Invalid pool size: {value}"))?;
+    match pool {
+        None | Some(DEFAULT_POOL_NAME) => resize_default_pool(repository, size),
+        Some(name) => resize_declared_pool(repository, name, size, &crate::config::load()?),
+    }
+}
+
+/// Resize the implicit `default` pool's state, exactly as `pool <N>` always has.
+fn resize_default_pool(repository: &Repository, size: usize) -> Result<()> {
     let capacity = PoolCapacity::new(size)?;
     let before = repository
         .worker_pool()
@@ -1472,6 +1701,41 @@ fn resize_pool_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Resize a declared pool by editing its `[pools.<name>] size`.
+fn resize_declared_pool(
+    repository: &Repository,
+    name: &str,
+    size: usize,
+    user: &Config,
+) -> Result<()> {
+    let existing = user.repo_config(repository.root())?;
+    if !existing.pools.contains_key(name) {
+        bail!(
+            "no pool `{name}` is declared in {}; create it with `{PROGRAM} pool create {name}`",
+            repo_config_display(repository)
+        );
+    }
+    crate::config::set_pool_size(repository.root(), name, size, user)?;
+    eprintln!(
+        "Pool `{name}` size set to {size} in {}",
+        repo_config_display(repository)
+    );
+    Ok(())
+}
+
+/// One Worker Pool as `pool list` reports it.
+struct PoolSummary {
+    /// The pool's name. `default` is always present.
+    name: String,
+    /// Whether the pool exists only implicitly - `default` when no declaration
+    /// names it. Every named pool is declared, so this is `false` for them.
+    implicit: bool,
+    /// The pool's size: its materialised state's, else its declared size.
+    size: Option<u64>,
+    /// The pool's materialised Worker count, when its state exists.
+    workers: Option<usize>,
+}
+
 fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     warn_when_behind_trunk(repository);
     let config = crate::config::load()?;
@@ -1482,19 +1746,29 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     let tickets = config.tickets_for(repository.root())?;
     let (snapshot, failures) = reconcile_pass(repository, &tickets);
     report_writeback_failures(&failures);
-    let pool = snapshot
-        .pool()
-        .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool <N>"))?;
+    let repo_config = config.repo_config(repository.root())?;
+    // A Repository that neither declares a pool nor has any state is the
+    // pre-pools shape: keep the old "no pool yet" guidance unchanged. Once a
+    // pool is declared, listing the pools is the useful answer even when
+    // `default` has no Workers yet.
+    if snapshot.pool().is_none() && repo_config.pools.is_empty() {
+        bail!("No pool. Run: {PROGRAM} pool <N>");
+    }
+    let pools = pool_summaries(&repo_config, &snapshot);
     // The watchdog's window is jjfx's own setting, read here rather than passed
     // down: `pool list` is the only CLI command that surfaces Run health, and
     // `cli::run` is already at the argument limit.
     let watchdog = config.watchdog.stuck_window();
     let now = Timestamp::now();
     if json {
-        return pool_list_json(&snapshot, now, watchdog);
+        return pool_list_json(&snapshot, &pools, now, watchdog);
     }
     for diagnostic in snapshot.diagnostics() {
         eprintln!("{}", diagnostic.message());
+    }
+    render_pool_summaries(&pools);
+    if snapshot.pool().is_none() {
+        return Ok(());
     }
     println!(
         "{:<10} {:<12} {:<10} {:<14} {:<11} ELAPSED",
@@ -1553,7 +1827,7 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
         }
     }
     println!();
-    if let Some(profile) = pool.profile() {
+    if let Some(profile) = snapshot.pool().and_then(|pool| pool.profile()) {
         println!("Profile: {}", render_profile(profile));
     }
     let stuck = if stuck > 0 {
@@ -1561,20 +1835,72 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     } else {
         String::new()
     };
+    let size = snapshot.pool().map_or(0, |pool| pool.size());
     println!(
         "Pool: {} idle, {} busy{}, {} done, {} failed ({} total)",
-        counts[0],
-        counts[1],
-        stuck,
-        counts[2],
-        counts[3],
-        pool.size()
+        counts[0], counts[1], stuck, counts[2], counts[3], size
     );
     println!("{}", spend_summary(&snapshot));
     if !snapshot.waiting().is_empty() {
         println!("Waiting: {}", snapshot.waiting().join(", "));
     }
     Ok(())
+}
+
+/// Every pool the Repository holds, `default` first.
+///
+/// The set is the declared pools plus `default`, which always exists: a
+/// Repository that declares nothing still has one implicit `default` pool. A
+/// named pool's size is its declaration's (its state materialises on first
+/// use); `default`'s is its state's, falling back to a declaration when one
+/// names it.
+fn pool_summaries(
+    repo_config: &crate::config::RepoConfig,
+    snapshot: &crate::engine::WorkerPoolSnapshot,
+) -> Vec<PoolSummary> {
+    let declared_default = repo_config.pools.get(DEFAULT_POOL_NAME);
+    let mut pools = vec![PoolSummary {
+        name: DEFAULT_POOL_NAME.to_owned(),
+        implicit: declared_default.is_none(),
+        size: snapshot
+            .pool()
+            .and_then(|pool| u64::try_from(pool.size()).ok())
+            .or_else(|| {
+                declared_default
+                    .and_then(|pool| pool.size)
+                    .map(|size| size as u64)
+            }),
+        workers: snapshot.pool().map(|_| snapshot.workers().len()),
+    }];
+    for (name, pool) in &repo_config.pools {
+        if name == DEFAULT_POOL_NAME {
+            continue;
+        }
+        pools.push(PoolSummary {
+            name: name.clone(),
+            implicit: false,
+            size: pool.size.map(|size| size as u64),
+            workers: None,
+        });
+    }
+    pools
+}
+
+/// The `Pools:` table: every pool, its size, and whether a declaration names it.
+fn render_pool_summaries(pools: &[PoolSummary]) {
+    println!("Pools:");
+    println!("{:<12} {:<6} {:<8} DECLARED", "POOL", "SIZE", "WORKERS");
+    for pool in pools {
+        let size = pool
+            .size
+            .map_or_else(|| "-".to_owned(), |size| size.to_string());
+        let workers = pool
+            .workers
+            .map_or_else(|| "-".to_owned(), |workers| workers.to_string());
+        let declared = if pool.implicit { "no" } else { "yes" };
+        println!("{:<12} {:<6} {:<8} {declared}", pool.name, size, workers);
+    }
+    println!();
 }
 
 /// One Worker's recorded spend, or `-` when it recorded no Run.
@@ -1615,22 +1941,26 @@ fn short_worker_id(worker_id: &str) -> &str {
 /// Machine-readable Pool status, including the failure fields the table omits.
 fn pool_list_json(
     snapshot: &crate::engine::WorkerPoolSnapshot,
+    pools: &[PoolSummary],
     now: Timestamp,
     watchdog: StuckWindow,
 ) -> Result<()> {
-    println!("{}", pool_list_json_string(snapshot, now, watchdog));
+    println!("{}", pool_list_json_string(snapshot, pools, now, watchdog));
     Ok(())
 }
 
-/// The Pool status JSON document: `{"workers": [ ... ], "waiting": [ ... ]}`.
+/// The Pool status JSON document:
+/// `{"workers": [ ... ], "waiting": [ ... ], "pools": [ ... ]}`.
 ///
 /// A top-level object rather than the bare Worker array: the human table prints
 /// state that is not per-Worker (the `Waiting:` line), and a bare array has
 /// nowhere to put it. The wrapper is the seam for that state and for the next
 /// line the table grows, so the JSON can always carry what the table prints.
-/// Encoded by hand so the emitted field order is fixed.
+/// `pools` names every pool the Repository holds, including an implicit
+/// `default`. Encoded by hand so the emitted field order is fixed.
 fn pool_list_json_string(
     snapshot: &crate::engine::WorkerPoolSnapshot,
+    pools: &[PoolSummary],
     now: Timestamp,
     watchdog: StuckWindow,
 ) -> String {
@@ -1654,7 +1984,47 @@ fn pool_list_json_string(
         }
         out.push_str(&json_string(ticket));
     }
-    out.push_str("]\n}");
+    out.push_str("],\n");
+    out.push_str("  \"pools\": [");
+    for (index, pool) in pools.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str("\n    ");
+        out.push_str(&pool_summary_json(pool));
+    }
+    if pools.is_empty() {
+        out.push_str("]\n}");
+    } else {
+        out.push_str("\n  ]\n}");
+    }
+    out
+}
+
+/// One pool's JSON object, the shape `status --json` emits per pool.
+fn pool_summary_json(pool: &PoolSummary) -> String {
+    let fields = [
+        ("name", json_string(&pool.name)),
+        (
+            "size",
+            pool.size
+                .map_or_else(|| "null".to_owned(), |size| size.to_string()),
+        ),
+        (
+            "workers",
+            pool.workers
+                .map_or_else(|| "null".to_owned(), |workers| workers.to_string()),
+        ),
+        ("implicit", pool.implicit.to_string()),
+    ];
+    let mut out = String::from("{");
+    for (index, (key, value)) in fields.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&format!("\"{key}\": {value}"));
+    }
+    out.push('}');
     out
 }
 
@@ -1790,15 +2160,61 @@ fn seconds_display(elapsed: jiff::SignedDuration) -> String {
     format!("{}m {}s", seconds / 60, seconds % 60)
 }
 
-fn destroy_pool_command(repository: &Repository) -> Result<()> {
-    if repository.worker_pool().snapshot().is_missing() {
-        eprintln!("No pool to destroy");
-        return Ok(());
+/// `pool destroy [<name>]`: remove a pool's declaration.
+///
+/// Removal is an undeclaration (ADR 0014): the declaration is the source of
+/// truth, so removing the pool is removing its `[pools.<name>]` table. Draining
+/// a pool - refusing while a Worker is busy, enumerating undelivered branches,
+/// and removing the Workers' Workspaces - is the removal ticket's job and is
+/// deliberately not here.
+///
+/// `default` is not removable: a Repository always has at least one pool and
+/// `jjfx pool <N>` targets it forever. A Repository that wants only named lanes
+/// resizes `default` to zero instead, which is explicit and reversible.
+fn destroy_pool_command(repository: &Repository, name: Option<&str>) -> Result<()> {
+    let name = name.unwrap_or(DEFAULT_POOL_NAME);
+    if name == DEFAULT_POOL_NAME {
+        bail!(
+            "the `default` pool cannot be removed: a Repository always has at least one pool, \
+             and `{PROGRAM} pool <N>` targets it. Resize it to zero instead: `{PROGRAM} pool 0`"
+        );
     }
-    repository
-        .worker_pool()
-        .destroy_with_progress(print_hook_output)?;
-    eprintln!("Pool destroyed");
+    destroy_pool(repository, name, &crate::config::load()?)
+}
+
+/// The undeclaration, with the user-global config handed in so a test can drive
+/// it without reading the developer's own config.
+fn destroy_pool(repository: &Repository, name: &str, user: &Config) -> Result<()> {
+    let pool = PoolName::parse(name).map_err(|error| anyhow::anyhow!("{error}"))?;
+    let existing = user.repo_config(repository.root())?;
+    if !existing.pools.contains_key(name) {
+        bail!(
+            "no pool `{name}` is declared in {}",
+            repo_config_display(repository)
+        );
+    }
+    crate::config::undeclare_pool(repository.root(), name, user)?;
+    eprintln!(
+        "Removed pool `{name}` from {}",
+        repo_config_display(repository)
+    );
+    // The declaration is gone, so any state directory left behind is an orphan.
+    // Report it rather than leave it silently; removing it is the removal
+    // ticket's job.
+    let declared: std::collections::BTreeSet<PoolName> = user
+        .repo_config(repository.root())?
+        .pools
+        .keys()
+        .filter_map(|name| PoolName::parse(name.clone()).ok())
+        .collect();
+    let orphaned = repository
+        .orphan_pool_directories(&declared)
+        .map_err(|error| anyhow::anyhow!("{error}"))?;
+    if orphaned.contains(&pool) {
+        eprintln!(
+            "warning: pool `{name}` still has state; its Workers and Workspaces are left in place"
+        );
+    }
     Ok(())
 }
 
@@ -3604,7 +4020,7 @@ _jjfx() {
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         ticket) _arguments '1:subcommand:(reconcile)' ;;
-        pool) _arguments '1:subcommand:(list resize rm reset profile destroy)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' ;;
+        pool) _arguments '1:subcommand:(list create destroy resize rm reset profile)' '2:runtime:(claude codex opencode)' '--provider[model provider]:provider:' '--model[model]:model:' '--pool[pool name]:name:' '--size[pool size]:N:' '--profile[Agent Runtime Profile]:name:' '--source[Ticket source]:(linear local)' '--label[routing label]:label:' '--ready-status[ready Status:]:status:' '--cap-usd[spend cap in USD]:dollars:' '--window[cap window]:(today week total)' '--on-exceed[cap mode]:(block warn)' ;;
         dispatch|d) _arguments '--fg[run in foreground]' '--bg[run in background]' '--all[dispatch all ready Tickets]' '--text[dispatch a one-off Ticket from text]:text:' '--from-file[dispatch a Ticket from a markdown file]:path:_files' '--id[Ticket id for ad-hoc input]:id:' '--no-orchestrate[skip orchestration]' '--json[print machine-readable results]' '--provider[model provider]:provider:' '--model[model]:model:' '--budget[maximum USD]:dollars:' '--label[label]:label:' '*:Ticket:' ;;
       esac
       ;;
@@ -3905,6 +4321,253 @@ mod tests {
         assert!(parse(&args(&["pool", "list", "--wat"])).is_err());
     }
 
+    #[test]
+    fn pool_create_parses_a_named_declaration() {
+        let command = parse(&args(&[
+            "pool",
+            "create",
+            "bugs",
+            "--size",
+            "2",
+            "--profile",
+            "fast",
+            "--source",
+            "local",
+            "--label",
+            "bug",
+            "--ready-status",
+            "ready-for-agent",
+            "--cap-usd",
+            "5.5",
+            "--window",
+            "week",
+            "--on-exceed",
+            "warn",
+        ]))
+        .expect("pool create parses");
+        assert_eq!(
+            command,
+            Command::Pool(PoolCommand::Create(PoolCreateArgs {
+                name: "bugs".to_owned(),
+                size: Some("2".to_owned()),
+                profile: Some("fast".to_owned()),
+                source: Some("local".to_owned()),
+                label: Some("bug".to_owned()),
+                ready_status: Some("ready-for-agent".to_owned()),
+                cap_usd: Some("5.5".to_owned()),
+                window: Some("week".to_owned()),
+                on_exceed: Some("warn".to_owned()),
+            }))
+        );
+        // `pool c` is the same verb, and a bare create is a bare declaration.
+        assert_eq!(
+            parse(&args(&["pool", "c", "features"])).unwrap(),
+            Command::Pool(PoolCommand::Create(PoolCreateArgs {
+                name: "features".to_owned(),
+                ..PoolCreateArgs::default()
+            }))
+        );
+    }
+
+    #[test]
+    fn pool_create_requires_a_name_and_rejects_unknown_options() {
+        assert!(parse(&args(&["pool", "create"])).is_err());
+        assert!(parse(&args(&["pool", "create", "--size", "2"])).is_err());
+        assert!(parse(&args(&["pool", "create", "bugs", "--size"])).is_err());
+        assert!(parse(&args(&["pool", "create", "bugs", "--wat"])).is_err());
+        assert!(parse(&args(&["pool", "create", "bugs", "extra"])).is_err());
+    }
+
+    #[test]
+    fn pool_destroy_parses_a_name_and_defaults_to_default() {
+        assert_eq!(
+            parse(&args(&["pool", "destroy"])).unwrap(),
+            Command::Pool(PoolCommand::Destroy { name: None })
+        );
+        assert_eq!(
+            parse(&args(&["pool", "destroy", "bugs"])).unwrap(),
+            Command::Pool(PoolCommand::Destroy {
+                name: Some("bugs".to_owned()),
+            })
+        );
+        assert!(parse(&args(&["pool", "destroy", "bugs", "extra"])).is_err());
+        assert!(parse(&args(&["pool", "destroy", "--wat"])).is_err());
+    }
+
+    #[test]
+    fn pool_resize_takes_an_optional_pool() {
+        for (arguments, pool) in [
+            (vec!["pool", "3"], None),
+            (vec!["pool", "resize", "3"], None),
+            (vec!["pool", "r", "3"], None),
+            (vec!["pool", "resize", "3", "--pool", "bugs"], Some("bugs")),
+            (vec!["pool", "r", "--pool", "bugs", "3"], Some("bugs")),
+        ] {
+            assert_eq!(
+                parse(&args(&arguments)).unwrap(),
+                Command::Pool(PoolCommand::Resize {
+                    size: "3".to_owned(),
+                    pool: pool.map(str::to_owned),
+                }),
+                "{arguments:?}"
+            );
+        }
+        assert!(parse(&args(&["pool", "resize"])).is_err());
+    }
+
+    /// A temporary Repository with a `.jj` marker and an optional
+    /// `.jjfx/config.toml`, for the pool lifecycle tests.
+    fn lifecycle_repo(config: Option<&str>) -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        std::fs::create_dir_all(repo.path().join(".jj")).expect("repository marker");
+        if let Some(text) = config {
+            let directory = repo.path().join(".jjfx");
+            std::fs::create_dir_all(&directory).expect("creating .jjfx");
+            std::fs::write(directory.join("config.toml"), text).expect("writing the config");
+        }
+        repo
+    }
+
+    /// The repository config text a lifecycle test wrote.
+    fn lifecycle_config(repository: &Repository) -> String {
+        std::fs::read_to_string(crate::config::repo_config_path(repository.root()))
+            .expect("the config file was written")
+    }
+
+    #[test]
+    fn create_pool_declares_the_pool_and_refuses_a_duplicate() {
+        let repo = lifecycle_repo(None);
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("[profiles.fast]\nruntime = \"claude\"\n")
+            .expect("user config");
+        let args = PoolCreateArgs {
+            name: "bugs".to_owned(),
+            size: Some("2".to_owned()),
+            profile: Some("fast".to_owned()),
+            ..PoolCreateArgs::default()
+        };
+        create_pool(&repository, &args, &user).expect("the pool is declared");
+
+        let text = lifecycle_config(&repository);
+        assert!(text.contains("[pools.bugs]"), "{text}");
+        assert!(text.contains("size = 2"), "{text}");
+        assert!(text.contains("profile = \"fast\""), "{text}");
+
+        // A second create of the same pool is refused rather than silently
+        // replacing a lane's settings.
+        let error = create_pool(&repository, &args, &user).expect_err("a duplicate is refused");
+        assert!(error.to_string().contains("bugs"), "{error}");
+    }
+
+    /// `pool create <N>` used to be a synonym for `pool <N>`, so a numeric name
+    /// must fail loudly rather than silently declare a pool called `3`.
+    #[test]
+    fn create_pool_refuses_a_numeric_name_that_used_to_mean_resize() {
+        let repo = lifecycle_repo(None);
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+        let args = PoolCreateArgs {
+            name: "3".to_owned(),
+            ..PoolCreateArgs::default()
+        };
+        let error = create_pool(&repository, &args, &user).expect_err("a numeric name is refused");
+        assert!(error.to_string().contains("pool 3"), "{error}");
+        assert!(
+            !crate::config::repo_config_path(repository.root()).exists(),
+            "the refusal writes nothing"
+        );
+    }
+
+    #[test]
+    fn destroy_pool_removes_the_declaration_but_never_default() {
+        let repo = lifecycle_repo(Some("[pools.bugs]\nsize = 2\n"));
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+
+        // `default` is not removable, and both spellings say why.
+        let error =
+            destroy_pool_command(&repository, Some("default")).expect_err("default is refused");
+        let message = error.to_string();
+        assert!(message.contains("default"), "{message}");
+        assert!(message.contains("Resize"), "{message}");
+        let bare =
+            destroy_pool_command(&repository, None).expect_err("a bare destroy targets default");
+        assert!(bare.to_string().contains("default"), "{bare}");
+
+        // The declaration was the file's only content, so removing it leaves no
+        // empty file behind.
+        destroy_pool(&repository, "bugs", &user).expect("the pool is removed");
+        assert!(
+            !crate::config::repo_config_path(repository.root()).exists(),
+            "the emptied config file is gone"
+        );
+
+        // Removing a pool that is not declared names it.
+        let error = destroy_pool(&repository, "ghost", &user).expect_err("no such pool");
+        assert!(error.to_string().contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn resizing_a_named_pool_edits_its_declaration() {
+        let repo = lifecycle_repo(Some("[pools.bugs]\nsize = 2\nlabel = \"bug\"\n"));
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+
+        resize_declared_pool(&repository, "bugs", 5, &user).expect("the size is set");
+        let text = lifecycle_config(&repository);
+        assert!(text.contains("size = 5"), "{text}");
+        assert!(text.contains("label = \"bug\""), "{text}");
+
+        let error = resize_declared_pool(&repository, "ghost", 5, &user)
+            .expect_err("an undeclared pool is refused");
+        assert!(error.to_string().contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn pool_summaries_name_every_pool_including_an_implicit_default() {
+        let repo = lifecycle_repo(Some("[pools.bugs]\nsize = 2\n"));
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+        let repo_config = user
+            .repo_config(repository.root())
+            .expect("the config parses");
+        let snapshot = repository.read_worker_pool_snapshot();
+
+        let pools = pool_summaries(&repo_config, &snapshot);
+        assert_eq!(pools.len(), 2, "`default` plus the declared pool");
+        assert_eq!(pools[0].name, DEFAULT_POOL_NAME);
+        assert!(pools[0].implicit, "nothing declares `default`");
+        assert_eq!(pools[1].name, "bugs");
+        assert!(!pools[1].implicit);
+        assert_eq!(pools[1].size, Some(2));
+
+        // `pool list --json` names every pool too.
+        let json = pool_list_json_string(&snapshot, &pools, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["pools"][0]["name"], "default");
+        assert_eq!(value["pools"][0]["implicit"], true);
+        assert_eq!(value["pools"][1]["name"], "bugs");
+        assert_eq!(value["pools"][1]["size"], 2);
+        assert_eq!(value["pools"][1]["implicit"], false);
+    }
+
+    #[test]
+    fn a_declared_default_is_named_but_no_longer_implicit() {
+        let repo = lifecycle_repo(Some("[pools.default]\nprofile = \"fast\"\n"));
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("[profiles.fast]\nruntime = \"claude\"\n")
+            .expect("user config");
+        let repo_config = user
+            .repo_config(repository.root())
+            .expect("the config parses");
+        let snapshot = repository.read_worker_pool_snapshot();
+
+        let pools = pool_summaries(&repo_config, &snapshot);
+        assert_eq!(pools.len(), 1);
+        assert_eq!(pools[0].name, DEFAULT_POOL_NAME);
+        assert!(!pools[0].implicit, "a declaration names it");
+    }
+
     struct FailingQuery;
 
     impl TicketQuery for FailingQuery {
@@ -3998,7 +4661,7 @@ mod tests {
     #[test]
     fn status_json_carries_the_waiting_set() {
         let held = snapshot_with_waiting(&["AMBA-42", "AMBA-43"]);
-        let json = pool_list_json_string(&held, Timestamp::now(), StuckWindow::DEFAULT);
+        let json = pool_list_json_string(&held, &[], Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["waiting"], serde_json::json!(["AMBA-42", "AMBA-43"]));
         assert_eq!(value["workers"][0]["worker"], "worker-01");
@@ -4007,7 +4670,7 @@ mod tests {
     #[test]
     fn status_json_waiting_is_empty_without_a_capped_dispatch() {
         let idle = snapshot_with_waiting(&[]);
-        let json = pool_list_json_string(&idle, Timestamp::now(), StuckWindow::DEFAULT);
+        let json = pool_list_json_string(&idle, &[], Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["waiting"], serde_json::json!([]));
     }

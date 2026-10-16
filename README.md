@@ -92,7 +92,7 @@ The same binary carries the non-interactive command surface alongside the TUI:
 | Group | Commands |
 | --- | --- |
 | Workspaces | `add`, `rm`, `list`, `clean`, `root`, `where`, `path`, `refresh`, `sync`, `colocation` |
-| Pool | `pool <N>`, `pool list`, `pool rm`, `pool reset`, `pool profile`, `pool destroy` |
+| Pool | `pool <N>`, `pool create`, `pool destroy`, `pool resize`, `pool list`, `pool rm`, `pool reset`, `pool profile` |
 | Dispatch & sessions | `dispatch`, `send`, `review`, `logs`, `mount`, `rebase`, `absorb`, `open-pr` |
 | Lifecycle | `hooks install`, `hooks status` |
 
@@ -121,14 +121,18 @@ prints alongside the per-Worker rows:
       "cost_usd": null
     }
   ],
-  "waiting": ["AMBA-42"]
+  "waiting": ["AMBA-42"],
+  "pools": [
+    { "name": "default", "size": 1, "workers": 1, "implicit": true }
+  ]
 }
 ```
 
 `workers` holds one object per Worker (the fields the table shows, plus `stuck`,
 `exit_code`, `error` and `log_file`). `waiting` lists the Tickets a capped
-Dispatch held back, in input order, and is `[]` when nothing was held. Read it
-with `jq -r '.workers[] | ...'`.
+Dispatch held back, in input order, and is `[]` when nothing was held. `pools`
+names every pool the Repository holds, including an implicit `default` when no
+`[pools]` declaration names one. Read it with `jq -r '.workers[] | ...'`.
 
 ## Documentation
 

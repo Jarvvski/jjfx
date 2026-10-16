@@ -218,6 +218,26 @@ pub enum SpendWindow {
 }
 
 impl SpendWindow {
+    /// The spelling the config file uses, so a written declaration reads back
+    /// as the same window.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Today => "today",
+            Self::Week => "week",
+            Self::Total => "total",
+        }
+    }
+
+    /// The window a `--window` value names, or `None` when it names none.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "today" => Some(Self::Today),
+            "week" => Some(Self::Week),
+            "total" => Some(Self::Total),
+            _ => None,
+        }
+    }
+
     /// The window's total in a snapshot.
     fn cost(self, snapshot: &PoolCostSnapshot) -> PoolCost {
         match self {
@@ -246,6 +266,26 @@ pub enum SpendCapMode {
     Block,
     /// Allow Dispatch and report the overage.
     Warn,
+}
+
+impl SpendCapMode {
+    /// The spelling the config file uses, so a written declaration reads back
+    /// as the same mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Block => "block",
+            Self::Warn => "warn",
+        }
+    }
+
+    /// The mode an `--on-exceed` value names, or `None` when it names none.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "block" => Some(Self::Block),
+            "warn" => Some(Self::Warn),
+            _ => None,
+        }
+    }
 }
 
 /// An optional aggregate spend cap on Dispatch.

@@ -83,6 +83,12 @@ syntect = { version = "5.3", default-features = false, features = ["default-fanc
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 # jjfx's own config file (~/.config/jjfx/config.toml); parsed once at startup.
 toml = "0.8"
+# The lifecycle verbs (`pool create` / `pool destroy`) are the first thing that
+# *writes* a config file. `toml_edit` edits one table in place and keeps the
+# rest of the document - comments, key order, formatting - verbatim, which a
+# parse-then-serialise round trip would discard. Same version `toml` already
+# depends on, so it adds no new crate to the tree.
+toml_edit = "0.22"
 
 [lints.rust]
 unsafe_code = "forbid"

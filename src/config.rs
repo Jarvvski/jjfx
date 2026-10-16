@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
@@ -414,6 +415,26 @@ pub enum TicketSource {
     Linear,
     /// Discover from local markdown under the repository.
     Local,
+}
+
+impl TicketSource {
+    /// The spelling the config file uses, so a written declaration reads back
+    /// as the same source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Linear => "linear",
+            Self::Local => "local",
+        }
+    }
+
+    /// The source an `--source` value names, or `None` when it names none.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "linear" => Some(Self::Linear),
+            "local" => Some(Self::Local),
+            _ => None,
+        }
+    }
 }
 
 /// Settings for `source = "linear"`.
@@ -963,18 +984,190 @@ pub fn load_repo(repo_root: &Path, user: &Config) -> anyhow::Result<RepoConfig> 
             return Err(error).with_context(|| format!("reading config {}", path.display()));
         }
     };
-    let config: RepoConfig = toml::from_str(&text).with_context(|| {
-        format!(
-            "parsing config {} - a repository may set only [checks], [pools] and [tickets]; a \
-             pool and a [tickets] selection may select a user-global profile and Ticket source, \
-             never define one",
-            path.display()
-        )
-    })?;
+    let config: RepoConfig = toml::from_str(&text).with_context(|| repo_config_hint(&path))?;
     config
         .validate(user)
         .with_context(|| format!("validating config {}", path.display()))?;
     Ok(config)
+}
+
+/// The loud message reading and writing the repository config share when the
+/// file parses but is wrong, so the two cannot drift.
+fn repo_config_hint(path: &Path) -> String {
+    format!(
+        "parsing config {} - a repository may set only [checks], [pools] and [tickets]; a \
+         pool and a [tickets] selection may select a user-global profile and Ticket source, \
+         never define one",
+        path.display()
+    )
+}
+
+/// Add or replace one Worker Pool declaration in `<repo>/.jjfx/config.toml`.
+///
+/// The repository config is the source of truth for which Worker Pools exist
+/// (ADR 0014), so the lifecycle verbs edit it rather than keeping a parallel
+/// state. Only the `[pools.<name>]` table is rewritten: `toml_edit` keeps every
+/// other byte of the document - comments, key order and formatting - verbatim,
+/// which a parse-then-serialise round trip would discard.
+///
+/// The edited document is parsed and validated against `user` before it is
+/// written, so a declaration the reader would reject is never persisted, and the
+/// write itself is atomic.
+pub fn declare_pool(
+    repo_root: &Path,
+    name: &str,
+    declaration: &PoolConfig,
+    user: &Config,
+) -> anyhow::Result<()> {
+    let path = repo_config_path(repo_root);
+    let mut document = read_repo_document(&path)?;
+    if !document.contains_key("pools") {
+        // Implicit, so the first `[pools.<name>]` does not leave an empty
+        // `[pools]` header above it. Every entry is a sub-table, so nothing is
+        // ever written directly under `[pools]`.
+        let mut pools = toml_edit::Table::new();
+        pools.set_implicit(true);
+        document.insert("pools", toml_edit::Item::Table(pools));
+    }
+    let pools = document["pools"]
+        .as_table_mut()
+        .ok_or_else(|| anyhow::anyhow!("`pools` in {} is not a table", path.display()))?;
+    pools.insert(name, toml_edit::Item::Table(pool_table(declaration)));
+    write_repo_document(&path, &document, user)
+}
+
+/// Set one pool's declared size, leaving every other key of its declaration -
+/// and the rest of the file - untouched.
+pub fn set_pool_size(
+    repo_root: &Path,
+    name: &str,
+    size: usize,
+    user: &Config,
+) -> anyhow::Result<()> {
+    let path = repo_config_path(repo_root);
+    let mut document = read_repo_document(&path)?;
+    let pool = pool_table_mut(&mut document, name)
+        .ok_or_else(|| anyhow::anyhow!("no `[pools.{name}]` in {}", path.display()))?;
+    // Replace the value in place when the key is already there, so the key's own
+    // decoration - a comment above it, for one - is kept. Inserting afresh would
+    // rebuild the key and drop that decoration.
+    if pool.contains_key("size") {
+        if let Some(item) = pool.get_mut("size") {
+            *item = toml_edit::value(size as i64);
+        }
+    } else {
+        pool.insert("size", toml_edit::value(size as i64));
+    }
+    write_repo_document(&path, &document, user)
+}
+
+/// Remove one pool's declaration. Returns whether one was present.
+///
+/// Removing the last named pool takes the `[pools]` table with it, so a
+/// Repository that undeclares its last pool is back to one implicit `default`.
+pub fn undeclare_pool(repo_root: &Path, name: &str, user: &Config) -> anyhow::Result<bool> {
+    let path = repo_config_path(repo_root);
+    if !path.is_file() {
+        return Ok(false);
+    }
+    let mut document = read_repo_document(&path)?;
+    let Some(pools) = document
+        .get_mut("pools")
+        .and_then(toml_edit::Item::as_table_mut)
+    else {
+        return Ok(false);
+    };
+    let removed = pools.remove(name).is_some();
+    if pools.is_empty() {
+        document.remove("pools");
+    }
+    if removed {
+        // Removing the last declaration takes the file with it when nothing else
+        // is left, so create-then-destroy leaves no empty file behind. Comments
+        // or another section are kept, and only then is the file rewritten.
+        if document.to_string().trim().is_empty() {
+            fs::remove_file(&path)
+                .with_context(|| format!("removing config {}", path.display()))?;
+        } else {
+            write_repo_document(&path, &document, user)?;
+        }
+    }
+    Ok(removed)
+}
+
+/// One `[pools.<name>]` table from a declaration, writing only the fields the
+/// caller set so a bare `[pools.bugs]` stays bare.
+fn pool_table(declaration: &PoolConfig) -> toml_edit::Table {
+    let mut table = toml_edit::Table::new();
+    if let Some(size) = declaration.size {
+        table.insert("size", toml_edit::value(size as i64));
+    }
+    if let Some(profile) = declaration.profile.as_deref() {
+        table.insert("profile", toml_edit::value(profile));
+    }
+    if let Some(source) = declaration.source {
+        table.insert("source", toml_edit::value(source.as_str()));
+    }
+    if let Some(label) = declaration.label.as_deref() {
+        table.insert("label", toml_edit::value(label));
+    }
+    if let Some(status) = declaration.ready_status.as_deref() {
+        table.insert("ready_status", toml_edit::value(status));
+    }
+    if let Some(cap) = declaration.cap_usd {
+        table.insert("cap_usd", toml_edit::value(cap));
+    }
+    if let Some(window) = declaration.window {
+        table.insert("window", toml_edit::value(window.as_str()));
+    }
+    if let Some(mode) = declaration.on_exceed {
+        table.insert("on_exceed", toml_edit::value(mode.as_str()));
+    }
+    table
+}
+
+/// The mutable `[pools.<name>]` table, when the file declares one.
+fn pool_table_mut<'a>(
+    document: &'a mut toml_edit::DocumentMut,
+    name: &str,
+) -> Option<&'a mut toml_edit::Table> {
+    document
+        .get_mut("pools")?
+        .as_table_mut()?
+        .get_mut(name)?
+        .as_table_mut()
+}
+
+/// Parse the repository config as a format-preserving document. A missing file
+/// is an empty document, so a Repository that declares its first pool writes one.
+fn read_repo_document(path: &Path) -> anyhow::Result<toml_edit::DocumentMut> {
+    let text = match fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading config {}", path.display()));
+        }
+    };
+    text.parse::<toml_edit::DocumentMut>()
+        .with_context(|| format!("parsing config {}", path.display()))
+}
+
+/// Validate an edited repository config, then replace the file atomically. The
+/// whole edited document is parsed and validated, so a write can never leave a
+/// file the reader rejects.
+fn write_repo_document(
+    path: &Path,
+    document: &toml_edit::DocumentMut,
+    user: &Config,
+) -> anyhow::Result<()> {
+    let text = document.to_string();
+    let edited: RepoConfig = toml::from_str(&text).with_context(|| repo_config_hint(path))?;
+    edited
+        .validate(user)
+        .with_context(|| format!("validating config {}", path.display()))?;
+    crate::engine::write_atomic_bytes(path, text.as_bytes())
+        .map_err(|error| anyhow::anyhow!("writing config {}: {error}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2109,5 +2302,149 @@ mod tests {
         ))
         .expect("missing file yields defaults");
         assert!(cfg.terminal.listen_on.is_none());
+    }
+
+    /// The config file text a lifecycle verb wrote, for the editor tests.
+    fn written(repo: &tempfile::TempDir) -> String {
+        fs::read_to_string(repo_config_path(repo.path())).expect("the config file was written")
+    }
+
+    #[test]
+    fn declaring_a_pool_writes_the_section_and_keeps_the_rest_of_the_file() {
+        let config = Config::from_toml("[profiles.fast]\nruntime = \"claude\"\n");
+        let repo = repo_with_config(Some(
+            "# keep this comment\n[checks]\ncommand = \"cargo check\"\n",
+        ));
+        let declaration = PoolConfig {
+            size: Some(2),
+            profile: Some("fast".to_owned()),
+            source: Some(TicketSource::Local),
+            label: Some("bug".to_owned()),
+            cap_usd: Some(5.5),
+            window: Some(SpendWindow::Week),
+            on_exceed: Some(SpendCapMode::Warn),
+            ..PoolConfig::default()
+        };
+        declare_pool(repo.path(), "bugs", &declaration, &config).expect("the pool is declared");
+
+        // The write preserves every other byte of the file...
+        let text = written(&repo);
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("command = \"cargo check\""), "{text}");
+        // ...and the new table reads back as the declaration that was written.
+        assert!(text.contains("[pools.bugs]"), "{text}");
+        let repo_config = config.repo_config(repo.path()).expect("the config parses");
+        let bugs = &repo_config.pools["bugs"];
+        assert_eq!(bugs.size, Some(2));
+        assert_eq!(bugs.profile.as_deref(), Some("fast"));
+        assert_eq!(bugs.source, Some(TicketSource::Local));
+        assert_eq!(bugs.label.as_deref(), Some("bug"));
+        assert_eq!(bugs.cap_usd, Some(5.5));
+        assert_eq!(bugs.window, Some(SpendWindow::Week));
+        assert_eq!(bugs.on_exceed, Some(SpendCapMode::Warn));
+    }
+
+    #[test]
+    fn declaring_a_pool_creates_the_config_file_when_it_is_absent() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(None);
+        declare_pool(repo.path(), "bugs", &PoolConfig::default(), &config)
+            .expect("the first declaration writes the file");
+        let text = written(&repo);
+        assert!(text.contains("[pools.bugs]"), "{text}");
+        // A bare declaration stays bare: no key was invented for it.
+        assert!(!text.contains("size ="), "{text}");
+    }
+
+    #[test]
+    fn declaring_a_pool_the_user_config_cannot_honour_writes_nothing() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[checks]\ncommand = \"cargo check\"\n"));
+        let declaration = PoolConfig {
+            profile: Some("ghost".to_owned()),
+            ..PoolConfig::default()
+        };
+        let error = declare_pool(repo.path(), "bugs", &declaration, &config)
+            .expect_err("an unknown profile is an error");
+        assert!(format!("{error:?}").contains("ghost"), "{error:?}");
+        // The edited document is validated before it is written, so the file is
+        // exactly as it was.
+        let text = written(&repo);
+        assert!(!text.contains("[pools"), "{text}");
+    }
+
+    #[test]
+    fn setting_a_pool_size_keeps_the_rest_of_its_declaration() {
+        let config = Config::from_toml("[profiles.fast]\nruntime = \"claude\"\n");
+        let repo = repo_with_config(Some(
+            "# leading\n[checks]\ncommand = \"cargo check\"\n\n\
+             [pools.bugs]\n# the lane\nsize = 2\nprofile = \"fast\"\nlabel = \"bug\"\n",
+        ));
+        set_pool_size(repo.path(), "bugs", 5, &config).expect("the size is set");
+        let text = written(&repo);
+        assert!(text.contains("# leading"), "{text}");
+        assert!(text.contains("# the lane"), "{text}");
+        assert!(text.contains("size = 5"), "{text}");
+        assert!(text.contains("label = \"bug\""), "{text}");
+        assert!(!text.contains("size = 2"), "{text}");
+    }
+
+    #[test]
+    fn setting_the_size_of_an_undeclared_pool_is_an_error() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[checks]\ncommand = \"cargo check\"\n"));
+        let error = set_pool_size(repo.path(), "ghost", 2, &config)
+            .expect_err("no such declaration is an error");
+        assert!(error.to_string().contains("ghost"), "{error}");
+    }
+
+    #[test]
+    fn undeclaring_the_last_pool_removes_the_whole_section() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some(
+            "[checks]\ncommand = \"cargo check\"\n\n[pools.bugs]\nsize = 2\n",
+        ));
+        assert!(
+            undeclare_pool(repo.path(), "bugs", &config).expect("the pool is undeclared"),
+            "the declaration was present"
+        );
+        let text = written(&repo);
+        assert!(!text.contains("[pools"), "{text}");
+        assert!(text.contains("command = \"cargo check\""), "{text}");
+        // A second removal is a no-op that reports nothing was there.
+        assert!(!undeclare_pool(repo.path(), "bugs", &config).expect("nothing to remove"));
+    }
+
+    #[test]
+    fn undeclaring_the_only_declaration_removes_an_otherwise_empty_file() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[pools.bugs]\nsize = 2\n"));
+        assert!(undeclare_pool(repo.path(), "bugs", &config).expect("the pool is undeclared"));
+        assert!(
+            !repo_config_path(repo.path()).exists(),
+            "a file that held only the declaration is removed"
+        );
+    }
+
+    #[test]
+    fn undeclaring_one_pool_keeps_the_others() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some(
+            "[pools.bugs]\nsize = 2\n\n[pools.features]\nsize = 4\n",
+        ));
+        assert!(undeclare_pool(repo.path(), "bugs", &config).expect("the pool is undeclared"));
+        let text = written(&repo);
+        assert!(!text.contains("[pools.bugs]"), "{text}");
+        assert!(text.contains("[pools.features]"), "{text}");
+        let repo_config = config.repo_config(repo.path()).expect("the config parses");
+        assert_eq!(repo_config.pools.len(), 1);
+        assert_eq!(repo_config.pools["features"].size, Some(4));
+    }
+
+    #[test]
+    fn undeclaring_a_pool_with_no_config_file_reports_nothing_removed() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(None);
+        assert!(!undeclare_pool(repo.path(), "bugs", &config).expect("nothing to remove"));
     }
 }
