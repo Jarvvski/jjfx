@@ -270,6 +270,7 @@ impl LocalTickets {
                     "title": ticket.title,
                     "status": filter.status().as_str(),
                     "labels": [filter.label()],
+                    "blocked_by": self.blocker_ids(ticket, &tickets),
                 }));
             }
         }
@@ -305,24 +306,7 @@ impl LocalTickets {
             .filter(|ticket| ticket.feature == parent.as_str());
         let mut sub_issues = Vec::new();
         for ticket in children {
-            let blocked_by = ticket
-                .blockers
-                .as_ref()
-                .map(|blockers| {
-                    blockers
-                        .iter()
-                        .map(|number| {
-                            tickets
-                                .iter()
-                                .find(|candidate| {
-                                    candidate.feature == ticket.feature
-                                        && candidate.number == *number
-                                })
-                                .map_or_else(|| number.to_string(), |blocker| blocker.id.clone())
-                        })
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let blocked_by = self.blocker_ids(ticket, &tickets);
             sub_issues.push(json!({
                 "id": ticket.id,
                 "title": ticket.title,
@@ -332,6 +316,31 @@ impl LocalTickets {
             }));
         }
         Ok(json!({ "sub_issues": sub_issues }).to_string())
+    }
+
+    /// One Ticket's `Blocked by:` numbers resolved to sibling Ticket ids.
+    ///
+    /// A number with no sibling in the same feature keeps its bare form, so the
+    /// relationship is still reported rather than dropped - the graph then
+    /// diagnoses it as an unknown Blocker.
+    fn blocker_ids(&self, ticket: &LocalTicket, tickets: &[LocalTicket]) -> Vec<String> {
+        ticket
+            .blockers
+            .as_ref()
+            .map(|blockers| {
+                blockers
+                    .iter()
+                    .map(|number| {
+                        tickets
+                            .iter()
+                            .find(|candidate| {
+                                candidate.feature == ticket.feature && candidate.number == *number
+                            })
+                            .map_or_else(|| number.to_string(), |blocker| blocker.id.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     /// Maps a local Ticket status onto the shared Dispatch Group vocabulary.
@@ -895,6 +904,35 @@ mod tests {
 
         assert_eq!(ready.tickets().len(), 1);
         assert_eq!(ready.tickets()[0].id().as_str(), "widgets--02-dependent");
+    }
+
+    #[test]
+    fn a_ready_dependent_reports_its_resolved_blocker_by_ticket_id() {
+        // The `Blocked by:` number must arrive as the sibling's Ticket id, so
+        // `--all` can look up the Blocker's branch and stack on it.
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: resolved\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        let dependent = ready.tickets()[0].id();
+        assert_eq!(dependent.as_str(), "widgets--02-dependent");
+        assert_eq!(
+            ready.blockers(dependent),
+            &[TicketId::parse("widgets--01-foundation").expect("Blocker id")]
+        );
     }
 
     #[test]

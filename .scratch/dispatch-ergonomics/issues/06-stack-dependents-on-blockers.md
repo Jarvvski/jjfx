@@ -1,6 +1,6 @@
 # `--all` must base a dependent on its blocker
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -35,3 +35,4 @@ Resolve each Ready Ticket's blockers and pass the blocker's branch as dependency
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive.
+- 2026-10-16: Resolved. Ready discovery now carries each Ticket's declared Blockers: `TicketQueryRequest::ReadyTickets` asks the source for `blockedBy`, `RawTicket` parses them into `ReadyTickets::blockers(id)` (a Ticket with none is absent), the local markdown source resolves each `Blocked by:` number to its sibling Ticket id, and an unusable Blocker id is a diagnostic that excludes the dependent rather than a silently dropped dependency. `cli::dispatch_command`'s `--all` path resolves each ready Ticket's Blockers to branches through the same `resolve_ticket_branch` orchestration uses (bookmark lookup by Ticket id, shared via `crate::engine`) and attaches a `DispatchDependencyContext` with `with_dependency_context`, so a dependent's Worker Workspace is based on its Blocker's branch and its Pull Request targets that branch. A Blocker with no branch - including one merged to trunk, which carries `main` - is not used as a base; it is reported and the dependent is stated as based on trunk (or on the remaining stacked branches), which is AC2's explicit-trunk alternative. The pure `dependency_basis(blockers, branch_of)` seam in `src/engine/orchestration.rs` is unit-tested for the stacked, unstacked, merged, and mixed cases; `tests/ticket_discovery.rs` covers a declared Blocker, none, and an unusable one; and `src/engine/local_tickets.rs` covers a ready dependent reporting its resolved sibling. `mise run check` is green and `momo add` records the change.

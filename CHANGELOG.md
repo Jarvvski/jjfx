@@ -36,6 +36,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch --json prints one machine-readable object per Ticket - its id, outcome, Worker and detail - including the Tickets a Dispatch held back or failed, so an agent reads a batch result instead of parsing prose.
 - Every command has a help page: `jjfx help <command>` prints a command's usage, arguments and flags (derived from the same definitions the parser reads, so the two cannot drift), an unknown command fails naming it, and the top-level help now lists the Lifecycle group (`hooks install` / `hooks status`).
 - jjfx dispatch can take a Ticket handed in directly - `--text`, `--from-file <path>`, or stdin (`-`) - with an optional `--id`, so an ad-hoc Dispatch consults no Ticket source and works in a repository with no `[tickets]` configuration, no Linear key, and no `.scratch/` tree.
+- jjfx dispatch --all bases a dependent Ticket on its blocker's branch (resolved from the blocker's bookmark), so a chain of Tickets lands as a real stack instead of parallel branches off trunk; a dependent whose blocker has no branch is stated and based on trunk rather than left silent.
 
 ### Fixed
 

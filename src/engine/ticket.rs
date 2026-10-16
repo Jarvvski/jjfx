@@ -195,7 +195,7 @@ impl TicketQueryRequest {
     fn prompt(&self) -> String {
         match self {
             Self::ReadyTickets { filter } => format!(
-                "Use Linear to find issues with label {:?} in {:?} status. Return only JSON as {{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"{}\",\"labels\":[{:?}]}}]}}.",
+                "Use Linear to find issues with label {:?} in {:?} status. For each issue, report its blockedBy relations. Return only JSON as {{\"tickets\":[{{\"id\":\"AMBA-42\",\"title\":\"Title\",\"status\":\"{}\",\"labels\":[{:?}],\"blocked_by\":[\"AMBA-41\"]}}]}}.",
                 filter.label,
                 filter.status.as_str(),
                 filter.status.as_str(),
@@ -380,6 +380,11 @@ impl DiscoveryDiagnostic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadyTickets {
     tickets: Vec<Ticket>,
+    /// Each Ready Ticket's declared Blockers, keyed by Ticket identifier. A
+    /// Ticket with none is absent. Carried alongside the Tickets, rather than on
+    /// [`Ticket`], so a Ticket stays a work item and its relationships stay a
+    /// relationship - the same shape as [`DiscoveredSubIssue`].
+    blockers: BTreeMap<TicketId, Vec<TicketId>>,
     diagnostics: Vec<DiscoveryDiagnostic>,
 }
 
@@ -387,6 +392,14 @@ impl ReadyTickets {
     /// Returns validated Ready Tickets in provider order.
     pub fn tickets(&self) -> &[Ticket] {
         &self.tickets
+    }
+
+    /// Returns the Blockers one Ready Ticket declared, in provider order.
+    ///
+    /// An empty slice for a Ticket with no Blockers, and for an identifier that
+    /// is not a Ready Ticket.
+    pub fn blockers(&self, id: &TicketId) -> &[TicketId] {
+        self.blockers.get(id).map_or(&[], Vec::as_slice)
     }
 
     /// Returns diagnostics for excluded provider entries.
@@ -420,11 +433,12 @@ where
         };
         let payload: RawReadyTickets = self.query_payload(&request)?;
         let mut tickets = Vec::with_capacity(payload.tickets.len());
+        let mut blockers = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut seen = BTreeSet::new();
         for raw in payload.tickets {
             match ready_ticket(raw, &filter.label, &filter.status) {
-                Ok(ticket) => {
+                Ok((ticket, declared)) => {
                     // A provider can return the same Ready Ticket twice. Keep it
                     // once and report the repeat, rather than letting the caller
                     // dispatch one Ticket onto two Workers.
@@ -435,6 +449,9 @@ where
                         ));
                         continue;
                     }
+                    if !declared.is_empty() {
+                        blockers.insert(ticket.id().clone(), declared);
+                    }
                     tickets.push(ticket);
                 }
                 Err(diagnostic) => diagnostics.push(diagnostic),
@@ -442,6 +459,7 @@ where
         }
         Ok(ReadyTickets {
             tickets,
+            blockers,
             diagnostics,
         })
     }
@@ -654,6 +672,10 @@ struct RawTicket {
     title: String,
     status: String,
     labels: Vec<String>,
+    /// Blockers the source declares for this Ready Ticket. Defaulted so a source
+    /// that does not report dependencies still parses.
+    #[serde(default)]
+    blocked_by: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -677,11 +699,17 @@ struct RawSubIssue {
     cross_repo: bool,
 }
 
+/// Validates one Ready Ticket and the Blockers its source declared.
+///
+/// A Blocker identifier that is not a safe filename component is a diagnostic,
+/// not a silently dropped dependency: jjfx cannot resolve a branch for a Blocker
+/// it cannot name, and dropping it would base the dependent on trunk without
+/// saying so - the exact silent-trunk failure this path exists to prevent.
 fn ready_ticket(
     raw: RawTicket,
     expected_label: &str,
     expected_status: &TicketStatus,
-) -> Result<Ticket, DiscoveryDiagnostic> {
+) -> Result<(Ticket, Vec<TicketId>), DiscoveryDiagnostic> {
     let subject = raw.id.clone();
     let id = TicketId::parse(raw.id)
         .map_err(|error| DiscoveryDiagnostic::new(&subject, error.to_string()))?;
@@ -705,7 +733,16 @@ fn ready_ticket(
             ),
         ));
     }
-    Ok(Ticket::new(id, title, status))
+    let blockers = raw
+        .blocked_by
+        .into_iter()
+        .map(|blocker| {
+            TicketId::parse(blocker).map_err(|error| {
+                DiscoveryDiagnostic::new(&subject, format!("invalid Blocker: {error}"))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((Ticket::new(id, title, status), blockers))
 }
 
 /// A failure that makes a Ticket discovery result unusable as a whole.
