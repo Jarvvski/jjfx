@@ -12,6 +12,10 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+use jjfx::engine::{
+    DispatchGroupOptions, DispatchGroupState, Expected, Repository, StateChange, SubIssueState,
+    TicketId, WireStatus, WireTimestamp,
+};
 use tempfile::TempDir;
 
 /// A jj repository with one local ready Ticket and a `[tickets] source = "local"`
@@ -136,6 +140,29 @@ impl DispatchFixture {
             .env("JJ_CONFIG", self.jj_config_path());
         command
     }
+
+    /// Persists a terminal Dispatch Group for `parent`, so orchestration resumes
+    /// it rather than discovering children - which a local Ticket source cannot
+    /// do for a Parent that is also a Ticket.
+    fn persist_terminal_group(&self, parent: &str) {
+        let repository = Repository::open(self.path()).expect("open repository");
+        let parent = TicketId::parse(parent).expect("Parent Ticket");
+        let mut group = DispatchGroupState::new(
+            parent.clone(),
+            WireTimestamp::new("2026-08-04T12:00:00Z"),
+            "owner/repo",
+            DispatchGroupOptions::new(""),
+        );
+        group.sub_issues.insert(
+            TicketId::parse("widgets--02-dependent").expect("Sub-issue"),
+            SubIssueState::new("Failed", WireStatus::new("failed"), Vec::new()),
+        );
+        repository
+            .state_store()
+            .dispatch_group(parent)
+            .commit(Expected::Missing, StateChange::Replace(group))
+            .expect("save group");
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -197,5 +224,85 @@ fn a_batch_with_a_dispatched_ticket_exits_zero() {
         stdout(&output).contains("\"outcome\": \"dispatched\""),
         "{}",
         stdout(&output)
+    );
+}
+
+#[test]
+fn a_background_orchestration_without_a_pool_is_a_failure_not_orchestrating() {
+    let fixture = DispatchFixture::new();
+    // No Pool at all: the child used to die at once behind a printed
+    // `orchestrating`. The parent must surface the error and exit non-zero.
+    let output = fixture
+        .jjfx(&["dispatch", "widgets--01-ship-the-widget", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        !stdout(&output).contains("orchestrating"),
+        "a dead orchestration must not print orchestrating:\n{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("Worker Pool is missing"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_background_orchestration_for_an_unresolvable_ticket_is_a_failure() {
+    let fixture = DispatchFixture::new();
+    fixture.with_pool(1);
+    let output = fixture
+        .jjfx(&["dispatch", "nope-typo", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(!output.status.success(), "{}", stdout(&output));
+    assert!(
+        !stdout(&output).contains("orchestrating"),
+        "a Ticket that cannot be resolved must not print orchestrating:\n{}",
+        stdout(&output)
+    );
+    assert!(
+        stderr(&output).contains("cannot fetch Ticket nope-typo"),
+        "{}",
+        stderr(&output)
+    );
+}
+
+#[test]
+fn a_prepared_background_orchestration_names_the_child_log() {
+    let fixture = DispatchFixture::new();
+    fixture.with_pool(1);
+    // A persisted group makes `prepare` resume rather than discover, so the
+    // handoff reaches a real background child without a tracker.
+    fixture.persist_terminal_group("widgets--01-ship-the-widget");
+
+    let output = fixture
+        .jjfx(&["dispatch", "widgets--01-ship-the-widget", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json = stdout(&output);
+    assert!(json.contains("\"outcome\": \"orchestrating\""), "{json}");
+    let log = fixture
+        .path()
+        .join(".jj/pool/orchestrate-widgets--01-ship-the-widget.log");
+    assert!(
+        json.contains(&log.display().to_string()),
+        "the JSON must name the child log:\n{json}"
+    );
+    assert!(
+        log.is_file(),
+        "the child log must exist at {}",
+        log.display()
     );
 }

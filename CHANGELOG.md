@@ -48,6 +48,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch works in a repository with no `main` bookmark - a Worker Workspace bases on `main` (then `master`, then the default Workspace's working copy) instead of failing - and a repository with no `origin` remote fails naming the fix (`jj git remote add origin <url>`, or the pool's `gh_repo`) instead of a bare owner/name format error about an empty slug.
 - A finished Worker's local Ticket is now resolved from the durable Run Record store rather than live Worker state, so a linear dependency chain no longer deadlocks at claimed: Dispatch reconciles before it discovers ready work, jjfx status and jjfx pool list reconcile on read, and jjfx ticket reconcile resolves finished Tickets on demand with no Dispatch and no ready Ticket.
 - jjfx dispatch exits non-zero when every Ticket failed, so a scripting caller can tell an all-failed batch from a successful one; a batch with a dispatched Ticket, or one deliberately held back under a cap, still exits zero, and the summary line now counts only Tickets actually dispatched.
+- A background `jjfx dispatch <parent>` now prepares the Parent synchronously, so a failure - an unresolvable Ticket, a missing Pool, a rejected discovery - exits non-zero and reports the error instead of printing `orchestrating` for a background child that dies at once; a started runner names its log in the dispatch result and the JSON detail.
 
 ## [0.55.0] - 2026-10-16
 
