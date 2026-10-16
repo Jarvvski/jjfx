@@ -16,6 +16,12 @@ Also decide **declarative vs imperative**: do pools exist because config declare
 
 This is the sharpest fork on the map, because it decides whether the repo-local policy stays honest or is quietly widened.
 
+**Inherited from *How does a Ticket reach a pool?*** (resolved 2026-10-16) — three schema questions this ticket now owns, because that ticket decided the routing behaviour and left the shape to the config surface:
+
+- The **ready label is per pool**, since each pool's source may discover by a different label. `--label` therefore becomes an override on the pool's configured value rather than a global default.
+- Whether a pool may have **no Ticket source** at all — a lane reachable only by an explicit `--pool`.
+- A pool **declares the label that routes to it**; two pools declaring the same label must be refused at config load, not resolved by precedence.
+
 ## Answer
 
 <!-- recorded on resolution -->
