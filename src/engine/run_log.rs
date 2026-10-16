@@ -381,6 +381,111 @@ pub(crate) fn unexpected_result(reason: RunResultFallback) -> (RunResult, RunRes
     )
 }
 
+/// Adds the cost and token usage opencode reports across its steps to `result`.
+///
+/// opencode reports cost and usage once per step (`step_finish`), not once per
+/// Run, so a Run's totals are the sum across every step in its log. The log is
+/// the provider's own record of what the Run spent, so reading it adds detail to
+/// a result that is already terminal without changing its conclusion. A missing
+/// or unreadable log, or a Run that reported neither, leaves `result` untouched.
+pub(crate) fn with_opencode_totals(result: RunResult, log_path: &Path) -> RunResult {
+    let totals = opencode_run_totals(log_path);
+    let mut result = result;
+    if let Some(cost) = totals.cost {
+        result = result.with_cost(cost);
+    }
+    if let Some(usage) = totals.usage {
+        result = result.with_usage(usage);
+    }
+    result
+}
+
+/// The cost and token usage opencode accumulates across a Run's steps.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct OpenCodeRunTotals {
+    /// The sum of every step's cost, when any step reported one.
+    cost: Option<RunCost>,
+    /// The sum of every step's tokens, when any step reported any.
+    usage: Option<RunUsage>,
+}
+
+/// Sums the cost and token usage opencode reports per step (`step_finish`).
+///
+/// A step that reports no cost contributes none, and a Run whose log reports
+/// neither yields `None` for each rather than failing. A negative or
+/// unrepresentable step cost is dropped the way a bad Claude cost is: it means
+/// "no cost reported" for that step, never a reason to drop the Run.
+fn opencode_run_totals(path: &Path) -> OpenCodeRunTotals {
+    let Ok(file) = fs::File::open(path) else {
+        return OpenCodeRunTotals::default();
+    };
+    let mut cost_micro_usd = 0u64;
+    let mut cost_reported = false;
+    let mut input_tokens = 0u64;
+    let mut output_tokens = 0u64;
+    let mut reasoning_output_tokens = 0u64;
+    let mut cached_input_tokens = 0u64;
+    let mut cache_write_input_tokens = 0u64;
+    let mut usage_reported = false;
+    for line in BufReader::new(file).lines() {
+        let Ok(line) = line else {
+            break;
+        };
+        let Ok(event) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        if event.get("type").and_then(Value::as_str) != Some("step_finish") {
+            continue;
+        }
+        let Some(part) = event.get("part") else {
+            continue;
+        };
+        if let Some(cost) = part.get("cost").and_then(Value::as_f64).and_then(micro_usd) {
+            cost_micro_usd = cost_micro_usd.saturating_add(cost);
+            cost_reported = true;
+        }
+        let Some(tokens) = part.get("tokens") else {
+            continue;
+        };
+        usage_reported = true;
+        input_tokens = input_tokens.saturating_add(token_count(tokens.get("input")));
+        output_tokens = output_tokens.saturating_add(token_count(tokens.get("output")));
+        reasoning_output_tokens =
+            reasoning_output_tokens.saturating_add(token_count(tokens.get("reasoning")));
+        let cache = tokens.get("cache");
+        cached_input_tokens =
+            cached_input_tokens.saturating_add(token_count(cache.and_then(|c| c.get("read"))));
+        cache_write_input_tokens = cache_write_input_tokens
+            .saturating_add(token_count(cache.and_then(|c| c.get("write"))));
+    }
+    OpenCodeRunTotals {
+        cost: cost_reported.then(|| RunCost::from_micro_usd(cost_micro_usd)),
+        usage: usage_reported.then(|| {
+            RunUsage::new(input_tokens, output_tokens)
+                .with_cached_input_tokens(cached_input_tokens)
+                .with_cache_write_input_tokens(cache_write_input_tokens)
+                .with_reasoning_output_tokens(reasoning_output_tokens)
+        }),
+    }
+}
+
+/// Reads a provider token count, treating a missing or non-numeric value as zero.
+fn token_count(value: Option<&Value>) -> u64 {
+    value.and_then(Value::as_u64).unwrap_or(0)
+}
+
+/// Converts a provider-reported dollar amount to millionths of one US dollar.
+///
+/// A negative, non-finite or out-of-range value is `None`: it means "no cost
+/// reported", never a reason for the Run to fail.
+fn micro_usd(value: f64) -> Option<u64> {
+    if !value.is_finite() || value < 0.0 {
+        return None;
+    }
+    let micro_usd = (value * 1_000_000.0).round();
+    (micro_usd <= u64::MAX as f64).then_some(micro_usd as u64)
+}
+
 /// One provider-neutral value decoded from an Agent Runtime log line.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RunLogEvent {
@@ -1031,14 +1136,9 @@ fn parse_claude_result(event: ClaudeEvent) -> Result<RunLogEvent, RunLogParseErr
 ///
 /// An unusable cost means "no cost reported", never "the Run failed".
 fn parse_claude_cost(cost: &Number) -> Option<RunCost> {
-    let value = cost
-        .as_f64()
-        .filter(|value| value.is_finite() && *value >= 0.0)?;
-    let micro_usd = (value * 1_000_000.0).round();
-    if micro_usd > u64::MAX as f64 {
-        return None;
-    }
-    Some(RunCost::from_micro_usd(micro_usd as u64))
+    cost.as_f64()
+        .and_then(micro_usd)
+        .map(RunCost::from_micro_usd)
 }
 
 /// Token usage normalized across Agent Runtime providers.
@@ -1431,5 +1531,83 @@ impl RunResult {
     /// Returns provider-reported cost when available.
     pub const fn cost(&self) -> Option<RunCost> {
         self.cost
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn log_with(contents: &str) -> (tempfile::TempDir, PathBuf) {
+        let directory = tempfile::TempDir::new().expect("temporary directory");
+        let path = directory.path().join("worker.log");
+        fs::write(&path, contents).expect("Run log should be written");
+        (directory, path)
+    }
+
+    #[test]
+    fn opencode_totals_sum_every_steps_cost_and_usage() {
+        let (_directory, path) = log_with(concat!(
+            r#"{"type":"step_start","sessionID":"ses_1"}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","cost":0.001817328,"tokens":{"input":910,"output":91,"reasoning":548,"cache":{"read":129588,"write":0}}}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"type":"step-finish","cost":0.0039036,"tokens":{"input":100,"output":40,"reasoning":0,"cache":{"read":20,"write":5}}}}"#,
+            "\n",
+        ));
+
+        let result = with_opencode_totals(RunResult::succeeded(), &path);
+
+        assert_eq!(result.cost(), Some(RunCost::from_micro_usd(5_721)));
+        let usage = result.usage().expect("summed usage");
+        assert_eq!(usage.input_tokens(), 1_010);
+        assert_eq!(usage.output_tokens(), 131);
+        assert_eq!(usage.reasoning_output_tokens(), 548);
+        assert_eq!(usage.cached_input_tokens(), 129_608);
+        assert_eq!(usage.cache_write_input_tokens(), 5);
+    }
+
+    #[test]
+    fn opencode_totals_are_absent_when_no_step_reported_them() {
+        let (_directory, path) = log_with(concat!(
+            r#"{"type":"text","sessionID":"ses_1","part":{"type":"text","text":"done"}}"#,
+            "\n",
+        ));
+
+        let result = with_opencode_totals(RunResult::succeeded(), &path);
+
+        assert_eq!(result.cost(), None);
+        assert_eq!(result.usage(), None);
+    }
+
+    #[test]
+    fn opencode_totals_drop_a_negative_step_cost_without_losing_the_rest() {
+        let (_directory, path) = log_with(concat!(
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"cost":-0.5,"tokens":{"input":1,"output":1}}}"#,
+            "\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"cost":0.25,"tokens":{"input":2,"output":2}}}"#,
+            "\n",
+        ));
+
+        let result = with_opencode_totals(RunResult::succeeded(), &path);
+
+        assert_eq!(result.cost(), Some(RunCost::from_micro_usd(250_000)));
+        assert_eq!(result.usage().expect("summed usage").input_tokens(), 3);
+    }
+
+    #[test]
+    fn opencode_totals_ignore_malformed_lines_and_a_missing_log() {
+        let (_directory, path) = log_with(concat!(
+            "not structured log data\n",
+            r#"{"type":"step_finish","sessionID":"ses_1","part":{"cost":0.5,"tokens":{"input":3,"output":1}}}"#,
+            "\n",
+            r#"{"type":"step_finish""#,
+        ));
+        let result = with_opencode_totals(RunResult::succeeded(), &path);
+        assert_eq!(result.cost(), Some(RunCost::from_micro_usd(500_000)));
+
+        let missing = with_opencode_totals(RunResult::succeeded(), Path::new("absent.log"));
+        assert_eq!(missing.cost(), None);
+        assert_eq!(missing.usage(), None);
     }
 }

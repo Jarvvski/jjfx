@@ -895,14 +895,23 @@ fn result_for_completion(
     runtime: AgentRuntime,
     exit_code: Option<i32>,
 ) -> (RunResult, RunResultSource) {
-    let result = crate::engine::run_log::result_for_finalization(log_path, runtime);
-    if runtime == AgentRuntime::OpenCode
-        && exit_code == Some(0)
-        && matches!(result.1, RunResultSource::Fallback { .. })
-    {
-        return (RunResult::succeeded(), RunResultSource::Provider);
+    let (result, source) = crate::engine::run_log::result_for_finalization(log_path, runtime);
+    if runtime != AgentRuntime::OpenCode {
+        return (result, source);
     }
-    result
+    // opencode emits no terminal event on success, so a clean exit is its own
+    // proof of success. Either way the Run's cost and tokens are summed from its
+    // own step events, which the provider reports per step rather than per Run.
+    if exit_code == Some(0) && matches!(source, RunResultSource::Fallback { .. }) {
+        return (
+            crate::engine::run_log::with_opencode_totals(RunResult::succeeded(), log_path),
+            RunResultSource::Provider,
+        );
+    }
+    (
+        crate::engine::run_log::with_opencode_totals(result, log_path),
+        source,
+    )
 }
 
 /// A reaped Run together with its provider-neutral terminal result.

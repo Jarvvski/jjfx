@@ -423,8 +423,19 @@ impl WorkerPool {
         let revision = loaded.revision().clone();
         let mut state = loaded.value;
         apply_run_result(&mut state, &result)?;
+        let record = run_record(&self.repository, worker, &state, &result);
         match repository.commit(Expected::Match(revision), StateChange::Replace(state)) {
-            Ok(CommitOutcome::Applied(_)) | Ok(CommitOutcome::Conflict(_)) => Ok(()),
+            // This reconciliation is the one that observed the Run end, so it
+            // owns the durable record - exactly as the spawning supervisor does
+            // when its own waiter finalizes the Run first.
+            Ok(CommitOutcome::Applied(_)) => {
+                self.repository.state_store().runs().append(&record)?;
+                Ok(())
+            }
+            // Another writer finalized this Run first (the supervisor's waiter,
+            // or a concurrent reconciliation). That writer appended the record,
+            // so appending here would count the Run twice.
+            Ok(CommitOutcome::Conflict(_)) => Ok(()),
             Err(source) => Err(WorkerPoolError::Reconciliation {
                 worker: worker.clone(),
                 source,
@@ -445,11 +456,15 @@ impl WorkerPool {
         match self.opencode_session_state(worker, state) {
             // The session reports a terminal outcome. A provider terminal event
             // in the Run log carries more detail than the bare outcome, so
-            // prefer it when the log has one.
-            RunSessionState::Finished(outcome) => Some(match log_source {
-                RunResultSource::Provider => log_result,
-                RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
-            }),
+            // prefer it when the log has one. opencode reports cost and tokens
+            // per step, so the Run's totals are summed from its own log.
+            RunSessionState::Finished(outcome) => Some(opencode_totals(
+                state,
+                match log_source {
+                    RunResultSource::Provider => log_result,
+                    RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
+                },
+            )),
             // No outcome yet, or the session cannot be read. Only a provider
             // terminal event in the Run log proves the Run ended: an *open*
             // session is not evidence of a *running* one - opencode reports a
@@ -1550,6 +1565,17 @@ fn opencode_outcome_result(outcome: &SessionOutcome) -> RunResult {
     }
 }
 
+/// Adds the cost and tokens opencode reports in its Run log to `result`.
+///
+/// The Run is already terminal; this only fills in what the provider's own step
+/// events say it spent, so a Run whose log reports neither is unchanged.
+fn opencode_totals(state: &WorkerState, result: RunResult) -> RunResult {
+    match state.log_file.as_deref() {
+        Some(path) => crate::engine::run_log::with_opencode_totals(result, Path::new(path)),
+        None => result,
+    }
+}
+
 fn apply_run_result(state: &mut WorkerState, result: &RunResult) -> Result<(), WorkerPoolError> {
     state.completed_at = Some(current_timestamp()?);
     match result.conclusion() {
@@ -2303,6 +2329,49 @@ mod tests {
         assert_eq!(records[0].ticket.as_deref(), Some("ENG-4"));
         assert_eq!(records[1].cost_micro_usd, Some(200));
         assert_eq!(records[1].ticket.as_deref(), Some("ENG-5"));
+    }
+
+    #[test]
+    fn reconciling_a_finished_run_appends_exactly_one_record() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-7");
+        // A PID that leads no live process group, so reconciliation observes the
+        // Run as ended rather than still executing.
+        reservation
+            .persist_pid(u32::MAX - 1)
+            .expect("persist a dead Run PID");
+
+        repository.worker_pool().reconcile_runs();
+
+        let recorded = records(&repository);
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].worker, worker);
+        assert_eq!(recorded[0].ticket.as_deref(), Some("ENG-7"));
+
+        // A later reconciliation sees the Run already finalized and records
+        // nothing more.
+        repository.worker_pool().reconcile_runs();
+        assert_eq!(records(&repository).len(), 1);
+    }
+
+    #[test]
+    fn a_run_its_supervisor_finalized_is_not_recorded_again_by_reconciliation() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-8");
+
+        assert!(matches!(
+            finalize(
+                &reservation,
+                &RunResult::succeeded().with_cost(RunCost::from_micro_usd(500))
+            ),
+            RunFinalization::Applied
+        ));
+
+        repository.worker_pool().reconcile_runs();
+
+        let records = records(&repository);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].cost_micro_usd, Some(500));
     }
 
     #[test]
