@@ -1733,19 +1733,21 @@ fn render_profile(profile: &AgentRuntimeProfile) -> String {
 
 /// `pool <N>` / `pool resize <N>`: size a pool.
 ///
-/// `default` (the bare form, or an explicit `--pool default`) is sized exactly
-/// as before - its Workers are provisioned and detached against its state. A
-/// named pool is sized in its *declaration*, because that is the source of
-/// truth (ADR 0014); when the lane has already materialised, the resize reaches
-/// its Workers first and the declaration is updated to agree, so the two never
-/// disagree about the size.
+/// `default` (the bare form, or an explicit `--pool default`) sizes its state
+/// exactly as before - its Workers are provisioned and detached against its
+/// state - and moves its declaration too when the Repository declares one, so a
+/// declared `default` cannot go stale (ticket 16). A named pool is sized in its
+/// *declaration*, because that is the source of truth (ADR 0014); when the lane
+/// has already materialised, the resize reaches its Workers first and the
+/// declaration is updated to agree, so the two never disagree about the size.
 fn resize_pool_command(repository: &Repository, value: &str, pool: Option<&str>) -> Result<()> {
     let size = value
         .parse::<usize>()
         .map_err(|_| anyhow::anyhow!("Invalid pool size: {value}"))?;
+    let user = crate::config::load()?;
     match pool {
-        None | Some(DEFAULT_POOL_NAME) => apply_pool_resize(repository, size),
-        Some(name) => resize_declared_pool(repository, name, size, &crate::config::load()?),
+        None | Some(DEFAULT_POOL_NAME) => resize_default_pool(repository, size, &user),
+        Some(name) => resize_declared_pool(repository, name, size, &user),
     }
 }
 
@@ -1776,6 +1778,32 @@ fn apply_pool_resize(repository: &Repository, size: usize) -> Result<()> {
         eprintln!("Pool expanded from {before} to {size}");
     } else {
         eprintln!("Pool shrunk from {before} to {size}");
+    }
+    Ok(())
+}
+
+/// Size `default`, moving its declaration too when the Repository declares one.
+///
+/// `default` is implicit unless a Repository writes `[pools.default]`, so the
+/// state resize is its whole path in the common case - and must stay that way:
+/// sizing an implicit `default` must never grow a `[pools.default]` section the
+/// first time someone resizes their pool. When a declaration does exist the two
+/// are moved together, exactly as a named pool's are (ticket 15): the state half
+/// runs first, so a resize refused over a busy Worker returns before the write
+/// and leaves the declaration alone, and the lane and the declaration cannot
+/// disagree about the size (ticket 16).
+fn resize_default_pool(repository: &Repository, size: usize, user: &Config) -> Result<()> {
+    let declared = user
+        .repo_config(repository.root())?
+        .pools
+        .contains_key(DEFAULT_POOL_NAME);
+    apply_pool_resize(repository, size)?;
+    if declared {
+        crate::config::set_pool_size(repository.root(), DEFAULT_POOL_NAME, size, user)?;
+        eprintln!(
+            "Pool `{DEFAULT_POOL_NAME}` size set to {size} in {}",
+            repo_config_display(repository)
+        );
     }
     Ok(())
 }

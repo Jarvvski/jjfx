@@ -438,3 +438,101 @@ fn shrinking_a_materialised_lane_over_a_busy_worker_is_refused() {
         fixture.repo_config_text()
     );
 }
+
+/// Ticket 16: a declared `default`'s declaration must not go stale. `jjfx pool
+/// <N>` sizes `default`'s state and, when the Repository declares one, moves the
+/// declaration to agree - both the bare form and an explicit `--pool default` -
+/// so the size a user sets is the size `status` reports.
+#[test]
+fn resizing_default_moves_its_declaration_when_one_exists() {
+    let fixture = MaterialiseFixture::new();
+    fixture.write_repo_config("[pools.default]\nsize = 1\n");
+
+    let sized = fixture.jjfx(&["pool", "1"]);
+    assert!(sized.status.success(), "{}", stderr(&sized));
+    assert_eq!(fixture.workers("default").len(), 1);
+
+    // The bare form `jjfx pool <N>`.
+    let resized = fixture.jjfx(&["pool", "3"]);
+    assert!(resized.status.success(), "{}", stderr(&resized));
+    assert_eq!(
+        fixture.workers("default").len(),
+        3,
+        "the size edit reached `default`'s lane"
+    );
+    assert!(
+        fixture.repo_config_text().contains("size = 3"),
+        "the declaration agrees: {}",
+        fixture.repo_config_text()
+    );
+
+    // The explicit form `jjfx pool resize <N> --pool default`.
+    let explicit = fixture.jjfx(&["pool", "resize", "4", "--pool", "default"]);
+    assert!(explicit.status.success(), "{}", stderr(&explicit));
+    assert_eq!(fixture.workers("default").len(), 4);
+    assert!(
+        fixture.repo_config_text().contains("size = 4"),
+        "the declaration agrees: {}",
+        fixture.repo_config_text()
+    );
+
+    // `status` reports the one size that is true: the lane's own.
+    let default = fixture.status_pool("default");
+    assert_eq!(default["size"], 4, "{default}");
+    assert_eq!(default["workers"], 4, "{default}");
+}
+
+/// With no `[pools.default]` declaration - the common case, since `default` is
+/// implicit - sizing it stays state-only and must not grow a declaration, which
+/// would otherwise appear in every Repository the first time someone resized.
+#[test]
+fn resizing_an_implicit_default_creates_no_declaration() {
+    let fixture = MaterialiseFixture::new();
+    assert!(
+        !fixture.path().join(".jjfx/config.toml").exists(),
+        "the fixture must start with no repository config"
+    );
+
+    let resized = fixture.jjfx(&["pool", "2"]);
+    assert!(resized.status.success(), "{}", stderr(&resized));
+    assert_eq!(fixture.workers("default").len(), 2);
+    assert!(
+        !fixture.path().join(".jjfx/config.toml").exists(),
+        "sizing an implicit `default` must not create a declaration"
+    );
+}
+
+/// A refused `default` shrink changes neither the lane nor the declaration that
+/// describes it.
+#[test]
+fn a_refused_default_shrink_leaves_the_declaration_alone() {
+    let fixture = MaterialiseFixture::new();
+    fixture.write_repo_config("[pools.default]\nsize = 2\n");
+    let sized = fixture.jjfx(&["pool", "2"]);
+    assert!(sized.status.success(), "{}", stderr(&sized));
+    let before = fixture.workers("default");
+    assert_eq!(before.len(), 2);
+    // The shrink detaches the tail, so that is the Worker the safety must catch.
+    fixture.set_worker_status("default", &before[1], "busy");
+
+    let refused = fixture.jjfx(&["pool", "1"]);
+    assert!(
+        !refused.status.success(),
+        "a shrink over a busy Worker must be refused"
+    );
+    assert!(
+        stderr(&refused).to_lowercase().contains("busy"),
+        "the refusal names the reason: {}",
+        stderr(&refused)
+    );
+    assert_eq!(
+        fixture.workers("default"),
+        before,
+        "a refused shrink changes nothing"
+    );
+    assert!(
+        fixture.repo_config_text().contains("size = 2"),
+        "the declaration is left alone: {}",
+        fixture.repo_config_text()
+    );
+}
