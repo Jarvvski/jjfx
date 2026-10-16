@@ -26,6 +26,8 @@ The implementation backlog for **running several named Worker Pools in one Repos
 | 10 | `clean --pool` | 02 |
 | 11 | Sweep the singular "the Pool" from the codebase | all |
 | 12 | A repository-local `[tickets]` source selection | 01 |
+| 13 | A declared pool's state is never materialised | - |
+| 14 | The per-pool `ready_status` is declared but unused | 07 |
 
 ## Suggested order
 
@@ -34,6 +36,8 @@ The implementation backlog for **running several named Worker Pools in one Repos
 **11 is deliberately last.** It is a mechanical sweep of every bare "the Pool" across comments, error strings and docs, and running it last keeps it from conflicting with every ticket above it. ADR 0012 already notes it touches the state layer, the CLI and ADR 0011.
 
 **12 is a follow-on, not a prerequisite.** Nothing here needs it; it exists because ADR 0014's capability rule makes it possible, and it is the wall the `todo-md` test-drive hit.
+
+**13 and 14 were filed while implementing the rest**, and both are gaps the effort left rather than new scope. **13 is the last mile**: nothing materialises a declared pool's state, so a named lane can be declared and never used - every other ticket is plumbing until it lands. 14 is the smaller half of the same honesty rule: a configuration key that parses and does nothing.
 
 ## Out of scope
 
