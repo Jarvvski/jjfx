@@ -1,7 +1,7 @@
 # Per-pool spend under the global ceiling
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 06
 
 ## Problem

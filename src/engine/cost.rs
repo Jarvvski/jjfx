@@ -312,6 +312,56 @@ impl SpendCapMode {
     }
 }
 
+/// Whose recorded spend a limit totals, and whose name a refusal carries.
+///
+/// A limit is named by the dial that turns it: the Repository ceiling is named
+/// as a whole, because a ceiling that has run out is raised by the
+/// Repository-wide setting and affects every pool, while a pool cap is named by
+/// its pool. Getting this wrong sends the owner to the wrong knob, which is the
+/// failure the multi-pool spend design exists to avoid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpendScope {
+    /// The Repository-wide ceiling, totalled over every pool's records.
+    Repository,
+    /// One pool's own cap, totalled over that pool's records.
+    Pool(PoolName),
+}
+
+impl SpendScope {
+    /// How a message names the limit itself.
+    fn describe(&self, limit_micro_usd: u64) -> String {
+        match self {
+            Self::Repository => format!("the Repository spend cap of {}", usd(limit_micro_usd)),
+            Self::Pool(name) => format!("the {} spend cap on pool `{name}`", usd(limit_micro_usd)),
+        }
+    }
+
+    /// The setting that raises or removes the limit.
+    fn cap_key(&self) -> String {
+        match self {
+            Self::Repository => "spend.cap_usd".to_owned(),
+            Self::Pool(name) => format!("pools.{name}.cap_usd"),
+        }
+    }
+
+    /// The setting that changes what Dispatch does at the limit.
+    fn mode_key(&self) -> String {
+        match self {
+            Self::Repository => "spend.on_exceed".to_owned(),
+            Self::Pool(name) => format!("pools.{name}.on_exceed"),
+        }
+    }
+
+    /// The tie-break rank when two limits are equally restrictive: the Repository
+    /// wins, because the ceiling bounds every pool rather than just one.
+    fn rank(&self) -> u8 {
+        match self {
+            Self::Repository => 0,
+            Self::Pool(_) => 1,
+        }
+    }
+}
+
 /// An optional aggregate spend cap on Dispatch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpendCap {
@@ -350,31 +400,90 @@ impl SpendCap {
         self.mode
     }
 
-    /// The gate decision for the current aggregate.
+    /// The gate decision for the current aggregate, attributed to `scope`.
     ///
     /// The cap fires at or above its limit - a Run at exactly the cap would push
-    /// the total past it - and the message names the cap, the current total and
+    /// the total past it - and the message names the scope, the current total and
     /// the setting that overrides it.
-    pub fn evaluate(self, snapshot: &PoolCostSnapshot) -> SpendDecision {
+    pub fn evaluate(self, scope: &SpendScope, snapshot: &PoolCostSnapshot) -> SpendDecision {
         let cost = self.window.cost(snapshot).cost_micro_usd();
         if cost < self.limit_micro_usd {
             return SpendDecision::Allowed;
         }
         let summary = format!(
-            "recorded Run spend {} {} exceeds the {} spend cap",
+            "recorded Run spend {} {} exceeds {}",
             usd(cost),
             self.window.label(),
-            usd(self.limit_micro_usd)
+            scope.describe(self.limit_micro_usd)
         );
         match self.mode {
             SpendCapMode::Block => SpendDecision::Refused(format!(
-                "{summary}; raise or remove spend.cap_usd, or set spend.on_exceed = \"warn\", to override"
+                "{summary}; raise or remove {}, or set {} = \"warn\", to override",
+                scope.cap_key(),
+                scope.mode_key()
             )),
             SpendCapMode::Warn => SpendDecision::Warned(format!(
-                "{summary}; dispatching anyway (spend.on_exceed = \"warn\")"
+                "{summary}; dispatching anyway ({} = \"warn\")",
+                scope.mode_key()
             )),
         }
     }
+}
+
+/// One spend limit that applies to a Dispatch, paired with the spend it totals.
+///
+/// A pool cap totals the selected pool's records; the Repository ceiling totals
+/// every pool's. [`evaluate_spend`] combines them so both bind. The snapshot is
+/// owned rather than borrowed so a caller can build the limits as it reads each
+/// store, without a snapshot having to outlive the call.
+pub struct SpendLimit {
+    scope: SpendScope,
+    cap: SpendCap,
+    spend: PoolCostSnapshot,
+}
+
+impl SpendLimit {
+    /// Pairs a cap with the spend it totals and the scope a refusal names.
+    pub const fn new(scope: SpendScope, cap: SpendCap, spend: PoolCostSnapshot) -> Self {
+        Self { scope, cap, spend }
+    }
+
+    /// The decision this one limit reaches against the spend it totals.
+    fn decision(&self) -> SpendDecision {
+        self.cap.evaluate(&self.scope, &self.spend)
+    }
+}
+
+/// The combined gate decision across every applicable spend limit.
+///
+/// Both limits bind, so a Dispatch proceeds only when **every** limit has room.
+/// When one or more limits have fired, the **most restrictive** is the one
+/// named: a blocking limit outranks a warning one, and among limits at the same
+/// severity the smallest limit wins, because the effective limit is their
+/// minimum. That names the pool when its own cap is the tighter constraint and
+/// the Repository when the ceiling is, so a refusal always points at the dial
+/// that unblocks the Dispatch.
+///
+/// A tie - two equally restrictive limits - names the Repository, because the
+/// ceiling bounds every pool rather than just this one.
+pub fn evaluate_spend(limits: impl IntoIterator<Item = SpendLimit>) -> SpendDecision {
+    let severity = |decision: &SpendDecision| match decision {
+        SpendDecision::Refused(_) => 0u8,
+        SpendDecision::Warned(_) => 1,
+        SpendDecision::Allowed => 2,
+    };
+    limits
+        .into_iter()
+        .filter_map(|limit| {
+            let decision = limit.decision();
+            (!matches!(decision, SpendDecision::Allowed)).then_some((
+                limit.cap.limit_micro_usd(),
+                limit.scope,
+                decision,
+            ))
+        })
+        .min_by_key(|(limit, scope, decision)| (severity(decision), *limit, scope.rank()))
+        .map_or(SpendDecision::Allowed, |(_, _, decision)| decision)
 }
 
 /// The gate decision for one Dispatch.
@@ -530,7 +639,10 @@ mod tests {
             now(),
         );
         let cap = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block);
-        assert_eq!(cap.evaluate(&snapshot), SpendDecision::Allowed);
+        assert_eq!(
+            cap.evaluate(&SpendScope::Repository, &snapshot),
+            SpendDecision::Allowed
+        );
     }
 
     #[test]
@@ -544,13 +656,37 @@ mod tests {
             now(),
         );
         let cap = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block);
-        let SpendDecision::Refused(message) = cap.evaluate(&snapshot) else {
+        let SpendDecision::Refused(message) = cap.evaluate(&SpendScope::Repository, &snapshot)
+        else {
             panic!("expected a refusal");
         };
         assert!(message.contains("$6.0000"), "{message}");
         assert!(message.contains("$5.0000"), "{message}");
+        assert!(message.contains("Repository"), "{message}");
         assert!(message.contains("spend.cap_usd"), "{message}");
         assert!(message.contains("spend.on_exceed"), "{message}");
+    }
+
+    #[test]
+    fn a_pool_cap_names_its_pool_and_the_pools_own_settings() {
+        let snapshot = PoolCostSnapshot::from_records(
+            &[record(
+                "worker-01",
+                Some("2026-10-15T09:00:00Z"),
+                Some(6_000_000),
+            )],
+            now(),
+        );
+        let cap = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block);
+        let scope = SpendScope::Pool(PoolName::parse("bugs").expect("pool name"));
+        let SpendDecision::Refused(message) = cap.evaluate(&scope, &snapshot) else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("pool `bugs`"), "{message}");
+        assert!(message.contains("pools.bugs.cap_usd"), "{message}");
+        assert!(message.contains("pools.bugs.on_exceed"), "{message}");
+        // The Repository's own settings are not the dial for a pool cap.
+        assert!(!message.contains("spend.cap_usd"), "{message}");
     }
 
     #[test]
@@ -564,7 +700,8 @@ mod tests {
             now(),
         );
         let cap = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Warn);
-        let SpendDecision::Warned(message) = cap.evaluate(&snapshot) else {
+        let SpendDecision::Warned(message) = cap.evaluate(&SpendScope::Repository, &snapshot)
+        else {
             panic!("expected a warning");
         };
         assert!(message.contains("dispatching anyway"), "{message}");
@@ -582,10 +719,13 @@ mod tests {
             now(),
         );
         let week = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block);
-        assert_eq!(week.evaluate(&snapshot), SpendDecision::Allowed);
+        assert_eq!(
+            week.evaluate(&SpendScope::Repository, &snapshot),
+            SpendDecision::Allowed
+        );
         let total = SpendCap::new(5_000_000, SpendWindow::Total, SpendCapMode::Block);
         assert!(matches!(
-            total.evaluate(&snapshot),
+            total.evaluate(&SpendScope::Repository, &snapshot),
             SpendDecision::Refused(_)
         ));
     }
@@ -678,5 +818,160 @@ mod tests {
                 .cost_micro_usd(),
             2_000_000
         );
+    }
+
+    /// A one-Run snapshot costing `cost_micro_usd` inside every window.
+    fn spent(cost_micro_usd: u64) -> PoolCostSnapshot {
+        PoolCostSnapshot::from_records(
+            &[record(
+                "worker-01",
+                Some("2026-10-15T09:00:00Z"),
+                Some(cost_micro_usd),
+            )],
+            now(),
+        )
+    }
+
+    fn bugs() -> SpendScope {
+        SpendScope::Pool(PoolName::parse("bugs").expect("pool name"))
+    }
+
+    #[test]
+    fn every_limit_under_its_cap_allows_dispatch() {
+        let repository = spent(1_000_000);
+        let pool = spent(1_000_000);
+        let decision = evaluate_spend([
+            SpendLimit::new(
+                SpendScope::Repository,
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block),
+                repository,
+            ),
+            SpendLimit::new(
+                bugs(),
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block),
+                pool,
+            ),
+        ]);
+        assert_eq!(decision, SpendDecision::Allowed);
+    }
+
+    #[test]
+    fn no_limits_at_all_allow_dispatch() {
+        assert_eq!(evaluate_spend([]), SpendDecision::Allowed);
+    }
+
+    #[test]
+    fn the_tighter_pool_cap_is_named_when_both_limits_fire() {
+        // The pool's $5 cap is tighter than the Repository's $10 ceiling, so the
+        // pool is the dial - even though the ceiling has also run out.
+        let repository = spent(11_000_000);
+        let pool = spent(6_000_000);
+        let SpendDecision::Refused(message) = evaluate_spend([
+            SpendLimit::new(
+                SpendScope::Repository,
+                SpendCap::new(10_000_000, SpendWindow::Week, SpendCapMode::Block),
+                repository,
+            ),
+            SpendLimit::new(
+                bugs(),
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block),
+                pool,
+            ),
+        ]) else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("pool `bugs`"), "{message}");
+        assert!(!message.contains("Repository"), "{message}");
+    }
+
+    #[test]
+    fn the_repository_ceiling_is_named_when_the_pool_still_has_room() {
+        // The pool is well under its cap; only the ceiling has run out, so the
+        // refusal names the Repository rather than sending the owner to a pool.
+        let repository = spent(11_000_000);
+        let pool = spent(1_000_000);
+        let SpendDecision::Refused(message) = evaluate_spend([
+            SpendLimit::new(
+                SpendScope::Repository,
+                SpendCap::new(10_000_000, SpendWindow::Week, SpendCapMode::Block),
+                repository,
+            ),
+            SpendLimit::new(
+                bugs(),
+                SpendCap::new(50_000_000, SpendWindow::Week, SpendCapMode::Block),
+                pool,
+            ),
+        ]) else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("Repository"), "{message}");
+        assert!(message.contains("spend.cap_usd"), "{message}");
+        assert!(!message.contains("pool `bugs`"), "{message}");
+    }
+
+    #[test]
+    fn a_blocking_limit_outranks_a_warning_one() {
+        // The pool is in warn mode, the ceiling blocks: the Dispatch is refused,
+        // because every limit has to have room for it to proceed.
+        let repository = spent(11_000_000);
+        let pool = spent(6_000_000);
+        let SpendDecision::Refused(message) = evaluate_spend([
+            SpendLimit::new(
+                SpendScope::Repository,
+                SpendCap::new(10_000_000, SpendWindow::Week, SpendCapMode::Block),
+                repository,
+            ),
+            SpendLimit::new(
+                bugs(),
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Warn),
+                pool,
+            ),
+        ]) else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("Repository"), "{message}");
+    }
+
+    #[test]
+    fn a_lone_warning_limit_proceeds_with_its_overage() {
+        let repository = spent(1_000_000);
+        let pool = spent(6_000_000);
+        let SpendDecision::Warned(message) = evaluate_spend([
+            SpendLimit::new(
+                SpendScope::Repository,
+                SpendCap::new(50_000_000, SpendWindow::Week, SpendCapMode::Block),
+                repository,
+            ),
+            SpendLimit::new(
+                bugs(),
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Warn),
+                pool,
+            ),
+        ]) else {
+            panic!("expected a warning");
+        };
+        assert!(message.contains("pool `bugs`"), "{message}");
+        assert!(message.contains("dispatching anyway"), "{message}");
+    }
+
+    #[test]
+    fn an_equally_tight_tie_names_the_repository() {
+        let repository = spent(6_000_000);
+        let pool = spent(6_000_000);
+        let SpendDecision::Refused(message) = evaluate_spend([
+            SpendLimit::new(
+                SpendScope::Repository,
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block),
+                repository,
+            ),
+            SpendLimit::new(
+                bugs(),
+                SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block),
+                pool,
+            ),
+        ]) else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("Repository"), "{message}");
     }
 }

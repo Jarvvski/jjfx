@@ -35,7 +35,10 @@ mod worker_actions;
 mod workspace;
 
 pub(crate) use atomic::write_atomic_bytes;
-pub use cost::{PoolCost, PoolCostSnapshot, SpendCap, SpendCapMode, SpendDecision, SpendWindow};
+pub use cost::{
+    PoolCost, PoolCostSnapshot, SpendCap, SpendCapMode, SpendDecision, SpendLimit, SpendScope,
+    SpendWindow, evaluate_spend,
+};
 pub use direct_dispatch::{
     DirectDispatch, DirectDispatchError, DirectDispatchExecution, DirectDispatchFailure,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest, DirectDispatchResult,

@@ -36,8 +36,7 @@ use crate::cli_help::{
     STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{
-    Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, SpendConfig, TicketSource,
-    TicketsConfig,
+    Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, TicketSource, TicketsConfig,
 };
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision,
@@ -46,11 +45,11 @@ use crate::engine::{
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
     FollowUpExecution, FollowUpOutcome, Loaded, OrchestrationEvent, PoolCapacity, PoolCostSnapshot,
     PoolName, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets, Repository, ReviewLoop,
-    RunActivity, RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendWindow,
-    StuckWindow, SyncAction, TerminalSettings, TicketDetails, TicketDiscovery, TicketId,
-    TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent, WorkerActions, WorkerId,
-    WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus, WorkspaceAddOutcome,
-    WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
+    RunActivity, RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendDecision,
+    SpendLimit, SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
+    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
+    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::reviewer_source::configured_reviewer;
@@ -1188,8 +1187,6 @@ pub struct Settings {
     /// Where Dispatch discovers Ready Tickets, resolved for the Repository the
     /// command acts on so its own `[tickets]` selection is honoured.
     pub tickets: fn(&Repository) -> Result<TicketsConfig>,
-    /// The aggregate spend cap Dispatch is gated on.
-    pub spend: fn() -> Result<SpendConfig>,
     /// How the migration-order check finds migrations.
     pub migrations: fn() -> Result<MigrationsConfig>,
 }
@@ -1203,7 +1200,6 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         colocate,
         open_workspaces,
         tickets,
-        spend,
         migrations,
     } = settings;
     match parse(&args)? {
@@ -1223,13 +1219,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
         Command::Clean => clean_command(&repository(colocate)?)?,
         Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
-        Command::Dispatch(args) => dispatch_command(
-            &repository(colocate)?,
-            &args,
-            open_workspaces,
-            tickets,
-            spend,
-        )?,
+        Command::Dispatch(args) => {
+            dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
+        }
         Command::Send {
             worker,
             prompt,
@@ -2861,7 +2853,8 @@ fn dispatch_all_across_pools(
     args: &DispatchArgs,
     routes: &[PoolRoute],
     tickets_config: fn(&Repository) -> Result<TicketsConfig>,
-    spend_config: fn() -> Result<SpendConfig>,
+    user_config: &Config,
+    repo_config: &RepoConfig,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
 ) -> Result<()> {
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
@@ -2889,8 +2882,9 @@ fn dispatch_all_across_pools(
         // so a Ticket whose Run completed since the last Dispatch resolves and
         // readies its dependent in this same fan-out.
         write_back_local_tickets(&scoped, &tickets);
-        if let Some(warning) = spend_gate(&scoped, spend_config)? {
-            eprintln!("{warning}");
+        let spend_decision = spend_gate(&scoped, repo_config, user_config)?;
+        if let SpendDecision::Warned(message) = &spend_decision {
+            eprintln!("{message}");
         }
         eprintln!(
             "Fetching tickets with label '{}' for pool '{}'...",
@@ -2917,8 +2911,16 @@ fn dispatch_all_across_pools(
         }
         let requests =
             ready_ticket_requests(&scoped, args, &discovery, &ready, &ticket_hint, &model)?;
-        let exclusions = dispatch_exclusions(&scoped, args.force, open_workspaces)?;
-        let result = dispatch_with_capacity_prompt(&scoped, &requests, &exclusions)?;
+        // A pool whose cap has run out holds its Tickets back rather than firing
+        // any of them, so the fan-out reports one lane held instead of aborting
+        // the others. Holding reserves no Worker, so it needs no exclusion query.
+        let result = match &spend_decision {
+            SpendDecision::Refused(message) => scoped.direct_dispatch().hold(&requests, message),
+            _ => {
+                let exclusions = dispatch_exclusions(&scoped, args.force, open_workspaces)?;
+                dispatch_with_capacity_prompt(&scoped, &requests, &exclusions)?
+            }
+        };
         entries.extend(result.outcomes().iter().map(DispatchEntry::from_outcome));
         routed.extend(
             ready
@@ -2972,9 +2974,17 @@ fn dispatch_all_across_pools(
             .filter(|entry| matches!(entry, DispatchEntry::Waiting { .. }))
             .count();
         if held > 0 {
-            eprintln!(
-                "Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes."
-            );
+            // The reason is the binding limit a pool's capacity governor or
+            // spend gate named, so a held lane reads as deliberately held rather
+            // than as a silent drop.
+            let reason = entries
+                .iter()
+                .find_map(|entry| match entry {
+                    DispatchEntry::Waiting { detail, .. } => Some(detail.as_str()),
+                    _ => None,
+                })
+                .unwrap_or("held back");
+            eprintln!("Held {held} ticket(s) back: {reason}");
         }
     }
     ensure_dispatch_progressed(&entries)?;
@@ -2986,9 +2996,13 @@ fn dispatch_command(
     args: &DispatchArgs,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
     tickets_config: fn(&Repository) -> Result<TicketsConfig>,
-    spend_config: fn() -> Result<SpendConfig>,
 ) -> Result<()> {
+    // The Repository's own settings are read once, before anything is gated,
+    // reserved or launched: they name the pools this Dispatch may fill, carry the
+    // routing labels `--all` fans out over, and hold the declarations - a pool's
+    // spend cap among them - the gate reads.
     let config = crate::config::load()?;
+    let repo_config = config.repo_config(repository.root())?;
     let available = config.pool_names_for(repository.root())?;
     let routes = config.pool_routes_for(repository.root())?;
 
@@ -3003,7 +3017,8 @@ fn dispatch_command(
             args,
             &routes,
             tickets_config,
-            spend_config,
+            &config,
+            &repo_config,
             open_workspaces,
         );
     }
@@ -3029,11 +3044,18 @@ fn dispatch_command(
     let repository = &scoped;
 
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
-    // The spend gate runs before anything is reserved or launched, including the
-    // orchestration handoff below, so a blocked cap refuses the whole Dispatch.
-    let spend_warning = spend_gate(repository, spend_config)?;
-    if let Some(warning) = spend_warning {
-        eprintln!("{warning}");
+    // Every spend limit is evaluated before anything is reserved or launched,
+    // including the orchestration handoff below, so a blocked limit refuses the
+    // whole Dispatch. A limit in warn mode reports and proceeds. A blocked limit
+    // holds a discovered (`--all`) batch back visibly below; an explicit Dispatch
+    // refuses loudly here, because the owner named the Ticket rather than asking
+    // for whatever fits.
+    let spend_decision = spend_gate(repository, &repo_config, &config)?;
+    match &spend_decision {
+        SpendDecision::Allowed => {}
+        SpendDecision::Warned(message) => eprintln!("{message}"),
+        SpendDecision::Refused(message) if !args.all => bail!("{message}"),
+        SpendDecision::Refused(_) => {}
     }
 
     // A Ticket handed in directly is an input to Direct Dispatch, not a source
@@ -3092,7 +3114,15 @@ fn dispatch_command(
         return Ok(());
     }
 
-    let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
+    // A refused `--all` batch is held back rather than fired, and holding
+    // reserves no Worker, so it needs no exclusion query: asking the terminal
+    // anyway would let an unreachable terminal mask the spend hold it is about
+    // to report.
+    let exclusions = if matches!(&spend_decision, SpendDecision::Refused(_)) {
+        DispatchExclusions::default()
+    } else {
+        dispatch_exclusions(repository, args.force, open_workspaces)?
+    };
     let tickets = tickets_config(repository)?;
     let ticket_hint = ticket_source_hint(&tickets, repository);
     // Reconcile finished Tickets before discovering ready work, so a Ticket whose
@@ -3140,7 +3170,17 @@ fn dispatch_command(
         }
         let requests =
             ready_ticket_requests(repository, args, &discovery, &ready, &ticket_hint, &model)?;
-        let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
+        // A blocked spend limit holds the whole discovered batch back rather
+        // than firing any of it: nothing is attempted and nothing is reserved,
+        // and every Ticket stays visible in `waiting` with the binding limit as
+        // its reason. That is the difference from an explicit Dispatch above,
+        // which refuses loudly because the owner named the Ticket.
+        let result = match &spend_decision {
+            SpendDecision::Refused(message) => {
+                repository.direct_dispatch().hold(&requests, message)
+            }
+            _ => dispatch_with_capacity_prompt(repository, &requests, &exclusions)?,
+        };
         let entries = render_dispatch_result(&result, requests.len(), true, args.json);
         write_back_local_tickets(repository, &tickets);
         ensure_dispatch_progressed(&entries)?;
@@ -3221,26 +3261,37 @@ fn dispatch_exclusions(
     Ok(crate::engine::reconcile_occupancy(repository, &open))
 }
 
-/// Evaluates the configured aggregate spend cap for one Dispatch.
+/// Evaluates every spend limit that applies to one Dispatch.
 ///
-/// `Ok(None)` when Dispatch is under the cap or no cap is configured; `Ok(Some)`
-/// with the warning message when it is over the cap in `warn` mode; an error
-/// naming the cap and its override when the cap is reached in `block` mode.
-/// A cap that cannot be evaluated because the record store is unreadable is
-/// also an error: failing closed is the only safe answer for a spend gate.
+/// The selected pool's own cap totals that pool's records; the Repository
+/// ceiling totals every pool's. Both bind, so Dispatch proceeds only when each
+/// limit has room, and the most restrictive fired limit is the one named - the
+/// pool when its cap is the tighter constraint, the Repository when the ceiling
+/// is, because the ceiling is the dial that unblocks every pool. `--budget` is a
+/// cap inside both: it stays a per-Dispatch limit and composes by this same rule,
+/// never refusing on its own because it is the allowance for the Run it bounds
+/// rather than an accumulated total. A limit that cannot be evaluated because
+/// the record store is unreadable is an error: failing closed is the only safe
+/// answer for a spend gate.
 fn spend_gate(
     repository: &Repository,
-    spend_config: fn() -> Result<SpendConfig>,
-) -> Result<Option<String>> {
-    let Some(cap) = spend_config()?.cap()? else {
-        return Ok(None);
-    };
-    let snapshot = repository.pool_cost()?;
-    match cap.evaluate(&snapshot) {
-        crate::engine::SpendDecision::Allowed => Ok(None),
-        crate::engine::SpendDecision::Warned(message) => Ok(Some(message)),
-        crate::engine::SpendDecision::Refused(message) => Err(anyhow::anyhow!(message)),
+    repo_config: &RepoConfig,
+    user_config: &Config,
+) -> Result<SpendDecision> {
+    let mut limits = Vec::new();
+    if let Some(cap) = user_config.spend.cap()? {
+        let names = repo_config.pool_names()?;
+        let spend = repository.repository_cost(&names)?;
+        limits.push(SpendLimit::new(SpendScope::Repository, cap, spend));
     }
+    let pool = repository.selected_pool();
+    if let Some(declaration) = repo_config.pools.get(pool.as_str())
+        && let Some(cap) = declaration.spend_cap(&user_config.spend)?
+    {
+        let spend = repository.pool_cost()?;
+        limits.push(SpendLimit::new(SpendScope::Pool(pool.clone()), cap, spend));
+    }
+    Ok(crate::engine::evaluate_spend(limits))
 }
 
 /// A live occupancy source for the orchestration runner.
@@ -3400,7 +3451,18 @@ fn render_dispatch_result(
     }
     let held = result.waiting().len();
     if held > 0 {
-        eprintln!("Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes.");
+        // The reason is the binding limit the capacity governor or the spend gate
+        // named, so a spend hold reads as deliberately held rather than as a
+        // silent drop, and the message never guesses "capacity" for a cap that is
+        // about spend.
+        let reason = entries
+            .iter()
+            .find_map(|entry| match entry {
+                DispatchEntry::Waiting { detail, .. } => Some(detail.as_str()),
+                _ => None,
+            })
+            .unwrap_or("held back");
+        eprintln!("Held {held} ticket(s) back: {reason}");
     }
     entries
 }
@@ -6259,51 +6321,143 @@ mod tests {
         );
     }
 
+    /// A user config whose Repository-wide ceiling is `cap_usd` in `mode`.
+    ///
+    /// Parsed from TOML rather than built by struct update: [`Config`] keeps a
+    /// private legacy field, so its only public constructors are parsing and
+    /// [`Config::default`].
+    fn config_with_spend(cap_usd: f64, mode: SpendCapMode) -> Config {
+        let text = format!(
+            "[spend]\ncap_usd = {cap_usd}\non_exceed = \"{}\"\n",
+            mode.as_str()
+        );
+        toml::from_str(&text).expect("valid spend config")
+    }
+
+    /// A repository-local config declaring `default`'s own cap.
+    fn repo_config_with_pool_cap(cap_usd: f64, mode: SpendCapMode) -> RepoConfig {
+        let declaration = PoolConfig {
+            cap_usd: Some(cap_usd),
+            on_exceed: Some(mode),
+            ..PoolConfig::default()
+        };
+        RepoConfig {
+            pools: [("default".to_owned(), declaration)].into_iter().collect(),
+            ..RepoConfig::default()
+        }
+    }
+
     #[test]
     fn the_dispatch_spend_gate_allows_warns_and_blocks() {
         let temp = tempfile::tempdir().expect("temp repository");
         std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
         let repository = Repository::open(temp.path()).expect("repository");
         append_run(&repository, "worker-01", Some(6_000_000));
+        let no_pools = RepoConfig::default();
 
         // No cap configured: Dispatch is never gated.
         assert_eq!(
-            spend_gate(&repository, || Ok(SpendConfig::default())).expect("no cap"),
-            None
+            spend_gate(&repository, &no_pools, &Config::default()).expect("no cap"),
+            SpendDecision::Allowed
         );
 
         // Under the cap: allowed.
-        let under = || {
-            Ok(SpendConfig {
-                cap_usd: Some(10.0),
-                ..SpendConfig::default()
-            })
-        };
-        assert_eq!(spend_gate(&repository, under).expect("under"), None);
+        let under = config_with_spend(10.0, SpendCapMode::Block);
+        assert_eq!(
+            spend_gate(&repository, &no_pools, &under).expect("under"),
+            SpendDecision::Allowed
+        );
 
         // Over the cap in warn mode: a message, and Dispatch proceeds.
-        let warn = || {
-            Ok(SpendConfig {
-                cap_usd: Some(5.0),
-                on_exceed: crate::engine::SpendCapMode::Warn,
-                ..SpendConfig::default()
-            })
+        let warn = config_with_spend(5.0, SpendCapMode::Warn);
+        let SpendDecision::Warned(warning) =
+            spend_gate(&repository, &no_pools, &warn).expect("warn")
+        else {
+            panic!("expected a warning");
         };
-        let warning = spend_gate(&repository, warn)
-            .expect("warn")
-            .expect("a warning");
         assert!(warning.contains("dispatching anyway"), "{warning}");
 
-        // Over the cap in block mode: an error naming the cap and the override.
-        let block = || {
-            Ok(SpendConfig {
-                cap_usd: Some(5.0),
-                ..SpendConfig::default()
-            })
+        // Over the cap in block mode: a refusal naming the cap and the override.
+        let block = config_with_spend(5.0, SpendCapMode::Block);
+        let SpendDecision::Refused(message) =
+            spend_gate(&repository, &no_pools, &block).expect("blocked")
+        else {
+            panic!("expected a refusal");
         };
-        let error = spend_gate(&repository, block).expect_err("blocked");
-        assert!(error.to_string().contains("spend.cap_usd"), "{error}");
-        assert!(error.to_string().contains("spend.on_exceed"), "{error}");
+        assert!(message.contains("Repository"), "{message}");
+        assert!(message.contains("spend.cap_usd"), "{message}");
+        assert!(message.contains("spend.on_exceed"), "{message}");
+    }
+
+    /// A pool's own cap binds on top of the ceiling, and the refusal names the
+    /// pool - its own setting is the dial, not the Repository's.
+    #[test]
+    fn the_dispatch_spend_gate_applies_a_pools_own_cap() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        append_run(&repository, "worker-01", Some(6_000_000));
+
+        let declared = repo_config_with_pool_cap(5.0, SpendCapMode::Block);
+        let SpendDecision::Refused(message) =
+            spend_gate(&repository, &declared, &Config::default()).expect("pool cap")
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("pool `default`"), "{message}");
+        assert!(message.contains("pools.default.cap_usd"), "{message}");
+        assert!(!message.contains("spend.cap_usd"), "{message}");
+
+        // The pool's cap defaults its window and mode to the global ceiling, so
+        // a declaration that states only `cap_usd` still gates.
+        let global_warn = config_with_spend(50.0, SpendCapMode::Warn);
+        let declaration = PoolConfig {
+            cap_usd: Some(5.0),
+            ..PoolConfig::default()
+        };
+        let declared = RepoConfig {
+            pools: [("default".to_owned(), declaration)].into_iter().collect(),
+            ..RepoConfig::default()
+        };
+        let SpendDecision::Warned(message) =
+            spend_gate(&repository, &declared, &global_warn).expect("inherited warn mode")
+        else {
+            panic!("expected a warning");
+        };
+        assert!(message.contains("pools.default.on_exceed"), "{message}");
+    }
+
+    /// Both limits bind: the tighter pool cap wins when both fire, and the
+    /// Repository ceiling wins when only it has run out.
+    #[test]
+    fn the_dispatch_spend_gate_names_the_most_restrictive_limit() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        // `default` alone records $6, so it is over a $5 cap and the $6 ceiling.
+        append_run(&repository, "worker-01", Some(6_000_000));
+
+        // A $5 pool cap under a $10 ceiling: the pool is the tighter dial.
+        let pool_tighter = config_with_spend(10.0, SpendCapMode::Block);
+        let declared = repo_config_with_pool_cap(5.0, SpendCapMode::Block);
+        let SpendDecision::Refused(message) =
+            spend_gate(&repository, &declared, &pool_tighter).expect("pool cap")
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("pool `default`"), "{message}");
+
+        // A $5 ceiling over a $50 pool cap: the ceiling has run out while the
+        // pool still has room, so the refusal names the Repository.
+        let ceiling_tighter = config_with_spend(5.0, SpendCapMode::Block);
+        let declared = repo_config_with_pool_cap(50.0, SpendCapMode::Block);
+        let SpendDecision::Refused(message) =
+            spend_gate(&repository, &declared, &ceiling_tighter).expect("ceiling")
+        else {
+            panic!("expected a refusal");
+        };
+        assert!(message.contains("Repository"), "{message}");
+        assert!(message.contains("spend.cap_usd"), "{message}");
     }
 
     /// Appends one completed Run record to `repository`'s store.

@@ -422,6 +422,23 @@ impl DirectDispatch {
         Ok(self.finish(result, waiting))
     }
 
+    /// Records a whole batch as held back without firing any of it.
+    ///
+    /// The spend gate's block mode holds every Ticket in a discovered batch
+    /// rather than firing the subset that fits: nothing is attempted and nothing
+    /// is reserved, and each Ticket is written to the waiting set with the
+    /// binding limit as its reason. That is the same set the capacity governor
+    /// writes, so a frontend reports a spend hold exactly as it reports a
+    /// capacity hold - a cap that silently dropped work would be the failure the
+    /// dispatch-ergonomics batch was filed to remove.
+    pub fn hold(&self, requests: &[DirectDispatchRequest], detail: &str) -> DirectDispatchResult {
+        let waiting = requests
+            .iter()
+            .map(|request| DirectDispatchWaiting::new(request.ticket().clone(), detail))
+            .collect();
+        self.finish(DirectDispatchResult::default(), waiting)
+    }
+
     /// Launches a previously persisted Reservation and transfers its ownership.
     pub fn dispatch_reserved(
         &self,
