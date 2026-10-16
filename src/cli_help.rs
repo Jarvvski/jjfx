@@ -158,6 +158,13 @@ pub(crate) const RM_FLAGS: &[Flag] = &[Flag {
     help: "Remove even a workspace with uncommitted work",
 }];
 
+pub(crate) const CLEAN_FLAGS: &[Flag] = &[Flag {
+    long: "--pool",
+    short: None,
+    value: Some("NAME"),
+    help: "Remove only this Worker Pool's workspaces (default: every workspace)",
+}];
+
 pub(crate) const STATUS_FLAGS: &[Flag] = &[Flag {
     long: "--json",
     short: None,
@@ -431,8 +438,8 @@ const TOP_LEVEL: &[Group] = &[
             },
             Entry {
                 key: "clean",
-                args: "",
-                summary: "Remove all non-default workspaces",
+                args: "[--pool <name>]",
+                summary: "Remove non-default workspaces",
             },
             Entry {
                 key: "root",
@@ -660,10 +667,10 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "clean",
-        summary: "Remove every non-default workspace, after one confirmation",
-        usage: "clean",
+        summary: "Remove non-default workspaces, whole-repo or one pool",
+        usage: "clean [--pool <name>]",
         arguments: &[],
-        flags: NO_FLAGS,
+        flags: CLEAN_FLAGS,
     },
     CommandHelp {
         key: "root",

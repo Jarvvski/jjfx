@@ -1,7 +1,7 @@
 # `clean --pool`
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 02
 
 ## Problem
@@ -19,11 +19,11 @@ This ticket is only the `Clean` half; the other three were confirmed as needing 
 
 ## Acceptance Criteria
 
-- [ ] `clean --pool <name>` removes only that pool's non-default Workspaces.
-- [ ] The default stays Repository-wide, so existing invocations are unchanged.
-- [ ] An unknown pool name is a loud error naming the pools that exist.
-- [ ] `Tidy`, `Lift`, `Reset` and `Dismiss` are untouched.
-- [ ] `mise run check` is green.
+- [x] `clean --pool <name>` removes only that pool's non-default Workspaces.
+- [x] The default stays Repository-wide, so existing invocations are unchanged.
+- [x] An unknown pool name is a loud error naming the pools that exist.
+- [x] `Tidy`, `Lift`, `Reset` and `Dismiss` are untouched.
+- [x] `mise run check` is green.
 
 ## References
 
