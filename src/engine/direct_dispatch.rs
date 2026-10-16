@@ -658,7 +658,7 @@ impl DirectDispatch {
                         String::from_utf8_lossy(&output.stderr).trim().to_owned(),
                     ));
                 }
-                String::from_utf8_lossy(&output.stdout)
+                let slug = String::from_utf8_lossy(&output.stdout)
                     .lines()
                     .find_map(|line| {
                         let mut fields = line.split_whitespace();
@@ -667,7 +667,14 @@ impl DirectDispatch {
                             _ => None,
                         }
                     })
-                    .unwrap_or_default()
+                    .filter(|slug| !slug.is_empty());
+                slug.ok_or_else(|| {
+                    DirectDispatchError::Identity(
+                        "no `origin` remote to derive an owner/name slug from; add one with \
+                         `jj git remote add origin <url>` (or set the pool's `gh_repo`)"
+                            .to_owned(),
+                    )
+                })?
             }
         };
         RepositoryIdentity::parse(slug)
