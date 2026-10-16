@@ -431,12 +431,15 @@ where
         let request = TicketQueryRequest::ReadyTickets {
             filter: filter.clone(),
         };
-        let payload: RawReadyTickets = self.query_payload(&request)?;
-        let mut tickets = Vec::with_capacity(payload.tickets.len());
+        let RawReadyTickets {
+            tickets: raw_tickets,
+            diagnostics: raw_diagnostics,
+        } = self.query_payload(&request)?;
+        let mut tickets = Vec::with_capacity(raw_tickets.len());
         let mut blockers = BTreeMap::new();
         let mut diagnostics = Vec::new();
         let mut seen = BTreeSet::new();
-        for raw in payload.tickets {
+        for raw in raw_tickets {
             match ready_ticket(raw, &filter.label, &filter.status) {
                 Ok((ticket, declared)) => {
                     // A provider can return the same Ready Ticket twice. Keep it
@@ -456,6 +459,13 @@ where
                 }
                 Err(diagnostic) => diagnostics.push(diagnostic),
             }
+        }
+        // A source can report why it excluded a Ticket it knows about but did not
+        // return as ready - a local Ticket that is blocked or carries the wrong
+        // `Status:`. Carry those through the same channel, so an empty Ready set
+        // explains itself instead of collapsing to a plausible-looking zero.
+        for raw in raw_diagnostics {
+            diagnostics.push(DiscoveryDiagnostic::new(raw.subject, raw.reason));
         }
         Ok(ReadyTickets {
             tickets,
@@ -664,6 +674,18 @@ impl QueryAttemptError {
 #[derive(Debug, Deserialize)]
 struct RawReadyTickets {
     tickets: Vec<RawTicket>,
+    /// Reasons the source itself gives for excluding a Ticket it knows about but
+    /// did not return as ready - a blocked or wrong-status local Ticket. A source
+    /// that reports none leaves this empty, so the field is optional.
+    #[serde(default)]
+    diagnostics: Vec<RawDiagnostic>,
+}
+
+/// One source-reported reason a Ticket was excluded from the Ready set.
+#[derive(Debug, Deserialize)]
+struct RawDiagnostic {
+    subject: String,
+    reason: String,
 }
 
 #[derive(Debug, Deserialize)]

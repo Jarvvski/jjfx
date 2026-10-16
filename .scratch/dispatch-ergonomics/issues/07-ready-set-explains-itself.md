@@ -1,6 +1,6 @@
 # The ready set must say why it is empty
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -48,3 +48,4 @@ No tickets found with label 'ready-for-agent'.
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive.
+- 2026-10-16: Resolved. The local source now reports why it excluded a well-formed Ticket instead of dropping it: `LocalTickets::not_ready_reason` names a Ticket whose `Status:` is not the ready status (`expected status "ready-for-agent", found "claimed"`) or whose `Blocked by:` sibling is unresolved (naming the blocker's id and status, e.g. `blocked by widgets--01-foundation (claimed)`), and `ready_payload` emits those through a new `diagnostics` array on the `ReadyTickets` payload that `TicketDiscovery::ready_tickets` folds into `ReadyTickets::diagnostics`. A resolved Ticket is deliberately not reported, so a genuinely finished repository still reads as nothing to do. `cli::dispatch_command`'s `--all` path renders the diagnostics on both paths: prose prints `No ready tickets with label '<label>':` followed by one line per skipped Ticket, and `--json` emits a `DispatchEntry::Skipped` object (`outcome: "skipped"`, `worker`/`phase`/`pid` null, `detail` the reason) instead of a bare `[]`. Tests cover a blocked Ticket, an unknown blocker, a wrong-status Ticket, a resolved-only repository, and the empty JSON array, plus CLI JSON and prose integration tests. `mise run check` is green and `momo add` records the change.

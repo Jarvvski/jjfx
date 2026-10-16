@@ -236,6 +236,83 @@ fn dispatch_all_json_reports_an_empty_batch_as_an_empty_array() {
 }
 
 #[test]
+fn dispatch_all_json_explains_an_empty_ready_set() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: claimed\n",
+    );
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "02-dependent.md",
+        "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+    );
+
+    // Nothing is ready: 01 is in flight and 02 is blocked by it. The batch must
+    // not read as a bare `[]` - each Ticket it skipped and why is in the JSON.
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["dispatch", "--all", "--json", "--force"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(output.status.success(), "{:?}", output);
+    let value: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&output.stdout).trim()).expect("valid JSON");
+    let entries = value.as_array().expect("an array of skipped entries");
+    let skipped = |ticket: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["ticket"] == ticket)
+            .unwrap_or_else(|| panic!("no skipped entry for {ticket}: {value}"))
+    };
+    assert_eq!(skipped("widgets--01-foundation")["outcome"], "skipped");
+    assert_eq!(
+        skipped("widgets--02-dependent")["detail"],
+        "blocked by widgets--01-foundation (claimed)"
+    );
+}
+
+#[test]
+fn dispatch_all_prose_explains_an_empty_ready_set() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: claimed\n",
+    );
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "02-dependent.md",
+        "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["dispatch", "--all", "--force"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(output.status.success(), "{:?}", output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("No ready tickets with label 'ready-for-agent'"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("widgets--02-dependent blocked by widgets--01-foundation (claimed)"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn dispatch_all_with_an_empty_ready_set_reconciles_finished_tickets() {
     let (repository, config_home) = jj_repository();
     write_ticket(

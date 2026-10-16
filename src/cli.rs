@@ -1706,16 +1706,30 @@ fn dispatch_command(
         let filter = ReadyTicketFilter::new(&args.label, status)?;
         eprintln!("Fetching tickets with label '{}'...", args.label);
         let ready = discovery.ready_tickets(&filter)?;
-        for diagnostic in ready.diagnostics() {
-            eprintln!("{}: {}", diagnostic.subject(), diagnostic.reason());
-        }
         if ready.tickets().is_empty() {
+            // An empty ready set must explain itself: name every Ticket that was
+            // discovered but not ready (blocked, wrong status, or malformed), so
+            // a caller can tell "nothing to do" from "nothing can be done".
+            let skipped = ready
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| DispatchEntry::Skipped {
+                    ticket: diagnostic.subject().to_owned(),
+                    detail: diagnostic.reason().to_owned(),
+                })
+                .collect::<Vec<_>>();
             if args.json {
-                render_dispatch_entries(&[], true);
-            } else {
+                render_dispatch_entries(&skipped, true);
+            } else if skipped.is_empty() {
                 eprintln!("No tickets found with label '{}'", args.label);
+            } else {
+                eprintln!("No ready tickets with label '{}':", args.label);
+                eprint!("{}", dispatch_prose(&skipped));
             }
             return Ok(());
+        }
+        for diagnostic in ready.diagnostics() {
+            eprintln!("{}: {}", diagnostic.subject(), diagnostic.reason());
         }
         let requests = ready
             .tickets()
@@ -1995,6 +2009,8 @@ enum DispatchEntry {
     },
     /// The capacity governor held the Ticket back; nothing was attempted.
     Waiting { ticket: String, detail: String },
+    /// The Ticket was discovered but is not ready to run; the detail says why.
+    Skipped { ticket: String, detail: String },
     /// The Ticket was handed to the Orchestrator rather than a single Worker.
     Orchestrating { ticket: String, detail: String },
 }
@@ -2040,6 +2056,7 @@ impl DispatchEntry {
             Self::Dispatched { ticket, .. }
             | Self::Failed { ticket, .. }
             | Self::Waiting { ticket, .. }
+            | Self::Skipped { ticket, .. }
             | Self::Orchestrating { ticket, .. } => ticket,
         }
     }
@@ -2050,6 +2067,7 @@ impl DispatchEntry {
             Self::Dispatched { .. } => "dispatched",
             Self::Failed { .. } => "failed",
             Self::Waiting { .. } => "waiting",
+            Self::Skipped { .. } => "skipped",
             Self::Orchestrating { .. } => "orchestrating",
         }
     }
@@ -2059,7 +2077,7 @@ impl DispatchEntry {
         match self {
             Self::Dispatched { worker, .. } => Some(worker),
             Self::Failed { worker, .. } => worker.as_deref(),
-            Self::Waiting { .. } | Self::Orchestrating { .. } => None,
+            Self::Waiting { .. } | Self::Skipped { .. } | Self::Orchestrating { .. } => None,
         }
     }
 
@@ -2085,6 +2103,7 @@ impl DispatchEntry {
             Self::Dispatched { detail, .. }
             | Self::Failed { detail, .. }
             | Self::Waiting { detail, .. }
+            | Self::Skipped { detail, .. }
             | Self::Orchestrating { detail, .. } => detail,
         }
     }
@@ -2128,6 +2147,9 @@ fn dispatch_prose(entries: &[DispatchEntry]) -> String {
             } => out.push_str(&format!("  {ticket} failed at {phase:?}: {detail}\n")),
             DispatchEntry::Waiting { ticket, detail } => {
                 out.push_str(&format!("  {ticket} waiting: {detail}\n"));
+            }
+            DispatchEntry::Skipped { ticket, detail } => {
+                out.push_str(&format!("  {ticket} {detail}\n"));
             }
             DispatchEntry::Orchestrating { ticket, .. } => {
                 out.push_str(&format!("Orchestrating {ticket} in background\n"));
@@ -3134,6 +3156,29 @@ mod tests {
     #[test]
     fn dispatch_json_is_an_empty_array_when_no_ticket_was_requested() {
         assert_eq!(dispatch_json(&[]), "[]");
+    }
+
+    #[test]
+    fn dispatch_json_reports_a_skipped_ticket_with_its_reason() {
+        let entries = vec![DispatchEntry::Skipped {
+            ticket: "widgets--02-dependent".to_owned(),
+            detail: "blocked by widgets--01-foundation (claimed)".to_owned(),
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&entries)).expect("valid JSON");
+
+        let entries = value.as_array().expect("one object per Ticket");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["ticket"], "widgets--02-dependent");
+        assert_eq!(entries[0]["outcome"], "skipped");
+        assert!(entries[0]["worker"].is_null());
+        assert!(entries[0]["phase"].is_null());
+        assert!(entries[0]["pid"].is_null());
+        assert_eq!(
+            entries[0]["detail"],
+            "blocked by widgets--01-foundation (claimed)"
+        );
     }
 
     #[test]

@@ -256,6 +256,7 @@ impl LocalTickets {
     fn ready_payload(&self, filter: &ReadyTicketFilter) -> Result<String, TicketQueryError> {
         let tickets = self.scan().map_err(TicketQueryError::from)?;
         let mut entries = Vec::new();
+        let mut diagnostics = Vec::new();
         for ticket in &tickets {
             if let Some(malformation) = ticket.malformation() {
                 // A malformed file must never be dropped silently: emit it so
@@ -272,9 +273,16 @@ impl LocalTickets {
                     "labels": [filter.label()],
                     "blocked_by": self.blocker_ids(ticket, &tickets),
                 }));
+                continue;
+            }
+            // A well-formed Ticket that is not ready is the case the bare `[]`
+            // used to hide: name it and say what stops it, so a caller can tell
+            // "nothing to do" from "nothing can be done".
+            if let Some(reason) = self.not_ready_reason(ticket, &tickets) {
+                diagnostics.push(json!({ "subject": ticket.id, "reason": reason }));
             }
         }
-        Ok(json!({ "tickets": entries }).to_string())
+        Ok(json!({ "tickets": entries, "diagnostics": diagnostics }).to_string())
     }
 
     /// Builds one Ticket's title and body for prompt inlining.
@@ -377,6 +385,53 @@ impl LocalTickets {
                 })
                 .is_some_and(|blocker| status_eq(&blocker.status, &self.resolved_status))
         })
+    }
+
+    /// Why a well-formed local Ticket is not in the Ready set, or `None` when it
+    /// is genuinely finished.
+    ///
+    /// A resolved Ticket is done, so its absence from the Ready set needs no
+    /// explanation and it is not reported. Every other Ticket is a candidate that
+    /// cannot run right now, and the reason names what stops it: a `Status:` that
+    /// is not the ready status, or the unresolved sibling(s) blocking it.
+    fn not_ready_reason(&self, ticket: &LocalTicket, tickets: &[LocalTicket]) -> Option<String> {
+        if status_eq(&ticket.status, &self.resolved_status) {
+            return None;
+        }
+        if !status_eq(&ticket.status, &self.ready_status) {
+            return Some(format!(
+                "expected status {:?}, found {:?}",
+                self.ready_status, ticket.status
+            ));
+        }
+        let unresolved = ticket
+            .blockers
+            .as_ref()?
+            .iter()
+            .filter_map(|number| self.unresolved_blocker(ticket, *number, tickets))
+            .collect::<Vec<_>>();
+        if unresolved.is_empty() {
+            return None;
+        }
+        Some(format!("blocked by {}", unresolved.join(", ")))
+    }
+
+    /// Describes one Blocker that is not yet resolved: its Ticket id and status,
+    /// or its bare number when no sibling in the feature declares it.
+    fn unresolved_blocker(
+        &self,
+        ticket: &LocalTicket,
+        number: u32,
+        tickets: &[LocalTicket],
+    ) -> Option<String> {
+        match tickets
+            .iter()
+            .find(|candidate| candidate.feature == ticket.feature && candidate.number == number)
+        {
+            Some(blocker) if status_eq(&blocker.status, &self.resolved_status) => None,
+            Some(blocker) => Some(format!("{} ({})", blocker.id, blocker.status)),
+            None => Some(format!("{number} (unknown)")),
+        }
     }
 }
 
@@ -881,6 +936,98 @@ mod tests {
 
         assert_eq!(ready.tickets().len(), 1);
         assert_eq!(ready.tickets()[0].id().as_str(), "widgets--01-foundation");
+    }
+
+    #[test]
+    fn a_blocked_ticket_reports_its_blocker_and_status() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: claimed\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        assert!(ready.tickets().is_empty(), "{:?}", ready.tickets());
+        // Both Tickets explain themselves: 01 is in flight, and 02 is blocked by
+        // the in-flight 01.
+        assert_eq!(ready.diagnostics().len(), 2, "{:?}", ready.diagnostics());
+        let dependent = ready
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.subject() == "widgets--02-dependent")
+            .expect("the dependent is reported");
+        assert_eq!(
+            dependent.reason(),
+            "blocked by widgets--01-foundation (claimed)"
+        );
+    }
+
+    #[test]
+    fn a_ticket_with_the_wrong_status_reports_it() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-in-flight.md",
+            "# In flight\n\nStatus: claimed\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        assert!(ready.tickets().is_empty(), "{:?}", ready.tickets());
+        assert_eq!(ready.diagnostics().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.diagnostics()[0].subject(), "widgets--01-in-flight");
+        assert_eq!(
+            ready.diagnostics()[0].reason(),
+            "expected status \"ready-for-agent\", found \"claimed\""
+        );
+    }
+
+    #[test]
+    fn a_ticket_blocked_by_an_unknown_sibling_names_the_number() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 99\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        assert_eq!(ready.diagnostics().len(), 1, "{:?}", ready.diagnostics());
+        assert_eq!(ready.diagnostics()[0].reason(), "blocked by 99 (unknown)");
+    }
+
+    #[test]
+    fn resolved_tickets_are_not_reported_as_skipped() {
+        // A genuinely empty Ready set - everything is done - must not read as
+        // "nothing can be done": a resolved Ticket needs no explanation.
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-done.md",
+            "# Done\n\nStatus: resolved\n",
+        );
+        let discovery = TicketDiscovery::new(source(temporary.path()));
+
+        let ready = discovery.ready_tickets(&ready_filter()).expect("discovery");
+
+        assert!(ready.tickets().is_empty(), "{:?}", ready.tickets());
+        assert!(ready.diagnostics().is_empty(), "{:?}", ready.diagnostics());
     }
 
     #[test]
