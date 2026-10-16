@@ -69,6 +69,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx logs stops following a Worker that has gone idle, so it no longer blocks forever on the log its last Run left behind: logs follows the current Run rather than the Worker, and a caller that wants the next Run re-attaches or uses jjfx wait.
 - jjfx pool resize <N> --pool <name> now reaches a materialised lane: it provisions or detaches the lane's Workers under the existing busy-Worker safety and moves the declaration to agree, so the size a user sets is the size jjfx status reports; previously it edited only the declaration, so a lane that had already materialised kept its old Workers and the edit looked like it worked but did nothing.
 - jjfx pool <N> now moves a declared [pools.default]'s size with the lane it describes: sizing default still provisions and detaches its Workers under the existing busy-Worker safety, and when the Repository declares [pools.default] the declaration is moved to agree, so the size a user sets is the size jjfx status reports; a Repository that declares no [pools.default] is untouched, so sizing an implicit default still writes state only and never grows a declaration.
+- jjfx pool list and jjfx status no longer write an unnamed 'pool state is absent' to stderr once per pool that has no state directory - a declared lane with no directory is normal, materialising on first use, and the WORKERS column already shows the absence - so a successful listing is silent.
 
 ## [0.55.0] - 2026-10-16
 

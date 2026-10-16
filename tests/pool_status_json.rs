@@ -164,6 +164,27 @@ fn status_json_reports_every_pool_and_its_workers() {
 }
 
 #[test]
+fn listing_declared_but_unmaterialised_pools_is_silent_on_stderr() {
+    let fixture = Fixture::new();
+    // Two declared lanes with no `.jj/pools/<name>/` directory, plus the
+    // implicit `default`, which is unmaterialised too. Absence is the normal
+    // case - a declared lane materialises on first use (ADR 0013) - so listing
+    // must not narrate it once per lane.
+    fixture.write_repo_config("[pools.alpha]\nsize = 1\n[pools.beta]\nsize = 2\n");
+    let output = fixture.jjfx(&["pool", "list"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        stderr(&output).is_empty(),
+        "a successful list must not narrate absence: {:?}",
+        stderr(&output)
+    );
+    // Dropping the fragment lost nothing: the table still names every lane.
+    let text = stdout(&output);
+    assert!(text.contains("alpha"), "{text}");
+    assert!(text.contains("beta"), "{text}");
+}
+
+#[test]
 fn status_prose_names_the_pool_its_spend_and_any_orphan() {
     let fixture = fixture();
     let output = fixture.jjfx(&["status"]);

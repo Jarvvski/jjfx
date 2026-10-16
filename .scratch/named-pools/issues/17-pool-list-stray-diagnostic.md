@@ -1,7 +1,7 @@
 # `pool list` prints an unnamed `pool state is absent` for every pool without state
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -34,9 +34,9 @@ Check whether the same fragment leaks from any other command; `status --json` di
 
 ## Acceptance Criteria
 
-- [ ] `pool list` on a Repository with declared-but-unmaterialised pools writes nothing to stderr.
-- [ ] A test covers it, so the fragment cannot come back.
-- [ ] `mise run check` is green.
+- [x] `pool list` on a Repository with declared-but-unmaterialised pools writes nothing to stderr.
+- [x] A test covers it, so the fragment cannot come back.
+- [x] `mise run check` is green.
 
 ## References
 
