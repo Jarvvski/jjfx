@@ -103,6 +103,9 @@ fn notes(key: &str) -> &'static str {
         "dispatch" => {
             "\n--fg blocks until every Run this Dispatch started has finished, inside\nthat one call. `jjfx wait` re-attaches to a Worker any session started, and\ncarries the answer in its exit code.\n"
         }
+        "sync" => {
+            "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
+        }
         _ => "",
     }
 }
@@ -377,6 +380,11 @@ const TOP_LEVEL: &[Group] = &[
                 summary: "Rebuild workspace cache",
             },
             Entry {
+                key: "sync",
+                args: "",
+                summary: "Re-sync this workspace onto trunk (fetch + move)",
+            },
+            Entry {
                 key: "colocation",
                 args: "<action>",
                 summary: "Enable/disable Git colocation (enable|disable|status)",
@@ -595,6 +603,13 @@ const PAGES: &[CommandHelp] = &[
         key: "refresh",
         summary: "Rebuild the workspace cache",
         usage: "refresh",
+        arguments: &[],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "sync",
+        summary: "Fetch and move the current workspace's working copy onto trunk",
+        usage: "sync",
         arguments: &[],
         flags: NO_FLAGS,
     },
@@ -1071,5 +1086,17 @@ mod tests {
         let dispatch = text(Some("dispatch")).expect("dispatch has a page");
         assert!(dispatch.contains("--fg"), "{dispatch}");
         assert!(dispatch.contains("wait"), "{dispatch}");
+    }
+
+    /// `sync` moves the working copy onto trunk, which is easy to confuse with
+    /// `refresh` (rebuild the cache) and `rebase <worker>` (push a Worker), so
+    /// its page must spell out how they differ.
+    #[test]
+    fn the_sync_page_distinguishes_refresh_and_worker_rebase() {
+        let sync = text(Some("sync")).expect("sync has a page");
+        assert!(sync.contains("refresh"), "{sync}");
+        assert!(sync.contains("workspace cache"), "{sync}");
+        assert!(sync.contains("rebase"), "{sync}");
+        assert!(sync.contains("Worker"), "{sync}");
     }
 }
