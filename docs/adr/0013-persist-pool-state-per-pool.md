@@ -62,3 +62,11 @@ alive.
 **Superseded in part.** The index (`.jj/pools.json`) is dropped: the `[pools]`
 declaration (ADR 0014) is the source of truth and a pool directory is state, so
 there is nothing for the index to disagree with. Everything else above stands.
+
+**Corrected in part.** The Decision's enumeration lists occupancy among the
+pool-scoped state under `.jj/pools/<name>/`, and that one item is wrong:
+occupancy is repository-scoped. `in-use.json` sits at the root of `.jj/`,
+because it is a single reconcile over every tab the terminal has open and so
+spans pools, and a whole-set replace wants the one atomic write a root file
+gives it. The split, the sidecar-shape argument and the lock ordering above are
+unchanged - only the list of pool-scoped items is short by one.
