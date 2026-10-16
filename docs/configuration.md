@@ -178,6 +178,11 @@ runtime with no native tracker can still pull work through a configured source.
 means the default, `linear`. An unknown source fails at load, before the TUI
 takes the screen or any Worker is reserved.
 
+A Ticket handed in directly (`jjfx dispatch --text`, `--from-file`, or stdin)
+never consults this section at all, so an ad-hoc dispatch works in a repository
+with no `[tickets]` and no `.scratch/`; see
+[Ad-hoc tickets](local-tickets.md#ad-hoc-tickets).
+
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `source` | `"linear"` (absent section) | Which tracker provides Ready Tickets: `linear` or `local`. |

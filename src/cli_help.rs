@@ -153,6 +153,24 @@ pub(crate) const DISPATCH_FLAGS: &[Flag] = &[
         help: "Dispatch every discovered Ready Ticket",
     },
     Flag {
+        long: "--text",
+        short: None,
+        value: Some("TEXT"),
+        help: "Dispatch a one-off Ticket whose body is this text (no tracker)",
+    },
+    Flag {
+        long: "--from-file",
+        short: None,
+        value: Some("PATH"),
+        help: "Dispatch a Ticket from any markdown file (use `-` for stdin)",
+    },
+    Flag {
+        long: "--id",
+        short: None,
+        value: Some("ID"),
+        help: "Ticket id for --text/--from-file (default derived from the input)",
+    },
+    Flag {
         long: "--label",
         short: None,
         value: Some("LABEL"),
@@ -360,7 +378,7 @@ const TOP_LEVEL: &[Group] = &[
             Entry {
                 key: "dispatch",
                 args: "<TICKET>...",
-                summary: "Dispatch Tickets (d; --provider/--model/--force/--json)",
+                summary: "Dispatch Tickets (d; --text/--from-file/--provider/--model/--json)",
             },
             Entry {
                 key: "send",
@@ -591,11 +609,17 @@ const PAGES: &[CommandHelp] = &[
     CommandHelp {
         key: "dispatch",
         summary: "Dispatch Tickets to idle Workers",
-        usage: "dispatch <TICKET>... [--fg|--bg] [--all] [--label LABEL] [--provider PROVIDER] [--model MODEL] [--budget USD] [--no-orchestrate] [--force] [--json]",
-        arguments: &[Argument {
-            name: "<TICKET>...",
-            help: "Ticket ids to dispatch; use --all to discover them instead",
-        }],
+        usage: "dispatch <TICKET>... [--fg|--bg] [--all] [--text TEXT | --from-file PATH | -] [--id ID] [--label LABEL] [--provider PROVIDER] [--model MODEL] [--budget USD] [--no-orchestrate] [--force] [--json]",
+        arguments: &[
+            Argument {
+                name: "<TICKET>...",
+                help: "Ticket ids to dispatch; use --all to discover them instead",
+            },
+            Argument {
+                name: "-",
+                help: "Read the Ticket from stdin; equivalent to --from-file -",
+            },
+        ],
         flags: DISPATCH_FLAGS,
     },
     CommandHelp {
@@ -939,5 +963,16 @@ mod tests {
         assert!(dispatch.contains("Usage: jjfx dispatch"), "{dispatch}");
         assert!(dispatch.contains("--no-orchestrate"), "{dispatch}");
         assert_eq!(text(None).expect("top-level help"), top_level());
+    }
+
+    /// The ad-hoc Ticket inputs are part of the documented surface: a reader of
+    /// `jjfx help dispatch` can find how to hand a Ticket in directly.
+    #[test]
+    fn the_dispatch_page_documents_the_ad_hoc_ticket_inputs() {
+        let dispatch = text(Some("dispatch")).expect("dispatch has a page");
+        for flag in ["--text", "--from-file", "--id"] {
+            assert!(dispatch.contains(flag), "{dispatch}");
+        }
+        assert!(dispatch.contains("stdin"), "{dispatch}");
     }
 }

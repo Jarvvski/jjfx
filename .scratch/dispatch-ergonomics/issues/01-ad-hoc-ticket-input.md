@@ -1,6 +1,6 @@
 # Take a Ticket from free text, a file path, or stdin
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -36,13 +36,13 @@ Design notes, not requirements:
 
 ## Acceptance Criteria
 
-- [ ] `jjfx dispatch --text "..."` dispatches a Worker with that text inlined, with no tracker configured.
-- [ ] `jjfx dispatch --from-file <path>` works for a markdown file outside `.scratch`.
-- [ ] Reading the Ticket from stdin works.
-- [ ] A repository with no `[tickets]` section and no `.scratch/` can dispatch an ad-hoc Ticket without a Linear key.
-- [ ] `jjfx help dispatch` documents the new flags.
-- [ ] Tests cover each input, and the no-config path.
-- [ ] `mise run check` is green.
+- [x] `jjfx dispatch --text "..."` dispatches a Worker with that text inlined, with no tracker configured.
+- [x] `jjfx dispatch --from-file <path>` works for a markdown file outside `.scratch`.
+- [x] Reading the Ticket from stdin works.
+- [x] A repository with no `[tickets]` section and no `.scratch/` can dispatch an ad-hoc Ticket without a Linear key.
+- [x] `jjfx help dispatch` documents the new flags.
+- [x] Tests cover each input, and the no-config path.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -55,3 +55,4 @@ Design notes, not requirements:
 ## Comments
 
 - 2026-10-16: Filed from the `todo-md` test-drive.
+- 2026-10-16: Resolved. `dispatch` gains `--text TEXT`, `--from-file PATH`, and a positional `-` (with `--from-file -` as an alias) to read the Ticket from stdin; `--id ID` names it, defaulting to `ad-hoc--<slug>` derived from the file stem or the first words of the text. The new `src/adhoc_ticket.rs` turns free text, a file, or stdin into the same `Ticket` + `TicketDetails` a configured source would supply (first `# ` heading is the title, the rest the body, matching `LocalTicket::parse`), and `cli::dispatch_command` dispatches that straight down the existing Direct Dispatch path - it never calls `configured_ticket_query`, so an ad-hoc Dispatch works with no `[tickets]` and no `.scratch/`, which is the default-`linear` case that previously failed on a missing API key. It is always a single direct request: an ad-hoc Ticket has no Parent to orchestrate and no file to write back. `--all`, explicit positional Tickets, and a second input are rejected as ambiguous; `--budget` is allowed (the single-Ticket orchestration guard does not apply). `cli_help::DISPATCH_FLAGS` documents all three flags and the dispatch page gains a `-` argument, so `jjfx help dispatch` and the parser stay in lockstep. `reject_unknown_flags` now treats a bare `-` as the stdin marker rather than an unknown option. Covered by unit tests for text/file/id derivation and the `--text`/`--from-file`/stdin parse, and by `tests/adhoc_ticket.rs`, which drives the real binary in a bare jj repo (no `[tickets]`, no `.scratch/`) for each input and asserts the ad-hoc id reaches the Pool without a tracker. `momo add` records the change.
