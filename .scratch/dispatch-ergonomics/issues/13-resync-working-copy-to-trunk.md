@@ -1,6 +1,6 @@
 # The working copy goes stale after a fetch, with no way to re-sync it
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -51,3 +51,4 @@ Out of scope: changing jj's behaviour, or making `@` auto-follow (it does not, a
 ## Comments
 
 - 2026-10-16: Filed at the owner's request. Hit by three sessions during the `todo-md` test-drive and the batch that followed it.
+- 2026-10-16: Implemented. `sync` was already an undocumented alias for `refresh`, so the alias is dropped and `sync` now means "fetch and move this workspace onto trunk". The drift warning is shape-neutral (a state-reading command must not snapshot the working copy, ADR 0006), so it names the fix rather than the shape; `sync` snapshots to choose `jj new` for an empty `@` and `jj rebase` when it carries changes, and exits non-zero naming the conflicted commits instead of resolving them.
