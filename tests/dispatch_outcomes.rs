@@ -99,6 +99,14 @@ impl DispatchFixture {
         .expect("jj config file");
     }
 
+    /// Writes the Repository's own `.jjfx/config.toml` - the file that may
+    /// select a Ticket source for this Repository alone.
+    fn write_repo_config(&self, content: &str) {
+        let directory = self.path().join(".jjfx");
+        fs::create_dir_all(&directory).expect("repository config directory");
+        fs::write(directory.join("config.toml"), content).expect("repository config file");
+    }
+
     /// Sizes the Pool, so Dispatch reaches a real per-Ticket outcome rather than
     /// failing on a missing Pool.
     fn with_pool(&self, size: usize) {
@@ -208,6 +216,59 @@ fn a_batch_with_a_dispatched_ticket_exits_zero() {
         "{}",
         stdout(&output)
     );
+}
+
+/// The wall this removes: a Repository selects `local` for itself, in its own
+/// `.jjfx/config.toml`, with the user config left at the `linear` default - no
+/// faked `XDG_CONFIG_HOME` needed.
+#[test]
+fn a_repository_selects_its_ticket_source_without_touching_the_user_config() {
+    let fixture = DispatchFixture::new();
+    // The user config carries jjfx's defaults (`source = "linear"`); the
+    // selection lives in the Repository alone.
+    fixture.write_config("");
+    fixture.write_repo_config("[tickets]\nsource = \"local\"\n");
+    fixture.with_pool(1);
+    fixture.with_origin();
+    fixture.with_fake_agent();
+    let output = fixture
+        .jjfx(&["dispatch", "--all", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "a Repository-local source selection must dispatch:\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("\"outcome\": \"dispatched\""),
+        "{}",
+        stdout(&output)
+    );
+}
+
+/// A Repository may select a source and may not define one: a repository-local
+/// attempt to set a source's details is a loud error naming the file.
+#[test]
+fn a_repository_defining_a_ticket_source_fails_loudly_naming_the_file() {
+    let fixture = DispatchFixture::new();
+    fixture.write_config("");
+    fixture.write_repo_config("[tickets.local]\nroot = \".tickets\"\n");
+    let output = fixture
+        .jjfx(&["ticket", "reconcile"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        !output.status.success(),
+        "defining a source must fail:\nstdout:\n{}",
+        stdout(&output)
+    );
+    let error = stderr(&output);
+    assert!(error.contains("config.toml"), "{error}");
+    assert!(error.contains("local"), "{error}");
 }
 
 #[test]

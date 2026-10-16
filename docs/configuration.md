@@ -2,10 +2,10 @@
 
 jjfx reads its own settings from two files. The **user config**,
 `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, is read once at startup and
-applies everywhere. The **repository config**, `<repo>/.jjfx/config.toml`, is read
-per repository and may set only the settings that are a property of the
-repository - [`[checks]`](#checks) and [`[pools]`](#pools). Both are distinct from
-jj config
+applies everywhere. The **repository config**, `<repo>/.jjfx/config.toml`, is
+read per repository and may set only the settings that are a property of the
+repository - [`[checks]`](#checks), [`[pools]`](#pools) and
+[`[tickets]`](#repository-local-ticket-source). Both are distinct from jj config
 (read through the `jj` CLI) and the lifecycle event log. A missing file means
 defaults; a file that exists but fails to parse is an error naming the offending
 key and file, surfaced before the TUI takes over the screen. Unknown keys are
@@ -242,6 +242,37 @@ identity, dependency, and writeback rules.
 | `ready_status` | `"ready-for-agent"` | The `Status:` value marking a Ticket ready for Dispatch. |
 | `resolved_status` | `"resolved"` | The `Status:` value marking a Ticket resolved, and therefore a satisfied `Blocked by:` entry. |
 
+### Repository-local ticket source
+
+A Repository may **select** which configured Ticket source it uses, in its own
+`.jjfx/config.toml`, so a cloned repository can discover its own local Tickets
+without the user config being changed for it:
+
+```toml
+# <repo>/.jjfx/config.toml
+[tickets]
+source = "local"
+```
+
+The selection is a **reference, not a grant** (ADR 0014). A Ticket source is one
+of the capabilities a repository-local file may select among and may never
+define: `source` names a source the user config already provides, so the local
+root, the Linear status and any credentials stay user-global. An absent
+`[tickets]` section leaves the user-global selection in place, so a repository
+that says nothing behaves exactly as before.
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `source` | the user-global value | Which configured Ticket source this Repository uses: `linear` or `local`. Required when the section is present. |
+
+Everything that *defines* a source is refused here, as a loud error naming the
+file: a `[tickets.local]` or `[tickets.linear]` table, a `root` or `status`
+key, a credential, and an unknown source name such as `jira` are all rejected at
+load rather than silently ignored. Only `source` is accepted. This is the same
+capability rule [`[pools]`](#a-declaration-may-select-but-never-grant) keeps,
+and it is what makes it safe to *commit* the selection: teammates share which
+source a repository reads, never a credential.
+
 ## `[spend]`
 
 An optional cap on the aggregate spend Dispatch may run up. The aggregate is the
@@ -435,12 +466,13 @@ command and the last line of its output.
 
 ### Repository-local checks
 
-`[checks]` is one of the two settings a repository may own. When the forge runs,
-jjfx reads `<repo>/.jjfx/config.toml`, and a `[checks]` section there **replaces**
-the user-global one for that repository - a repository either owns its check or
-inherits the user's. Any other section in that file is rejected, so a repository
-cannot silently configure the agent, the terminal, or anything else. The other
-repository-owned section is [`[pools]`](#pools).
+`[checks]` is one of the three settings a repository may own. When the
+forge runs, jjfx reads `<repo>/.jjfx/config.toml`, and a `[checks]` section
+there **replaces** the user-global one for that repository - a repository either
+owns its check or inherits the user's. Any other section in that file is
+rejected, so a repository cannot silently configure the agent, the terminal, or
+anything else. The other repository-owned sections are [`[pools]`](#pools) and
+[`[tickets]`](#repository-local-ticket-source).
 
 ```toml
 # <repo>/.jjfx/config.toml
