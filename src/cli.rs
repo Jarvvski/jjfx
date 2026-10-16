@@ -1797,8 +1797,11 @@ fn dispatch_command(
         return dispatch_adhoc_ticket(repository, args, &ticket, model, open_workspaces);
     }
 
-    // A single Ticket with orchestration enabled fetches its own details before
-    // reserving a placeholder, so hand off before building direct requests.
+    // A single Ticket with orchestration enabled is handed to the Orchestrator.
+    // Its fallible front half runs synchronously first: an unresolvable Ticket,
+    // a missing Pool, or a rejected discovery fails here and exits non-zero,
+    // rather than being swallowed by a background child that dies at once behind
+    // a printed `orchestrating`.
     if !args.all && !args.no_orchestrate && args.tickets.len() == 1 {
         if args.mode == RunMode::Foreground {
             return orchestrate_command(
@@ -1811,27 +1814,23 @@ fn dispatch_command(
                 tickets_config,
             );
         }
-        let executable = std::env::current_exe()?;
-        let mut command = std::process::Command::new(executable);
-        command.arg("__orchestrate").arg(&args.tickets[0]);
-        if let Some(provider) = args.provider.as_deref() {
-            command.args(["--provider", provider]);
+        let handoff = prepare_orchestration(
+            repository,
+            &args.tickets[0],
+            model.clone(),
+            args.force,
+            open_workspaces,
+            tickets_config,
+        )?;
+        if let crate::engine::OrchestrationStart::Direct(success) = handoff.start {
+            render_dispatch_entries(&[DispatchEntry::from_success(&success)], args.json);
+            return Ok(());
         }
-        if let Some(model) = args.model.as_deref() {
-            command.args(["--model", model]);
-        }
-        if args.force {
-            command.arg("--force");
-        }
-        command
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn()?;
+        let log = spawn_background_orchestration(repository, &handoff.parent, args)?;
         render_dispatch_entries(
             &[DispatchEntry::Orchestrating {
-                ticket: args.tickets[0].clone(),
-                detail: "orchestrating in background".to_owned(),
+                ticket: handoff.parent.as_str().to_owned(),
+                detail: format!("log: {}", log.display()),
             }],
             args.json,
         );
@@ -1920,8 +1919,9 @@ fn dispatch_command(
             })
             .collect::<Result<Vec<_>>>()?;
         let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-        render_dispatch_result(&result, requests.len(), true, args.json);
+        let entries = render_dispatch_result(&result, requests.len(), true, args.json);
         write_back_local_tickets(repository, &tickets);
+        ensure_dispatch_progressed(&entries)?;
         return Ok(());
     }
 
@@ -1944,8 +1944,9 @@ fn dispatch_command(
         })
         .collect::<Result<Vec<_>>>()?;
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-    render_dispatch_result(&result, requests.len(), false, args.json);
+    let entries = render_dispatch_result(&result, requests.len(), false, args.json);
     write_back_local_tickets(repository, &tickets);
+    ensure_dispatch_progressed(&entries)?;
     Ok(())
 }
 
@@ -1973,7 +1974,8 @@ fn dispatch_adhoc_ticket(
     }
     let requests = [request];
     let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
-    render_dispatch_result(&result, requests.len(), false, args.json);
+    let entries = render_dispatch_result(&result, requests.len(), false, args.json);
+    ensure_dispatch_progressed(&entries)?;
     Ok(())
 }
 
@@ -2103,12 +2105,14 @@ fn confirm_growth(shortage: CapacityShortage) -> bool {
     !input.trim().eq_ignore_ascii_case("n") && !input.trim().eq_ignore_ascii_case("no")
 }
 
+/// Renders one Dispatch batch and returns the shared model the caller inspects
+/// to decide the exit code.
 fn render_dispatch_result(
     result: &crate::engine::DirectDispatchResult,
     requested: usize,
     all: bool,
     json: bool,
-) {
+) -> Vec<DispatchEntry> {
     let entries: Vec<DispatchEntry> = result
         .outcomes()
         .iter()
@@ -2116,22 +2120,46 @@ fn render_dispatch_result(
         .collect();
     render_dispatch_entries(&entries, json);
     if json {
-        return;
+        return entries;
     }
-    let fired = entries.iter().filter(|entry| entry.attempted()).count();
+    let dispatched = entries.iter().filter(|entry| entry.dispatched()).count();
+    let failed = entries.iter().filter(|entry| entry.failed()).count();
     if result.is_partial() {
-        if fired == 0 && !all {
+        if dispatched == 0 && !all {
             eprintln!("No idle workers. Run: {PROGRAM} pool list");
         } else {
-            eprintln!("No more idle workers. Dispatched {fired}/{requested} ticket(s).");
+            eprintln!("No more idle workers. Dispatched {dispatched}/{requested} ticket(s).");
         }
     } else if all {
-        eprintln!("Dispatched {fired} ticket(s)");
+        eprintln!("Dispatched {dispatched} ticket(s)");
+    }
+    if failed > 0 {
+        eprintln!("{failed} ticket(s) failed to dispatch.");
     }
     let held = result.waiting().len();
     if held > 0 {
         eprintln!("Held {held} ticket(s) back under the dispatch cap; re-run once a Run finishes.");
     }
+    entries
+}
+
+/// Turns an all-failed Dispatch batch into an error, so a scripting caller can
+/// tell "nothing happened" from "it worked".
+///
+/// A batch where every Ticket failed exits non-zero. A batch with at least one
+/// dispatched Ticket, or one deliberately held back under a cap, is still a
+/// success: some of the work was done or queued. An empty batch is left alone -
+/// it is "nothing was requested", not "everything failed".
+fn ensure_dispatch_progressed(entries: &[DispatchEntry]) -> Result<()> {
+    if entries.is_empty() || entries.iter().any(DispatchEntry::progressed) {
+        return Ok(());
+    }
+    let tickets = entries
+        .iter()
+        .map(DispatchEntry::ticket)
+        .collect::<Vec<_>>()
+        .join(", ");
+    bail!("every Ticket failed to dispatch: {tickets}")
 }
 
 /// The result for one Ticket in a Dispatch, the shared model both the prose and
@@ -2259,10 +2287,21 @@ impl DispatchEntry {
         }
     }
 
-    /// Whether Dispatch attempted this Ticket (launched or failed), as opposed
-    /// to holding it back.
-    const fn attempted(&self) -> bool {
-        matches!(self, Self::Dispatched { .. } | Self::Failed { .. })
+    /// Whether the Ticket was launched on a Worker.
+    const fn dispatched(&self) -> bool {
+        matches!(self, Self::Dispatched { .. })
+    }
+
+    /// Whether the Ticket failed before a usable Run was launched.
+    const fn failed(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+
+    /// Whether this outcome means the Dispatch did something: launched a Run,
+    /// held a Ticket back under a cap, or handed a Parent to the Orchestrator.
+    /// Only a failed Ticket did not.
+    const fn progressed(&self) -> bool {
+        !self.failed()
     }
 }
 
@@ -2302,8 +2341,11 @@ fn dispatch_prose(entries: &[DispatchEntry]) -> String {
             DispatchEntry::Skipped { ticket, detail } => {
                 out.push_str(&format!("  {ticket} {detail}\n"));
             }
-            DispatchEntry::Orchestrating { ticket, .. } => {
+            DispatchEntry::Orchestrating { ticket, detail } => {
                 out.push_str(&format!("Orchestrating {ticket} in background\n"));
+                if !detail.is_empty() {
+                    out.push_str(&format!("  {detail}\n"));
+                }
                 out.push_str(&format!(
                     "  Re-run '{PROGRAM} dispatch {ticket}' to check progress\n"
                 ));
@@ -3026,15 +3068,35 @@ fn internal_complete_command(mode: &str) -> Result<()> {
     Ok(())
 }
 
-fn orchestrate_command(
+/// A Parent Ticket resolved and prepared for orchestration, before either the
+/// foreground watch or the detached runner starts.
+///
+/// The fallible front half of orchestration - config, discovery, the Parent's
+/// own fetch, and the group prepare/resume - is done in
+/// [`prepare_orchestration`], so a caller runs it synchronously and surfaces its
+/// error before blocking (foreground) or spawning a child (background).
+struct OrchestrationHandoff {
+    parent: TicketId,
+    request: crate::engine::OrchestrationRequest,
+    runner: crate::engine::OrchestrationRunner,
+    start: crate::engine::OrchestrationStart,
+    resumed: bool,
+    tickets: TicketsConfig,
+}
+
+/// Resolves a Parent Ticket and prepares its Dispatch Group.
+///
+/// This is the whole fallible front half of orchestration, run synchronously so
+/// an unresolvable Ticket, a missing Pool, or a rejected discovery fails where
+/// the caller can see it rather than inside a detached child.
+fn prepare_orchestration(
     repository: &Repository,
     parent: &str,
     model: Option<AgentModel>,
     force: bool,
-    json: bool,
     open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
     tickets_config: fn() -> Result<TicketsConfig>,
-) -> Result<()> {
+) -> Result<OrchestrationHandoff> {
     let id = TicketId::parse(parent.to_owned())?;
     // The runner re-queries occupancy per claim, so a Workspace a human opens or
     // closes while the group runs changes the next decision (ADR-0011).
@@ -3053,7 +3115,10 @@ fn orchestrate_command(
     if let Some(details) = details {
         request = request.with_ticket_details(details);
     }
-    let request = model.map_or(request.clone(), |selection| request.with_model(selection));
+    let request = match model {
+        Some(selection) => request.with_model(selection),
+        None => request,
+    };
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();
@@ -3062,18 +3127,46 @@ fn orchestrate_command(
         .orchestration_runner()
         .with_exclusions(exclusions);
     let preparation = runner.prepare(&request, &parent_ticket, &discovery)?;
+    let resumed = preparation.resumed();
+    Ok(OrchestrationHandoff {
+        parent: id,
+        request,
+        runner,
+        start: preparation.into_start(),
+        resumed,
+        tickets,
+    })
+}
+
+fn orchestrate_command(
+    repository: &Repository,
+    parent: &str,
+    model: Option<AgentModel>,
+    force: bool,
+    json: bool,
+    open_workspaces: fn() -> Result<std::collections::BTreeSet<String>>,
+    tickets_config: fn() -> Result<TicketsConfig>,
+) -> Result<()> {
+    let handoff = prepare_orchestration(
+        repository,
+        parent,
+        model,
+        force,
+        open_workspaces,
+        tickets_config,
+    )?;
     if !json {
         render_orchestration_event(&OrchestrationEvent::Started {
-            parent: id.clone(),
-            resumed: preparation.resumed(),
+            parent: handoff.parent.clone(),
+            resumed: handoff.resumed,
         });
     }
-    if let crate::engine::OrchestrationStart::Direct(success) = preparation.into_start() {
+    if let crate::engine::OrchestrationStart::Direct(success) = handoff.start {
         render_dispatch_entries(&[DispatchEntry::from_success(&success)], json);
         return Ok(());
     }
     let options = crate::engine::OrchestrationOptions::new();
-    let summary = runner.run(&request, &options, |event| {
+    let summary = handoff.runner.run(&handoff.request, &options, |event| {
         if !json {
             render_orchestration_event(&event);
         }
@@ -3082,7 +3175,7 @@ fn orchestrate_command(
         let counts = summary.counts();
         render_dispatch_entries(
             &[DispatchEntry::Orchestrating {
-                ticket: id.as_str().to_owned(),
+                ticket: handoff.parent.as_str().to_owned(),
                 detail: format!(
                     "{} done, {} failed, {} skipped, {} blocked",
                     counts.done(),
@@ -3096,8 +3189,61 @@ fn orchestrate_command(
     } else {
         render_orchestration_event(&OrchestrationEvent::Terminal(summary));
     }
-    write_back_local_tickets(repository, &tickets);
+    write_back_local_tickets(repository, &handoff.tickets);
     Ok(())
+}
+
+/// Spawns the detached orchestration runner for a prepared Parent Ticket.
+///
+/// The child's stdout and stderr go to a per-Parent log under `.jj/pool`, and
+/// the log path is returned so the Dispatch result can name it: a failure after
+/// the handoff is reachable even though the parent has already returned.
+fn spawn_background_orchestration(
+    repository: &Repository,
+    parent: &TicketId,
+    args: &DispatchArgs,
+) -> Result<PathBuf> {
+    let executable = std::env::current_exe()?;
+    let mut command = std::process::Command::new(executable);
+    command.arg("__orchestrate").arg(parent.as_str());
+    if let Some(provider) = args.provider.as_deref() {
+        command.args(["--provider", provider]);
+    }
+    if let Some(model) = args.model.as_deref() {
+        command.args(["--model", model]);
+    }
+    if args.force {
+        command.arg("--force");
+    }
+    let log = orchestration_log_path(repository, parent);
+    if let Some(directory) = log.parent() {
+        std::fs::create_dir_all(directory)
+            .with_context(|| format!("cannot create {}", directory.display()))?;
+    }
+    let stdout = std::fs::File::create(&log)
+        .with_context(|| format!("cannot create orchestration log {}", log.display()))?;
+    let stderr = stdout
+        .try_clone()
+        .with_context(|| format!("cannot open orchestration log {}", log.display()))?;
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(stdout))
+        .stderr(std::process::Stdio::from(stderr))
+        .spawn()
+        .with_context(|| format!("cannot start background orchestration for {parent}"))?;
+    Ok(log)
+}
+
+/// The log a detached orchestration runner writes to, under the Pool directory.
+///
+/// A [`TicketId`] is a safe filename component, so it needs no escaping. The
+/// name is lowercased to match the orchestration lock, which is case-folded
+/// because the filesystem may be case-insensitive.
+fn orchestration_log_path(repository: &Repository, parent: &TicketId) -> PathBuf {
+    repository.root().join(".jj/pool").join(format!(
+        "orchestrate-{}.log",
+        parent.as_str().to_ascii_lowercase()
+    ))
 }
 
 fn render_orchestration_event(event: &OrchestrationEvent) {
@@ -3674,6 +3820,73 @@ mod tests {
                 "  ENG-403 waiting: waiting for capacity\n",
             )
         );
+    }
+
+    fn failed_entry(ticket: &str) -> DispatchEntry {
+        DispatchEntry::Failed {
+            ticket: ticket.to_owned(),
+            worker: None,
+            phase: DirectDispatchFailurePhase::Workspace,
+            detail: "cannot prepare Workspace".to_owned(),
+        }
+    }
+
+    fn dispatched_entry() -> DispatchEntry {
+        DispatchEntry::Dispatched {
+            ticket: "ENG-1".to_owned(),
+            worker: "worker-01".to_owned(),
+            pid: Some(4242),
+            detail: "PID 4242".to_owned(),
+        }
+    }
+
+    fn waiting_entry() -> DispatchEntry {
+        DispatchEntry::Waiting {
+            ticket: "ENG-2".to_owned(),
+            detail: "concurrency cap 1 reached (1 Run(s) in flight)".to_owned(),
+        }
+    }
+
+    #[test]
+    fn an_all_failed_dispatch_is_an_error_but_a_dispatched_or_held_batch_is_not() {
+        // Nothing requested is not "everything failed".
+        assert!(ensure_dispatch_progressed(&[]).is_ok());
+
+        // One dispatched or deliberately held-back Ticket is a success.
+        assert!(ensure_dispatch_progressed(&[dispatched_entry()]).is_ok());
+        assert!(ensure_dispatch_progressed(&[waiting_entry()]).is_ok());
+        assert!(ensure_dispatch_progressed(&[failed_entry("ENG-1"), waiting_entry()]).is_ok());
+
+        // Every Ticket failing is the case a scripting caller must be able to
+        // tell apart from success, and the message names the Tickets.
+        let error = ensure_dispatch_progressed(&[failed_entry("ENG-1"), failed_entry("ENG-2")])
+            .expect_err("every Ticket failed");
+        let message = error.to_string();
+        assert!(message.contains("ENG-1"), "{message}");
+        assert!(message.contains("ENG-2"), "{message}");
+    }
+
+    #[test]
+    fn a_background_orchestration_names_its_log_in_json_and_prose() {
+        let entries = [DispatchEntry::Orchestrating {
+            ticket: "ENG-100".to_owned(),
+            detail: "log: /repo/.jj/pool/orchestrate-ENG-100.log".to_owned(),
+        }];
+
+        let value: serde_json::Value =
+            serde_json::from_str(&dispatch_json(&entries)).expect("valid JSON");
+        assert_eq!(value[0]["outcome"], "orchestrating");
+        assert_eq!(
+            value[0]["detail"],
+            "log: /repo/.jj/pool/orchestrate-ENG-100.log"
+        );
+
+        let prose = dispatch_prose(&entries);
+        assert!(
+            prose.contains("Orchestrating ENG-100 in background"),
+            "{prose}"
+        );
+        assert!(prose.contains("orchestrate-ENG-100.log"), "{prose}");
     }
 
     #[test]
