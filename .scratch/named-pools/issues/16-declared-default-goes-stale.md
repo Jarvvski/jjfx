@@ -1,7 +1,7 @@
 # A declared `default` pool's declaration goes stale
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -20,11 +20,11 @@ When there is **no** `[pools.default]` declaration - the common case, since `def
 
 ## Acceptance Criteria
 
-- [ ] `jjfx pool <N>` on a Repository with a declared `[pools.default] size` updates both the lane and the declaration.
-- [ ] With no `[pools.default]` declaration, `jjfx pool <N>` behaves exactly as today and creates no declaration.
-- [ ] A refused resize (busy Worker) changes neither.
-- [ ] `status` reports a single size, and it matches the lane's Workers.
-- [ ] `mise run check` is green.
+- [x] `jjfx pool <N>` on a Repository with a declared `[pools.default] size` updates both the lane and the declaration.
+- [x] With no `[pools.default]` declaration, `jjfx pool <N>` behaves exactly as today and creates no declaration.
+- [x] A refused resize (busy Worker) changes neither.
+- [x] `status` reports a single size, and it matches the lane's Workers.
+- [x] `mise run check` is green.
 
 ## References
 
