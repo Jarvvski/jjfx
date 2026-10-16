@@ -1630,7 +1630,7 @@ fn opencode_session_fixture() -> OpencodeSessionFixture {
         .resize_to(PoolCapacity::new(1).expect("capacity"))
         .expect("Worker Workspace should be provisioned");
     let worker_id = growth.added_workers()[0].clone();
-    // Configure the Pool for opencode so the Reservation selects it.
+    // Configure the Worker Pool for opencode so the Reservation selects it.
     let pool_path = temporary_directory
         .path()
         .join(".jj/pools/default/pool.json");
@@ -2459,7 +2459,7 @@ fn opencode_send_fixture() -> OpencodeSendFixture {
     let temporary_directory = TempDir::new().expect("temporary directory");
     let repository = initialize_repository(temporary_directory.path());
     let worker_id = grow_one_worker(&repository);
-    // Configure the Pool for opencode so the Follow-up selects it.
+    // Configure the Worker Pool for opencode so the Follow-up selects it.
     let pool_path = temporary_directory
         .path()
         .join(".jj/pools/default/pool.json");

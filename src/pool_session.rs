@@ -2,9 +2,10 @@
 //!
 //! [`PoolSession::apply`] is the one place the operation-identity rules live: it
 //! folds a Dispatch event, ignores it when its operation has been superseded by a
-//! newer command, updates the Pool presentation, and returns the App-facing
-//! [`PoolUpdate`]s that follow. The App keeps one field of this type, forwards
-//! events through `apply`, and reads the projection when rendering the Pool.
+//! newer command, updates the Worker Pool presentation, and returns the
+//! App-facing [`PoolUpdate`]s that follow. The App keeps one field of this type,
+//! forwards events through `apply`, and reads the projection when rendering the
+//! Worker Pool view.
 
 use crate::engine::{DispatchGroupProgress, WorkerPoolSnapshot};
 use crate::workspace_dispatch::{
@@ -19,7 +20,7 @@ pub(crate) enum PoolUpdate {
     Status(String),
     /// Ask the controller for a fresh Pool snapshot.
     RefreshPool,
-    /// Ask the operator to confirm growing the Pool for these Tickets.
+    /// Ask the operator to confirm growing the Worker Pool for these Tickets.
     ConfirmCapacity {
         tickets: Vec<String>,
         worker: Option<String>,
@@ -27,7 +28,7 @@ pub(crate) enum PoolUpdate {
     },
     /// Show the discovered Ready Tickets for review.
     ReadyPreview,
-    /// Leave the Pool mode.
+    /// Leave the Worker Pool mode.
     ClosePoolMode,
 }
 
@@ -53,7 +54,7 @@ pub(crate) struct PoolSession {
     pub(crate) worker_command_result: Option<WorkerCommandResult>,
     /// Latest Worker log failure retained for the focused detail view.
     pub(crate) worker_log_error: Option<String>,
-    /// Latest ordered Direct Dispatch outcomes for the Pool view.
+    /// Latest ordered Direct Dispatch outcomes for the Worker Pool view.
     pub(crate) dispatch_result: Option<DispatchResult>,
     /// Latest Ready Ticket discovery result awaiting preview or launch.
     pub(crate) ready_tickets: Option<ReadyTicketResult>,

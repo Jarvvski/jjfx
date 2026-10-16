@@ -2,9 +2,9 @@
 //!
 //! Every finalized Run appends a [`RunRecord`] to jjfx's append-only store
 //! (ticket 16). This module reads that store once and folds it into the shapes a
-//! frontend needs: a pool total, the windows the Pool view shows (today and the
-//! last seven days), and a per-Worker split. It is the data behind the pool
-//! cost/usage view and behind the optional Dispatch spend cap.
+//! frontend needs: a pool total, the windows the Worker Pool view shows (today
+//! and the last seven days), and a per-Worker split. It is the data behind the
+//! pool cost/usage view and behind the optional Dispatch spend cap.
 //!
 //! The aggregation is a pure fold over decoded records ([`PoolCostSnapshot::from_records`]),
 //! so it is exercised without a repository; [`Repository::pool_cost`] is the thin
@@ -118,7 +118,8 @@ impl PoolCost {
     }
 }
 
-/// The Pool's recorded cost and usage, split the way the Pool view shows it.
+/// The Worker Pool's recorded cost and usage, split the way the Worker Pool view
+/// shows it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PoolCostSnapshot {
     total: PoolCost,

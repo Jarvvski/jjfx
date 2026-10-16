@@ -1,7 +1,7 @@
 # Sweep the singular "the Pool" from the codebase
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01, 02, 03, 04, 05, 06, 07, 08, 09, 10
 
 ## Problem
@@ -19,11 +19,36 @@ This is **deliberately last**. It is mechanical and it touches nearly everything
 
 ## Acceptance Criteria
 
-- [ ] No bare "the Pool" remains in comments, error strings or docs; each says which pool.
-- [ ] `CONTEXT.md` and the ADRs read consistently with plural pools.
-- [ ] No new noun is introduced for the collection.
-- [ ] No behaviour changes - this is a wording sweep, and the test suite is unchanged.
-- [ ] `mise run check` is green.
+- [x] No bare "the Pool" remains in comments, error strings or docs; each says which pool.
+- [x] `CONTEXT.md` and the ADRs read consistently with plural pools.
+- [x] No new noun is introduced for the collection.
+- [x] No behaviour changes - this is a wording sweep, and the test suite is unchanged.
+- [x] `mise run check` is green.
+
+## Resolution
+
+Every bare "the Pool" in code comments, doc comments, error strings and docs now
+says which pool: "the Worker Pool", the pool's own name, or the Repository's
+Worker Pools. `CONTEXT.md` already read plurally and needed no edit;
+`docs/configuration.md`, `docs/run-records.md` and `docs/undo.md` did.
+
+Three user-facing strings were reworded - the two destroy failure strings and
+`logs`' follow-mode stop message, whose assertion in `tests/logs.rs` moved with
+it. That assertion is the only test change. `Worker Pool` is not renamed and no
+collection noun was added.
+
+ADR 0011's occupancy note was stale in three ways: it asserted the lapsed
+compatibility constraint as live, named the pre-`wsg`-expunge marker path
+`.jj/pool/in-use.json`, and kept a sentence about a dead compatibility peer. It
+now cites ADR 0013's atomic-replace reason, uses `.jj/in-use.json`, and states
+that the marker is repository-scoped. Its Dispatch Eligibility wording was
+aligned with `CONTEXT.md`, as was `src/engine/eligibility.rs`.
+
+Left alone deliberately: `CHANGELOG.md` (a dated historical record),
+`.scratch/**` (issue records), ADR 0012's quotation of the phrase itself, and
+other singular `Pool` attributives - `Pool capacity`, the `compatible Pool
+lock`, the TUI keybinding labels - which are not "the Pool" and whose sweeping
+would have turned a wording pass into a refactor.
 
 ## References
 

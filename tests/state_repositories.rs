@@ -318,7 +318,7 @@ fn a_failed_pool_shrink_leaves_no_cleanup_marker_on_a_member() {
             .expect("idle Worker");
     }
 
-    // Make the pool directory read-only so the Pool manifest's atomic write
+    // Make the pool directory read-only so the Worker Pool manifest's atomic write
     // cannot create its temporary file. The cleanup markers live in the same
     // directory as the manifest now, so this asserts the failure path leaves no
     // marker behind: a member carrying one would fail `persist_reserved_pid`
@@ -379,7 +379,7 @@ fn session_sidecar_records_reads_and_replaces_worker_sessions() {
         Some("ses_three")
     );
 
-    // It is jjfx-owned sidecar state, not part of the Pool and Worker documents.
+    // It is jjfx-owned sidecar state, not part of the pool and Worker documents.
     let path = temp.path().join(".jj/pools/default/sessions.json");
     let value: Value =
         serde_json::from_slice(&fs::read(&path).expect("session sidecar")).expect("JSON");

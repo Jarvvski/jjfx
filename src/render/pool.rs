@@ -29,9 +29,9 @@ pub(crate) enum PoolPane<'a> {
     },
 }
 
-/// A read-only projection for the Pool view: the session state plus the focused
-/// pane, the selected Worker, and the clock and stuck-Run window the watchdog is
-/// judged against.
+/// A read-only projection for the Worker Pool view: the session state plus the
+/// focused pane, the selected Worker, and the clock and stuck-Run window the
+/// watchdog is judged against.
 pub(crate) struct PoolView<'a> {
     pub session: &'a PoolSession,
     pub pane: PoolPane<'a>,
@@ -40,7 +40,7 @@ pub(crate) struct PoolView<'a> {
     pub now: Timestamp,
 }
 
-/// Draw the Pool view body; `footer` is rendered into the bottom strip.
+/// Draw the Worker Pool view body; `footer` is rendered into the bottom strip.
 pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>) {
     let [header, body, footer_area] = Layout::vertical([
         Constraint::Length(2),

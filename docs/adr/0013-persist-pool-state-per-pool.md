@@ -42,7 +42,7 @@ alive.
 - **Flat, with a `pool` field on each record** - least path churn, but every
   shared file grows a pool dimension and the locks stay shared, so one pool's
   Dispatch blocks another's.
-- **Folding the sidecars into the Pool or Worker documents** - removes two files,
+- **Folding the sidecars into the pool or Worker documents** - removes two files,
   at the cost of the single atomic write a wholesale occupancy reconcile depends
   on.
 - **Read-time fallback instead of conversion** - no big-bang, but two read paths

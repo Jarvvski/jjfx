@@ -298,25 +298,26 @@ raise or remove spend.cap_usd, or set spend.on_exceed = "warn", to override
 ```
 
 To override, raise or remove `spend.cap_usd`, or set `spend.on_exceed = "warn"`.
-Both Dispatch paths are gated: the Pool view's Dispatch and orchestration, and
-`jjfx dispatch` (including its orchestration handoff). A cap that cannot be
-evaluated because the record store is unreadable also refuses Dispatch - failing
-closed is the only safe answer for a spend gate.
+Both Dispatch paths are gated: the Worker Pool view's Dispatch and
+orchestration, and `jjfx dispatch` (including its orchestration handoff). A cap
+that cannot be evaluated because the record store is unreadable also refuses
+Dispatch - failing closed is the only safe answer for a spend gate.
 
-The current aggregate is always visible without the cap: the Pool view shows a
-pool spend line, and `jjfx status` (and `jjfx pool list`) shows a `SPEND` column
-and a Repository-wide summary. When the Repository holds several pools, each
-pool's recorded spend is reported against its own [`cap_usd`](#pools) - a
-subtotal under that total, in the `Pools:` table and in the `pools` array of
-`jjfx status --json`.
+The current aggregate is always visible without the cap: the Worker Pool view
+shows a pool spend line, and `jjfx status` (and `jjfx pool list`) shows a
+`SPEND` column and a Repository-wide summary. When the Repository holds several
+pools, each pool's recorded spend is reported against its own
+[`cap_usd`](#pools) - a subtotal under that total, in the `Pools:` table and in
+the `pools` array of `jjfx status --json`.
 
 ## `[dispatch]`
 
-An optional ceiling on how many Runs Dispatch may keep in flight at once. `pool N`
-sizes the Pool and `dispatch --all` fires the whole batch, so a large Pool plus a
-large batch can trip a provider's rate limit in one go; the cap paces the batch
-instead. Absent `max_concurrent` means no cap and Dispatch behaves exactly as it
-did before the governor existed: the whole batch fires at once.
+An optional ceiling on how many Runs Dispatch may keep in flight at once.
+`pool N` sizes `default` and `dispatch --all` fires the whole batch, so a large
+Worker Pool plus a large batch can trip a provider's rate limit in one go; the
+cap paces the batch instead. Absent `max_concurrent` means no cap and Dispatch
+behaves exactly as it did before the governor existed: the whole batch fires at
+once.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -329,12 +330,12 @@ max_concurrent = 4
 
 The cap is a ceiling on concurrent Runs, not a batch size. A batch fires its
 first `max_concurrent - in_flight` Tickets, where `in_flight` counts the Workers
-the Pool already records as busy, and holds the rest back. Repeated Dispatches
-therefore stay under the same limit rather than each firing a fresh batch of
-`max_concurrent`.
+the Worker Pool already records as busy, and holds the rest back. Repeated
+Dispatches therefore stay under the same limit rather than each firing a fresh
+batch of `max_concurrent`.
 
 A held Ticket is neither reserved nor launched. It comes back as a waiting
-outcome in input order, named in the CLI and the Pool view:
+outcome in input order, named in the CLI and the Worker Pool view:
 
 ```text
   ENG-42 waiting: concurrency cap 4 reached (4 Run(s) in flight)
@@ -345,9 +346,9 @@ The waiting set is recorded in jjfx's own
 `.jj/pools/<name>/waiting.json`, inside the pool's own state directory, and
 shown by `jjfx status` (a `Waiting:` line naming each Ticket's pool, and the
 `waiting` array in `jjfx status --json`, where each entry carries its `ticket`
-and the `pool` whose Dispatch held it) and the Pool view, so the backlog is
-visible after the Dispatch that held it. It is jjfx-owned presentation state,
-kept out of the Pool and Worker documents, and it is rewritten by every Dispatch
+and the `pool` whose Dispatch held it) and the Worker Pool view, so the backlog
+is visible after the Dispatch that held it. It is jjfx-owned presentation state,
+kept out of the pool and Worker documents, and it is rewritten by every Dispatch
 - including an uncapped one, which clears it - so it always describes the last
 Dispatch rather than accumulating Tickets you have since dispatched by hand.
 
@@ -374,13 +375,13 @@ the watchdog's: it becomes failed, never stuck. A Run with neither a start time
 nor a readable log has no evidence either way and is never flagged on a guess.
 
 Stuck is derived, never persisted - like occupancy it is a view of live Run
-state, so the Pool and Worker documents are untouched. It shows up
+state, so the pool and Worker documents are untouched. It shows up
 in three places:
 
 - the home list, where a stuck Run sorts into the `needs you` lane instead of
   reading as `working`;
-- the Pool view, as a `[stuck]` marker beside the Worker's persisted `busy`
-  status;
+- the Worker Pool view, as a `[stuck]` marker beside the Worker's persisted
+  `busy` status;
 - `jjfx status`, as a per-Worker `stuck: no progress for 42m 0s` line and a
   `, N stuck` count in the pool summary.
 

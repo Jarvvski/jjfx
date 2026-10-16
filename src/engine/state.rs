@@ -389,7 +389,7 @@ impl WorkerState {
 /// The set of Worker Workspaces jjfx currently considers in use (open in a
 /// terminal).
 ///
-/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
 /// documents so their shape is preserved. A missing or unreadable file means
 /// "nothing known to be in use".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,7 +401,7 @@ pub struct InUseState {
 
 /// The Agent Runtime session each Worker's current Run drives.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
 /// documents so their shape is preserved. jjfx records the session id an
 /// opencode Run created here so a later, different process can identify that
 /// Run's session - for example to interrupt it - without re-deriving it. A
@@ -415,7 +415,7 @@ pub struct SessionState {
 
 /// The Tickets the Dispatch capacity governor held back rather than fired.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
 /// documents so their shape is preserved. A missing or unreadable file means
 /// "nothing was held back". The set is
 /// rewritten by each capped Dispatch, so it always describes the last one: a
@@ -437,7 +437,7 @@ pub struct WaitingState {
 /// kept instead - one JSON object per line in `.jj/pools/<name>/runs.jsonl`, appended
 /// and never truncated, the same shape the Agent Runtime hooks already write.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
 /// documents so their shape is preserved, and it is readable without the TUI.
 ///
 /// A value the provider reported unusably - a negative, non-finite or
@@ -580,7 +580,7 @@ pub struct MutationRecord {
 
 /// The latest jjfx-initiated mutation per Workspace.
 ///
-/// This is jjfx-owned state, deliberately kept out of the Pool and Worker
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
 /// documents so their shape is preserved. A missing or unreadable file means
 /// "nothing recorded to undo".
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -1010,12 +1010,12 @@ impl StateStore {
         self.root.join(POOLS_DIRECTORY).join(self.pool.as_str())
     }
 
-    /// Whether the Pool has ever materialised its state directory.
+    /// Whether this Worker Pool has ever materialised its state directory.
     pub(crate) fn directory_exists(&self) -> bool {
         self.directory().is_dir()
     }
 
-    /// Removes the Pool's state directory outright.
+    /// Removes this Worker Pool's state directory outright.
     ///
     /// For a Pool that is being *removed* rather than destroyed and recreated:
     /// nothing will read the directory again, so leaving it (and its locks)
@@ -1498,7 +1498,7 @@ impl StateStore {
         Ok(workers)
     }
 
-    /// Revalidates a cleanup marker under the Pool lock followed by its Worker lock.
+    /// Revalidates a cleanup marker under the Worker Pool lock followed by its Worker lock.
     pub(crate) fn detached_cleanup_status(
         &self,
         worker: &WorkerId,
@@ -1738,7 +1738,7 @@ impl StateStore {
 
     /// Atomically reserves enough idle Workers for the complete input batch.
     ///
-    /// Selection and every write happen while holding the Pool lock followed
+    /// Selection and every write happen while holding the Worker Pool lock followed
     /// by every member Worker lock in deterministic Pool order. A shortage
     /// writes nothing. A later write failure restores every earlier Worker
     /// before releasing the locks.

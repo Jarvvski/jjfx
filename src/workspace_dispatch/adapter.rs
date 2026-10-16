@@ -28,14 +28,14 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
         tickets: &[String],
         worker: Option<&str>,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
-    /// Dispatch after approving the exact capacity gap under the Pool lock.
+    /// Dispatch after approving the exact capacity gap under the Worker Pool lock.
     fn dispatch_with_approved_growth(
         &self,
         tickets: &[String],
         worker: Option<&str>,
         additional: usize,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
-    /// Dispatch only the available subset under the Pool lock.
+    /// Dispatch only the available subset under the Worker Pool lock.
     fn dispatch_use_available(
         &self,
         tickets: &[String],
@@ -118,7 +118,7 @@ pub struct RealWorkspaceDispatch {
     /// Whether new Workspaces are colocated with Git (jjfx's `colocate`).
     colocate: bool,
     /// Where Dispatch discovers Ready Tickets (`[tickets]`), independent of the
-    /// Agent Runtime the Pool runs.
+    /// Agent Runtime the Worker Pool runs.
     tickets: TicketsConfig,
     /// The optional aggregate spend cap (`[spend]`) that gates Dispatch.
     spend: SpendConfig,
@@ -487,8 +487,8 @@ impl RealWorkspaceDispatch {
 impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
     fn refresh(&self) -> Result<WorkerPoolSnapshot, String> {
         let repository = self.repository()?;
-        // Refresh the durable in-use marker from the live terminal so the Pool
-        // view reflects which Workspaces are open. Best effort: a failed query
+        // Refresh the durable in-use marker from the live terminal so the Worker
+        // Pool view reflects which Workspaces are open. Best effort: a failed query
         // leaves the marker as it was rather than failing the refresh.
         if let Some(terminal) = self.terminal.as_ref()
             && let Ok(open) = terminal.open_workspaces()

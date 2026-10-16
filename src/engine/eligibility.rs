@@ -2,11 +2,11 @@
 //! Dispatch decision.
 //!
 //! Eligibility is derived, not persisted as a lifecycle: a Worker is eligible
-//! when it is a Pool member, its Worker Status is idle, and it is not occupied
-//! (open in a terminal). A frontend computes the occupied set from live terminal
-//! state and hands it to the Dispatch coordinator as [`DispatchExclusions`]; the
-//! engine enforces it while holding the Pool lock. The engine never inspects the
-//! terminal itself.
+//! when it is a member of the pool being dispatched into, its Worker Status is
+//! idle, and it is not occupied (open in a terminal). A frontend computes the
+//! occupied set from live terminal state and hands it to the Dispatch
+//! coordinator as [`DispatchExclusions`]; the engine enforces it while holding
+//! the Worker Pool lock. The engine never inspects the terminal itself.
 
 use std::collections::BTreeSet;
 use std::fmt;

@@ -107,8 +107,8 @@ impl DispatchFixture {
         fs::write(directory.join("config.toml"), content).expect("repository config file");
     }
 
-    /// Sizes the Pool, so Dispatch reaches a real per-Ticket outcome rather than
-    /// failing on a missing Pool.
+    /// Sizes the Worker Pool, so Dispatch reaches a real per-Ticket outcome
+    /// rather than failing on a missing Pool.
     fn with_pool(&self, size: usize) {
         let output = self
             .jjfx(&["pool", &size.to_string()])
@@ -320,7 +320,7 @@ fn a_background_orchestration_for_an_unresolvable_ticket_is_a_failure() {
 #[test]
 fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
     let fixture = DispatchFixture::new();
-    // The origin must precede the Pool, so the Pool records the owner/name
+    // The origin must precede the Worker Pool, so it records the owner/name
     // identity orchestration resolves before it discovers children.
     fixture.with_origin();
     fixture.with_pool(1);

@@ -175,7 +175,7 @@ impl Fixture {
     }
 
     /// Leave an unpushed commit in `worker`'s Workspace: work that exists only
-    /// there, so removing the Pool would discard it.
+    /// there, so removing the Worker Pool would discard it.
     fn leave_local_work(&self, worker: &str) {
         let directory = self.worker_workspace(worker);
         fs::write(directory.join("work.txt"), "work\n").expect("worker edit");
@@ -249,7 +249,7 @@ fn destroy_reports_each_branch_and_refuses_undelivered_work_unless_forced() {
     assert!(fixture.declares("bugs"));
 
     // `--force` overrides the drain, says what it discards, and removes the
-    // Pool's state directory and its Workers' Workspaces with the declaration.
+    // Worker Pool's state directory and its Workers' Workspaces with the declaration.
     let output = fixture.jjfx(&["pool", "destroy", "bugs", "--force"]);
     assert!(
         output.status.success(),
