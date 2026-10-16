@@ -3,6 +3,9 @@ use std::fs;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
 
 use jjfx::engine::{
     CleanDecision, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome,
@@ -384,6 +387,55 @@ fn provisions_a_compatible_worker_workspace_and_idle_state() {
     assert_eq!(state.value.ticket, None);
     assert_eq!(state.value.pid, None);
     assert_eq!(state.value.branch_name, None);
+}
+
+/// Provisioning takes the repository-wide lock (Workspace creation) and then a
+/// pool lock (the Worker's own state), so two concurrent provisions must neither
+/// deadlock nor lose a cache entry.
+#[test]
+fn concurrent_provisioning_neither_deadlocks_nor_corrupts_the_cache() {
+    let (_temporary_directory, repository) = local_repository();
+    let workers = ["worker-01", "worker-02"]
+        .map(|name| WorkerId::parse(name).expect("Worker ID should be valid"));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let mut handles = Vec::new();
+    for worker in workers {
+        let repository = repository.clone();
+        let done_tx = done_tx.clone();
+        handles.push(thread::spawn(move || {
+            let result = repository.provision_worker_workspace(&worker);
+            done_tx.send(result).expect("report provisioning result");
+        }));
+    }
+
+    for _ in 0..2 {
+        done_rx
+            .recv_timeout(Duration::from_secs(120))
+            .expect("concurrent provisioning must not deadlock")
+            .expect("provisioning should succeed");
+    }
+    for handle in handles {
+        handle.join().expect("provisioning thread");
+    }
+
+    let names = workspace_names(repository.root());
+    let cache = fs::read_to_string(repository.root().join(".jj/ws-cache"))
+        .expect("ws-cache should be projected");
+    for name in ["worker-01", "worker-02"] {
+        assert!(
+            names.contains(&name.to_owned()),
+            "{name} should be a jj Workspace"
+        );
+        assert!(
+            cache.contains(&format!("{name}\t")),
+            "{name} should be cached in ws-cache"
+        );
+    }
+    assert!(
+        repository.root().join(".jj/.repository.lock").is_file(),
+        "the repository-wide lock should leave its sidecar behind"
+    );
 }
 
 fn assert_workspace_directory_environment(
