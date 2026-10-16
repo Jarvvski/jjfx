@@ -56,6 +56,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx help now answers for every spelling the parser accepts - the short aliases (d, rb, pool create) and the pool synonyms - so the recovery hint command is documented instead of rejected as an unknown command, and the top-level list documents jjfx help itself.
 - jjfx dispatch no longer grows the pool when the capacity prompt cannot be answered: with no terminal (a script) or an empty answer the pool stays at its size and the batch dispatches to the available Workers, so the expensive option is never the default.
 - jjfx version now reports a -dev suffix for a build from a checkout, so a binary built from main after a release cannot be mistaken for the released version; the release archives and a crate installed from crates.io report the clean version.
+- jjfx logs stops following a Worker that has gone idle, so it no longer blocks forever on the log its last Run left behind: logs follows the current Run rather than the Worker, and a caller that wants the next Run re-attaches or uses jjfx wait.
 
 ## [0.55.0] - 2026-10-16
 

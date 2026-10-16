@@ -1,7 +1,7 @@
 # `jjfx logs` still blocks on a stale idle Worker
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Question
@@ -19,4 +19,16 @@ The first is recommended. `logs` should answer "what did this Run print", and th
 
 ## Answer
 
-<!-- recorded on resolution -->
+**Follow the current Run, not the Worker** - the recommended option. `logs` now stops following on `idle` as well as on the terminal states ticket 12 covered, so a Worker with no Run ends the follow instead of holding the caller on a log nothing will append to.
+
+The reachable hang is a Worker reset *during* a follow - a human runs `logs`, then `jjfx pool reset`. The command has already captured the log path, and a Reset leaves the file on disk (it only clears the state's `log_file` field), so the loop kept re-reading a file that could never grow again and never returned. `follow_stop` now returns `FollowStop::Idle` for `WorkerStatus::Idle`, so the loop reports `Stopped following <worker>: the Worker is idle` and returns `0`, the same shape as ticket 12's other stops.
+
+The ticket's literal case - `logs <idle-worker>` blocking forever - needs a stale `log_file` on the idle state to bite, and a Reset clears that field (`clear_run_fields`), so `logs` on a reset Worker already failed fast with `no Run log` rather than hanging. The one rule still covers the case where an idle state does point at a log file: `logs` now returns at once with just the tail, as attaching to an already-terminal Worker does.
+
+The trade-off ticket 12 declined is real but small: a Worker can be re-dispatched and reuse its log file, so stopping at `idle` can return just before an imminent `busy`. That is the point of the decision - `logs` answers "what did this Run print", and a caller that wants the next Run re-attaches or, better, runs `jjfx wait`, which is the purpose-built way to block for one.
+
+Tests: `tests/logs.rs` gains `logs_returns_immediately_for_an_idle_worker` and `logs_returns_when_a_running_worker_is_reset_to_idle`. Both hang on the pre-fix code and return on the fix. `mise run check` is green.
+
+## Comments
+
+- 2026-10-16: Resolved. `logs` treats `idle` as a stop, so the follow loop has an exit for the state a Worker sits in between Runs; the changelog records it as a fix.
