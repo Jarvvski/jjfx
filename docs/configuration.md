@@ -4,7 +4,8 @@ jjfx reads its own settings from two files. The **user config**,
 `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, is read once at startup and
 applies everywhere. The **repository config**, `<repo>/.jjfx/config.toml`, is read
 per repository and may set only the settings that are a property of the
-repository - today just [`[checks]`](#checks). Both are distinct from jj config
+repository - [`[checks]`](#checks) and [`[pools]`](#pools). Both are distinct from
+jj config
 (read through the `jj` CLI) and the lifecycle event log. A missing file means
 defaults; a file that exists but fails to parse is an error naming the offending
 key and file, surfaced before the TUI takes over the screen. Unknown keys are
@@ -17,6 +18,11 @@ colocate = true
 
 [agent]
 command = "claude"
+
+[profiles.fast]
+runtime = "claude"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
 
 [terminal]
 listen_on = "unix:/tmp/kitty-visor"
@@ -71,6 +77,32 @@ stuck_after_secs = 1800
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `command` | `"claude"` | The shell command run in a workspace's agent pane. It runs in your login interactive shell as `$SHELL -l -i -c <command>`, so aliases and your `PATH` are available and the value may name an alias such as `cx`. |
+
+## `[profiles]`
+
+Named Agent Runtime Profiles: the runtime, and the provider and model its Runs
+launch with. A repository-local [`[pools]`](#pools) declaration may **reference**
+one by name, but never define one - a profile is executable-affecting, so it is
+granted here, user-globally, and a Repository may only select among the profiles
+already granted. See
+[ADR 0014](adr/0014-repository-local-pool-declarations.md).
+
+```toml
+[profiles.fast]
+runtime = "claude"
+provider = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[profiles.deep]
+runtime = "codex"
+model = "gpt-5"
+```
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `runtime` | required | The Agent Runtime: `claude`, `codex`, or `opencode`. |
+| `provider` | unset | The provider identifier the runtime needs alongside the model, e.g. `anthropic`. Requires `model`. |
+| `model` | unset | The model identifier, e.g. `claude-sonnet-4-20250514`. Unset leaves the runtime to pick its own default model. |
 
 ## `[terminal]`
 
@@ -402,11 +434,12 @@ command and the last line of its output.
 
 ### Repository-local checks
 
-`[checks]` is also the one setting a repository may own. When the forge runs,
+`[checks]` is one of the two settings a repository may own. When the forge runs,
 jjfx reads `<repo>/.jjfx/config.toml`, and a `[checks]` section there **replaces**
 the user-global one for that repository - a repository either owns its check or
 inherits the user's. Any other section in that file is rejected, so a repository
-cannot silently configure the agent, the terminal, or anything else.
+cannot silently configure the agent, the terminal, or anything else. The other
+repository-owned section is [`[pools]`](#pools).
 
 ```toml
 # <repo>/.jjfx/config.toml
@@ -425,6 +458,80 @@ hooks, which jjfx already executes when it creates a workspace in the repository
 so a repository-local check grants no capability the repository did not already
 have. Track it in jj (`jj file track root:.jjfx/config.toml`) so it is present in
 a fresh clone.
+
+## `[pools]`
+
+A Repository may run several named Worker Pools, each its own lane: its own size,
+its own Agent Runtime Profile, its own Ticket source, and its own spend cap under
+the Repository-wide ceiling. They are declared in the repository config,
+`<repo>/.jjfx/config.toml`, in a `[pools]` section beside `[checks]`:
+
+```toml
+# <repo>/.jjfx/config.toml
+[checks]
+command = "cargo check"
+
+[pools.bugs]
+size = 2
+profile = "fast"
+source = "local"
+label = "bug"
+cap_usd = 5.0
+
+[pools.features]
+size = 4
+profile = "deep"
+source = "linear"
+label = "feature"
+ready_status = "Todo"
+```
+
+### A declaration may select, but never grant
+
+The repository config is read by default because it grants no capability the
+repository did not already have. A pool declaration keeps that rule: it may
+**reference** an Agent Runtime Profile and a Ticket source the user config
+defines, and may set a size, a spend cap, a routing label and a ready status. It
+may **not** define an agent command, a model, credentials, a runtime or a new
+source kind. A `[pools]` entry that tries to is a loud error naming the file,
+never a silent acceptance - which is what makes it safe to *commit* a lane
+definition: teammates share lanes, never running Workers. See
+[ADR 0014](adr/0014-repository-local-pool-declarations.md).
+
+### Keys
+
+Every key is optional but the pool's name (the table key).
+
+| Key | Default | Meaning |
+| --- | --- | --- |
+| `size` | unset | The number of Workers the pool holds. Absent leaves the Repository's configured size in place. |
+| `profile` | unset | The name of an Agent Runtime Profile the user-global [`[profiles]`](#profiles) defines. Naming one the user config does not define is a loud error. Absent leaves the Repository default in place. |
+| `source` | unset | Which configured Ticket source discovers this pool's work: `linear` or `local`. Absent means the pool has **no** Ticket source and is reachable only by an explicit `--pool`. |
+| `label` | unset | The Ticket label that routes a Ticket to this pool. Two pools declaring the same label is an error at load, naming both. |
+| `ready_status` | the global value | The `Status:` value marking a Ticket ready for this pool, defaulting to the user-global value. |
+| `cap_usd` | unset | The pool's spend cap in US dollars, under the Repository-wide ceiling. Must be a positive, finite amount; absent means the ceiling is the only limit. |
+| `window` | the global value | The window the pool's cap totals over, defaulting to `spend.window`. |
+| `on_exceed` | the global value | What Dispatch does once the pool's cap is reached, defaulting to `spend.on_exceed`. |
+
+### The implicit `default` pool
+
+With no `[pools]` section, a Repository has one implicit pool named `default`,
+and behaves exactly as it did before pools could be named: `jjfx pool <N>` sizes
+`default`, and nothing else changes. A Repository always has at least one pool,
+so `default` is not removable - resize it to zero instead. `jjfx pool <N>` keeps
+sizing `default` even when other pools are declared.
+
+### Validation is loud
+
+A file that parses but is wrong fails at load, naming the file - the same rule as
+`[checks]`. A pool naming a profile the user config does not define, two pools
+declaring the same routing label, a size that cannot be honoured, and a cap that
+is not a positive finite amount are all errors at load, never a silent fallback
+or a precedence rule.
+
+**A Repository with no user-global `[spend] cap_usd` is exposed to whatever size a
+cloned Repository declares.** The declaration is committed, so a teammate's lane
+definition arrives with the clone; declare a ceiling to bound it.
 
 ## Legacy `[workspace]`
 Earlier releases configured new-workspace provisioning with a `[workspace]`

@@ -9,7 +9,10 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::engine::{PaneLayout, SpendCap, SpendCapMode, SpendWindow};
+use crate::engine::{
+    AgentModel, AgentRuntime, AgentRuntimeProfile, PaneLayout, PoolCapacity, SpendCap,
+    SpendCapMode, SpendWindow, WireAgent,
+};
 use anyhow::Context;
 use serde::Deserialize;
 
@@ -19,6 +22,10 @@ use serde::Deserialize;
 pub struct Config {
     /// How jjfx launches the coding agent in each workspace.
     pub agent: AgentConfig,
+    /// Named Agent Runtime Profiles, keyed by name. Defined here, user-globally,
+    /// so a repository-local pool declaration can *reference* one without
+    /// granting a capability it did not already have (ADR 0014).
+    pub profiles: BTreeMap<String, ProfileConfig>,
     /// Which terminal instance hosts workspace sessions, and how to reach it.
     pub terminal: TerminalConfig,
     /// How the forge pipeline opens and maintains pull requests.
@@ -57,6 +64,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             agent: AgentConfig::default(),
+            profiles: BTreeMap::new(),
             terminal: TerminalConfig::default(),
             forge: ForgeConfig::default(),
             tickets: TicketsConfig::default(),
@@ -99,6 +107,11 @@ impl Config {
     /// Reject layouts and display mappings that cannot be built, so a bad
     /// config fails here rather than when a tab opens.
     pub fn validate(&self) -> anyhow::Result<()> {
+        for (name, profile) in &self.profiles {
+            profile
+                .validate()
+                .map_err(|error| anyhow::anyhow!("profiles.{name}: {error}"))?;
+        }
         for (name, layout) in &self.terminal.layouts {
             layout
                 .validate()
@@ -142,9 +155,17 @@ impl Config {
     /// applied to every repository jjfx is pointed at, so a check configured for
     /// one repository would otherwise run in all of them.
     pub fn checks_for(&self, repo_root: &Path) -> anyhow::Result<ChecksConfig> {
-        Ok(load_repo(repo_root)?
+        Ok(self
+            .repo_config(repo_root)?
             .checks
             .unwrap_or_else(|| self.checks.clone()))
+    }
+
+    /// The repository-local settings for `repo_root`, read and validated against
+    /// this user-global config. The single entry point for the repository file,
+    /// so `[checks]` and `[pools]` are read - and fail - together.
+    pub fn repo_config(&self, repo_root: &Path) -> anyhow::Result<RepoConfig> {
+        load_repo(repo_root, self)
     }
 
     /// The settings the TUI and Dispatch both act on, loaded once and handed
@@ -210,6 +231,73 @@ impl Default for AgentConfig {
             command: "claude".to_string(),
         }
     }
+}
+
+/// A named Agent Runtime Profile: the runtime, and the provider and model its
+/// Runs launch with.
+///
+/// Defined user-globally so a repository-local pool declaration can *reference*
+/// one by name. The capability rule (ADR 0014) is what puts it here: a
+/// repository-local file may select among the profiles the user granted, and
+/// may never define a runtime, a model or credentials of its own.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProfileConfig {
+    /// The Agent Runtime: `claude`, `codex`, or `opencode`.
+    pub runtime: String,
+    /// The provider identifier the runtime needs alongside the model, e.g.
+    /// `anthropic`. Optional.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// The model identifier, e.g. `claude-sonnet-4-20250514`. Optional, leaving
+    /// the runtime to pick its own default model.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+impl ProfileConfig {
+    /// The Agent Runtime Profile this config describes.
+    pub fn profile(&self) -> anyhow::Result<AgentRuntimeProfile> {
+        let runtime = AgentRuntime::from_configured(Some(&WireAgent::new(self.runtime.trim())))
+            .map_err(|message| anyhow::anyhow!("{message}"))?;
+        let mut profile = AgentRuntimeProfile::new(runtime);
+        if let Some(model) = non_blank(self.model.as_deref()) {
+            let mut selection = AgentModel::new(model);
+            if let Some(provider) = non_blank(self.provider.as_deref()) {
+                selection = selection.with_provider(provider);
+            }
+            profile = profile.with_model(selection);
+        }
+        Ok(profile)
+    }
+
+    /// Reject a profile a Run cannot launch with, so a bad config fails at
+    /// startup rather than mid-Dispatch.
+    fn validate(&self) -> anyhow::Result<()> {
+        if self.runtime.trim().is_empty() {
+            anyhow::bail!("runtime cannot be blank");
+        }
+        for (key, value) in [
+            ("provider", self.provider.as_deref()),
+            ("model", self.model.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                anyhow::bail!("{key} cannot be blank; remove it instead");
+            }
+        }
+        if non_blank(self.provider.as_deref()).is_some()
+            && non_blank(self.model.as_deref()).is_none()
+        {
+            anyhow::bail!("provider requires model");
+        }
+        self.profile()?;
+        Ok(())
+    }
+}
+
+/// `value` trimmed, or `None` when it is absent or blank.
+fn non_blank(value: Option<&str>) -> Option<&str> {
+    value.map(str::trim).filter(|value| !value.is_empty())
 }
 
 /// How the forge's final step manages pull requests. jjfx submits PRs natively
@@ -690,9 +778,13 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
 /// lifecycle hooks, because a value that is a property of the repository cannot
 /// live in a file read once for every repository.
 ///
-/// Only `[checks]` is repo-owned. `deny_unknown_fields` is deliberate: a
-/// repository must not be able to silently configure jjfx beyond its build
-/// check, so any other section is a loud error rather than a quiet ignore.
+/// `[checks]` and `[pools]` are the repo-owned sections. `deny_unknown_fields` is
+/// deliberate: a repository must not be able to silently configure jjfx beyond
+/// its build check and its Worker Pools, so any other section is a loud error
+/// rather than a quiet ignore. A pool may only *select* - reference a user-global
+/// Agent Runtime Profile and Ticket source, set a size, cap a spend, name a
+/// routing label - and `deny_unknown_fields` on [`PoolConfig`] is what makes an
+/// attempt to *define* an agent command, a model or credentials a loud error.
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
@@ -700,6 +792,115 @@ pub struct RepoConfig {
     /// wholesale when present. `None` (no `[checks]` section) leaves the
     /// user-global value in place.
     pub checks: Option<ChecksConfig>,
+    /// One declaration per named Worker Pool, keyed by name. Empty (the default)
+    /// means the Repository's single implicit `default` pool and today's
+    /// behaviour, unchanged.
+    pub pools: BTreeMap<String, PoolConfig>,
+}
+
+impl RepoConfig {
+    /// Reject repository-local settings that cannot be honoured, naming the
+    /// offending pool. Takes the user-global config so a declaration can be
+    /// checked against the profiles and sources it may only reference.
+    fn validate(&self, user: &Config) -> anyhow::Result<()> {
+        if let Some(checks) = &self.checks {
+            checks.validate()?;
+        }
+        let mut labels: BTreeMap<&str, &str> = BTreeMap::new();
+        for (name, pool) in &self.pools {
+            pool.validate(name, user)?;
+            if let Some(label) = pool.label.as_deref()
+                && let Some(previous) = labels.insert(label, name)
+            {
+                anyhow::bail!(
+                    "pools `{previous}` and `{name}` both declare the routing label `{label}`"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+/// One repository-local Worker Pool declaration, from `[pools.<name>]`.
+///
+/// Every field is optional but the name (the table key). A declaration may
+/// **select, not grant** (ADR 0014): it references an Agent Runtime Profile and
+/// a Ticket source the user-global config defines, and sets the pool's size,
+/// spend cap, routing label and ready status. It can never define an agent
+/// command, a model, credentials or a new source kind - `deny_unknown_fields`
+/// makes such a key a loud error naming the file.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct PoolConfig {
+    /// The number of Workers the pool holds. Absent leaves the Repository's
+    /// configured size in place.
+    pub size: Option<usize>,
+    /// The name of an Agent Runtime Profile the user-global `[profiles]`
+    /// defines. Absent leaves the Repository default in place.
+    pub profile: Option<String>,
+    /// Which configured Ticket source discovers this pool's work. Absent means a
+    /// pool with no Ticket source, reachable only by an explicit `--pool`.
+    pub source: Option<TicketSource>,
+    /// The Ticket label that routes a Ticket to this pool. Absent means the pool
+    /// is reachable only by an explicit `--pool`.
+    pub label: Option<String>,
+    /// The `Status:` value marking a Ticket ready for this pool, defaulting to
+    /// the user-global value.
+    pub ready_status: Option<String>,
+    /// The pool's spend cap in US dollars. Absent means the global ceiling is
+    /// the only limit.
+    pub cap_usd: Option<f64>,
+    /// The window the pool's cap totals over. Absent defaults to the global
+    /// `spend.window`.
+    pub window: Option<SpendWindow>,
+    /// What Dispatch does once the pool's cap is reached. Absent defaults to the
+    /// global `spend.on_exceed`.
+    pub on_exceed: Option<SpendCapMode>,
+}
+
+impl PoolConfig {
+    /// The spend cap this declaration describes, filling `window` and
+    /// `on_exceed` from the user-global `[spend]` when the pool omits them.
+    ///
+    /// A cap that is not a positive, finite dollar amount is rejected, so a bad
+    /// declaration fails at load rather than mid-Dispatch.
+    pub fn spend_cap(&self, global: &SpendConfig) -> anyhow::Result<Option<SpendCap>> {
+        SpendConfig {
+            cap_usd: self.cap_usd,
+            window: self.window.unwrap_or(global.window),
+            on_exceed: self.on_exceed.unwrap_or(global.on_exceed),
+        }
+        .cap()
+    }
+
+    /// Reject a declaration that cannot be honoured, naming the pool.
+    fn validate(&self, name: &str, user: &Config) -> anyhow::Result<()> {
+        if let Some(size) = self.size {
+            PoolCapacity::new(size).map_err(|error| anyhow::anyhow!("pool `{name}`: {error}"))?;
+        }
+        if let Some(profile) = self.profile.as_deref() {
+            if profile.trim().is_empty() {
+                anyhow::bail!("pool `{name}` profile cannot be blank");
+            }
+            if !user.profiles.contains_key(profile) {
+                anyhow::bail!(
+                    "pool `{name}` names Agent Runtime Profile `{profile}`, which the user \
+                     config does not define"
+                );
+            }
+        }
+        for (key, value) in [
+            ("label", self.label.as_deref()),
+            ("ready_status", self.ready_status.as_deref()),
+        ] {
+            if value.is_some_and(|value| value.trim().is_empty()) {
+                anyhow::bail!("pool `{name}` {key} cannot be blank");
+            }
+        }
+        self.spend_cap(&user.spend)
+            .map_err(|error| anyhow::anyhow!("pool `{name}`: {error}"))?;
+        Ok(())
+    }
 }
 
 /// `<repo>/.jjfx/config.toml` - the repository-local settings file, next to the
@@ -711,8 +912,9 @@ pub fn repo_config_path(repo_root: &Path) -> PathBuf {
 /// Read the repository-local settings. A missing file is no overrides; a file
 /// that exists but fails to parse, names a section a repository may not set, or
 /// holds invalid values is an error naming the file - the same loud-failure rule
-/// as the user-global config.
-pub fn load_repo(repo_root: &Path) -> anyhow::Result<RepoConfig> {
+/// as the user-global config. The user-global config is passed in so a pool
+/// declaration can be checked against the profiles it may only reference.
+pub fn load_repo(repo_root: &Path, user: &Config) -> anyhow::Result<RepoConfig> {
     let path = repo_config_path(repo_root);
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
@@ -725,16 +927,14 @@ pub fn load_repo(repo_root: &Path) -> anyhow::Result<RepoConfig> {
     };
     let config: RepoConfig = toml::from_str(&text).with_context(|| {
         format!(
-            "parsing config {} - only [checks] is repository-local; every other setting belongs \
-             in the user config",
+            "parsing config {} - a repository may set only [checks] and [pools]; a pool may \
+             select a user-global profile and Ticket source, never define one",
             path.display()
         )
     })?;
-    if let Some(checks) = &config.checks {
-        checks
-            .validate()
-            .with_context(|| format!("validating config {}", path.display()))?;
-    }
+    config
+        .validate(user)
+        .with_context(|| format!("validating config {}", path.display()))?;
     Ok(config)
 }
 
@@ -858,7 +1058,8 @@ mod tests {
     fn the_user_global_check_applies_when_the_repository_sets_none() {
         let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
         // No repository file at all, and one that sets nothing (a comment only -
-        // any section other than `[checks]` is rejected, not ignored).
+        // any section other than `[checks]` and `[pools]` is rejected, not
+        // ignored).
         for repo in [
             repo_with_config(None),
             repo_with_config(Some("# nothing repo-owned here yet\n")),
@@ -894,8 +1095,8 @@ mod tests {
     fn an_invalid_repository_config_is_an_error_naming_the_file() {
         let config = Config::from_toml("");
 
-        // `[checks]` is the only repo-owned section, so a repository cannot
-        // reconfigure the agent, the terminal, or anything else.
+        // `[checks]` and `[pools]` are the repo-owned sections, so a repository
+        // cannot reconfigure the agent, the terminal, or anything else.
         let repo = repo_with_config(Some("[agent]\ncommand = \"rm -rf /\"\n"));
         let error = config
             .checks_for(repo.path())
@@ -917,6 +1118,267 @@ mod tests {
             .checks_for(repo.path())
             .expect_err("a blank command must be rejected");
         assert!(format!("{error:?}").contains("checks.command"), "{error:?}");
+    }
+
+    #[test]
+    fn profiles_are_empty_by_default() {
+        let cfg = Config::default();
+        cfg.validate().expect("the default config is valid");
+        assert!(cfg.profiles.is_empty());
+    }
+
+    #[test]
+    fn a_profile_defines_a_named_agent_runtime_profile() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [profiles.fast]
+            runtime = "claude"
+            provider = "anthropic"
+            model = "claude-sonnet-4-20250514"
+            "#,
+        )
+        .expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        let profile = cfg.profiles["fast"].profile().expect("a valid profile");
+        assert_eq!(profile.runtime(), AgentRuntime::Claude);
+        let model = profile.model().expect("a model");
+        assert_eq!(model.provider(), Some("anthropic"));
+        assert_eq!(model.model(), "claude-sonnet-4-20250514");
+    }
+
+    #[test]
+    fn a_profile_may_leave_provider_and_model_unset() {
+        let cfg: Config =
+            toml::from_str("[profiles.fast]\nruntime = \"codex\"\n").expect("toml parses");
+        cfg.validate().expect("the config is valid");
+        let profile = cfg.profiles["fast"].profile().expect("a valid profile");
+        assert_eq!(profile.runtime(), AgentRuntime::Codex);
+        assert!(profile.model().is_none());
+    }
+
+    #[test]
+    fn an_unknown_profile_runtime_is_rejected() {
+        let cfg: Config =
+            toml::from_str("[profiles.fast]\nruntime = \"gpt5\"\n").expect("toml parses");
+        let error = cfg.validate().expect_err("an unknown runtime is an error");
+        assert!(error.to_string().contains("profiles.fast"), "{error}");
+        assert!(error.to_string().contains("gpt5"), "{error}");
+    }
+
+    #[test]
+    fn a_profile_provider_without_a_model_is_rejected() {
+        let cfg: Config =
+            toml::from_str("[profiles.fast]\nruntime = \"claude\"\nprovider = \"anthropic\"\n")
+                .expect("toml parses");
+        let error = cfg
+            .validate()
+            .expect_err("provider without a model is an error");
+        assert!(error.to_string().contains("profiles.fast"), "{error}");
+        assert!(error.to_string().contains("provider"), "{error}");
+    }
+
+    #[test]
+    fn unknown_profile_keys_are_rejected() {
+        let err = toml::from_str::<Config>("[profiles.fast]\nruntim = \"claude\"\n")
+            .expect_err("a typo is an error");
+        assert!(err.to_string().contains("runtim"), "{err}");
+    }
+
+    #[test]
+    fn blank_profile_fields_are_rejected() {
+        for text in [
+            "[profiles.fast]\nruntime = \"  \"\n",
+            "[profiles.fast]\nruntime = \"claude\"\nmodel = \"  \"\n",
+        ] {
+            let cfg: Config = toml::from_str(text).expect("toml parses");
+            let error = cfg.validate().expect_err("a blank field is an error");
+            assert!(
+                error.to_string().contains("profiles.fast"),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_pools_section_declares_no_pools() {
+        // The additive stance: no `[pools]` is the single implicit `default`
+        // pool and today's behaviour, so the declaration set is simply empty.
+        let config = Config::from_toml("");
+        for repo in [
+            repo_with_config(None),
+            repo_with_config(Some("# nothing repo-owned here yet\n")),
+        ] {
+            let repo_config = config
+                .repo_config(repo.path())
+                .expect("no repository override");
+            assert!(repo_config.pools.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_pools_section_parses_with_every_field_optional_but_the_name() {
+        let config = Config::from_toml(
+            r#"
+            [profiles.fast]
+            runtime = "claude"
+            "#,
+        );
+        let repo = repo_with_config(Some(
+            r#"
+            [pools.bugs]
+            size = 2
+            profile = "fast"
+            source = "local"
+            label = "bug"
+            ready_status = "ready-for-agent"
+            cap_usd = 5.0
+            window = "week"
+            on_exceed = "block"
+
+            [pools.review]
+            "#,
+        ));
+        let repo_config = config
+            .repo_config(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(repo_config.pools.len(), 2);
+        let bugs = &repo_config.pools["bugs"];
+        assert_eq!(bugs.size, Some(2));
+        assert_eq!(bugs.profile.as_deref(), Some("fast"));
+        assert_eq!(bugs.source, Some(TicketSource::Local));
+        assert_eq!(bugs.label.as_deref(), Some("bug"));
+        assert_eq!(bugs.ready_status.as_deref(), Some("ready-for-agent"));
+        let cap = bugs
+            .spend_cap(&config.spend)
+            .expect("valid")
+            .expect("a cap");
+        assert_eq!(cap.limit_micro_usd(), 5_000_000);
+        // A bare `[pools.<name>]` is a valid pool: every field is optional but
+        // the name, and a pool may declare no Ticket source at all.
+        let review = &repo_config.pools["review"];
+        assert!(review.size.is_none());
+        assert!(review.profile.is_none());
+        assert!(review.source.is_none());
+        assert!(review.label.is_none());
+        assert!(review.ready_status.is_none());
+        assert!(review.spend_cap(&config.spend).expect("valid").is_none());
+    }
+
+    #[test]
+    fn a_pool_naming_an_unknown_profile_is_a_loud_error_naming_the_file() {
+        let config = Config::from_toml("[profiles.fast]\nruntime = \"claude\"\n");
+        let repo = repo_with_config(Some("[pools.bugs]\nprofile = \"fast\"\n"));
+        config
+            .repo_config(repo.path())
+            .expect("a profile the user config defines is fine");
+
+        let repo = repo_with_config(Some("[pools.bugs]\nprofile = \"turbo\"\n"));
+        let error = config
+            .repo_config(repo.path())
+            .expect_err("an unknown profile is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("turbo"), "{message}");
+        assert!(message.contains("bugs"), "{message}");
+    }
+
+    #[test]
+    fn two_pools_with_the_same_routing_label_are_refused_naming_both() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some(
+            "[pools.bugs]\nlabel = \"urgent\"\n\n[pools.features]\nlabel = \"urgent\"\n",
+        ));
+        let error = config
+            .repo_config(repo.path())
+            .expect_err("a duplicate routing label is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("bugs"), "{message}");
+        assert!(message.contains("features"), "{message}");
+        assert!(message.contains("urgent"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_pool_is_rejected() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[pools.bugs]\nsixe = 2\n"));
+        let error = config
+            .repo_config(repo.path())
+            .expect_err("a typo is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("sixe"), "{message}");
+    }
+
+    #[test]
+    fn a_pool_may_select_but_never_define_a_capability() {
+        let config = Config::from_toml("");
+        // A declaration may reference a user-global profile and source; defining
+        // an agent command, a model, a runtime, credentials or a new source kind
+        // of its own is a loud error naming the file (ADR 0014).
+        for defining in [
+            "[pools.bugs]\ncommand = \"rm -rf /\"\n",
+            "[pools.bugs]\nmodel = \"claude-sonnet-4\"\n",
+            "[pools.bugs]\nruntime = \"claude\"\n",
+            "[pools.bugs]\nprovider = \"anthropic\"\n",
+            "[pools.bugs]\ncredentials = \"sk-secret\"\n",
+            "[pools.bugs]\nsource = \"jira\"\n",
+            "[profiles.fast]\nruntime = \"claude\"\n",
+        ] {
+            let repo = repo_with_config(Some(defining));
+            let error = config
+                .repo_config(repo.path())
+                .expect_err("defining rather than referencing must fail");
+            let message = format!("{error:?}");
+            assert!(message.contains("config.toml"), "{defining:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_pool_size_that_cannot_be_honoured_is_an_error() {
+        let user = Config::default();
+        let pool = PoolConfig {
+            size: Some(usize::MAX),
+            ..PoolConfig::default()
+        };
+        let error = pool
+            .validate("bugs", &user)
+            .expect_err("an oversized pool is an error");
+        assert!(error.to_string().contains("bugs"), "{error}");
+    }
+
+    #[test]
+    fn a_pool_cap_that_cannot_be_honoured_is_an_error() {
+        let config = Config::from_toml("");
+        for cap in ["0", "-1.0", "nan"] {
+            let repo = repo_with_config(Some(&format!("[pools.bugs]\ncap_usd = {cap}\n")));
+            let error = config
+                .repo_config(repo.path())
+                .expect_err("an unusable cap is an error");
+            assert!(format!("{error:?}").contains("bugs"), "{error:?}");
+        }
+    }
+
+    #[test]
+    fn a_pool_cap_defaults_its_window_and_mode_to_the_global_values() {
+        let config = Config::from_toml(
+            r#"
+            [spend]
+            cap_usd = 25.0
+            window = "today"
+            on_exceed = "warn"
+            "#,
+        );
+        let repo = repo_with_config(Some("[pools.bugs]\ncap_usd = 5.0\n"));
+        let repo_config = config
+            .repo_config(repo.path())
+            .expect("the repository config parses");
+        let cap = repo_config.pools["bugs"]
+            .spend_cap(&config.spend)
+            .expect("valid")
+            .expect("a cap");
+        assert_eq!(cap.limit_micro_usd(), 5_000_000);
+        assert_eq!(cap.window(), SpendWindow::Today);
+        assert_eq!(cap.mode(), SpendCapMode::Warn);
     }
 
     #[test]
