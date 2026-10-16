@@ -29,6 +29,18 @@ Both themes cost the test-drive real time, and both are invisible unless you rea
 | 08 | Capture Run Records and spend | `engine/state.rs`, `engine/opencode_api.rs` |
 | 09 | Small dispatch frictions: help, prompt and version | `cli.rs`, `cli_help.rs` |
 | 10 | Stop the test suite leaking agent processes | `tests/` |
+| 11 | `jjfx wait`: block until a Worker is done, exit code carries the answer | `cli.rs`, `engine/foreground.rs` |
+| 12 | `jjfx logs` follows a finished Worker forever | `cli.rs` |
+
+## Waves
+
+Wave 1 (dispatched 2026-10-16): **01, 02, 03, 08** — the owner's two priorities (ad-hoc Ticket input, out-of-the-box defaults) plus the worst bug in the test-drive (the writeback deadlock) and the most surprising (Run Records and spend).
+
+Wave 2 (queued): **04, 05, 06, 07, 09, 10, 11, 12**.
+
+Wave 1 is deliberately narrow. Almost every ticket here edits `src/cli.rs`, and the test-drive's own integration pain came from parallel workers in one file, so tickets that share `dispatch_command` — 03, 04 and 05 — are spread across waves rather than stacked.
+
+**11 is `Blocked by: 03` on purpose.** It is the same reconciliation mechanism seen from the other side — `reconcile` is one pass, `wait` is reconcile-until-a-condition — so it should be built after 03 rather than racing it. That is also a live test of the readiness gate this batch is partly about.
 
 ## Deliberately not filed
 
