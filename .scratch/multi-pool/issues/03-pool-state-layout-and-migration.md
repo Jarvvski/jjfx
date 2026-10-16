@@ -20,6 +20,8 @@ Whichever is chosen, answer:
 
 Blocked by the `wsg` compatibility research — if the layout is a contract, this is a migration design rather than a free choice — and by the domain model, which decides whether a Worker belongs to a pool or is assigned to one.
 
+**That first blocker has resolved, and it widened this ticket.** The compatibility contract is dead (*Is the persisted Pool state a `wsg` compatibility contract?* → **ours**), so the directory-per-pool option is no longer excluded by anything. More usefully, three jjfx-owned sidecar documents — `InUseState`, `SessionState` and the waiting set in `src/engine/state.rs` — exist *only* to avoid touching the Go-shaped documents, and can now be folded into the Pool or Worker documents. Decide whether they should be, since a pool-aware layout has to place per-pool state somewhere anyway. *Retire the dead `wsg` compatibility residue* clears the fixtures and doc comments that still assert the old shapes; this ticket owns the design decision, not that cleanup.
+
 ## Answer
 
 <!-- recorded on resolution -->
