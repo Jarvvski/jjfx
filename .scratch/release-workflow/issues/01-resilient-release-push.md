@@ -1,6 +1,6 @@
 # Make the release workflow resilient to a moving `main`
 
-Status: needs-triage
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -58,3 +58,5 @@ Options 1 and 2 are complementary and both small. Option 3 is larger, and arguab
 ## Comments
 
 Filed 2026-10-14, discovered during the momo migration: the first real 0.53.0 release hit exactly this (run 38600471957). crates.io was untouched; the orphaned `v0.53.0` was deleted by hand and the release re-run succeeded (run 38603112212).
+
+- 2026-10-16 - Resolved with options 1 and 2 (both small, complementary); option 3 was not taken - serialising releases against ordinary pushes is larger and unnecessary once 1 and 2 hold. `Commit and tag` now fetches `origin/main`, rebases the release commit onto it, and retries the push up to five times when another commit wins the race between the fetch and the push. It pushes the branch *before* the tag, so a rejected branch push can never orphan the tag; the tag is created with `momo tag` (unchanged) only after the branch push succeeds. A `CHANGELOG.md` rebase conflict aborts and fails the run with an explicit "never force the push" message rather than dropping the concurrent entry. The derive-step guards (existing tag, existing crates.io version) are untouched. Validated the loop against a throwaway git repo (clean rebase, one retry, conflict, budget exhaustion) and `actionlint` + `shellcheck`.
