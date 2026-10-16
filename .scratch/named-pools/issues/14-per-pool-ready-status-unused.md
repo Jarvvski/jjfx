@@ -1,7 +1,7 @@
 # The per-pool `ready_status` is declared but unused
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 07
 
 ## Problem
@@ -20,10 +20,10 @@ If it turns out the design does not need it, remove the key and say why. A docum
 
 ## Acceptance Criteria
 
-- [ ] `[pools.<name>] ready_status` either filters that pool's discovery, or the key is gone.
-- [ ] Whichever is chosen, `docs/configuration.md` matches.
-- [ ] No configuration key parses and does nothing.
-- [ ] `mise run check` is green.
+- [x] `[pools.<name>] ready_status` either filters that pool's discovery, or the key is gone.
+- [x] Whichever is chosen, `docs/configuration.md` matches.
+- [x] No configuration key parses and does nothing.
+- [x] `mise run check` is green.
 
 ## References
 

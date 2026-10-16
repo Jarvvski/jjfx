@@ -902,6 +902,22 @@ impl RepoConfig {
         Ok(names)
     }
 
+    /// The `Status:` value a Ticket must be in to be ready for `pool`: the
+    /// pool's own declaration when it makes one, else `global`, the Repository's
+    /// user-global value.
+    ///
+    /// Read from an already-loaded config, like [`Self::pool_names`], so a caller
+    /// that needs both the names and the declarations loads the file once. The
+    /// implicit `default` a Repository never declares resolves to `global`, so a
+    /// Repository that sets nothing is unchanged.
+    pub fn pool_ready_status(&self, pool: &PoolName, global: &str) -> String {
+        self.pools
+            .get(pool.as_str())
+            .and_then(|declaration| declaration.ready_status.as_deref())
+            .unwrap_or(global)
+            .to_owned()
+    }
+
     /// Reject repository-local settings that cannot be honoured, naming the
     /// offending pool. Takes the user-global config so a declaration can be
     /// checked against the profiles and sources it may only reference.
@@ -1615,6 +1631,42 @@ mod tests {
                 ("bugs".to_owned(), "bug".to_owned()),
                 ("features".to_owned(), "feature".to_owned()),
             ]
+        );
+    }
+
+    /// The `Status:` value a pool draws its work by is per pool: a declaration
+    /// overrides the user-global value, and a pool that declares none - including
+    /// the implicit `default` - keeps it.
+    #[test]
+    fn a_pools_ready_status_overrides_the_global_one_and_defaults_to_it() {
+        let config = Config::from_toml("[tickets]\nsource = \"local\"\n");
+        let repo = repo_with_config(Some(
+            "[pools.review]\nready_status = \"ready-for-review\"\n\n[pools.bugs]\n",
+        ));
+        let repo_config = config
+            .repo_config(repo.path())
+            .expect("the repository config parses");
+
+        assert_eq!(
+            repo_config.pool_ready_status(
+                &PoolName::parse("review").expect("pool name"),
+                config.tickets.ready_status()
+            ),
+            "ready-for-review",
+            "a pool's own ready status wins"
+        );
+        assert_eq!(
+            repo_config.pool_ready_status(
+                &PoolName::parse("bugs").expect("pool name"),
+                config.tickets.ready_status()
+            ),
+            "ready-for-agent",
+            "a pool that declares none keeps the global value"
+        );
+        assert_eq!(
+            repo_config.pool_ready_status(&PoolName::default(), config.tickets.ready_status()),
+            "ready-for-agent",
+            "an implicit default keeps the global value"
         );
     }
 

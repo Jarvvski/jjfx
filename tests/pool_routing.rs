@@ -353,6 +353,81 @@ fn an_untagged_ticket_does_not_route_to_a_named_lane() {
     assert!(error.contains("ready-for-agent"), "{error}");
 }
 
+/// The ready status is per pool, exactly as the routing label is: a review lane
+/// that declares `ready_status = "ready-for-review"` draws work the default lane
+/// does not, from the same `.scratch/` tree, so a lane can define readiness
+/// differently rather than every lane drawing the one global status.
+#[test]
+fn a_pools_ready_status_filters_its_own_discovery() {
+    let fixture = RoutingFixture::new();
+    fixture.write_repo_config(
+        "[pools.bugs]\nsize = 1\nlabel = \"bug\"\nready_status = \"ready-for-agent\"\n\n\
+         [pools.review]\nsize = 1\nlabel = \"review\"\nready_status = \"ready-for-review\"\n",
+    );
+    fixture.write_ticket(
+        "01-agent.md",
+        "# Ready for an agent\n\nStatus: ready-for-agent\nLabels: bug\n\n## Problem\n\nDo it.\n",
+    );
+    fixture.write_ticket(
+        "02-review.md",
+        "# Ready for review\n\nStatus: ready-for-review\nLabels: review\n\n## Problem\n\nDo it.\n",
+    );
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    // Both Tickets are drawn - each by the lane whose ready status it is in, not
+    // by a single global status the review Ticket would fail.
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    assert_eq!(json.as_array().expect("a batch").len(), 2, "{json}");
+    assert_eq!(
+        entry(&json, "widgets--01-agent")["worker"],
+        lane_worker(&fixture, "bugs").as_str()
+    );
+    assert_eq!(
+        entry(&json, "widgets--02-review")["worker"],
+        lane_worker(&fixture, "review").as_str()
+    );
+}
+
+/// An explicit `--pool` uses that pool's ready status too, not the global one, so
+/// a lane that defines readiness differently is reachable by name as well as by
+/// the `--all` fan-out.
+#[test]
+fn an_explicit_pool_uses_its_own_ready_status() {
+    let fixture = RoutingFixture::new();
+    fixture.write_repo_config(
+        "[pools.bugs]\nsize = 1\nlabel = \"bug\"\n\n\
+         [pools.review]\nsize = 1\nlabel = \"review\"\nready_status = \"ready-for-review\"\n",
+    );
+    fixture.write_ticket(
+        "01-review.md",
+        "# Ready for review\n\nStatus: ready-for-review\nLabels: review\n\n## Problem\n\nDo it.\n",
+    );
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--pool", "review", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    assert_eq!(json.as_array().expect("a batch").len(), 1, "{json}");
+    assert_eq!(
+        entry(&json, "widgets--01-review")["worker"],
+        lane_worker(&fixture, "review").as_str()
+    );
+}
+
 /// An explicit `--pool` still wins, and still means "only this lane".
 #[test]
 fn an_explicit_pool_overrides_label_routing() {

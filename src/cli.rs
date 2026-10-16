@@ -2764,6 +2764,7 @@ fn ticket_reconcile_command(
 fn report_named_ticket_readiness(
     repository: &Repository,
     args: &DispatchArgs,
+    repo_config: &RepoConfig,
     tickets_config: fn(&Repository) -> Result<TicketsConfig>,
 ) -> Result<()> {
     let tickets = tickets_config(repository)?;
@@ -2772,9 +2773,13 @@ fn report_named_ticket_readiness(
     }
     // Readiness, not routing: the report answers "is this Ticket ready to run",
     // so it discovers by the global ready label rather than the selected pool's
-    // routing label. A Ticket tagged for another lane is still ready.
+    // routing label. A Ticket tagged for another lane is still ready. The
+    // *status*, though, is the selected pool's: that pool is where the Ticket
+    // will run, so readiness is whatever that lane declares.
     let label = global_ready_label(args.label.as_deref());
-    let status = TicketStatus::parse(tickets.ready_status())?;
+    let status = TicketStatus::parse(
+        repo_config.pool_ready_status(repository.selected_pool(), tickets.ready_status()),
+    )?;
     let filter = ReadyTicketFilter::new(&label, status)?;
     let runtime = configured_runtime(repository);
     let discovery = TicketDiscovery::new(configured_ticket_query(
@@ -2939,7 +2944,6 @@ fn dispatch_all_across_pools(
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
     let tickets = tickets_config(repository)?;
     let ticket_hint = ticket_source_hint(&tickets, repository);
-    let status = TicketStatus::parse(tickets.ready_status())?;
     // The source is built once, with the global ready label: a Ticket that
     // declares no `Labels:` carries that, never a pool's routing label, so an
     // untagged Ticket cannot match every lane at once.
@@ -2970,7 +2974,13 @@ fn dispatch_all_across_pools(
             route.label(),
             route.name()
         );
-        let filter = ReadyTicketFilter::new(route.label(), status.clone())?;
+        // The status a Ticket must be in to be ready is per pool, exactly as its
+        // label routes it: a lane that declares its own `ready_status` draws work
+        // by that status, and one that declares none keeps the user-global value.
+        let status = TicketStatus::parse(
+            repo_config.pool_ready_status(route.name(), tickets.ready_status()),
+        )?;
+        let filter = ReadyTicketFilter::new(route.label(), status)?;
         let ready = discovery.ready_tickets(&filter)?;
         // Fold by subject: every pool reports the same not-ready Ticket, and one
         // reason is enough to say what stops it.
@@ -3159,7 +3169,7 @@ fn dispatch_command(
     // seam the `--all` path uses. This runs before the Orchestrator handoff below,
     // so a named Ticket that falls back to a direct Dispatch reports too.
     if !args.all {
-        report_named_ticket_readiness(repository, args, tickets_config)?;
+        report_named_ticket_readiness(repository, args, &repo_config, tickets_config)?;
     }
 
     // A single Ticket with orchestration enabled is handed to the Orchestrator.
@@ -3227,7 +3237,12 @@ fn dispatch_command(
     )?);
 
     if args.all {
-        let status = TicketStatus::parse(tickets.ready_status())?;
+        // The ready status is per pool, exactly as the ready label is: a lane
+        // that declares its own `ready_status` draws work by that status, and one
+        // that declares none keeps the user-global value.
+        let status = TicketStatus::parse(
+            repo_config.pool_ready_status(repository.selected_pool(), tickets.ready_status()),
+        )?;
         let filter = ReadyTicketFilter::new(&ready_label, status)?;
         eprintln!("Fetching tickets with label '{ready_label}'...");
         let ready = discovery.ready_tickets(&filter)?;

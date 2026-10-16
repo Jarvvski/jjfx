@@ -66,10 +66,12 @@ it.
 
 ## Ready set
 
-A Ticket is **ready** when its `Status:` is `ready-for-agent` and every
-`Blocked by:` number resolves to a sibling in the same feature whose `Status:` is
-`resolved`. A Ticket with an unresolved Blocker is not ready; resolving the
-Blocker makes it ready on the next discovery.
+A Ticket is **ready** when its `Status:` is the ready status - `ready-for-agent`
+unless the Worker Pool it is drawn for declares its own `ready_status` (see
+[configuration](configuration.md)) - and every `Blocked by:` number resolves to
+a sibling in the same feature whose `Status:` is `resolved`. A Ticket with an
+unresolved Blocker is not ready; resolving the Blocker makes it ready on the
+next discovery.
 
 Naming a Ticket is the override. `jjfx dispatch <ticket-id>` reports why the
 Ticket is not ready - the wrong `Status:`, or the unresolved Blocker and its
