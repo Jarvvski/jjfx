@@ -30,6 +30,9 @@ The implementation backlog for **running several named Worker Pools in one Repos
 | 14 | The per-pool `ready_status` is declared but unused | 07 |
 | 15 | `pool resize --pool <name>` does not resize a materialised pool | - |
 | 16 | A declared `default` pool's declaration goes stale | - |
+| 17 | `pool list` prints an unnamed `pool state is absent` for every pool without state | - |
+| 18 | `clean`'s confirmation on EOF removes nothing and exits 0 without saying so | - |
+| 19 | `--json` never explains an empty ready set | - |
 
 ## Suggested order
 
@@ -40,6 +43,10 @@ The implementation backlog for **running several named Worker Pools in one Repos
 **12 is a follow-on, not a prerequisite.** Nothing here needs it; it exists because ADR 0014's capability rule makes it possible, and it is the wall the `todo-md` test-drive hit.
 
 **13, 14, 15 and 16 were filed while implementing the rest**, and all four are gaps the effort left rather than new scope. **13 was the last mile**: nothing materialised a declared pool's state, so a named lane could be declared and never used - every other ticket was plumbing until it landed. The other three are the same failure in miniature, and they are worth reading together: **a declaration that does not reach the thing it describes.** 14 is a configuration key that parses and does nothing; 15 is a size edit that looks like it worked and changes nothing once the lane exists; 16 is 15's mirror, where `default`'s declaration goes stale because the fix stopped at named lanes. **Four instances of one shape is a signal about how these tickets were written**, not four coincidences.
+
+**17, 18 and 19 came from driving the finished feature end to end** against a throwaway Repository - the same method that produced the dispatch-ergonomics batch, and the check the effort had been missing: every ticket so far had been verified by the worker that wrote it, not by using the thing. The drive confirmed the feature works (per-lane label routing, per-lane materialisation under `.jj/pools/<name>/`, `pool` on every Worker in `status --json`, per-pool subtotals, resize moving lane and declaration together, honest failure with exit 1) and found three diagnostic defects.
+
+They are not all the effort's own debt, and the tickets say so individually: **17 is a regression this effort introduced** (the stray stderr fragment arrived with `pool list`), while **18 and 19 are pre-existing** - the single-pool path behaves identically to the pool paths in both cases. 17 is the one that belongs to finishing this work; 18 and 19 are the owner's call.
 
 ## Out of scope
 
