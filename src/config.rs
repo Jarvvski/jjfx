@@ -192,14 +192,7 @@ impl Config {
     /// that declares nothing therefore has exactly one pool, which is what lets
     /// an unqualified Dispatch imply it (`.scratch/multi-pool/issues/04`).
     pub fn pool_names_for(&self, repo_root: &Path) -> anyhow::Result<Vec<PoolName>> {
-        let mut names = vec![PoolName::default()];
-        for name in self.repo_config(repo_root)?.pools.keys() {
-            if name == DEFAULT_POOL_NAME {
-                continue;
-            }
-            names.push(PoolName::parse(name.clone())?);
-        }
-        Ok(names)
+        self.repo_config(repo_root)?.pool_names()
     }
 
     /// The routing table `repo_root` declares: one entry per Worker Pool that
@@ -891,6 +884,24 @@ pub struct RepoConfig {
 }
 
 impl RepoConfig {
+    /// The names of every Worker Pool this Repository holds, `default` first.
+    ///
+    /// The set is `default` - which every Repository has, implicitly or by
+    /// declaration - plus each pool its `[pools]` section declares, so a
+    /// Repository that declares nothing holds exactly one. Reading it here, from
+    /// an already-loaded config, is what lets a caller that needs both the
+    /// declarations and the names load the file once.
+    pub fn pool_names(&self) -> anyhow::Result<Vec<PoolName>> {
+        let mut names = vec![PoolName::default()];
+        for name in self.pools.keys() {
+            if name == DEFAULT_POOL_NAME {
+                continue;
+            }
+            names.push(PoolName::parse(name.clone())?);
+        }
+        Ok(names)
+    }
+
     /// Reject repository-local settings that cannot be honoured, naming the
     /// offending pool. Takes the user-global config so a declaration can be
     /// checked against the profiles and sources it may only reference.

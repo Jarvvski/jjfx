@@ -249,23 +249,73 @@ impl RealWorkspaceDispatch {
             .map_err(|error| error.to_string())
     }
 
-    /// Evaluates the configured spend cap for one Dispatch.
+    /// Evaluates every spend limit for one Dispatch.
     ///
-    /// Returns the warning message when Dispatch is over the cap in `warn` mode,
-    /// `None` when it is under the cap or no cap is configured, and an error -
-    /// refusing Dispatch - when the cap is reached in `block` mode. A cap that
-    /// cannot be evaluated because the record store is unreadable refuses too:
-    /// failing closed is the only safe answer for a spend gate.
+    /// Both limits bind: the selected pool's own cap totals its records and the
+    /// Repository ceiling totals every pool's, so Dispatch proceeds only when
+    /// each has room. Returns the warning message when the tightest fired limit
+    /// is in `warn` mode, `None` when every limit has room or none is
+    /// configured, and an error - refusing Dispatch - when any limit blocks. A
+    /// limit that cannot be evaluated because the record store is unreadable
+    /// refuses too: failing closed is the only safe answer for a spend gate.
     fn spend_gate(&self, repository: &crate::engine::Repository) -> Result<Option<String>, String> {
-        let Some(cap) = self.spend.cap().map_err(|error| error.to_string())? else {
-            return Ok(None);
-        };
-        let snapshot = repository.pool_cost().map_err(|error| error.to_string())?;
-        match cap.evaluate(&snapshot) {
+        let (names, pool_cap) = self.declared_spend(repository);
+        let mut limits = Vec::new();
+        if let Some(cap) = self.spend.cap().map_err(|error| error.to_string())? {
+            let spend = repository
+                .repository_cost(&names)
+                .map_err(|error| error.to_string())?;
+            limits.push(crate::engine::SpendLimit::new(
+                crate::engine::SpendScope::Repository,
+                cap,
+                spend,
+            ));
+        }
+        if let Some(cap) = pool_cap {
+            let spend = repository.pool_cost().map_err(|error| error.to_string())?;
+            limits.push(crate::engine::SpendLimit::new(
+                crate::engine::SpendScope::Pool(repository.selected_pool().clone()),
+                cap,
+                spend,
+            ));
+        }
+        match crate::engine::evaluate_spend(limits) {
             crate::engine::SpendDecision::Allowed => Ok(None),
             crate::engine::SpendDecision::Warned(message) => Ok(Some(message)),
             crate::engine::SpendDecision::Refused(message) => Err(message),
         }
+    }
+
+    /// The pool names the Repository ceiling totals and the selected pool's cap.
+    ///
+    /// The ceiling totals every pool's records, so it needs the Repository's
+    /// declared names, and the selected pool's cap is a repository-local
+    /// declaration whose window and mode default to the configured ceiling. A
+    /// config that cannot be read falls back to the implicit `default` pool with
+    /// no cap - the floor every Repository holds - rather than refusing a
+    /// Dispatch the frontend already validated at launch.
+    fn declared_spend(
+        &self,
+        repository: &crate::engine::Repository,
+    ) -> (
+        Vec<crate::engine::PoolName>,
+        Option<crate::engine::SpendCap>,
+    ) {
+        let default_only = || (vec![crate::engine::PoolName::default()], None);
+        let Ok(user) = crate::config::load() else {
+            return default_only();
+        };
+        let Ok(repo_config) = user.repo_config(repository.root()) else {
+            return default_only();
+        };
+        let names = user
+            .pool_names_for(repository.root())
+            .unwrap_or_else(|_| vec![crate::engine::PoolName::default()]);
+        let cap = repo_config
+            .pools
+            .get(repository.selected_pool().as_str())
+            .and_then(|declaration| declaration.spend_cap(&self.spend).ok().flatten());
+        (names, cap)
     }
 
     fn dispatch_with_strategy(

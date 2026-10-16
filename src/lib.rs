@@ -85,7 +85,6 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
                 colocate: colocate_setting,
                 open_workspaces,
                 tickets: tickets_setting,
-                spend: spend_setting,
                 migrations: migrations_setting,
             },
         )
@@ -210,11 +209,6 @@ fn tickets_setting(
     repository: &crate::engine::Repository,
 ) -> anyhow::Result<config::TicketsConfig> {
     config::load()?.tickets_for(repository.root())
-}
-
-/// Resolve the aggregate spend cap Dispatch is gated on.
-fn spend_setting() -> anyhow::Result<config::SpendConfig> {
-    Ok(config::load()?.spend)
 }
 
 /// The `[migrations]` settings the `check migrations` verb reads. Loaded lazily,

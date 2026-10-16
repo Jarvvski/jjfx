@@ -181,6 +181,27 @@ impl RoutingFixture {
             .output()
             .expect("jjfx should run")
     }
+
+    /// Seeds `pool`'s durable Run records with one Run costing `micro_usd`, so a
+    /// declared cap has already run out without launching anything.
+    fn seed_spend(&self, pool: &str, worker: &str, micro_usd: u64) {
+        let directory = self.path().join(".jj/pools").join(pool);
+        fs::create_dir_all(&directory).expect("pool directory");
+        fs::write(
+            directory.join("runs.jsonl"),
+            format!(
+                "{}\n",
+                serde_json::json!({
+                    "run_id": format!("{worker}@1"),
+                    "worker": worker,
+                    "cost_micro_usd": micro_usd,
+                    "conclusion": "succeeded",
+                    "completed_at": "2026-10-15T09:00:00Z",
+                })
+            ),
+        )
+        .expect("run records");
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -400,6 +421,56 @@ fn an_unqualified_named_dispatch_is_still_refused_when_pools_declare_labels() {
     assert!(error.contains("bugs"), "{error}");
     assert!(error.contains("features"), "{error}");
     assert!(error.contains("--pool"), "{error}");
+}
+
+/// A lane whose spend cap has run out holds its Tickets back while the other
+/// lanes still dispatch: the fan-out reports one lane held rather than aborting
+/// the whole batch, and the held Ticket is visible in that lane's `waiting` set.
+#[test]
+fn a_capped_lane_is_held_while_other_lanes_dispatch() {
+    let fixture = RoutingFixture::new();
+    declare_two_lanes(&fixture);
+    // `bugs` declares a cap it has already run out of; `features` has room.
+    fixture.write_repo_config(
+        "[pools.bugs]\nlabel = \"bug\"\ncap_usd = 5.0\n\n\
+         [pools.features]\nlabel = \"features\"\n",
+    );
+    fixture.seed_spend("bugs", "worker-bugs", 6_000_000);
+    fixture.write_ticket(
+        "01-bug.md",
+        "# Fix the crash\n\nStatus: ready-for-agent\nLabels: bug\n\n## Problem\n\nDo it.\n",
+    );
+    fixture.write_ticket(
+        "02-feature.md",
+        "# Ship the widget\n\nStatus: ready-for-agent\nLabels: features\n\n## Problem\n\nDo it.\n",
+    );
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    let held = entry(&json, "widgets--01-bug");
+    assert_eq!(held["outcome"], "waiting", "{json}");
+    assert!(
+        held["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("pool `bugs`")),
+        "the held lane is named: {json}"
+    );
+    // The other lane is untouched by its neighbour's cap.
+    assert_eq!(
+        entry(&json, "widgets--02-feature")["worker"],
+        "worker-features"
+    );
+    let waiting = fs::read_to_string(fixture.path().join(".jj/pools/bugs/waiting.json"))
+        .expect("bugs waiting set");
+    assert!(waiting.contains("widgets--01-bug"), "{waiting}");
 }
 
 /// Label routing is opt-in per Repository: a Repository whose pools declare no
