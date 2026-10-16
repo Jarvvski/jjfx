@@ -7,6 +7,7 @@
 //! atomic-replacement implementation and one lock implementation, and a
 //! durability fix lands at every caller at once.
 
+use std::fmt;
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -35,6 +36,30 @@ pub(crate) enum AtomicWriteError {
     Sync(io::Error),
     /// The temporary file could not be renamed over the target.
     Rename(io::Error),
+}
+
+impl fmt::Display for AtomicWriteError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingParent => formatter.write_str("the target has no parent directory"),
+            Self::CreateDirectory(source) => {
+                write!(formatter, "cannot create the target directory: {source}")
+            }
+            Self::CreateTemporary(source) => {
+                write!(formatter, "cannot create the temporary file: {source}")
+            }
+            Self::SetPermissions(source) => {
+                write!(
+                    formatter,
+                    "cannot set the temporary file's permissions: {source}"
+                )
+            }
+            Self::Write(source) => write!(formatter, "cannot write the temporary file: {source}"),
+            Self::Flush(source) => write!(formatter, "cannot flush the temporary file: {source}"),
+            Self::Sync(source) => write!(formatter, "cannot sync the temporary file: {source}"),
+            Self::Rename(source) => write!(formatter, "cannot replace the target: {source}"),
+        }
+    }
 }
 
 /// The step of taking an exclusive advisory lock that failed.

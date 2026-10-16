@@ -554,6 +554,30 @@ and behaves exactly as it did before pools could be named: `jjfx pool <N>` sizes
 so `default` is not removable - resize it to zero instead. `jjfx pool <N>` keeps
 sizing `default` even when other pools are declared.
 
+### The verbs edit the declaration
+
+The declaration is the source of truth, so `jjfx pool create` and
+`jjfx pool destroy` write the `[pools]` section rather than keeping a parallel
+state - there is no second description to reconcile.
+
+- `jjfx pool create <name>` declares a pool, writing its `[pools.<name>]` table.
+  It takes one flag per key - `--size`, `--profile`, `--source`, `--label`,
+  `--ready-status`, `--cap-usd`, `--window` and `--on-exceed` - all of which
+  `jjfx help pool create` lists. A create for a pool that is already declared
+  is refused, so a typo cannot clobber a lane's settings.
+- `jjfx pool destroy <name>` removes that declaration. It refuses `default`,
+  because a Repository always has at least one pool; resize `default` to zero
+  instead.
+- `jjfx pool <N>` sizes `default`; a named pool is sized explicitly with
+  `--pool`, as in `jjfx pool resize 4 --pool bugs`.
+- `jjfx pool list` (and `pool list --json`) lists every pool, naming `default`
+  when it is implicit.
+
+The write preserves the rest of the file - comments, key order and formatting -
+so the verbs are safe to use on a hand-maintained config. A declaration the
+reader would reject (an unknown profile, say) is refused before anything is
+written.
+
 ### Validation is loud
 
 A file that parses but is wrong fails at load, naming the file - the same rule as

@@ -298,12 +298,76 @@ pub(crate) const POOL_PROFILE_FLAGS: &[Flag] = &[
     },
 ];
 
-pub(crate) const POOL_RESIZE_FLAGS: &[Flag] = &[Flag {
-    long: "--size",
-    short: Some("-s"),
-    value: Some("N"),
-    help: "Pool size; the positional `<N>` is the usual form",
-}];
+pub(crate) const POOL_RESIZE_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--size",
+        short: Some("-s"),
+        value: Some("N"),
+        help: "Pool size; the positional `<N>` is the usual form",
+    },
+    Flag {
+        long: "--pool",
+        short: None,
+        value: Some("NAME"),
+        help: "Size this named pool instead of `default`",
+    },
+];
+
+/// `pool create` takes the `[pools.<name>]` keys, one flag each. Every one is
+/// optional, so a bare `pool create bugs` writes a bare `[pools.bugs]`.
+pub(crate) const POOL_CREATE_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--size",
+        short: Some("-s"),
+        value: Some("N"),
+        help: "The number of Workers the pool holds",
+    },
+    Flag {
+        long: "--profile",
+        short: None,
+        value: Some("NAME"),
+        help: "An Agent Runtime Profile the user config defines",
+    },
+    Flag {
+        long: "--source",
+        short: None,
+        value: Some("SOURCE"),
+        help: "Which configured Ticket source discovers this pool's work (linear|local)",
+    },
+    Flag {
+        long: "--label",
+        short: None,
+        value: Some("LABEL"),
+        help: "The Ticket label that routes a Ticket to this pool",
+    },
+    Flag {
+        long: "--ready-status",
+        short: None,
+        value: Some("STATUS"),
+        help: "The Status: value marking a Ticket ready for this pool",
+    },
+    Flag {
+        long: "--cap-usd",
+        short: None,
+        value: Some("USD"),
+        help: "The pool's spend cap in US dollars, under the global ceiling",
+    },
+    Flag {
+        long: "--window",
+        short: None,
+        value: Some("WINDOW"),
+        help: "The window the pool's cap totals over (today|week|total)",
+    },
+    Flag {
+        long: "--on-exceed",
+        short: None,
+        value: Some("MODE"),
+        help: "What Dispatch does once the pool's cap is reached (block|warn)",
+    },
+];
+
+/// `pool destroy` takes only the pool name, so any option is a mistake.
+pub(crate) const POOL_DESTROY_FLAGS: &[Flag] = NO_FLAGS;
 
 pub(crate) const WAIT_FLAGS: &[Flag] = &[
     Flag {
@@ -402,17 +466,27 @@ const TOP_LEVEL: &[Group] = &[
             Entry {
                 key: "pool",
                 args: "[<N>]",
-                summary: "List the Worker Pool, or set its size to <N>",
+                summary: "List the Worker Pools, or set `default`'s size to <N>",
+            },
+            Entry {
+                key: "pool create",
+                args: "<name>",
+                summary: "Declare a named pool in `[pools.<name>]`",
+            },
+            Entry {
+                key: "pool destroy",
+                args: "<name>",
+                summary: "Remove a named pool's declaration (`default` is refused)",
             },
             Entry {
                 key: "pool resize",
                 args: "<N>",
-                summary: "Set pool size (the explicit form of `pool <N>`)",
+                summary: "Set a pool's size (the explicit form of `pool <N>`)",
             },
             Entry {
                 key: "pool list",
                 args: "[--json]",
-                summary: "Show pool status",
+                summary: "Show every pool's status",
             },
             Entry {
                 key: "pool rm",
@@ -428,11 +502,6 @@ const TOP_LEVEL: &[Group] = &[
                 key: "pool profile",
                 args: "<runtime>",
                 summary: "Set runtime profile (--provider/--model)",
-            },
-            Entry {
-                key: "pool destroy",
-                args: "",
-                summary: "Tear down all workers and remove pool",
             },
         ],
     },
@@ -635,18 +704,38 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "pool",
-        summary: "Manage the Worker Pool",
+        summary: "Manage the Repository's Worker Pools",
         usage: "pool [<N>]",
         arguments: &[Argument {
             name: "<N>",
-            help: "Optional: resize the pool to N Workers (safe shrink)",
+            help: "Optional: resize `default` to N Workers (safe shrink)",
         }],
         flags: NO_FLAGS,
     },
     CommandHelp {
+        key: "pool create",
+        summary: "Declare a named Worker Pool in the repository config",
+        usage: "pool create <name> [--size N] [--profile NAME] [--source SOURCE] [--label LABEL] [--ready-status STATUS] [--cap-usd USD] [--window WINDOW] [--on-exceed MODE]",
+        arguments: &[Argument {
+            name: "<name>",
+            help: "The pool's name; it becomes the `[pools.<name>]` table key",
+        }],
+        flags: POOL_CREATE_FLAGS,
+    },
+    CommandHelp {
+        key: "pool destroy",
+        summary: "Remove a named pool's declaration; `default` is refused",
+        usage: "pool destroy <name>",
+        arguments: &[Argument {
+            name: "<name>",
+            help: "The pool to remove; `default` is never removable",
+        }],
+        flags: POOL_DESTROY_FLAGS,
+    },
+    CommandHelp {
         key: "pool resize",
-        summary: "Set the Worker Pool's size, creating it when it does not exist",
-        usage: "pool resize <N> [--size N]",
+        summary: "Set a pool's size, creating `default` when it does not exist",
+        usage: "pool resize <N> [--pool NAME]",
         arguments: &[Argument {
             name: "<N>",
             help: "The size to grow or shrink the pool to; `pool <N>` is the short form",
@@ -655,7 +744,7 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "pool list",
-        summary: "Show pool status",
+        summary: "Show every pool, and the `default` pool's Workers",
         usage: "pool list [--json]",
         arguments: &[],
         flags: POOL_LIST_FLAGS,
@@ -689,13 +778,6 @@ const PAGES: &[CommandHelp] = &[
             help: "Agent runtime every Worker runs",
         }],
         flags: POOL_PROFILE_FLAGS,
-    },
-    CommandHelp {
-        key: "pool destroy",
-        summary: "Tear down every Worker and remove the pool",
-        usage: "pool destroy",
-        arguments: &[],
-        flags: NO_FLAGS,
     },
     CommandHelp {
         key: "dispatch",
@@ -887,10 +969,9 @@ const PAGES: &[CommandHelp] = &[
 /// to the page that documents them.
 ///
 /// The parser accepts more words than [`TOP_LEVEL`] lists - short aliases
-/// (`d`, `rb`), the `reset` shorthand, and pool synonyms (`pool create`,
-/// `pool resize`) - so `jjfx help <spelling>` must answer for each. A word
-/// absent here and absent from [`PAGES`] is an unknown command, which is the
-/// error a typo gets.
+/// (`d`, `rb`), the `reset` shorthand, and pool synonyms (`pool c`, `pool r`) -
+/// so `jjfx help <spelling>` must answer for each. A word absent here and absent
+/// from [`PAGES`] is an unknown command, which is the error a typo gets.
 ///
 /// `every_parser_alias_resolves_to_its_page` holds this table to `text`, and
 /// `cli::tests::the_parser_accepts_every_documented_alias` holds it to the
@@ -916,9 +997,8 @@ pub(crate) const ALIASES: &[(&str, &str)] = &[
     ("-h", "help"),
     ("--help", "help"),
     ("--version", "version"),
-    ("pool c", "pool resize"),
+    ("pool c", "pool create"),
     ("pool r", "pool resize"),
-    ("pool create", "pool resize"),
     ("pool ls", "pool list"),
     ("pool status", "pool list"),
     ("pool remove", "pool rm"),

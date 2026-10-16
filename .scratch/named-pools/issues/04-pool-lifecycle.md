@@ -1,7 +1,7 @@
 # Pool lifecycle: create, destroy, and size `default`
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: 01, 02
 
 ## Problem
@@ -24,11 +24,11 @@ The design settled both (*Where are pools declared?* and *What happens when a Wo
 
 ## Acceptance Criteria
 
-- [ ] `pool create` / `pool destroy` edit the `[pools]` declaration, and a Repository with no declaration is unchanged.
-- [ ] `jjfx pool <N>` still sizes `default`.
-- [ ] `pool list` names every pool, including an implicit `default`.
-- [ ] Destroying `default` is refused, naming the reason.
-- [ ] `mise run check` is green.
+- [x] `pool create` / `pool destroy` edit the `[pools]` declaration, and a Repository with no declaration is unchanged.
+- [x] `jjfx pool <N>` still sizes `default`.
+- [x] `pool list` names every pool, including an implicit `default`.
+- [x] Destroying `default` is refused, naming the reason.
+- [x] `mise run check` is green.
 
 ## References
 

@@ -43,6 +43,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch <TICKET> reports why a Ticket named by hand is not ready - a blocked Ticket names its blocker and that blocker's status, a Ticket with the wrong Status: reports it - then dispatches it anyway, because naming a Ticket is the override; the reason comes from the same readiness seam --all uses, so the two paths cannot drift apart.
 - Worker Pool state is persisted a directory per pool - `.jj/pools/<name>/` holds the pool document, its Workers, Run Records, the waiting set, sessions and its locks - while repository-scoped state (the ws-cache, occupancy and undo) stays at `.jj/`; an existing repository converts automatically on first access, copying, verifying and only then removing the old layout, and refuses loudly, leaving the old layout intact, if it cannot verify the result.
 - jjfx reads `[tickets] source` from a Repository's own `.jjfx/config.toml`, so a cloned Repository discovers its own local Tickets without the user config being changed for it; the section may select a configured source and may never define one, so a repository-local attempt to set a source's details or credentials is a loud error naming the file.
+- jjfx pool create declares a named Worker Pool in the repository's [pools] config and jjfx pool destroy removes it, so lanes live in the committed declaration rather than a parallel state; jjfx pool list (and its --json) names every pool, including an implicit default, and jjfx pool <N> still sizes default.
 
 ### Fixed
 
