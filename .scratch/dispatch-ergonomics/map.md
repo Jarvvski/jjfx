@@ -35,12 +35,13 @@ Both themes cost the test-drive real time, and both are invisible unless you rea
 | 14 | Guard the remaining raw test helpers | `tests/support/mod.rs` |
 | 15 | A named Ticket that is not ready must say why | `cli.rs`, `engine/local_tickets.rs` |
 | 16 | `jjfx logs` still blocks on a stale idle Worker | `cli.rs` |
+| 17 | Dispatch tests must not depend on the ambient terminal | `tests/` |
 
 ## Waves
 
 Wave 1 (dispatched 2026-10-16): **01, 02, 03, 08** — the owner's two priorities (ad-hoc Ticket input, out-of-the-box defaults) plus the worst bug in the test-drive (the writeback deadlock) and the most surprising (Run Records and spend).
 
-Wave 2 (queued): **04, 05, 06, 07, 09, 10, 11, 12, 13**, plus **14** — filed during wave 2, when ticket 10 fixed the demonstrated leaks and deliberately left the remaining raw `spawn()` sites alone — and **15**, filed when ticket 07 landed: its Solution named two cases but its acceptance criteria covered one, so the named-Ticket path still asks nothing about readiness — and **16**, filed when ticket 12 landed, which stopped follow mode at a terminal Run but left the `idle` state, where a Worker sits most of the time.
+Wave 2 (queued): **04, 05, 06, 07, 09, 10, 11, 12, 13**, plus **14** — filed during wave 2, when ticket 10 fixed the demonstrated leaks and deliberately left the remaining raw `spawn()` sites alone — and **15**, filed when ticket 07 landed: its Solution named two cases but its acceptance criteria covered one, so the named-Ticket path still asks nothing about readiness — and **16**, filed when ticket 12 landed, which stopped follow mode at a terminal Run but left the `idle` state, where a Worker sits most of the time — and **17**, filed when a ticket-05 test broke `main`: `dispatch` fails closed with no reachable terminal (ADR 0011), so any dispatch test that forgets `--force` is green locally and red on CI.
 
 **Sequencing, from the multi-pool map (2026-10-16).** Two wave-2 tickets interact with named Worker Pools, and both were settled by the multi-pool map's *Does the queued dispatch-ergonomics batch wait for this design?*:
 
