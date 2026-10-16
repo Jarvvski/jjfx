@@ -6,6 +6,7 @@
 //! tracker - the default source is Linear, which wants an API key the
 //! repository does not have.
 
+use std::ffi::OsString;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -13,10 +14,19 @@ use std::process::{Command, Output, Stdio};
 
 use tempfile::TempDir;
 
+mod support;
+
 /// A jj repository with no jjfx `[tickets]` section and no `.scratch/`.
 struct BareRepository {
     root: TempDir,
     config_home: TempDir,
+    /// Holds the stub `kitten` binary the fixture puts on `PATH`; only its
+    /// lifetime matters, so it is never read.
+    _bin: TempDir,
+    /// `PATH` with the stub terminal ahead of the inherited one, so Dispatch's
+    /// terminal check (ADR 0011) answers deterministically and needs no
+    /// `--force`.
+    env_path: OsString,
 }
 
 impl BareRepository {
@@ -35,7 +45,14 @@ impl BareRepository {
             .expect("jj should be installed");
         assert!(status.success(), "jj git init");
         let config_home = TempDir::new().expect("temporary config home");
-        let repository = Self { root, config_home };
+        let bin = TempDir::new().expect("temporary stub bin");
+        let env_path = support::stub_terminal(bin.path());
+        let repository = Self {
+            root,
+            config_home,
+            _bin: bin,
+            env_path,
+        };
         // The whole premise: nothing configures a Ticket source, and no local
         // Ticket tree exists. Only the bare jj repo does.
         assert!(!repository.config_file().exists());
@@ -56,7 +73,8 @@ impl BareRepository {
         command
             .args(args)
             .current_dir(self.root.path())
-            .env("XDG_CONFIG_HOME", self.config_home.path());
+            .env("XDG_CONFIG_HOME", self.config_home.path())
+            .env("PATH", &self.env_path);
         command
     }
 
@@ -107,7 +125,6 @@ fn free_text_dispatches_with_no_ticket_source_configured() {
             "--text",
             "Fix the login bug\n\nIt fails on Safari.",
             "--json",
-            "--force",
         ],
         "n\n",
     );
@@ -133,13 +150,7 @@ fn a_markdown_file_outside_scratch_dispatches() {
     .expect("Ticket file");
 
     let output = repository.dispatch(
-        &[
-            "dispatch",
-            "--from-file",
-            "docs/plan.md",
-            "--json",
-            "--force",
-        ],
+        &["dispatch", "--from-file", "docs/plan.md", "--json"],
         "n\n",
     );
 
@@ -154,7 +165,7 @@ fn a_ticket_can_be_read_from_stdin() {
 
     // Empty stdin is read as the Ticket, and an empty Ticket is a loud error
     // rather than a silent no-op: this is what proves stdin is the input.
-    let empty = repository.dispatch(&["dispatch", "-", "--force"], "");
+    let empty = repository.dispatch(&["dispatch", "-"], "");
     assert!(!empty.status.success(), "{}", stdout(&empty));
     assert!(
         stderr(&empty).contains("the Ticket text is empty"),
@@ -164,7 +175,7 @@ fn a_ticket_can_be_read_from_stdin() {
 
     // Real text is carried through to Dispatch. With no Pool at all, the
     // failure is the Worker Pool - never a tracker.
-    let piped = repository.dispatch(&["dispatch", "--from-file", "-", "--force"], "Fix it\n");
+    let piped = repository.dispatch(&["dispatch", "--from-file", "-"], "Fix it\n");
     let stderr = stderr(&piped);
     assert!(stderr.contains("Worker Pool"), "{stderr}");
     assert!(!stderr.contains("Linear"), "{stderr}");
@@ -176,10 +187,7 @@ fn an_explicit_id_still_needs_no_tracker() {
     // never an unavailable Linear key.
     let repository = BareRepository::new();
 
-    let output = repository.dispatch(
-        &["dispatch", "--text", "Do it", "--id", "TOOL-9", "--force"],
-        "n\n",
-    );
+    let output = repository.dispatch(&["dispatch", "--text", "Do it", "--id", "TOOL-9"], "n\n");
 
     let stderr = stderr(&output);
     assert!(stderr.contains("Worker Pool"), "{stderr}");

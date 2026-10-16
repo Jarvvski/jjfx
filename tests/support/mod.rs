@@ -8,13 +8,49 @@
 //! so dead-code analysis is off here rather than worked around per crate.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use rustix::process::{Pid, Signal, kill_process_group};
+
+/// Writes a fake `kitten` into `bin` that answers `kitten @ ls` with an empty
+/// workspace list, and returns a `PATH` with `bin` ahead of the inherited one.
+///
+/// `dispatch` fails closed when it cannot see which Worker Workspaces are open
+/// (ADR 0011): it names `kitten @ ls` and suggests `--force`. That is the right
+/// product behaviour, but it makes every Dispatch test that runs the real
+/// terminal seam depend on the machine it runs on - green on a developer box
+/// running kitty, red on CI, which is exactly how a ticket-05 test left `main`
+/// red. This stub answers the seam deterministically, so a Dispatch test needs
+/// neither kitty nor `--force`, and it exercises the real seam rather than
+/// bypassing it. Use it in every fixture that runs `jjfx dispatch`.
+///
+/// `bin` must outlive the returned `PATH` (hold it in a `TempDir`), and the
+/// command under test must be given the returned `PATH`.
+#[cfg(unix)]
+pub fn stub_terminal(bin: &Path) -> OsString {
+    let kitten = bin.join("kitten");
+    // An empty array is a `kitten @ ls` tree with no tabs open, so no Workspace
+    // is reported as occupied and Dispatch proceeds without `--force`.
+    fs::write(&kitten, "#!/bin/sh\nprintf '[]\\n'\n").expect("terminal stub");
+    let mut permissions = fs::metadata(&kitten)
+        .expect("terminal stub metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&kitten, permissions).expect("terminal stub permissions");
+    let mut paths = vec![bin.to_path_buf()];
+    paths.extend(std::env::split_paths(
+        &std::env::var_os("PATH").unwrap_or_default(),
+    ));
+    std::env::join_paths(paths).expect("PATH with the terminal stub")
+}
 
 /// Liveness budget for waiting on a helper subprocess.
 ///
