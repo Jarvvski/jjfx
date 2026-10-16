@@ -8,6 +8,27 @@ use anyhow::{Context, Result, bail};
 use jiff::Timestamp;
 const PROGRAM: &str = env!("CARGO_PKG_NAME");
 
+/// Whether this build is a development build rather than a release.
+///
+/// `build.rs` sets the marker for a checkout build the release pipeline did not
+/// produce. See `docs/releasing.md`.
+const DEVELOPMENT_BUILD: bool = option_env!("JJFX_DEV_BUILD").is_some();
+
+/// The version `jjfx version` reports.
+///
+/// A development build carries a `-dev` suffix, so a binary built from `main`
+/// after a release cannot be mistaken for that release in a bug report.
+pub(crate) const VERSION: &str = version_string(DEVELOPMENT_BUILD);
+
+/// The version string for a build: `-dev` when it is a development build.
+const fn version_string(development: bool) -> &'static str {
+    if development {
+        concat!(env!("CARGO_PKG_VERSION"), "-dev")
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
+}
+
 use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
     ADD_FLAGS, DISPATCH_FLAGS, Flag, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS,
@@ -998,7 +1019,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
     } = settings;
     match parse(&args)? {
         Command::Help { command } => print!("{}", crate::cli_help::text(command.as_deref())?),
-        Command::Version => println!("{PROGRAM} {}", env!("CARGO_PKG_VERSION")),
+        Command::Version => println!("{PROGRAM} {VERSION}"),
         Command::Default => default_command(launch)?,
         Command::Root => root_command(&repository(colocate)?)?,
         Command::Where => where_command(&repository(colocate)?)?,
@@ -1459,7 +1480,7 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     report_writeback_failures(&failures);
     let pool = snapshot
         .pool()
-        .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool create --size N"))?;
+        .ok_or_else(|| anyhow::anyhow!("No pool. Run: {PROGRAM} pool <N>"))?;
     // The watchdog's window is jjfx's own setting, read here rather than passed
     // down: `pool list` is the only CLI command that surfaces Run health, and
     // `cli::run` is already at the argument limit.
@@ -2181,22 +2202,43 @@ fn dispatch_with_capacity_prompt(
     }
 }
 
+/// The capacity question, without the answer hint: `Grow pool by 3?`.
 fn growth_question(shortage: CapacityShortage) -> String {
     format!(
-        "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Grow pool by {}? [Y/n] ",
+        "Pool has {} idle worker(s) but {} ticket(s) to dispatch. Grow pool by {}?",
         shortage.available(),
         shortage.requested(),
         shortage.gap()
     )
 }
 
+/// Whether a typed answer approves growing the pool.
+///
+/// Only an explicit `y`/`yes` does. An empty answer, an EOF, or anything else
+/// refuses, so the prompt's default is the cheap option.
+fn answer_approves_growth(answer: &str) -> bool {
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+/// Ask whether to grow the pool to fit a whole batch.
+///
+/// A prompt that cannot be answered must not default to the expensive option:
+/// a non-interactive caller - no terminal, or stdin at EOF - refuses, so
+/// `jjfx dispatch` in a script can never grow the pool by not answering.
 fn confirm_growth(shortage: CapacityShortage) -> bool {
-    eprint!("{}", growth_question(shortage));
-    let mut input = String::new();
-    if std::io::stdin().read_to_string(&mut input).is_err() {
+    let question = growth_question(shortage);
+    if !std::io::stdin().is_terminal() {
+        eprintln!(
+            "{question} Not a terminal, so not growing the pool; run `{PROGRAM} pool <N>` to grow it."
+        );
         return false;
     }
-    !input.trim().eq_ignore_ascii_case("n") && !input.trim().eq_ignore_ascii_case("no")
+    eprint!("{question} [y/N] ");
+    let mut answer = String::new();
+    if std::io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+    answer_approves_growth(&answer)
 }
 
 /// Renders one Dispatch batch and returns the shared model the caller inspects
@@ -4069,6 +4111,23 @@ mod tests {
         assert!(prose.contains("orchestrate-ENG-100.log"), "{prose}");
     }
 
+    /// The other half of the help drift check: every spelling `jjfx help`
+    /// answers for must be one the parser accepts. The probe is the bare word,
+    /// which a command that needs arguments answers with its usage - only an
+    /// unknown word says `Unknown command`.
+    #[test]
+    fn the_parser_accepts_every_documented_alias() {
+        for (alias, _) in crate::cli_help::ALIASES {
+            let arguments = args(&alias.split(' ').collect::<Vec<_>>());
+            if let Err(error) = parse(&arguments) {
+                assert!(
+                    !error.to_string().contains("Unknown command"),
+                    "`{alias}` is documented but the parser rejects it: {error}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn pool_help_forms_all_parse_to_help() {
         for form in ["help", "--help", "-h"] {
@@ -4248,8 +4307,34 @@ mod tests {
         let shortage = CapacityShortage::new(5, 2);
         assert_eq!(
             growth_question(shortage),
-            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Grow pool by 3? [Y/n] "
+            "Pool has 2 idle worker(s) but 5 ticket(s) to dispatch. Grow pool by 3?"
         );
+    }
+
+    /// A prompt that cannot be answered must not default to the expensive
+    /// option: only an explicit `y`/`yes` grows the pool, so an empty answer or
+    /// an EOF refuses it.
+    #[test]
+    fn only_an_explicit_yes_grows_the_pool() {
+        for answer in ["y", "Y", "yes", "YES", " y \n"] {
+            assert!(answer_approves_growth(answer), "`{answer}` should approve");
+        }
+        for answer in ["", "\n", "n", "no", "nope", "maybe", "y n"] {
+            assert!(!answer_approves_growth(answer), "`{answer}` should refuse");
+        }
+    }
+
+    /// A development build must say so: its version carries a `-dev` suffix, so
+    /// a binary built from `main` cannot be mistaken for the release it
+    /// followed. A release build reports the clean version.
+    #[test]
+    fn a_development_build_is_marked_in_the_version() {
+        assert_eq!(
+            version_string(true),
+            concat!(env!("CARGO_PKG_VERSION"), "-dev")
+        );
+        assert_eq!(version_string(false), env!("CARGO_PKG_VERSION"));
+        assert_ne!(version_string(true), version_string(false));
     }
 
     #[test]

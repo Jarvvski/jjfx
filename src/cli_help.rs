@@ -389,6 +389,11 @@ const TOP_LEVEL: &[Group] = &[
                 args: "<action>",
                 summary: "Enable/disable Git colocation (enable|disable|status)",
             },
+            Entry {
+                key: "help",
+                args: "[<command>...]",
+                summary: "Show this command list, or one command's page",
+            },
         ],
     },
     Group {
@@ -396,8 +401,13 @@ const TOP_LEVEL: &[Group] = &[
         entries: &[
             Entry {
                 key: "pool",
+                args: "[<N>]",
+                summary: "List the Worker Pool, or set its size to <N>",
+            },
+            Entry {
+                key: "pool resize",
                 args: "<N>",
-                summary: "Set pool size (creates pool if needed, safe shrink)",
+                summary: "Set pool size (the explicit form of `pool <N>`)",
             },
             Entry {
                 key: "pool list",
@@ -634,6 +644,16 @@ const PAGES: &[CommandHelp] = &[
         flags: NO_FLAGS,
     },
     CommandHelp {
+        key: "pool resize",
+        summary: "Set the Worker Pool's size, creating it when it does not exist",
+        usage: "pool resize <N> [--size N]",
+        arguments: &[Argument {
+            name: "<N>",
+            help: "The size to grow or shrink the pool to; `pool <N>` is the short form",
+        }],
+        flags: POOL_RESIZE_FLAGS,
+    },
+    CommandHelp {
         key: "pool list",
         summary: "Show pool status",
         usage: "pool list [--json]",
@@ -851,11 +871,74 @@ const PAGES: &[CommandHelp] = &[
         arguments: &[],
         flags: NO_FLAGS,
     },
+    CommandHelp {
+        key: "help",
+        summary: "Show the command list, or one command's page",
+        usage: "help [<command>...]",
+        arguments: &[Argument {
+            name: "[<command>...]",
+            help: "Command to describe; omit it for the full command list",
+        }],
+        flags: NO_FLAGS,
+    },
+];
+
+/// Spellings the parser accepts that the top-level list does not name, mapped
+/// to the page that documents them.
+///
+/// The parser accepts more words than [`TOP_LEVEL`] lists - short aliases
+/// (`d`, `rb`), the `reset` shorthand, and pool synonyms (`pool create`,
+/// `pool resize`) - so `jjfx help <spelling>` must answer for each. A word
+/// absent here and absent from [`PAGES`] is an unknown command, which is the
+/// error a typo gets.
+///
+/// `every_parser_alias_resolves_to_its_page` holds this table to `text`, and
+/// `cli::tests::the_parser_accepts_every_documented_alias` holds it to the
+/// parser, so an accepted spelling cannot drift away from its page.
+///
+/// The hidden words (`__complete`, `__orchestrate`, the foreground wrapper) are
+/// deliberately absent: they are private, and the top-level list keeps them so.
+pub(crate) const ALIASES: &[(&str, &str)] = &[
+    ("a", "add"),
+    ("remove", "rm"),
+    ("ls", "list"),
+    ("info", "where"),
+    ("colocate", "colocation"),
+    ("reset", "pool reset"),
+    ("d", "dispatch"),
+    ("s", "send"),
+    ("rev", "review"),
+    ("log", "logs"),
+    ("m", "mount"),
+    ("rb", "rebase"),
+    ("ab", "absorb"),
+    ("pr", "open-pr"),
+    ("-h", "help"),
+    ("--help", "help"),
+    ("--version", "version"),
+    ("pool c", "pool resize"),
+    ("pool r", "pool resize"),
+    ("pool create", "pool resize"),
+    ("pool ls", "pool list"),
+    ("pool status", "pool list"),
+    ("pool remove", "pool rm"),
+    ("pool help", "pool"),
+    ("pool -h", "pool"),
+    ("pool --help", "pool"),
 ];
 
 /// The page for `key`, or `None` when no command by that name exists.
 fn page(key: &str) -> Option<&'static CommandHelp> {
     PAGES.iter().find(|page| page.key == key)
+}
+
+/// The page key a spelling resolves to: the spelling itself for a canonical
+/// command, or the canonical key for a spelling the parser accepts as an alias.
+fn canonical(key: &str) -> &str {
+    ALIASES
+        .iter()
+        .find(|(alias, _)| *alias == key)
+        .map_or(key, |(_, canonical)| *canonical)
 }
 
 /// The rendered help text: a command's page when `key` names one, otherwise the
@@ -864,9 +947,13 @@ fn page(key: &str) -> Option<&'static CommandHelp> {
 pub(crate) fn text(key: Option<&str>) -> Result<String> {
     match key {
         None => Ok(top_level()),
-        Some(key) => page(key).map(CommandHelp::render).ok_or_else(|| {
-            anyhow::anyhow!("unknown command: {key}. Run '{PROGRAM} help' for the command list.")
-        }),
+        Some(key) => page(canonical(key))
+            .map(CommandHelp::render)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "unknown command: {key}. Run '{PROGRAM} help' for the command list."
+                )
+            }),
     }
 }
 
@@ -916,6 +1003,25 @@ mod tests {
                     entry.key
                 );
             }
+        }
+    }
+
+    /// The parser accepts more spellings than the top-level list names - short
+    /// aliases and pool synonyms. `jjfx help <spelling>` must answer for each
+    /// of them, so an accepted word never dead-ends the way `pool create` once
+    /// did.
+    #[test]
+    fn every_parser_alias_resolves_to_its_page() {
+        for (alias, key) in ALIASES {
+            let rendered = text(Some(alias))
+                .unwrap_or_else(|error| panic!("alias `{alias}` has no help page: {error}"));
+            let expected = text(Some(key)).unwrap_or_else(|error| {
+                panic!("alias `{alias}` names a missing page `{key}`: {error}")
+            });
+            assert_eq!(
+                rendered, expected,
+                "alias `{alias}` did not resolve to the `{key}` page"
+            );
         }
     }
 

@@ -103,7 +103,7 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // terminal work, so it is safe to run outside a jj repo and without a TTY
     // (release/CI can smoke-test the built binary with it).
     if args.iter().any(|a| a == "--version" || a == "-V") {
-        println!("{} {}", env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+        println!("{} {}", env!("CARGO_PKG_NAME"), cli::VERSION);
         return Ok(());
     }
 
