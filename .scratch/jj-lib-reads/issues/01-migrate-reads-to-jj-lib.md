@@ -2,13 +2,20 @@
 
 Status: needs-triage
 
-> Re-triage (2026-07-08, ticket 11): `jj-lib` is now in the tree - the commit
-> graph reads the store through it (ADR 0007 note). This ticket's gate assumed no
-> jj-lib dependency yet; that premise no longer holds. The graph uses only a
-> minimal read surface (open + heads/bookmarks/wc + parent walk) and avoids the
-> revset engine, so it does not yet prove out the churny surface the five reads
-> below would need. Reassess the gate against the churn actually observed at the
-> next `jj` pin bump before promoting this back to `ready-for-agent`/`-human`.
+> Re-triage (2026-10-16, ticket 01): the pin-bump reassessment the note below asked for. The `jj` pin moved **0.43.0 -> 0.46.0** (`mise.toml`; `jj-lib` bumped in lockstep in `Cargo.toml`/`Cargo.lock`), spanning 0.44.0 (2026-08-05), 0.45.0 (2026-09-02), 0.45.1 (2026-09-03) and 0.46.0 (2026-10-07). **The gate is red on every clause, so the ticket stays parked.** Evidence:
+>
+> - **(a) no stability policy - still false.** jj's own FAQ (docs.jj-vcs.dev) states plainly: "`jj-lib` is not a stable API, so you may have to make changes to your tool when the API changes. The CLI is not stable either, so you may need to make your tool detect the different versions and call the right command." None of these releases shipped a semver/stability guarantee for `jj-lib`.
+> - **(b) N releases without a breaking change to the read surface - false; the surface broke in every direction.** The five sites this ticket names are the ones hit:
+>   - `jj.rs::workspace_names` (CLI `workspace list`): 0.44 made `jj workspace list` show workspace roots by default and changed `WorkspaceRef.root()` to `Option<FsPath>`; 0.46 stopped omitting unreachable paths and relabelled the template output (`workspace name`, `workspace root`, ...). Two output-format changes in three releases, and the repo's own copy of this read broke on the second - `Harden wsg-core workspace-list parsing for jj 0.46`.
+>   - Template reads (`work.rs`): 0.44 changed `WorkspaceRef.root()`/`RepoPath.absolute()` from `String` to `Option<FsPath>`/`FsPath`, and `path` in `jj config list` to `Option<FsPath>`; 0.46 changed the `List.get()`, `.first()` and `.last()` template functions to return `Option<T>` instead of erroring.
+>   - Revset evaluation: 0.45's default `immutable_heads()` now includes `untracked_remote_tags()` - a semantic change to the `mutable()`/`immutable()` revsets `tidy`/`lift` depend on.
+>   - **`jj-lib` itself:** the *minimal* surface jjfx already reads (open + settings + store factories) broke across 0.43 -> 0.46 - `UserSettings::from_config` -> `from_config_and_home_dir`, `jj_lib::repo::StoreFactories` -> `jj_lib::default_backend_factories::default_backend_factories`, `default_working_copy_factories` moved out of `jj_lib::workspace`, and a new `jj-core` split crate appeared. This is exactly the caveat in the note below - the minimal surface "does not yet prove out the churny surface the five reads would need" - and it churned anyway.
+> - **(c) a concrete pain point recurs - false.** No v0.8.1-class scraping / `trunk()`-resolution bug recurred; the drift it came from is now structurally prevented by the shared `trunk` module (ADR 0007 note, 2026-07-09), so the CLI `-T` path remains the correct, more stable contract.
+> - **Corroboration in-repo:** the 0.46 bump itself cost follow-up commits on 2026-10-12/13 - `Upgrade jj and jj-lib to 0.46.0 in lockstep`, `Preserve non-colocated workspace creation under jj 0.46`, `Harden wsg-core workspace-list parsing for jj 0.46`, `Fix the Worker undo command for jj 0.46`, `Create colocated workspaces by default (jj 0.46 colocation)` - plus the later `Detect and surface a jj/jj-lib version mismatch`.
+>
+> **Decision:** gate still red; ticket stays `needs-triage` (the repo's parked state - no separate "parked" status exists). Do **not** start the migration. Reassess at the next `jj` pin bump.
+
+> Re-triage (2026-07-08, ticket 11): `jj-lib` is now in the tree - the commit graph reads the store through it (ADR 0007 note). This ticket's gate assumed no jj-lib dependency yet; that premise no longer holds. The graph uses only a minimal read surface (open + heads/bookmarks/wc + parent walk) and avoids the revset engine, so it does not yet prove out the churny surface the five reads below would need. Reassess the gate against the churn actually observed at the next `jj` pin bump before promoting this back to `ready-for-agent`/`-human`.
 
 
 ## Gate (read this first)
