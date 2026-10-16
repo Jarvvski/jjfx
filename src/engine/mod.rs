@@ -123,10 +123,18 @@ pub use workspace::{
 };
 
 /// A Jujutsu repository discovered from a starting path.
+///
+/// A handle also names the Worker Pool its pool-scoped operations act on
+/// (ADR 0012): the pool a Dispatch fills, for instance. Repository-scoped
+/// operations - Workspaces, undo, the workspace cache - ignore it and use the
+/// Repository root, which is what keeps the split in ADR 0013 honest. A handle
+/// from [`Repository::open`] acts on `default`, so every pre-pools caller is
+/// unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Repository {
     root: PathBuf,
     colocate: bool,
+    pool: PoolName,
 }
 
 impl Repository {
@@ -142,6 +150,21 @@ impl Repository {
     /// tests) stay on the default without threading the setting everywhere.
     pub fn with_colocate(mut self, colocate: bool) -> Self {
         self.colocate = colocate;
+        self
+    }
+
+    /// The Worker Pool this handle's pool-scoped operations act on.
+    pub fn selected_pool(&self) -> &PoolName {
+        &self.pool
+    }
+
+    /// Returns this repository acting on `pool` instead of `default`.
+    ///
+    /// The pool a Dispatch fills is resolved once, then carried by the handle, so
+    /// Worker reservation, Dispatch Eligibility and the pool's size are all read
+    /// from the selected pool's state rather than from a default one.
+    pub fn with_pool(mut self, pool: PoolName) -> Self {
+        self.pool = pool;
         self
     }
 
@@ -186,6 +209,7 @@ impl Repository {
                 return Ok(Self {
                     root,
                     colocate: true,
+                    pool: PoolName::default(),
                 });
             }
             if !directory.pop() {

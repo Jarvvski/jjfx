@@ -977,9 +977,14 @@ pub struct MutationRecordRepository {
 }
 
 impl Repository {
-    /// Opens the state facade for the pool a Repository holds by default.
+    /// Opens the state facade for the pool this handle acts on.
+    ///
+    /// A handle from [`Repository::open`] acts on `default`; [`Repository::with_pool`]
+    /// narrows it to a named pool, so every pool-scoped read and write - the pool
+    /// document, its Workers, Run Records, waiting set and locks - lands under
+    /// `.jj/pools/<name>/`.
     pub fn state_store(&self) -> StateStore {
-        self.state_store_for_pool(PoolName::default())
+        self.state_store_for_pool(self.pool.clone())
     }
 
     /// Opens the state facade for one named Worker Pool.

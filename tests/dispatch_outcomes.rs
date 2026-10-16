@@ -490,3 +490,125 @@ fn a_ready_named_ticket_is_not_reported_as_not_ready() {
         "a ready Ticket must not be reported as not ready:\n{error}"
     );
 }
+
+/// One pool implies it: a Repository that declares no pools behaves exactly as
+/// it did before pools could be named, so an unqualified Dispatch fills the
+/// implicit `default` lane.
+#[test]
+fn an_unqualified_dispatch_fills_the_only_pool() {
+    let fixture = DispatchFixture::new();
+    fixture.with_origin();
+    fixture.with_pool(1);
+    fixture.with_fake_agent();
+
+    let output = fixture
+        .jjfx(&[
+            "dispatch",
+            "widgets--01-ship-the-widget",
+            "--no-orchestrate",
+        ])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        fixture.path().join(".jj/pools/default").is_dir(),
+        "the single pool is the implicit `default`"
+    );
+}
+
+/// Several pools require `--pool`: an unqualified Dispatch is refused loudly,
+/// naming the pools that exist, never silently filling one. The refusal comes
+/// before any Pool or Worker mutation, so nothing is reserved or launched.
+#[test]
+fn a_dispatch_into_a_repository_with_several_pools_is_refused_naming_them() {
+    let fixture = DispatchFixture::new();
+    fixture.write_repo_config("[pools.bugs]\n");
+
+    let output = fixture
+        .jjfx(&["dispatch", "widgets--01-ship-the-widget"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        !output.status.success(),
+        "an unqualified Dispatch into several pools must refuse:\nstdout:\n{}",
+        stdout(&output)
+    );
+    let error = stderr(&output);
+    assert!(error.contains("default"), "{error}");
+    assert!(error.contains("bugs"), "{error}");
+    assert!(error.contains("--pool"), "{error}");
+
+    // `--text` and `--from-file` follow the same rule, because they resolve a
+    // pool through the same seam.
+    let ad_hoc = fixture
+        .jjfx(&["dispatch", "--text", "fix the bug"])
+        .output()
+        .expect("jjfx should run");
+    assert!(
+        !ad_hoc.status.success(),
+        "an unqualified --text Dispatch must refuse too:\nstdout:\n{}",
+        stdout(&ad_hoc)
+    );
+    let error = stderr(&ad_hoc);
+    assert!(error.contains("default"), "{error}");
+    assert!(error.contains("bugs"), "{error}");
+}
+
+/// `--pool` selects the lane: reservation, eligibility and size are all read
+/// from the named pool, so a Dispatch into a named pool with no state fails on
+/// that pool rather than quietly using `default`'s Worker.
+#[test]
+fn an_explicit_pool_fills_that_lane_not_default() {
+    let fixture = DispatchFixture::new();
+    fixture.with_origin();
+    // `default` is sized and ready; `bugs` is declared but has no state.
+    fixture.with_pool(1);
+    fixture.write_repo_config("[pools.bugs]\n");
+    fixture.with_fake_agent();
+
+    // Naming `bugs` targets its (absent) state, not `default`'s idle Worker.
+    let bugs = fixture
+        .jjfx(&[
+            "dispatch",
+            "widgets--01-ship-the-widget",
+            "--pool",
+            "bugs",
+            "--no-orchestrate",
+        ])
+        .output()
+        .expect("jjfx should run");
+    assert!(
+        !bugs.status.success(),
+        "a Dispatch into an unprovisioned lane must fail:\nstdout:\n{}",
+        stdout(&bugs)
+    );
+    assert!(
+        !fixture.path().join(".jj/pools/bugs/pool.json").exists(),
+        "the selected lane is not materialised by a failed Dispatch"
+    );
+
+    // Naming `default` fills the lane that is provisioned.
+    let default = fixture
+        .jjfx(&[
+            "dispatch",
+            "widgets--01-ship-the-widget",
+            "--pool",
+            "default",
+            "--no-orchestrate",
+        ])
+        .output()
+        .expect("jjfx should run");
+    assert!(
+        default.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&default),
+        stderr(&default)
+    );
+}
