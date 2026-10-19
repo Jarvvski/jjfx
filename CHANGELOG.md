@@ -76,6 +76,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx clean writes its confirmation prompt to stderr and, when stdin reaches EOF without an answer, refuses loudly with a non-zero exit instead of silently removing nothing and exiting 0
 - Name the missing origin remote when orchestrating a single Ticket, instead of failing on an empty repository slug
 - A malformed Worker Pool document is now reported naming the pool it belongs to (for example `Worker Pool alpha: cannot decode Worker Pool: ...`), so a user with several lanes can tell which one is corrupt; an absent pool document still prints nothing.
+- jjfx absorb no longer rewrites trunk: it pins the absorb destination to the Worker's own commits above the mainline, refuses outright when the repository has no resolvable trunk (no fetched `main@origin`), naming the fix, and rolls the absorb back with `jj undo` if the mainline moved anyway - so a Worker whose change is already committed is a no-op instead of a silent rewrite of `main`.
 
 ## [0.55.0] - 2026-10-16
 
