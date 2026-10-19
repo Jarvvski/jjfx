@@ -519,10 +519,15 @@ impl RunSupervisor {
         let worker = reservation.worker_id();
         let workspace =
             crate::engine::workspace::worker_path(reservation.repository().root(), worker);
+        // The opencode session that issued this Dispatch, when there is one: the
+        // Run's session is created as its child so that session can see the
+        // Worker. A Dispatch from outside opencode creates a root session.
+        let dispatching_session = super::opencode_api::dispatching_session();
         let session_id = match super::opencode_api::create_run_session(
             &crate::engine::OpenCodeApi::new(),
             &workspace,
             invocation.name.as_deref(),
+            dispatching_session.as_deref(),
         ) {
             Ok(Some(session_id)) => session_id,
             Ok(None) => {

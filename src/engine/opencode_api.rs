@@ -29,13 +29,38 @@ use crate::engine::WorkerId;
 /// The opencode executable looked up on `PATH`.
 const OPENCODE_EXECUTABLE: &str = "opencode";
 
+/// The environment variable opencode injects into a session's shell commands,
+/// naming the session that ran them.
+pub(crate) const OPENCODE_SESSION_ENV: &str = "OPENCODE_SESSION_ID";
+
+/// The opencode session that dispatched this process, when it runs inside one.
+///
+/// opencode sets `OPENCODE_SESSION_ID` in the environment of every command a
+/// session runs, so a `jjfx dispatch` issued from an agent's shell knows which
+/// session asked for the work. A Dispatch from outside opencode - the TUI, a
+/// terminal, CI - carries no session, and its Workers stay root sessions.
+pub(crate) fn dispatching_session() -> Option<String> {
+    session_from_env(std::env::var(OPENCODE_SESSION_ENV).ok().as_deref())
+}
+
+/// Normalizes the environment value: a blank or absent variable names no
+/// session.
+fn session_from_env(value: Option<&str>) -> Option<String> {
+    value
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_owned)
+}
+
 /// A session as opencode reports it.
 ///
-/// Only the fields jjfx's Run path needs are kept: the id, the directory the
-/// session is anchored to, how it ended, and its title.
+/// Only the fields jjfx's Run path needs are kept: the id, the session that
+/// owns it when it is a child, the directory the session is anchored to, how it
+/// ended, and its title.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     id: String,
+    parent_id: Option<String>,
     directory: Option<PathBuf>,
     outcome: Option<SessionOutcome>,
     title: Option<String>,
@@ -45,6 +70,15 @@ impl Session {
     /// The session id, e.g. `ses_ec5f7b702ffe...`.
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    /// The session that owns this one, or `None` for a root session.
+    ///
+    /// A child session is a session with a `parentID`; opencode has no
+    /// `session.children` route, so a parent finds its children by filtering
+    /// `session.list` on this field.
+    pub fn parent_id(&self) -> Option<&str> {
+        self.parent_id.as_deref()
     }
 
     /// The directory the session is anchored to (`location.directory`).
@@ -168,14 +202,15 @@ impl ModelRef {
 /// A `session.create` request.
 ///
 /// `location.directory` is required: a Run's session must be anchored to the
-/// Worker Workspace it runs in. `title`, `agent` and `model` are optional and
-/// omitted from the request body when unset.
+/// Worker Workspace it runs in. `title`, `agent`, `model` and `parentID` are
+/// optional and omitted from the request body when unset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewSession {
     directory: PathBuf,
     title: Option<String>,
     agent: Option<String>,
     model: Option<ModelRef>,
+    parent_id: Option<String>,
 }
 
 impl NewSession {
@@ -186,6 +221,7 @@ impl NewSession {
             title: None,
             agent: None,
             model: None,
+            parent_id: None,
         }
     }
 
@@ -207,6 +243,15 @@ impl NewSession {
         self
     }
 
+    /// Creates the session as a child of `parent_id`.
+    ///
+    /// A session without a parent is a root session, which is what a Dispatch
+    /// that no opencode session owns produces.
+    pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
+        self.parent_id = Some(parent_id.into());
+        self
+    }
+
     /// The directory the session is anchored to.
     pub fn directory(&self) -> &Path {
         &self.directory
@@ -220,6 +265,7 @@ impl NewSession {
             title: self.title.as_deref(),
             agent: self.agent.as_deref(),
             model: self.model.as_ref().map(ModelBody::from),
+            parent_id: self.parent_id.as_deref(),
         };
         serde_json::to_string(&body).map_err(|source| OpenCodeError::Unavailable {
             reason: format!("cannot encode session.create request: {source}"),
@@ -236,6 +282,8 @@ struct CreateSessionBody<'a> {
     agent: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     model: Option<ModelBody<'a>>,
+    #[serde(rename = "parentID", skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -477,6 +525,28 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
         })
     }
 
+    /// The sessions owned by `parent_id` (`session.list` filtered by parent).
+    ///
+    /// opencode has no `session.children` route, so a parent enumerates its
+    /// children by filtering the session list. The filter is asked of the server
+    /// (`parentID`) and applied again here, so an older opencode that ignores
+    /// the query parameter cannot answer with unrelated sessions.
+    pub fn child_sessions(&self, parent_id: &str) -> Result<Vec<Session>, OpenCodeError> {
+        let raw = self.call(operation_args(
+            "session.list",
+            &[("parentID", parent_id)],
+            None,
+        ))?;
+        parse_envelope::<SessionsEnvelope>(&raw, "session.list").map(|envelope| {
+            envelope
+                .data
+                .into_iter()
+                .map(SessionInfo::into_session)
+                .filter(|session| session.parent_id() == Some(parent_id))
+                .collect()
+        })
+    }
+
     /// The ids of the sessions opencode currently reports as active
     /// (`session.active`).
     ///
@@ -586,6 +656,12 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
 /// `location.directory` and, once it exists, read back to confirm opencode did
 /// not put it somewhere else.
 ///
+/// `parent` is the opencode session the Dispatch was issued from, when there is
+/// one ([`dispatching_session`]): the Run's session is then created as that
+/// session's child, so the dispatching session can see it. `None` creates a
+/// root session, which is what a Dispatch with no opencode session behind it
+/// produces.
+///
 /// `Ok(Some(id))` is the session to drive. `Ok(None)` means the API is
 /// unavailable - no executable, no running server, an older opencode without
 /// these routes, or output this client cannot parse - and the caller must fall
@@ -597,10 +673,14 @@ pub(crate) fn create_run_session<R: OpenCodeRunner>(
     api: &OpenCodeApi<R>,
     workspace: &Path,
     title: Option<&str>,
+    parent: Option<&str>,
 ) -> Result<Option<String>, String> {
     let mut request = NewSession::new(workspace);
     if let Some(title) = title.filter(|title| !title.is_empty()) {
         request = request.with_title(title);
+    }
+    if let Some(parent) = parent.filter(|parent| !parent.is_empty()) {
+        request = request.with_parent(parent);
     }
     let created = match api.create_session(&request) {
         Ok(session) => session,
@@ -744,6 +824,8 @@ impl PermissionInfo {
 #[derive(Deserialize)]
 struct SessionInfo {
     id: String,
+    #[serde(rename = "parentID", default)]
+    parent_id: Option<String>,
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -761,6 +843,7 @@ impl SessionInfo {
     fn into_session(self) -> Session {
         Session {
             id: self.id,
+            parent_id: self.parent_id,
             directory: self.location.map(|location| location.directory),
             outcome: self.outcome.map(session_outcome),
             title: self.title,
@@ -1280,10 +1363,14 @@ mod tests {
             ok(&session_body("ses_new", "/w/new")),
         ]));
 
-        let session_id =
-            create_run_session(&api, Path::new("/w/new"), Some("pool:worker-01:ENG-42"))
-                .expect("creates")
-                .expect("drives the created session");
+        let session_id = create_run_session(
+            &api,
+            Path::new("/w/new"),
+            Some("pool:worker-01:ENG-42"),
+            Some("ses_dispatch"),
+        )
+        .expect("creates")
+        .expect("drives the created session");
 
         assert_eq!(session_id, "ses_new");
 
@@ -1298,10 +1385,52 @@ mod tests {
         let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
         assert_eq!(body["location"]["directory"], "/w/new");
         assert_eq!(body["title"], "pool:worker-01:ENG-42");
+        // The dispatching session owns the Run's session.
+        assert_eq!(body["parentID"], "ses_dispatch");
         assert_eq!(
             calls[1],
             vec!["api", "session.get", "--param", "sessionID=ses_new"]
         );
+    }
+
+    #[test]
+    fn create_run_session_stays_a_root_session_without_a_dispatching_one() {
+        // No opencode session dispatched this Run - the TUI, a terminal, CI - so
+        // the Run's session is a root session and no `parentID` is sent.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w")),
+            ok(&session_body("ses_new", "/w")),
+        ]));
+
+        create_run_session(&api, Path::new("/w"), None, None).expect("creates");
+
+        let body = api.runner.calls()[0]
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert!(body.get("parentID").is_none());
+    }
+
+    #[test]
+    fn create_run_session_ignores_a_blank_parent() {
+        // An empty `OPENCODE_SESSION_ID` names no session, so it must not be
+        // sent as a parent opencode would have to reject.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w")),
+            ok(&session_body("ses_new", "/w")),
+        ]));
+
+        create_run_session(&api, Path::new("/w"), None, Some("")).expect("creates");
+
+        let body = api.runner.calls()[0]
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert!(body.get("parentID").is_none());
     }
 
     #[test]
@@ -1311,7 +1440,7 @@ mod tests {
             ok(&session_body("ses_new", "/w")),
         ]));
 
-        create_run_session(&api, Path::new("/w"), None).expect("creates");
+        create_run_session(&api, Path::new("/w"), None, None).expect("creates");
 
         let body = api.runner.calls()[0]
             .windows(2)
@@ -1330,7 +1459,8 @@ mod tests {
             io::ErrorKind::NotFound,
         ))]));
 
-        let session = create_run_session(&api, Path::new("/w"), Some("title")).expect("falls back");
+        let session =
+            create_run_session(&api, Path::new("/w"), Some("title"), None).expect("falls back");
 
         assert_eq!(session, None);
         assert_eq!(api.runner.calls().len(), 1);
@@ -1344,7 +1474,7 @@ mod tests {
             "HTTP 400 Bad Request\n",
         )]));
 
-        let reason = create_run_session(&api, Path::new("/w"), None).expect_err("refused");
+        let reason = create_run_session(&api, Path::new("/w"), None, None).expect_err("refused");
 
         assert!(reason.contains("refused"), "{reason}");
     }
@@ -1358,8 +1488,8 @@ mod tests {
             ok(&session_body("ses_new", "/main")),
         ]));
 
-        let reason =
-            create_run_session(&api, Path::new("/w/new"), None).expect_err("mismatch detected");
+        let reason = create_run_session(&api, Path::new("/w/new"), None, None)
+            .expect_err("mismatch detected");
 
         assert!(reason.contains("/main"), "{reason}");
         assert!(reason.contains("/w/new"), "{reason}");
@@ -1374,7 +1504,7 @@ mod tests {
             failed(1, "", "no server"),
         ]));
 
-        let session = create_run_session(&api, Path::new("/w"), None).expect("drives");
+        let session = create_run_session(&api, Path::new("/w"), None, None).expect("drives");
 
         assert_eq!(session.as_deref(), Some("ses_new"));
     }
@@ -1386,7 +1516,7 @@ mod tests {
             ok(r#"{"data":{"id":"ses_new"}}"#),
         ]));
 
-        let session = create_run_session(&api, Path::new("/w"), None).expect("drives");
+        let session = create_run_session(&api, Path::new("/w"), None, None).expect("drives");
 
         assert_eq!(session.as_deref(), Some("ses_new"));
     }
@@ -1476,6 +1606,72 @@ mod tests {
         assert_eq!(run_session_id(&api, None, None), None);
         assert_eq!(run_session_id(&api, Some(""), Some("")), None);
         assert!(api.runner.calls().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_keeps_the_parent_a_child_session_names() {
+        let payload = r#"{"data":[
+            {"id":"ses_child","parentID":"ses_parent","location":{"directory":"/w"}},
+            {"id":"ses_root","location":{"directory":"/w"}}
+        ]}"#;
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(payload)]));
+
+        let sessions = api.list_sessions().expect("parses");
+
+        assert_eq!(sessions[0].parent_id(), Some("ses_parent"));
+        // A root session names no parent, which is not a parse failure.
+        assert_eq!(sessions[1].parent_id(), None);
+    }
+
+    #[test]
+    fn child_sessions_asks_for_the_parent_and_keeps_only_its_children() {
+        // The server is asked to filter by parent; the filter is applied again
+        // so an older opencode that ignores the parameter cannot answer with
+        // unrelated sessions.
+        let payload = r#"{"data":[
+            {"id":"ses_child","parentID":"ses_parent","location":{"directory":"/w"}},
+            {"id":"ses_other","parentID":"ses_someone_else","location":{"directory":"/w"}},
+            {"id":"ses_root","location":{"directory":"/w"}}
+        ]}"#;
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(payload)]));
+
+        let children = api.child_sessions("ses_parent").expect("parses");
+
+        assert_eq!(
+            api.runner.calls(),
+            vec![vec![
+                "api",
+                "session.list",
+                "--param",
+                "parentID=ses_parent"
+            ]]
+        );
+        let ids: Vec<&str> = children.iter().map(|session| session.id()).collect();
+        assert_eq!(ids, ["ses_child"]);
+    }
+
+    #[test]
+    fn child_sessions_is_unavailable_when_the_server_cannot_be_reached() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(1, "", "no server")]));
+
+        let error = api.child_sessions("ses_parent").expect_err("no server");
+
+        assert!(error.is_unavailable());
+    }
+
+    #[test]
+    fn session_from_env_names_a_session_only_for_a_real_value() {
+        assert_eq!(
+            session_from_env(Some("ses_abc")),
+            Some("ses_abc".to_owned())
+        );
+        assert_eq!(
+            session_from_env(Some("  ses_abc  ")),
+            Some("ses_abc".to_owned())
+        );
+        assert_eq!(session_from_env(Some("")), None);
+        assert_eq!(session_from_env(Some("   ")), None);
+        assert_eq!(session_from_env(None), None);
     }
 
     fn sessions_titled(ids: &[&str], title: &str) -> String {

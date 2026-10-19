@@ -489,6 +489,7 @@ mod tests {
             "hook_event_name",
             "agent_kind: \"opencode\"",
             "session_id",
+            "parent_id",
             "cwd",
         ] {
             assert!(

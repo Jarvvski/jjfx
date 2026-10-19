@@ -64,8 +64,20 @@ the agent state.
 jjfx installs an owned plugin that writes the same versioned lifecycle contract.
 It maps `session.created` to a session start, non-idle `session.status` to a
 prompt submit (working), `session.idle` to a stop (waiting), `session.deleted`
-to a session end, and `permission.asked` to a permission request. Lifecycle
+to a session end, and `permission.asked` to a permission request. A v2 opencode
+reports a turn with `session.execution.started` and
+`session.execution.succeeded`/`failed`/`interrupted` instead of the
+status/idle pair; the plugin maps those too, to the same states. Lifecycle
 reporting never interrupts an OpenCode session.
+
+The plugin also reports **parentage**. opencode nests sessions: a child session
+is one created with a `parentID`, and jjfx creates a Worker's session as a child
+of the session that dispatched it (the `OPENCODE_SESSION_ID` opencode puts in
+that session's shell environment). A Dispatch from outside opencode - the TUI, a
+terminal, CI - creates a root session instead. The plugin remembers each
+session's parent when it is created and stamps `parent_id` on that session's
+whole lifecycle, so a parent can enumerate and read its children's state rather
+than polling.
 
 ## Installation guarantees
 

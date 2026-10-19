@@ -31,9 +31,9 @@ const fn version_string(development: bool) -> &'static str {
 
 use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
-    ADD_FLAGS, CLEAN_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS, POOL_DESTROY_FLAGS,
-    POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS, REVIEW_FLAGS, RM_FLAGS,
-    SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
+    ADD_FLAGS, CHILDREN_FLAGS, CLEAN_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS,
+    POOL_DESTROY_FLAGS, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS,
+    REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{
     Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, TicketSource, TicketsConfig,
@@ -89,6 +89,12 @@ pub enum Command {
         action: ColocationAction,
     },
     Status {
+        json: bool,
+    },
+    /// `children [<session>] [--json]`: a session's child sessions and what
+    /// each is doing.
+    Children {
+        session: Option<String>,
         json: bool,
     },
     Dispatch(DispatchArgs),
@@ -389,6 +395,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         "sync" => Ok(Command::Sync),
         "colocation" | "colocate" => parse_colocation(&args[1..]),
         "status" => parse_status(&args[1..]),
+        "children" => parse_children(&args[1..]),
         "reset" => parse_single_exact(
             concat!("Usage: ", env!("CARGO_PKG_NAME"), " reset <worker>"),
             &args[1..],
@@ -619,6 +626,28 @@ fn parse_status(args: &[String]) -> Result<Command> {
         }
     }
     Ok(Command::Status { json })
+}
+
+/// Parse `children [<session>] [--json]`.
+///
+/// The parent session is optional: omitted, the command asks about the session
+/// that ran it (the `OPENCODE_SESSION_ID` opencode puts in its shell), which is
+/// how a parent asks from its own shell with no argument at all.
+fn parse_children(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("children", CHILDREN_FLAGS, args)?;
+    let mut session = None;
+    let mut json = false;
+    for argument in args {
+        match argument.as_str() {
+            "--json" => json = true,
+            value if value.starts_with('-') => {
+                bail!("Unknown option for children: {value}")
+            }
+            value if session.is_none() => session = Some(value.to_owned()),
+            _ => bail!("children takes at most one session"),
+        }
+    }
+    Ok(Command::Children { session, json })
 }
 
 /// Parse `wait <worker>... [--until CONDITION] [--timeout SECS] [--json] [--all]
@@ -1264,6 +1293,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
         Command::Clean { pool } => clean_command(&repository(colocate)?, pool.as_deref())?,
         Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
+        Command::Children { session, json } => crate::children::run(session.as_deref(), json)?,
         Command::Dispatch(args) => {
             dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
         }
@@ -5376,6 +5406,32 @@ mod tests {
             Command::Pool(PoolCommand::List { json: false })
         );
         assert!(parse(&args(&["pool", "list", "--wat"])).is_err());
+    }
+
+    /// `children` names a parent, or nothing at all: omitted, the command asks
+    /// about the session that ran it, which is how a parent asks from its own
+    /// shell.
+    #[test]
+    fn children_takes_one_session_and_json_or_neither() {
+        assert_eq!(
+            parse(&args(&["children"])).unwrap(),
+            Command::Children {
+                session: None,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["children", "ses_x", "--json"])).unwrap(),
+            Command::Children {
+                session: Some("ses_x".to_owned()),
+                json: true
+            }
+        );
+        // A second session and an unknown option are both refused, naming the
+        // option when there is one to name.
+        assert!(parse(&args(&["children", "ses_a", "ses_b"])).is_err());
+        let error = parse(&args(&["children", "--wat"])).unwrap_err();
+        assert!(error.to_string().contains("--wat"), "{error}");
     }
 
     #[test]

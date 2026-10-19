@@ -1682,6 +1682,21 @@ impl OpencodeSessionFixture {
     }
 
     fn spawn_helper(&self, get_directory: &Path, session_id: Option<&str>) -> std::process::Output {
+        self.spawn_helper_from(get_directory, session_id, None)
+    }
+
+    /// Spawns the helper as a Dispatch issued from the opencode session
+    /// `dispatcher`, when there is one.
+    ///
+    /// `OPENCODE_SESSION_ID` is cleared when there is not, so a test run from
+    /// inside an opencode session cannot silently make a root-session assertion
+    /// pass or fail for the wrong reason.
+    fn spawn_helper_from(
+        &self,
+        get_directory: &Path,
+        session_id: Option<&str>,
+        dispatcher: Option<&str>,
+    ) -> std::process::Output {
         let mut helper = Command::new(env::current_exe().expect("test executable"));
         helper
             .args(["--exact", "opencode_run_session_helper", "--ignored"])
@@ -1691,11 +1706,15 @@ impl OpencodeSessionFixture {
             .env(HELPER_REPOSITORY, self.repository.root())
             .env(HELPER_WORKER, self.worker_id.as_str())
             .env(HELPER_RESULT, &self.result)
+            .env_remove("OPENCODE_SESSION_ID")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         if let Some(session_id) = session_id {
             helper.env(HELPER_OPENCODE_SESSION_ID, session_id);
+        }
+        if let Some(dispatcher) = dispatcher {
+            helper.env("OPENCODE_SESSION_ID", dispatcher);
         }
         helper.output().expect("opencode session helper should run")
     }
@@ -1755,6 +1774,12 @@ fn opencode_run_prompts_its_session_with_no_client_process() {
     let expected_title = format!("pool:{}:ENG-42", fixture.worker_id);
     assert_eq!(body["title"].as_str(), Some(expected_title.as_str()));
 
+    // No opencode session dispatched this Run, so its session is a root session.
+    assert!(
+        body.get("parentID").is_none(),
+        "a Dispatch from outside opencode must create a root session: {body}"
+    );
+
     // The prompt reached the created session through the daemon API.
     let prompt: Value = serde_json::from_slice(
         &fs::read(&fixture.prompt_body).expect("recorded session.prompt body"),
@@ -1784,6 +1809,40 @@ fn opencode_run_prompts_its_session_with_no_client_process() {
 
     // The id survives for a later process to identify the Run's session.
     assert_eq!(fixture.recorded_session().as_deref(), Some("ses_test"));
+}
+
+#[test]
+fn opencode_run_creates_a_child_session_of_the_session_that_dispatched_it() {
+    // The Dispatch was issued from an opencode session, so the Run's session is
+    // created as that session's child and the dispatcher can see it.
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
+
+    let output = fixture.spawn_helper_from(&fixture.workspace, None, Some("ses_dispatcher"));
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "session ses_test"
+    );
+
+    let body: Value = serde_json::from_slice(
+        &fs::read(&fixture.create_body).expect("recorded session.create body"),
+    )
+    .expect("session.create body JSON");
+    assert_eq!(
+        body["parentID"].as_str(),
+        Some("ses_dispatcher"),
+        "the Run's session must be a child of the dispatching session: {body}"
+    );
+    // The Run is still anchored to the Worker Workspace, not the dispatcher's.
+    assert_eq!(
+        body["location"]["directory"].as_str(),
+        Some(fixture.workspace.to_str().expect("workspace UTF-8"))
+    );
 }
 
 #[test]
