@@ -77,6 +77,7 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 | T11 | TUI | H | report | `jjfx tui` floods the terminal with unbounded, un-deduplicated `kitten @ ls` subprocesses until kitty pegs a core | 40 (fixed) |
 | T12 | TUI | H | report | the recursive `.jj` watcher and a snapshotting Workspace projection form a self-sustaining reload loop that storms `jj` and everything downstream of a reload | 41 (fixed) |
 | T13 | process | L | verified | the engine's two `jj git remote list` identity reads also snapshot the working copy, committing it as a side effect of dispatching | 41 (fixed) |
+| F4 | tests | M | verified | a real `jj workspace add` in the cache-provisioning test blocks past the shared 120s budget under heavy load (2 sightings) | 43 |
 | F3 | tests | M | verified | the process- and exec-timing integration tests flake under CI and load (an empty PID-file read; an ETXTBSY holder race) | 42 |
 
 ## Tickets
@@ -309,3 +310,9 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - How much of the jj read path can move to `jj-lib` without breaking the version
   coupling - still live, parked until the churn gate clears; tracked in
   [`01-migrate-reads-to-jj-lib`](../jj-lib-reads/issues/01-migrate-reads-to-jj-lib.md).
+
+### Filed - 2026-10-19
+
+- [43](issues/43-concurrent-provisioning-blocks-under-load.md) - F4, filed from two
+  independent sightings while fixing `35` and `42`; the third load-sensitive
+  failure, and the first where the work itself did not complete.

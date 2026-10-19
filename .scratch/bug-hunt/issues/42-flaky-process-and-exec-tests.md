@@ -181,3 +181,8 @@ the settled re-run. That is the same broad class but a different mechanism - a
 real `jj workspace add` taking too long, not the terminal seam - and the load
 that redded it (16 concurrent Dispatch binaries plus three continuous unit-test
 binaries) is far beyond a real `mise run check`. Recorded, not fixed here.
+
+Filed separately as [`43`](43-concurrent-provisioning-blocks-under-load.md): the
+`concurrent_provisioning` sighting is a *different mechanism* from this ticket's
+class - the work not completing, rather than the child refusing to run - so it
+is not covered here.
