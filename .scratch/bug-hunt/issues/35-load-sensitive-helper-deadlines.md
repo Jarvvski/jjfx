@@ -1,6 +1,6 @@
 # Helper-subprocess deadlines in the test suite are load-sensitive
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -72,14 +72,14 @@ every site listed above, and `worker_pool.rs:108` (5s) guards the sibling
 
 ## Acceptance Criteria
 
-- [ ] The suite is green under the same concurrent load that produced the flake
+- [x] The suite is green under the same concurrent load that produced the flake
       (verify by running the process/timing tests while a build is in flight, and
       repeat them enough times to be convincing).
-- [ ] A genuinely hung helper still fails the test within a bounded time - the
+- [x] A genuinely hung helper still fails the test within a bounded time - the
       change must not turn a liveness guard into no guard.
-- [ ] The chosen budget/mechanism is documented where it is defined, with the
+- [x] The chosen budget/mechanism is documented where it is defined, with the
       reason (load-dependent subprocess work), so it is not "tidied" back down.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -138,3 +138,52 @@ present there.
 To close it: give the locks test the same treatment - a budget that reflects a
 liveness guard against a hang rather than an expected schedule, or progress-based
 liveness - so a loaded machine cannot red it. Do not simply re-run it.
+
+## Resolution (Mon 19 Oct 2026)
+
+Reproduced red first, and the reproduction corrected the diagnosis: the failure
+is **not** the 30s `LIVENESS`. Under a six-way full-suite load (six concurrent
+`jjfx` unit-test binaries plus 48 CPU burners on a 12-core machine) the named
+test failed in roughly one run in eight, always as
+
+    the pool lock was taken while the repository lock was held
+
+- the `pool_was_free` assertion, never the post-release timeout. Instrumenting
+the test showed the pool lock reading `Busy` only momentarily (0.5-4ms) while
+the helper was still correctly blocked on the repository lock, with nothing
+holding it afterwards. Ruled out as the holder: the helper itself (it takes the
+repository lock first and blocks), the test's own open/flock/close churn (500k
+uncontended cycles, zero `Busy`), a forked child inheriting the descriptor (a
+direct probe found none), a path collision with another test, and this process's
+own open descriptors. A reversed order holds the pool lock for the *whole* wait,
+so a momentary `Busy` is not what the test means to catch - the old busy poll
+that failed on the first `Busy` was.
+
+Two commits close it:
+
+- `Share one liveness budget across the test suite` - one
+  `test_support::LIVENESS_TIMEOUT` (120s), defined in the crate so the unit and
+  integration crates use the same item, replaces every private liveness budget:
+  `src/engine/locks.rs`'s `LIVENESS` (30s), `src/app.rs`'s `WAIT_BUDGET` (30s,
+  itself reproduced red under the same load), `tests/wait.rs` (30s),
+  `tests/logs.rs` (30s), `tests/agent_runtime.rs`'s `wait_for` (10s), and
+  `tests/repository.rs`'s inline 120s.
+- `Stop the locks ordering test failing on a momentary pool-lock Busy` - the
+  ordering test now waits out a one-second observation window and then requires
+  the pool lock to *clear*, rather than never reading `Busy`. A reversed order
+  holds the lock for the whole window and still fails; a momentary unrelated
+  holder does not.
+
+Evidence:
+
+- Green under load: 90 consecutive full-suite runs (15 rounds x 6 concurrent
+  binaries) plus 48 CPU burners - zero failures. Before the change the same load
+  failed roughly one run in eight.
+- The guard is still live: with `ordered()`'s sort reversed the test fails in
+  1.16s; with the helper made to hang and the budget forced to 1s it fails in
+  2.06s, so a genuine hang still fails within a bound rather than hanging the
+  suite.
+- `mise run check`: green.
+
+No changelog entry: test infrastructure, nothing user-visible. The version is
+untouched - it is release-owned.

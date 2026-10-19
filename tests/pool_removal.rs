@@ -18,13 +18,14 @@ use std::process::{Command, Output};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use rustix::process::{Pid, test_kill_process_group};
 use serde_json::Value;
 use tempfile::TempDir;
 
 mod support;
 
-use support::{HELPER_LIVENESS_TIMEOUT, HelperGuard, wait_for_file_content};
+use support::{HelperGuard, wait_for_file_content};
 
 /// A throwaway repository plus the config home the binary under test reads.
 ///
@@ -418,7 +419,7 @@ fn destroy_force_terminates_a_live_worker_process_group() {
     );
     // The process group the fixture started is gone...
     let pid = Pid::from_raw(pid).expect("live PID");
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -447,7 +448,7 @@ fn destroy_force_terminates_a_live_worker_process_group() {
 /// forever. Bounding the wait here is what turns that into a red test; the
 /// armed [`HelperGuard`] still reaps the group and the helper on the way out.
 fn wait_for_helper_exit(helper: &mut HelperGuard) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while helper.is_running() {
         assert!(
             Instant::now() < deadline,

@@ -10,12 +10,13 @@ use jjfx::engine::{
     AgentRuntime, DirectDispatchError, DirectDispatchRequest, DispatchExclusions, PoolName,
     Repository, RunMode, SnapshotDiagnosticKind, TicketId, WorkerId, WorkerPoolError, WorkerStatus,
 };
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use serde_json::Value;
 use tempfile::TempDir;
 
 mod support;
 
-use support::{HELPER_LIVENESS_TIMEOUT, HelperGuard, wait_for_file_content};
+use support::{HelperGuard, wait_for_file_content};
 
 const FIXTURES: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/state");
 fn fixture(name: &str) -> Vec<u8> {
@@ -248,7 +249,7 @@ fn stale_reservation_cannot_persist_a_pid_after_destroy_detaches_membership() {
         .env("PATH", path)
         .spawn()
         .expect("spawn stale Reservation helper");
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     loop {
         if let Some(status) = child.try_wait().expect("helper status") {
             assert!(

@@ -16,6 +16,7 @@ use jjfx::engine::{
     RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerActions, WorkerId,
     WorkerStatus,
 };
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use rustix::process::{
     Pid, Signal, getpgid, kill_process, kill_process_group, test_kill_process,
     test_kill_process_group,
@@ -25,7 +26,7 @@ use tempfile::TempDir;
 
 mod support;
 
-use support::{HELPER_LIVENESS_TIMEOUT, HelperGuard, wait_for_file_content};
+use support::{HelperGuard, wait_for_file_content};
 
 const HELPER_MODE: &str = "JJFX_AGENT_RUNTIME_HELPER_MODE";
 const HELPER_PATH: &str = "JJFX_AGENT_RUNTIME_HELPER_PATH";
@@ -892,7 +893,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
         .parse()
         .expect("numeric runtime PID");
     let pid = Pid::from_raw(pid).expect("runtime PID");
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -906,7 +907,7 @@ fn reserved_background_run_allows_graceful_group_shutdown_before_forcing() {
         .parse::<i32>()
         .expect("numeric descendant PID");
     let descendant_pid = Pid::from_raw(descendant_pid).expect("descendant PID");
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while test_kill_process(descendant_pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -4461,7 +4462,7 @@ fn spawn_non_group_leader() -> Child {
 /// Blocks until the Worker records `pid` for a busy Run, so a Reset in another
 /// process targets the launched Run rather than a reservation without a PID.
 fn wait_for_busy_pid(repository: &Repository, worker: &WorkerId, pid: u32) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     loop {
         let recorded = matches!(
             repository.worker_pool().snapshot().worker(worker.as_str()),
@@ -4549,7 +4550,7 @@ fn unix_pid(pid: u32) -> Pid {
 }
 
 fn wait_for_file(path: &std::path::Path) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while !path.exists() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(20));
     }
@@ -4564,7 +4565,7 @@ fn wait_for_file(path: &std::path::Path) {
 /// process-group probe ignores zombies, so a group can read as gone while one of
 /// its members is still observable; poll the member itself to a bounded deadline.
 fn wait_for_process_exit(pid: Pid) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while test_kill_process(pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -4572,7 +4573,7 @@ fn wait_for_process_exit(pid: Pid) {
 
 /// The same reaping race for a whole process group.
 fn wait_for_process_group_exit(pid: Pid) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
@@ -4669,7 +4670,10 @@ impl PtyOutput {
     }
 
     fn wait_for(&mut self, marker: &str) -> String {
-        let deadline = Instant::now() + Duration::from_secs(10);
+        // A hang guard, not a latency budget: the marker is produced by a real
+        // subprocess, so a loaded machine must not turn a correct run into a
+        // failure. See `LIVENESS_TIMEOUT`.
+        let deadline = Instant::now() + LIVENESS_TIMEOUT;
         while !self.buffer.contains(marker) {
             let remaining = deadline.saturating_duration_since(Instant::now());
             assert!(
