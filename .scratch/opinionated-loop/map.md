@@ -13,12 +13,18 @@ CLI, and an agent via the bundled skill. His three named frictions were the
 **dispatch loop**, **review & landing**, and **trustworthiness**.
 
 The review's competitive sweep (Conductor, Sculptor, Crystal/Nimbalyst,
-vibe-kanban, claude-squad, Terragon, Superset, Paseo, container-use) found jjfx
-is the **only jj-native orchestrator** — every rival is git-worktree-based — and
-that the category consolidated in 2026 (Terragon shut down; Crystal became
-Nimbalyst; vibe-kanban sunsetting). The strategic call is therefore **not**
-feature-parity with cloud/GUI apps; it is to lean into jj-native + terminal +
-one opinionated path.
+vibe-kanban, claude-squad, Terragon, Superset, Paseo, container-use) concluded
+that jjfx is the **only jj-native orchestrator** and that **every rival is
+git-worktree-based**. **Both claims are false and are withdrawn.** Container-based
+isolators exist (container-use, Sculptor, Terragon), and there is a jj-native
+cluster (jj-navi, ao-jj, jjx, agentic-jujutsu, Kaisen, smithers-orchestrator).
+What survives is narrower and stronger - **jjfx is the only tool that makes the
+jj substrate the orchestration model** - and the field's two unsolved problems
+are verifying agent output and integrating parallel work, which jjfx's `[checks]`
+and conflict-as-data already address. The sweep did find the category
+consolidated in 2026 (Terragon shut down; Crystal became Nimbalyst; vibe-kanban
+sunsetting). The strategic call is therefore **not** feature-parity with
+cloud/GUI apps; it is to lean into jj-native + terminal + one opinionated path.
 
 **Opinionation means subtraction.** jjfx is already opinionated (attention-first,
 forge pipeline, two orthogonal lifecycles). "More opinionated" here means:
@@ -148,3 +154,9 @@ in. This is the effort's foundation and its highest-leverage change.
   never retained (16, which now blocks it). It also found one jjfx premise wrong:
   "one editor per workspace" is already structurally impossible, since a Worker is
   1:1 with its own workspace by construction - so no lease is needed.
+- 2026-10-19: The competitive sweep's two load-bearing claims - that every rival
+  is git-worktree-based and that jjfx is the only jj-native orchestrator - were
+  false and are withdrawn above. Container-based isolators and a jj-native
+  cluster both exist; the surviving claim is narrower (jjfx is the only tool
+  that makes the jj substrate the orchestration model). Recorded with the rest
+  of the harness decision in ADR 0016.
