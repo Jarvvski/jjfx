@@ -931,9 +931,16 @@ impl WorkerPool {
         )
     }
 
-    /// Sets a Worker's cosmetic display alias, or clears it when `text` is blank.
     /// Replaces the Repository default profile used by future Reservations.
+    ///
+    /// The profile is stored in the Pool document, so a Repository with no Pool
+    /// state yet would otherwise fail before it could name its runtime - and the
+    /// documented dispatch order names the runtime before capacity. Naming a
+    /// runtime therefore provisions the empty Pool document first, exactly as
+    /// `jjfx pool <N>` does, so either order works. It provisions no capacity:
+    /// `jjfx pool <N>` remains the only thing that creates Workers.
     pub fn set_profile(&self, profile: AgentRuntimeProfile) -> Result<(), WorkerPoolError> {
+        self.load_or_create(&self.repository.state_store().pool())?;
         self.repository.state_store().set_pool_profile(&profile)?;
         Ok(())
     }

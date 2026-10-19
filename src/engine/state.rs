@@ -1146,7 +1146,15 @@ impl StateStore {
             let mut pool = match load_state(&self.pool_document(), subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
-                    return Err(StateError::new("set profile", subject, "state is missing"));
+                    // Reachable only if the Pool document vanishes between the
+                    // caller's provisioning and this lock, but the message must
+                    // still name the missing state and the command that creates
+                    // it rather than report a bare `state is missing`.
+                    return Err(StateError::new(
+                        "set profile",
+                        subject,
+                        "the Worker Pool state does not exist yet; create it with `jjfx pool <N>`",
+                    ));
                 }
             };
             pool.agent = Some(WireAgent::new(profile.runtime().as_str()));
@@ -3265,5 +3273,26 @@ mod tests {
 
         let records = store.records().expect("records");
         assert_eq!(records.len(), writers * per_writer);
+    }
+
+    #[test]
+    fn setting_a_profile_without_pool_state_names_the_missing_state() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        let profile = AgentRuntimeProfile::new(crate::engine::AgentRuntime::OpenCode);
+
+        let error = repository
+            .state_store()
+            .set_pool_profile(&profile)
+            .expect_err("no Pool state exists yet");
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("state is missing"),
+            "a bare `state is missing` names neither the state nor the fix: {message}"
+        );
+        assert!(message.contains("Worker Pool state"), "{message}");
+        assert!(message.contains("jjfx pool"), "{message}");
     }
 }
