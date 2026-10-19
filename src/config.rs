@@ -237,6 +237,7 @@ impl Config {
             dispatch: self.dispatch,
             watchdog: self.watchdog,
             pool_routing: PoolRouting::load(self, repo_root)?,
+            checks: self.checks_for(repo_root)?,
         })
     }
 }
@@ -387,6 +388,9 @@ pub struct DispatchSettings {
     /// The Repository's Worker Pools and the routing each declares, so a
     /// frontend can name a lane and discover through it.
     pub pool_routing: PoolRouting,
+    /// The repo-owned build check a finished Run is verified against before its
+    /// Ticket reaches done (ticket 02).
+    pub checks: ChecksConfig,
 }
 
 /// Wrap a shell command in `$SHELL -l -i -c <command>` so login and interactive
@@ -834,7 +838,7 @@ impl Default for MigrationsConfig {
 /// `main` will actually be, which a post-Run hook on the un-welded tree would
 /// miss. jjfx never guesses the command: an unconfigured repo is a no-op, not a
 /// default.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ChecksConfig {
     /// The command the repository owns for a build check - `cargo check`,

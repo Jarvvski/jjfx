@@ -79,13 +79,22 @@ fn jj_repository() -> (TempDir, TempDir) {
 
 /// Append one succeeded Run Record for `ticket`, the durable completion signal a
 /// local Ticket writeback resolves from - and the only signal left after `pool
-/// reset` clears a Worker's Ticket association.
+/// reset` clears a Worker's Ticket association. The record carries the check the
+/// repository's build ran against the Run's change; a local Ticket is done only
+/// on a passing check (ticket 02), so the fixture records one.
 fn write_run_record(root: &Path, ticket: &str) {
+    write_run_record_with_check(root, ticket, "\"passed\"");
+}
+
+/// Append one succeeded Run Record for `ticket` carrying `check` as its raw JSON
+/// verification value, so a test can drive a failed, missing, or unconfigured
+/// check through the CLI.
+fn write_run_record_with_check(root: &Path, ticket: &str, check: &str) {
     let pool = root.join(".jj").join("pools").join("default");
     fs::create_dir_all(&pool).expect("pool directory");
     let line = format!(
         "{{\"run_id\":\"worker-1@2026-01-01T00:00:00Z\",\"worker\":\"worker-1\",\
-         \"ticket\":\"{ticket}\",\"conclusion\":\"succeeded\"}}\n"
+         \"ticket\":\"{ticket}\",\"conclusion\":\"succeeded\",\"check\":{check}}}\n"
     );
     fs::write(pool.join("runs.jsonl"), line).expect("run record");
 }
@@ -443,6 +452,46 @@ fn ticket_reconcile_resolves_a_finished_run_without_a_dispatch() {
         ticket_status(repository.path(), "widgets", "01-foundation.md")
             .contains("Status: resolved"),
         "an explicit reconcile must resolve a finished Run"
+    );
+}
+
+/// A finished Run whose change did not pass the repository's check is not done:
+/// an explicit reconcile leaves the Ticket as it was and fails loudly, naming
+/// what failed, rather than silently claiming the work is finished (ticket 02).
+#[test]
+fn ticket_reconcile_refuses_to_resolve_a_run_whose_check_did_not_pass() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: claimed\n",
+    );
+    write_run_record_with_check(
+        repository.path(),
+        "widgets--01-foundation",
+        "{\"failed\":{\"command\":\"cargo check\",\"detail\":\"error: could not compile\"}}",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["ticket", "reconcile"])
+        .current_dir(repository.path())
+        .env("XDG_CONFIG_HOME", config_home.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        ticket_status(repository.path(), "widgets", "01-foundation.md").contains("Status: claimed"),
+        "a failed check must leave the Ticket not-done"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("not verified") && stderr.contains("cargo check"),
+        "the failure must name the command: {stderr}"
+    );
+    assert!(
+        !output.status.success(),
+        "a reconcile that could not mark a finished Run done must not report success: {output:?}"
     );
 }
 

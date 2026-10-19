@@ -17,6 +17,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::checks::RunCheck;
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::locks::{self, ScopedLock};
 use crate::engine::{AgentRuntimeProfile, DispatchExclusions, Repository};
@@ -484,6 +485,12 @@ pub struct RunRecord {
     pub turns: Option<u64>,
     /// The provider-reported conclusion.
     pub conclusion: RunRecordConclusion,
+    /// The repository's own verification of this Run's change: the check that
+    /// ran against it, or why none did. `None` for a Run that failed, and for a
+    /// record written before jjfx recorded verification - either way the Run is
+    /// not verified, so a Ticket does not reach its done status on it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<RunCheck>,
     /// The provider-neutral failure message, for a failed Run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -2443,34 +2450,55 @@ impl RunRecordRepository {
             .collect())
     }
 
-    /// The Tickets whose most recent Run concluded successfully.
+    /// The Tickets whose most recent Run both concluded successfully **and**
+    /// passed the repository's check.
     ///
-    /// This is the durable completion signal a local Ticket writeback resolves
+    /// This is the durable verified-done signal a local Ticket writeback resolves
     /// from: a Run appends its record when it finalizes, and the record names the
-    /// Ticket, so a finished Run can still resolve its Ticket after `pool reset`
-    /// cleared the live Worker's Ticket association. Only the most recent record
-    /// per Ticket counts, so a Ticket re-dispatched after an earlier success is
-    /// not resolved from the stale record; a Ticket whose latest Run failed is not
-    /// resolved either. Returned in first-recorded order.
-    pub fn completed_tickets(&self) -> Result<Vec<String>, StateError> {
-        let mut latest: Vec<(String, RunRecordConclusion)> = Vec::new();
+    /// Ticket and carries the check that ran against its change, so a verified Run
+    /// still resolves its Ticket after `pool reset` cleared the live Worker's
+    /// Ticket association. Only the most recent record per Ticket counts, so a
+    /// Ticket re-dispatched after an earlier verified success is not resolved from
+    /// the stale record; a Ticket whose latest Run failed, whose check failed,
+    /// could not run, or was never configured is not resolved either - the agent's
+    /// own "done" report is not enough. Returned in first-recorded order.
+    pub fn verified_tickets(&self) -> Result<Vec<String>, StateError> {
+        Ok(self
+            .latest_per_ticket()?
+            .into_iter()
+            .filter(|(_, record)| {
+                record.conclusion == RunRecordConclusion::Succeeded
+                    && record.check.as_ref().is_some_and(RunCheck::passed)
+            })
+            .map(|(ticket, _)| ticket)
+            .collect())
+    }
+
+    /// Every Ticket's most recent Run Record, in first-recorded order.
+    ///
+    /// A caller that resolves Tickets uses this to explain why a finished Run did
+    /// **not** verify its Ticket - the check failed, could not run, or none is
+    /// configured - rather than letting the Ticket sit un-resolved with no reason.
+    pub fn latest_ticket_records(&self) -> Result<Vec<(String, RunRecord)>, StateError> {
+        self.latest_per_ticket()
+    }
+
+    /// The most recent record for each Ticket that has one.
+    fn latest_per_ticket(&self) -> Result<Vec<(String, RunRecord)>, StateError> {
+        let mut latest: Vec<(String, RunRecord)> = Vec::new();
         for record in self.records()? {
-            let Some(ticket) = record.ticket else {
+            let Some(ticket) = record.ticket.clone() else {
                 continue;
             };
             match latest
                 .iter_mut()
                 .find(|(candidate, _)| candidate == &ticket)
             {
-                Some(entry) => entry.1 = record.conclusion,
-                None => latest.push((ticket, record.conclusion)),
+                Some(entry) => entry.1 = record,
+                None => latest.push((ticket, record)),
             }
         }
-        Ok(latest
-            .into_iter()
-            .filter(|(_, conclusion)| *conclusion == RunRecordConclusion::Succeeded)
-            .map(|(ticket, _)| ticket)
-            .collect())
+        Ok(latest)
     }
 }
 
@@ -3116,6 +3144,7 @@ mod tests {
             duration_ms: None,
             turns: None,
             conclusion: RunRecordConclusion::Succeeded,
+            check: None,
             error: None,
             started_at: None,
             completed_at: None,
@@ -3173,11 +3202,19 @@ mod tests {
         let mut record = record("worker-01", "worker-01@1", Some(1));
         record.ticket = ticket.map(str::to_owned);
         record.conclusion = conclusion;
+        record.check = Some(RunCheck::Passed);
+        record
+    }
+
+    fn verified_record(ticket: &str, check: RunCheck) -> RunRecord {
+        let mut record = record("worker-01", "worker-01@1", Some(1));
+        record.ticket = Some(ticket.to_owned());
+        record.check = Some(check);
         record
     }
 
     #[test]
-    fn completed_tickets_returns_the_latest_success_per_ticket() {
+    fn verified_tickets_returns_the_latest_verified_success_per_ticket() {
         let (_temp, store) = store();
         store
             .append(&record_for(
@@ -3196,13 +3233,13 @@ mod tests {
             .expect("append");
 
         assert_eq!(
-            store.completed_tickets().expect("completed tickets"),
+            store.verified_tickets().expect("verified tickets"),
             ["widgets--01-foundation"]
         );
     }
 
     #[test]
-    fn a_ticket_whose_latest_run_failed_is_not_completed() {
+    fn a_ticket_whose_latest_run_failed_is_not_verified() {
         let (_temp, store) = store();
         store
             .append(&record_for(
@@ -3221,10 +3258,78 @@ mod tests {
 
         assert!(
             store
-                .completed_tickets()
-                .expect("completed tickets")
+                .verified_tickets()
+                .expect("verified tickets")
                 .is_empty()
         );
+    }
+
+    /// A finished Run whose check did not pass is not verified, so its Ticket is
+    /// not done - the trust boundary ticket 02 draws. The reason names the command.
+    #[test]
+    fn a_finished_run_whose_check_did_not_pass_is_not_verified() {
+        let (_temp, store) = store();
+        for check in [
+            RunCheck::Failed {
+                command: "cargo check".to_owned(),
+                detail: "error: could not compile".to_owned(),
+            },
+            RunCheck::CouldNotRun {
+                command: "cargo check".to_owned(),
+                detail: "command not found".to_owned(),
+            },
+            RunCheck::NotConfigured,
+        ] {
+            store
+                .append(&verified_record("widgets--01-foundation", check.clone()))
+                .expect("append");
+            assert!(
+                store
+                    .verified_tickets()
+                    .expect("verified tickets")
+                    .is_empty(),
+                "{check:?} must not read as done"
+            );
+        }
+    }
+
+    /// A record written before jjfx recorded verification - or one for a Run that
+    /// never had a check run - is not verified either.
+    #[test]
+    fn a_record_without_a_check_is_not_verified() {
+        let (_temp, store) = store();
+        let mut record = record("worker-01", "worker-01@1", Some(1));
+        record.ticket = Some("widgets--01-foundation".to_owned());
+        store.append(&record).expect("append");
+
+        assert!(
+            store
+                .verified_tickets()
+                .expect("verified tickets")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn latest_ticket_records_reports_the_latest_per_ticket() {
+        let (_temp, store) = store();
+        store
+            .append(&verified_record(
+                "widgets--01-foundation",
+                RunCheck::Failed {
+                    command: "cargo check".to_owned(),
+                    detail: "boom".to_owned(),
+                },
+            ))
+            .expect("append");
+        let mut later = verified_record("widgets--01-foundation", RunCheck::Passed);
+        later.run_id = "worker-01@2".to_owned();
+        store.append(&later).expect("append");
+
+        let latest = store.latest_ticket_records().expect("latest records");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].0, "widgets--01-foundation");
+        assert_eq!(latest[0].1.run_id, "worker-01@2");
     }
 
     #[test]

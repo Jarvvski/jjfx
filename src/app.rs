@@ -505,6 +505,7 @@ impl App {
                 .with_colocate(store.colocate())
                 .with_tickets(settings.tickets)
                 .with_spend(settings.spend)
+                .with_checks(settings.checks)
                 // The config was validated when it was loaded, so an unusable
                 // cap cannot arrive from a real launch; a hand-built one falls
                 // back to no cap rather than refusing the whole TUI.

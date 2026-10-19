@@ -469,6 +469,13 @@ at all: a command that does not exist (a shell reports exit 127) or one that
 outruns `timeout_secs` is a loud failure, never a silent pass. The forge names the
 command and the last line of its output.
 
+The same check is the ground truth for a **local Ticket's done status**. A Run
+is recorded as `done` from the agent runtime's own terminal event - the agent's
+report that it finished - so a local Ticket is resolved only when the Run's
+change passed this check, and a Run whose check failed, could not run, or had
+none configured leaves the Ticket not-done with the reason named. See
+[Local tickets](local-tickets.md#done-means-verified-not-the-agent-said-so).
+
 ### Repository-local checks
 
 `[checks]` is one of the three settings a repository may own. When the

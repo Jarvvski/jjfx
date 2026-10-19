@@ -1646,6 +1646,13 @@ fn run_record(
         RunConclusion::Succeeded => (RunRecordConclusion::Succeeded, None),
         RunConclusion::Failed { message } => (RunRecordConclusion::Failed, Some(message.clone())),
     };
+    // The repository's own check runs against the Run's change as the Run is
+    // finalized, and its outcome is recorded on the record. A Ticket is done only
+    // on a passing check (ticket 02): the agent's terminal "done" event is the
+    // agent's own report, and this is the external signal that supersedes it. A
+    // failed Run is already not done, so its check is not run.
+    let check = (conclusion == RunRecordConclusion::Succeeded)
+        .then(|| crate::checks::run(&workspace, repository.checks()).run_check());
     RunRecord {
         run_id: run_identity(worker, state),
         worker: worker.clone(),
@@ -1668,6 +1675,7 @@ fn run_record(
             .and_then(|duration| u64::try_from(duration.as_millis()).ok()),
         turns: result.turns(),
         conclusion,
+        check,
         error,
         started_at: state.started_at.clone(),
         completed_at: state.completed_at.clone(),
@@ -2289,6 +2297,75 @@ mod tests {
             .runs()
             .records()
             .expect("Run records")
+    }
+
+    /// A repository whose finished Runs are verified by `command`.
+    fn reserved_worker_with_check(command: &str) -> (tempfile::TempDir, Repository, WorkerId) {
+        let (temporary, repository, worker) = reserved_worker();
+        let repository = repository.with_checks(crate::config::ChecksConfig {
+            command: Some(command.to_owned()),
+            ..crate::config::ChecksConfig::default()
+        });
+        (temporary, repository, worker)
+    }
+
+    /// The check a finalization recorded for the Worker's Run.
+    fn recorded_check(command: &str, result: &RunResult) -> Option<crate::engine::RunCheck> {
+        let (_temporary, repository, worker) = reserved_worker_with_check(command);
+        let reservation = reserve(&repository, &worker, "ENG-1");
+        finalize(&reservation, result);
+        records(&repository)[0].check.clone()
+    }
+
+    /// A finished Run's change is verified by the repository's own check, and the
+    /// outcome is recorded on the Run Record - the signal a Ticket's done status
+    /// reads (ticket 02).
+    #[test]
+    fn a_finished_run_records_the_check_that_ran_against_its_change() {
+        assert_eq!(
+            recorded_check("true", &RunResult::succeeded()),
+            Some(crate::engine::RunCheck::Passed)
+        );
+
+        let failed = recorded_check("echo 'boom' >&2; exit 1", &RunResult::succeeded())
+            .expect("a check was recorded");
+        let crate::engine::RunCheck::Failed { command, detail } = &failed else {
+            panic!("a failing check maps to Failed, got {failed:?}");
+        };
+        assert_eq!(command, "echo 'boom' >&2; exit 1");
+        assert!(detail.contains("boom"), "{detail}");
+        assert!(!failed.passed());
+
+        let missing = recorded_check("jjfx-no-such-program-exists", &RunResult::succeeded())
+            .expect("a check was recorded");
+        assert!(
+            matches!(missing, crate::engine::RunCheck::CouldNotRun { .. }),
+            "a command that does not exist is not a pass: {missing:?}"
+        );
+    }
+
+    /// A repository with no check configured records that nothing verified the
+    /// Run, so its Ticket does not read as done - it is not silently claimed.
+    #[test]
+    fn a_run_with_no_check_configured_records_that_nothing_verified_it() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-1");
+        finalize(&reservation, &RunResult::succeeded());
+
+        assert_eq!(
+            records(&repository)[0].check,
+            Some(crate::engine::RunCheck::NotConfigured)
+        );
+    }
+
+    /// A Run that failed is already not-done, so no check is run for it.
+    #[test]
+    fn a_failed_run_records_no_check() {
+        let (_temporary, repository, worker) = reserved_worker_with_check("true");
+        let reservation = reserve(&repository, &worker, "ENG-1");
+        finalize(&reservation, &RunResult::failed("boom"));
+
+        assert_eq!(records(&repository)[0].check, None);
     }
 
     #[test]

@@ -97,9 +97,9 @@ same way a Linear title and description are, so a Worker needs no tracker tools.
 jjfx keeps the files in step with the Worker Pool:
 
 - A Worker that reserves a local Ticket sets its `Status:` to `claimed`.
-- A Ticket whose Run finishes sets its `Status:` to `resolved` and appends a
-  dated line under the file's `## Comments` heading, adding the heading when the
-  file has none.
+- A Ticket whose Run finishes **and whose change passed the repository's
+  `[checks]`** sets its `Status:` to `resolved` and appends a dated line under
+  the file's `## Comments` heading, adding the heading when the file has none.
 
 Only the `Status:` line and the appended comment are written, so the rest of the
 file is preserved byte for byte. Both steps are idempotent: a repeated reconcile
@@ -115,6 +115,26 @@ Dispatch), on the state-reading commands (`jjfx status`, `jjfx pool list`), and
 on demand with `jjfx ticket reconcile`, which needs no ready Ticket and no
 Dispatch. A Ticket a live Worker is still running is in flight, not finished, so
 it is never resolved from a stale record.
+
+### Done means verified, not "the agent said so"
+
+A Run is recorded as `done` purely from the agent runtime's own terminal event,
+which is the agent's report that it finished - nothing about whether the work is
+correct, or even complete. So a local Ticket is resolved only when the record's
+change passed the repository's `[checks]` command (see
+[`[checks]`](configuration.md#checks)), which runs against the change as the Run
+finalizes and whose outcome is stored on the Run Record.
+
+A Run whose check failed, could not run, or had none configured leaves the
+Ticket as it was, and the writeback names the reason - a finished Run is never
+mistaken for finished work. A repository with **no `[checks]` command
+configured** therefore never auto-resolves its local Tickets: nothing ran to
+verify them, so jjfx does not silently claim it did. The writeback says so on
+every reconcile (`Ticket <id> is not verified: no check is configured for this
+repository`) and `jjfx ticket reconcile` exits non-zero. Dispatch, claiming,
+dependency readiness and the rest of the loop are unaffected - a repository
+without a check still dispatches and runs work; it just never marks it done on
+the agent's word alone.
 
 ## Diagnostics
 

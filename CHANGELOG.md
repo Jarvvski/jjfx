@@ -80,6 +80,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx rebase, absorb and open-pr resolve the Worker's bookmark by Ticket (the prefixed name the agent actually created) instead of the bare Ticket id in Worker state, and fail before touching the Workspace when it is missing; a push that matches no bookmark is reported as a failure rather than a silent success.
 - `jjfx pool profile <runtime>` works on a Repository with no Worker Pool state yet: it provisions the empty Pool document it needs - and no capacity - instead of failing with a bare `state is missing`, so the documented profile-then-capacity order is a working one; when the state is genuinely gone it refuses naming the missing state and the `jjfx pool <N>` command that creates it.
 - A non-GitHub `origin` (a filesystem path or another forge) is now refused by name - `origin is not a GitHub remote` - before any Worker Pool state is written, and again when Dispatch resolves the repository identity, instead of persisting a slug guessed from its last two path segments and failing much later with a `gh` error naming a repository that never existed.
+- A local Ticket is resolved only when the repository's [checks] command ran against its Run's change and passed - not merely when the agent's Run reported success. A Run whose check failed, could not run, or had none configured leaves the Ticket not-done and the writeback names why, so a repository with no [checks] never silently claims verification.
 
 ## [0.55.0] - 2026-10-16
 

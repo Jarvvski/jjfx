@@ -34,6 +34,9 @@ mod watchdog;
 mod worker_actions;
 mod workspace;
 
+/// The repository's own verification of a Run's change, recorded on its Run
+/// Record. Re-exported because [`RunRecord`] exposes it.
+pub use crate::checks::RunCheck;
 pub(crate) use atomic::write_atomic_bytes;
 pub use cost::{
     PoolCost, PoolCostSnapshot, SpendCap, SpendCapMode, SpendDecision, SpendLimit, SpendScope,
@@ -138,6 +141,11 @@ pub struct Repository {
     root: PathBuf,
     colocate: bool,
     pool: PoolName,
+    /// The repo-owned build check a finished Run is verified against, resolved
+    /// from config when the handle is built. `open` defaults to none configured,
+    /// so a test or a caller that never sets one runs no check and verifies no
+    /// Run (ticket 02).
+    checks: crate::config::ChecksConfig,
 }
 
 impl Repository {
@@ -154,6 +162,19 @@ impl Repository {
     pub fn with_colocate(mut self, colocate: bool) -> Self {
         self.colocate = colocate;
         self
+    }
+
+    /// Returns this repository with the repo-owned build check a finished Run is
+    /// verified against. A handle that never sets one runs no check, so a Run it
+    /// finalizes is not verified and its Ticket does not reach done (ticket 02).
+    pub fn with_checks(mut self, checks: crate::config::ChecksConfig) -> Self {
+        self.checks = checks;
+        self
+    }
+
+    /// The repo-owned build check a finished Run is verified against.
+    pub fn checks(&self) -> &crate::config::ChecksConfig {
+        &self.checks
     }
 
     /// The Worker Pool this handle's pool-scoped operations act on.
@@ -213,6 +234,7 @@ impl Repository {
                     root,
                     colocate: true,
                     pool: PoolName::default(),
+                    checks: crate::config::ChecksConfig::default(),
                 });
             }
             if !directory.pop() {

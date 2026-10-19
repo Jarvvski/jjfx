@@ -16,6 +16,8 @@
 use std::path::Path;
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 use crate::cmd::{Run, cmd};
 use crate::config::ChecksConfig;
 
@@ -53,6 +55,78 @@ impl Outcome {
                 format!("check: `{command}` could not run"),
                 detail,
             )),
+        }
+    }
+
+    /// The durable form of this outcome, recorded against the Run whose change
+    /// the check ran on, so a Ticket's status can reflect the check rather than
+    /// the agent's own report (ticket 02). It keeps only the tool's summary line:
+    /// the full output belongs in the forge footer, not in every Run Record.
+    pub(crate) fn run_check(&self) -> RunCheck {
+        match self {
+            Outcome::Passed => RunCheck::Passed,
+            Outcome::NotConfigured => RunCheck::NotConfigured,
+            Outcome::Failed { command, output } => RunCheck::Failed {
+                command: command.clone(),
+                detail: last_line(output),
+            },
+            Outcome::CouldNotRun { command, detail } => RunCheck::CouldNotRun {
+                command: command.clone(),
+                detail: last_line(detail),
+            },
+        }
+    }
+}
+
+/// The repository's own verification of one Run's change, as persisted on the
+/// Run Record: whether the repo-defined check ran and passed, or why it did not.
+///
+/// A Run Record without one - an older record, or a Run that failed - is not
+/// verified. A local Ticket reaches its done status only on [`RunCheck::Passed`];
+/// the other variants keep it demonstrably not-done and name what happened.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunCheck {
+    /// The check ran and exited zero.
+    Passed,
+    /// The check ran and failed.
+    Failed {
+        /// The command the repository ran.
+        command: String,
+        /// The tool's own summary of the failure.
+        detail: String,
+    },
+    /// The check could not be run at all (a missing command, a timeout).
+    CouldNotRun {
+        /// The command the repository named.
+        command: String,
+        /// Why it could not run.
+        detail: String,
+    },
+    /// No check is configured for this repository, so nothing was verified.
+    NotConfigured,
+}
+
+impl RunCheck {
+    /// Whether the change passed the repository's check. Only this reads as
+    /// verified; every other variant - including "not configured" - does not.
+    pub const fn passed(&self) -> bool {
+        matches!(self, Self::Passed)
+    }
+
+    /// Why this Run is not verified, in one line, naming the command; `None`
+    /// when it passed.
+    pub fn reason(&self) -> Option<String> {
+        match self {
+            Self::Passed => None,
+            Self::Failed { command, detail } => {
+                Some(with_output(format!("check: `{command}` failed"), detail))
+            }
+            Self::CouldNotRun { command, detail } => Some(with_output(
+                format!("check: `{command}` could not run"),
+                detail,
+            )),
+            Self::NotConfigured => Some("no check is configured for this repository".to_owned()),
         }
     }
 }
@@ -118,11 +192,22 @@ fn combined_output(run: &Run) -> String {
 /// failure ("error: could not compile ...", "command not found"), and the footer
 /// is a single line, so the whole log cannot go there.
 fn with_output(lead: String, output: &str) -> String {
-    let Some(line) = output.lines().map(str::trim).rfind(|line| !line.is_empty()) else {
+    let line = last_line(output);
+    if line.is_empty() {
         return lead;
-    };
-    let line: String = line.chars().take(MAX_REASON_CHARS).collect();
+    }
     format!("{lead}: {line}")
+}
+
+/// The last non-empty, trimmed, bounded line of `output` - the tool's own
+/// summary of what happened. Empty when there is no output at all.
+fn last_line(output: &str) -> String {
+    output
+        .lines()
+        .map(str::trim)
+        .rfind(|line| !line.is_empty())
+        .map(|line| line.chars().take(MAX_REASON_CHARS).collect())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -227,6 +312,60 @@ mod tests {
         assert_eq!(
             with_output("check: `cargo check` failed".to_owned(), "  \n"),
             "check: `cargo check` failed"
+        );
+    }
+
+    #[test]
+    fn run_check_maps_each_outcome_to_its_durable_form() {
+        assert_eq!(run(&cwd(), &config("true")).run_check(), RunCheck::Passed);
+        assert_eq!(
+            run(&cwd(), &ChecksConfig::default()).run_check(),
+            RunCheck::NotConfigured
+        );
+
+        let failed = run(&cwd(), &config("echo 'boom: type error' >&2; exit 1")).run_check();
+        let RunCheck::Failed { command, detail } = &failed else {
+            panic!("a non-zero exit maps to Failed, got {failed:?}");
+        };
+        assert_eq!(command, "echo 'boom: type error' >&2; exit 1");
+        assert!(detail.contains("boom: type error"), "{detail}");
+        assert!(!failed.passed());
+        assert!(
+            failed
+                .reason()
+                .expect("a failure names why")
+                .contains("boom"),
+            "{failed:?}"
+        );
+
+        let missing = run(&cwd(), &config("jjfx-no-such-program-exists")).run_check();
+        assert!(
+            matches!(missing, RunCheck::CouldNotRun { .. }),
+            "a command that does not exist is not a pass: {missing:?}"
+        );
+        assert!(!missing.passed());
+    }
+
+    /// The durable form keeps the tool's own summary line, bounded, so a Run
+    /// Record never carries a whole compiler log.
+    #[test]
+    fn run_check_keeps_only_the_bounded_summary_line() {
+        let failed = run(
+            &cwd(),
+            &config("printf 'a\\nb\\nerror: could not compile\\n' >&2; exit 1"),
+        )
+        .run_check();
+        let RunCheck::Failed { detail, .. } = &failed else {
+            panic!("expected Failed, got {failed:?}");
+        };
+        assert_eq!(detail, "error: could not compile");
+        assert!(!detail.contains('\n'));
+
+        // Not configured and passed never carry a reason.
+        assert!(RunCheck::Passed.reason().is_none());
+        assert_eq!(
+            RunCheck::NotConfigured.reason().as_deref(),
+            Some("no check is configured for this repository")
         );
     }
 }
