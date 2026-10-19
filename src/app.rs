@@ -4072,6 +4072,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         }));
@@ -4105,6 +4106,7 @@ mod tests {
             jjfx_event_version: Some(1),
             agent_kind: Some("opencode".into()),
             session_id: Some("oc-1".into()),
+            parent_id: None,
             notification_type: None,
             error: None,
         }));
@@ -6499,6 +6501,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         }));
@@ -6509,6 +6512,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         }));
@@ -6560,6 +6564,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         }));
@@ -7015,6 +7020,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         })
@@ -7043,6 +7049,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: Some("rate_limit".to_string()),
         }));
@@ -7094,6 +7101,7 @@ mod tests {
                 jjfx_event_version: None,
                 agent_kind: None,
                 session_id: None,
+                parent_id: None,
                 notification_type: None,
                 error: None,
             }));
@@ -7113,6 +7121,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         }));
@@ -7137,6 +7146,7 @@ mod tests {
                 jjfx_event_version: None,
                 agent_kind: None,
                 session_id: None,
+                parent_id: None,
                 notification_type: None,
                 error: None,
             }));

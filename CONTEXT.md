@@ -53,6 +53,9 @@ awaiting the human), **NeedsAttention** (blocked on a permission or decision),
 **QuotaBlocked** (the turn ended on a provider quota or billing wall, so it is
 blocked on capacity or account state rather than on a bug), or **Ended**
 (session closed).
+The workspace's agent is its **root session**; a session that names a parent is
+a **child session**, tracked on its own axis so a parent can enumerate and read
+its children without a child displacing the workspace's agent.
 
 **Work lifecycle**:
 The least-delivered state among a workspace's owned changes: **Clean** (no

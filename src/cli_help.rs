@@ -106,6 +106,9 @@ fn notes(key: &str) -> &'static str {
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
         }
+        "children" => {
+            "\nA parent reaches this from its own shell: opencode puts the session's id\nin OPENCODE_SESSION_ID, so a bare `jjfx children` lists the sessions that\nsession dispatched, and naming one lists another session's. It needs no jj\nrepository, so a parent can ask from anywhere.\n\nThe children are the union of what opencode reports and what the lifecycle\nlog has seen; each state is the fold's. opencode also supplies each child's\ntitle and directory - which Worker it is - when it is reachable, and the log\nalone still names every child and its state when it is not.\n"
+        }
         _ => "",
     }
 }
@@ -166,6 +169,13 @@ pub(crate) const CLEAN_FLAGS: &[Flag] = &[Flag {
 }];
 
 pub(crate) const STATUS_FLAGS: &[Flag] = &[Flag {
+    long: "--json",
+    short: None,
+    value: None,
+    help: "Emit machine-readable JSON",
+}];
+
+pub(crate) const CHILDREN_FLAGS: &[Flag] = &[Flag {
     long: "--json",
     short: None,
     value: None,
@@ -607,6 +617,11 @@ const TOP_LEVEL: &[Group] = &[
                 args: "",
                 summary: "Report lifecycle integration state",
             },
+            Entry {
+                key: "children",
+                args: "[<session>] [--json]",
+                summary: "List a session's child sessions and what each is doing",
+            },
         ],
     },
     Group {
@@ -945,6 +960,16 @@ const PAGES: &[CommandHelp] = &[
         usage: "hooks status",
         arguments: &[],
         flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "children",
+        summary: "List the child sessions a session dispatched, and what each is doing",
+        usage: "children [<session>] [--json]",
+        arguments: &[Argument {
+            name: "[<session>]",
+            help: "The parent session; defaults to the session that ran this command (OPENCODE_SESSION_ID)",
+        }],
+        flags: CHILDREN_FLAGS,
     },
     CommandHelp {
         key: "completion",

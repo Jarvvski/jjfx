@@ -4,8 +4,15 @@
 //! common event name and `cwd` join (ADR 0004). Legacy transcript locations
 //! identify Claude and Codex; versioned envelopes carry explicit identity and
 //! session fields without exposing provider-specific payloads to the fold.
+//!
+//! A workspace's agent is its **root session** - the session that names no
+//! parent. A session that names a parent is a **child session**: it shares the
+//! workspace but is folded on its own axis, so a child can never displace the
+//! agent that owns the workspace and a parent can still enumerate and read what
+//! its children are doing.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -29,6 +36,21 @@ pub enum AgentState {
     QuotaBlocked,
     /// The session closed.
     Ended,
+}
+
+impl fmt::Display for AgentState {
+    /// The state's lower-case name, for a list row or a machine-readable field.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            AgentState::Absent => "absent",
+            AgentState::Working => "working",
+            AgentState::Waiting => "waiting",
+            AgentState::NeedsAttention => "needs-attention",
+            AgentState::QuotaBlocked => "quota-blocked",
+            AgentState::Ended => "ended",
+        };
+        f.write_str(label)
+    }
 }
 
 /// Which CLI a session's events come from. Versioned jjfx envelopes carry an
@@ -111,6 +133,11 @@ pub struct Event {
     /// Stable provider session identity carried by a jjfx-owned envelope.
     #[serde(default)]
     pub session_id: Option<String>,
+    /// The session that owns the session this event came from, when it is a
+    /// child. A root session names no parent, and a provider that does not
+    /// report parentage names none either.
+    #[serde(default)]
+    pub parent_id: Option<String>,
     /// Claude `Notification` type (`agent_needs_input`, `idle_prompt`, ...).
     /// The `Notification` hook is a catch-all; this field is the discriminator.
     #[serde(default)]
@@ -134,6 +161,9 @@ pub fn parse_line(line: &str) -> Option<Event> {
     }
     if event.session_id.as_deref() == Some("") {
         event.session_id = None;
+    }
+    if event.parent_id.as_deref() == Some("") {
+        event.parent_id = None;
     }
     match event.jjfx_event_version {
         None | Some(1) => Some(event),
@@ -217,9 +247,74 @@ struct TrackedAgent {
     session_id: Option<String>,
 }
 
+/// One child session, folded on its own axis: the session that owns it, and what
+/// it is doing.
+///
+/// A child session shares its parent's workspace but is not the workspace's
+/// agent, so it is tracked here rather than in the per-workspace map. This is
+/// what keeps "at most one agent per workspace" true while a child's lifecycle
+/// stays observable to the parent that dispatched it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChildSession {
+    session_id: String,
+    parent_id: String,
+    agent: Agent,
+}
+
+impl ChildSession {
+    /// The child's provider session id.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// The session that owns this one.
+    pub fn parent_id(&self) -> &str {
+        &self.parent_id
+    }
+
+    /// What the child is doing right now.
+    pub fn agent(&self) -> Agent {
+        self.agent
+    }
+}
+
+/// The kind one event identifies, from its explicit envelope identity or, for a
+/// legacy payload, its transcript location.
+fn event_kind(ev: &Event) -> AgentKind {
+    match ev.agent_kind.as_deref() {
+        Some(name) => AgentKind::from_name(name),
+        None => ev
+            .transcript_path
+            .as_deref()
+            .map(AgentKind::from_transcript_path)
+            .unwrap_or_default(),
+    }
+}
+
+/// Whether one event retags the kind of the session it folds into: an explicit
+/// versioned `SessionStart` always does, and any event that actually names a
+/// kind does. A field-less legacy line advances the state without wiping a kind
+/// it cannot replace.
+fn retags_kind(ev: &Event, kind: AgentKind) -> bool {
+    (ev.name == "SessionStart" && ev.jjfx_event_version.is_some()) || kind != AgentKind::Unknown
+}
+
+/// Advances one tracked session by one event.
+fn fold_agent(agent: &mut Agent, ev: &Event, kind: AgentKind) {
+    agent.state = transition(agent.state, ev);
+    if retags_kind(ev, kind) {
+        agent.kind = kind;
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct AgentStates {
     states: HashMap<PathBuf, TrackedAgent>,
+    /// Child sessions, keyed by session id. A session that names a parent is
+    /// folded here instead of into its workspace's agent, so a child can never
+    /// displace the agent that owns the workspace; a parent reads them back
+    /// through [`children_of`](Self::children_of).
+    children: HashMap<String, ChildSession>,
     /// Workspace path -> canonical join key, memoised so a caller that asks for
     /// the same workspace every frame or tick does not `canonicalize` it again
     /// (that syscall dominated the idle render path). Populated by
@@ -249,6 +344,10 @@ impl AgentStates {
 
     /// Live: fold one event into the state, keyed by its canonicalized `cwd`.
     pub fn apply(&mut self, ev: &Event) {
+        let kind = event_kind(ev);
+        if self.apply_to_child(ev, kind) {
+            return;
+        }
         let key = canon(Path::new(&ev.cwd));
         let entry = self.states.entry(key).or_default();
         if ev.name == "SessionStart" {
@@ -265,19 +364,63 @@ impl AgentStates {
             }
         }
 
-        entry.agent.state = transition(entry.agent.state, ev);
-        let kind = match ev.agent_kind.as_deref() {
-            Some(name) => AgentKind::from_name(name),
-            None => ev
-                .transcript_path
-                .as_deref()
-                .map(AgentKind::from_transcript_path)
-                .unwrap_or_default(),
+        fold_agent(&mut entry.agent, ev, kind);
+    }
+
+    /// Folds an event that belongs to a child session, reporting whether it did.
+    ///
+    /// A session is a child when the event names a parent, or when the session
+    /// was already seen as one (a provider reports parentage on the session's
+    /// start, and the later events for it name only the session). Either way the
+    /// event is folded on the child's own axis and never reaches the workspace's
+    /// agent.
+    fn apply_to_child(&mut self, ev: &Event, kind: AgentKind) -> bool {
+        let Some(session_id) = ev.session_id.as_deref().filter(|id| !id.is_empty()) else {
+            return false;
         };
-        let starts_versioned_session = ev.name == "SessionStart" && ev.jjfx_event_version.is_some();
-        if starts_versioned_session || kind != AgentKind::Unknown {
-            entry.agent.kind = kind;
+        if let Some(parent_id) = ev.parent_id.as_deref().filter(|id| !id.is_empty()) {
+            match self.children.get_mut(session_id) {
+                Some(child) => {
+                    if child.parent_id != parent_id {
+                        child.parent_id = parent_id.to_owned();
+                    }
+                    fold_agent(&mut child.agent, ev, kind);
+                }
+                None => {
+                    let mut child = ChildSession {
+                        session_id: session_id.to_owned(),
+                        parent_id: parent_id.to_owned(),
+                        agent: Agent::default(),
+                    };
+                    fold_agent(&mut child.agent, ev, kind);
+                    self.children.insert(session_id.to_owned(), child);
+                }
+            }
+            return true;
         }
+        match self.children.get_mut(session_id) {
+            Some(child) => {
+                fold_agent(&mut child.agent, ev, kind);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The child sessions owned by `parent_session_id`, with their folded state.
+    ///
+    /// This is how a parent enumerates and reads its children: opencode reports
+    /// the parentage when a session is created, the fold tracks each child on its
+    /// own axis, and a parent asks for the ones it owns. Ordered by session id so
+    /// a caller sees a stable list.
+    pub fn children_of(&self, parent_session_id: &str) -> Vec<&ChildSession> {
+        let mut children: Vec<&ChildSession> = self
+            .children
+            .values()
+            .filter(|child| child.parent_id == parent_session_id)
+            .collect();
+        children.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        children
     }
 
     /// The live agent for a workspace `path`, canonicalized to match the `cwd`
@@ -367,6 +510,166 @@ mod tests {
         assert_eq!(agent.kind, AgentKind::Unknown);
     }
 
+    /// The versioned `SessionStart` a session reports when it is created, with
+    /// the parent it names (empty for a root session).
+    fn session_start(session_id: &str, parent_id: &str) -> String {
+        format!(
+            r#"{{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"{session_id}","parent_id":"{parent_id}","cwd":"/w/a","hook_event_name":"SessionStart"}}"#
+        )
+    }
+
+    /// A later event for a session that names only itself, as opencode's status
+    /// and idle events do.
+    fn session_event(session_id: &str, name: &str) -> String {
+        format!(
+            r#"{{"jjfx_event_version":1,"agent_kind":"opencode","session_id":"{session_id}","cwd":"/w/a","hook_event_name":"{name}"}}"#
+        )
+    }
+
+    #[test]
+    fn a_child_session_does_not_replace_the_workspace_agent() {
+        let lines = [
+            session_start("root-1", ""),
+            session_event("root-1", "UserPromptSubmit"),
+            // The dispatching session's Worker is created as its child.
+            session_start("child-1", "root-1"),
+            session_event("child-1", "UserPromptSubmit"),
+        ];
+        let states = AgentStates::replay(lines.into_iter().filter_map(|line| parse_line(&line)));
+
+        // The workspace's agent is still the session that owns it, working...
+        let agent = states.agent_for(Path::new("/w/a"));
+        assert_eq!(
+            agent,
+            Agent {
+                state: AgentState::Working,
+                kind: AgentKind::OpenCode,
+            }
+        );
+
+        // ...and the child is tracked on its own axis, under its parent.
+        let children = states.children_of("root-1");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].session_id(), "child-1");
+        assert_eq!(children[0].parent_id(), "root-1");
+        assert_eq!(children[0].agent().state, AgentState::Working);
+        assert_eq!(children[0].agent().kind, AgentKind::OpenCode);
+
+        // A different parent owns nothing.
+        assert!(states.children_of("root-2").is_empty());
+    }
+
+    #[test]
+    fn a_childs_completion_is_visible_to_its_parent() {
+        let lines = [
+            session_start("root-1", ""),
+            session_event("root-1", "UserPromptSubmit"),
+            session_start("child-1", "root-1"),
+            session_event("child-1", "UserPromptSubmit"),
+            // The child finishes; the event names only the child, as opencode's
+            // idle event does.
+            session_event("child-1", "Stop"),
+        ];
+        let states = AgentStates::replay(lines.iter().filter_map(|line| parse_line(line)));
+
+        let children = states.children_of("root-1");
+        assert_eq!(
+            children[0].agent().state,
+            AgentState::Waiting,
+            "the parent must see its child settle"
+        );
+
+        // The child ending is visible too, and does not end the parent.
+        let mut ended = lines.to_vec();
+        ended.push(session_event("child-1", "SessionEnd"));
+        let states = AgentStates::replay(ended.into_iter().filter_map(|line| parse_line(&line)));
+        assert_eq!(
+            states.children_of("root-1")[0].agent().state,
+            AgentState::Ended
+        );
+        assert_eq!(
+            states.agent_for(Path::new("/w/a")).state,
+            AgentState::Working,
+            "a child ending must not end the workspace's agent"
+        );
+    }
+
+    #[test]
+    fn a_childs_events_route_by_session_id_after_its_start() {
+        // The start carries the parent; the later events name only the session,
+        // and must still land on the child rather than on the workspace agent.
+        let mut states = AgentStates::default();
+        for line in [
+            session_start("root-1", ""),
+            session_start("child-1", "root-1"),
+            session_event("child-1", "UserPromptSubmit"),
+        ] {
+            states.apply(&parse_line(&line).expect("event"));
+        }
+
+        assert_eq!(
+            states.children_of("root-1")[0].agent().state,
+            AgentState::Working
+        );
+        // The root never saw a prompt, so it stays waiting rather than adopting
+        // the child's work.
+        assert_eq!(
+            states.agent_for(Path::new("/w/a")).state,
+            AgentState::Waiting
+        );
+    }
+
+    #[test]
+    fn a_child_started_before_its_parent_is_still_a_child() {
+        // Ordering is not guaranteed across a plugin restart: parentage on the
+        // event alone is enough to keep a child out of the workspace agent.
+        let lines = [session_start("child-1", "root-1")];
+        let states = AgentStates::replay(lines.into_iter().filter_map(|line| parse_line(&line)));
+
+        assert_eq!(
+            states.agent_for(Path::new("/w/a")).state,
+            AgentState::Absent,
+            "a child must never become the workspace's agent"
+        );
+        assert_eq!(states.children_of("root-1").len(), 1);
+    }
+
+    #[test]
+    fn an_unknown_session_without_parentage_still_becomes_the_agent() {
+        // Backward compatibility: a provider that reports no parentage keeps
+        // today's rule, where the first session seen owns the workspace.
+        let lines = [session_event("root-2", "UserPromptSubmit")];
+        let states = AgentStates::replay(lines.into_iter().filter_map(|line| parse_line(&line)));
+
+        assert_eq!(
+            states.agent_for(Path::new("/w/a")).state,
+            AgentState::Working
+        );
+        assert!(
+            states.children_of("root-2").is_empty(),
+            "a session with no parent is an agent, not a child"
+        );
+    }
+
+    #[test]
+    fn a_new_root_session_replaces_the_previous_agent() {
+        // The original session-switch rule still holds for root sessions.
+        let lines = [
+            session_start("root-1", ""),
+            session_event("root-1", "UserPromptSubmit"),
+            session_start("root-2", ""),
+            session_event("root-2", "UserPromptSubmit"),
+            session_event("root-1", "Stop"),
+        ];
+        let states = AgentStates::replay(lines.into_iter().filter_map(|line| parse_line(&line)));
+
+        assert_eq!(
+            states.agent_for(Path::new("/w/a")).state,
+            AgentState::Working,
+            "a delayed event from the replaced session must not change the agent"
+        );
+    }
+
     #[test]
     fn fold_keeps_the_last_known_kind() {
         let mut states = AgentStates::default();
@@ -377,6 +680,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         });
@@ -390,6 +694,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         });
@@ -405,6 +710,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         });
@@ -707,6 +1013,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         });
@@ -736,6 +1043,7 @@ mod tests {
             jjfx_event_version: None,
             agent_kind: None,
             session_id: None,
+            parent_id: None,
             notification_type: None,
             error: None,
         });
@@ -761,6 +1069,7 @@ mod tests {
                 jjfx_event_version: None,
                 agent_kind: None,
                 session_id: None,
+                parent_id: None,
                 notification_type: None,
                 error: None,
             });

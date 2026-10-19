@@ -1,10 +1,11 @@
 //! Shared jjfx application implementation and interactive launcher.
 
 mod adhoc_ticket;
-mod agent;
+pub mod agent;
 mod app;
 mod attention;
 mod checks;
+mod children;
 mod cli;
 mod cli_help;
 mod cmd;
@@ -100,6 +101,14 @@ pub fn run(args: Vec<String>) -> anyhow::Result<()> {
     // and needs no jj repo, so it runs before repo discovery.
     if args.first().map(String::as_str) == Some("hooks") {
         return hooks::run_cli(args.get(1).map(String::as_str));
+    }
+
+    // `jjfx children [<session>]` is session-scoped and global too: it reads the
+    // lifecycle log and opencode, never a jj repository, so a parent session can
+    // ask it from anywhere - including outside the repository it dispatched
+    // into. Like `help`, it is parsed and dispatched without repo discovery.
+    if args.first().map(String::as_str) == Some("children") {
+        return dispatch(args);
     }
 
     // The TUI is explicit. Bare `jjfx` is the non-interactive CLI and prints
