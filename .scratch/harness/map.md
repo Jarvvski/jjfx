@@ -108,6 +108,9 @@ verifying agent output and integrating parallel work, which is what jjfx's
 - [08](issues/08-child-session-topology.md) - task: workers as child sessions,
   with the plugin and fold modelling them.
 
+- [11](issues/11-declare-jjfxs-own-check.md) - task: declare this
+  repository's own check, so the loop can verify work in the repo that builds it.
+
 ### Phase 3 - subtraction
 
 - [10](issues/10-cut-the-forge-to-one-path.md) - task: one blessed push+PR
