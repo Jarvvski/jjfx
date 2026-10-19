@@ -625,17 +625,46 @@ impl RunSupervisor {
         RunCompletion::new(reservation, revision).finalize(outcome)
     }
 
-    /// Starts a reserved Run and persists its process identifier before success.
+    /// Starts a reserved Run in the background.
+    ///
+    /// An opencode Run whose session the daemon API accepts the prompt for
+    /// starts with no client process at all: the work runs in the shared daemon
+    /// and the Worker's liveness follows the session, exactly as a daemon
+    /// Follow-up already does. Every other Run - and an opencode Run whose API
+    /// is unreachable, older, or refuses the prompt - starts as a detached
+    /// process, the path that predates this, unchanged.
+    ///
+    /// A detached process persists its identifier before success; a session
+    /// delivery has none, and reconciliation finishes the Run on the session's
+    /// outcome.
     pub fn run_reserved_background(
         &self,
         reservation: Reservation,
         invocation: AgentRuntimeInvocation,
-    ) -> Result<BackgroundRun, RunSupervisorError> {
+    ) -> Result<BackgroundStart, RunSupervisorError> {
         let worker_id = reservation.worker_id().clone();
+        let runtime = reservation.agent_runtime();
         let invocation = match self.prepare_reserved_session(&reservation, invocation) {
             Ok(invocation) => invocation,
             Err(error) => return release_after_failure(&reservation, error),
         };
+        // The Run's session was recorded by `prepare_reserved_session`. When the
+        // daemon admits the prompt the Run has started with no process; a
+        // refusal or an unreachable daemon falls through to the detached
+        // process, which drives the same session.
+        if runtime == AgentRuntime::OpenCode
+            && let Some(session_id) = invocation
+                .session_id
+                .as_deref()
+                .filter(|session_id| !session_id.is_empty())
+            && deliver_session_prompt(
+                &reservation,
+                session_id,
+                &invocation.delivered_prompt(runtime),
+            )
+        {
+            return Ok(BackgroundStart::Session(SessionRun::new(session_id)));
+        }
         let request = reserved_request(&reservation, invocation);
         let mut background = match self.run_background(&request) {
             Ok(background) => background,
@@ -645,7 +674,7 @@ impl RunSupervisor {
         match reservation.persist_pid(pid) {
             Ok(crate::engine::pool::PidPersistence::Persisted(revision)) => {
                 background.completion = Some(RunCompletion::new(reservation, revision));
-                Ok(background)
+                Ok(BackgroundStart::Process(Box::new(background)))
             }
             Ok(crate::engine::pool::PidPersistence::Missing) => persist_pid_failure(
                 &reservation,
@@ -654,12 +683,14 @@ impl RunSupervisor {
                     worker: worker_id,
                     pid,
                 },
-            ),
+            )
+            .map(|run| BackgroundStart::Process(Box::new(run))),
             Ok(crate::engine::pool::PidPersistence::Conflict) => persist_pid_failure(
                 &reservation,
                 background,
                 RunSupervisorError::PersistPidConflict { worker: worker_id },
-            ),
+            )
+            .map(|run| BackgroundStart::Process(Box::new(run))),
             Err(source) => persist_pid_failure(
                 &reservation,
                 background,
@@ -668,7 +699,8 @@ impl RunSupervisor {
                     pid,
                     source,
                 },
-            ),
+            )
+            .map(|run| BackgroundStart::Process(Box::new(run))),
         }
     }
 
@@ -808,6 +840,43 @@ impl RunSupervisor {
             log_path: request.log_path.clone(),
             completion: None,
         })
+    }
+}
+
+/// A reserved background Run that has started.
+///
+/// An opencode Run whose session the daemon accepts the prompt for drives no
+/// client process: the work runs in the shared daemon and the Worker's liveness
+/// follows the session, so there is nothing to reap. Every other Run - and an
+/// opencode Run whose API is unreachable, older, or refuses - is a detached
+/// process the caller owns.
+#[must_use = "a started background Run must be reaped or reconciled"]
+#[derive(Debug)]
+pub enum BackgroundStart {
+    /// A detached Agent Runtime process, to be waited on and finalized.
+    Process(Box<BackgroundRun>),
+    /// The prompt reached the Run's opencode session through the daemon API, so
+    /// no client process exists. Reconciliation finishes the Run on the
+    /// session's outcome.
+    Session(SessionRun),
+}
+
+/// The opencode session a no-process background Run delivered its prompt to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRun {
+    session_id: String,
+}
+
+impl SessionRun {
+    fn new(session_id: impl Into<String>) -> Self {
+        Self {
+            session_id: session_id.into(),
+        }
+    }
+
+    /// The session the Run's prompt was delivered to.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
     }
 }
 
@@ -1263,6 +1332,46 @@ fn interrupt_opencode_run(
         return false;
     };
     matches!(api.interrupt_session(&session_id), Ok(true))
+}
+
+/// Delivers a Run's prompt to an opencode session through the daemon API,
+/// reporting whether the daemon accepted it.
+///
+/// Best-effort by contract: only an accepted prompt is `true`, so an unreachable
+/// or older opencode, or a server rejection, falls back to the process
+/// invocation rather than failing the Run. The Worker's previous Run log is
+/// emptied on success, exactly as a spawned client's log truncation does, so
+/// reconciliation cannot read the previous Run's terminal event as this Run's.
+///
+/// The caller is responsible for recording the session first, so a Run is never
+/// delivered twice.
+pub(crate) fn deliver_session_prompt(
+    reservation: &Reservation,
+    session_id: &str,
+    prompt: &str,
+) -> bool {
+    if crate::engine::OpenCodeApi::new()
+        .prompt_async(session_id, prompt)
+        .is_err()
+    {
+        return false;
+    }
+    truncate_run_log(reservation.repository(), reservation.worker_id());
+    true
+}
+
+/// Empties a Worker's Run log so a previous Run's provider terminal event is not
+/// read as the current Run's.
+///
+/// Best-effort: a missing or unwritable log must not fail a Run whose liveness
+/// follows its session rather than its log.
+fn truncate_run_log(repository: &Repository, worker: &WorkerId) {
+    let path = repository.state_store().worker_log(worker);
+    let _ = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path);
 }
 
 /// Returns the process group for `pid` only when `pid` is a live process-group

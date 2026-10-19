@@ -419,6 +419,12 @@ impl RealWorkspaceDispatch {
                         success.worker().to_string(),
                         *pid,
                     ),
+                    DirectDispatchExecution::Session { session_id } => DispatchOutcome::session(
+                        success.ticket().id().to_string(),
+                        success.ticket().title().as_str().to_owned(),
+                        success.worker().to_string(),
+                        session_id.clone(),
+                    ),
                     DirectDispatchExecution::Foreground(_) => DispatchOutcome::failure(
                         success.ticket().id().to_string(),
                         success.ticket().title().as_str().to_owned(),
@@ -660,15 +666,24 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         });
         match preparation.into_start() {
             crate::engine::OrchestrationStart::Direct(success) => {
-                let crate::engine::DirectDispatchExecution::Background { pid } =
-                    success.execution()
-                else {
-                    return Err("foreground Parent Dispatch is not supported by jjfx".to_owned());
+                let (pid, session_id) = match success.execution() {
+                    crate::engine::DirectDispatchExecution::Background { pid } => {
+                        (Some(*pid), None)
+                    }
+                    crate::engine::DirectDispatchExecution::Session { session_id } => {
+                        (None, Some(session_id.clone()))
+                    }
+                    crate::engine::DirectDispatchExecution::Foreground(_) => {
+                        return Err(
+                            "foreground Parent Dispatch is not supported by jjfx".to_owned()
+                        );
+                    }
                 };
                 emit(WorkspaceDispatchOrchestrationEvent::Direct {
                     parent: id.to_string(),
                     worker: success.worker().to_string(),
-                    pid: *pid,
+                    pid,
+                    session_id,
                 });
                 return Ok(());
             }

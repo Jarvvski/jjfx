@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use jjfx::engine::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    Expected, FollowUpExecution, PoolCapacity, Repository, RunMode, RunRequest, RunReset,
-    RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerActions, WorkerId,
-    WorkerStatus,
+    BackgroundStart, Expected, FollowUpExecution, PoolCapacity, Repository, RunMode, RunRequest,
+    RunReset, RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerActions,
+    WorkerId, WorkerStatus,
 };
 use jjfx::test_support::LIVENESS_TIMEOUT;
 use rustix::process::{
@@ -1576,8 +1576,9 @@ fn reserved_background_run_finalizes_worker_after_wait() {
 ///
 /// `session.create` records the request body and reports `ses_test` anchored to
 /// the Worker Workspace; `session.get` reports it anchored to the directory in
-/// `JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`; `run` records its cwd and
-/// arguments.
+/// `JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`; `session.prompt` records
+/// the delivered prompt body; `run` records its cwd and arguments, so a test can
+/// prove no client process was spawned.
 const OPENCODE_SESSION_SCRIPT: &str = r#"#!/bin/sh
 case "$1" in
   --version) printf '%s\n' '2.0.29'; exit 0 ;;
@@ -1589,6 +1590,10 @@ case "$1" in
         exit 0 ;;
       session.get)
         printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
+        exit 0 ;;
+      session.prompt)
+        printf '%s' "$6" > "__PROMPT_BODY__"
+        printf '{"data":{"id":"msg_1"}}'
         exit 0 ;;
     esac
     exit 1 ;;
@@ -1618,6 +1623,7 @@ struct OpencodeSessionFixture {
     worker_id: WorkerId,
     workspace: PathBuf,
     create_body: PathBuf,
+    prompt_body: PathBuf,
     run_args: PathBuf,
     bin_directory: PathBuf,
     result: PathBuf,
@@ -1653,6 +1659,7 @@ fn opencode_session_fixture() -> OpencodeSessionFixture {
     fs::create_dir(&bin_directory).expect("runtime bin directory");
     OpencodeSessionFixture {
         create_body: temporary_directory.path().join("opencode-create-body"),
+        prompt_body: temporary_directory.path().join("opencode-prompt-body"),
         run_args: temporary_directory.path().join("opencode-run-args"),
         result: temporary_directory.path().join("result"),
         _temporary_directory: temporary_directory,
@@ -1669,6 +1676,7 @@ impl OpencodeSessionFixture {
             &self.bin_directory.join("opencode"),
             &script
                 .replace("__CREATE_BODY__", &self.create_body.display().to_string())
+                .replace("__PROMPT_BODY__", &self.prompt_body.display().to_string())
                 .replace("__RUN_ARGS__", &self.run_args.display().to_string()),
         );
     }
@@ -1720,7 +1728,7 @@ impl OpencodeSessionFixture {
 }
 
 #[test]
-fn opencode_run_creates_a_session_anchored_to_the_workspace_and_drives_it() {
+fn opencode_run_prompts_its_session_with_no_client_process() {
     let fixture = opencode_session_fixture();
     fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
 
@@ -1732,7 +1740,7 @@ fn opencode_run_creates_a_session_anchored_to_the_workspace_and_drives_it() {
     );
     assert_eq!(
         fs::read_to_string(&fixture.result).expect("helper result"),
-        "ok exit=Some(0)"
+        "session ses_test"
     );
 
     // The session was created with the Worker Workspace as its location.
@@ -1747,21 +1755,32 @@ fn opencode_run_creates_a_session_anchored_to_the_workspace_and_drives_it() {
     let expected_title = format!("pool:{}:ENG-42", fixture.worker_id);
     assert_eq!(body["title"].as_str(), Some(expected_title.as_str()));
 
-    // The Run was driven with the created session, in the Worker Workspace.
-    let (cwd, arguments) = fixture.recorded_run();
-    assert_eq!(
-        cwd.canonicalize().expect("run cwd canonical"),
-        fixture
-            .workspace
-            .canonicalize()
-            .expect("workspace canonical")
-    );
+    // The prompt reached the created session through the daemon API.
+    let prompt: Value = serde_json::from_slice(
+        &fs::read(&fixture.prompt_body).expect("recorded session.prompt body"),
+    )
+    .expect("session.prompt body JSON");
     assert!(
-        arguments
-            .windows(2)
-            .any(|pair| pair == ["--session", "ses_test"]),
-        "the Run should drive the created session: {arguments:?}"
+        prompt["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("do the work")),
+        "the session should receive the Run's prompt: {prompt}"
     );
+
+    // No client process was spawned: the Run drives the session through the
+    // daemon instead of `opencode run`.
+    assert!(
+        !fixture.run_args.exists(),
+        "a session-delivered Run must not spawn an opencode client process"
+    );
+
+    // The Worker is busy on its session, with no process of its own.
+    let snapshot = fixture.repository.worker_pool().snapshot();
+    let worker = snapshot
+        .worker(fixture.worker_id.as_str())
+        .expect("busy Worker");
+    assert_eq!(worker.status(), WorkerStatus::Busy);
+    assert_eq!(worker.pid(), None);
 
     // The id survives for a later process to identify the Run's session.
     assert_eq!(fixture.recorded_session().as_deref(), Some("ses_test"));
@@ -1780,7 +1799,7 @@ fn opencode_run_falls_back_when_the_session_api_is_unavailable() {
     );
     assert_eq!(
         fs::read_to_string(&fixture.result).expect("helper result"),
-        "ok exit=Some(0)"
+        "process exit=Some(0)"
     );
 
     // Today's invocation still runs, in the Worker Workspace, without a session.
@@ -1827,8 +1846,8 @@ fn opencode_run_resumes_and_records_an_existing_session() {
     let fixture = opencode_session_fixture();
     fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
 
-    // A resumed Run already carries a session id: it must drive that session and
-    // record it, without creating another.
+    // A resumed Run already carries a session id: it must prompt that session
+    // and record it, without creating another and without a client process.
     let output = fixture.spawn_helper(&fixture.workspace, Some("ses_existing"));
     assert!(
         output.status.success(),
@@ -1837,15 +1856,16 @@ fn opencode_run_resumes_and_records_an_existing_session() {
     );
     assert_eq!(
         fs::read_to_string(&fixture.result).expect("helper result"),
-        "ok exit=Some(0)"
+        "session ses_existing"
     );
 
-    let (_, arguments) = fixture.recorded_run();
     assert!(
-        arguments
-            .windows(2)
-            .any(|pair| pair == ["--session", "ses_existing"]),
-        "the Run should drive the resumed session: {arguments:?}"
+        fixture.prompt_body.exists(),
+        "the Run should prompt the resumed session"
+    );
+    assert!(
+        !fixture.run_args.exists(),
+        "a resumed session Run must not spawn a client process"
     );
     assert_eq!(fixture.recorded_session().as_deref(), Some("ses_existing"));
     assert!(
@@ -1905,9 +1925,12 @@ fn opencode_run_session_helper() {
     }
     let result = env::var_os(HELPER_RESULT).expect("result path");
     match RunSupervisor::new().run_reserved_background(reservation, invocation) {
-        Ok(background) => {
+        Ok(BackgroundStart::Process(background)) => {
             let outcome = background.wait().expect("background Run should complete");
-            fs::write(result, format!("ok exit={:?}", outcome.exit_code())).expect("result");
+            fs::write(result, format!("process exit={:?}", outcome.exit_code())).expect("result");
+        }
+        Ok(BackgroundStart::Session(session)) => {
+            fs::write(result, format!("session {}", session.session_id())).expect("result");
         }
         Err(error) => {
             fs::write(result, format!("err {error}")).expect("result");
@@ -2692,10 +2715,10 @@ fn opencode_send_falls_back_to_the_client_when_the_session_api_is_unavailable() 
     );
 }
 
-/// An opencode send with no session to resume starts a fresh client Run,
-/// exactly as before the API path existed.
+/// An opencode send with no session to resume creates one and delivers the
+/// prompt through the daemon API, so it too starts without a client process.
 #[test]
-fn opencode_send_starts_a_fresh_client_run_without_a_recorded_session() {
+fn opencode_send_prompts_a_freshly_created_session_without_a_client() {
     let fixture = opencode_send_fixture();
     fixture.write_opencode();
 
@@ -2705,26 +2728,23 @@ fn opencode_send_starts_a_fresh_client_run_without_a_recorded_session() {
         "helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let result = fs::read_to_string(&fixture.result).expect("helper result");
-    assert!(
-        result.starts_with("background "),
-        "with no session to prompt, the send must run a fresh client: {result}"
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "session ses_new"
     );
-    assert!(
-        !fixture.prompt_args.exists(),
-        "there is no session to prompt"
-    );
-    // The Run created and drove a fresh session, as it always did.
+    // The Run created its session and delivered the prompt through the API.
     assert!(
         fixture.create_body.exists(),
         "a fresh Run creates its session"
     );
-    let (_, arguments) = fixture.recorded_run();
     assert!(
-        arguments
-            .windows(2)
-            .any(|pair| pair == ["--session", "ses_new"]),
-        "the fresh Run should drive the created session: {arguments:?}"
+        fixture.prompt_args.exists(),
+        "the freshly created session should be prompted"
+    );
+    // No client process was spawned.
+    assert!(
+        !fixture.run_args.exists(),
+        "a fresh session Run must not spawn a client"
     );
 }
 
@@ -3088,9 +3108,12 @@ fn stale_background_waiter_helper() {
         .worker_pool()
         .reserve_named(worker_id, "ENG-216")
         .expect("Run A reservation");
-    let background = RunSupervisor::new()
+    let BackgroundStart::Process(background) = RunSupervisor::new()
         .run_reserved_background(reservation, AgentRuntimeInvocation::new("Run A"))
-        .expect("Run A should start");
+        .expect("Run A should start")
+    else {
+        panic!("a non-opencode Run should start a process");
+    };
     fs::write(
         env::var_os(HELPER_PROCESS).expect("process path"),
         background.pid().to_string(),
@@ -3125,9 +3148,12 @@ fn reserved_background_run_finalize_helper() {
         .expect("Worker reservation");
     let result = env::var_os(HELPER_RESULT).expect("result path");
     let invocation = AgentRuntimeInvocation::new("reserved test");
-    let background = RunSupervisor::new()
+    let BackgroundStart::Process(background) = RunSupervisor::new()
         .run_reserved_background(reservation, invocation)
-        .expect("reserved background Run should start");
+        .expect("reserved background Run should start")
+    else {
+        panic!("a non-opencode Run should start a process");
+    };
     let outcome = background.wait().expect("background Run should complete");
     fs::write(
         result,
@@ -3937,9 +3963,12 @@ fn reset_run_helper() {
         .worker_pool()
         .reserve_named(worker_id, "ENG-218")
         .expect("Worker reservation");
-    let background = RunSupervisor::new()
+    let BackgroundStart::Process(background) = RunSupervisor::new()
         .run_reserved_background(reservation, AgentRuntimeInvocation::new("reset test"))
-        .expect("reserved background Run should start");
+        .expect("reserved background Run should start")
+    else {
+        panic!("a non-opencode Run should start a process");
+    };
     fs::write(
         env::var_os(HELPER_RESULT).expect("result path"),
         background.pid().to_string(),
@@ -4038,10 +4067,16 @@ fn reserved_background_run_helper() {
     match RunSupervisor::new()
         .run_reserved_background(reservation, AgentRuntimeInvocation::new("reserved test"))
     {
-        Ok(background) => {
+        Ok(BackgroundStart::Process(background)) => {
             fs::write(&result, background.pid().to_string()).expect("background PID result");
             let outcome = background.wait().expect("background Run should complete");
             assert_eq!(outcome.exit_code(), Some(0));
+        }
+        Ok(BackgroundStart::Session(session)) => {
+            panic!(
+                "a non-opencode Run should start a process, not session {}",
+                session.session_id()
+            );
         }
         Err(error) => {
             if let RunSupervisorError::PersistPid { pid, .. }
@@ -4079,9 +4114,12 @@ fn reserved_background_run_cwd_helper() {
         .worker_pool()
         .reserve_named(worker_id, "ENG-1")
         .expect("Worker reservation");
-    let background = RunSupervisor::new()
+    let BackgroundStart::Process(background) = RunSupervisor::new()
         .run_reserved_background(reservation, AgentRuntimeInvocation::new("cwd test"))
-        .expect("background Run should start");
+        .expect("background Run should start")
+    else {
+        panic!("a non-opencode Run should start a process");
+    };
     let outcome = background.wait().expect("background Run should complete");
     assert_eq!(outcome.exit_code(), Some(0));
 }

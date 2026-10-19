@@ -314,12 +314,19 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
             )));
             for outcome in result.outcomes() {
                 let line = if outcome.succeeded() {
+                    let target = outcome.pid().map_or_else(
+                        || {
+                            outcome
+                                .session_id()
+                                .map_or_else(|| "?".to_owned(), |id| format!("session {id}"))
+                        },
+                        |pid| format!("PID {pid}"),
+                    );
                     format!(
-                        "  ✓ {}  {} -> {} (PID {})",
+                        "  ✓ {}  {} -> {} ({target})",
                         outcome.ticket(),
                         outcome.title(),
-                        outcome.worker().unwrap_or("?"),
-                        outcome.pid().unwrap_or_default()
+                        outcome.worker().unwrap_or("?")
                     )
                 } else if outcome.is_waiting() {
                     format!(
