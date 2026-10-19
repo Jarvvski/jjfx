@@ -71,7 +71,7 @@ pub use orchestration::{
     OrchestrationError, OrchestrationEvent, OrchestrationOptions, OrchestrationPreparation,
     OrchestrationRequest, OrchestrationRunner, OrchestrationStart, OrchestrationSummary,
 };
-pub(crate) use orchestration::{dependency_basis, resolve_ticket_branch};
+pub(crate) use orchestration::{TicketBranch, dependency_basis, resolve_ticket_branch};
 pub use pool::{
     CapacityShortage, PersistedField, PoolCapacity, PoolCapacityError, PoolResize, PoolSnapshot,
     Reservation, SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError,

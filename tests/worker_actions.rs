@@ -189,10 +189,11 @@ fn rebase_waits_for_the_workspace_operation_lock() {
 
     let bin = temporary_directory.path().join("rebase-lock-bin");
     fs::create_dir(&bin).expect("fake command directory");
-    let command_script =
-        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n";
-    write_executable(&bin.join("jj"), command_script);
-    write_executable(&bin.join("gh"), command_script);
+    let command_script = format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\ncase \" $* \" in\n{LANDING_JJ_ARMS}esac\n"
+    );
+    write_executable(&bin.join("jj"), &command_script);
+    write_executable(&bin.join("gh"), &command_script);
     let path = format!(
         "{}:{}",
         bin.display(),
@@ -243,12 +244,14 @@ fn rebase_waits_for_the_workspace_operation_lock() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert_eq!(
-        fs::read_to_string(&capture).expect("command capture"),
-        concat!(
-            "jj rebase -b owner/eng-301-action -d main\n",
-            "jj git push -b owner/eng-301-action\n",
-            "gh -R owner/repo pr view owner/eng-301-action --web\n"
-        )
+        jj_operations(&fs::read_to_string(&capture).expect("command capture")),
+        vec![
+            "bookmark list -T name ++ \"\\n\"",
+            "rebase -b owner/eng-301-action -d main",
+            "git push --bookmark owner/eng-301-action",
+            "bookmark list -T name ++ \"\\n\"",
+            "gh -R owner/repo pr view owner/eng-301-action --web",
+        ]
     );
 }
 
@@ -346,7 +349,7 @@ fn repository_actions_reject_a_worker_without_a_branch() {
 }
 
 #[test]
-fn rebase_and_open_pull_request_use_compatible_typed_actions() {
+fn rebase_and_open_pull_request_resolve_the_prefixed_bookmark_the_agent_created() {
     let (temporary_directory, repository) = local_repository();
     let worker = grow_one_worker(&repository);
     let log = repository.root().join("repository-actions.log");
@@ -355,10 +358,11 @@ fn rebase_and_open_pull_request_use_compatible_typed_actions() {
 
     let bin = temporary_directory.path().join("bin");
     fs::create_dir(&bin).expect("fake command directory");
-    let command_script =
-        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n";
-    write_executable(&bin.join("jj"), command_script);
-    write_executable(&bin.join("gh"), command_script);
+    let command_script = format!(
+        "#!/bin/sh\nprintf '%s %s\\n' \"$(basename \"$0\")\" \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\ncase \" $* \" in\n{LANDING_JJ_ARMS}esac\n"
+    );
+    write_executable(&bin.join("jj"), &command_script);
+    write_executable(&bin.join("gh"), &command_script);
     let capture = temporary_directory.path().join("commands");
     let result = temporary_directory.path().join("result");
     let path = format!(
@@ -383,17 +387,22 @@ fn rebase_and_open_pull_request_use_compatible_typed_actions() {
         "repository action helper failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    // Worker state names the bare Ticket (`eng-301`), the repository names the
+    // prefixed bookmark the dispatch prompt asked the agent to create. Both
+    // verbs must find the latter, not fail on the former.
     assert_eq!(
         fs::read_to_string(&result).expect("action result"),
         "owner/eng-301-action\nowner/eng-301-action\n"
     );
     assert_eq!(
-        fs::read_to_string(&capture).expect("command capture"),
-        concat!(
-            "jj rebase -b owner/eng-301-action -d main\n",
-            "jj git push -b owner/eng-301-action\n",
-            "gh -R owner/repo pr view owner/eng-301-action --web\n"
-        )
+        jj_operations(&fs::read_to_string(&capture).expect("command capture")),
+        vec![
+            "bookmark list -T name ++ \"\\n\"",
+            "rebase -b owner/eng-301-action -d main",
+            "git push --bookmark owner/eng-301-action",
+            "bookmark list -T name ++ \"\\n\"",
+            "gh -R owner/repo pr view owner/eng-301-action --web",
+        ]
     );
 }
 
@@ -409,14 +418,8 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
     fs::create_dir(&bin).expect("fake command directory");
     write_executable(
         &bin.join("jj"),
-        concat!(
-            "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "case \" $* \" in\n",
-            "  *' --count '*) printf '1\\n' ;;\n",
-            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
-            "  *' absorb '*) printf 'Absorbed changes into 2 revisions:\\n  aaa111 A: add x\\n  bbb222 B: bump y\\n' >&2 ;;\n",
-            "esac\n"
+        &format!(
+            "#!/bin/sh\nprintf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\ncase \" $* \" in\n{LANDING_JJ_ARMS}  *' --count '*) printf '1\\n' ;;\n  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n  *' absorb '*) printf 'Absorbed changes into 2 revisions:\\n  aaa111 A: add x\\n  bbb222 B: bump y\\n' >&2 ;;\nesac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-commands");
@@ -447,21 +450,24 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
         fs::read_to_string(&result).expect("absorb result"),
         "owner/eng-301-action\nabsorbed=2 remaining=false\n"
     );
-    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
-    assert_eq!(commands.len(), 5, "{commands:?}");
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 6, "{commands:?}");
+    // The Ticket's bookmark is resolved by a read before anything is mutated, so
+    // the prefixed name the agent created is what every later command uses.
+    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
     // The precondition is read before anything is mutated, so a repository with
     // no trunk is refused before absorb can run.
-    assert_eq!(commands[0], "log -r trunk() ~ root() --count");
+    assert_eq!(commands[1], "log -r trunk() ~ root() --count");
     // The mainline is read either side of the fold, so a rewrite of it is
     // caught rather than reported as success.
     assert!(
-        commands[1].starts_with("log -r ") && commands[1].ends_with(" --no-graph -T commit_id"),
+        commands[2].starts_with("log -r ") && commands[2].ends_with(" --no-graph -T commit_id"),
         "{commands:?}"
     );
     // The destination is pinned rather than left at jj's `mutable()` default.
-    assert!(commands[2].starts_with("absorb --into "), "{commands:?}");
-    assert_eq!(commands[3], commands[1], "the mainline is re-read");
-    assert_eq!(commands[4], "git push -b owner/eng-301-action");
+    assert!(commands[3].starts_with("absorb --into "), "{commands:?}");
+    assert_eq!(commands[4], commands[2], "the mainline is re-read");
+    assert_eq!(commands[5], "git push --bookmark owner/eng-301-action");
 }
 
 #[test]
@@ -476,14 +482,8 @@ fn absorb_that_moves_nothing_skips_the_push() {
     fs::create_dir(&bin).expect("fake command directory");
     write_executable(
         &bin.join("jj"),
-        concat!(
-            "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "case \" $* \" in\n",
-            "  *' --count '*) printf '1\\n' ;;\n",
-            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
-            "  *' absorb '*) printf 'Nothing changed.\\n' >&2 ;;\n",
-            "esac\n"
+        &format!(
+            "#!/bin/sh\nprintf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\ncase \" $* \" in\n{LANDING_JJ_ARMS}  *' --count '*) printf '1\\n' ;;\n  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n  *' absorb '*) printf 'Nothing changed.\\n' >&2 ;;\nesac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-nothing-commands");
@@ -510,9 +510,10 @@ fn absorb_that_moves_nothing_skips_the_push() {
         fs::read_to_string(&result).expect("absorb result"),
         "owner/eng-301-action\nabsorbed=0 remaining=false\n"
     );
-    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
-    assert_eq!(commands.len(), 4, "{commands:?}");
-    assert!(commands[2].starts_with("absorb --into "), "{commands:?}");
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 5, "{commands:?}");
+    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert!(commands[3].starts_with("absorb --into "), "{commands:?}");
     assert!(
         !commands
             .iter()
@@ -533,14 +534,8 @@ fn absorb_reports_hunks_that_stayed_in_the_working_copy() {
     fs::create_dir(&bin).expect("fake command directory");
     write_executable(
         &bin.join("jj"),
-        concat!(
-            "#!/bin/sh\n",
-            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "case \" $* \" in\n",
-            "  *' --count '*) printf '1\\n' ;;\n",
-            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
-            "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n  aaa111 A: add x\\nRemaining changes:\\nA new.rs\\n' >&2 ;;\n",
-            "esac\n"
+        &format!(
+            "#!/bin/sh\nprintf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\ncase \" $* \" in\n{LANDING_JJ_ARMS}  *' --count '*) printf '1\\n' ;;\n  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n  aaa111 A: add x\\nRemaining changes:\\nA new.rs\\n' >&2 ;;\nesac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-remaining-commands");
@@ -585,6 +580,7 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \" $* \" in\n",
+            "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
             "  *' --count '*) printf '1\\n' ;;\n",
             "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
             "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n' >&2 ;;\n",
@@ -618,11 +614,12 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
             .contains("cannot push absorbed branch"),
         "result should name the absorb push failure"
     );
-    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
-    assert_eq!(commands.len(), 6, "{commands:?}");
-    assert!(commands[2].starts_with("absorb --into "), "{commands:?}");
-    assert_eq!(commands[4], "git push -b owner/eng-301-action");
-    assert_eq!(commands[5], "undo --allow-cross-workspace");
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 7, "{commands:?}");
+    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert!(commands[3].starts_with("absorb --into "), "{commands:?}");
+    assert_eq!(commands[5], "git push --bookmark owner/eng-301-action");
+    assert_eq!(commands[6], "undo --allow-cross-workspace");
 }
 
 /// The repository `jjfx absorb` was observed to destroy: `origin` exists but no
@@ -659,6 +656,14 @@ fn absorb_refuses_when_trunk_does_not_resolve_and_leaves_main_alone() {
     let log = repository.root().join("absorb-trunk.log");
     fs::write(&log, "{}\n").expect("Worker log");
     set_terminal_worker(&repository, &worker, &log);
+
+    // The bookmark the agent created for the Ticket: `absorb` resolves the
+    // Worker's real bookmark before it mutates anything, so it must exist here.
+    jj_with_config(
+        repository.root(),
+        &["bookmark", "create", "owner/eng-301-action", "-r", "main"],
+        &jj_config,
+    );
 
     let workspace = worker_workspace_path(&repository, &worker);
     // Dispatch bases a Worker on the mainline (`prepare_for_dispatch` runs
@@ -745,6 +750,7 @@ fn an_absorb_that_rewrites_the_mainline_is_rolled_back_and_fails() {
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \" $* \" in\n",
+            "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
             "  *' --count '*) printf '1\\n' ;;\n",
             "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n' >&2 ;;\n",
             "  *' log '*) if [ -e \"$JJFX_ACTION_CAPTURE.mark\" ]; then\n",
@@ -781,9 +787,10 @@ fn an_absorb_that_rewrites_the_mainline_is_rolled_back_and_fails() {
         outcome.contains("rewrote the mainline"),
         "a moved mainline must be reported, never success: {outcome}"
     );
-    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
-    assert_eq!(commands.len(), 5, "{commands:?}");
-    assert_eq!(commands[4], "undo --allow-cross-workspace");
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 6, "{commands:?}");
+    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert_eq!(commands[5], "undo --allow-cross-workspace");
     assert!(
         !commands
             .iter()
@@ -807,7 +814,10 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
         concat!(
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "if [ \"$1\" = git ] && [ \"$2\" = push ]; then echo rejected >&2; exit 1; fi\n"
+            "case \" $* \" in\n",
+            "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
+            "  *' git push '*) echo rejected >&2; exit 1 ;;\n",
+            "esac\n"
         ),
     );
     let capture = temporary_directory.path().join("commands");
@@ -836,12 +846,264 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
             .contains("cannot push rebased branch")
     );
     assert_eq!(
-        fs::read_to_string(&capture).expect("command capture"),
+        jj_operations(&fs::read_to_string(&capture).expect("command capture")),
+        vec![
+            "bookmark list -T name ++ \"\\n\"",
+            "rebase -b owner/eng-301-action -d main",
+            "git push --bookmark owner/eng-301-action",
+            "undo --allow-cross-workspace",
+        ]
+    );
+}
+
+/// The drive's failure shape, in reverse: when no bookmark names the Worker's
+/// Ticket the verb must fail on a *read*, before it rebases the Workspace. The
+/// old code rebased first and looked the bookmark up second, leaving a rebased
+/// (and sometimes conflicted) Workspace behind a failure.
+#[test]
+fn a_missing_worker_bookmark_fails_before_the_workspace_is_touched() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("missing-bookmark.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("missing-bookmark-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    // A repository with no bookmark for the Ticket: `bookmark list` is empty.
+    write_executable(
+        &bin.join("jj"),
+        "#!/bin/sh\nprintf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
+    );
+    let capture = temporary_directory.path().join("missing-bookmark-commands");
+    let result = temporary_directory.path().join("missing-bookmark-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "missing-bookmark")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("repository action helper should run");
+
+    assert!(output.status.success());
+    let outcome = fs::read_to_string(&result).expect("action result");
+    assert!(outcome.contains("no bookmark names Worker"), "{outcome}");
+    assert!(
+        outcome.contains("ENG-301"),
+        "the refusal names the Ticket: {outcome}"
+    );
+    assert_eq!(
+        jj_operations(&fs::read_to_string(&capture).expect("command capture")),
+        vec!["bookmark list -T name ++ \"\\n\""],
+        "resolution is a read, so a missing bookmark must fail before any rebase"
+    );
+}
+
+/// More than one bookmark naming the Ticket is the same hazard as none: choosing
+/// one would be a guess, and the guess is what put the wrong name in a landing
+/// verb. The verb must refuse on the read, before it mutates.
+#[test]
+fn an_ambiguous_worker_bookmark_fails_before_the_workspace_is_touched() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("ambiguous-bookmark.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("ambiguous-bookmark-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
         concat!(
-            "jj rebase -b owner/eng-301-action -d main\n",
-            "jj git push -b owner/eng-301-action\n",
-            "jj undo --allow-cross-workspace\n"
-        )
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
+            "case \" $* \" in\n",
+            "  *' bookmark list '*) printf 'owner/eng-301-action\\nowner/eng-301-other\\n' ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory
+        .path()
+        .join("ambiguous-bookmark-commands");
+    let result = temporary_directory.path().join("ambiguous-bookmark-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "missing-bookmark")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("repository action helper should run");
+
+    assert!(output.status.success());
+    let outcome = fs::read_to_string(&result).expect("action result");
+    assert!(
+        outcome.contains("named by more than one bookmark"),
+        "{outcome}"
+    );
+    assert!(outcome.contains("owner/eng-301-action"), "{outcome}");
+    assert!(outcome.contains("owner/eng-301-other"), "{outcome}");
+    assert_eq!(
+        jj_operations(&fs::read_to_string(&capture).expect("command capture")),
+        vec!["bookmark list -T name ++ \"\\n\""],
+        "resolution is a read, so an ambiguous bookmark must fail before any rebase"
+    );
+}
+
+/// `jj git push` exits zero and moves nothing when the name matches no bookmark,
+/// so a verb must classify what the push did rather than trust the exit code.
+/// Here the bookmark resolved and then vanished before the push (a concurrent
+/// delete): nothing could have been pushed, so `absorb` must report the failure
+/// and roll the local fold back, never claim it published.
+#[test]
+fn a_push_that_matched_no_bookmark_is_not_reported_as_success() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-vanished-push.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("absorb-vanished-push-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
+            "case \" $* \" in\n",
+            // Resolution sees the bookmark; by the time the push is classified
+            // it is gone, which is the race the classification has to survive.
+            "  *' bookmark list '*)\n",
+            "    if [ -e \"$JJFX_ACTION_CAPTURE.resolved\" ]; then :; else\n",
+            "      printf 'owner/eng-301-action\\n'\n",
+            "      : > \"$JJFX_ACTION_CAPTURE.resolved\"\n",
+            "    fi ;;\n",
+            "  *' --count '*) printf '1\\n' ;;\n",
+            "  *' remote_bookmarks() '*) printf 'origin/owner/eng-301-action aaaa\\n' ;;\n",
+            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
+            "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n' >&2 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory
+        .path()
+        .join("absorb-vanished-push-commands");
+    let result = temporary_directory
+        .path()
+        .join("absorb-vanished-push-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(output.status.success());
+    let outcome = fs::read_to_string(&result).expect("absorb result");
+    assert!(
+        outcome.contains("no bookmark named `owner/eng-301-action`"),
+        "a push that matched no bookmark must not read as success: {outcome}"
+    );
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert!(
+        commands
+            .iter()
+            .any(|command| command == "git push --bookmark owner/eng-301-action"),
+        "{commands:?}"
+    );
+    assert_eq!(
+        commands.last().map(String::as_str),
+        Some("undo --allow-cross-workspace"),
+        "an unpublished fold must be rolled back: {commands:?}"
+    );
+}
+
+/// The other half of the same classification: the bookmark exists and is already
+/// published, so the push has nothing to move. That is a no-op *success* - the
+/// desired state already holds - so re-running `rebase` must report success and
+/// must not undo the rebase it just did.
+#[test]
+fn re_running_rebase_on_an_already_pushed_worker_succeeds_without_rolling_back() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("rebase-already-pushed.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("rebase-already-pushed-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
+            "case \" $* \" in\n",
+            "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
+            // The remote already carries the bookmark, and the push moves
+            // nothing, so the snapshot is identical either side of it.
+            "  *' remote_bookmarks() '*) printf 'origin/owner/eng-301-action aaaa\\n' ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory
+        .path()
+        .join("rebase-already-pushed-commands");
+    let result = temporary_directory
+        .path()
+        .join("rebase-already-pushed-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "rebase")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("rebase helper should run");
+
+    assert!(output.status.success());
+    assert_eq!(
+        fs::read_to_string(&result).expect("rebase result"),
+        "rebased=owner/eng-301-action\n"
+    );
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert!(
+        !commands.iter().any(|command| command.starts_with("undo")),
+        "an already-published bookmark must not roll the rebase back: {commands:?}"
     );
 }
 
@@ -1306,6 +1568,12 @@ fn review_builds_one_provider_neutral_follow_up_from_pr_state() {
     let bin = temporary_directory.path().join("review-bin");
     fs::create_dir(&bin).expect("fake executable directory");
     let captured = temporary_directory.path().join("review-prompt");
+    // Review resolves the Worker's bookmark the same way the landing verbs do,
+    // so the fake `jj` answers the resolution read.
+    write_executable(
+        &bin.join("jj"),
+        "#!/bin/sh\ncase \" $* \" in\n  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\nesac\n",
+    );
     write_executable(
         &bin.join("gh"),
         "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"mergeable\":\"CONFLICTING\",\"reviewDecision\":\"CHANGES_REQUESTED\"}]' ;;\n  *\"pr checks\"*) printf '%s\\n' '[{\"name\":\"tests\",\"conclusion\":\"FAILURE\"},{\"name\":\"lint\",\"conclusion\":\"SUCCESS\"}]'; exit 1 ;;\nesac\n",
@@ -1485,7 +1753,7 @@ fn failed_send_launch_restores_the_prior_terminal_worker() {
     let restored = snapshot.worker(worker.as_str()).expect("restored Worker");
     assert_eq!(restored.status(), jjfx::engine::WorkerStatus::Done);
     assert_eq!(restored.ticket(), Some("ENG-301"));
-    assert_eq!(restored.branch_name(), Some("owner/eng-301-action"));
+    assert_eq!(restored.branch_name(), Some("eng-301"));
     assert_eq!(
         restored.log_file(),
         Some(prior_log.to_string_lossy().as_ref())
@@ -1574,7 +1842,12 @@ fn mount_action_helper() {
 #[ignore]
 fn repository_action_helper() {
     let mode = env::var(HELPER_MODE).unwrap_or_default();
-    if mode != "repository" && mode != "rebase-failure" && mode != "absorb" {
+    if mode != "repository"
+        && mode != "rebase-failure"
+        && mode != "rebase"
+        && mode != "absorb"
+        && mode != "missing-bookmark"
+    {
         return;
     }
     let repository =
@@ -1587,6 +1860,11 @@ fn repository_action_helper() {
             .open_pull_request(&worker)
             .expect("Open PR should succeed");
         format!("{}\n{}\n", rebase.branch(), open.branch())
+    } else if mode == "rebase" {
+        match actions.rebase(&worker) {
+            Ok(rebase) => format!("rebased={}\n", rebase.branch()),
+            Err(error) => error.to_string(),
+        }
     } else if mode == "absorb" {
         match actions.absorb(&worker) {
             Ok(absorb) => {
@@ -1603,7 +1881,7 @@ fn repository_action_helper() {
     } else {
         actions
             .rebase(&worker)
-            .expect_err("Push should fail")
+            .expect_err("Rebase should fail")
             .to_string()
     };
     fs::write(env::var_os(HELPER_RESULT).expect("result path"), result).expect("action result");
@@ -1737,6 +2015,31 @@ fn jj_subcommands(capture: &str) -> Vec<String> {
         .collect()
 }
 
+/// The `jj` operations a capture recorded, without the remote-bookmark reads the
+/// push classification makes: an assertion should name the operation, not the
+/// probe that decides whether it pushed.
+fn jj_operations(capture: &str) -> Vec<String> {
+    jj_subcommands(capture)
+        .into_iter()
+        .filter(|command| !command.starts_with("log -r remote_bookmarks()"))
+        .collect()
+}
+
+/// The fake-`jj` arms every landing verb needs: the bookmark the Worker's Ticket
+/// actually carries - prefixed and described, unlike the bare id Worker state
+/// records - and a push that moves a remote bookmark so the classified outcome
+/// is `Pushed`. The `$JJFX_ACTION_CAPTURE.mark` barrier flips the remote
+/// snapshot after the push, so the before/after comparison sees a real change.
+const LANDING_JJ_ARMS: &str = concat!(
+    "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
+    "  *' remote_bookmarks() '*) if [ -e \"$JJFX_ACTION_CAPTURE.mark\" ]; then\n",
+    "      printf 'origin/owner/eng-301-action bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'\n",
+    "    else\n",
+    "      printf 'origin/owner/eng-301-action aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\n",
+    "    fi ;;\n",
+    "  *' git push '*) : > \"$JJFX_ACTION_CAPTURE.mark\" ;;\n",
+);
+
 /// Run one jj command against a fixture repository with its own `JJ_CONFIG`,
 /// asserting success.
 fn jj_with_config(dir: &Path, args: &[&str], config: &Path) {
@@ -1823,7 +2126,11 @@ fn set_terminal_worker_for_runtime(
     state.started_at = Some(WireTimestamp::new("2026-07-31T10:00:00Z"));
     state.completed_at = Some(WireTimestamp::new("2026-07-31T10:05:00Z"));
     state.log_file = Some(prior_log.to_string_lossy().into_owned());
-    state.branch_name = Some("owner/eng-301-action".to_owned());
+    // Worker state records the bare Ticket id, exactly as reservation does
+    // (`branch_name: ticket.to_lowercase()`); the bookmark the agent actually
+    // created carries the operator's prefix and a description the state never
+    // learns, so every landing verb has to resolve it.
+    state.branch_name = Some("eng-301".to_owned());
     state.exit_code = Some(0);
     let outcome = state_repository
         .commit(Expected::Match(revision), StateChange::Replace(state))

@@ -1,6 +1,6 @@
 # Resolve the Worker's bookmark before the landing verbs mutate anything
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -36,13 +36,43 @@ Two consequences make it worse than a wrong message:
 
 ## Acceptance Criteria
 
-- [ ] The landing verbs (`absorb`'s push, `rebase`, `open-pr`) resolve the
+- [x] The landing verbs (`absorb`'s push, `rebase`, `open-pr`) resolve the
       Worker's actual bookmark, by the same rule `bug-hunt/14` established.
-- [ ] A missing bookmark fails loudly and before any mutation - no rebased,
+- [x] A missing bookmark fails loudly and before any mutation - no rebased,
       conflicted workspace left behind.
-- [ ] A push that matches no bookmark is not reported as success.
-- [ ] A test drives a Worker whose bookmark carries the configured prefix and
+- [x] A push that matches no bookmark is not reported as success.
+- [x] A test drives a Worker whose bookmark carries the configured prefix and
       asserts `rebase` and `open-pr` find it.
+
+## Resolution
+
+The matching rule moved into one place the verbs share. `resolve_ticket_branch`
+(`src/engine/orchestration.rs`) now returns a `TicketBranch` outcome -
+`Resolved(name)`, `Missing`, or `Ambiguous(names)` - instead of a bare
+`Option`, and is the single source of truth for "which bookmark carries this
+Ticket's work?"; orchestration's branch repair and the `--all` stacked base
+read `.name()`, while `WorkerActions::worker_branch` turns `Missing` and
+`Ambiguous` into typed errors. `branch_and_workspace` (used by `rebase`,
+`absorb` and `open-pr`) and `pull_request_for` (used by `review`) both resolve
+through it, and resolution is a read, so it fails before the Workspace lock is
+taken and before any jj mutation.
+
+The push no longer trusts an exit code: `SystemCommands::push` goes through
+`crate::jj::push_bookmark`, which classifies the result from the remote-bookmark
+state *and* jj's bookmark list. The two zero-exit cases are opposites. A push
+that moves a remote bookmark is `Pushed`. A push that moves nothing while the
+bookmark exists is `Nothing` - a **no-op success**, because the desired state
+already holds - so re-running `rebase` on an up-to-date Worker reports success
+and does not roll the rebase back. A push whose name matches no bookmark is
+`Failed`, because nothing could have been pushed; `Failed` is what rolls back.
+
+Verified with `mise run check` (fmt + lint + build + test green), and by
+`tests/worker_actions.rs`, where a Worker whose state names the bare Ticket
+`eng-301` now drives `rebase`/`open-pr` onto the prefixed
+`owner/eng-301-action`; a missing and an ambiguous bookmark both fail on the
+resolution read with no rebase recorded; re-running `rebase` on an
+already-published bookmark succeeds without an `undo`; and an absorb whose
+bookmark vanishes before the push reports the failure and undoes the fold.
 
 ## References
 

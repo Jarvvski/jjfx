@@ -635,7 +635,9 @@ fn revalidate_branches(root: &Path, group: &mut DispatchGroup) -> Vec<BranchRepa
         if previous == "main" || revision_exists(root, &previous) {
             continue;
         }
-        let current = resolve_ticket_branch(root, &ticket).unwrap_or_else(|| "main".to_owned());
+        let current = resolve_ticket_branch(root, &ticket)
+            .name()
+            .map_or_else(|| "main".to_owned(), str::to_owned);
         if let Some(issue) = group.state_mut().sub_issues.get_mut(&ticket) {
             issue.branch = Some(current.clone());
         }
@@ -665,34 +667,71 @@ fn revision_exists(root: &Path, revision: &str) -> bool {
         .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
 }
 
-/// The bookmark a Worker delivered for `ticket`, when one exists.
+/// How a Ticket's delivered bookmark resolved against the repository's bookmarks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TicketBranch {
+    /// Exactly one bookmark names the Ticket.
+    Resolved(String),
+    /// No bookmark names the Ticket.
+    Missing,
+    /// More than one bookmark names the Ticket; the matches, in jj's order.
+    Ambiguous(Vec<String>),
+}
+
+impl TicketBranch {
+    /// The resolved bookmark, or `None` when the Ticket has no single bookmark.
+    ///
+    /// Callers that can only act on one name treat [`Self::Missing`] and
+    /// [`Self::Ambiguous`] alike: picking one of several matches is a guess, and
+    /// a guess is how the wrong branch got used before.
+    pub(crate) fn name(&self) -> Option<&str> {
+        match self {
+            Self::Resolved(name) => Some(name),
+            Self::Missing | Self::Ambiguous(_) => None,
+        }
+    }
+}
+
+/// The bookmark a Worker delivered for `ticket`, matched by the Ticket rather
+/// than by a namespace.
 ///
-/// Shared by orchestration's branch repair and the `--all` path's stacked base:
-/// both answer "which branch carries this Ticket's work?" the same way.
-pub(crate) fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> Option<String> {
-    // Match on the Ticket, not a hardcoded namespace. The branch prefix comes
-    // from the operator's `jj user.name`, which dispatch reads at dispatch time
-    // and which may change before a group is resumed; hardcoding it made the
-    // lookup miss and silently rewrite a stacked dependency onto `main`.
+/// The single source of truth for "which bookmark carries this Ticket's work?",
+/// shared by orchestration's branch repair, the `--all` path's stacked base, and
+/// the Worker landing verbs. Matching on the Ticket is what makes it stable: the
+/// prefix comes from the operator's `jj user.name`, which dispatch reads at
+/// dispatch time and which may change before a group is resumed, and the
+/// dispatch prompt appends a description the persisted state never learns. A
+/// bookmark whose final component is `<ticket>` or `<ticket>-<slug>` is the only
+/// match that survives both.
+pub(crate) fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> TicketBranch {
     let ticket = ticket.as_str().to_ascii_lowercase();
-    let output = crate::jj::command()
+    let Some(output) = crate::jj::command()
         .args(["bookmark", "list", "-T", "name ++ \"\\n\""])
         .current_dir(root)
         .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout)
-        .ok()?
+        .ok()
+        .filter(|output| output.status.success())
+    else {
+        return TicketBranch::Missing;
+    };
+    let Ok(names) = String::from_utf8(output.stdout) else {
+        return TicketBranch::Missing;
+    };
+    let matches = names
         .lines()
-        .find(|name| {
+        .filter(|name| {
             name.rsplit('/').next().is_some_and(|component| {
                 let component = component.to_ascii_lowercase();
                 component == ticket || component.starts_with(&format!("{ticket}-"))
             })
         })
         .map(str::to_owned)
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [] => TicketBranch::Missing,
+        [only] => TicketBranch::Resolved(only.clone()),
+        many => TicketBranch::Ambiguous(many.to_vec()),
+    }
 }
 
 /// The stacked base resolved for a dependent Ticket from its Blockers' branches.
