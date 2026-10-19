@@ -24,10 +24,10 @@ Build it from the same outcome model the prose is rendered from (`DirectDispatch
 
 ## Acceptance Criteria
 
-- [ ] `jjfx dispatch --json` prints a machine-readable result for every Ticket in the request, including the ones not dispatched.
-- [ ] Each entry names the Ticket, its outcome, and the Worker when one took it.
-- [ ] Without `--json` the prose output is unchanged.
-- [ ] Tests cover a dispatched Ticket, a held-back Ticket, and a failure.
+- [x] `jjfx dispatch --json` prints a machine-readable result for every Ticket in the request, including the ones not dispatched.
+- [x] Each entry names the Ticket, its outcome, and the Worker when one took it.
+- [x] Without `--json` the prose output is unchanged.
+- [x] Tests cover a dispatched Ticket, a held-back Ticket, and a failure.
 - [ ] `mise run check` is green.
 
 ## Out of Scope
@@ -45,3 +45,13 @@ Build it from the same outcome model the prose is rendered from (`DirectDispatch
 
 - 2026-10-16: Filed from the `jjfx-dispatch` skill pass, so an agent can read what a dispatch did instead of parsing its prose.
 - 2026-10-16: Implemented `dispatch --json`. `DispatchEntry` in `src/cli.rs` is the shared outcome model both the prose and JSON renderings read, built once from `DirectDispatchOutcome`, so a new engine outcome breaks compilation in `from_outcome` rather than reaching only one rendering. Each object carries `ticket`, `outcome` (`dispatched`/`failed`/`waiting`/`orchestrating`), `worker` (null when none took it), `phase`, `pid` and `detail`. The single-Ticket orchestration handoff also reports JSON, and `--json` with no discovered Tickets prints `[]`. Unit tests cover a dispatched, a failed and a held-back Ticket plus the unchanged prose; an integration test asserts the empty batch on stdout.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `DispatchArgs` carries `json: bool` (`src/cli.rs:192`), and `render_dispatch_entries` (`:3861`) routes to `dispatch_json` (`:3941`) or the unchanged `dispatch_prose` (`:3870`) from the one `DispatchEntry` model. Criterion 4 holds: `dispatch_json_names_each_ticket_outcome_worker_and_detail` (`:6221`), `dispatch_json_reports_a_skipped_ticket_with_its_reason` (`:6249`), `dispatch_json_is_an_empty_array_when_no_ticket_was_requested` (`:6244`) and `dispatch_parser_accepts_json` (`:5215`), plus the integration coverage in `tests/dispatch_outcomes.rs`. Criterion 3 holds because the prose path is a separate rendering of the same entries, unchanged.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

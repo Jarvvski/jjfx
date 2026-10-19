@@ -25,10 +25,10 @@ Derive the flag text from the same definitions the parser reads, so the two cann
 
 ## Acceptance Criteria
 
-- [ ] `jjfx help <command>` prints that command's usage, arguments and flags, for every command the top-level help lists.
-- [ ] `jjfx help <unknown>` fails loudly, naming the unknown command.
-- [ ] The top-level help lists `hooks install` and `hooks status`.
-- [ ] A test asserts every command named in the top-level help has a help page, so a new command without one fails the suite.
+- [x] `jjfx help <command>` prints that command's usage, arguments and flags, for every command the top-level help lists.
+- [x] `jjfx help <unknown>` fails loudly, naming the unknown command.
+- [x] The top-level help lists `hooks install` and `hooks status`.
+- [x] A test asserts every command named in the top-level help has a help page, so a new command without one fails the suite.
 - [ ] `mise run check` is green.
 
 ## Out of Scope
@@ -47,3 +47,13 @@ Derive the flag text from the same definitions the parser reads, so the two cann
 
 - 2026-10-16: Filed from the `jjfx-dispatch` skill pass, which had to hard-code the flag surface because the CLI could not be asked for it.
 - 2026-10-16: Resolved. `src/cli_help.rs` now owns the command surface: the grouped top-level list and one page per command. `cli::parse` reads each command's flags from the same `Flag` slice its page renders and rejects any option the page omits (`cli::reject_unknown_flags`), so the parser and the help cannot drift in either direction. `jjfx help <command>` prints the page (joining multi-word keys, so `jjfx help pool list` works), an unknown command fails naming it, and the top-level list gained the Lifecycle group. Tests cover the top-level↔page mapping, page rendering, and both drift directions.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `src/cli_help.rs` owns the surface - `PAGES` holds one `CommandHelp` per command, `top_level()` (`:1065`) renders the grouped list, and `page()` (`:1035`) resolves a key to its page, failing with `unknown command: {key}. Run 'jjfx help' ...` (`:1058`) for a typo. The Lifecycle group with `hooks install` / `hooks status` is present (`:598-606`, pages at `:936-945`). Criterion 4 holds: `every_top_level_command_has_a_page` (`:1095`), with `every_page_is_named_at_the_top_level` (`:1135`) catching the reverse direction and `every_page_renders_its_usage_arguments_and_flags` (`:1152`) the rendering; `an_unknown_command_is_named_in_the_error` (`:1237`) and `the_top_level_help_lists_the_lifecycle_commands` (`:1244`) cover the other criteria. The parser cannot drift from the pages because each `parse_*` rejects an option its page omits via `reject_unknown_flags` (`src/cli.rs:462`).
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
