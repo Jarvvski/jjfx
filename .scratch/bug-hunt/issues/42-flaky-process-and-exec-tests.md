@@ -1,6 +1,6 @@
 # Process- and exec-timing tests are flaky under CI and load
 
-Status: ready-for-agent
+Status: resolved
 Type: task
 Blocked by: none
 
@@ -58,10 +58,10 @@ Make the timing/exec assertions deterministic rather than instantaneous:
 
 ## Acceptance Criteria
 
-- [ ] Each named test is reproduced red under load (or in CI) before it is changed.
-- [ ] Each named test passes N consecutive runs under a loaded machine and in CI.
-- [ ] No production timing behaviour is changed to make a test pass.
-- [ ] `mise run check` is green.
+- [x] Each named test is reproduced red under load (or in CI) before it is changed.
+- [x] Each named test passes N consecutive runs under a loaded machine and in CI.
+- [x] No production timing behaviour is changed to make a test pass.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -125,6 +125,59 @@ is a `wait_with_output()` to EOF (`:103`), which returned nothing at all, so the
 lost output points at the process rather than at a file-read window. The
 mechanism is not established by inspection and needs reproducing under load.
 
-To close it: reproduce the empty-stdout failure under load, find where the
-child's output is lost or Dispatch fails before it prints, and make the assertion
-deterministic. Do not simply re-run it.
+## Resolution (Mon 19 Oct 2026)
+
+Reproduced red first, and the reproduction named the mechanism. Under the
+ticket-35-style load - 16 concurrent `adhoc_ticket` binaries, three continuous
+`jjfx` unit-test binaries, and 48 CPU burners on a 12-core machine - 11-12 of
+the 16 copies failed in the first round, each at the stdout assertion with empty
+stdout. Printing the child's status and stderr from that assertion (kept as a
+diagnostic improvement) showed the cause:
+
+    Error: cannot determine which Worker Workspaces are open; re-run with --force to dispatch anyway
+    Caused by: running `kitten @ ls` - is kitty's remote control enabled?: kitten @ ls did not finish within 3s
+
+So the empty stdout is neither a lost pipe nor a read race. `wait_with_output()`
+reads the child to EOF, and the child printed nothing because Dispatch failed
+closed *before* it rendered the batch: the Dispatch Eligibility terminal check
+(ADR 0011) spawns the real `kitten @ ls`, and under load the stub terminal was
+starved past `terminal::LS_QUERY_TIMEOUT` (3s), so Dispatch refused rather than
+risk a Workspace collision.
+
+Ruled out with probes: the pipe/read path (`wait_with_output()` to EOF cannot
+lose a written stream, and instrumented timing put every failure at the 3s
+deadline, never in the read); the helper-written-file race this ticket's earlier
+fix addressed (the Ticket file is written and closed before Dispatch starts, and
+the child never reads it back); the child being slow (the stub burns ~5ms of CPU
+- timing every `kitten @ ls` under the same load gave successes just under the
+deadline, max 2999ms, and timeouts at 3000ms+); and any other subprocess
+(`kitten @ ls` is the only process the ad-hoc Dispatch path spawns).
+
+Fix, test-only. `tests/support/mod.rs` gains
+`run_jjfx_tolerating_a_starved_terminal` (and a stdin variant), which reruns an
+invocation *only* while it failed closed on the terminal refusal, bounded by
+`jjfx::test_support::LIVENESS_TIMEOUT` - the shared budget, not a new private
+one. Every CLI Dispatch fixture adopts it (`adhoc_ticket`, `dispatch_outcomes`,
+`local_tickets`, `pool_routing`, `pool_materialisation`, `pool_spend`), so a
+loaded machine can no longer red a Dispatch test that is not about the terminal,
+while the seam keeps being exercised; a genuinely stuck or unreachable terminal
+still fails within the bound rather than hanging. The named test's assertion now
+also prints the child's status and stderr, so a Dispatch that fails before it
+prints says why instead of reporting empty stdout. No production timing changed
+(`src/` untouched); no changelog entry: nothing user-visible.
+
+Evidence: red first (11-12 of 16 concurrent copies per round pre-fix); green
+under the same load (12 consecutive rounds of 16 concurrent `adhoc_ticket`
+binaries - 192 binary runs, ~768 Dispatches - plus three continuous unit-test
+binaries and 48 burners, 0 failures); `dispatch_outcomes` and the other four
+changed fixtures also green under it; `mise run check` green.
+`.scratch/bug-hunt/map.md`'s ticket-35 entry is corrected to match that ticket's
+`## Resolution`.
+
+One observation outside the named tests: under that extreme harness load,
+`tests/repository.rs::concurrent_provisioning_neither_deadlocks_nor_corrupts_the_cache`
+exceeded its shared 120s liveness budget once, and passed in isolation and on
+the settled re-run. That is the same broad class but a different mechanism - a
+real `jj workspace add` taking too long, not the terminal seam - and the load
+that redded it (16 concurrent Dispatch binaries plus three continuous unit-test
+binaries) is far beyond a real `mise run check`. Recorded, not fixed here.
