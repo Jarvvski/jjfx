@@ -1,6 +1,6 @@
 # A Ticket reads `resolved` when its run finishes, not when its work lands
 
-Status: needs-triage
+Status: resolved
 Type: design
 Blocked by: none
 
@@ -26,3 +26,17 @@ landing; if the latter, reconciliation needs a landing signal.
 - [ ] The board distinguishes "the run finished" from "the change landed", or
       says plainly that it does not.
 - [ ] A drive where landing fails does not leave every Ticket reading as done.
+
+## Resolution
+
+Decided 2026-10-19: a Ticket is done only when a repo-defined check actually ran
+and passed against the change - never on the agent's own report. The decision and
+its evidence are recorded in `.scratch/harness/map.md`; the work is
+`.scratch/harness/issues/02-verified-done.md`.
+
+The research behind the decision: this is the most-repeated pattern across
+independent primary sources (Anthropic's "the outcome is whether a reservation
+exists in the database"; Huang et al. on self-correction failing without external
+feedback; the Replit post-mortem, where the root cause was architectural and no
+prompt could have prevented it). Ticket 18 already built the `[checks]` gate, so
+this was mostly wiring the status to it.
