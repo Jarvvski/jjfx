@@ -887,6 +887,63 @@ fn prepare_names_the_missing_remote_instead_of_an_empty_slug_format_error() {
     );
 }
 
+/// A local-path `origin` is not a GitHub remote, so orchestration must refuse
+/// it by name rather than deriving a slug from its last two path segments -
+/// which would name a repository that does not exist.
+#[test]
+fn prepare_refuses_a_non_github_origin_instead_of_guessing_a_slug() {
+    let directory = TempDir::new().expect("temporary repository");
+    init_colocated_repository(directory.path());
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker_with_gh_repo(&repository, &worker, "");
+
+    let origin = TempDir::new().expect("origin repository");
+    let origin_path = origin.path().join("dogfood-site-origin.git");
+    let init = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--colocate",
+        ])
+        .arg(&origin_path)
+        .output()
+        .expect("jj executable");
+    assert!(init.status.success(), "jj init origin failed: {init:?}");
+    let add = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            &origin_path.to_string_lossy(),
+        ])
+        .current_dir(repository.root())
+        .output()
+        .expect("add origin");
+    assert!(add.status.success(), "jj remote add failed: {add:?}");
+
+    let parent = ParentTicket::new(TicketId::parse("ENG-100").expect("Parent Ticket"));
+    let discovery = TicketDiscovery::new(StaticQuery(r#"{"sub_issues":[]}"#));
+
+    let error = repository
+        .orchestration_runner()
+        .prepare(
+            &OrchestrationRequest::new(parent.id().clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+        )
+        .expect_err("a non-GitHub origin must fail at identity");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("origin is not a GitHub remote"),
+        "the failure must name the non-GitHub origin: {message}"
+    );
+}
+
 /// The same empty `gh_repo` must not block dispatch once an `origin` exists:
 /// orchestration derives the identity from the remote and records it on the
 /// group instead of failing on the empty slug.
