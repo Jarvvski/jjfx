@@ -45,10 +45,10 @@ Options 1 and 2 are complementary and both small. Option 3 is larger, and arguab
 
 ## Acceptance Criteria
 
-- [ ] A commit landing on `origin/main` mid-run does not fail the release: the release commit is rebased onto the latest `main` (or the push is retried) and lands, within a bounded number of attempts.
-- [ ] A rejected branch push never leaves an orphaned tag: the tag is published only after the branch push succeeds, or is cleaned up on failure.
-- [ ] A rebase conflict on `CHANGELOG.md` fails the run with a clear error rather than dropping a concurrently recorded entry.
-- [ ] The existing guards are preserved: the release still refuses to run when the tag or the crates.io version already exists.
+- [x] A commit landing on `origin/main` mid-run does not fail the release: the release commit is rebased onto the latest `main` (or the push is retried) and lands, within a bounded number of attempts.
+- [x] A rejected branch push never leaves an orphaned tag: the tag is published only after the branch push succeeds, or is cleaned up on failure.
+- [x] A rebase conflict on `CHANGELOG.md` fails the run with a clear error rather than dropping a concurrently recorded entry.
+- [x] The existing guards are preserved: the release still refuses to run when the tag or the crates.io version already exists.
 
 ## Out of Scope
 
@@ -60,3 +60,13 @@ Options 1 and 2 are complementary and both small. Option 3 is larger, and arguab
 Filed 2026-10-14, discovered during the momo migration: the first real 0.53.0 release hit exactly this (run 38600471957). crates.io was untouched; the orphaned `v0.53.0` was deleted by hand and the release re-run succeeded (run 38603112212).
 
 - 2026-10-16 - Resolved with options 1 and 2 (both small, complementary); option 3 was not taken - serialising releases against ordinary pushes is larger and unnecessary once 1 and 2 hold. `Commit and tag` now fetches `origin/main`, rebases the release commit onto it, and retries the push up to five times when another commit wins the race between the fetch and the push. It pushes the branch *before* the tag, so a rejected branch push can never orphan the tag; the tag is created with `momo tag` (unchanged) only after the branch push succeeds. A `CHANGELOG.md` rebase conflict aborts and fails the run with an explicit "never force the push" message rather than dropping the concurrent entry. The derive-step guards (existing tag, existing crates.io version) are untouched. Validated the loop against a throwaway git repo (clean rebase, one retry, conflict, budget exhaustion) and `actionlint` + `shellcheck`.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of `.github/workflows/release.yml` on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence, all in the `Commit and tag` step: the loop fetches `origin/$branch`, rebases, and retries up to `attempts=5` (`.github/workflows/release.yml:121-141`), so a mid-run commit no longer fails the release. The branch is pushed at `:133` and only then is the tag created and pushed (`momo tag`, `:136-137`), so a rejected branch push cannot orphan the tag. A rebase conflict aborts with an explicit error and `exit 1` (`:124-128`), naming the `CHANGELOG.md` conflict and forbidding a force-push. The derive-step guards are intact - the existing-tag check at `:65` and the crates.io check at `:70` still refuse a duplicate release.
+
+No gate criterion: this ticket's criteria are about the workflow's push/race behaviour, which is static here; the workflow is owner-dispatched automation and was not run by this reconciliation.

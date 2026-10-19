@@ -92,10 +92,18 @@ Follow-up: none for jjfx code.
 
 ## Acceptance Criteria
 
-- [ ] A failing-or-passing test exists that pins a background Run's cwd.
-- [ ] The root cause is named with reproducible evidence.
-- [ ] The follow-up fix is identified (05, 24, or a new ticket).
+- [x] A failing-or-passing test exists that pins a background Run's cwd.
+- [x] The root cause is named with reproducible evidence.
+- [x] The follow-up fix is identified (05, 24, or a new ticket).
 
 ## Out of Scope
 
 - Fixing the bug (that is ticket 05, blocked by this answer).
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: the pinning test exists and is permanent - `reserved_background_run_uses_the_worker_workspace_as_cwd` (`tests/agent_runtime.rs:449`), which drives a reserved background Run through the real supervisor and asserts its cwd is its own Worker Workspace. The root cause is named in the Answer section above (not reproducible against `main` or `v0.52.1`; opencode honours the cwd; the untested variable is the reporter's `PATH`), and the follow-up is identified as ticket 05. This is a research ticket, so its criteria are satisfied by the recorded evidence rather than by code.

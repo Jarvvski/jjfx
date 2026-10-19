@@ -38,8 +38,8 @@ clear confirmation and a per-repo opt-in.
 
 ## Acceptance Criteria
 
-- [ ] The landing rule is decided and recorded.
-- [ ] If implemented: landing is opt-in, gated on the stated condition, and
+- [x] The landing rule is decided and recorded.
+- [x] If implemented: landing is opt-in, gated on the stated condition, and
       never merges without it.
 - [ ] `mise run check` is green.
 
@@ -65,3 +65,13 @@ clear confirmation and a per-repo opt-in.
   checks, no rulesets, no required reviews). This is the batch's landing rule;
   the *config-gated, opt-in* implementation of it inside jjfx remains a future
   change and is out of scope for the batch itself.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review. The reconciliation recorded no new work; it confirms what shipped.
+
+This is a decision ticket, so its criteria are satisfied by the recorded decision rather than by code. Criterion 1 holds: the owner ruled option (a) - agents push, open a PR per ticket, and merge once the PR's checks are green - and it is recorded in the `## Comments` above. Criterion 2 is conditional ("If implemented"); the config-gated, opt-in landing step inside jjfx was deliberately **not** implemented in this batch (the comment records it as a future change and out of scope), so the criterion holds vacuously - there is no landing step that could merge without its condition.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

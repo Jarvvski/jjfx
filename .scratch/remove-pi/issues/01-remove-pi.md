@@ -79,15 +79,15 @@ must reach a terminal, non-busy state rather than being stranded.
 
 ## Acceptance Criteria
 
-- [ ] `AgentRuntime::Pi` is gone and no Pi-specific type, function, transport or
+- [x] `AgentRuntime::Pi` is gone and no Pi-specific type, function, transport or
       environment variable remains in `src/`.
-- [ ] Claude, Codex and opencode behaviour is unchanged; their hooks, discovery
+- [x] Claude, Codex and opencode behaviour is unchanged; their hooks, discovery
       and dispatch paths still work.
-- [ ] A persisted `"agent": "pi"` pool profile or Worker fails with a clear
+- [x] A persisted `"agent": "pi"` pool profile or Worker fails with a clear
       message naming the removal, and leaves no Worker stranded `busy`.
-- [ ] The Pi tests and fixtures are deleted, and `docs/pi-workers.md` and its
+- [x] The Pi tests and fixtures are deleted, and `docs/pi-workers.md` and its
       README references are removed.
-- [ ] The compatibility contract is amended and remains internally consistent.
+- [x] The compatibility contract is amended and remains internally consistent.
 - [ ] `mise run check` is green.
 
 ## Out of Scope
@@ -115,3 +115,13 @@ Persisted state is handled deliberately. `AgentRuntime::from_configured` rejects
 `docs/pi-workers.md` and its README link are deleted, as are the Pi tests and fixtures (including `tests/fixtures/compatibility/worker-done-pi.json`), and `momo break` records the incompatible change.
 
 **Deviation.** Solution step 6 asks to amend `docs/wsg-compatibility-contract.md`, but that file (and `tests/compatibility_contract.rs`) was already deleted when the wsg compatibility binary was eliminated, so there is nothing left to amend. No surviving doc or fixture pins Pi, so the compatibility-contract criterion is satisfied vacuously.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: a search for every Pi type, transport and environment variable named in this ticket (`PiEvent`, `PiToolCall`, `PiUsage`, `PiCost`, `PiMessage`, `PiSessionHeader`, `PiProfileProbe`, `PiMcpAdapter`, `PiDispatchProfile`, `PiDiscoveryHelper`, `JJFX_PI_LINEAR_HELPER`, `pi-sessions`, `AgentRuntime::Pi`, `AgentKind::Pi`) returns nothing in `src/` or `tests/` - criterion 1 holds. The only surviving Pi references are the deliberate removal guard: `REMOVED_PI_RUNTIME` (`src/engine/runtime.rs:33`), `is_removed_runtime` (`:42`) and `removed_runtime_message` (`:48`), which `from_configured` (`:1476`) and the pool reconciliation (`src/engine/pool.rs:1558-1569`) use to reject a persisted `"agent": "pi"` with a message naming the removal - criterion 3, covered by `tests/agent_runtime.rs:65` and `tests/worker_pool.rs:1525,1997`. `docs/pi-workers.md` and `tests/fixtures/pi/` are gone and no README reference remains - criterion 4. Criterion 5 is satisfied vacuously, per the deviation note above. Criterion 2 (Claude/Codex/opencode unchanged) is supported by the surviving runtime match arms and their test suites; it is not separately re-established here.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

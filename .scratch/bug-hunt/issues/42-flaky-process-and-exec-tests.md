@@ -1,6 +1,6 @@
 # Process- and exec-timing tests are flaky under CI and load
 
-Status: resolved
+Status: ready-for-agent
 Type: task
 Blocked by: none
 
@@ -105,3 +105,26 @@ Make the timing/exec assertions deterministic rather than instantaneous:
   helper, so the ETXTBSY write-hold fix that targeted the latter is moot. The
   rebase onto `main` drops both; the three surviving `agent_runtime.rs` tests -
   and the same-class read/reaping races in `worker_pool.rs` - are fixed.
+
+## Re-opened Mon 19 Oct 2026
+
+Reconciled against the merged code at `9d6bd0ce6e7b`. This ticket's own four
+criteria held for the five tests it named - `wait_for_file_content`
+(`tests/support/mod.rs:85`) polls a helper-written file to the liveness deadline,
+and the read sites in `agent_runtime.rs` and `worker_pool.rs` use it - but the
+class it exists to remove is not closed, so it is back to `ready-for-agent`. All
+boxes are left unticked rather than partially ticked.
+
+The same process/exec flake recurred during the named-pools work in a test this
+ticket never covered: `tests/adhoc_ticket.rs::a_markdown_file_outside_scratch_dispatches`
+(`tests/adhoc_ticket.rs:140`) failed **once with empty stdout** and passed every
+re-run. It spawns the real binary (`CARGO_BIN_EXE_jjfx`, `:72`) and reads its
+stdout (`:103`), so it is squarely in this ticket's class - but its failure mode
+is not the helper-written-file read race `wait_for_file_content` fixes: the read
+is a `wait_with_output()` to EOF (`:103`), which returned nothing at all, so the
+lost output points at the process rather than at a file-read window. The
+mechanism is not established by inspection and needs reproducing under load.
+
+To close it: reproduce the empty-stdout failure under load, find where the
+child's output is lost or Dispatch fails before it prints, and make the assertion
+deterministic. Do not simply re-run it.

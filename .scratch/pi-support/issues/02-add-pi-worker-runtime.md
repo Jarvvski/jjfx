@@ -139,3 +139,11 @@ implementation and do not run an unrestricted TestContainers test command.
 ## Blocked by
 
 - issues/01-spike-pi-contracts.md
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`. **Not ticked, and deliberately not re-opened.**
+
+This ticket was marked resolved without its acceptance boxes ticked, and the criteria do not hold against current `main` - because the Pi Agent Runtime they describe was **implemented and then deliberately removed** by `.scratch/remove-pi/01` (resolved 2026-10-16, on the owner's decision). The only Pi trace left in `src/` is the typed removal error at `src/engine/runtime.rs:27-50` (`AgentRuntime::from_configured` rejects `"pi"` and names the removal). There is no `AgentRuntime::Pi`, no Pi probe, log parser, session parser or Pi types to verify against.
+
+Ticking these boxes would be false. Re-opening the ticket would also be false: the work was genuinely done - `remove-pi/01` records that "tickets 02-05, 07 and 08 of the `pi-support` effort all landed" - and nothing is outstanding, so a `ready-for-agent` status would ask a future agent to re-add a runtime the owner chose to remove. The honest correction is this note, which records the supersession the unticked boxes were hiding. The live ticket for current behaviour is `.scratch/remove-pi/01-remove-pi.md`.

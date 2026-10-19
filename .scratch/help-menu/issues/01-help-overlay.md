@@ -60,14 +60,14 @@ can read. The dispatch itself stays a `match` - do not over-engineer a registry.
 
 ## Acceptance criteria
 
-- [ ] In `Mode::Normal` the footer shows only movement + help + quit, not the
+- [x] In `Mode::Normal` the footer shows only movement + help + quit, not the
       full key list.
-- [ ] `?` opens a centered, bordered help overlay listing the bindings above,
+- [x] `?` opens a centered, bordered help overlay listing the bindings above,
       label-left / key-right, over the still-visible (dimmed) list; `?` or `esc`
       closes it and returns to `Normal`.
-- [ ] Opening/closing help changes no workspace state and emits no status
+- [x] Opening/closing help changes no workspace state and emits no status
       message; other modes (new/confirm-delete/confirm-tidy) are unaffected.
-- [ ] The overlay degrades gracefully in a short/narrow terminal (clamp the
+- [x] The overlay degrades gracefully in a short/narrow terminal (clamp the
       popup to the frame; never panic or corrupt layout).
 - [ ] `mise run check` is green. User-visible, so bump the version (MINOR) and
       add a dated `CHANGELOG.md` entry in the same landing commit.
@@ -91,3 +91,13 @@ can read. The dispatch itself stays a `match` - do not over-engineer a registry.
 
 - Nothing - `03-skeleton-store` (list render) and the mode/footer machinery are
   already in place on `main`.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked `done` without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `Mode::Help` exists (`src/app.rs:111`) with the `?`/`esc`-only handler at `src/app.rs:971`; the Normal footer is the slim `j/k move ... ? help ... q quit` line at `src/app.rs:2878`. Bindings live in one shared const (`NORMAL_BINDINGS`, `src/app.rs:122`) read by the overlay, not a second hand-maintained list. Tests: `help_toggles_without_touching_state`, `help_overlay_renders_a_bordered_box`, `help_overlay_renders_over_detail_and_graph`, `help_overlay_clamps_to_a_tiny_terminal`, `bindings_cover_the_essential_keys`. The version/changelog half shipped as v0.9.0 (`CHANGELOG.md:636`).
+
+Not ticked: the `mise run check` half of the last criterion. It is a landing-commit property that cannot be re-established by inspection, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

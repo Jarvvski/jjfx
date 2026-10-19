@@ -48,12 +48,12 @@ the lifecycle. This is an extension of an existing contract, not new plumbing.
 
 ## Acceptance Criteria
 
-- [ ] `Notification:agent_needs_input` produces `NeedsAttention`.
-- [ ] A rate-limit/billing `StopFailure` produces a distinct quota-blocked
+- [x] `Notification:agent_needs_input` produces `NeedsAttention`.
+- [x] A rate-limit/billing `StopFailure` produces a distinct quota-blocked
       outcome, shown in the list, and is not retried immediately.
-- [ ] Subagent/`PostToolBatch` events are recorded and do not regress existing
+- [x] Subagent/`PostToolBatch` events are recorded and do not regress existing
       Working/Waiting transitions.
-- [ ] The event log stays backward compatible for existing consumers.
+- [x] The event log stays backward compatible for existing consumers.
 - [ ] `mise run check` is green.
 
 ## Out of Scope
@@ -84,3 +84,13 @@ the lifecycle. This is an extension of an existing contract, not new plumbing.
   of retrying it, driven by the hook-derived agent state for the Worker's
   workspace. Subagent/batch events are recorded without regressing
   Working/Waiting. `mise run check` green.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `src/hooks.rs:30-43` registers `Notification`, `StopFailure`, `SubagentStart`/`Stop`, `PostToolBatch`, `TaskCreated`/`Completed` and `TeammateIdle` (plus Codex's subagent events, `:57`). The shared `Event` struct carries the new optional `notification_type` field (`src/agent.rs:117`), and `notification_transition` (`:181`) folds `agent_needs_input` to `NeedsAttention`. `StopFailure:rate_limit`/`billing_error` folds to `AgentState::QuotaBlocked`, which has its own `⊘` glyph (`src/render/style.rs:204`) and sorts to needs-you. Orchestration parks a quota-blocked Run via `DispatchGroupEvent::QuotaBlocked` (`src/engine/orchestration.rs:483`, `src/engine/dispatch_group.rs:470`) rather than retrying it. Tests: `events::tests::a_fake_hook_emitter_drives_the_lifecycle_and_attention_through_the_log` (`src/events.rs:436`) and `a_fake_emitter_billing_failure_also_blocks_the_run` (`:504`); `agent::tests::other_notification_types_do_not_disturb_the_state` (`src/agent.rs:531`). Criterion 4 (backward compatibility) holds because the added fields are optional and an old line without them still parses - pinned by `agent::tests::parses_common_fields_and_ignores_the_rest` (`src/agent.rs:302`).
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
