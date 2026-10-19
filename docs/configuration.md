@@ -180,8 +180,14 @@ How the forge pipeline's final step manages pull requests over `gh`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `pull_requests` | `true` | Whether forging creates and updates PRs at all. Set false to stop after push and open PRs yourself. |
+| `pull_requests` | `true` | Whether forging opens Pull Requests at all. Set false to forge without a forge - welding, checking and pushing only - and open PRs yourself. |
 | `draft` | `true` | Open newly-created PRs as drafts. Set false to open them ready for review. |
+
+One Pull Request per change, based on the repository's default branch: the forge
+never assembles base-chained stacks and never rewrites a PR body beyond the
+change's own description. A repository with no forge - `pull_requests = false`,
+or no `origin` remote to open one against - forges cleanly: the Pull Request
+step does not apply, and it does not taint an otherwise successful run.
 
 ### Formatting before push
 
