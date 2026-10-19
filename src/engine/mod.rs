@@ -90,8 +90,8 @@ pub use run_log::{
 };
 pub use runtime::{
     AgentModel, AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation,
-    AgentRuntimeProbeError, AgentRuntimeProfile, BackgroundRun, CompletedRun, RunOutcome,
-    RunRequest, RunReset, RunSupervisor, RunSupervisorError,
+    AgentRuntimeProbeError, AgentRuntimeProfile, BackgroundRun, BackgroundStart, CompletedRun,
+    RunOutcome, RunRequest, RunReset, RunSupervisor, RunSupervisorError, SessionRun,
 };
 pub use state::{
     CommitOutcome, DEFAULT_POOL_NAME, DispatchGroupOptions, DispatchGroupState,

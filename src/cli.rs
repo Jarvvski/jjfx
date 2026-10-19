@@ -3690,6 +3690,9 @@ impl DispatchEntry {
     fn from_success(success: &DirectDispatchSuccess) -> Self {
         let (pid, detail) = match success.execution() {
             DirectDispatchExecution::Background { pid } => (Some(*pid), format!("PID {pid}")),
+            DirectDispatchExecution::Session { session_id } => {
+                (None, format!("session {session_id}"))
+            }
             DirectDispatchExecution::Foreground(completed) => (
                 None,
                 format!("completed {:?}", completed.result().conclusion()),

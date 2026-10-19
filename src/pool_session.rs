@@ -230,11 +230,17 @@ impl PoolSession {
                 parent,
                 worker,
                 pid,
+                session_id,
             } => {
                 if self.orchestration_operation == Some(operation) {
                     self.orchestration_operation = None;
+                    let detail = match (pid, session_id.as_deref()) {
+                        (Some(pid), _) => format!("PID {pid}"),
+                        (None, Some(session_id)) => format!("session {session_id}"),
+                        (None, None) => "launched".to_owned(),
+                    };
                     return vec![PoolUpdate::Status(format!(
-                        "Dispatched Parent {parent} to {worker} (PID {pid})"
+                        "Dispatched Parent {parent} to {worker} ({detail})"
                     ))];
                 }
                 Vec::new()
@@ -592,7 +598,8 @@ mod tests {
             operation: 2,
             parent: "ENG-100".to_owned(),
             worker: "worker-02".to_owned(),
-            pid: 99,
+            pid: Some(99),
+            session_id: None,
         });
 
         assert_eq!(pool.orchestration_operation, None);

@@ -433,6 +433,9 @@ pub struct DispatchOutcome {
     title: String,
     worker: Option<String>,
     pid: Option<u32>,
+    /// The opencode session the prompt was delivered to, when the Run drove no
+    /// client process.
+    session_id: Option<String>,
     phase: Option<String>,
     detail: Option<String>,
     /// The capacity governor held this Ticket back: nothing was attempted.
@@ -447,6 +450,22 @@ impl DispatchOutcome {
             title,
             worker: Some(worker),
             pid: Some(pid),
+            session_id: None,
+            phase: None,
+            detail: None,
+            waiting: false,
+        }
+    }
+
+    /// Creates a successful outcome for a Run delivered to its opencode session
+    /// with no client process.
+    pub fn session(ticket: String, title: String, worker: String, session_id: String) -> Self {
+        Self {
+            ticket,
+            title,
+            worker: Some(worker),
+            pid: None,
+            session_id: Some(session_id),
             phase: None,
             detail: None,
             waiting: false,
@@ -466,6 +485,7 @@ impl DispatchOutcome {
             title,
             worker,
             pid: None,
+            session_id: None,
             phase: Some(format!("{phase:?}")),
             detail: Some(detail),
             waiting: false,
@@ -479,6 +499,7 @@ impl DispatchOutcome {
             title,
             worker: None,
             pid: None,
+            session_id: None,
             phase: None,
             detail: Some(detail),
             waiting: true,
@@ -501,6 +522,11 @@ impl DispatchOutcome {
     pub const fn pid(&self) -> Option<u32> {
         self.pid
     }
+    /// Returns the opencode session the prompt was delivered to, when the Run
+    /// drove no client process.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
+    }
     /// Returns the failure phase, when Dispatch failed.
     pub fn phase(&self) -> Option<&str> {
         self.phase.as_deref()
@@ -511,7 +537,7 @@ impl DispatchOutcome {
     }
     /// Reports whether the Ticket launched successfully.
     pub const fn succeeded(&self) -> bool {
-        self.pid.is_some()
+        self.pid.is_some() || self.session_id.is_some()
     }
     /// Reports whether the capacity governor held the Ticket back.
     pub const fn is_waiting(&self) -> bool {
@@ -705,7 +731,11 @@ pub enum WorkspaceDispatchOrchestrationEvent {
     Direct {
         parent: String,
         worker: String,
-        pid: u32,
+        /// The background process identifier, when the Run drove a process.
+        pid: Option<u32>,
+        /// The opencode session the prompt was delivered to, when the Run drove
+        /// no client process.
+        session_id: Option<String>,
     },
     /// The group reached a terminal state.
     Terminal {
@@ -763,7 +793,11 @@ pub enum WorkspaceDispatchEvent {
         operation: OperationId,
         parent: String,
         worker: String,
-        pid: u32,
+        /// The background process identifier, when the Run drove a process.
+        pid: Option<u32>,
+        /// The opencode session the prompt was delivered to, when the Run drove
+        /// no client process.
+        session_id: Option<String>,
     },
     /// Orchestration reached a terminal group state.
     OrchestrationTerminal {
@@ -1007,12 +1041,14 @@ impl WorkspaceDispatchController {
                         parent,
                         worker,
                         pid,
+                        session_id,
                     } => {
                         emit(WorkspaceDispatchEvent::OrchestrationDirect {
                             operation,
                             parent,
                             worker,
                             pid,
+                            session_id,
                         });
                     }
                     WorkspaceDispatchOrchestrationEvent::Terminal { parent, counts } => {
@@ -1239,6 +1275,7 @@ impl RecordingAdapter {
                     title: ticket.clone(),
                     worker: worker.map(str::to_owned),
                     pid: Some(42),
+                    session_id: None,
                     phase: None,
                     detail: None,
                     waiting: false,

@@ -12,10 +12,11 @@ use thiserror::Error;
 use crate::engine::layout::{PaneLayout, PaneRole};
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    AgentSessionResolution, BackgroundRun, CompletedRun, DispatchExclusions, MutationGuard,
-    MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation, ReviewFinding,
-    ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, TicketBranch, TicketId, WorkerId,
-    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime, resolve_ticket_branch,
+    AgentSessionResolution, BackgroundRun, BackgroundStart, CompletedRun, DispatchExclusions,
+    MutationGuard, MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation,
+    ReviewFinding, ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, TicketBranch,
+    TicketId, WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
+    resolve_ticket_branch,
 };
 use crate::jj::PushOutcome;
 
@@ -943,11 +944,16 @@ impl WorkerActions {
                 )?,
             ),
             RunMode::Background => {
-                let execution = self
+                let started = self
                     .supervisor
                     .run_reserved_background(reservation, invocation)?;
                 drop(operation);
-                FollowUpExecution::Background(Box::new(execution))
+                match started {
+                    BackgroundStart::Process(run) => FollowUpExecution::Background(run),
+                    BackgroundStart::Session(session) => {
+                        FollowUpExecution::Session(FollowUpSession::new(session.session_id()))
+                    }
+                }
             }
         };
         Ok(FollowUpOutcome {
@@ -1003,32 +1009,8 @@ impl WorkerActions {
         {
             return false;
         }
-        if crate::engine::OpenCodeApi::new()
-            .prompt_async(session_id, prompt)
-            .is_err()
-        {
-            return false;
-        }
-        // The daemon admitted the prompt. Clear the previous Run's provider
-        // terminal event, exactly as a spawned client's log truncation does:
-        // reconcile must not read that result as this Run's.
-        truncate_run_log(reservation.repository(), reservation.worker_id());
-        true
+        crate::engine::runtime::deliver_session_prompt(reservation, session_id, prompt)
     }
-}
-
-/// Empties a Worker's Run log so a previous Run's provider terminal event is not
-/// read as the current Run's.
-///
-/// Best-effort: a missing or unwritable log must not fail the Follow-up, because
-/// the Run's liveness still follows its session.
-fn truncate_run_log(repository: &Repository, worker: &WorkerId) {
-    let path = repository.state_store().worker_log(worker);
-    let _ = fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .open(path);
 }
 
 #[derive(Debug, Clone, Copy)]

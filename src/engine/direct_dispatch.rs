@@ -5,11 +5,12 @@ use std::thread;
 use thiserror::Error;
 
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProfile, CompletedRun,
-    ConcurrencyCap, DeliveryContract, DispatchBudget, DispatchExclusions, DispatchPromptBuilder,
-    DispatchPromptContext, DispatchPromptError, Repository, RepositoryIdentity, Reservation,
-    RunMode, RunSupervisor, RunSupervisorError, Ticket, TicketDetails, TicketId, TicketStatus,
-    TicketTitle, WorkerId, WorkerPoolError, WorkerStatus, WorkerWorkspaceError,
+    AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProfile, BackgroundStart,
+    CompletedRun, ConcurrencyCap, DeliveryContract, DispatchBudget, DispatchExclusions,
+    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, Repository,
+    RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError, Ticket,
+    TicketDetails, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError, WorkerStatus,
+    WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -493,14 +494,21 @@ impl DirectDispatch {
                 )?,
             ),
             RunMode::Background => {
-                let background =
+                let started =
                     RunSupervisor::new().run_reserved_background(reservation, invocation)?;
                 drop(_prepared);
-                let pid = background.pid();
-                thread::spawn(move || {
-                    let _ = background.wait();
-                });
-                DirectDispatchExecution::Background { pid }
+                match started {
+                    BackgroundStart::Process(background) => {
+                        let pid = background.pid();
+                        thread::spawn(move || {
+                            let _ = background.wait();
+                        });
+                        DirectDispatchExecution::Background { pid }
+                    }
+                    BackgroundStart::Session(session) => DirectDispatchExecution::Session {
+                        session_id: session.session_id().to_owned(),
+                    },
+                }
             }
         };
         Ok(DirectDispatchSuccess::new(
@@ -750,6 +758,13 @@ pub enum DirectDispatchExecution {
     Background {
         /// Process and process-group identifier for the Agent Runtime.
         pid: u32,
+    },
+    /// The prompt reached the Run's opencode session through the daemon API, so
+    /// no client process was spawned. Reconciliation finishes the Run on the
+    /// session's outcome.
+    Session {
+        /// The session the prompt was delivered to.
+        session_id: String,
     },
 }
 
