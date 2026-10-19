@@ -17,12 +17,11 @@ use jjfx::engine::{
     StateChange, Ticket, TicketId, TicketStatus, TicketTitle, WireAgent, WorkerId, WorkerPoolError,
     WorkerStatus,
 };
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use serde_json::Value;
 use tempfile::TempDir;
 
 mod support;
-
-use support::HELPER_LIVENESS_TIMEOUT;
 
 const HELPER_REPOSITORY: &str = "JJFX_DIRECT_DISPATCH_REPOSITORY";
 const HELPER_RESULT: &str = "JJFX_DIRECT_DISPATCH_RESULT";
@@ -451,7 +450,7 @@ fn production_direct_dispatch_helper() {
     .expect("capture busy Worker state");
     fs::write(env::var_os(HELPER_RELEASE).expect("background release"), [])
         .expect("release background Runtime");
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     loop {
         let snapshot = repository.worker_pool().snapshot();
         let status = snapshot

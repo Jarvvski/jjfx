@@ -3056,6 +3056,7 @@ mod tests {
     };
     use crate::runtime::Runtime;
     use crate::store::{Workspace, WorkspacePath};
+    use crate::test_support::LIVENESS_TIMEOUT;
     use crate::workspace_dispatch::{RecordingAdapter, WorkerCommandResult, WorkerSessionOutcome};
     use crate::{jj, terminal::Terminal};
     use ratatui::crossterm::event::{KeyEventState, KeyModifiers};
@@ -3307,7 +3308,7 @@ mod tests {
         done: impl Fn(&Msg) -> bool,
     ) {
         loop {
-            let message = tokio::time::timeout(WAIT_BUDGET, rx.recv())
+            let message = tokio::time::timeout(LIVENESS_TIMEOUT, rx.recv())
                 .await
                 .expect("background work completes")
                 .expect("completion message arrives");
@@ -3327,15 +3328,10 @@ mod tests {
         handle(app, runtime, press(KeyCode::Enter));
     }
 
-    /// How long a test waits for asynchronous work. These tests assert ordering,
-    /// not speed, so the budget only guards against a genuine hang - a heavily
-    /// loaded machine must not turn a correct run into a failure.
-    const WAIT_BUDGET: Duration = Duration::from_secs(30);
-
-    /// Poll `condition` on the calling thread until it holds or [`WAIT_BUDGET`]
-    /// passes.
+    /// Poll `condition` on the calling thread until it holds or
+    /// [`LIVENESS_TIMEOUT`] passes.
     fn wait_until(mut condition: impl FnMut() -> bool) {
-        let deadline = std::time::Instant::now() + WAIT_BUDGET;
+        let deadline = std::time::Instant::now() + LIVENESS_TIMEOUT;
         while std::time::Instant::now() < deadline {
             if condition() {
                 return;
@@ -3372,7 +3368,7 @@ mod tests {
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
         loop {
-            let message = tokio::time::timeout(WAIT_BUDGET, rx.recv())
+            let message = tokio::time::timeout(LIVENESS_TIMEOUT, rx.recv())
                 .await
                 .expect("workspace deletion completes")
                 .expect("deletion completion message arrives");
@@ -6096,7 +6092,7 @@ mod tests {
         path: &std::path::Path,
         rx: &mut tokio::sync::mpsc::UnboundedReceiver<Msg>,
     ) {
-        let deadline = tokio::time::Instant::now() + WAIT_BUDGET;
+        let deadline = tokio::time::Instant::now() + LIVENESS_TIMEOUT;
         while tokio::time::Instant::now() < deadline {
             if path.is_dir() {
                 return;

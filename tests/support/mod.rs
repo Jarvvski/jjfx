@@ -52,23 +52,10 @@ pub fn stub_terminal(bin: &Path) -> OsString {
     std::env::join_paths(paths).expect("PATH with the terminal stub")
 }
 
-/// Liveness budget for waiting on a helper subprocess.
-///
-/// This is a guard against a *hang*, not a statement of how long the work is
-/// expected to take. The helpers do real `jj`/`git` work - creating
-/// repositories, `jj workspace add`, destroy, forge steps - whose wall-clock
-/// duration tracks machine load rather than CPU: a single helper has been
-/// measured burning only ~1.3s of CPU while taking 7-48s of wall clock while
-/// several cargo builds shared the machine. A budget tuned to the *expected*
-/// duration therefore goes red under load with no regression behind it, which
-/// is the worst kind of failure: a re-run at best, a wrong conclusion at worst.
-///
-/// So it is deliberately generous - roughly 2.5x the worst legitimate wait
-/// observed above. Two minutes is invisible next to the cost of a false red,
-/// and a genuinely hung helper still fails its test within this bound instead of
-/// hanging the suite forever. Do not "tidy" it back down to a few seconds; that
-/// reintroduces the load-sensitive flake this exists to remove.
-pub const HELPER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
+/// Liveness budget for waiting on a helper subprocess, shared with the crate's
+/// own unit tests. See its documentation in `jjfx::test_support` for why it is
+/// deliberately generous rather than a statement of expected duration.
+use jjfx::test_support::LIVENESS_TIMEOUT;
 
 /// Polls `path` to a bounded deadline, returning its contents once non-empty.
 ///
@@ -83,7 +70,7 @@ pub const HELPER_LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
 /// Use this wherever a test reads a file a helper writes; use `wait_for_file`
 /// (existence only) for a barrier file that is deliberately created empty.
 pub fn wait_for_file_content(path: &Path) -> String {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     loop {
         if let Ok(contents) = fs::read_to_string(path)
             && !contents.trim().is_empty()

@@ -12,12 +12,11 @@ use jjfx::engine::{
     CommitOutcome, DispatchGroupOptions, DispatchGroupState, Expected, Loaded, PoolState,
     Repository, StateChange, TicketId, WireStatus, WireTimestamp, WorkerId, WorkerState,
 };
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use rustix::fs::{FlockOperation, flock};
 use tempfile::TempDir;
 
 mod support;
-
-use support::HELPER_LIVENESS_TIMEOUT;
 
 const MODE: &str = "JJFX_RUST_STATE_HELPER_MODE";
 const LOCK: &str = "JJFX_RUST_STATE_HELPER_LOCK";
@@ -136,7 +135,7 @@ fn outcome_name<T>(outcome: CommitOutcome<T>) -> &'static str {
 }
 
 fn wait_for_helper_release(path: &Path) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while !path.exists() {
         assert!(Instant::now() < deadline, "timed out waiting for release");
         thread::sleep(Duration::from_millis(10));
@@ -151,7 +150,7 @@ fn repository() -> (TempDir, Repository) {
 }
 
 fn wait_for(path: &Path) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     while !path.exists() {
         assert!(
             Instant::now() < deadline,
@@ -163,7 +162,7 @@ fn wait_for(path: &Path) {
 }
 
 fn wait_for_child(child: &mut ChildGuard) {
-    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
     loop {
         let process = child.0.as_mut().expect("child process");
         if let Some(status) = process.try_wait().expect("child status") {
@@ -305,7 +304,7 @@ fn an_independent_rust_process_serializes_pool_commits() {
     }
     assert!(
         receiver
-            .recv_timeout(HELPER_LIVENESS_TIMEOUT)
+            .recv_timeout(LIVENESS_TIMEOUT)
             .expect("commit completed")
             .is_ok()
     );
@@ -349,7 +348,7 @@ fn an_independent_rust_process_serializes_worker_commits() {
     }
     assert!(
         receiver
-            .recv_timeout(HELPER_LIVENESS_TIMEOUT)
+            .recv_timeout(LIVENESS_TIMEOUT)
             .expect("commit completed")
             .is_ok()
     );
@@ -397,7 +396,7 @@ fn an_independent_rust_process_serializes_dispatch_group_commits() {
     }
     assert!(
         receiver
-            .recv_timeout(HELPER_LIVENESS_TIMEOUT)
+            .recv_timeout(LIVENESS_TIMEOUT)
             .expect("commit completed")
             .is_ok()
     );

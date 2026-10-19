@@ -11,6 +11,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use rustix::fs::{FlockOperation, flock};
 use rustix::process::{
     Pid, Signal, kill_process_group, test_kill_process, test_kill_process_group,
@@ -18,8 +19,6 @@ use rustix::process::{
 use tempfile::{NamedTempFile, tempdir};
 
 mod support;
-
-use support::HELPER_LIVENESS_TIMEOUT;
 
 const HELPER_MODE: &str = "JJFX_UNIX_SPIKE_MODE";
 const HELPER_LOCK_PATH: &str = "JJFX_UNIX_SPIKE_LOCK_PATH";
@@ -262,11 +261,11 @@ fn exclusive_sidecar_lock_serializes_independent_processes() {
         let acquired_result = temp.path().join(format!("acquired-result-{index}"));
 
         let mut holder = ChildGuard::spawn(&mut helper_command("hold", &lock_path, &holder_result));
-        wait_for_file(&holder_result, HELPER_LIVENESS_TIMEOUT);
+        wait_for_file(&holder_result, LIVENESS_TIMEOUT);
 
         let mut blocked =
             ChildGuard::spawn(&mut helper_command("try", &lock_path, &blocked_result));
-        assert!(blocked.wait(HELPER_LIVENESS_TIMEOUT).success());
+        assert!(blocked.wait(LIVENESS_TIMEOUT).success());
         assert_eq!(
             fs::read_to_string(&blocked_result).expect("contender result should exist"),
             "blocked"
@@ -276,7 +275,7 @@ fn exclusive_sidecar_lock_serializes_independent_processes() {
 
         let mut acquired =
             ChildGuard::spawn(&mut helper_command("try", &lock_path, &acquired_result));
-        assert!(acquired.wait(HELPER_LIVENESS_TIMEOUT).success());
+        assert!(acquired.wait(LIVENESS_TIMEOUT).success());
         assert_eq!(
             fs::read_to_string(&acquired_result).expect("contender result should exist"),
             "acquired"
@@ -295,7 +294,7 @@ fn spawned_command_leads_its_own_process_group() {
 
     let mut child = ChildGuard::spawn_process_group(&mut command);
     let pid = child.id();
-    let reported_group: u32 = read_line_with_timeout(child.take_stdout(), HELPER_LIVENESS_TIMEOUT)
+    let reported_group: u32 = read_line_with_timeout(child.take_stdout(), LIVENESS_TIMEOUT)
         .trim()
         .parse()
         .expect("process group should be numeric");
@@ -327,7 +326,7 @@ fn group_termination_is_graceful_then_forced_and_removes_descendants() {
     let mut leader = ChildGuard::spawn_process_group(&mut command);
     let group = Pid::from_raw(i32::try_from(leader.id()).expect("group ID should fit in i32"))
         .expect("group ID should be non-zero");
-    let descendant_raw: i32 = read_line_with_timeout(leader.take_stdout(), HELPER_LIVENESS_TIMEOUT)
+    let descendant_raw: i32 = read_line_with_timeout(leader.take_stdout(), LIVENESS_TIMEOUT)
         .trim()
         .parse()
         .expect("descendant PID should be numeric");
@@ -337,7 +336,7 @@ fn group_termination_is_graceful_then_forced_and_removes_descendants() {
     terminate_process_group(&mut leader, group, Duration::from_millis(200));
 
     assert!(
-        wait_until(HELPER_LIVENESS_TIMEOUT, || !pid_is_live(descendant)),
+        wait_until(LIVENESS_TIMEOUT, || !pid_is_live(descendant)),
         "forced signal should remove the stubborn descendant"
     );
     assert!(
@@ -345,7 +344,7 @@ fn group_termination_is_graceful_then_forced_and_removes_descendants() {
         "forced signal should remove and reap the stubborn leader"
     );
     assert!(
-        wait_until(HELPER_LIVENESS_TIMEOUT, || !process_group_is_live(group)),
+        wait_until(LIVENESS_TIMEOUT, || !process_group_is_live(group)),
         "terminated process group should disappear"
     );
     leader.disarm_process_group();
@@ -357,7 +356,7 @@ fn child_keeps_writing_after_the_parent_closes_its_log_handle() {
     let log_path = temp.path().join("worker.log");
     let mut child = spawn_logged_child(&log_path);
 
-    assert!(child.wait(HELPER_LIVENESS_TIMEOUT).success());
+    assert!(child.wait(LIVENESS_TIMEOUT).success());
     assert_eq!(
         fs::read_to_string(log_path).expect("log should be readable"),
         "first\nsecond\n"
@@ -385,7 +384,7 @@ fn same_directory_replacement_is_atomic_for_concurrent_readers() {
     let reader_saw_new = Arc::clone(&saw_new);
     let reader_reads = Arc::clone(&reads);
     let reader = thread::spawn(move || {
-        let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+        let deadline = Instant::now() + LIVENESS_TIMEOUT;
         let mut started_sender = Some(started_sender);
         while reader_running.load(Ordering::Acquire) && Instant::now() < deadline {
             match fs::read(&reader_target) {
@@ -401,11 +400,11 @@ fn same_directory_replacement_is_atomic_for_concurrent_readers() {
     });
 
     started_receiver
-        .recv_timeout(HELPER_LIVENESS_TIMEOUT)
+        .recv_timeout(LIVENESS_TIMEOUT)
         .expect("reader should observe the old state before replacement");
     replace_state_file(&target, &new).expect("state replacement should succeed");
     assert!(
-        wait_until(HELPER_LIVENESS_TIMEOUT, || saw_new.load(Ordering::Acquire)),
+        wait_until(LIVENESS_TIMEOUT, || saw_new.load(Ordering::Acquire)),
         "reader should observe the new state after replacement"
     );
     reading.store(false, Ordering::Release);

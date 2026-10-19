@@ -5,11 +5,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use jjfx::engine::{
     CleanDecision, CleanScope, Loaded, Repository, RepositoryError, WorkerId, WorkspaceAddOutcome,
 };
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use tempfile::TempDir;
 
 fn local_repository() -> (TempDir, Repository) {
@@ -413,7 +413,7 @@ fn concurrent_provisioning_neither_deadlocks_nor_corrupts_the_cache() {
 
     for _ in 0..2 {
         done_rx
-            .recv_timeout(Duration::from_secs(120))
+            .recv_timeout(LIVENESS_TIMEOUT)
             .expect("concurrent provisioning must not deadlock")
             .expect("provisioning should succeed");
     }

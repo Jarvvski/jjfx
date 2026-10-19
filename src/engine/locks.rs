@@ -104,15 +104,11 @@ fn ordered(locks: &[ScopedLock]) -> Vec<ScopedLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::LIVENESS_TIMEOUT;
     use std::fs;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
-
-    /// How long a concurrency test waits for progress before calling it a
-    /// deadlock. Generous enough to survive a loaded machine, short enough that
-    /// a real deadlock fails the test instead of hanging the suite.
-    const LIVENESS: Duration = Duration::from_secs(30);
 
     fn file_names(locks: &[ScopedLock]) -> Vec<String> {
         ordered(locks)
@@ -200,7 +196,7 @@ mod tests {
         );
         drop(held);
         acquired_rx
-            .recv_timeout(LIVENESS)
+            .recv_timeout(LIVENESS_TIMEOUT)
             .expect("the blocked acquisition completes once the repository lock is released");
         handle.join().expect("thread");
         assert!(
@@ -256,7 +252,7 @@ mod tests {
 
         for _ in 0..2 {
             done_rx
-                .recv_timeout(LIVENESS)
+                .recv_timeout(LIVENESS_TIMEOUT)
                 .expect("neither pool deadlocks");
         }
         for handle in handles {

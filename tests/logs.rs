@@ -13,12 +13,8 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use tempfile::TempDir;
-
-/// A hang guard, not a latency budget: follow mode blocks until the Run ends, so
-/// a `logs` that never notices the end would otherwise run forever. Generous,
-/// because the failure it guards against is a hang.
-const LOGS_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// A `jj` repository plus an empty config home, the shape a CLI invocation needs.
 /// A missing config file is jjfx's defaults.
@@ -185,10 +181,10 @@ impl FollowWatcher {
 
     /// Blocks until follow mode has announced itself, or fails if it never does.
     fn wait_for_banner(&self) {
-        match self.banner.recv_timeout(LOGS_LIVENESS_TIMEOUT) {
+        match self.banner.recv_timeout(LIVENESS_TIMEOUT) {
             Ok(()) => {}
             Err(RecvTimeoutError::Timeout) => {
-                panic!("jjfx logs never announced follow mode within {LOGS_LIVENESS_TIMEOUT:?}");
+                panic!("jjfx logs never announced follow mode within {LIVENESS_TIMEOUT:?}");
             }
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("jjfx logs exited without announcing follow mode");
@@ -246,7 +242,7 @@ fn logs_returns_when_a_running_worker_reaches_a_terminal_state() {
         Some("thinking\ndone\n"),
     );
 
-    let status = wait_bounded(&mut child, LOGS_LIVENESS_TIMEOUT);
+    let status = wait_bounded(&mut child, LIVENESS_TIMEOUT);
     assert_eq!(status.code(), Some(0), "follow must return cleanly");
 
     let stderr = watcher.into_output();
@@ -261,7 +257,7 @@ fn logs_returns_immediately_for_an_already_terminal_worker() {
 
     let output = run_bounded(
         logs_command(repository.path(), config_home.path(), &["1"]),
-        LOGS_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -292,7 +288,7 @@ fn logs_stops_cleanly_when_the_run_log_disappears_mid_follow() {
     // must end cleanly rather than error.
     fs::remove_file(worker_log(repository.path(), "worker-1")).expect("remove log");
 
-    let status = wait_bounded(&mut child, LOGS_LIVENESS_TIMEOUT);
+    let status = wait_bounded(&mut child, LIVENESS_TIMEOUT);
     assert_eq!(status.code(), Some(0), "a vanished log is a clean end");
 
     let stderr = watcher.into_output();
@@ -312,7 +308,7 @@ fn logs_stops_cleanly_when_the_worker_leaves_the_pool() {
     // The Worker is reconciled away mid-follow, so its log can never grow again.
     fs::remove_file(worker_state(repository.path(), "worker-1")).expect("remove worker state");
 
-    let status = wait_bounded(&mut child, LOGS_LIVENESS_TIMEOUT);
+    let status = wait_bounded(&mut child, LIVENESS_TIMEOUT);
     assert_eq!(status.code(), Some(0), "a departed Worker is a clean end");
 
     let stderr = watcher.into_output();
@@ -334,7 +330,7 @@ fn logs_returns_immediately_for_an_idle_worker() {
 
     let output = run_bounded(
         logs_command(repository.path(), config_home.path(), &["1"]),
-        LOGS_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -366,7 +362,7 @@ fn logs_returns_when_a_running_worker_is_reset_to_idle() {
     // notice the Worker has no Run and return rather than spin on a stale log.
     write_idle_worker(repository.path(), "worker-1");
 
-    let status = wait_bounded(&mut child, LOGS_LIVENESS_TIMEOUT);
+    let status = wait_bounded(&mut child, LIVENESS_TIMEOUT);
     assert_eq!(status.code(), Some(0), "an idle Worker is a clean end");
 
     let stderr = watcher.into_output();

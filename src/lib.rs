@@ -29,6 +29,8 @@ mod runtime;
 mod store;
 mod task_editor;
 mod terminal;
+#[doc(hidden)]
+pub mod test_support;
 mod ticket_source;
 mod trunk;
 mod tui;
@@ -51,26 +53,6 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use crate::app::{App, Msg};
 use crate::runtime::Runtime;
 use crate::store::Store;
-
-#[cfg(feature = "test-support")]
-#[doc(hidden)]
-pub mod test_support {
-    /// Enter the terminal and panic, for an external PTY restoration test.
-    pub fn panic_after_tui_init() -> ! {
-        let _session = crate::tui::Session::enter().expect("test PTY should enter");
-        panic!("intentional terminal restoration test panic");
-    }
-
-    /// Enter the terminal and hold it, for an external PTY signal test. The
-    /// process stays in raw mode on the alternate screen until the test signals
-    /// it, so the handler's restoration is the only thing that can clean up.
-    pub fn block_after_tui_init() -> ! {
-        let _session = crate::tui::Session::enter().expect("test PTY should enter");
-        loop {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-    }
-}
 
 /// Run the jjfx binary's argument router.
 pub fn run(args: Vec<String>) -> anyhow::Result<()> {

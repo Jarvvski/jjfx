@@ -11,12 +11,8 @@ use std::process::{Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use jjfx::test_support::LIVENESS_TIMEOUT;
 use tempfile::TempDir;
-
-/// A hang guard, not a latency budget: `wait` blocks until its condition, so a
-/// test that never reaches one would otherwise run forever. Generous, because
-/// the failure it guards against is a hang.
-const WAIT_LIVENESS_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Runs `command`, killing and failing if it does not return within `timeout`.
 ///
@@ -178,7 +174,7 @@ fn wait_returns_immediately_for_an_already_terminal_worker() {
     // so a passing run proves there is no lost wakeup.
     let output = run_bounded(
         wait_command(repository.path(), config_home.path(), &["1"]),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -203,7 +199,7 @@ fn wait_times_out_with_a_code_distinct_from_success() {
             config_home.path(),
             &["1", "--timeout", "1"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -228,7 +224,7 @@ fn a_worker_that_fails_while_waiting_for_done_is_not_a_timeout() {
             config_home.path(),
             &["1", "--until", "done"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
@@ -248,7 +244,7 @@ fn wait_all_returns_once_every_worker_is_terminal() {
 
     let output = run_bounded(
         wait_command(repository.path(), config_home.path(), &["--all"]),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -268,7 +264,7 @@ fn a_multi_worker_wait_does_not_return_until_every_worker_is_done() {
             config_home.path(),
             &["1", "2", "--until", "done", "--timeout", "1"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(1), "{output:?}");
@@ -289,7 +285,7 @@ fn a_failure_in_the_set_decides_a_multi_worker_wait() {
             config_home.path(),
             &["1", "2", "--until", "done"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(2), "{output:?}");
@@ -303,7 +299,7 @@ fn wait_json_prints_the_worker_object_status_json_uses() {
 
     let output = run_bounded(
         wait_command(repository.path(), config_home.path(), &["1", "--json"]),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -362,7 +358,7 @@ fn wait_ticket_resolved_confirms_end_to_end() {
             config_home.path(),
             &["1", "--until", "ticket-resolved"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
@@ -381,7 +377,7 @@ fn wait_rejects_an_unknown_worker_rather_than_blocking() {
 
     let output = run_bounded(
         wait_command(repository.path(), config_home.path(), &["9"]),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert!(!output.status.success(), "{output:?}");
@@ -417,7 +413,7 @@ fn wait_all_with_several_pools_refuses_naming_them() {
 
     let output = run_bounded(
         wait_command(repository.path(), config_home.path(), &["--all"]),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert!(!output.status.success(), "{output:?}");
@@ -446,7 +442,7 @@ fn wait_pool_all_acts_on_that_lane_only() {
             config_home.path(),
             &["--pool", "bugs", "--all", "--timeout", "1"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
     assert_eq!(output.status.code(), Some(1), "{output:?}");
 
@@ -458,7 +454,7 @@ fn wait_pool_all_acts_on_that_lane_only() {
             config_home.path(),
             &["--pool", "bugs", "--all"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
     assert_eq!(output.status.code(), Some(0), "{output:?}");
     assert!(
@@ -483,7 +479,7 @@ fn wait_pool_scopes_a_named_worker() {
             config_home.path(),
             &["1", "--pool", "bugs"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert!(!output.status.success(), "{output:?}");
@@ -509,7 +505,7 @@ fn wait_refuses_an_unknown_pool_the_same_way_dispatch_does() {
             config_home.path(),
             &["--pool", "ghost", "--all"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
     let dispatched = run_bounded(
         dispatch_command(
@@ -517,7 +513,7 @@ fn wait_refuses_an_unknown_pool_the_same_way_dispatch_does() {
             config_home.path(),
             &["AMBA-1", "--pool", "ghost"],
         ),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert!(!wait.status.success(), "{wait:?}");
@@ -549,7 +545,7 @@ fn wait_with_one_pool_needs_no_pool_flag() {
 
     let output = run_bounded(
         wait_command(repository.path(), config_home.path(), &["--all"]),
-        WAIT_LIVENESS_TIMEOUT,
+        LIVENESS_TIMEOUT,
     );
 
     assert_eq!(output.status.code(), Some(0), "{output:?}");
