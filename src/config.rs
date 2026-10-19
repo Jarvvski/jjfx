@@ -41,8 +41,8 @@ pub struct Config {
     pub dispatch: DispatchConfig,
     /// How long a Run may make no progress before the list surfaces it as stuck.
     pub watchdog: WatchdogConfig,
-    /// Which AI reviewer the review loop runs, and how many re-review passes it
-    /// makes. `reviewer = "none"` (the default) leaves review human-only.
+    /// The pass cap for the tool-enforced re-review loop (ADR 0016). jjfx runs
+    /// no reviewer of its own; the cap bounds the loop when the harness drives it.
     pub review: ReviewConfig,
     /// How the cross-workspace migration-order check finds migrations.
     pub migrations: MigrationsConfig,
@@ -755,13 +755,15 @@ impl Default for WatchdogConfig {
     }
 }
 
-/// The AI reviewer the review loop runs, and how far it iterates.
+/// How far the tool-enforced re-review loop may iterate.
+///
+/// The bound itself lives in `crate::engine::ReviewLoop`; this is its cap. jjfx
+/// does not run a reviewer of its own - the review verb inlines the pull
+/// request's human comments and failing checks - so the cap is the ceiling the
+/// loop enforces when the harness drives it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewConfig {
-    /// Which reviewer produces findings. `none` (the default) keeps the review
-    /// verb's human-only behaviour: nothing is run and the prompt is unchanged.
-    pub reviewer: ReviewerKind,
     /// The pass cap for the re-review loop: the most reviewer passes jjfx runs
     /// before it stops. One pass reviews and addresses once.
     pub max_passes: usize,
@@ -769,10 +771,7 @@ pub struct ReviewConfig {
 
 impl Default for ReviewConfig {
     fn default() -> Self {
-        Self {
-            reviewer: ReviewerKind::None,
-            max_passes: 2,
-        }
+        Self { max_passes: 2 }
     }
 }
 
@@ -785,20 +784,6 @@ impl ReviewConfig {
         }
         Ok(())
     }
-}
-
-/// The configured AI reviewer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-pub enum ReviewerKind {
-    /// No reviewer: `review` behaves exactly as it did before reviewers existed.
-    #[serde(rename = "none")]
-    None,
-    /// The CodeRabbit CLI in agent mode (`cr review --agent`).
-    #[serde(rename = "coderabbit")]
-    Coderabbit,
-    /// The opencode GitHub Action, run repo-side.
-    #[serde(rename = "opencode-action")]
-    OpenCodeAction,
 }
 
 /// How the cross-workspace migration-order check (ticket 17) finds migrations.
@@ -2350,50 +2335,23 @@ mod tests {
     }
 
     #[test]
-    fn review_defaults_to_no_reviewer() {
+    fn review_defaults_to_the_default_pass_cap() {
         let cfg = Config::default();
         cfg.validate().expect("the default config is valid");
-        assert_eq!(cfg.review.reviewer, ReviewerKind::None);
         assert_eq!(cfg.review.max_passes, 2);
     }
 
     #[test]
-    fn a_review_section_selects_a_reviewer_and_its_pass_cap() {
+    fn a_review_section_sets_the_pass_cap() {
         let cfg: Config = toml::from_str(
             r#"
             [review]
-            reviewer = "coderabbit"
             max_passes = 4
             "#,
         )
         .expect("toml parses");
         cfg.validate().expect("the config is valid");
-        assert_eq!(cfg.review.reviewer, ReviewerKind::Coderabbit);
         assert_eq!(cfg.review.max_passes, 4);
-    }
-
-    #[test]
-    fn the_opencode_action_reviewer_is_selectable() {
-        let cfg: Config = toml::from_str(
-            r#"
-            [review]
-            reviewer = "opencode-action"
-            "#,
-        )
-        .expect("toml parses");
-        assert_eq!(cfg.review.reviewer, ReviewerKind::OpenCodeAction);
-    }
-
-    #[test]
-    fn an_unknown_reviewer_is_rejected() {
-        let err = toml::from_str::<Config>(
-            r#"
-            [review]
-            reviewer = "sonarqube"
-            "#,
-        )
-        .expect_err("unknown reviewer is an error");
-        assert!(err.to_string().contains("sonarqube"), "{err}");
     }
 
     #[test]
@@ -2413,7 +2371,6 @@ mod tests {
         let cfg: Config = toml::from_str(
             r#"
             [review]
-            reviewer = "coderabbit"
             max_passes = 0
             "#,
         )

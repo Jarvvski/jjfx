@@ -83,9 +83,9 @@ pub use pool::{
 };
 pub use queue::{QueueResolution, WorkQueue};
 pub use reviewer::{
-    CodeRabbitReviewer, ReviewCompleteness, ReviewEscalation, ReviewFinding, ReviewLoop,
-    ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop,
-    Reviewer, ReviewerError,
+    ReviewCompleteness, ReviewEscalation, ReviewFinding, ReviewLoop, ReviewLoopError,
+    ReviewLoopSummary, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop, Reviewer,
+    ReviewerError,
 };
 pub use run_log::{
     AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,

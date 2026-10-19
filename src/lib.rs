@@ -24,7 +24,6 @@ mod pool_session;
 mod prs;
 mod render;
 mod repo;
-mod reviewer_source;
 mod runtime;
 mod store;
 mod task_editor;

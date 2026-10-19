@@ -14,9 +14,8 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
     AgentSessionResolution, BackgroundRun, BackgroundStart, CompletedRun, DispatchExclusions,
     MutationGuard, MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation,
-    ReviewFinding, ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, TicketBranch,
-    TicketId, WorkerId, WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime,
-    resolve_ticket_branch,
+    RunLog, RunSupervisor, RunSupervisorError, TicketBranch, TicketId, WorkerId, WorkerPoolError,
+    WorkerStatus, resolve_agent_session_for_runtime, resolve_ticket_branch,
 };
 use crate::jj::PushOutcome;
 
@@ -328,7 +327,6 @@ pub struct WorkerActions {
     first_pane_command: Vec<String>,
     layout: PaneLayout,
     exclusions: DispatchExclusions,
-    review_findings: Vec<ReviewFinding>,
 }
 
 impl WorkerActions {
@@ -342,15 +340,7 @@ impl WorkerActions {
             first_pane_command: Vec::new(),
             layout: PaneLayout::builtin(),
             exclusions: DispatchExclusions::default(),
-            review_findings: Vec::new(),
         }
-    }
-
-    /// Supplies an AI reviewer's normalised findings to inline into the next
-    /// review prompt. Empty (the default) leaves the prompt as it was.
-    pub fn with_review_findings(mut self, findings: Vec<ReviewFinding>) -> Self {
-        self.review_findings = findings;
-        self
     }
 
     /// Excludes the given Worker Workspaces from Follow-up selection.
@@ -747,8 +737,8 @@ impl WorkerActions {
 
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
     ///
-    /// When [`Self::with_review_findings`] supplied a reviewer's findings, they
-    /// are inlined alongside the human comments and failing checks.
+    /// The prompt inlines the pull request's review state, its failing checks,
+    /// and an instruction to fetch and address human review comments.
     pub fn review(
         &self,
         worker: &WorkerId,
@@ -758,25 +748,8 @@ impl WorkerActions {
         let checks = self
             .commands
             .failing_checks(&repository, pull_request.number)?;
-        let prompt =
-            build_review_prompt(&repository, &pull_request, &checks, &self.review_findings);
+        let prompt = build_review_prompt(&repository, &pull_request, &checks);
         self.follow_up(worker, &prompt, None, mode)
-    }
-
-    /// Describes the pull request `review` would review, for a configured AI
-    /// reviewer to review without a local checkout.
-    pub fn review_request(&self, worker: &WorkerId) -> Result<ReviewRequest, WorkerActionError> {
-        let (repository, pull_request) = self.pull_request_for(worker)?;
-        let base = if pull_request.base_ref_name.trim().is_empty() {
-            "main".to_owned()
-        } else {
-            pull_request.base_ref_name.clone()
-        };
-        Ok(ReviewRequest::new(
-            repository,
-            base,
-            pull_request.head_ref_name.clone(),
-        ))
     }
 
     /// Returns the `owner/repo` and open pull request for a Worker's bookmark.
@@ -1022,8 +995,6 @@ struct PullRequest {
     number: u64,
     url: String,
     head_ref_name: String,
-    #[serde(default)]
-    base_ref_name: String,
     mergeable: String,
     #[serde(default)]
     review_decision: String,
@@ -1284,7 +1255,7 @@ impl SystemCommands {
                 "--head",
                 branch,
                 "--json",
-                "number,url,headRefName,mergeable,reviewDecision,baseRefName",
+                "number,url,headRefName,mergeable,reviewDecision",
                 "--limit",
                 "1",
             ],
@@ -1423,12 +1394,7 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
-fn build_review_prompt(
-    repository: &str,
-    pull_request: &PullRequest,
-    checks: &[Check],
-    findings: &[ReviewFinding],
-) -> String {
+fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[Check]) -> String {
     let header = if pull_request.url.is_empty() {
         format!("#{}", pull_request.number)
     } else {
@@ -1456,20 +1422,6 @@ fn build_review_prompt(
         pull_request.number, pull_request.number
     ));
     step += 1;
-    if !findings.is_empty() {
-        prompt.push_str(&format!("{step}. Fix these AI reviewer findings:\n"));
-        for finding in findings {
-            prompt.push_str(&format!("   - {}\n", finding.summary()));
-            for line in finding.body().lines() {
-                prompt.push_str(&format!("     {line}\n"));
-            }
-            for suggestion in finding.suggestions() {
-                prompt.push_str(&format!("     Suggested fix: {suggestion}\n"));
-            }
-        }
-        prompt.push('\n');
-        step += 1;
-    }
     prompt.push_str(&format!(
         "{step}. Address each unresolved comment, or explain a reasoned disagreement in the PR. Decide where each fix belongs before you make it:\n   - A fix to code this PR already introduced belongs in the commit that introduced it - not in a new commit stacked on top, and not in a hand-split. Find that commit with `jj log`, start an edit on top of it with `jj new <commit>`, make the change, then run `jj absorb`. jj moves each hunk into the closest mutable ancestor where those lines last changed, and abandons the edit commit once every hunk has landed (describe the edit if you want to keep it).\n   - `jj absorb` can leave the commits above it conflicted: resolve every conflict it reports, or run `jj undo` and address that feedback on top of `@` instead.\n   - Feedback that does not belong in an existing commit - a new file, a new test - is an ordinary edit on `@`.\n\n"
     ));
@@ -1644,51 +1596,20 @@ pub enum WorkerActionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::ReviewSeverity;
 
     fn pull_request() -> PullRequest {
         PullRequest {
             number: 7,
             url: "https://github.com/o/r/pull/7".to_owned(),
             head_ref_name: "adam/x".to_owned(),
-            base_ref_name: "main".to_owned(),
             mergeable: "MERGEABLE".to_owned(),
             review_decision: "REVIEW_REQUIRED".to_owned(),
         }
     }
 
-    fn finding() -> ReviewFinding {
-        ReviewFinding::new(
-            ReviewSeverity::Major,
-            Some("src/x.rs".to_owned()),
-            Some((12, 14)),
-            Some("Unbounded loop".to_owned()),
-            "Cap the loop at the configured pass count.",
-            vec!["let n = max_passes.min(3);".to_owned()],
-        )
-    }
-
     #[test]
-    fn a_reviewers_findings_are_inlined_into_the_prompt() {
-        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[finding()]);
-
-        assert!(
-            prompt.contains("[major] src/x.rs:12-14 - Unbounded loop"),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("Cap the loop at the configured pass count."),
-            "{prompt}"
-        );
-        assert!(
-            prompt.contains("Suggested fix: let n = max_passes.min(3);"),
-            "{prompt}"
-        );
-    }
-
-    #[test]
-    fn no_findings_leaves_the_prompt_without_a_reviewer_step() {
-        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[]);
+    fn the_prompt_has_no_reviewer_step_and_fetches_human_comments() {
+        let prompt = build_review_prompt("o/r", &pull_request(), &[]);
 
         assert!(!prompt.contains("AI reviewer findings"), "{prompt}");
         assert!(prompt.contains("Fetch all review comments"), "{prompt}");
@@ -1696,7 +1617,7 @@ mod tests {
 
     #[test]
     fn the_prompt_sends_base_commit_feedback_through_jj_new_and_absorb() {
-        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[]);
+        let prompt = build_review_prompt("o/r", &pull_request(), &[]);
 
         assert!(prompt.contains("`jj new <commit>`"), "{prompt}");
         assert!(prompt.contains("`jj absorb`"), "{prompt}");

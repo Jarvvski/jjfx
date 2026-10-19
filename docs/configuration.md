@@ -397,25 +397,22 @@ automatically: a stuck Run is surfaced, and the human decides.
 
 ## `[review]`
 
-Which AI reviewer `jjfx review <worker>` runs, and how many times the re-review
-loop may iterate. An absent `[review]` section means `reviewer = "none"`, which
-leaves `review` exactly as it was: the prompt inlines the PR's review state,
-failing checks and human comments, and nothing else runs.
+The pass cap for the tool-enforced re-review loop. `jjfx review <worker>` itself
+runs no reviewer: its prompt inlines the PR's review state, failing checks and
+human comments, and nothing else. jjfx does not ingest an external review bot's
+findings - the loop is bounded by the tool, not by a prompt (ADR 0016).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `reviewer` | `"none"` | Which reviewer produces findings: `none`, `coderabbit`, or `opencode-action`. |
 | `max_passes` | `2` | The pass cap for the re-review loop; must be at least 1. The loop also stops early when a round makes no progress, so this is a ceiling, not a target. |
 
 ```toml
 [review]
-reviewer = "coderabbit"
 max_passes = 2
 ```
 
-`coderabbit` shells out to the CodeRabbit CLI in agent mode. `opencode-action`
-is accepted but not implemented yet: selecting it fails at load with a setup
-error rather than silently skipping the review.
+See [The review loop](review-loop.md) for the bound and how a review's feedback
+is addressed.
 
 See [The review loop](review-loop.md) for what a configured reviewer does, how
 the pass cap and the progress rule bound it, and how it authenticates without
