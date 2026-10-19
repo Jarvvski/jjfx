@@ -37,11 +37,11 @@ If the log disappears or the Worker's Run is reconciled away mid-follow, exit cl
 
 ## Acceptance Criteria
 
-- [ ] `jjfx logs <worker>` on a running Worker returns by itself when the Run reaches a terminal state.
-- [ ] Attaching to an already-terminal Worker still returns immediately, as it does today.
-- [ ] The command does not spin after the Run ends.
-- [ ] A test covers the follow-until-terminal path.
-- [ ] `mise run check` is green.
+- [x] `jjfx logs <worker>` on a running Worker returns by itself when the Run reaches a terminal state.
+- [x] Attaching to an already-terminal Worker still returns immediately, as it does today.
+- [x] The command does not spin after the Run ends.
+- [x] A test covers the follow-until-terminal path.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -52,3 +52,9 @@ If the log disappears or the Worker's Run is reconciled away mid-follow, exit cl
 ## Comments
 
 - 2026-10-16: Found while designing `jjfx wait` - the only existing blocking surface turns out to be a hang.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.

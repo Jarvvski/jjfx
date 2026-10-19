@@ -48,15 +48,15 @@ Precedent for the shape: `kubectl wait --for=condition=...`, `docker wait`, `doc
 
 ## Acceptance Criteria
 
-- [ ] `jjfx wait <worker>` returns when the Worker reaches the default condition, and immediately if it is already there.
-- [ ] `--timeout` bounds the wait and exits with a code distinct from both success and a failed Worker.
-- [ ] A Worker that fails while waiting for `done` is distinguishable from a timeout.
-- [ ] Multiple workers and `--all` are supported.
-- [ ] `--json` prints the terminal Worker object(s) in the shape `status --json` already uses.
-- [ ] `jjfx help wait` documents the conditions and the exit codes.
-- [ ] `jjfx help dispatch` states how `--fg` relates to `wait`.
-- [ ] Tests cover: already-terminal, timeout, failure, and the multi-worker case.
-- [ ] `mise run check` is green.
+- [x] `jjfx wait <worker>` returns when the Worker reaches the default condition, and immediately if it is already there.
+- [x] `--timeout` bounds the wait and exits with a code distinct from both success and a failed Worker.
+- [x] A Worker that fails while waiting for `done` is distinguishable from a timeout.
+- [x] Multiple workers and `--all` are supported.
+- [x] `--json` prints the terminal Worker object(s) in the shape `status --json` already uses.
+- [x] `jjfx help wait` documents the conditions and the exit codes.
+- [x] `jjfx help dispatch` states how `--fg` relates to `wait`.
+- [x] Tests cover: already-terminal, timeout, failure, and the multi-worker case.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -68,3 +68,11 @@ Precedent for the shape: `kubectl wait --for=condition=...`, `docker wait`, `doc
 
 - 2026-10-16: Filed at the owner's request, after the `todo-md` test-drive in which an agent had to poll with sleeps.
 - 2026-10-16: Resolved. `jjfx wait <worker>... [--until done|failed|terminal|ticket-resolved] [--timeout SECS] [--json] [--all]` blocks until the condition holds and carries the answer in its exit code: `0` reached, `1` timed out, `2` a Worker reached a terminal state that does not satisfy `--until`. It is reconcile-until-a-condition, sharing the one reconcile pass (`reconcile_pass`: `reconcile_runs` then the local Ticket writeback) with `status` and `ticket reconcile`, so a Worker whose process died silently still advances and a finished Run still resolves its local Ticket. The condition is evaluated before the first sleep, so an already-terminal Worker returns at once. `--until ticket-resolved` needs `[tickets] source = "local"` and a Ticket on every target.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.
+
+Caveat: the running-to-terminal transition is implemented by the per-pass re-evaluation loop but has no dedicated test. The ticket test list does not require one.

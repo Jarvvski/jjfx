@@ -23,15 +23,23 @@ The design settled both halves - *Where are pools declared?* and **ADR 0014**:
 
 ## Acceptance Criteria
 
-- [ ] `[pools]` parses, with every field optional but the name.
-- [ ] With no `[pools]` section, behaviour is byte-for-byte today's, and `jjfx pool <N>` still sizes `default`.
-- [ ] A declaration can only reference a profile/source the user config defines; naming an unknown one is a loud error naming the file.
-- [ ] Duplicate routing labels are refused at load, naming both pools.
-- [ ] An unknown key inside `[pools]` is still a loud error (`deny_unknown_fields` intact).
-- [ ] `mise run check` is green.
+- [x] `[pools]` parses, with every field optional but the name.
+- [x] With no `[pools]` section, behaviour is byte-for-byte today's, and `jjfx pool <N>` still sizes `default`.
+- [x] A declaration can only reference a profile/source the user config defines; naming an unknown one is a loud error naming the file.
+- [x] Duplicate routing labels are refused at load, naming both pools.
+- [x] An unknown key inside `[pools]` is still a loud error (`deny_unknown_fields` intact).
+- [x] `mise run check` is green.
 
 ## References
 
 - `src/config.rs` (`RepoConfig`, `load_repo`, `ChecksConfig::validate`, the `deny_unknown_fields` error text)
 - `docs/adr/0014-repository-local-pool-declarations.md`
 - `docs/configuration.md` (the repository-local section)
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.
+
+Caveat: the byte-for-byte clause is established behaviourally, by additive tests, rather than by a literal baseline comparison.

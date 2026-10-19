@@ -20,14 +20,20 @@ This is a follow-on, not a prerequisite: nothing in the named-pools work needs i
 
 ## Acceptance Criteria
 
-- [ ] A Repository can select `local` or `linear` for itself without touching the user config.
-- [ ] A repository-local attempt to define a source's details or credentials is a loud error naming the file.
-- [ ] An unknown key inside `[tickets]` is still a loud error.
-- [ ] `docs/configuration.md` documents the selection and the capability rule behind it.
-- [ ] `mise run check` is green.
+- [x] A Repository can select `local` or `linear` for itself without touching the user config.
+- [x] A repository-local attempt to define a source's details or credentials is a loud error naming the file.
+- [x] An unknown key inside `[tickets]` is still a loud error.
+- [x] `docs/configuration.md` documents the selection and the capability rule behind it.
+- [x] `mise run check` is green.
 
 ## References
 
 - `src/config.rs` (`RepoConfig`, `TicketsConfig`, `TicketSource`)
 - `docs/adr/0014-repository-local-pool-declarations.md`
 - `.scratch/dispatch-ergonomics/map.md` ("Deliberately not filed" - `[tickets]` cannot be repository-local)
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.
