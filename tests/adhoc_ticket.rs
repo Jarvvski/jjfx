@@ -8,9 +8,8 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, Output};
 
 use tempfile::TempDir;
 
@@ -86,21 +85,16 @@ impl BareRepository {
     }
 
     /// Runs `dispatch` with `stdin` piped in, and returns the raw output.
+    ///
+    /// The fixture's stub terminal answers the Dispatch Eligibility check
+    /// instantly, but the seam runs the real `kitten @ ls` under a short
+    /// deadline, so on a loaded machine that subprocess can be starved past it
+    /// and Dispatch fails closed before it reaches the Ticket. That is an
+    /// environmental transient, so the shared runner retries it, bounded by the
+    /// liveness budget - see
+    /// [`support::run_jjfx_with_stdin_tolerating_a_starved_terminal`].
     fn dispatch(&self, args: &[&str], stdin: &str) -> Output {
-        let mut child = self
-            .jjfx(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("jjfx should run");
-        child
-            .stdin
-            .as_mut()
-            .expect("piped stdin")
-            .write_all(stdin.as_bytes())
-            .expect("write stdin");
-        child.wait_with_output().expect("jjfx output")
+        support::run_jjfx_with_stdin_tolerating_a_starved_terminal(|| self.jjfx(args), stdin)
     }
 }
 
@@ -110,6 +104,19 @@ fn stdout(output: &Output) -> String {
 
 fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+/// Renders an output for an assertion message: the JSON stdout under test, plus
+/// the exit status and stderr, so a Dispatch that failed before it printed
+/// anything reports *why* rather than asserting against empty stdout with no
+/// clue where the output went.
+fn diagnostics(output: &Output) -> String {
+    format!(
+        "status: {}\nstdout: {}\nstderr: {}",
+        output.status,
+        stdout(output),
+        stderr(output)
+    )
 }
 
 #[test]
@@ -155,8 +162,12 @@ fn a_markdown_file_outside_scratch_dispatches() {
     );
 
     let json = stdout(&output);
-    assert!(json.contains("ad-hoc--plan"), "{json}");
-    assert!(json.contains("\"phase\": \"capacity\""), "{json}");
+    assert!(json.contains("ad-hoc--plan"), "{}", diagnostics(&output));
+    assert!(
+        json.contains("\"phase\": \"capacity\""),
+        "{}",
+        diagnostics(&output)
+    );
 }
 
 #[test]

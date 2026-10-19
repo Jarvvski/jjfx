@@ -177,6 +177,13 @@ impl DispatchFixture {
             .env("PATH", &self.env_path);
         command
     }
+
+    /// Runs `dispatch`, retrying a Dispatch that failed closed because the stub
+    /// terminal was starved past its deadline under load - see
+    /// [`support::run_jjfx_tolerating_a_starved_terminal`].
+    fn dispatch(&self, args: &[&str]) -> Output {
+        support::run_jjfx_tolerating_a_starved_terminal(|| self.jjfx(args))
+    }
 }
 
 fn stdout(output: &Output) -> String {
@@ -193,10 +200,7 @@ fn a_batch_where_every_ticket_failed_exits_non_zero() {
     fixture.with_pool(1);
     // No origin remote, so the only Ticket fails at the identity phase - the
     // exact shape that used to exit 0.
-    let output = fixture
-        .jjfx(&["dispatch", "--all", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "--all", "--json"]);
 
     assert!(
         !output.status.success(),
@@ -222,10 +226,7 @@ fn a_batch_with_a_dispatched_ticket_exits_zero() {
     fixture.with_pool(1);
     fixture.with_origin();
     fixture.with_fake_agent();
-    let output = fixture
-        .jjfx(&["dispatch", "--all", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "--all", "--json"]);
 
     assert!(
         output.status.success(),
@@ -253,10 +254,7 @@ fn a_repository_selects_its_ticket_source_without_touching_the_user_config() {
     fixture.with_pool(1);
     fixture.with_origin();
     fixture.with_fake_agent();
-    let output = fixture
-        .jjfx(&["dispatch", "--all", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "--all", "--json"]);
 
     assert!(
         output.status.success(),
@@ -298,10 +296,7 @@ fn a_background_orchestration_without_a_pool_is_a_failure_not_orchestrating() {
     let fixture = DispatchFixture::new();
     // No Pool at all: the child used to die at once behind a printed
     // `orchestrating`. The parent must surface the error and exit non-zero.
-    let output = fixture
-        .jjfx(&["dispatch", "widgets--01-ship-the-widget", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "widgets--01-ship-the-widget", "--json"]);
 
     assert!(!output.status.success(), "{}", stdout(&output));
     assert!(
@@ -320,10 +315,7 @@ fn a_background_orchestration_without_a_pool_is_a_failure_not_orchestrating() {
 fn a_background_orchestration_for_an_unresolvable_ticket_is_a_failure() {
     let fixture = DispatchFixture::new();
     fixture.with_pool(1);
-    let output = fixture
-        .jjfx(&["dispatch", "nope-typo", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "nope-typo", "--json"]);
 
     assert!(!output.status.success(), "{}", stdout(&output));
     assert!(
@@ -353,11 +345,9 @@ fn a_background_orchestration_for_a_local_feature_parent_names_the_child_log() {
 
     // No `--force`: the fixture's stub `kitten` answers the Dispatch Eligibility
     // terminal check (ADR 0011) with an empty workspace list, so this exercises
-    // the real seam without depending on the ambient terminal.
-    let output = fixture
-        .jjfx(&["dispatch", "gadgets", "--json"])
-        .output()
-        .expect("jjfx should run");
+    // the real seam without depending on the ambient terminal. The runner
+    // retries the one transient that seam can hit under load.
+    let output = fixture.dispatch(&["dispatch", "gadgets", "--json"]);
 
     assert!(
         output.status.success(),
@@ -416,10 +406,7 @@ fn a_named_ticket_blocked_by_an_unresolved_sibling_says_why_and_dispatches_anywa
     // Default Dispatch orchestrates a single named Ticket, which falls back to a
     // direct Dispatch because the Ticket is not a feature directory - so this
     // covers the path `jjfx dispatch <TICKET>` actually takes.
-    let output = fixture
-        .jjfx(&["dispatch", "widgets--02-dependent"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "widgets--02-dependent"]);
 
     assert!(
         output.status.success(),
@@ -455,15 +442,12 @@ fn a_named_ticket_with_the_wrong_status_reports_it_and_dispatches_anyway() {
     );
     fixture.with_fake_agent();
 
-    let output = fixture
-        .jjfx(&[
-            "dispatch",
-            "widgets--01-ship-the-widget",
-            "--no-orchestrate",
-            "--json",
-        ])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&[
+        "dispatch",
+        "widgets--01-ship-the-widget",
+        "--no-orchestrate",
+        "--json",
+    ]);
 
     assert!(
         output.status.success(),
@@ -495,10 +479,7 @@ fn a_ready_named_ticket_is_not_reported_as_not_ready() {
     fixture.with_pool(1);
     fixture.with_fake_agent();
 
-    let output = fixture
-        .jjfx(&["dispatch", "widgets--01-ship-the-widget"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "widgets--01-ship-the-widget"]);
 
     assert!(
         output.status.success(),
@@ -523,14 +504,11 @@ fn an_unqualified_dispatch_fills_the_only_pool() {
     fixture.with_pool(1);
     fixture.with_fake_agent();
 
-    let output = fixture
-        .jjfx(&[
-            "dispatch",
-            "widgets--01-ship-the-widget",
-            "--no-orchestrate",
-        ])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&[
+        "dispatch",
+        "widgets--01-ship-the-widget",
+        "--no-orchestrate",
+    ]);
 
     assert!(
         output.status.success(),
@@ -552,10 +530,7 @@ fn a_dispatch_into_a_repository_with_several_pools_is_refused_naming_them() {
     let fixture = DispatchFixture::new();
     fixture.write_repo_config("[pools.bugs]\n");
 
-    let output = fixture
-        .jjfx(&["dispatch", "widgets--01-ship-the-widget"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "widgets--01-ship-the-widget"]);
 
     assert!(
         !output.status.success(),
@@ -569,10 +544,7 @@ fn a_dispatch_into_a_repository_with_several_pools_is_refused_naming_them() {
 
     // `--text` and `--from-file` follow the same rule, because they resolve a
     // pool through the same seam.
-    let ad_hoc = fixture
-        .jjfx(&["dispatch", "--text", "fix the bug"])
-        .output()
-        .expect("jjfx should run");
+    let ad_hoc = fixture.dispatch(&["dispatch", "--text", "fix the bug"]);
     assert!(
         !ad_hoc.status.success(),
         "an unqualified --text Dispatch must refuse too:\nstdout:\n{}",
@@ -598,16 +570,13 @@ fn an_explicit_pool_fills_that_lane_not_default() {
     // Naming `bugs` materialises that lane's own state - empty, because the
     // declaration names no size - and fails for want of an idle Worker there
     // rather than falling back to `default`'s idle one.
-    let bugs = fixture
-        .jjfx(&[
-            "dispatch",
-            "widgets--01-ship-the-widget",
-            "--pool",
-            "bugs",
-            "--no-orchestrate",
-        ])
-        .output()
-        .expect("jjfx should run");
+    let bugs = fixture.dispatch(&[
+        "dispatch",
+        "widgets--01-ship-the-widget",
+        "--pool",
+        "bugs",
+        "--no-orchestrate",
+    ]);
     assert!(
         !bugs.status.success(),
         "a Dispatch into a lane with no idle Worker must fail:\nstdout:\n{}",
@@ -622,16 +591,13 @@ fn an_explicit_pool_fills_that_lane_not_default() {
     );
 
     // Naming `default` fills the lane that is provisioned.
-    let default = fixture
-        .jjfx(&[
-            "dispatch",
-            "widgets--01-ship-the-widget",
-            "--pool",
-            "default",
-            "--no-orchestrate",
-        ])
-        .output()
-        .expect("jjfx should run");
+    let default = fixture.dispatch(&[
+        "dispatch",
+        "widgets--01-ship-the-widget",
+        "--pool",
+        "default",
+        "--no-orchestrate",
+    ]);
     assert!(
         default.status.success(),
         "stdout:\n{}\nstderr:\n{}",
@@ -656,10 +622,7 @@ fn an_empty_ready_set_carries_the_search_in_json() {
         "# Ship the widget\n\nStatus: resolved\n",
     );
 
-    let output = fixture
-        .jjfx(&["dispatch", "--all", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "--all", "--json"]);
 
     assert!(
         output.status.success(),
@@ -682,10 +645,7 @@ fn an_empty_ready_set_carries_the_search_in_json() {
     assert!(root.ends_with(".scratch"), "{root}");
 
     // The prose path is unchanged: it still names the label on stderr.
-    let prose = fixture
-        .jjfx(&["dispatch", "--all"])
-        .output()
-        .expect("jjfx should run");
+    let prose = fixture.dispatch(&["dispatch", "--all"]);
     assert!(prose.status.success(), "{}", stderr(&prose));
     assert!(
         stderr(&prose).contains("No tickets found with label 'ready-for-agent'"),
@@ -711,10 +671,7 @@ fn a_linear_source_reports_a_null_search_root_in_json() {
     fixture.with_pool(1);
     fixture.with_empty_ready_query();
 
-    let output = fixture
-        .jjfx(&["dispatch", "--all", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "--all", "--json"]);
 
     assert!(
         output.status.success(),
@@ -751,10 +708,7 @@ fn a_not_ready_ticket_is_named_alongside_the_search_in_json() {
         "# Ship the widget\n\nStatus: claimed\n",
     );
 
-    let output = fixture
-        .jjfx(&["dispatch", "--all", "--json"])
-        .output()
-        .expect("jjfx should run");
+    let output = fixture.dispatch(&["dispatch", "--all", "--json"]);
 
     assert!(
         output.status.success(),

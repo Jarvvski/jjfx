@@ -193,12 +193,18 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   undelivered statuses no longer satisfy dependents, and `unblocks()` is gone.
 - [34](issues/34-claude-result-usage.md) - D9, split out of 28.
   **resolved** - option 1: populate the Run result's usage, matching Pi and Codex.
-- [35](issues/35-load-sensitive-helper-deadlines.md) - the test suite's fixed
-  helper-subprocess deadlines, found while landing 03/23/28.
-  **resolved** - one shared `HELPER_LIVENESS_TIMEOUT` (120s) in
-  `tests/support/mod.rs`, documented as a hang guard; the helper exceeded the old
-  10s budget in 10 of 12 measured runs, so the budget was the defect, not the
-  code. No changelog entry: nothing user-visible.
+- [35](issues/35-load-sensitive-helper-deadlines.md) - the test suite's
+  load-sensitive waits, found while landing 03/23/28 and re-opened when the
+  class recurred in a new `engine::locks` test.
+  **resolved** - one shared `test_support::LIVENESS_TIMEOUT` (120s), defined in
+  the crate so unit and integration tests share it, replaces every private
+  liveness budget (`locks.rs`/`app.rs`/`wait.rs`/`logs.rs` 30s,
+  `agent_runtime.rs` 10s, `repository.rs` inline 120s), and the locks ordering
+  test now waits out a one-second observation window and requires the pool lock
+  to *clear* rather than never reading `Busy` - the recurrence was that
+  momentary-`Busy` assertion, not the 30s budget. 90 consecutive full-suite runs
+  under load failed 0 (pre-fix roughly 1 in 8). No changelog entry: nothing
+  user-visible.
 - [36](issues/36-fixed-sibling-paths-collide.md) - fixed sibling paths in
   `store.rs` tests, found while landing 28.
   **resolved** - siblings derive from the unique repo directory via a `sibling`
