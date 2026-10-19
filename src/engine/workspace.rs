@@ -13,8 +13,8 @@ use thiserror::Error;
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::locks::{self, ScopedLock};
 use crate::engine::{
-    Expected, Loaded, PoolName, Repository, StateChange, StateStore, WireStatus, WorkerId,
-    WorkerState,
+    Expected, Loaded, PoolName, Repository, RepositoryIdentity, StateChange, StateStore,
+    TicketValueError, WireStatus, WorkerId, WorkerState,
 };
 
 const CACHE_PATH: &str = ".jj/ws-cache";
@@ -1541,6 +1541,77 @@ pub(crate) fn git_remotes(root: &Path) -> std::io::Result<std::process::Output> 
         .args(["git", "remote", "list"])
         .current_dir(root)
         .output()
+}
+
+/// Why a Repository's Dispatch identity could not be resolved.
+#[derive(Debug, Error)]
+pub(crate) enum RepositoryIdentityError {
+    /// The Repository has no `origin` remote and no configured `gh_repo`, so
+    /// there is no `owner/name` slug to derive. A Worker could not push or open
+    /// a pull request, so the delivery contract cannot be honoured.
+    #[error(
+        "no `origin` remote to derive an owner/name slug from; add one with \
+         `jj git remote add origin <url>` (or set the pool's `gh_repo`)"
+    )]
+    MissingOrigin,
+    /// Reading the Repository's git remotes failed.
+    #[error("{0}")]
+    Remotes(String),
+    /// The resolved slug is not a valid `owner/name` Repository identity.
+    #[error(transparent)]
+    Invalid(#[from] TicketValueError),
+}
+
+/// Resolves the Repository's `owner/name` identity for Dispatch delivery.
+///
+/// Prefers `configured` (the selected Worker Pool's `gh_repo`), then the
+/// `origin` remote. A Repository with neither names the missing piece and the
+/// command that adds it, rather than failing with a format complaint about an
+/// empty slug. Direct Dispatch and orchestration share this one helper so the
+/// user-facing message cannot drift between them.
+pub(crate) fn repository_identity(
+    root: &Path,
+    configured: &str,
+) -> Result<RepositoryIdentity, RepositoryIdentityError> {
+    let configured = configured.trim_end_matches(".git");
+    if !configured.is_empty() {
+        return Ok(RepositoryIdentity::parse(configured)?);
+    }
+    let output =
+        git_remotes(root).map_err(|error| RepositoryIdentityError::Remotes(error.to_string()))?;
+    if !output.status.success() {
+        return Err(RepositoryIdentityError::Remotes(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ));
+    }
+    let slug = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            match (fields.next(), fields.next()) {
+                (Some("origin"), Some(remote)) => Some(remote_slug(remote)),
+                _ => None,
+            }
+        })
+        .filter(|slug| !slug.is_empty())
+        .ok_or(RepositoryIdentityError::MissingOrigin)?;
+    Ok(RepositoryIdentity::parse(slug)?)
+}
+
+/// Derives an `owner/name` slug from a git remote URL.
+///
+/// Handles both `git@host:owner/name(.git)` and `https://host/owner/name(.git)`
+/// shapes; anything shorter falls back to the raw remote.
+pub(crate) fn remote_slug(remote: &str) -> String {
+    let remote = remote.trim_end_matches(".git");
+    if let Some((_, path)) = remote.rsplit_once(':') {
+        return path.to_owned();
+    }
+    let mut parts = remote.rsplitn(3, '/');
+    match (parts.next(), parts.next()) {
+        (Some(name), Some(owner)) => format!("{owner}/{name}"),
+        _ => remote.to_owned(),
+    }
 }
 
 /// List workspace names through an explicit template. The default

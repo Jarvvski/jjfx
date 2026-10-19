@@ -72,6 +72,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx pool <N> now moves a declared [pools.default]'s size with the lane it describes: sizing default still provisions and detaches its Workers under the existing busy-Worker safety, and when the Repository declares [pools.default] the declaration is moved to agree, so the size a user sets is the size jjfx status reports; a Repository that declares no [pools.default] is untouched, so sizing an implicit default still writes state only and never grows a declaration.
 - jjfx pool list and jjfx status no longer write an unnamed 'pool state is absent' to stderr once per pool that has no state directory - a declared lane with no directory is normal, materialising on first use, and the WORKERS column already shows the absence - so a successful listing is silent.
 - jjfx clean writes its confirmation prompt to stderr and, when stdin reaches EOF without an answer, refuses loudly with a non-zero exit instead of silently removing nothing and exiting 0
+- Name the missing origin remote when orchestrating a single Ticket, instead of failing on an empty repository slug
 
 ## [0.55.0] - 2026-10-16
 

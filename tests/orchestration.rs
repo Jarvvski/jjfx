@@ -43,6 +43,10 @@ fn write_local_ticket(root: &std::path::Path, feature: &str, file: &str, content
 }
 
 fn install_idle_worker(repository: &Repository, worker: &WorkerId) {
+    install_idle_worker_with_gh_repo(repository, worker, "owner/repo");
+}
+
+fn install_idle_worker_with_gh_repo(repository: &Repository, worker: &WorkerId, gh_repo: &str) {
     repository
         .state_store()
         .pool()
@@ -50,7 +54,7 @@ fn install_idle_worker(repository: &Repository, worker: &WorkerId) {
             Expected::Missing,
             StateChange::Replace(PoolState::new(
                 1,
-                "owner/repo",
+                gh_repo,
                 vec![worker.clone()],
                 WireTimestamp::new("2026-08-04T12:00:00Z"),
             )),
@@ -64,6 +68,38 @@ fn install_idle_worker(repository: &Repository, worker: &WorkerId) {
             StateChange::Replace(WorkerState::new(WireStatus::new("idle"))),
         )
         .expect("save idle Worker");
+}
+
+/// Initialises a real colocated jj repository, so `jj git remote list` answers
+/// instead of erroring on a bare `.jj` marker directory.
+fn init_colocated_repository(directory: &std::path::Path) {
+    let output = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--colocate",
+        ])
+        .arg(directory)
+        .output()
+        .expect("jj executable");
+    assert!(output.status.success(), "jj init failed: {output:?}");
+}
+
+fn add_origin(repository: &Repository) {
+    let output = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:owner/repo.git",
+        ])
+        .current_dir(repository.root())
+        .output()
+        .expect("add origin");
+    assert!(output.status.success(), "jj remote add failed: {output:?}");
 }
 
 #[test]
@@ -230,18 +266,7 @@ fn advance_once_observes_a_failed_blocker_group_as_terminal() {
 #[test]
 fn resumed_group_repairs_a_missing_branch_from_a_ticket_bookmark() {
     let directory = TempDir::new().expect("temporary repository");
-    let output = Command::new("jj")
-        .args([
-            "--config",
-            "signing.behavior=drop",
-            "git",
-            "init",
-            "--colocate",
-        ])
-        .arg(directory.path())
-        .output()
-        .expect("jj executable");
-    assert!(output.status.success(), "jj init failed: {output:?}");
+    init_colocated_repository(directory.path());
     fs::write(directory.path().join("README"), "foundation\n").expect("file");
     let output = Command::new("jj")
         .args([
@@ -826,4 +851,80 @@ fn bounded_polling_reports_capacity_wait_without_busy_looping() {
         event,
         OrchestrationEvent::WaitingForCapacity { ticket } if ticket.as_str() == "ENG-101"
     )));
+}
+
+/// A fresh repository has no `origin`, and a Pool created before any remote
+/// existed carries an empty `gh_repo`. Orchestration must name the missing
+/// remote and the command that adds it rather than failing with a format
+/// complaint about an empty slug.
+#[test]
+fn prepare_names_the_missing_remote_instead_of_an_empty_slug_format_error() {
+    let directory = TempDir::new().expect("temporary repository");
+    init_colocated_repository(directory.path());
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker_with_gh_repo(&repository, &worker, "");
+    let parent = ParentTicket::new(TicketId::parse("ENG-100").expect("Parent Ticket"));
+    let discovery = TicketDiscovery::new(StaticQuery(r#"{"sub_issues":[]}"#));
+
+    let error = repository
+        .orchestration_runner()
+        .prepare(
+            &OrchestrationRequest::new(parent.id().clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+        )
+        .expect_err("a repository with no origin must fail at identity");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("origin"),
+        "the failure must name the missing remote: {message}"
+    );
+    assert!(
+        message.contains("jj git remote add origin"),
+        "the failure must name the command that adds it: {message}"
+    );
+}
+
+/// The same empty `gh_repo` must not block dispatch once an `origin` exists:
+/// orchestration derives the identity from the remote and records it on the
+/// group instead of failing on the empty slug.
+#[test]
+fn prepare_derives_identity_from_origin_when_the_pool_gh_repo_is_empty() {
+    let directory = TempDir::new().expect("temporary repository");
+    init_colocated_repository(directory.path());
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker_with_gh_repo(&repository, &worker, "");
+    add_origin(&repository);
+    let parent_id = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+    let discovery = TicketDiscovery::new(StaticQuery(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Foundation","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    ));
+
+    let preparation = repository
+        .orchestration_runner()
+        .prepare(
+            &OrchestrationRequest::new(parent_id.clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+        )
+        .expect("an origin remote must supply the identity the Pool left empty");
+    assert!(matches!(
+        preparation.start(),
+        jjfx::engine::OrchestrationStart::Group
+    ));
+
+    let loaded = match repository
+        .state_store()
+        .dispatch_group(parent_id)
+        .load()
+        .expect("load group")
+    {
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("group missing"),
+    };
+    assert_eq!(loaded.gh_repo, "owner/repo");
 }

@@ -658,43 +658,9 @@ impl DirectDispatch {
     }
 
     fn repository_identity(&self) -> Result<RepositoryIdentity, DirectDispatchError> {
-        let configured = self
-            .repository
-            .worker_pool()
-            .snapshot()
-            .pool()
-            .map(|pool| pool.gh_repo().trim_end_matches(".git").to_owned())
-            .filter(|value| !value.is_empty());
-        let slug = match configured {
-            Some(slug) => slug,
-            None => {
-                let output = crate::engine::workspace::git_remotes(self.repository.root())
-                    .map_err(|error| DirectDispatchError::Identity(error.to_string()))?;
-                if !output.status.success() {
-                    return Err(DirectDispatchError::Identity(
-                        String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-                    ));
-                }
-                let slug = String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .find_map(|line| {
-                        let mut fields = line.split_whitespace();
-                        match (fields.next(), fields.next()) {
-                            (Some("origin"), Some(remote)) => Some(remote_slug(remote)),
-                            _ => None,
-                        }
-                    })
-                    .filter(|slug| !slug.is_empty());
-                slug.ok_or_else(|| {
-                    DirectDispatchError::Identity(
-                        "no `origin` remote to derive an owner/name slug from; add one with \
-                         `jj git remote add origin <url>` (or set the pool's `gh_repo`)"
-                            .to_owned(),
-                    )
-                })?
-            }
-        };
-        RepositoryIdentity::parse(slug)
+        let snapshot = self.repository.worker_pool().snapshot();
+        let configured = snapshot.pool().map_or("", |pool| pool.gh_repo());
+        crate::engine::workspace::repository_identity(self.repository.root(), configured)
             .map_err(|error| DirectDispatchError::Identity(error.to_string()))
     }
 
@@ -743,18 +709,6 @@ fn release_before_launch(
             primary: Box::new(primary),
             release,
         },
-    }
-}
-
-fn remote_slug(remote: &str) -> String {
-    let remote = remote.trim_end_matches(".git");
-    if let Some((_, path)) = remote.rsplit_once(':') {
-        return path.to_owned();
-    }
-    let mut parts = remote.rsplitn(3, '/');
-    match (parts.next(), parts.next()) {
-        (Some(name), Some(owner)) => format!("{owner}/{name}"),
-        _ => remote.to_owned(),
     }
 }
 
