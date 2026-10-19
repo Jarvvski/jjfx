@@ -1104,9 +1104,10 @@ impl OrchestrationRunner {
         let pool = pool
             .pool()
             .ok_or_else(|| OrchestrationError::Execution("Worker Pool is missing".to_owned()))?;
-        let identity = RepositoryIdentity::parse(pool.gh_repo())
-            .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
-        let start = self.discover(request, parent, discovery, &identity, pool.gh_repo())?;
+        let identity =
+            crate::engine::workspace::repository_identity(self.repository.root(), pool.gh_repo())
+                .map_err(|error| OrchestrationError::Execution(error.to_string()))?;
+        let start = self.discover(request, parent, discovery, &identity, identity.as_str())?;
         let maximum_wave = match &start {
             OrchestrationStart::Group => match group_repository
                 .load()

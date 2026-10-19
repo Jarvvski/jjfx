@@ -1517,22 +1517,10 @@ fn discover_gh_repo(repository: &Repository) -> Result<String, WorkerPoolError> 
     for line in String::from_utf8_lossy(&output.stdout).lines() {
         let fields = line.split_whitespace().collect::<Vec<_>>();
         if fields.len() >= 2 && fields[0] == "origin" {
-            return Ok(remote_slug(fields[1]));
+            return Ok(crate::engine::workspace::remote_slug(fields[1]));
         }
     }
     Ok(String::new())
-}
-
-fn remote_slug(remote: &str) -> String {
-    let remote = remote.trim_end_matches(".git");
-    if let Some((_, path)) = remote.rsplit_once(':') {
-        return path.to_owned();
-    }
-    let mut parts = remote.rsplitn(3, '/');
-    match (parts.next(), parts.next()) {
-        (Some(name), Some(owner)) => format!("{owner}/{name}"),
-        _ => remote.to_owned(),
-    }
 }
 
 /// Clears every Run-owned Worker field, leaving alias metadata and unknown
