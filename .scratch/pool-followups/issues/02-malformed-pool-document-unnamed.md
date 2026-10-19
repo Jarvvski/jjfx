@@ -1,7 +1,7 @@
 # A malformed pool document prints an unnamed diagnostic
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -16,10 +16,36 @@ Name the pool in the message, at the source that builds the diagnostic (`Reposit
 
 ## Acceptance Criteria
 
-- [ ] A malformed pool document's diagnostic names the pool it belongs to.
-- [ ] It still reaches stderr on `pool list` and prose `status`.
-- [ ] An absent pool document still prints nothing.
-- [ ] `mise run check` is green.
+- [x] A malformed pool document's diagnostic names the pool it belongs to.
+- [x] It still reaches stderr on `pool list` and prose `status`.
+- [x] An absent pool document still prints nothing.
+- [x] `mise run check` is green.
+
+## Resolution
+
+Named the pool where the diagnostic is built, in
+`Repository::read_worker_pool_snapshot` (`src/engine/pool.rs`). The
+`MalformedPool` message is now
+`Worker Pool <name>: <error>`, so the three surfaces that print
+`SnapshotDiagnostic::message()` - `pool list`, prose `status` (the same
+`pool_list_command`) and the TUI (`src/render/pool.rs`) - all name the lane
+without any printer being patched. The absent arm is untouched: `Loaded::Missing`
+still returns no diagnostic, so a declared-but-unmaterialised lane stays silent
+while an unreadable document still reports.
+
+Verified by a manual drive (a repo declaring `alpha` with a malformed
+`pool.json` and `beta` unmaterialised) which prints
+`Worker Pool alpha: cannot decode Worker Pool: key must be a string at line 1
+column 3` on both `pool list` and `status` and nothing for `beta`; and by three
+new tests: an engine test in `tests/worker_pool.rs`
+(`malformed_pool_diagnostic_names_the_pool`), a TUI render test in
+`src/render/pool.rs`
+(`the_pool_view_names_a_malformed_lane_in_its_diagnostic`), and an end-to-end
+test in `tests/pool_status_json.rs`
+(`a_malformed_pool_document_is_reported_naming_its_lane`). The existing
+`missing_pool_is_not_invented_as_empty` and
+`listing_declared_but_unmaterialised_pools_is_silent_on_stderr` tests continue
+to pin the absent case silent. `mise run check` is green.
 
 ## References
 

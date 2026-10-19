@@ -90,6 +90,15 @@ impl Fixture {
         .expect("worker state");
     }
 
+    /// Seeds `.jj/pools/<pool>/pool.json` with bytes that cannot be decoded -
+    /// the unreadable case, which is a real error rather than the normal absence
+    /// of a lane that has never run.
+    fn seed_malformed_pool(&self, pool: &str) {
+        let directory = self.path().join(".jj/pools").join(pool);
+        fs::create_dir_all(&directory).expect("pool directory");
+        fs::write(directory.join("pool.json"), b"{ not json").expect("malformed pool state");
+    }
+
     fn jjfx(&self, args: &[&str]) -> Output {
         Command::new(env!("CARGO_BIN_EXE_jjfx"))
             .args(args)
@@ -182,6 +191,39 @@ fn listing_declared_but_unmaterialised_pools_is_silent_on_stderr() {
     let text = stdout(&output);
     assert!(text.contains("alpha"), "{text}");
     assert!(text.contains("beta"), "{text}");
+}
+
+#[test]
+fn a_malformed_pool_document_is_reported_naming_its_lane() {
+    let fixture = Fixture::new();
+    // `alpha` holds a document that exists but cannot be decoded - a real error,
+    // so it is reported - while `beta` has no state at all, the normal absent
+    // case, which must stay silent.
+    fixture.write_repo_config("[pools.alpha]\nsize = 1\n[pools.beta]\nsize = 1\n");
+    fixture.seed_malformed_pool("alpha");
+
+    // `pool list` and prose `status` are the same command, but the point is the
+    // text a human reads on either spelling, so drive both.
+    for args in [&["pool", "list"][..], &["status"][..]] {
+        let output = fixture.jjfx(args);
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = stderr(&output);
+        assert!(
+            text.contains("alpha"),
+            "`{}` must name the corrupt lane: {text:?}",
+            args[0]
+        );
+        assert!(
+            text.contains("cannot decode Worker Pool"),
+            "`{}` must keep the malformed detail: {text:?}",
+            args[0]
+        );
+        assert!(
+            !text.contains("beta"),
+            "`{}` must stay silent about an absent lane: {text:?}",
+            args[0]
+        );
+    }
 }
 
 #[test]

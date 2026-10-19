@@ -421,7 +421,7 @@ fn worker_result_line(result: &RunResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::{Repository, WorkerId};
+    use crate::engine::{PoolName, Repository, WorkerId};
     use crate::pool_session::PoolSession;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
@@ -633,6 +633,32 @@ mod tests {
         let text = render(&session, PoolPane::View, Some("worker-01"));
         assert!(text.contains("spend: $0.0000"), "{text}");
         assert!(text.contains("runs: 0"), "{text}");
+    }
+
+    #[test]
+    fn the_pool_view_names_a_malformed_lane_in_its_diagnostic() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        let directory = temp.path().join(".jj/pools/alpha");
+        std::fs::create_dir_all(&directory).expect("pool directory");
+        std::fs::write(directory.join("pool.json"), b"{ not json").expect("malformed pool");
+        let repository = Repository::open(temp.path())
+            .expect("repository")
+            .with_pool(PoolName::parse("alpha").expect("pool name"));
+        let session = PoolSession {
+            worker_pool: Some(repository.read_worker_pool_snapshot()),
+            ..PoolSession::default()
+        };
+
+        let text = render(&session, PoolPane::View, None);
+
+        assert!(
+            text.contains("alpha"),
+            "the rendered diagnostic must name its lane: {text}"
+        );
+        assert!(
+            text.contains("cannot decode Worker Pool"),
+            "the rendered diagnostic must keep the detail: {text}"
+        );
     }
 
     #[test]
