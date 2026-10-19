@@ -1,8 +1,8 @@
 //! One model of "a pull request as `gh` reports it", and the `gh pr list` reads
-//! jjfx does over it. Both consumers - `work`'s lifecycle overlay and Forge's
-//! stacked Pull Request submission - project from the one [`Pr`] here, so
-//! the "is this PR merged?" question is answered in exactly one place and the two
-//! callers cannot drift apart (the divergence this module exists to remove).
+//! jjfx does over it. The work lifecycle overlay and Forge's Pull Request
+//! submission both project from the one [`Pr`] here, so the "is this PR merged?"
+//! question is answered in exactly one place and the two callers cannot drift
+//! apart (the divergence this module exists to remove).
 
 use serde::Deserialize;
 
@@ -10,7 +10,7 @@ use crate::cmd::cmd;
 
 /// The `--json` fields every `gh pr list` read requests, spelled once. Their
 /// camelCase spellings map onto [`Pr`]'s fields (two via `serde(rename)`).
-const FIELDS: &str = "number,headRefName,state,reviewDecision,body,mergedAt";
+const FIELDS: &str = "number,headRefName,state,reviewDecision,mergedAt";
 
 /// One PR as reported by `gh pr list --json`. Carries the union of the fields the
 /// two consumers need; each reads only the subset it cares about.
@@ -26,8 +26,6 @@ pub struct Pr {
     /// The review verdict (`reviewDecision`); `None` when no decision yet.
     #[serde(rename = "reviewDecision")]
     pub review: Option<String>,
-    /// The PR description; rewritten with a `## Stack` section on submission.
-    pub body: Option<String>,
     #[serde(rename = "mergedAt")]
     pub merged_at: Option<String>,
 }
@@ -96,7 +94,6 @@ mod tests {
             head: "branch".to_string(),
             state: state.to_string(),
             review: None,
-            body: None,
             merged_at: merged_at.map(String::from),
         }
     }
@@ -110,7 +107,6 @@ mod tests {
             "headRefName": "adam/feature",
             "state": "OPEN",
             "reviewDecision": "APPROVED",
-            "body": "the description",
             "mergedAt": null
         }]"#;
         let prs: Vec<Pr> = serde_json::from_str(json).expect("gh json parses");
@@ -119,7 +115,6 @@ mod tests {
         assert_eq!(pr.head, "adam/feature");
         assert_eq!(pr.state, "OPEN");
         assert_eq!(pr.review.as_deref(), Some("APPROVED"));
-        assert_eq!(pr.body.as_deref(), Some("the description"));
         assert_eq!(pr.merged_at, None);
     }
 

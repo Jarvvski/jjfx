@@ -33,24 +33,25 @@ fn untrusted_block(value: &str) -> String {
 }
 
 /// Delivery obligations supplied by a Dispatch caller.
+///
+/// Delivery is jjfx's job, not the agent's: this carries only what the agent
+/// must supply for jjfx to deliver - the assignee to claim the Ticket as, and the
+/// bookmark namespace to name its change under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeliveryContract {
     assignee: String,
     branch_prefix: String,
-    pull_request_command: String,
 }
 
 impl DeliveryContract {
-    /// Creates the assignee, bookmark namespace, and Pull Request command contract.
+    /// Creates the assignee and bookmark namespace delivery contract.
     pub fn new(
         assignee: impl Into<String>,
         branch_prefix: impl Into<String>,
-        pull_request_command: impl Into<String>,
     ) -> Result<Self, DispatchPromptError> {
         Ok(Self {
             assignee: required(assignee, "assignee")?,
             branch_prefix: required(branch_prefix, "branch prefix")?,
-            pull_request_command: required(pull_request_command, "Pull Request command")?,
         })
     }
 }
@@ -153,10 +154,10 @@ impl DispatchPromptBuilder {
     ) -> Result<AgentRuntimeInvocation, DispatchPromptError> {
         let ticket_lower = context.ticket.id().as_str().to_ascii_lowercase();
         let mut system_prompt = format!(
-            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- The gh CLI requires: gh -R {} pr create ...\n- Branch naming: {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- To push your work: jj git push --named <branch>=@\n- Use Linear tools to update status only when they are available; never block on their absence.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the PR description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
-            context.repository.as_str(),
+            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- Name your change's bookmark {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- Describe the change with jj describe; its description becomes the Pull Request body. jjfx delivers the change to {}: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens the Pull Request. Do not push or open the Pull Request yourself.\n- Use Linear tools to update status only when they are available; never block on their absence.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the change description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
             context.delivery.branch_prefix,
             ticket_lower,
+            context.repository.as_str(),
         );
         if let Some(dependency) = context
             .dependency_context
@@ -201,18 +202,17 @@ impl DispatchPromptBuilder {
             ));
         }
         worker_prompt.push_str(&format!(
-            "3. Derive a bookmark beginning {}/{ticket_lower}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe.\n8. Push with jj git push.\n9. Create the Pull Request with: {}\n",
+            "3. Derive a bookmark beginning {}/{ticket_lower}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe; its description becomes the Pull Request body.\n8. jjfx delivers the change: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens the Pull Request. Do not push or open the Pull Request yourself.\n",
             context.delivery.branch_prefix,
-            context.delivery.pull_request_command,
         ));
         if context.ticket_details.is_some() {
             worker_prompt.push_str(&format!(
-                "10. If Linear delivery tools are available, move {} to Reviewable and add a Linear comment summarizing the implementation, PR URL, and assumptions; otherwise note the summary in the Pull Request.\n",
+                "9. If Linear delivery tools are available, move {} to Reviewable and add a Linear comment summarizing the implementation and any assumptions; otherwise note the summary in the change description.\n",
                 context.ticket.id(),
             ));
         } else {
             worker_prompt.push_str(&format!(
-                "10. Move {} to Reviewable and add a Linear comment summarizing the implementation, PR URL, and assumptions.\n",
+                "9. Move {} to Reviewable and add a Linear comment summarizing the implementation and any assumptions.\n",
                 context.ticket.id(),
             ));
         }

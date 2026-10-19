@@ -30,6 +30,8 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Breaking
 
 - jjfx status --json now emits an object (`workers` plus `waiting`) instead of a bare array, so the waiting set a capped Dispatch held back is machine-readable; consumers reading the array must read `.workers[]`.
+- the forge opens one Pull Request per change against the default branch instead of assembling base-chained PR stacks and rewriting bodies with a `## Stack` section; a repository with no forge (Pull Requests off, or no origin remote) now forges cleanly rather than reporting a skip
+- jjfx review no longer ingests an AI reviewer's findings: the `[review] reviewer` setting and its CodeRabbit and opencode-action adapters are removed, so a config that set `reviewer` must drop it; `[review] max_passes` remains as the tool-enforced re-review bound
 
 ### Added
 

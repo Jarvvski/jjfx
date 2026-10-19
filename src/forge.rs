@@ -233,15 +233,6 @@ struct Change {
     description: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PullRequest {
-    number: u64,
-    head: String,
-    state: String,
-    body: String,
-    merged: bool,
-}
-
 struct NewPullRequest {
     slug: String,
     head: String,
@@ -253,9 +244,9 @@ struct NewPullRequest {
 
 trait GitHubAdapter: Send + Sync {
     fn default_branch(&self, slug: &str) -> Result<String, String>;
-    fn find(&self, slug: &str, head: &str) -> Result<Option<PullRequest>, String>;
-    fn create(&self, request: NewPullRequest) -> Result<PullRequest, String>;
-    fn edit(&self, slug: &str, number: u64, body: &str, base: &str) -> Result<(), String>;
+    /// Whether a Pull Request already exists for `head`, open or merged.
+    fn exists(&self, slug: &str, head: &str) -> Result<bool, String>;
+    fn create(&self, request: NewPullRequest) -> Result<(), String>;
 }
 
 /// What the forge pipeline needs from jjfx's config: how it opens Pull Requests,
@@ -532,22 +523,11 @@ impl GitHubAdapter for SystemGitHub {
         }
     }
 
-    fn find(&self, slug: &str, head: &str) -> Result<Option<PullRequest>, String> {
-        crate::prs::find(slug, head).map(|pull_request| {
-            pull_request.map(|pull_request| {
-                let merged = pull_request.is_merged();
-                PullRequest {
-                    number: pull_request.number,
-                    head: pull_request.head,
-                    state: pull_request.state,
-                    body: pull_request.body.unwrap_or_default(),
-                    merged,
-                }
-            })
-        })
+    fn exists(&self, slug: &str, head: &str) -> Result<bool, String> {
+        crate::prs::find(slug, head).map(|pull_request| pull_request.is_some())
     }
 
-    fn create(&self, request: NewPullRequest) -> Result<PullRequest, String> {
+    fn create(&self, request: NewPullRequest) -> Result<(), String> {
         let mut args = vec![
             "pr",
             "create",
@@ -576,43 +556,7 @@ impl GitHubAdapter for SystemGitHub {
                 out.stderr().trim()
             ));
         }
-        let number = out
-            .stdout()
-            .trim()
-            .rsplit('/')
-            .next()
-            .and_then(|number| number.parse().ok())
-            .ok_or_else(|| format!("gh pr create ({}): no PR url in output", request.head))?;
-        Ok(PullRequest {
-            number,
-            head: request.head,
-            state: "OPEN".to_string(),
-            body: request.body,
-            merged: false,
-        })
-    }
-
-    fn edit(&self, slug: &str, number: u64, body: &str, base: &str) -> Result<(), String> {
-        let number_arg = number.to_string();
-        let out = cmd("gh")
-            .args([
-                "pr",
-                "edit",
-                &number_arg,
-                "-R",
-                slug,
-                "--body",
-                body,
-                "--base",
-                base,
-            ])
-            .run()
-            .map_err(|error| error.to_string())?;
-        if out.ok() {
-            Ok(())
-        } else {
-            Err(format!("gh pr edit #{number}: {}", out.stderr().trim()))
-        }
+        Ok(())
     }
 }
 
@@ -680,6 +624,17 @@ fn run_pipeline(
         }
     } else {
         Ok(None)
+    };
+
+    // Whether this run has a forge at all. A repository with no forge - Pull
+    // Requests switched off, or no origin remote to open one against - is a
+    // supported path, not a degraded one: the Pull Request step does not apply
+    // and does not taint an otherwise clean forge. A forge that *failed* is a
+    // different fact, and stays a skip with a reason.
+    let forge: Option<Result<&PullRequestContext, &str>> = match &pull_request_context {
+        Ok(Some(context)) if config.pull_requests => Some(Ok(context)),
+        Err(error) => Some(Err(error.as_str())),
+        Ok(_) => None,
     };
 
     for (target, state) in targets.iter().zip(&mut progress) {
@@ -789,13 +744,16 @@ fn run_pipeline(
             continue;
         }
 
-        state.set(Step::PullRequest, Status::Running);
-        publish_progress(tx, target, state, None);
-        if config.pull_requests {
-            let reason = match pull_request_context.as_ref() {
-                Err(error) => Some(format!("pr: {error}")),
-                Ok(None) => Some("pr: no origin remote".to_string()),
-                Ok(Some(context)) => match jj.changes(&target.dir) {
+        match &forge {
+            // No forge: the step does not apply, and the run is still clean.
+            None => {
+                state.set(Step::PullRequest, Status::NotApplicable);
+                publish_progress(tx, target, state, None);
+            }
+            Some(Ok(context)) => {
+                state.set(Step::PullRequest, Status::Running);
+                publish_progress(tx, target, state, None);
+                let reason = match jj.changes(&target.dir) {
                     Ok(changes) => {
                         match pull_requests::submit(context, changes, config.draft, github) {
                             pull_requests::Outcome::Did => None,
@@ -806,15 +764,25 @@ fn run_pipeline(
                         }
                     }
                     Err(error) => Some(format!("pr: {error}")),
-                },
-            };
-            if let Some(reason) = reason {
-                skip_step(tx, target, state, Step::PullRequest, &reason);
-            } else {
-                succeed_step(tx, target, state, Step::PullRequest);
+                };
+                if let Some(reason) = reason {
+                    skip_step(tx, target, state, Step::PullRequest, &reason);
+                } else {
+                    succeed_step(tx, target, state, Step::PullRequest);
+                }
             }
-        } else {
-            succeed_step(tx, target, state, Step::PullRequest);
+            // A forge that could not be reached is a failure, not an absence.
+            Some(Err(error)) => {
+                state.set(Step::PullRequest, Status::Running);
+                publish_progress(tx, target, state, None);
+                skip_step(
+                    tx,
+                    target,
+                    state,
+                    Step::PullRequest,
+                    &format!("pr: {error}"),
+                );
+            }
         }
 
         state.active = false;
@@ -1141,6 +1109,28 @@ mod tests {
         }
     }
 
+    /// A jj whose repository has no `origin` remote, so there is no forge to
+    /// open Pull Requests against.
+    struct NoOriginJj;
+
+    impl JjAdapter for NoOriginJj {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
+        }
+
+        fn origin_slug(&self) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+    }
+
     struct RepositoryGitHub;
 
     impl GitHubAdapter for RepositoryGitHub {
@@ -1149,16 +1139,12 @@ mod tests {
             Ok("main".to_string())
         }
 
-        fn find(&self, _slug: &str, _head: &str) -> Result<Option<PullRequest>, String> {
+        fn exists(&self, _slug: &str, _head: &str) -> Result<bool, String> {
             panic!("an empty change chain must not query Pull Requests")
         }
 
-        fn create(&self, _request: NewPullRequest) -> Result<PullRequest, String> {
+        fn create(&self, _request: NewPullRequest) -> Result<(), String> {
             panic!("an empty change chain must not create Pull Requests")
-        }
-
-        fn edit(&self, _slug: &str, _number: u64, _body: &str, _base: &str) -> Result<(), String> {
-            panic!("an empty change chain must not edit Pull Requests")
         }
     }
 
@@ -1369,91 +1355,37 @@ mod tests {
             Err("gh: not authenticated".to_string())
         }
 
-        fn find(&self, _slug: &str, _head: &str) -> Result<Option<PullRequest>, String> {
+        fn exists(&self, _slug: &str, _head: &str) -> Result<bool, String> {
             panic!("a failed default-branch lookup must not query Pull Requests")
         }
 
-        fn create(&self, _request: NewPullRequest) -> Result<PullRequest, String> {
+        fn create(&self, _request: NewPullRequest) -> Result<(), String> {
             panic!("a failed default-branch lookup must not create Pull Requests")
-        }
-
-        fn edit(&self, _slug: &str, _number: u64, _body: &str, _base: &str) -> Result<(), String> {
-            panic!("a failed default-branch lookup must not edit Pull Requests")
         }
     }
 
+    /// A created Pull Request as the fake forge recorded it.
     #[derive(Debug, Clone, PartialEq, Eq)]
-    struct RemotePullRequest {
-        number: u64,
+    struct CreatedPullRequest {
         head: String,
         base: String,
         title: String,
         body: String,
-        merged: bool,
         draft: bool,
     }
 
-    struct GitHubState {
-        next_number: u64,
-        pull_requests: Vec<RemotePullRequest>,
-    }
-
+    /// A forge that records what was opened and answers `exists` from that log.
+    #[derive(Default)]
     struct MemoryGitHub {
-        state: Mutex<GitHubState>,
+        created: Mutex<Vec<CreatedPullRequest>>,
     }
 
     impl MemoryGitHub {
-        fn with_merged_base() -> Self {
-            Self {
-                state: Mutex::new(GitHubState {
-                    next_number: 11,
-                    pull_requests: vec![RemotePullRequest {
-                        number: 10,
-                        head: "base".to_string(),
-                        base: "main".to_string(),
-                        title: "Base change".to_string(),
-                        body: "Base body".to_string(),
-                        merged: true,
-                        draft: false,
-                    }],
-                }),
-            }
-        }
-
-        fn snapshot(&self) -> Vec<RemotePullRequest> {
-            self.state
+        fn snapshot(&self) -> Vec<CreatedPullRequest> {
+            self.created
                 .lock()
                 .expect("fake GitHub state is not poisoned")
-                .pull_requests
                 .clone()
-        }
-
-        fn with_merged_base_and_open_mid() -> Self {
-            Self {
-                state: Mutex::new(GitHubState {
-                    next_number: 12,
-                    pull_requests: vec![
-                        RemotePullRequest {
-                            number: 10,
-                            head: "base".to_string(),
-                            base: "main".to_string(),
-                            title: "Base change".to_string(),
-                            body: "Base body".to_string(),
-                            merged: true,
-                            draft: false,
-                        },
-                        RemotePullRequest {
-                            number: 11,
-                            head: "mid".to_string(),
-                            base: "base".to_string(),
-                            title: "Mid change".to_string(),
-                            body: "Mid body\n\n## Stack\n\n- stale".to_string(),
-                            merged: false,
-                            draft: true,
-                        },
-                    ],
-                }),
-            }
         }
     }
 
@@ -1462,64 +1394,26 @@ mod tests {
             Ok("main".to_string())
         }
 
-        fn find(&self, _slug: &str, head: &str) -> Result<Option<PullRequest>, String> {
+        fn exists(&self, _slug: &str, head: &str) -> Result<bool, String> {
             Ok(self
-                .state
+                .created
                 .lock()
                 .expect("fake GitHub state is not poisoned")
-                .pull_requests
                 .iter()
-                .find(|pull_request| pull_request.head == head)
-                .map(|pull_request| PullRequest {
-                    number: pull_request.number,
-                    head: pull_request.head.clone(),
-                    state: if pull_request.merged {
-                        "MERGED".to_string()
-                    } else {
-                        "OPEN".to_string()
-                    },
-                    body: pull_request.body.clone(),
-                    merged: pull_request.merged,
-                }))
+                .any(|pull_request| pull_request.head == head))
         }
 
-        fn create(&self, request: NewPullRequest) -> Result<PullRequest, String> {
-            let mut state = self
-                .state
+        fn create(&self, request: NewPullRequest) -> Result<(), String> {
+            self.created
                 .lock()
-                .expect("fake GitHub state is not poisoned");
-            let number = state.next_number;
-            state.next_number += 1;
-            state.pull_requests.push(RemotePullRequest {
-                number,
-                head: request.head.clone(),
-                base: request.base,
-                title: request.title,
-                body: request.body.clone(),
-                merged: false,
-                draft: request.draft,
-            });
-            Ok(PullRequest {
-                number,
-                head: request.head,
-                state: "OPEN".to_string(),
-                body: request.body,
-                merged: false,
-            })
-        }
-
-        fn edit(&self, _slug: &str, number: u64, body: &str, base: &str) -> Result<(), String> {
-            let mut state = self
-                .state
-                .lock()
-                .expect("fake GitHub state is not poisoned");
-            let pull_request = state
-                .pull_requests
-                .iter_mut()
-                .find(|pull_request| pull_request.number == number)
-                .expect("edited Pull Request exists");
-            pull_request.body = body.to_string();
-            pull_request.base = base.to_string();
+                .expect("fake GitHub state is not poisoned")
+                .push(CreatedPullRequest {
+                    head: request.head,
+                    base: request.base,
+                    title: request.title,
+                    body: request.body,
+                    draft: request.draft,
+                });
             Ok(())
         }
     }
@@ -1691,6 +1585,8 @@ mod tests {
                     None,
                     "progress",
                 ),
+                // No forge configured: the Pull Request step does not apply, and
+                // the run is still a clean success.
                 (
                     "feat".into(),
                     [
@@ -1698,20 +1594,7 @@ mod tests {
                         Status::Ok,
                         Status::NotApplicable,
                         Status::Ok,
-                        Status::Running,
-                    ],
-                    true,
-                    None,
-                    "progress",
-                ),
-                (
-                    "feat".into(),
-                    [
-                        Status::Ok,
-                        Status::Ok,
                         Status::NotApplicable,
-                        Status::Ok,
-                        Status::Ok,
                     ],
                     true,
                     None,
@@ -2086,7 +1969,7 @@ mod tests {
                 ..
             }) if status(progress, Step::Weld) == Status::Skipped
                 && status(progress, Step::Push) == Status::Ok
-                && status(progress, Step::PullRequest) == Status::Ok
+                && status(progress, Step::PullRequest) == Status::NotApplicable
         ));
     }
 
@@ -2383,8 +2266,64 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_request_step_creates_and_links_the_stack() {
-        let github = Arc::new(MemoryGitHub::with_merged_base());
+    async fn a_repository_with_no_forge_forges_cleanly() {
+        // A repository that does not open Pull Requests is a supported path, not
+        // a degraded one: the Pull Request step does not apply, and the run is a
+        // clean success rather than a skip that retains a reason.
+        let forge = Forge::with_adapters(
+            settings(false, true),
+            Arc::new(SuccessfulJj),
+            Arc::new(UnlockedGpg),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress { progress, .. }
+                if status(progress, Step::PullRequest) == Status::NotApplicable
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished { progress: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_no_origin_remote_forges_cleanly() {
+        // Pull Requests are on, but there is no origin remote to open one
+        // against: still a supported path, not a skip.
+        let forge = Forge::with_github(
+            settings(true, true),
+            Arc::new(NoOriginJj),
+            Arc::new(UnlockedGpg),
+            Arc::new(RepositoryGitHub),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress { progress, .. }
+                if status(progress, Step::PullRequest) == Status::NotApplicable
+        )));
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished { progress: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn pull_request_step_opens_one_flat_pr_per_change() {
+        let github = Arc::new(MemoryGitHub::default());
         let forge = Forge::with_github(
             settings(true, true),
             Arc::new(StackedChangesJj),
@@ -2402,34 +2341,30 @@ mod tests {
             updates.last(),
             Some(Update::Finished { progress: None, .. })
         ));
+        // One Pull Request per change, each based on the default branch - no
+        // base-chained stack, and no `## Stack` section written into any body.
         assert_eq!(
             github.snapshot(),
             vec![
-                RemotePullRequest {
-                    number: 10,
+                CreatedPullRequest {
                     head: "base".to_string(),
                     base: "main".to_string(),
                     title: "Base change".to_string(),
                     body: "Base body".to_string(),
-                    merged: true,
-                    draft: false,
+                    draft: true,
                 },
-                RemotePullRequest {
-                    number: 11,
+                CreatedPullRequest {
                     head: "mid".to_string(),
                     base: "main".to_string(),
                     title: "Mid change".to_string(),
-                    body: "Mid body\n\n## Stack\n\n- ~~#10~~\n- 👉🏻 #11\n- #12".to_string(),
-                    merged: false,
+                    body: "Mid body".to_string(),
                     draft: true,
                 },
-                RemotePullRequest {
-                    number: 12,
+                CreatedPullRequest {
                     head: "top".to_string(),
-                    base: "mid".to_string(),
+                    base: "main".to_string(),
                     title: "Top change".to_string(),
-                    body: "Top body\n\n## Stack\n\n- ~~#10~~\n- #11\n- 👉🏻 #12".to_string(),
-                    merged: false,
+                    body: "Top body".to_string(),
                     draft: true,
                 },
             ]
@@ -2437,8 +2372,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_request_step_updates_an_existing_open_stack_entry() {
-        let github = Arc::new(MemoryGitHub::with_merged_base_and_open_mid());
+    async fn a_change_that_already_has_a_pull_request_is_left_alone() {
+        // A re-forge must not duplicate a Pull Request or rewrite its body.
+        let github = Arc::new(MemoryGitHub::default());
+        github
+            .created
+            .lock()
+            .expect("fake GitHub state is not poisoned")
+            .push(CreatedPullRequest {
+                head: "base".to_string(),
+                base: "main".to_string(),
+                title: "Base change".to_string(),
+                body: "human-edited body".to_string(),
+                draft: false,
+            });
         let forge = Forge::with_github(
             settings(true, true),
             Arc::new(StackedChangesJj),
@@ -2446,24 +2393,14 @@ mod tests {
             github.clone(),
         );
 
-        let updates = updates(forge.start(vec![Target::new(
+        updates(forge.start(vec![Target::new(
             "feat".to_string(),
             PathBuf::from("/workspace/feat"),
         )]))
         .await;
-        let pull_requests = github.snapshot();
 
-        assert!(matches!(
-            updates.last(),
-            Some(Update::Finished { progress: None, .. })
-        ));
-        assert_eq!(pull_requests[1].number, 11);
-        assert_eq!(pull_requests[1].base, "main");
-        assert_eq!(
-            pull_requests[1].body,
-            "Mid body\n\n## Stack\n\n- ~~#10~~\n- 👉🏻 #11\n- #12"
-        );
-        assert_eq!(pull_requests[2].number, 12);
-        assert_eq!(pull_requests[2].base, "mid");
+        let pull_requests = github.snapshot();
+        assert_eq!(pull_requests.len(), 3);
+        assert_eq!(pull_requests[0].body, "human-edited body");
     }
 }

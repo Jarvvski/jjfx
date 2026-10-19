@@ -73,7 +73,7 @@ fn inlined_ticket_details_replace_the_fetch_step_and_soften_status_updates() {
     assert!(prompt.contains("TICKET DETAILS"));
     assert!(prompt.contains("inline the body"));
     assert!(!prompt.contains("Fetch the Ticket through Linear tools"));
-    assert!(prompt.contains("otherwise note the summary in the Pull Request"));
+    assert!(prompt.contains("otherwise note the summary in the change description"));
 }
 
 #[test]
@@ -115,8 +115,12 @@ fn initial_dispatch_prompt_pins_delivery_obligations_and_supported_overrides() {
     assert!(prompt.contains("AGENTS.md"));
     assert!(prompt.contains("TDD"));
     assert!(prompt.contains("jj describe"));
-    assert!(prompt.contains("jj git push"));
-    assert!(prompt.contains("gh -R owner/repo pr create --fill"));
+    // Delivery is jjfx's job, not a command list the agent must run: the prompt
+    // says jjfx delivers and the agent does not push or open the Pull Request.
+    assert!(prompt.contains("jjfx delivers the change"));
+    assert!(prompt.contains("Do not push or open the Pull Request yourself"));
+    assert!(!prompt.contains("jj git push"));
+    assert!(!prompt.contains("gh -R"));
     assert!(prompt.contains("Reviewable"));
     assert!(prompt.contains("Do NOT add any AI attribution"));
     assert!(args.windows(2).any(|pair| pair == ["--model", "opus"]));
@@ -136,12 +140,7 @@ fn untrusted_ticket_text_is_fenced_and_cannot_forge_the_terminator() {
         TicketTitle::parse(hostile.clone()).expect("Ticket title"),
         TicketStatus::parse("Todo").expect("Ticket status"),
     );
-    let delivery = DeliveryContract::new(
-        "owner@example.com",
-        "adam",
-        "gh -R owner/repo pr create --fill",
-    )
-    .expect("delivery contract");
+    let delivery = DeliveryContract::new("owner@example.com", "adam").expect("delivery contract");
     let context = DispatchPromptContext::new(
         AgentRuntime::Claude,
         RepositoryIdentity::parse("owner/repo").expect("Repository identity"),
@@ -190,12 +189,7 @@ fn dispatch_context(runtime: AgentRuntime) -> DispatchPromptContext {
         TicketTitle::parse("Ship typed discovery").expect("Ticket title"),
         TicketStatus::parse("Todo").expect("Ticket status"),
     );
-    let delivery = DeliveryContract::new(
-        "owner@example.com",
-        "adam",
-        "gh -R owner/repo pr create --fill",
-    )
-    .expect("delivery contract");
+    let delivery = DeliveryContract::new("owner@example.com", "adam").expect("delivery contract");
     DispatchPromptContext::new(
         runtime,
         RepositoryIdentity::parse("owner/repo").expect("Repository identity"),
