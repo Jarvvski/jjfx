@@ -318,12 +318,23 @@ fn a_failed_pool_shrink_leaves_no_cleanup_marker_on_a_member() {
             .expect("idle Worker");
     }
 
-    // Make the pool directory read-only so the Worker Pool manifest's atomic write
-    // cannot create its temporary file. The cleanup markers live in the same
-    // directory as the manifest now, so this asserts the failure path leaves no
-    // marker behind: a member carrying one would fail `persist_reserved_pid`
-    // forever, and no Run could start on it.
+    // Fail the manifest write *specifically*. The manifest's atomic replacement
+    // creates its temporary file in the pool directory, so a read-only pool
+    // directory fails it - but the cleanup markers live in that same directory
+    // now, so a read-only directory would fail the marker write too and the
+    // assertion below would hold for the wrong reason.
+    //
+    // Point the marker this shrink would write at a writable file *outside* the
+    // pool directory instead: the manifest write still fails, but an attempted
+    // marker write would now succeed and leave a marker behind, which is what
+    // the assertion catches. Production decides whether a marker is present with
+    // `Path::exists()`, which follows the link, so the dangling link reads as
+    // "no marker" - to the code and to this assertion alike.
     let pool_directory = temp.path().join(".jj/pools/default");
+    let marker = pool_directory.join("worker-02.cleanup");
+    let escaped_marker = temp.path().join("escaped-worker-02.cleanup");
+    std::os::unix::fs::symlink(&escaped_marker, &marker).expect("marker link");
+
     let original = fs::metadata(&pool_directory)
         .expect("metadata")
         .permissions();
@@ -338,7 +349,6 @@ fn a_failed_pool_shrink_leaves_no_cleanup_marker_on_a_member() {
     fs::set_permissions(&pool_directory, original).expect("restore pool directory permissions");
 
     assert!(result.is_err(), "the failed manifest write must surface");
-    let marker = temp.path().join(".jj/pools/default/worker-02.cleanup");
     assert!(
         !marker.exists(),
         "a Pool member must never carry a cleanup marker after a failed shrink"
