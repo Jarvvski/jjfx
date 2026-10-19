@@ -78,6 +78,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - A malformed Worker Pool document is now reported naming the pool it belongs to (for example `Worker Pool alpha: cannot decode Worker Pool: ...`), so a user with several lanes can tell which one is corrupt; an absent pool document still prints nothing.
 - jjfx absorb no longer rewrites trunk: it pins the absorb destination to the Worker's own commits above the mainline, refuses outright when the repository has no resolvable trunk (no fetched `main@origin`), naming the fix, and rolls the absorb back with `jj undo` if the mainline moved anyway - so a Worker whose change is already committed is a no-op instead of a silent rewrite of `main`.
 - jjfx rebase, absorb and open-pr resolve the Worker's bookmark by Ticket (the prefixed name the agent actually created) instead of the bare Ticket id in Worker state, and fail before touching the Workspace when it is missing; a push that matches no bookmark is reported as a failure rather than a silent success.
+- `jjfx pool profile <runtime>` works on a Repository with no Worker Pool state yet: it provisions the empty Pool document it needs - and no capacity - instead of failing with a bare `state is missing`, so the documented profile-then-capacity order is a working one; when the state is genuinely gone it refuses naming the missing state and the `jjfx pool <N>` command that creates it.
 
 ## [0.55.0] - 2026-10-16
 
