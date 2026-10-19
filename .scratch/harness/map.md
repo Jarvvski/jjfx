@@ -125,9 +125,10 @@ verifying agent output and integrating parallel work, which is what jjfx's
 
 ## Fog
 
-- Whether the durable queue should be a jj-native artefact (a bookmark or a
-  commit) or a sidecar file, given that every jj read mutates the op log.
 - Whether `jjfx` should keep its own Worker pool at all, or drive opencode
   sessions directly with the pool as a capacity declaration.
 - Whether jj's lack of operation attribution (no tool/process tag) can be
   worked around for an audit trail, or must be accepted.
+
+The durable queue's jj-native-versus-sidecar question is settled: it is a
+sidecar (ADR 0017, ticket 06).

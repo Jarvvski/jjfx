@@ -108,6 +108,29 @@ fn a_capped_dispatch_holds_a_batch_back_when_the_pool_is_full() {
             .count(),
         1
     );
+    // The held-back Tickets are queued durably too: they are work jjfx accepted
+    // and did not run, so they must survive this process rather than living only
+    // in the waiting set the next Dispatch rewrites.
+    let queue = repository.work_queue().items().expect("read the queue");
+    assert_eq!(
+        queue
+            .iter()
+            .map(|item| (item.step.as_str(), item.state))
+            .collect::<Vec<_>>(),
+        [
+            ("dispatch:ENG-10", jjfx::engine::QueueItemState::Queued),
+            ("dispatch:ENG-11", jjfx::engine::QueueItemState::Queued),
+            ("dispatch:ENG-12", jjfx::engine::QueueItemState::Queued)
+        ]
+    );
+    assert!(
+        queue[0]
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("cap 2")),
+        "a queued step must record why it did not run: {:?}",
+        queue[0].detail
+    );
 }
 
 #[test]

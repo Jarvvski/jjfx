@@ -4,13 +4,14 @@ use std::thread;
 
 use thiserror::Error;
 
+use crate::engine::pool::current_timestamp;
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProfile, BackgroundStart,
     CompletedRun, ConcurrencyCap, DeliveryContract, DispatchBudget, DispatchExclusions,
-    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, Repository,
-    RepositoryIdentity, Reservation, RunMode, RunSupervisor, RunSupervisorError, Ticket,
-    TicketDetails, TicketId, TicketStatus, TicketTitle, WorkerId, WorkerPoolError, WorkerStatus,
-    WorkerWorkspaceError,
+    DispatchPromptBuilder, DispatchPromptContext, DispatchPromptError, InFlightRecord,
+    QueueSettlement, QueuedStep, Repository, RepositoryIdentity, Reservation, RunMode,
+    RunSupervisor, RunSupervisorError, StepKey, Ticket, TicketDetails, TicketId, TicketStatus,
+    TicketTitle, WorkerId, WorkerPoolError, WorkerStatus, WorkerWorkspaceError,
 };
 
 /// Ordered dependency information for a Ticket that builds on prerequisite work.
@@ -264,6 +265,23 @@ impl DirectDispatch {
                 .map(|held| held.ticket().id().as_str().to_owned())
                 .collect(),
         );
+        // The held-back Tickets are also queued durably: they are work jjfx has
+        // accepted and not yet run, so they must survive this process. Best
+        // effort, as the waiting set is - a Run in the same batch may already be
+        // live, and a queue write that failed must not misreport the Dispatch.
+        if let Ok(at) = current_timestamp() {
+            let steps = waiting
+                .iter()
+                .map(|held| {
+                    QueuedStep::dispatch(
+                        held.ticket().id().as_str(),
+                        at.clone(),
+                        Some(held.detail().to_owned()),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let _ = self.repository.work_queue().enqueue(&steps);
+        }
         result.with_waiting(waiting)
     }
 
@@ -291,12 +309,35 @@ impl DirectDispatch {
             DirectDispatchTarget::FirstIdle => None,
             DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
         };
-        Ok(self.repository.worker_pool().reserve_profiled(
+        let reservation = self.repository.worker_pool().reserve_profiled(
             worker,
             request.ticket().id().as_str(),
             profile,
             &self.exclusions,
-        )?)
+        )?;
+        // The claim is written before the Run starts, so a jjfx killed between
+        // the claim and the launch still knows what was in flight and where
+        // (ticket 07). Best effort: the Reservation is real, so a queue write
+        // that failed must not release it.
+        if let Ok(at) = current_timestamp() {
+            let step = StepKey::dispatch(request.ticket().id().as_str());
+            let _ = self.repository.work_queue().enqueue(&[QueuedStep::dispatch(
+                request.ticket().id().as_str(),
+                at.clone(),
+                None,
+            )]);
+            let _ = self.repository.work_queue().claim(
+                &step,
+                in_flight_record(
+                    &self.repository,
+                    reservation.worker_id(),
+                    request.ticket().id().as_str(),
+                    reservation.profile(),
+                ),
+                at,
+            );
+        }
+        Ok(reservation)
     }
 
     /// Atomically reserves the complete batch before launching ordered outcomes.
@@ -465,6 +506,27 @@ impl DirectDispatch {
         request: &DirectDispatchRequest,
     ) -> Result<DirectDispatchSuccess, DirectDispatchError> {
         let worker = reservation.worker_id().clone();
+        // The claim and the in-flight record are written before the Workspace is
+        // prepared, so a jjfx killed between the claim and the launch still knows
+        // what was in flight and where (ticket 07). Best effort: the Run may
+        // follow, and a queue write that failed must not release a live Worker.
+        if let Ok(at) = current_timestamp() {
+            let step = StepKey::dispatch(request.ticket().id().as_str());
+            let _ = self.repository.work_queue().claim(
+                &step,
+                in_flight_record(
+                    &self.repository,
+                    &worker,
+                    request.ticket().id().as_str(),
+                    reservation.profile(),
+                ),
+                at.clone(),
+            );
+            // Marked in flight before the launch, not after: a Foreground Run
+            // finalizes inside the supervisor below, so a `begin` after it would
+            // find the step already settled and never record that it started.
+            let _ = self.repository.work_queue().begin(&step, None, None, at);
+        }
         let bases = request
             .dependency_context()
             .map(DispatchDependencyContext::base_revisions)
@@ -511,13 +573,33 @@ impl DirectDispatch {
                 }
             }
         };
+        // The step is in flight, with the session or process only the launch
+        // knows. Best effort: the Run is live, so a queue write that failed must
+        // not misreport the Dispatch or release the Worker.
+        // Complete the in-flight record with the session or process only the
+        // launch knows. Best effort: the Run is live, so a queue write that
+        // failed must not misreport the Dispatch or release the Worker.
+        if let Ok(at) = current_timestamp() {
+            let (session, pid) = match &execution {
+                DirectDispatchExecution::Foreground(_) => (None, None),
+                DirectDispatchExecution::Background { pid } => (None, Some(i64::from(*pid))),
+                DirectDispatchExecution::Session { session_id } => (Some(session_id.clone()), None),
+            };
+            if session.is_some() || pid.is_some() {
+                let _ = self.repository.work_queue().begin(
+                    &StepKey::dispatch(request.ticket().id().as_str()),
+                    session,
+                    pid,
+                    at,
+                );
+            }
+        }
         Ok(DirectDispatchSuccess::new(
             request.ticket().clone(),
             worker,
             execution,
         ))
     }
-
     fn preflight_all(
         &self,
         requests: &[DirectDispatchRequest],
@@ -581,6 +663,7 @@ impl DirectDispatch {
         unavailable: Vec<usize>,
         partial: bool,
     ) -> DirectDispatchResult {
+        self.queue_batch(requests);
         let mut outcomes = requests
             .iter()
             .map(|request| {
@@ -610,7 +693,63 @@ impl DirectDispatch {
                 )),
             };
         }
+        self.record_outcomes(&outcomes);
         DirectDispatchResult::new(outcomes, partial)
+    }
+
+    /// Records every requested step in the durable queue before anything is
+    /// claimed.
+    ///
+    /// A step must be queued before a claim or a launch can move it, and the
+    /// whole batch is admitted at once so the queue order is the caller's input
+    /// order rather than the order launches happened to finish in.
+    ///
+    /// Best effort: a Run in this batch may already be live, so a queue write
+    /// that failed must not misreport the Dispatch.
+    fn queue_batch(&self, requests: &[DirectDispatchRequest]) {
+        let Ok(at) = current_timestamp() else {
+            return;
+        };
+        let steps = requests
+            .iter()
+            .map(|request| QueuedStep::dispatch(request.ticket().id().as_str(), at.clone(), None))
+            .collect::<Vec<_>>();
+        let _ = self.repository.work_queue().enqueue(&steps);
+    }
+
+    /// Records the durable queue outcome of every Ticket in one batch.
+    ///
+    /// A Ticket that never started - the governor held it, or an explicit
+    /// use-available Dispatch found no capacity - is queued, not failed: the work
+    /// is outstanding. One that was claimed and failed before its Run started is
+    /// settled as failed, so "what happened to this?" has an answer.
+    ///
+    /// Best effort: a Run in this batch may already be live, so a queue write
+    /// that failed must not misreport the Dispatch.
+    fn record_outcomes(&self, outcomes: &[DirectDispatchOutcome]) {
+        for outcome in outcomes {
+            let DirectDispatchOutcome::Failed(failure) = outcome else {
+                continue;
+            };
+            let ticket = failure.ticket().id().as_str();
+            let Ok(at) = current_timestamp() else {
+                continue;
+            };
+            if failure.phase() == DirectDispatchFailurePhase::Capacity {
+                let _ = self
+                    .repository
+                    .work_queue()
+                    .note(&StepKey::dispatch(ticket), failure.detail());
+            } else {
+                let _ = self.repository.work_queue().settle(
+                    &StepKey::dispatch(ticket),
+                    QueueSettlement::Failed {
+                        detail: failure.detail().to_owned(),
+                    },
+                    at,
+                );
+            }
+        }
     }
 
     fn build_invocation(
@@ -690,6 +829,29 @@ impl DirectDispatch {
         }
         Ok(value)
     }
+}
+
+/// The in-flight record a claim leaves behind, for a resumption (ticket 07).
+///
+/// Everything here is known once the Reservation exists - the Worker, its
+/// Workspace, the Ticket's bookmark and the selected profile - so a jjfx that
+/// dies before the Run reports back can still say what was in flight. Only the
+/// session or process is left for the launch to add.
+fn in_flight_record(
+    repository: &Repository,
+    worker: &WorkerId,
+    ticket: &str,
+    profile: &AgentRuntimeProfile,
+) -> InFlightRecord {
+    InFlightRecord::for_run(
+        worker.clone(),
+        repository
+            .worker_workspace_path(worker)
+            .to_string_lossy()
+            .into_owned(),
+        ticket.to_lowercase(),
+        profile,
+    )
 }
 
 fn failure_phase(error: &DirectDispatchError) -> DirectDispatchFailurePhase {

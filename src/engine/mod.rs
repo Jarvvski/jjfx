@@ -24,6 +24,7 @@ mod locks;
 mod opencode_api;
 mod orchestration;
 mod pool;
+mod queue;
 mod reviewer;
 mod run_log;
 mod runtime;
@@ -80,6 +81,7 @@ pub use pool::{
     Reservation, SnapshotDiagnostic, SnapshotDiagnosticKind, WorkerPool, WorkerPoolError,
     WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
 };
+pub use queue::{QueueResolution, WorkQueue};
 pub use reviewer::{
     CodeRabbitReviewer, ReviewCompleteness, ReviewEscalation, ReviewFinding, ReviewLoop,
     ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop,
@@ -97,14 +99,15 @@ pub use runtime::{
     RunOutcome, RunRequest, RunReset, RunSupervisor, RunSupervisorError, SessionRun,
 };
 pub use state::{
-    CommitOutcome, DEFAULT_POOL_NAME, DispatchGroupOptions, DispatchGroupState,
-    DispatchGroupStateRepository, Expected, IdentifierError, InUseState, InUseStateRepository,
-    Loaded, MutationKind, MutationRecord, MutationRecordRepository, PoolName, PoolState,
-    PoolStateRepository, REPOSITORY_WIDE_MUTATION, RunRecord, RunRecordConclusion,
-    RunRecordRepository, RunRecordUsage, SessionState, SessionStateRepository, StateChange,
-    StateError, StateRevision, StateStore, SubIssueState, TicketId, UndoState, Versioned,
-    WaitingState, WaitingStateRepository, WireAgent, WireStatus, WireTimestamp, WorkerId,
-    WorkerState, WorkerStateRepository,
+    CommitOutcome, DEFAULT_POOL_NAME, DISPATCH_STEP_KIND, DispatchGroupOptions, DispatchGroupState,
+    DispatchGroupStateRepository, Expected, IdentifierError, InFlightRecord, InUseState,
+    InUseStateRepository, Loaded, MutationKind, MutationRecord, MutationRecordRepository, PoolName,
+    PoolState, PoolStateRepository, QueueAdmission, QueueItem, QueueItemState, QueueSettlement,
+    QueueState, QueueStateRepository, QueuedStep, REPOSITORY_WIDE_MUTATION, RunRecord,
+    RunRecordConclusion, RunRecordRepository, RunRecordUsage, SessionState, SessionStateRepository,
+    StateChange, StateError, StateRevision, StateStore, StepKey, SubIssueState, TicketId,
+    UndoState, Versioned, WaitingState, WaitingStateRepository, WireAgent, WireStatus,
+    WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DEFAULT_READY_LABEL, DependencyGraph, DiscoveredSubIssue,
