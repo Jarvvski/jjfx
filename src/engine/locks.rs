@@ -110,6 +110,23 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    /// How long the ordering test lets a reversed acquisition misbehave before
+    /// it looks.
+    ///
+    /// This is an observation window, not a liveness budget, so it is not
+    /// [`LIVENESS_TIMEOUT`]: a reversed order takes the pool lock within
+    /// milliseconds of the helper starting, so a second is ample to let it show.
+    const REVERSED_ORDER_WINDOW: Duration = Duration::from_secs(1);
+
+    /// How long the ordering test keeps sampling the pool lock for it to read as
+    /// free.
+    ///
+    /// A reversed order holds the pool lock for the *whole* wait - the helper
+    /// blocks on the repository lock while holding it - so it never clears; a
+    /// momentary `Busy` from an unrelated holder on a shared machine clears well
+    /// inside this.
+    const POOL_FREE_SAMPLE: Duration = Duration::from_millis(100);
+
     fn file_names(locks: &[ScopedLock]) -> Vec<String> {
         ordered(locks)
             .into_iter()
@@ -171,22 +188,34 @@ mod tests {
             drop(set);
         });
 
-        // Poll for long enough that a reversed order would have taken the pool
-        // lock and started waiting on the repository lock. Under the correct
-        // order the pool lock stays free the whole time.
-        let deadline = std::time::Instant::now() + Duration::from_secs(1);
-        let mut pool_was_free = true;
-        while std::time::Instant::now() < deadline {
+        // Give a reversed order time to take the pool lock and start waiting on
+        // the repository lock: it would then hold the pool lock for the rest of
+        // the wait, because the repository lock is held here until after the
+        // check below. The correct order leaves the pool lock free.
+        thread::sleep(REVERSED_ORDER_WINDOW);
+
+        // Then the pool lock must be free. Sampling rather than a single probe -
+        // and requiring it to *clear* rather than never reading `Busy` - is what
+        // makes this a statement about the order and not about the machine: a
+        // reproduction under a six-way full-suite load saw a momentary `Busy`
+        // clear within 0.5-4ms while the helper was correctly blocked on the
+        // repository lock, and a busy poll that failed on the first `Busy`
+        // turned that into a false failure. Only a lock that stays held is the
+        // reversed order.
+        let sample_deadline = std::time::Instant::now() + POOL_FREE_SAMPLE;
+        let mut pool_was_free = false;
+        loop {
             match atomic::try_lock_exclusive(&pool_lock).expect("try the pool lock") {
                 atomic::LockOutcome::Acquired(file) => {
-                    // Release before sleeping: a later attempt must not see this
-                    // thread's own lock and mistake it for the other thread's.
                     drop(file);
-                    thread::sleep(Duration::from_millis(1));
+                    pool_was_free = true;
+                    break;
                 }
                 atomic::LockOutcome::Busy => {
-                    pool_was_free = false;
-                    break;
+                    if std::time::Instant::now() >= sample_deadline {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(2));
                 }
             }
         }
