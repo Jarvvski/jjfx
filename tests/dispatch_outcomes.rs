@@ -145,6 +145,28 @@ impl DispatchFixture {
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("executable agent");
     }
 
+    /// Puts a fake `claude` on the fixture's `PATH` that answers a Ticket query
+    /// with an empty ready set.
+    ///
+    /// A Linear source is queried by shelling out to the configured Agent
+    /// Runtime, so this stubs the Runtime rather than Linear itself: the query
+    /// returns `{"tickets":[]}`, the shape a real query returns when the label
+    /// matched nothing. That reaches the empty-ready-set branch without Linear
+    /// credentials, a network call, or a real Agent.
+    fn with_empty_ready_query(&self) {
+        let agent = self.bin.path().join("claude");
+        fs::write(
+            &agent,
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = \"--help\" ]; then exit 0; fi\n",
+                "printf '%s\\n' '{\"result\":\"{\\\"tickets\\\":[]}\"}'\n",
+            ),
+        )
+        .expect("fake agent");
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("executable agent");
+    }
+
     fn jjfx(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
         command
@@ -669,6 +691,49 @@ fn an_empty_ready_set_carries_the_search_in_json() {
         stderr(&prose).contains("No tickets found with label 'ready-for-agent'"),
         "{}",
         stderr(&prose)
+    );
+}
+
+/// A Linear source has no filesystem root to name, so its search entry carries
+/// `root: null` rather than a path - the shape a caller reads without checking.
+///
+/// This drives the config seam that selects the source - `[tickets] source =
+/// "linear"` - and asserts the emitted JSON. The query itself is not exercised:
+/// a real Linear query needs Linear credentials and a reachable Agent Runtime,
+/// neither of which a test suite has, so the Runtime is stubbed with an empty
+/// ready set. What this proves is that the source selection reaches
+/// `search_entry` and that a Linear source emits a null root end to end; it is
+/// not evidence that jjfx can discover real Linear Tickets.
+#[test]
+fn a_linear_source_reports_a_null_search_root_in_json() {
+    let fixture = DispatchFixture::new();
+    fixture.write_config("[tickets]\nsource = \"linear\"\n");
+    fixture.with_pool(1);
+    fixture.with_empty_ready_query();
+
+    let output = fixture
+        .jjfx(&["dispatch", "--all", "--json"])
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    let entries = json.as_array().expect("a batch is an array");
+    let search = entries
+        .iter()
+        .find(|entry| entry["ticket"].is_null())
+        .expect("the batch names the search that found nothing");
+    assert_eq!(search["outcome"], "skipped");
+    assert_eq!(search["label"], "ready-for-agent");
+    assert!(
+        search["root"].is_null(),
+        "a Linear source names no filesystem root: {json}"
     );
 }
 

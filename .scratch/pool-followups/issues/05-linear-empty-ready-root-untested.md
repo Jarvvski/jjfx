@@ -1,7 +1,7 @@
 # The Linear branch of the empty-ready-set `root` is untested
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -16,9 +16,29 @@ Cover the Linear path end to end. If a live Linear source cannot be driven in th
 
 ## Acceptance Criteria
 
-- [ ] An integration test asserts the `root` field is `null` for a Linear source.
-- [ ] The test explains why the query is not exercised, if it is not.
-- [ ] `mise run check` is green.
+- [x] An integration test asserts the `root` field is `null` for a Linear source.
+- [x] The test explains why the query is not exercised, if it is not.
+- [x] `mise run check` is green.
+
+## Resolution
+
+`tests/dispatch_outcomes.rs` gains
+`a_linear_source_reports_a_null_search_root_in_json`, which drives the real
+binary end to end. It selects the source the way a user does - a user config
+carrying `[tickets] source = "linear"` - and asserts the emitted `--json` batch
+names the search with `root: null` and `label: "ready-for-agent"`.
+
+The query itself is not exercised, and the test says so in its doc comment: a
+real Linear query needs Linear credentials and a reachable Agent Runtime, so
+the fixture stubs the Runtime (a fake `claude` on `PATH`) with the empty ready
+set `{"tickets":[]}`. That reaches the empty-ready-set branch that emits the
+search entry, which is the shape under test; it is not evidence that jjfx can
+discover real Linear Tickets. The fixture helper `with_empty_ready_query`
+carries the same reasoning.
+
+The local-source path is unchanged: `an_empty_ready_set_carries_the_search_in_json`
+still asserts a filesystem root ending in `.scratch`, and no production code
+changed. `mise run check` is green.
 
 ## References
 
