@@ -1946,6 +1946,8 @@ struct PoolStatus {
     members: Vec<WorkerSnapshot>,
     /// The Tickets this pool's last capped Dispatch held back, in input order.
     waiting: Vec<String>,
+    /// The pool's durable work queue, in queue order.
+    queue: Vec<crate::engine::QueueItem>,
     /// The pool's configured Agent Runtime Profile, when its state names one.
     profile: Option<AgentRuntimeProfile>,
 }
@@ -2078,6 +2080,7 @@ fn pool_report(
             cost: scoped.pool_cost().ok(),
             members: snapshot.workers().to_vec(),
             waiting: snapshot.waiting().to_vec(),
+            queue: snapshot.queue().to_vec(),
             profile: snapshot.pool().and_then(|pool| pool.profile()).cloned(),
         });
     }
@@ -2272,7 +2275,8 @@ fn short_worker_id(worker_id: &str) -> &str {
 }
 
 /// The Pool status JSON document:
-/// `{"workers": [ ... ], "waiting": [ ... ], "pools": [ ... ], "orphans": [ ... ]}`.
+/// `{"workers": [ ... ], "waiting": [ ... ], "queue": [ ... ], "pools": [ ... ],
+/// "orphans": [ ... ]}`.
 ///
 /// A top-level object rather than the bare Worker array: the human table prints
 /// state that is not per-Worker (the `Waiting:` line), and a bare array has
@@ -2281,7 +2285,10 @@ fn short_worker_id(worker_id: &str) -> &str {
 ///
 /// `workers` and `waiting` stay flat and each entry names its pool, so
 /// `jq '.workers[] | select(.pool == "bugs")'` answers the per-pool question
-/// without a second shape. `pools` names every pool the Repository holds,
+/// without a second shape. `queue` is the durable work queue, also flat and
+/// pool-tagged, so a step that was queued, claimed or abandoned is visible as
+/// structure rather than only as live Worker state. `pools` names every pool the
+/// Repository holds,
 /// including an implicit `default`, with its size and its recorded spend against
 /// its own cap - a subtotal under the Repository-wide total. `orphans` names
 /// pool directories no pool claims. Encoded by hand so the emitted field order
@@ -2322,6 +2329,18 @@ fn pool_list_json_string(report: &PoolReport, now: Timestamp, watchdog: StuckWin
         }
     }
     out.push_str("],\n");
+    out.push_str("  \"queue\": [");
+    let mut first = true;
+    for pool in &report.pools {
+        for item in &pool.queue {
+            if !first {
+                out.push_str(", ");
+            }
+            first = false;
+            out.push_str(&queue_json(item, &pool.name));
+        }
+    }
+    out.push_str("],\n");
     out.push_str("  \"pools\": [");
     for (index, pool) in report.pools.iter().enumerate() {
         if index > 0 {
@@ -2353,6 +2372,50 @@ fn waiting_json(ticket: &str, pool: &str) -> String {
         "{{\"ticket\": {}, \"pool\": {}}}",
         json_string(ticket),
         json_string(pool)
+    )
+}
+
+/// One queued step, the shape `status --json` emits per queue entry.
+///
+/// The durable record, not a view of it: what the step is (`step`, `kind`,
+/// `subject`), its lifecycle (`state`, `sequence`), when it was queued and
+/// claimed and by what (`queued_at`, `claimed_at`, `claimed_by`, `started_at`),
+/// how it ended (`finished_at`, `detail`), and what a resumption needs
+/// (`in_flight`) - tagged with the pool whose queue holds it, as `waiting` is.
+fn queue_json(item: &crate::engine::QueueItem, pool: &str) -> String {
+    let in_flight = item.in_flight.as_ref().map_or_else(
+        || "null".to_owned(),
+        |record| {
+            format!(
+                "{{\"worker\": {}, \"workspace\": {}, \"branch\": {}, \"runtime\": {}, \"provider\": {}, \"model\": {}, \"session\": {}, \"pid\": {}}}",
+                json_option(record.worker.as_ref().map(WorkerId::as_str)),
+                json_option(record.workspace.as_deref()),
+                json_option(record.branch.as_deref()),
+                json_option(record.runtime.as_deref()),
+                json_option(record.provider.as_deref()),
+                json_option(record.model.as_deref()),
+                json_option(record.session.as_deref()),
+                record
+                    .pid
+                    .map_or_else(|| "null".to_owned(), |pid| pid.to_string()),
+            )
+        },
+    );
+    format!(
+        "{{\"step\": {}, \"kind\": {}, \"subject\": {}, \"state\": {}, \"pool\": {}, \"sequence\": {}, \"queued_at\": {}, \"claimed_at\": {}, \"claimed_by\": {}, \"started_at\": {}, \"finished_at\": {}, \"detail\": {}, \"in_flight\": {}}}",
+        json_string(item.step.as_str()),
+        json_string(item.kind.as_str()),
+        json_string(&item.subject),
+        json_string(item.state.as_str()),
+        json_string(pool),
+        item.sequence,
+        json_string(item.queued_at.as_str()),
+        json_option(item.claimed_at.as_ref().map(|at| at.as_str())),
+        json_option(item.claimed_by.as_ref().map(WorkerId::as_str)),
+        json_option(item.started_at.as_ref().map(|at| at.as_str())),
+        json_option(item.finished_at.as_ref().map(|at| at.as_str())),
+        json_option(item.detail.as_deref()),
+        in_flight,
     )
 }
 
@@ -5906,11 +5969,86 @@ mod tests {
             .read_worker_pool_snapshot()
     }
 
+    /// A one-Worker Pool snapshot whose durable queue holds `queue`, the JSON
+    /// body a Dispatch would have written to `.jj/pools/default/queue.json`.
+    fn snapshot_with_queue(queue: &str) -> crate::engine::WorkerPoolSnapshot {
+        let temp = tempfile::tempdir().expect("temp repository");
+        let pool = temp.path().join(".jj/pools/default");
+        std::fs::create_dir_all(&pool).expect("pool directory");
+        std::fs::write(
+            temp.path().join(".jj/pools/default/pool.json"),
+            br#"{"size":1,"gh_repo":"Jarvvski/jjfx","workers":["worker-01"],"created_at":"2026-07-27T10:00:00Z","names":{}}"#,
+        )
+        .expect("pool state");
+        std::fs::write(
+            pool.join("worker-01.json"),
+            br#"{"status":"idle","agent":"claude","ticket":null,"pid":null,"started_at":null,"completed_at":null,"log_file":null,"branch_name":null,"exit_code":null,"error":null}"#,
+        )
+        .expect("worker state");
+        std::fs::write(pool.join("queue.json"), queue).expect("queue state");
+        crate::engine::Repository::open(temp.path())
+            .expect("repository")
+            .read_worker_pool_snapshot()
+    }
+
+    /// The durable queue is structure a script can read: one entry per step, with
+    /// stable field names for what it is, when it was claimed, by what, and how it
+    /// ended - tagged with the pool whose queue holds it, as `waiting` is.
+    #[test]
+    fn status_json_carries_the_durable_queue_tagged_with_its_pool() {
+        let report = report_with_snapshot(snapshot_with_queue(
+            r#"{"items":[{"step":"dispatch:AMBA-42","kind":"dispatch","subject":"AMBA-42","state":"in_flight","sequence":0,"queued_at":"2026-07-27T10:00:00Z","claimed_at":"2026-07-27T10:00:01Z","claimed_by":"worker-01","started_at":"2026-07-27T10:00:02Z","in_flight":{"worker":"worker-01","branch":"amba-42","runtime":"opencode","session":"ses_1"}}]}"#,
+        ));
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(
+            value["queue"],
+            serde_json::json!([{
+                "step": "dispatch:AMBA-42",
+                "kind": "dispatch",
+                "subject": "AMBA-42",
+                "state": "in_flight",
+                "pool": "default",
+                "sequence": 0,
+                "queued_at": "2026-07-27T10:00:00Z",
+                "claimed_at": "2026-07-27T10:00:01Z",
+                "claimed_by": "worker-01",
+                "started_at": "2026-07-27T10:00:02Z",
+                "finished_at": null,
+                "detail": null,
+                "in_flight": {
+                    "worker": "worker-01",
+                    "workspace": null,
+                    "branch": "amba-42",
+                    "runtime": "opencode",
+                    "provider": null,
+                    "model": null,
+                    "session": "ses_1",
+                    "pid": null
+                }
+            }])
+        );
+    }
+
+    /// A Repository that has never queued anything emits an empty array rather
+    /// than omitting the key, so a caller never has to tell "no queue" from
+    /// "this jjfx does not have one".
+    #[test]
+    fn status_json_queue_is_empty_without_a_queue() {
+        let report = report_with_snapshot(snapshot_with_waiting(&[]));
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(value["queue"], serde_json::json!([]));
+    }
+
     /// A one-pool report from a `default`-pool snapshot, for the JSON tests.
     fn report_with_snapshot(snapshot: WorkerPoolSnapshot) -> PoolReport {
         let cost = snapshot.cost().cloned();
         let members = snapshot.workers().to_vec();
         let waiting = snapshot.waiting().to_vec();
+        let queue = snapshot.queue().to_vec();
         let profile = snapshot.pool().and_then(|pool| pool.profile()).cloned();
         let size = snapshot.pool().map(|pool| pool.size() as u64);
         let workers = snapshot.pool().map(|_| members.len());
@@ -5925,6 +6063,7 @@ mod tests {
                 cost: cost.clone(),
                 members,
                 waiting,
+                queue,
                 profile,
             }],
             total_cost: cost,

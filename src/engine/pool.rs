@@ -9,10 +9,10 @@ use thiserror::Error;
 
 use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
-    PoolCostSnapshot, PoolState, Repository, RunConclusion, RunCost, RunHealth, RunProgress,
-    RunRecord, RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource, SessionOutcome,
-    StateChange, StateError, StateRevision, StuckWindow, WireStatus, WireTimestamp, WorkerId,
-    WorkerState, WorkerWorkspaceError,
+    PoolCostSnapshot, PoolState, QueueSettlement, Repository, RunConclusion, RunCost, RunHealth,
+    RunProgress, RunRecord, RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource,
+    SessionOutcome, StateChange, StateError, StateRevision, StepKey, StuckWindow, WireStatus,
+    WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -245,6 +245,7 @@ impl Reservation {
         match worker_state.commit(Expected::Match(revision), StateChange::Replace(state))? {
             CommitOutcome::Applied(_) => {
                 self.repository.state_store().runs().append(&record)?;
+                settle_queue_step(&self.repository, Some(self.ticket.as_str()), result);
                 Ok(RunFinalization::Applied)
             }
             CommitOutcome::Conflict(_) => Ok(RunFinalization::Stale),
@@ -257,12 +258,50 @@ impl Reservation {
             Expected::Match(self.worker_revision.clone()),
             StateChange::Replace(self.rollback.clone()),
         )? {
-            CommitOutcome::Applied(_) => Ok(()),
+            CommitOutcome::Applied(_) => {
+                requeue_step(&self.repository, &self.ticket);
+                Ok(())
+            }
             CommitOutcome::Conflict(_) => Err(WorkerPoolError::ReleaseConflict {
                 worker: self.worker_id.clone(),
             }),
         }
     }
+}
+
+/// Settles the durable queue step a finalized Run belongs to.
+///
+/// Best effort: the Run Record is the durable record of the Run, and a queue
+/// write that failed must not fail the finalization that produced it. Every
+/// transition is keyed by step identity, so a later reconciliation settles the
+/// same step without duplicating anything.
+fn settle_queue_step(repository: &Repository, ticket: Option<&str>, result: &RunResult) {
+    let Some(ticket) = ticket else {
+        return;
+    };
+    let settlement = match result.conclusion() {
+        RunConclusion::Succeeded => QueueSettlement::Done,
+        RunConclusion::Failed { message } => QueueSettlement::Failed {
+            detail: message.clone(),
+        },
+    };
+    let Ok(at) = current_timestamp() else {
+        return;
+    };
+    let _ = repository
+        .work_queue()
+        .settle(&StepKey::dispatch(ticket), settlement, at);
+}
+
+/// Returns the durable queue step a released Reservation held to the queue.
+///
+/// A launch that never happened leaves the work outstanding rather than failing
+/// it, so the step is queued again for the next Dispatch to pick up.
+fn requeue_step(repository: &Repository, ticket: &str) {
+    let _ = repository.work_queue().requeue(
+        &StepKey::dispatch(ticket),
+        Some("released before launch".to_owned()),
+    );
 }
 
 /// Errors from Worker Pool lifecycle and Reservation operations.
@@ -373,6 +412,17 @@ impl WorkerPool {
                 ));
             }
         }
+        // The queue is reconciled from its own durable record, not from the
+        // Worker loop above: a step whose Worker has left the Pool is still
+        // resolved, which is the whole point of keeping it (ticket 07).
+        if let Err(error) = self.repository.work_queue().reconcile() {
+            diagnostics.push(diagnostic(
+                self.repository.root(),
+                SnapshotDiagnosticKind::ReconciliationFailed,
+                None,
+                format!("Work Queue: {error}"),
+            ));
+        }
         let mut after = self.snapshot();
         after.diagnostics.extend(diagnostics);
         after
@@ -424,12 +474,14 @@ impl WorkerPool {
         let mut state = loaded.value;
         apply_run_result(&mut state, &result)?;
         let record = run_record(&self.repository, worker, &state, &result);
+        let ticket = state.ticket.clone();
         match repository.commit(Expected::Match(revision), StateChange::Replace(state)) {
             // This reconciliation is the one that observed the Run end, so it
             // owns the durable record - exactly as the spawning supervisor does
             // when its own waiter finalizes the Run first.
             Ok(CommitOutcome::Applied(_)) => {
                 self.repository.state_store().runs().append(&record)?;
+                settle_queue_step(&self.repository, ticket.as_deref(), &result);
                 Ok(())
             }
             // Another writer finalized this Run first (the supervisor's waiter,
@@ -1962,6 +2014,8 @@ pub struct WorkerPoolSnapshot {
     occupied: BTreeSet<WorkerId>,
     /// Tickets the Dispatch capacity governor held back rather than fired.
     waiting: Vec<String>,
+    /// The Pool's durable work queue, in queue order.
+    queue: Vec<crate::engine::QueueItem>,
     /// The Pool's recorded cost and usage, or `None` when the record store could
     /// not be read (so a frontend can say "unavailable" rather than "$0").
     cost: Option<PoolCostSnapshot>,
@@ -1994,6 +2048,10 @@ impl WorkerPoolSnapshot {
     /// Dispatch, in the order they were requested.
     pub fn waiting(&self) -> &[String] {
         &self.waiting
+    }
+    /// Returns the Pool's durable work queue, in queue order.
+    pub fn queue(&self) -> &[crate::engine::QueueItem] {
+        &self.queue
     }
     /// Reports whether `worker_id` is currently open in a terminal.
     pub fn is_occupied(&self, worker_id: &str) -> bool {
@@ -2033,6 +2091,11 @@ impl Repository {
         // The waiting set is jjfx-owned presentation state too: what the last
         // capped Dispatch held back, so a frontend can show the backlog.
         let waiting = state.waiting().held();
+        // The durable work queue is read here rather than recomputed: it is the
+        // record of what was queued, claimed and settled, and it outlives the
+        // process that wrote it. An unreadable queue reads as empty here and is
+        // reported by reconciliation, which propagates the error.
+        let queue = state.queue().items().unwrap_or_default();
         // The recorded Run costs are read once here so every Pool presentation
         // carries them; an unreadable store is `None`, not zero spend.
         let cost = self.pool_cost().ok();
@@ -2051,6 +2114,7 @@ impl Repository {
                     diagnostics,
                     occupied,
                     waiting,
+                    queue,
                     cost,
                 };
             }
@@ -2072,6 +2136,7 @@ impl Repository {
                     diagnostics,
                     occupied,
                     waiting,
+                    queue,
                     cost,
                 };
             }
@@ -2133,6 +2198,7 @@ impl Repository {
             diagnostics,
             occupied,
             waiting,
+            queue,
             cost,
         }
     }

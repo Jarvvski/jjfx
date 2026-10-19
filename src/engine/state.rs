@@ -42,6 +42,8 @@ const SESSION_NAME: &str = "sessions.json";
 const SESSION_LOCK_NAME: &str = ".sessions.lock";
 const WAITING_NAME: &str = "waiting.json";
 const WAITING_LOCK_NAME: &str = ".waiting.lock";
+const QUEUE_NAME: &str = "queue.json";
+const QUEUE_LOCK_NAME: &str = ".queue.lock";
 const RUN_RECORDS_NAME: &str = "runs.jsonl";
 const RUN_RECORDS_LOCK_NAME: &str = ".runs.lock";
 
@@ -144,6 +146,11 @@ wire_string!(
     "An open, forward-compatible Agent Runtime value."
 );
 wire_string!(WireTimestamp, "A timestamp preserved exactly as persisted.");
+wire_string!(StepKey, "The durable identity of one unit of queued work.");
+wire_string!(
+    QueueStepKind,
+    "An open, forward-compatible kind of queued work."
+);
 
 /// A validated Worker identifier that is safe as one filename component.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
@@ -705,6 +712,293 @@ impl DispatchGroupState {
     }
 }
 
+/// The kind of step a queued item records, when it dispatches one Ticket.
+pub const DISPATCH_STEP_KIND: &str = "dispatch";
+
+impl StepKey {
+    /// The identity of the step that dispatches `ticket`.
+    ///
+    /// Identity is derived from what the step *is*, not from when it ran, so the
+    /// same Ticket offered twice is the same step: a repeat is detectable rather
+    /// than a silent second Run (ticket 09). A later step kind - a review
+    /// dimension and pass, say - composes its own key the same way.
+    pub fn dispatch(ticket: &str) -> Self {
+        Self(format!("{DISPATCH_STEP_KIND}:{ticket}"))
+    }
+}
+
+/// The lifecycle state of one queued item.
+///
+/// The open states are `Queued` (waiting for capacity), `Claimed` (a Worker
+/// holds the step but its Run has not started) and `InFlight` (the Run has
+/// started). The terminal states are `Done`, `Failed` and `Abandoned`; a step
+/// that never ran and was never re-queued ends `Abandoned` rather than being
+/// silently dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueItemState {
+    /// The step is waiting for capacity to run.
+    Queued,
+    /// A Worker holds the step; its Run has not started.
+    Claimed,
+    /// The step's Run has started.
+    InFlight,
+    /// The step's work completed.
+    Done,
+    /// The step's work failed.
+    Failed,
+    /// The step was given up on without running to a conclusion.
+    Abandoned,
+}
+
+impl QueueItemState {
+    /// Returns the persisted spelling.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Claimed => "claimed",
+            Self::InFlight => "in_flight",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Abandoned => "abandoned",
+        }
+    }
+
+    /// Reports whether the step may still reach a conclusion.
+    pub const fn is_open(self) -> bool {
+        matches!(self, Self::Queued | Self::Claimed | Self::InFlight)
+    }
+
+    /// Reports whether the step has reached a conclusion.
+    pub const fn is_terminal(self) -> bool {
+        !self.is_open()
+    }
+}
+
+impl fmt::Display for QueueItemState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// What a resumption of an open step needs (ticket 07).
+///
+/// Everything here is read from the Repository, the Reservation and the launch
+/// rather than re-derived from live Worker state, so a step whose Worker has
+/// since been destroyed can still be resumed - or at least explained.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InFlightRecord {
+    /// The Worker the step runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<WorkerId>,
+    /// The Worker Workspace path the step runs in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
+    /// The bookmark naming the step's change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// The Agent Runtime executing the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime: Option<String>,
+    /// The model provider selected for the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// The model selected for the step.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// The Agent Runtime session driving the step, for a session-backed Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    /// The process the Run launched, for a process-backed Run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pid: Option<i64>,
+    #[serde(flatten)]
+    extra: Extensions,
+}
+
+impl InFlightRecord {
+    /// The in-flight record for a step about to run in `worker`, under the
+    /// profile its Run was reserved with.
+    ///
+    /// Only the session or the process is missing: that is what the launch adds
+    /// when it starts the Run.
+    pub fn for_run(
+        worker: WorkerId,
+        workspace: impl Into<String>,
+        branch: impl Into<String>,
+        profile: &AgentRuntimeProfile,
+    ) -> Self {
+        Self {
+            worker: Some(worker),
+            workspace: Some(workspace.into()),
+            branch: Some(branch.into()),
+            runtime: Some(profile.runtime().as_str().to_owned()),
+            provider: profile.provider_value(),
+            model: profile.model_value(),
+            session: None,
+            pid: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// One step offered to the durable queue, before it has a position in it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueuedStep {
+    /// The step's identity.
+    pub step: StepKey,
+    /// What sort of step it is.
+    pub kind: QueueStepKind,
+    /// The human-facing subject: the Ticket, dimension and pass the step is for.
+    pub subject: String,
+    /// When the step was offered.
+    pub queued_at: WireTimestamp,
+    /// Why the step is queued rather than running, when there is a reason.
+    pub detail: Option<String>,
+}
+
+impl QueuedStep {
+    /// The step that dispatches `ticket`.
+    pub fn dispatch(ticket: &str, queued_at: WireTimestamp, detail: Option<String>) -> Self {
+        Self {
+            step: StepKey::dispatch(ticket),
+            kind: QueueStepKind::new(DISPATCH_STEP_KIND),
+            subject: ticket.to_owned(),
+            queued_at,
+            detail,
+        }
+    }
+}
+
+/// What offering a step to the queue did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueAdmission {
+    /// The step was not recorded, and is now, at this position in the queue.
+    Queued {
+        /// The position the step took.
+        sequence: u64,
+    },
+    /// The step was already recorded in this state, so nothing changed.
+    ///
+    /// A completed step re-offered is reported here rather than queued again, so
+    /// a re-run is detectable instead of silently repeated (ticket 09).
+    Known {
+        /// The state the recorded step is in.
+        state: QueueItemState,
+    },
+}
+
+/// How a queued step ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueueSettlement {
+    /// The step's work completed.
+    Done,
+    /// The step's work failed, with the provider-neutral reason.
+    Failed {
+        /// Why the step failed.
+        detail: String,
+    },
+    /// The step was given up on, with the reason it could not be followed.
+    Abandoned {
+        /// Why the step was abandoned.
+        detail: String,
+    },
+}
+
+impl QueueSettlement {
+    /// The state this settlement records.
+    pub const fn state(&self) -> QueueItemState {
+        match self {
+            Self::Done => QueueItemState::Done,
+            Self::Failed { .. } => QueueItemState::Failed,
+            Self::Abandoned { .. } => QueueItemState::Abandoned,
+        }
+    }
+
+    /// The reason this settlement carries.
+    pub fn detail(&self) -> &str {
+        match self {
+            Self::Done => "",
+            Self::Failed { detail } | Self::Abandoned { detail } => detail,
+        }
+    }
+}
+
+/// One durable record of a unit of queued work.
+///
+/// This is what answers "what happened to this?" after the fact: what the step
+/// is, when it was queued and claimed, by what, and how it ended - kept in the
+/// pool's own state directory so it outlives the process that wrote it and is
+/// never recomputed from live Worker state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueItem {
+    /// The step's identity.
+    pub step: StepKey,
+    /// What sort of step it is.
+    pub kind: QueueStepKind,
+    /// The human-facing subject: the Ticket the step is for.
+    pub subject: String,
+    /// The step's lifecycle state.
+    pub state: QueueItemState,
+    /// The position the step took when it was queued.
+    pub sequence: u64,
+    /// When the step was queued.
+    pub queued_at: WireTimestamp,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When a Worker claimed the step.
+    pub claimed_at: Option<WireTimestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// The Worker that claimed the step.
+    pub claimed_by: Option<WorkerId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When the step's Run started.
+    pub started_at: Option<WireTimestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// When the step reached its terminal state.
+    pub finished_at: Option<WireTimestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Why the step is queued, failed or abandoned.
+    pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// What a resumption of the step needs, once it has been claimed.
+    pub in_flight: Option<InFlightRecord>,
+    #[serde(flatten)]
+    extra: Extensions,
+}
+
+impl QueueItem {
+    /// A newly queued step, in no terminal state and claimed by nothing.
+    pub fn queued(step: &QueuedStep, sequence: u64) -> Self {
+        Self {
+            step: step.step.clone(),
+            kind: step.kind.clone(),
+            subject: step.subject.clone(),
+            state: QueueItemState::Queued,
+            sequence,
+            queued_at: step.queued_at.clone(),
+            claimed_at: None,
+            claimed_by: None,
+            started_at: None,
+            finished_at: None,
+            detail: step.detail.clone(),
+            in_flight: None,
+            extra: BTreeMap::new(),
+        }
+    }
+}
+
+/// The durable queue of work jjfx has queued, claimed, run and settled.
+///
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
+/// documents so their shape is preserved. A missing or unreadable file means
+/// "nothing is queued".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueueState {
+    /// The queued items, in queue order.
+    #[serde(default)]
+    pub items: Vec<QueueItem>,
+}
+
 /// A loaded state document, including absence as data rather than an error.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Loaded<T> {
@@ -792,7 +1086,11 @@ pub struct StateError {
     detail: String,
 }
 impl StateError {
-    fn new(operation: &'static str, subject: impl Into<String>, error: impl fmt::Display) -> Self {
+    pub(crate) fn new(
+        operation: &'static str,
+        subject: impl Into<String>,
+        error: impl fmt::Display,
+    ) -> Self {
         Self {
             operation,
             subject: subject.into(),
@@ -971,6 +1269,11 @@ pub struct SessionStateRepository {
 pub struct WaitingStateRepository {
     directory: PathBuf,
 }
+/// The jjfx-owned durable work queue.
+#[derive(Debug, Clone)]
+pub struct QueueStateRepository {
+    directory: PathBuf,
+}
 /// The jjfx-owned, append-only per-Run cost record store.
 #[derive(Debug, Clone)]
 pub struct RunRecordRepository {
@@ -1121,6 +1424,13 @@ impl StateStore {
     /// Opens the jjfx-owned Waiting (governor-held) Ticket repository.
     pub fn waiting(&self) -> WaitingStateRepository {
         WaitingStateRepository {
+            directory: self.directory(),
+        }
+    }
+
+    /// Opens the jjfx-owned durable work queue.
+    pub fn queue(&self) -> QueueStateRepository {
+        QueueStateRepository {
             directory: self.directory(),
         }
     }
@@ -2217,6 +2527,14 @@ repository_methods!(
     |_s: &WaitingStateRepository| "Waiting Tickets".to_owned(),
     validate_waiting
 );
+repository_methods!(
+    QueueStateRepository,
+    QueueState,
+    |s: &QueueStateRepository| s.directory.join(QUEUE_NAME),
+    |s: &QueueStateRepository| vec![ScopedLock::pool(s.directory.join(QUEUE_LOCK_NAME))],
+    |_s: &QueueStateRepository| "Work Queue".to_owned(),
+    validate_queue
+);
 
 impl WaitingStateRepository {
     /// Returns the Tickets held back by the last capped Dispatch, in order.
@@ -2256,6 +2574,100 @@ impl WaitingStateRepository {
                     &WaitingState { tickets },
                     subject,
                 )
+            },
+        )
+    }
+}
+
+impl QueueStateRepository {
+    /// Every queued item, in queue order.
+    pub fn items(&self) -> Result<Vec<QueueItem>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.items),
+            Loaded::Missing => Ok(Vec::new()),
+        }
+    }
+
+    /// One queued item by its step identity.
+    pub fn item(&self, step: &StepKey) -> Result<Option<QueueItem>, StateError> {
+        Ok(self.items()?.into_iter().find(|item| &item.step == step))
+    }
+
+    /// Records every offered step that is not already queued, in the order it is
+    /// offered, and reports what happened to each.
+    ///
+    /// A step already recorded is left exactly as it is - including a completed
+    /// one - so re-offering work jjfx has already done is detectable rather than
+    /// a silent repeat (ticket 09).
+    pub fn enqueue(&self, steps: &[QueuedStep]) -> Result<Vec<QueueAdmission>, StateError> {
+        self.update_items(|items| {
+            let mut admissions = Vec::with_capacity(steps.len());
+            let mut changed = false;
+            for step in steps {
+                if let Some(existing) = items.iter().find(|item| item.step == step.step) {
+                    admissions.push(QueueAdmission::Known {
+                        state: existing.state,
+                    });
+                    continue;
+                }
+                let sequence = items
+                    .iter()
+                    .map(|item| item.sequence)
+                    .max()
+                    .map_or(0, |highest| highest + 1);
+                items.push(QueueItem::queued(step, sequence));
+                admissions.push(QueueAdmission::Queued { sequence });
+                changed = true;
+            }
+            (admissions, changed)
+        })
+    }
+
+    /// Applies `edit` to the item for `step`, writing only when it changed.
+    ///
+    /// Returns whether the step changed. A step the queue does not know, or one
+    /// whose `edit` changed nothing, is reported unchanged - so a transition for
+    /// work that was never queued cannot invent it.
+    pub fn transition(
+        &self,
+        step: &StepKey,
+        edit: impl FnOnce(&mut QueueItem) -> bool,
+    ) -> Result<bool, StateError> {
+        self.update_items(
+            |items| match items.iter_mut().find(|item| &item.step == step) {
+                Some(item) => {
+                    let changed = edit(item);
+                    (changed, changed)
+                }
+                None => (false, false),
+            },
+        )
+    }
+
+    /// Applies `edit` to the queue under its lock, writing only when it changed.
+    fn update_items<T>(
+        &self,
+        edit: impl FnOnce(&mut Vec<QueueItem>) -> (T, bool),
+    ) -> Result<T, StateError> {
+        let subject = "Work Queue";
+        with_locks(
+            &[ScopedLock::pool(self.directory.join(QUEUE_LOCK_NAME))],
+            subject,
+            || {
+                let mut items =
+                    match load_state(&self.directory.join(QUEUE_NAME), subject, &validate_queue)? {
+                        Loaded::Present(versioned) => versioned.value.items,
+                        Loaded::Missing => Vec::new(),
+                    };
+                let (outcome, changed) = edit(&mut items);
+                if changed {
+                    write_atomic(
+                        &self.directory.join(QUEUE_NAME),
+                        &QueueState { items },
+                        subject,
+                    )?;
+                }
+                Ok(outcome)
             },
         )
     }
@@ -3110,6 +3522,21 @@ fn validate_undo(_state: &UndoState) -> Result<(), String> {
 fn validate_waiting(_state: &WaitingState) -> Result<(), String> {
     // Ticket ids are opaque strings to this record: it names Tickets back to the
     // owner, and never parses them.
+    Ok(())
+}
+fn validate_queue(queue: &QueueState) -> Result<(), String> {
+    let mut seen = BTreeSet::new();
+    for item in &queue.items {
+        if item.step.as_str().is_empty() {
+            return Err("a queued step has an empty identity".to_owned());
+        }
+        if item.subject.is_empty() {
+            return Err(format!("queued step {} has an empty subject", item.step));
+        }
+        if !seen.insert(item.step.as_str()) {
+            return Err(format!("queued step {} is recorded twice", item.step));
+        }
+    }
     Ok(())
 }
 fn validate_dispatch_group_for(

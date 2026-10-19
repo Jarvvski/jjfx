@@ -231,6 +231,27 @@ The set of Sub-issues in a Dispatch Group whose Dependencies are satisfied and
 that may be dispatched concurrently.
 _Avoid_: batch (for concurrent set)
 
+**Work Queue**:
+The durable, pool-scoped record of every unit of work jjfx has accepted, claimed,
+run and settled, kept in `.jj/pools/<name>/queue.json`. It is what a resumption
+reads and what makes a repeated step detectable. A Work Queue is not the waiting
+set, which describes one Dispatch and is rewritten by the next.
+_Avoid_: backlog, waiting set (for the durable record)
+_See_: `docs/work-queue.md`
+
+**Step**:
+One unit of work in the Work Queue, identified by what it is rather than when it
+ran - a Dispatch of one Ticket is the step `dispatch:<ticket>`, so the same Ticket
+offered twice is the same Step. A Step is not a Run: a Run is one execution
+attempt, while a Step is the work the queue tracks.
+_Avoid_: task, job, work item
+
+**Queue Item**:
+The durable record of one Step: what it is, when it was queued and claimed, by
+what, and how it ended. Its state is `queued`, `claimed`, `in_flight`, `done`,
+`failed` or `abandoned`; `in_flight` carries what a resumption needs.
+_Avoid_: entry, row
+
 **Follow-up**:
 A further Run dispatched to a Worker after its previous Run ended, either
 resuming the prior Agent Session or starting a fresh one.
