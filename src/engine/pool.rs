@@ -2045,11 +2045,15 @@ impl Repository {
             }
             Ok(Loaded::Present(versioned)) => versioned.value,
             Err(error) => {
+                // A document that exists but cannot be read is a real error, so
+                // it is reported - but it is named, because with several lanes a
+                // user cannot otherwise tell which one is corrupt. Absence above
+                // stays silent; only this unreadable case speaks.
                 diagnostics.push(diagnostic(
                     self.root(),
                     SnapshotDiagnosticKind::MalformedPool,
                     None,
-                    error,
+                    format!("Worker Pool {pool}: {error}", pool = self.selected_pool()),
                 ));
                 return WorkerPoolSnapshot {
                     pool: None,

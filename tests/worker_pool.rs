@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use jjfx::engine::{
-    AgentRuntime, DirectDispatchError, DirectDispatchRequest, DispatchExclusions, Repository,
-    RunMode, SnapshotDiagnosticKind, TicketId, WorkerId, WorkerPoolError, WorkerStatus,
+    AgentRuntime, DirectDispatchError, DirectDispatchRequest, DispatchExclusions, PoolName,
+    Repository, RunMode, SnapshotDiagnosticKind, TicketId, WorkerId, WorkerPoolError, WorkerStatus,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -2107,6 +2107,41 @@ fn missing_pool_is_not_invented_as_empty() {
         snapshot.diagnostics().is_empty(),
         "{:?}",
         snapshot.diagnostics()
+    );
+}
+
+#[test]
+fn malformed_pool_diagnostic_names_the_pool() {
+    let temp = tempfile::tempdir().expect("temp repository");
+    let directory = temp.path().join(".jj/pools/alpha");
+    fs::create_dir_all(&directory).expect("pool directory");
+    // A document that exists but cannot be decoded: a real error, unlike the
+    // absent case above, so it is reported - and it must name its lane.
+    fs::write(directory.join("pool.json"), b"{ not json").expect("malformed pool");
+    let repository = Repository::open(temp.path())
+        .expect("repository")
+        .with_pool(PoolName::parse("alpha").expect("pool name"));
+
+    let snapshot = repository.read_worker_pool_snapshot();
+
+    assert!(snapshot.pool().is_none());
+    // A malformed document is not an absent one: `is_missing` stays false so a
+    // frontend does not present a corrupt lane as a merely unmaterialised one.
+    assert!(!snapshot.is_missing());
+    let diagnostic = snapshot
+        .diagnostics()
+        .iter()
+        .find(|diagnostic| diagnostic.kind() == SnapshotDiagnosticKind::MalformedPool)
+        .expect("a malformed Pool diagnostic");
+    assert!(
+        diagnostic.message().contains("alpha"),
+        "the diagnostic must name its lane: {}",
+        diagnostic.message()
+    );
+    assert!(
+        diagnostic.message().contains("cannot decode Worker Pool"),
+        "the diagnostic must keep the malformed detail: {}",
+        diagnostic.message()
     );
 }
 

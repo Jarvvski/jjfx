@@ -74,6 +74,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx pool list and jjfx status no longer write an unnamed 'pool state is absent' to stderr once per pool that has no state directory - a declared lane with no directory is normal, materialising on first use, and the WORKERS column already shows the absence - so a successful listing is silent.
 - jjfx clean writes its confirmation prompt to stderr and, when stdin reaches EOF without an answer, refuses loudly with a non-zero exit instead of silently removing nothing and exiting 0
 - Name the missing origin remote when orchestrating a single Ticket, instead of failing on an empty repository slug
+- A malformed Worker Pool document is now reported naming the pool it belongs to (for example `Worker Pool alpha: cannot decode Worker Pool: ...`), so a user with several lanes can tell which one is corrupt; an absent pool document still prints nothing.
 
 ## [0.55.0] - 2026-10-16
 
