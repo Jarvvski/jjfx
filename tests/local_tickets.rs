@@ -13,16 +13,23 @@ mod support;
 /// depend on kitty being present and does not need `--force` (ADR 0011): the
 /// stub answers the Dispatch Eligibility terminal check with an empty workspace
 /// list.
+///
+/// The stub is spawned by jjfx under a short deadline, so a loaded machine can
+/// starve it past that deadline and Dispatch fails closed before it reaches the
+/// behaviour under test. The shared runner retries that environmental transient
+/// - see [`support::run_jjfx_tolerating_a_starved_terminal`].
 fn run_jjfx(repository: &Path, config_home: &Path, args: &[&str]) -> std::process::Output {
     let bin = TempDir::new().expect("temporary stub bin");
     let path = support::stub_terminal(bin.path());
-    Command::new(env!("CARGO_BIN_EXE_jjfx"))
-        .args(args)
-        .current_dir(repository)
-        .env("XDG_CONFIG_HOME", config_home)
-        .env("PATH", path)
-        .output()
-        .expect("jjfx should run")
+    support::run_jjfx_tolerating_a_starved_terminal(|| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
+        command
+            .args(args)
+            .current_dir(repository)
+            .env("XDG_CONFIG_HOME", config_home)
+            .env("PATH", &path);
+        command
+    })
 }
 
 fn write_ticket(root: &Path, feature: &str, file: &str, content: &str) {

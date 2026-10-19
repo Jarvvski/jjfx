@@ -157,15 +157,20 @@ impl SpendFixture {
             .collect()
     }
 
+    /// Runs `jjfx`, retrying a Dispatch that failed closed because the stub
+    /// terminal was starved past its deadline under load - see
+    /// [`support::run_jjfx_tolerating_a_starved_terminal`].
     fn jjfx(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_jjfx"))
-            .args(args)
-            .current_dir(self.path())
-            .env("XDG_CONFIG_HOME", self.config_home.path())
-            .env("JJ_CONFIG", self.jj_config_path())
-            .env("PATH", &self.env_path)
-            .output()
-            .expect("jjfx should run")
+        support::run_jjfx_tolerating_a_starved_terminal(|| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
+            command
+                .args(args)
+                .current_dir(self.path())
+                .env("XDG_CONFIG_HOME", self.config_home.path())
+                .env("JJ_CONFIG", self.jj_config_path())
+                .env("PATH", &self.env_path);
+            command
+        })
     }
 }
 

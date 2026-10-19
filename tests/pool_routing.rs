@@ -135,16 +135,21 @@ impl RoutingFixture {
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("executable agent");
     }
 
+    /// Runs `jjfx`, retrying a Dispatch that failed closed because the stub
+    /// terminal was starved past its deadline under load - see
+    /// [`support::run_jjfx_tolerating_a_starved_terminal`].
     fn jjfx(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_jjfx"))
-            .args(args)
-            .current_dir(self.path())
-            .env("XDG_CONFIG_HOME", self.config_home.path())
-            .env("JJ_CONFIG", self.jj_config_path())
-            .env("JJ_WS_DIR", self.ws_dir())
-            .env("PATH", &self.env_path)
-            .output()
-            .expect("jjfx should run")
+        support::run_jjfx_tolerating_a_starved_terminal(|| {
+            let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
+            command
+                .args(args)
+                .current_dir(self.path())
+                .env("XDG_CONFIG_HOME", self.config_home.path())
+                .env("JJ_CONFIG", self.jj_config_path())
+                .env("JJ_WS_DIR", self.ws_dir())
+                .env("PATH", &self.env_path);
+            command
+        })
     }
 
     /// Seeds `pool`'s durable Run records with one Run costing `micro_usd`, so a

@@ -11,10 +11,11 @@
 #[cfg(unix)]
 use std::ffi::OsString;
 use std::fs;
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -56,6 +57,73 @@ pub fn stub_terminal(bin: &Path) -> OsString {
 /// own unit tests. See its documentation in `jjfx::test_support` for why it is
 /// deliberately generous rather than a statement of expected duration.
 use jjfx::test_support::LIVENESS_TIMEOUT;
+
+/// The message Dispatch prints when it refuses to run because the terminal could
+/// not be queried (ADR 0011).
+const TERMINAL_REFUSAL: &str = "cannot determine which Worker Workspaces are open";
+
+/// Runs a `jjfx` invocation to completion, retrying while Dispatch refused
+/// because the terminal could not be queried.
+///
+/// Every Dispatch test drives the real terminal seam (ADR 0011): jjfx spawns
+/// `kitten @ ls` and gives it a short deadline. The stub terminal answers
+/// instantly, but under load that subprocess can be starved past the deadline,
+/// so Dispatch fails closed - printing nothing to stdout and the terminal
+/// refusal to stderr - before it reaches the behaviour the test is about. That
+/// is an environmental transient, not a product failure, and a test that is not
+/// about the terminal must not turn it into a red suite. So the fixture retries
+/// until the seam answers, bounded by [`LIVENESS_TIMEOUT`]: a genuinely
+/// unreachable or stuck terminal still fails the test within the bound rather
+/// than hanging it.
+///
+/// The retry is deliberately narrow - it fires only on the terminal refusal, so
+/// a real failure of the behaviour under test is returned at once, not retried.
+///
+/// `build` is called for each attempt, because a [`Command`] cannot be re-run.
+pub fn run_jjfx_tolerating_a_starved_terminal(build: impl Fn() -> Command) -> Output {
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
+    loop {
+        let output = build().output().expect("jjfx should run");
+        if !refused_on_the_terminal_check(&output) || Instant::now() >= deadline {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Like [`run_jjfx_tolerating_a_starved_terminal`], for an invocation that reads
+/// its Ticket from stdin, which has to be piped in on every attempt.
+pub fn run_jjfx_with_stdin_tolerating_a_starved_terminal(
+    build: impl Fn() -> Command,
+    stdin: &str,
+) -> Output {
+    let deadline = Instant::now() + LIVENESS_TIMEOUT;
+    loop {
+        let mut child = build()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("jjfx should run");
+        child
+            .stdin
+            .as_mut()
+            .expect("piped stdin")
+            .write_all(stdin.as_bytes())
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("jjfx output");
+        if !refused_on_the_terminal_check(&output) || Instant::now() >= deadline {
+            return output;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Whether `output` is Dispatch's fail-closed refusal to run the terminal check,
+/// rather than a failure of the behaviour a test is asserting on.
+fn refused_on_the_terminal_check(output: &Output) -> bool {
+    !output.status.success() && String::from_utf8_lossy(&output.stderr).contains(TERMINAL_REFUSAL)
+}
 
 /// Polls `path` to a bounded deadline, returning its contents once non-empty.
 ///
