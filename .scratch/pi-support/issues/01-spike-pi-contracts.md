@@ -95,24 +95,24 @@ and sanitized fixtures alone do not justify adding production code.
 
 ## Acceptance Criteria
 
-- [ ] The installed Pi version and the exact tested executable are recorded.
-- [ ] Fresh, headless JSON, interactive, and resumed invocation forms are
+- [x] The installed Pi version and the exact tested executable are recorded.
+- [x] Fresh, headless JSON, interactive, and resumed invocation forms are
       proven or explicitly marked unsupported, including exit and error
       behavior.
-- [ ] A sanitized fixture set records session identity, working directory,
+- [x] A sanitized fixture set records session identity, working directory,
       assistant/tool activity, terminal success/failure, usage/cost fields,
       and malformed or unknown event behavior where Pi exposes them.
-- [ ] The session file location, schema version, identity extraction rule, and
+- [x] The session file location, schema version, identity extraction rule, and
       resume/fork behavior are documented.
-- [ ] Extension lifecycle events and payloads are mapped to jjfx lifecycle
+- [x] Extension lifecycle events and payloads are mapped to jjfx lifecycle
       states, with unsupported states called out rather than invented.
-- [ ] Tool, trust, approval, model, system-prompt, name, budget, and Linear
+- [x] Tool, trust, approval, model, system-prompt, name, budget, and Linear
       discovery capabilities have an explicit supported/unsupported decision.
-- [ ] The findings identify every assumption that implementation tickets must
+- [x] The findings identify every assumption that implementation tickets must
       not make and provide enough evidence to implement tickets 02-04.
-- [ ] No global Pi configuration, credentials, sessions, or project files are
+- [x] No global Pi configuration, credentials, sessions, or project files are
       modified by the spike.
-- [ ] Findings and fixtures are reviewable under `.scratch/pi-support/` and
+- [x] Findings and fixtures are reviewable under `.scratch/pi-support/` and
       contain no secrets.
 
 ## Out of Scope
@@ -128,3 +128,11 @@ and sanitized fixtures alone do not justify adding production code.
 ## Blocked by
 
 None - this spike can start immediately.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review. The reconciliation recorded no new work; it confirms what shipped.
+
+The spike's deliverables are records, not code, and they survive the later removal of the Pi runtime (`.scratch/remove-pi/01` explicitly keeps `.scratch/pi-support/` as the history of why Pi was added). Evidence: `.scratch/pi-support/spike-01-contract-findings.md` records the installed version `0.84.1` and the exact tested executable with a SHA-256 (`:9-12`); the CLI/invocation table (`:23-32`); the JSON/session record inventory (`:36-46`); session identity and resume/fork rules (`:58-73`); the extension lifecycle mapping (`:75-108`); the tool/trust/approval/model/budget/Linear capability matrix (`:165-185`); the rejected assumptions for tickets 02-04 (`:187-215`); and the fixture inventory under `.scratch/pi-support/fixtures/` (`:217-228`). No secrets are present - the fixtures use placeholder paths, IDs and prompts.
