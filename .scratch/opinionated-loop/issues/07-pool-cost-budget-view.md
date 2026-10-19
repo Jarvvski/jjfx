@@ -36,9 +36,9 @@ recorded per-Run costs are sufficient for a first cut.
 
 ## Acceptance Criteria
 
-- [ ] The Pool view shows aggregate cost/usage for the pool, not just per Worker.
-- [ ] A configured cap is enforced at Dispatch with a clear, actionable message.
-- [ ] A Run with an unrepresentable cost does not break aggregation (per the
+- [x] The Pool view shows aggregate cost/usage for the pool, not just per Worker.
+- [x] A configured cap is enforced at Dispatch with a clear, actionable message.
+- [x] A Run with an unrepresentable cost does not break aggregation (per the
       bug-hunt ticket 28 handling).
 - [ ] `mise run check` is green.
 
@@ -84,3 +84,13 @@ recorded per-Run costs are sufficient for a first cut.
   the cap fires at or above its limit; and a cap that cannot be evaluated because
   the record store is unreadable refuses Dispatch rather than guessing. The
   provider usage/cost API reconciliation stays out of scope, as the ticket says.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `PoolCostSnapshot` (`src/engine/cost.rs:124`) folds the durable records into a pool total (today and a rolling seven days) plus a per-Worker split, and `pool_cost` (`:211`) builds it from the store; `WorkerPoolSnapshot` carries it so both frontends read it from the snapshot they already hold. The `[spend]` cap (`cap_usd`, `window`, `on_exceed`) is evaluated by `evaluate_spend` (`src/engine/cost.rs:470`) over `SpendLimit`s whose keys name `spend.cap_usd` / `spend.on_exceed` (`:343-352`), and both Dispatch paths are gated. Criterion 3 holds: a Run whose provider reported no usable cost is counted apart from a zero spend rather than breaking the fold (`PoolCostSnapshot::from_records`), matching bug-hunt 28. The ticket's own comment records the coverage: 9 engine aggregation/cap tests, 4 adapter gate tests, 2 `jjfx status` tests, a render test, a Pool session test and 6 config parsing/validation tests.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

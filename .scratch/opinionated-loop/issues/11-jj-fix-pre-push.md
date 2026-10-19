@@ -33,10 +33,10 @@ surface as a typed error, never a silent pass.
 
 ## Acceptance Criteria
 
-- [ ] After a forge, no commit in the chain has content a configured formatter
+- [x] After a forge, no commit in the chain has content a configured formatter
       would change.
-- [ ] With no `[fix.tools]` configured, the step is a no-op.
-- [ ] A failing formatter surfaces as a typed error, not a successful no-op.
+- [x] With no `[fix.tools]` configured, the step is a no-op.
+- [x] A failing formatter surfaces as a typed error, not a successful no-op.
 - [ ] `mise run check` is green.
 
 ## Out of Scope
@@ -63,3 +63,13 @@ surface as a typed error, never a silent pass.
   naming the tool and stops the push - a deliberate, documented exception to the
   typed-jj-access rule (bug-hunt 21), which jj's zero exit and lack of a
   machine-readable field force.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: the Weld step runs `jj fix -s <welded chain>` after the conflict re-check and before push (`src/forge.rs:716`), honouring the user's `[fix.tools]`. The outcome is typed - `FixOutcome` (`src/jj.rs:597`) distinguishes `NoTools` (`:600`) from a successful fix and a formatter failure. Criterion 2 holds: `jj fix` exits non-zero with a config error when no tools are configured, so a `jj config list` probe keeps the no-tools case a genuine no-op. Criterion 3 holds: jj exits zero when a tool fails, so the forge parses jj's own warning into a typed error naming the tool and stops the push. Tests: `forge::tests::fix_normalises_the_chain_between_weld_and_push` and `a_failed_formatter_stops_the_push_and_surfaces_a_typed_error`. The ticket's comment records the deliberate exception to the typed-jj-access rule (bug-hunt 21) that jj's zero exit and lack of a machine-readable field force.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

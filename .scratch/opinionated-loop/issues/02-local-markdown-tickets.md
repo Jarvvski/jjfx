@@ -52,18 +52,18 @@ not YAML front-matter.
 
 ## Acceptance Criteria
 
-- [ ] `jjfx dispatch --all` with `source = "local"` discovers ready tickets from
+- [x] `jjfx dispatch --all` with `source = "local"` discovers ready tickets from
       `.scratch/*/issues/*.md`.
-- [ ] A ticket with an unresolved `Blocked by:` is not ready; resolving the
+- [x] A ticket with an unresolved `Blocked by:` is not ready; resolving the
       blocker makes it ready, and the dependency graph matches the files.
-- [ ] Id, title, and body are read correctly and the body is inlined into the
+- [x] Id, title, and body are read correctly and the body is inlined into the
       Worker prompt.
-- [ ] Dispatch sets `Status: claimed`; a completed Run sets `Status: resolved`
+- [x] Dispatch sets `Status: claimed`; a completed Run sets `Status: resolved`
       and appends a dated `## Comments` line.
-- [ ] A malformed ticket file is surfaced as a `DiscoveryDiagnostic`, never
+- [x] A malformed ticket file is surfaced as a `DiscoveryDiagnostic`, never
       silently skipped and never collapsed into an empty ready list (the "no
       plausible zero" rule from bug-hunt ticket 21).
-- [ ] Works end-to-end on opencode with no Pi and no Linear configured.
+- [x] Works end-to-end on opencode with no Pi and no Linear configured.
 - [ ] `mise run check` is green.
 
 ## Out of Scope
@@ -106,3 +106,13 @@ not YAML front-matter.
   resolved when some jjfx process next reconciles the Pool (the TUI poller, or a
   later command).
   `mise run check` green.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `LocalMarkdownQuery` (`src/engine/local_tickets.rs`) implements `TicketQuery` over the `.scratch/<feature>/issues/<NN>-<slug>.md` tree - `ready_payload` (`:275`) builds the ready set, `is_ready` (`:412`) requires the ready status and every blocker resolved, and the dependency graph resolves `Blocked by:` against `Status:`. Malformed entries become diagnostics rather than being dropped (`:279-305`, `:679`), satisfying the "no plausible zero" rule. Writeback is wired through `apply_local_writeback` (`src/ticket_source.rs:57`), called from both the TUI adapter (`src/workspace_dispatch/adapter.rs:502`) and the CLI pass (`src/cli.rs:2800`), using `claim` (`src/engine/local_tickets.rs:163`) and `resolve` (`:179`). Integration tests: `tests/local_tickets.rs::dispatch_all_with_a_local_source_discovers_from_scratch`, `a_local_source_discovers_ready_tickets_and_inlines_the_body`, `a_local_ticket_resolves_and_records_a_dated_comment`, `a_reconciled_blocker_readies_its_dependent_in_the_same_dispatch`; plus the `src/engine/local_tickets.rs` diagnostic and readiness tests. Criterion 6 holds: the source needs no runtime, no Linear and no Pi - it reads the repository's own tree.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).

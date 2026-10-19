@@ -58,14 +58,14 @@ seam that already exists: `TicketQuery` (`src/engine/ticket.rs:511`) is a trait,
 
 ## Acceptance Criteria
 
-- [ ] The ticket source is selected by config, not by `AgentRuntime`.
-- [ ] `source = "linear"` reproduces today's Claude/Codex discovery, dependency
+- [x] The ticket source is selected by config, not by `AgentRuntime`.
+- [x] `source = "linear"` reproduces today's Claude/Codex discovery, dependency
       graph, and ticket-details behaviour exactly.
-- [ ] Discovery, dependency graph, and ticket details all go through the selected
+- [x] Discovery, dependency graph, and ticket details all go through the selected
       source.
-- [ ] A missing or unknown source is a clear setup error surfaced before any
+- [x] A missing or unknown source is a clear setup error surfaced before any
       Worker reservation or Pool mutation.
-- [ ] An opencode Worker can discover tickets through a configured non-runtime
+- [x] An opencode Worker can discover tickets through a configured non-runtime
       source.
 - [ ] `mise run check` is green.
 
@@ -95,3 +95,15 @@ seam that already exists: `TicketQuery` (`src/engine/ticket.rs:511`) is a trait,
   tickets through a configured non-runtime source" — is satisfied by 02 (PR #6).
   Status reconciled after the batch: PR #2 left this file's status uncommitted,
   so it is committed here.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: the source is a config decision - `TicketSource` (`src/config.rs:452`) is `linear | local`, and `configured_ticket_query` (`src/ticket_source.rs:27`) selects the implementation from `TicketsConfig`, taking the runtime only to build the `linear` variant (`:34`). Criterion 4 holds: `source` is required when `[tickets]` is present (`src/config.rs:390-397`), so a missing `source` is a load-time serde error and an unknown value fails the enum parse - both before the TUI opens and before any Pool mutation. Criterion 5 (deferred to ticket 02 by the ticket's own comment) holds on 02's evidence, below.
+
+Caveat, as in the reconciliation of named-pools 01: the "byte-for-byte" clause is established behaviourally - the `linear` path is the unchanged `AgentRuntimeQuery` and the config-selection tests are additive - not by a literal baseline comparison.
+
+Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
