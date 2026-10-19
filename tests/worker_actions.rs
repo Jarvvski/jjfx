@@ -412,9 +412,11 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
         concat!(
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "if [ \"$1\" = absorb ]; then\n",
-            "  printf 'Absorbed changes into 2 revisions:\\n  aaa111 A: add x\\n  bbb222 B: bump y\\n' >&2\n",
-            "fi\n"
+            "case \" $* \" in\n",
+            "  *' --count '*) printf '1\\n' ;;\n",
+            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
+            "  *' absorb '*) printf 'Absorbed changes into 2 revisions:\\n  aaa111 A: add x\\n  bbb222 B: bump y\\n' >&2 ;;\n",
+            "esac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-commands");
@@ -445,10 +447,21 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
         fs::read_to_string(&result).expect("absorb result"),
         "owner/eng-301-action\nabsorbed=2 remaining=false\n"
     );
-    assert_eq!(
-        fs::read_to_string(&capture).expect("command capture"),
-        concat!("jj absorb\n", "jj git push -b owner/eng-301-action\n",)
+    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 5, "{commands:?}");
+    // The precondition is read before anything is mutated, so a repository with
+    // no trunk is refused before absorb can run.
+    assert_eq!(commands[0], "log -r trunk() ~ root() --count");
+    // The mainline is read either side of the fold, so a rewrite of it is
+    // caught rather than reported as success.
+    assert!(
+        commands[1].starts_with("log -r ") && commands[1].ends_with(" --no-graph -T commit_id"),
+        "{commands:?}"
     );
+    // The destination is pinned rather than left at jj's `mutable()` default.
+    assert!(commands[2].starts_with("absorb --into "), "{commands:?}");
+    assert_eq!(commands[3], commands[1], "the mainline is re-read");
+    assert_eq!(commands[4], "git push -b owner/eng-301-action");
 }
 
 #[test]
@@ -466,7 +479,11 @@ fn absorb_that_moves_nothing_skips_the_push() {
         concat!(
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "if [ \"$1\" = absorb ]; then printf 'Nothing changed.\\n' >&2; fi\n"
+            "case \" $* \" in\n",
+            "  *' --count '*) printf '1\\n' ;;\n",
+            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
+            "  *' absorb '*) printf 'Nothing changed.\\n' >&2 ;;\n",
+            "esac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-nothing-commands");
@@ -493,9 +510,14 @@ fn absorb_that_moves_nothing_skips_the_push() {
         fs::read_to_string(&result).expect("absorb result"),
         "owner/eng-301-action\nabsorbed=0 remaining=false\n"
     );
-    assert_eq!(
-        fs::read_to_string(&capture).expect("command capture"),
-        "jj absorb\n"
+    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 4, "{commands:?}");
+    assert!(commands[2].starts_with("absorb --into "), "{commands:?}");
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.starts_with("git push")),
+        "a run that absorbs nothing must not push: {commands:?}"
     );
 }
 
@@ -514,9 +536,11 @@ fn absorb_reports_hunks_that_stayed_in_the_working_copy() {
         concat!(
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "if [ \"$1\" = absorb ]; then\n",
-            "  printf 'Absorbed changes into 1 revisions:\\n  aaa111 A: add x\\nRemaining changes:\\nA new.rs\\n' >&2\n",
-            "fi\n"
+            "case \" $* \" in\n",
+            "  *' --count '*) printf '1\\n' ;;\n",
+            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
+            "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n  aaa111 A: add x\\nRemaining changes:\\nA new.rs\\n' >&2 ;;\n",
+            "esac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-remaining-commands");
@@ -560,8 +584,12 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
         concat!(
             "#!/bin/sh\n",
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
-            "if [ \"$1\" = absorb ]; then printf 'Absorbed changes into 1 revisions:\\n' >&2; fi\n",
-            "if [ \"$1\" = git ] && [ \"$2\" = push ]; then echo rejected >&2; exit 1; fi\n"
+            "case \" $* \" in\n",
+            "  *' --count '*) printf '1\\n' ;;\n",
+            "  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n",
+            "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n' >&2 ;;\n",
+            "  *' git push '*) echo rejected >&2; exit 1 ;;\n",
+            "esac\n"
         ),
     );
     let capture = temporary_directory.path().join("absorb-failure-commands");
@@ -590,13 +618,177 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
             .contains("cannot push absorbed branch"),
         "result should name the absorb push failure"
     );
+    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 6, "{commands:?}");
+    assert!(commands[2].starts_with("absorb --into "), "{commands:?}");
+    assert_eq!(commands[4], "git push -b owner/eng-301-action");
+    assert_eq!(commands[5], "undo --allow-cross-workspace");
+}
+
+/// The repository `jjfx absorb` was observed to destroy: `origin` exists but no
+/// `main@origin` has been fetched, so `trunk()` does not resolve, `immutable_heads()`
+/// is empty, and jj calls every commit - `main` included - mutable. A Worker
+/// whose change is already committed must not be folded into trunk: absorb
+/// refuses, naming what is missing, and both commits are left exactly as they
+/// were.
+#[test]
+fn absorb_refuses_when_trunk_does_not_resolve_and_leaves_main_alone() {
+    let (temporary_directory, repository) = local_repository();
+    let jj_config = temporary_directory.path().join("jj-config.toml");
+    fs::write(
+        &jj_config,
+        "user.name = \"jjfx test\"\nuser.email = \"jjfx@example.com\"\n",
+    )
+    .expect("jj config");
+
+    // `main` needs a real base commit first: a Worker's edit to existing lines
+    // is what absorb would fold into a mutable main. A brand-new file has no
+    // ancestor to attach to, so absorb leaves it alone whatever the destination.
+    fs::write(
+        repository.root().join("site.css"),
+        "body { color: black; }\n",
+    )
+    .expect("base file");
+    jj_with_config(
+        repository.root(),
+        &["describe", "-m", "Lantern static site"],
+        &jj_config,
+    );
+
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-trunk.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let workspace = worker_workspace_path(&repository, &worker);
+    // Dispatch bases a Worker on the mainline (`prepare_for_dispatch` runs
+    // `jj new main`); `jj workspace add` alone leaves it on the root commit.
+    jj_with_config(&workspace, &["new", "main"], &jj_config);
+
+    // The Worker's deliverable, committed as `@`, exactly as the drive had it.
+    fs::write(
+        workspace.join("site.css"),
+        "body { color: black; }\nform { margin: 1em; }\n",
+    )
+    .expect("Worker edit");
+    jj_with_config(
+        &workspace,
+        &["describe", "-m", "contact-form: Add a contact form"],
+        &jj_config,
+    );
+
+    assert!(
+        !jj_trunk_resolves(&workspace, &jj_config),
+        "the fixture must be the dangerous repository: no fetched mainline"
+    );
+    let main_before = jj_commit_id(repository.root(), "main", &jj_config);
+    let worker_before = jj_commit_id(&workspace, "@", &jj_config);
+
+    let result = temporary_directory.path().join("absorb-trunk-result");
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env("JJ_CONFIG", &jj_config)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(
+        output.status.success(),
+        "absorb helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let outcome = fs::read_to_string(&result).expect("absorb result");
+    assert!(
+        outcome.contains("no resolvable trunk"),
+        "the refusal must name the precondition: {outcome}"
+    );
+    assert!(
+        outcome.contains("jj git fetch"),
+        "the refusal must say how to get a trunk: {outcome}"
+    );
     assert_eq!(
-        fs::read_to_string(&capture).expect("command capture"),
+        jj_commit_id(repository.root(), "main", &jj_config),
+        main_before,
+        "`main` must not be rewritten"
+    );
+    assert_eq!(
+        jj_commit_id(&workspace, "@", &jj_config),
+        worker_before,
+        "the Worker's commit must survive"
+    );
+    assert_eq!(
+        fs::read_to_string(workspace.join("site.css")).expect("Worker file"),
+        "body { color: black; }\nform { margin: 1em; }\n",
+        "the Worker's change must stay in its commit"
+    );
+}
+
+/// The belt to the pinned destination's braces: if `jj absorb` rewrites the
+/// mainline anyway - because a future jj ignores `--into`, say - the rewrite is
+/// detected, undone, and reported as a failure rather than as success.
+#[test]
+fn an_absorb_that_rewrites_the_mainline_is_rolled_back_and_fails() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-rollback.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("absorb-rollback-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
         concat!(
-            "jj absorb\n",
-            "jj git push -b owner/eng-301-action\n",
-            "jj undo --allow-cross-workspace\n"
-        )
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
+            "case \" $* \" in\n",
+            "  *' --count '*) printf '1\\n' ;;\n",
+            "  *' absorb '*) printf 'Absorbed changes into 1 revisions:\\n' >&2 ;;\n",
+            "  *' log '*) if [ -e \"$JJFX_ACTION_CAPTURE.mark\" ]; then\n",
+            "      printf 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'\n",
+            "    else\n",
+            "      printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\n",
+            "      : > \"$JJFX_ACTION_CAPTURE.mark\"\n",
+            "    fi ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("absorb-rollback-commands");
+    let result = temporary_directory.path().join("absorb-rollback-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(output.status.success());
+    let outcome = fs::read_to_string(&result).expect("absorb result");
+    assert!(
+        outcome.contains("rewrote the mainline"),
+        "a moved mainline must be reported, never success: {outcome}"
+    );
+    let commands = jj_subcommands(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(commands.len(), 5, "{commands:?}");
+    assert_eq!(commands[4], "undo --allow-cross-workspace");
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.starts_with("git push")),
+        "a rolled-back absorb must not push: {commands:?}"
     );
 }
 
@@ -1523,6 +1715,90 @@ fn grow_one_worker(repository: &Repository) -> WorkerId {
         .expect("Worker Workspace should be provisioned")
         .added_workers()[0]
         .clone()
+}
+
+/// The `jj` subcommands a fake-`jj` capture recorded, with the global flags
+/// jjfx adds (`--config signing.behavior=drop`, `--ignore-working-copy`)
+/// stripped, so an assertion names the operation rather than the environment it
+/// ran in.
+fn jj_subcommands(capture: &str) -> Vec<String> {
+    capture
+        .lines()
+        .map(|line| {
+            let mut rest = line.strip_prefix("jj ").unwrap_or(line).trim();
+            while let Some(tail) = rest
+                .strip_prefix("--ignore-working-copy ")
+                .or_else(|| rest.strip_prefix("--config signing.behavior=drop "))
+            {
+                rest = tail;
+            }
+            rest.to_owned()
+        })
+        .collect()
+}
+
+/// Run one jj command against a fixture repository with its own `JJ_CONFIG`,
+/// asserting success.
+fn jj_with_config(dir: &Path, args: &[&str], config: &Path) {
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop"])
+        .args(args)
+        .current_dir(dir)
+        .env("JJ_CONFIG", config)
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The commit id `revset` resolves to in `dir`, read against `config`.
+fn jj_commit_id(dir: &Path, revset: &str, config: &Path) -> String {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            revset,
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ])
+        .current_dir(dir)
+        .env("JJ_CONFIG", config)
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj log -r {revset} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
+
+/// Whether jj's `trunk()` resolves in `dir`: a fetched mainline, not the root
+/// commit it degrades to when there is none.
+fn jj_trunk_resolves(dir: &Path, config: &Path) -> bool {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "log",
+            "-r",
+            "trunk() ~ root()",
+            "--count",
+        ])
+        .current_dir(dir)
+        .env("JJ_CONFIG", config)
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj log -r 'trunk() ~ root()' failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim() != "0"
 }
 
 fn set_terminal_worker(repository: &Repository, worker: &WorkerId, prior_log: &Path) {

@@ -687,6 +687,52 @@ fn has_fix_tools(dir: &Path) -> anyhow::Result<bool> {
         .any(|line| line.trim_start().starts_with("fix.tools.")))
 }
 
+/// Whether jj's `trunk()` resolves to a real commit: a `main`/`master`/`trunk`
+/// bookmark on the `origin` or `upstream` remote that has been fetched.
+///
+/// This is the precondition `jj absorb` needs and jjfx used to assume. `trunk()`
+/// falls back to the root commit, so in a repository with no fetched mainline it
+/// resolves to nothing, `immutable_heads()` is empty, and jj treats *every*
+/// commit - `main` included - as mutable. False here is the dangerous state, not
+/// an empty repository.
+pub fn trunk_resolves(dir: &Path) -> anyhow::Result<bool> {
+    let out = read_in_dir(dir, &["log", "-r", "trunk() ~ root()", "--count"])?;
+    Ok(parse_count(&out)? > 0)
+}
+
+/// The commit id the mainline base ([`crate::trunk::as_revset`]) resolves to in
+/// `dir`. Read before and after a `jj absorb` to tell whether the absorb
+/// rewrote the mainline: `trunk::as_revset` resolves a local `main` even when
+/// jj's bare `trunk()` does not, so this is the checkpoint that catches a
+/// rewrite in exactly the repository where absorb is dangerous.
+pub fn mainline_commit(dir: &Path) -> anyhow::Result<String> {
+    let out = read_in_dir(
+        dir,
+        &[
+            "log",
+            "-r",
+            &crate::trunk::as_revset(),
+            "--no-graph",
+            "-T",
+            "commit_id",
+        ],
+    )?;
+    Ok(out.trim().to_owned())
+}
+
+/// The revset `jj absorb` may fold a Worker's working-copy edits into: the
+/// Worker's own mutable commits above the mainline base, and never the mainline
+/// itself.
+///
+/// `jj absorb` defaults its destination to `mutable()`, which is safe only while
+/// trunk is immutable. Pinning the destination to `(mainline)..@` keeps trunk
+/// out of reach whether or not it is immutable, so a Worker whose change is
+/// already committed stays put instead of being folded into the branch it sits
+/// on.
+pub fn absorb_destinations() -> String {
+    format!("mutable() & ::@ & ~::({})", crate::trunk::as_revset())
+}
+
 /// Build a `jj` invocation for a command that may write.
 ///
 /// Tests never sign: their commits are throwaway, and signing them made the
@@ -1077,6 +1123,82 @@ mod tests {
         assert_eq!(
             diff_line_delta(&root, "@-", "@").expect("the git diff reads"),
             (2, 1)
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn trunk_resolution_is_read_from_jjs_own_revset_not_assumed() {
+        let repo = temp_repo("trunk-resolution");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+
+        // Nothing on `origin` has been fetched, so `trunk()` degrades to the
+        // root commit: it does not resolve, and every commit is mutable.
+        assert!(!trunk_resolves(&root).expect("the trunk read succeeds"));
+
+        std::fs::write(root.join("f.txt"), "base\n").expect("writing f.txt");
+        run_mut(&root, &["describe", "-m", "base"]).expect("describe");
+        run_mut(&root, &["bookmark", "create", "main", "-r", "@"]).expect("bookmark");
+
+        // A *local* `main` is not a trunk: `trunk()` still does not resolve,
+        // which is exactly the repository where absorb is dangerous.
+        assert!(!trunk_resolves(&root).expect("the trunk read succeeds"));
+        // The mainline base does resolve it, so it is the checkpoint that
+        // catches a rewrite of the branch absorb would otherwise fold into.
+        assert_eq!(
+            mainline_commit(&root).expect("the mainline read succeeds"),
+            read_in_dir(
+                &root,
+                &["log", "-r", "main", "--no-graph", "-T", "commit_id"]
+            )
+            .expect("main reads")
+            .trim()
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    #[test]
+    fn absorb_destinations_keep_the_worker_stack_and_drop_a_mutable_main() {
+        let repo = temp_repo("absorb-destinations");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        std::fs::write(root.join("f.txt"), "base\n").expect("writing f.txt");
+        run_mut(&root, &["describe", "-m", "main"]).expect("describe");
+        run_mut(&root, &["bookmark", "create", "main", "-r", "@"]).expect("bookmark");
+        run_mut(&root, &["new", "-m", "A"]).expect("new");
+        std::fs::write(root.join("f.txt"), "a\n").expect("writing f.txt");
+        run_mut(&root, &["describe", "-m", "A"]).expect("describe");
+
+        let descriptions = |revset: &str| {
+            read_in_dir(
+                &root,
+                &[
+                    "log",
+                    "-r",
+                    revset,
+                    "--no-graph",
+                    "-T",
+                    "description.first_line() ++ \"\\n\"",
+                ],
+            )
+            .expect("the revset reads")
+        };
+
+        // `jj absorb`'s own default destination is `mutable()`, which includes
+        // `main` here: nothing protects it, because `trunk()` does not resolve.
+        let mutable = descriptions("mutable()");
+        assert!(mutable.lines().any(|line| line == "main"), "{mutable}");
+
+        // The pinned destination does not, and keeps the Worker's own commit.
+        let destinations = descriptions(&absorb_destinations());
+        assert!(
+            !destinations.lines().any(|line| line == "main"),
+            "{destinations}"
+        );
+        assert!(
+            destinations.lines().any(|line| line == "A"),
+            "{destinations}"
         );
 
         std::fs::remove_dir_all(&repo).ok();

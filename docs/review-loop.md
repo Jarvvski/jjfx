@@ -56,6 +56,21 @@ jjfx reads that summary: a run that leaves hunks behind - because no ancestor
 unambiguously owns those lines - says so rather than pretending the working copy
 is clean.
 
+Two guards keep that step off the mainline, because a Worker's `@` is its
+deliverable and `jj absorb` folds into the closest *mutable* ancestor:
+
+- The destination is pinned to the Worker's own commits above the mainline,
+  never jj's default `mutable()`. A Worker whose change is already committed
+  therefore has nowhere to fold into, so the command is the no-op it should be
+  rather than a rewrite of the branch the Worker sits on.
+- The mainline is read before and after the fold. If it moved anyway, the absorb
+  is rolled back with `jj undo` and reported as a failure - never as success.
+
+`jjfx absorb` also refuses outright when the repository has no resolvable trunk
+(no fetched `main@origin`), because there is nothing for absorb to stop at: in
+that repository every commit, `main` included, is mutable. The refusal says so
+and names the remedy (`jj git fetch`).
+
 Absorb can leave the commits above it conflicted, because it rewrites a commit
 they sit on. The prompt says so: resolve every conflict absorb reports, or
 `jj undo` and address that feedback on top of `@` instead. Feedback that does not

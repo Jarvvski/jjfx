@@ -517,8 +517,27 @@ impl WorkerActions {
     /// it (`jj new <commit>`), and `jj absorb` moves each hunk into the closest
     /// mutable ancestor where those lines last changed. A run that absorbs
     /// nothing does not push, so `absorb` is safe to run speculatively.
+    ///
+    /// The destination is pinned to the Worker's own commits above the mainline,
+    /// so a Worker whose change is already committed is a no-op rather than a
+    /// rewrite of the branch it sits on, and the mainline is checked before and
+    /// after. A repository whose `trunk()` does not resolve is refused outright:
+    /// there is nothing for absorb to stop at.
     pub fn absorb(&self, worker: &WorkerId) -> Result<AbsorbOutcome, WorkerActionError> {
         let (branch, workspace) = self.branch_and_workspace(worker)?;
+        // `jj absorb` folds the source revision's hunks into the closest
+        // *mutable* ancestor, and a Worker's `@` is its deliverable commit. In a
+        // repository whose `trunk()` does not resolve, every ancestor - `main`
+        // included - is mutable, so the deliverable would be folded into trunk
+        // and trunk rewritten. Check the precondition rather than assume it.
+        if !crate::jj::trunk_resolves(&workspace).map_err(|source| WorkerActionError::Command {
+            operation: "read the repository's trunk",
+            detail: source.to_string(),
+        })? {
+            return Err(WorkerActionError::TrunkUnresolved {
+                worker: worker.clone(),
+            });
+        }
         // Absorb rewrites the working copy, so serialise it with preparation and
         // Reset restoration like every other Workspace operation.
         let _operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
@@ -1146,16 +1165,36 @@ impl SystemCommands {
     /// `jj absorb` writes that summary to stderr and exits zero whether or not
     /// anything was absorbed, so the summary - not the exit code - says what
     /// happened.
+    ///
+    /// The destination is pinned to the Worker's own mutable commits above the
+    /// mainline ([`crate::jj::absorb_destinations`]) rather than jj's default
+    /// `mutable()`, which is only safe while trunk is immutable. The mainline is
+    /// then re-read: if it moved anyway, the absorb is rolled back with
+    /// `jj undo` and reported as a failure, never as a success.
     fn absorb(self, workspace: &Path) -> Result<AbsorbReport, String> {
-        let output = Command::new("jj")
-            .args(["absorb"])
+        let mainline =
+            crate::jj::mainline_commit(workspace).map_err(|source| source.to_string())?;
+        let output = crate::jj::command()
+            .args(["absorb", "--into", &crate::jj::absorb_destinations()])
             .current_dir(workspace)
             .output()
             .map_err(|source| source.to_string())?;
         if !output.status.success() {
             return Err(String::from_utf8_lossy(&output.stderr).trim().to_owned());
         }
-        Ok(classify_absorb(&String::from_utf8_lossy(&output.stderr)))
+        let report = classify_absorb(&String::from_utf8_lossy(&output.stderr));
+        let after = crate::jj::mainline_commit(workspace).map_err(|source| source.to_string())?;
+        if after != mainline {
+            return Err(match self.undo(workspace) {
+                Ok(()) => format!(
+                    "jj absorb rewrote the mainline ({mainline} -> {after}); rolled back with `jj undo`"
+                ),
+                Err(rollback) => format!(
+                    "jj absorb rewrote the mainline ({mainline} -> {after}) and the `jj undo` rollback failed: {rollback}"
+                ),
+            });
+        }
+        Ok(report)
     }
 
     fn undo(self, workspace: &Path) -> Result<(), String> {
@@ -1544,6 +1583,14 @@ pub enum WorkerActionError {
         push: String,
         rollback: Option<String>,
     },
+    /// The repository has no resolvable trunk, so absorb has nothing safe to
+    /// stop at.
+    #[error(
+        "cannot absorb for Worker {worker}: the repository has no resolvable trunk, so every \
+         commit - `main` included - is mutable and `jj absorb` would fold the Worker's commit \
+         into it; fetch the mainline first (`jj git fetch`, or push `main` to `origin`)"
+    )]
+    TrunkUnresolved { worker: WorkerId },
     /// An external action adapter failed.
     #[error("cannot {operation}: {detail}")]
     Command {
@@ -1668,5 +1715,136 @@ mod tests {
         assert_eq!(report.revisions(), 0);
         assert!(report.is_empty());
         assert!(!report.has_remaining_changes());
+    }
+
+    /// Run one jj command in `dir`, asserting it succeeds. Goes through
+    /// [`crate::jj::command`] so a throwaway test commit is never signed with
+    /// the developer's key.
+    fn jj(dir: &Path, args: &[&str]) {
+        let output = crate::jj::command()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// The commit id `revset` resolves to in `dir`.
+    fn commit_id(dir: &Path, revset: &str) -> String {
+        crate::jj::read_in_dir(dir, &["log", "-r", revset, "--no-graph", "-T", "commit_id"])
+            .expect("a commit id read")
+            .trim()
+            .to_owned()
+    }
+
+    /// The contents of `path` at `revset` in `dir`.
+    fn file(dir: &Path, revset: &str, path: &str) -> String {
+        crate::jj::read_in_dir(dir, &["file", "show", "-r", revset, path]).expect("a file read")
+    }
+
+    /// The repository `jjfx absorb` was observed to destroy: a *local* `main`
+    /// bookmark with no `main@origin` fetched, so `trunk()` does not resolve and
+    /// jj calls every commit - `main` included - mutable. `@` is a Worker's
+    /// committed deliverable, one change stacked on `main`.
+    fn mutable_main_repo(tag: &str) -> std::path::PathBuf {
+        let root = crate::store::test_local_repo(tag);
+        std::fs::write(root.join("site.css"), "body { color: black; }\n").expect("base file");
+        jj(&root, &["describe", "-m", "Lantern static site"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@"]);
+        jj(&root, &["new"]);
+        std::fs::write(
+            root.join("site.css"),
+            "body { color: black; }\nform { margin: 1em; }\n",
+        )
+        .expect("Worker edit");
+        jj(
+            &root,
+            &["describe", "-m", "contact-form: Add a contact form"],
+        );
+        root
+    }
+
+    #[test]
+    fn absorb_never_folds_a_committed_change_into_a_mutable_main() {
+        let root = mutable_main_repo("absorb-mutable-main");
+        let main = commit_id(&root, "main");
+        let worker = commit_id(&root, "@");
+
+        // The destination is pinned to the Worker's own commits, so a change
+        // already committed as the deliverable has nowhere to go: absorb is the
+        // no-op it should be, rather than the rewrite of `main` it used to be.
+        let report = SystemCommands.absorb(&root).expect("absorb runs");
+
+        assert!(report.is_empty(), "nothing belongs in an earlier commit");
+        assert_eq!(
+            commit_id(&root, "main"),
+            main,
+            "`main` must not be rewritten"
+        );
+        assert_eq!(
+            commit_id(&root, "@"),
+            worker,
+            "the Worker's commit must survive"
+        );
+        assert_eq!(
+            file(&root, "@", "site.css"),
+            "body { color: black; }\nform { margin: 1em; }\n",
+            "the Worker's change must stay in its commit"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn absorb_still_folds_an_edit_into_the_workers_own_base_commit() {
+        // The review-feedback flow the pinning must not break: an edit made on
+        // top of a base commit is folded into that commit, and nothing below it
+        // moves.
+        let root = crate::store::test_local_repo("absorb-base-commit");
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("seed file");
+        jj(&root, &["describe", "-m", "main: initial"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@"]);
+        jj(&root, &["new", "-m", "A: add a and b"]);
+        std::fs::write(root.join("a.rs"), "let a = 1;\n").expect("a.rs");
+        std::fs::write(root.join("b.rs"), "let b = 2;\n").expect("b.rs");
+        jj(&root, &["describe", "-m", "A: add a and b"]);
+        let base = commit_id(&root, "@");
+        let base_change =
+            crate::jj::read_in_dir(&root, &["log", "-r", "@", "--no-graph", "-T", "change_id"])
+                .expect("a change id read")
+                .trim()
+                .to_owned();
+        jj(&root, &["new", "-m", "B: bump b"]);
+        std::fs::write(root.join("b.rs"), "let b = 3;\n").expect("b.rs edit");
+        jj(&root, &["describe", "-m", "B: bump b"]);
+        jj(&root, &["new"]);
+        std::fs::write(root.join("a.rs"), "let a = 0;\n").expect("feedback edit");
+        let main = commit_id(&root, "main");
+
+        let report = SystemCommands.absorb(&root).expect("absorb runs");
+
+        assert_eq!(report.revisions(), 1, "the edit folds into one commit");
+        assert_eq!(commit_id(&root, "main"), main, "`main` must not move");
+        assert_ne!(
+            commit_id(&root, &base_change),
+            base,
+            "the base commit is rewritten by the fold"
+        );
+        assert_eq!(
+            file(&root, &base_change, "a.rs"),
+            "let a = 0;\n",
+            "the feedback lands in the base commit"
+        );
+        assert_eq!(
+            file(&root, &base_change, "b.rs"),
+            "let b = 2;\n",
+            "the base commit keeps its own change"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
     }
 }
