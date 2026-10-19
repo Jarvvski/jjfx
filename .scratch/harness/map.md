@@ -49,6 +49,11 @@ data maps onto a pattern the research says prevents it.
 - **The review bound lives in jjfx (2026-10-19).** Tool-enforced, not
   prompt-enforced.
 
+These four are recorded as **ADR 0016**
+(`docs/adr/0016-jjfx-is-the-deterministic-control-plane.md`), which extends
+ADR 0009: 0009 gave the control plane its domain and its seam, 0016 gives it
+its job.
+
 ## What already exists (so this is cheaper than it looks)
 
 - opencode **child sessions are one field** - `POST /api/session {parentID,
@@ -79,7 +84,8 @@ exist (container-use, Sculptor, Terragon), and there is a jj-native cluster
 true is narrower and stronger - **jjfx is the only tool that makes the jj
 substrate the orchestration model**. The field's two unsolved problems are
 verifying agent output and integrating parallel work, which is what jjfx's
-`[checks]` and conflict-as-data already address.
+`[checks]` and conflict-as-data already address. Applied to
+`opinionated-loop/map.md` on 2026-10-19.
 
 ## Tickets
 
