@@ -83,8 +83,11 @@ its working copy.
 _Avoid_: branch
 
 **Bookmark**:
-A Jujutsu named pointer that can be pushed to a remote; the persisted
-`branch_name` field carries it.
+A Jujutsu named pointer that can be pushed to a remote. A Worker's bookmark is
+`<prefix>/<ticket>-<description>`, so a landing verb matches it by its Ticket
+rather than reading it from the persisted `branch_name` field, which records
+only the bare Ticket id. A push that finds the bookmark already published is a
+no-op success; a push whose name matches no bookmark is a failure.
 _Avoid_: branch
 
 **Pull request stack**:

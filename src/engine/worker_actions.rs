@@ -14,9 +14,10 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
     AgentSessionResolution, BackgroundRun, CompletedRun, DispatchExclusions, MutationGuard,
     MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation, ReviewFinding,
-    ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, WorkerId, WorkerPoolError,
-    WorkerStatus, resolve_agent_session_for_runtime,
+    ReviewRequest, RunLog, RunSupervisor, RunSupervisorError, TicketBranch, TicketId, WorkerId,
+    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime, resolve_ticket_branch,
 };
+use crate::jj::PushOutcome;
 
 /// Whether a Worker action runs attached to the caller or in the background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -782,36 +783,32 @@ impl WorkerActions {
         &self,
         worker: &WorkerId,
     ) -> Result<(String, PullRequest), WorkerActionError> {
-        let snapshot = self.repository.worker_pool().snapshot();
-        let state =
-            snapshot
-                .worker(worker.as_str())
-                .ok_or_else(|| WorkerActionError::WorkerNotFound {
-                    worker: worker.clone(),
-                })?;
-        let branch = state
-            .branch_name()
-            .filter(|branch| !branch.is_empty())
-            .ok_or_else(|| WorkerActionError::MissingBranch {
-                worker: worker.clone(),
-            })?;
+        let branch = self.worker_branch(worker)?;
         let repository = repository_slug(&self.repository);
         if repository.is_empty() {
             return Err(WorkerActionError::RepositoryUnavailable);
         }
         let pull_request = self
             .commands
-            .pull_request(&repository, branch)?
+            .pull_request(&repository, &branch)?
             .ok_or_else(|| WorkerActionError::PullRequestNotFound {
-                branch: branch.to_owned(),
+                branch: branch.clone(),
             })?;
         Ok((repository, pull_request))
     }
 
-    fn branch_and_workspace(
-        &self,
-        worker: &WorkerId,
-    ) -> Result<(String, std::path::PathBuf), WorkerActionError> {
+    /// The Worker's delivered bookmark, resolved against the repository.
+    ///
+    /// Worker state records the bare Ticket id at reservation time
+    /// (`branch_name: ticket.to_lowercase()`), but the dispatch prompt tells the
+    /// agent to create `{prefix}/{ticket}-<description>`. The state value is
+    /// therefore a guess at the bookmark, never the bookmark itself: resolve the
+    /// real one by matching on the Ticket, the same rule orchestration uses
+    /// ([`resolve_ticket_branch`]). Resolution happens at *use* rather than from
+    /// a recorded name because before the agent has chosen its bookmark there is
+    /// nothing to record. It is a read, so it fails before any Workspace is
+    /// touched.
+    fn worker_branch(&self, worker: &WorkerId) -> Result<String, WorkerActionError> {
         let snapshot = self.repository.worker_pool().snapshot();
         let state =
             snapshot
@@ -819,13 +816,32 @@ impl WorkerActions {
                 .ok_or_else(|| WorkerActionError::WorkerNotFound {
                     worker: worker.clone(),
                 })?;
-        let branch = state
-            .branch_name()
-            .filter(|branch| !branch.is_empty())
-            .map(str::to_owned)
+        let ticket = state
+            .ticket()
+            .filter(|ticket| !ticket.is_empty())
+            .and_then(|ticket| TicketId::parse(ticket).ok())
             .ok_or_else(|| WorkerActionError::MissingBranch {
                 worker: worker.clone(),
             })?;
+        match resolve_ticket_branch(self.repository.root(), &ticket) {
+            TicketBranch::Resolved(branch) => Ok(branch),
+            TicketBranch::Missing => Err(WorkerActionError::BranchNotFound {
+                worker: worker.clone(),
+                ticket: ticket.as_str().to_owned(),
+            }),
+            TicketBranch::Ambiguous(branches) => Err(WorkerActionError::AmbiguousBranch {
+                worker: worker.clone(),
+                ticket: ticket.as_str().to_owned(),
+                branches: branches.join(", "),
+            }),
+        }
+    }
+
+    fn branch_and_workspace(
+        &self,
+        worker: &WorkerId,
+    ) -> Result<(String, std::path::PathBuf), WorkerActionError> {
+        let branch = self.worker_branch(worker)?;
         let workspace = crate::engine::workspace::worker_path(self.repository.root(), worker);
         if !workspace.is_dir() {
             return Err(WorkerActionError::MissingWorkspace {
@@ -1157,7 +1173,17 @@ impl SystemCommands {
     }
 
     fn push(self, workspace: &Path, branch: &str) -> Result<(), String> {
-        self.run_status(workspace, "jj", &["git", "push", "-b", branch])
+        // `jj git push -b <name>` exits zero and pushes nothing both when the
+        // bookmark is already published and when the name matches no bookmark,
+        // so the exit code alone cannot tell them apart. `push_bookmark`
+        // classifies from the remote-bookmark state *and* jj's bookmark list:
+        // `Nothing` is a bookmark that is there and already published - the
+        // desired state already holds, so the verb succeeds and nothing is
+        // rolled back - while a name that matches no bookmark is a failure.
+        match crate::jj::push_bookmark(workspace, branch).map_err(|error| error.to_string())? {
+            PushOutcome::Pushed | PushOutcome::Nothing => Ok(()),
+            PushOutcome::Failed(detail) => Err(detail),
+        }
     }
 
     /// Runs `jj absorb` and reads what it did from its summary.
@@ -1542,6 +1568,22 @@ pub enum WorkerActionError {
     /// Review and repository actions require a resolved Worker bookmark.
     #[error("Worker {worker} has no branch")]
     MissingBranch { worker: WorkerId },
+    /// No bookmark in the repository names the Worker's Ticket.
+    #[error(
+        "no bookmark names Worker {worker}'s Ticket {ticket}: create \
+         `<prefix>/{ticket}-<description>` or re-run the Run that was to deliver it"
+    )]
+    BranchNotFound { worker: WorkerId, ticket: String },
+    /// More than one bookmark names the Worker's Ticket.
+    #[error(
+        "Worker {worker}'s Ticket {ticket} is named by more than one bookmark ({branches}): \
+         keep one and delete the rest"
+    )]
+    AmbiguousBranch {
+        worker: WorkerId,
+        ticket: String,
+        branches: String,
+    },
     /// The compatible structured log is absent.
     #[error("Worker {worker} has no Run log")]
     MissingLog { worker: WorkerId },

@@ -510,6 +510,12 @@ pub enum PushOutcome {
     /// A remote bookmark moved, so the remote was updated.
     Pushed,
     /// jj exited zero and left every remote bookmark where it was.
+    ///
+    /// For a bookmark push this is a no-op *success*: the bookmark is there and
+    /// already published, so the desired state already holds. It is why
+    /// [`push_bookmark`] consults jj's bookmark list before reporting it - a name
+    /// that matches no bookmark leaves the same remote state behind but is a
+    /// failure, not this.
     Nothing,
     /// The push failed; carries jj's own message.
     Failed(String),
@@ -531,6 +537,71 @@ pub fn push(dir: &Path, revset: &str) -> anyhow::Result<PushOutcome> {
         .then(|| remote_bookmark_snapshot(dir))
         .transpose()?;
     Ok(classify_push(&run, &before, after.as_deref()))
+}
+
+/// Push one named bookmark from `dir` (`jj git push --bookmark`), classified
+/// like [`push`] except for the one case only jj's bookmark list can settle.
+///
+/// `jj git push --bookmark <name>` exits zero and leaves identical remote state
+/// both when the bookmark is already published and when the name matches no
+/// bookmark at all, so the exit code cannot tell a no-op from a push that did
+/// nothing because there was nothing to push *to*. The two are opposites:
+/// [`PushOutcome::Nothing`] is a success - the bookmark is there, the remote
+/// already has it - while a name that matches nothing is
+/// [`PushOutcome::Failed`], because the push did not do what it was asked.
+pub fn push_bookmark(dir: &Path, bookmark: &str) -> anyhow::Result<PushOutcome> {
+    let before = remote_bookmark_snapshot(dir)?;
+    let run = cmd("jj")
+        .current_dir(dir)
+        .args(["git", "push", "--bookmark", bookmark])
+        .run()?;
+    let after = run
+        .ok()
+        .then(|| remote_bookmark_snapshot(dir))
+        .transpose()?;
+    // Only a zero exit that moved no remote bookmark needs the extra read: every
+    // other outcome is decided by the run and the snapshots alone.
+    let unchanged = run.ok() && after.as_deref() == Some(before.as_str());
+    let exists = if unchanged {
+        bookmark_exists(dir, bookmark)?
+    } else {
+        false
+    };
+    Ok(classify_push_bookmark(
+        &run,
+        &before,
+        after.as_deref(),
+        bookmark,
+        exists,
+    ))
+}
+
+/// Classify one bookmark push from its run, the remote-bookmark snapshots, and
+/// whether the named bookmark exists. Pure, so the one distinction an exit code
+/// cannot make is unit-testable.
+fn classify_push_bookmark(
+    run: &Run,
+    before: &str,
+    after: Option<&str>,
+    bookmark: &str,
+    bookmark_exists: bool,
+) -> PushOutcome {
+    match classify_push(run, before, after) {
+        PushOutcome::Nothing if !bookmark_exists => {
+            PushOutcome::Failed(format!("no bookmark named `{bookmark}`"))
+        }
+        outcome => outcome,
+    }
+}
+
+/// Whether `name` is one of the repository's bookmarks at `dir`.
+///
+/// `jj git push --bookmark <name>` leaves identical remote state whether the
+/// bookmark was already published or the name matched nothing, so this read is
+/// what tells those two apart.
+fn bookmark_exists(dir: &Path, name: &str) -> anyhow::Result<bool> {
+    let out = read_in_dir(dir, &["bookmark", "list", "-T", "name ++ \"\\n\""])?;
+    Ok(out.lines().any(|candidate| candidate == name))
 }
 
 /// Classify one push from its captured run and the remote-bookmark snapshots
@@ -1030,6 +1101,50 @@ mod tests {
             classify_push(&run, "", Some("origin/feat def")),
             PushOutcome::Pushed
         );
+    }
+
+    #[test]
+    fn classify_push_bookmark_reads_an_unchanged_snapshot_by_what_the_bookmark_list_says() {
+        let run = Run::for_test(true, "Nothing changed.", "");
+        // The bookmark is there and already published: nothing to move is a
+        // no-op success, the desired state already holding.
+        assert_eq!(
+            classify_push_bookmark(&run, "origin/x abc", Some("origin/x abc"), "x", true),
+            PushOutcome::Nothing
+        );
+        // The name matches no bookmark: identical remote state, but nothing
+        // could have been pushed, so it is a failure.
+        assert_eq!(
+            classify_push_bookmark(&run, "origin/x abc", Some("origin/x abc"), "x", false),
+            PushOutcome::Failed("no bookmark named `x`".to_string())
+        );
+        // A moved bookmark is a push whatever the bookmark list says, and a
+        // non-zero exit is a failure whatever the snapshots say.
+        assert_eq!(
+            classify_push_bookmark(&run, "", Some("origin/x def"), "x", false),
+            PushOutcome::Pushed
+        );
+        let failed = Run::for_test(false, "", "rejected");
+        assert_eq!(
+            classify_push_bookmark(&failed, "", None, "x", true),
+            PushOutcome::Failed("rejected".to_string())
+        );
+    }
+
+    #[test]
+    fn bookmark_exists_reads_jjs_own_bookmark_list() {
+        let repo = temp_repo("bookmark-exists");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        run_mut(
+            &root,
+            &["bookmark", "create", "adam/eng-101-foundation", "-r", "@"],
+        )
+        .expect("bookmark");
+
+        assert!(bookmark_exists(&root, "adam/eng-101-foundation").expect("the read succeeds"));
+        assert!(!bookmark_exists(&root, "adam/eng-999-missing").expect("the read succeeds"));
+
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

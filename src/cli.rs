@@ -2928,6 +2928,8 @@ fn ready_ticket_requests<Q: TicketQuery>(
             // stacked is never a surprise.
             let basis = dependency_basis(ready.blockers(ticket.id()), |blocker| {
                 resolve_ticket_branch(repository.root(), blocker)
+                    .name()
+                    .map(str::to_owned)
             });
             if let Some(context) = basis.context() {
                 request = request.with_dependency_context(context.clone());
