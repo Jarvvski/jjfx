@@ -766,20 +766,7 @@ impl DirectDispatch {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| DirectDispatchError::Identity("jj user.name is blank".to_owned()))?
             .to_ascii_lowercase();
-        let pull_request_command = match request.dependency_context() {
-            Some(context) if !context.pull_request_base().trim().is_empty() => format!(
-                "gh -R {} pr create --head <branch> --base {} --title \"{}: <title from Ticket>\" --body \"<summary of changes and link to Linear Ticket>\"",
-                repository.as_str(),
-                context.pull_request_base(),
-                request.ticket().id(),
-            ),
-            _ => format!(
-                "gh -R {} pr create --head <branch> --title \"{}: <title from Ticket>\" --body \"<summary of changes and link to Linear Ticket>\"",
-                repository.as_str(),
-                request.ticket().id(),
-            ),
-        };
-        let delivery = DeliveryContract::new(assignee, branch_prefix, pull_request_command)?;
+        let delivery = DeliveryContract::new(assignee, branch_prefix)?;
         let mut context = DispatchPromptContext::new(
             reservation.agent_runtime(),
             repository,
