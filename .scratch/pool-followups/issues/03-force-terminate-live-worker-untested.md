@@ -1,7 +1,7 @@
 # `pool destroy --force` has no end-to-end test for a live busy Worker
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -16,10 +16,18 @@ Make it testable rather than dangerous: start a real, harmless long-running proc
 
 ## Acceptance Criteria
 
-- [ ] A test drives `pool destroy --force` against a live busy Worker and asserts its process group is terminated.
-- [ ] The same test asserts the pool's state and the declaration are removed.
-- [ ] No test kills a process it did not start.
-- [ ] `mise run check` is green.
+- [x] A test drives `pool destroy --force` against a live busy Worker and asserts its process group is terminated.
+- [x] The same test asserts the pool's state and the declaration are removed.
+- [x] No test kills a process it did not start.
+- [x] `mise run check` is green.
+
+## Resolution
+
+`tests/pool_removal.rs::destroy_force_terminates_a_live_worker_process_group` drives the real binary (`jjfx pool destroy bugs --force`) against a busy Worker whose persisted `pid` names a process group the test started. It reuses the existing helper pattern: an ignored `destroy_live_process_helper` test spawns `sh` with `process_group(0)`, records the leader's PID, and blocks on it, so the fixture owns the group it asserts on.
+
+The test asserts the group is gone by polling `test_kill_process_group` (a signal-0 liveness probe, never a kill) to a deadline, and that the helper exited cleanly on `TERM` - the wait is bounded so a removal that never signals fails the test instead of hanging the suite. A negative check with the PID left unrecorded failed at the deadline as intended. It then asserts the Pool's state directory (`pool_state("bugs")`) and its `[pools.bugs]` declaration are both removed, and that the forced path printed `--force terminates`.
+
+`mise run check` is green. No changelog entry: a test-only change with no user-visible effect.
 
 ## References
 

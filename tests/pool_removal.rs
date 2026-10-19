@@ -10,11 +10,21 @@
 //! lane's, and never the whole Repository the way `Clean` does.
 #![cfg(unix)]
 
+use std::env;
 use std::fs;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::thread;
+use std::time::{Duration, Instant};
 
+use rustix::process::{Pid, test_kill_process_group};
+use serde_json::Value;
 use tempfile::TempDir;
+
+mod support;
+
+use support::{HELPER_LIVENESS_TIMEOUT, HelperGuard, wait_for_file_content};
 
 /// A throwaway repository plus the config home the binary under test reads.
 ///
@@ -156,6 +166,25 @@ impl Fixture {
             )
             .expect("writing the worker state");
         }
+    }
+
+    /// Record `pid` as the live process group the busy `worker`'s Run leads.
+    ///
+    /// [`Fixture::write_pool_state`] records `pid: null`, which exercises the
+    /// forced path only up to the point where there is a process to terminate.
+    /// A forced removal that actually kills a Run needs the persisted PID to
+    /// name a real process group - one this fixture started, never an arbitrary
+    /// PID - so this rewrites that one field.
+    fn record_worker_pid(&self, pool: &str, worker: &str, pid: i64) {
+        let path = self.pool_state(pool).join(format!("{worker}.json"));
+        let mut state: Value = serde_json::from_slice(&fs::read(&path).expect("Worker state"))
+            .expect("Worker state JSON");
+        state["pid"] = Value::from(pid);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&state).expect("Worker state JSON"),
+        )
+        .expect("writing the Worker state with a live PID");
     }
 
     /// Add a jj Workspace for `worker` at the Worker Workspace path the pool
@@ -325,4 +354,105 @@ fn destroy_touches_only_the_removed_pools_workers() {
     assert!(fixture.declares("features"));
     // And the Repository itself is still there.
     assert!(fixture.path().join(".jj").is_dir());
+}
+
+/// Starts a real, harmless long-running process in a process group of its own
+/// and records the group leader's PID, the way a background Run does.
+///
+/// Run as a helper subprocess by
+/// [`destroy_force_terminates_a_live_worker_process_group`]: the test owns the
+/// process it starts, so the forced removal can be driven end to end without
+/// ever signalling a PID the test did not create.
+#[test]
+#[ignore]
+fn destroy_live_process_helper() {
+    let pid_path = env::var_os("JJFX_DESTROY_PID").expect("PID path");
+    let mut child = Command::new("sh")
+        .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done"])
+        .process_group(0)
+        .spawn()
+        .expect("spawn live Run");
+    fs::write(pid_path, child.id().to_string()).expect("write live PID");
+    let status = child.wait().expect("wait for destroyed Run");
+    assert!(status.success(), "Run should handle TERM successfully");
+}
+
+/// `pool destroy --force` against a live busy Worker terminates the process
+/// group that Worker's Run leads, and removes the Pool's state directory and
+/// its declaration with it.
+///
+/// This is the path an operator reaches for when a Worker is stuck, and the
+/// only one that discards work; the refusal side and the `pid: null` forced
+/// path are covered elsewhere, so this is the one test that proves the kill end
+/// to end. The process group is one this test started - the helper records its
+/// own PID - so nothing here signals a PID the test does not own.
+#[test]
+fn destroy_force_terminates_a_live_worker_process_group() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"])]);
+    fixture.write_pool_state("bugs", &[("worker-01", "busy", Some("eng-101"))]);
+    fixture.provision_worker("worker-01");
+    let pid_path = fixture.path().join("live-pid");
+    let mut helper = Command::new(env::current_exe().expect("test executable"));
+    helper
+        .args(["--exact", "destroy_live_process_helper", "--ignored"])
+        .env("JJFX_DESTROY_PID", &pid_path);
+    let mut helper = HelperGuard::spawn(&mut helper, None, &[&pid_path]);
+    let pid = wait_for_file_content(&pid_path)
+        .trim()
+        .parse::<i32>()
+        .expect("numeric live PID");
+    fixture.record_worker_pid("bugs", "worker-01", i64::from(pid));
+
+    let output = fixture.jjfx(&["pool", "destroy", "bugs", "--force"]);
+
+    assert!(
+        output.status.success(),
+        "a forced removal of a live Worker must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--force terminates"),
+        "the forced path says what it kills: {stderr}"
+    );
+    // The process group the fixture started is gone...
+    let pid = Pid::from_raw(pid).expect("live PID");
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    while test_kill_process_group(pid).is_ok() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        test_kill_process_group(pid).is_err(),
+        "the busy Worker's process group should be terminated"
+    );
+    // ...and the helper that owned it exited cleanly on TERM, which bounds the
+    // wait so a failed kill fails the test rather than hanging the suite.
+    wait_for_helper_exit(&mut helper);
+    let output = helper.wait_with_output();
+    assert!(
+        output.status.success(),
+        "process owner failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The Pool's state directory and its declaration went with it.
+    assert!(!fixture.pool_state("bugs").exists());
+    assert!(!fixture.declares("bugs"));
+}
+
+/// Waits for the helper to exit on its own, failing rather than hanging.
+///
+/// The helper blocks on the process group the removal is meant to terminate, so
+/// a removal that never signals it would otherwise leave the test waiting
+/// forever. Bounding the wait here is what turns that into a red test; the
+/// armed [`HelperGuard`] still reaps the group and the helper on the way out.
+fn wait_for_helper_exit(helper: &mut HelperGuard) {
+    let deadline = Instant::now() + HELPER_LIVENESS_TIMEOUT;
+    while helper.is_running() {
+        assert!(
+            Instant::now() < deadline,
+            "the helper should exit once its process group is terminated"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
 }
