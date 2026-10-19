@@ -54,7 +54,7 @@ the lifecycle. This is an extension of an existing contract, not new plumbing.
 - [x] Subagent/`PostToolBatch` events are recorded and do not regress existing
       Working/Waiting transitions.
 - [x] The event log stays backward compatible for existing consumers.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -94,3 +94,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `src/hooks.rs:30-43` registers `Notification`, `StopFailure`, `SubagentStart`/`Stop`, `PostToolBatch`, `TaskCreated`/`Completed` and `TeammateIdle` (plus Codex's subagent events, `:57`). The shared `Event` struct carries the new optional `notification_type` field (`src/agent.rs:117`), and `notification_transition` (`:181`) folds `agent_needs_input` to `NeedsAttention`. `StopFailure:rate_limit`/`billing_error` folds to `AgentState::QuotaBlocked`, which has its own `⊘` glyph (`src/render/style.rs:204`) and sorts to needs-you. Orchestration parks a quota-blocked Run via `DispatchGroupEvent::QuotaBlocked` (`src/engine/orchestration.rs:483`, `src/engine/dispatch_group.rs:470`) rather than retrying it. Tests: `events::tests::a_fake_hook_emitter_drives_the_lifecycle_and_attention_through_the_log` (`src/events.rs:436`) and `a_fake_emitter_billing_failure_also_blocks_the_run` (`:504`); `agent::tests::other_notification_types_do_not_disturb_the_state` (`src/agent.rs:531`). Criterion 4 (backward compatibility) holds because the added fields are optional and an old line without them still parses - pinned by `agent::tests::parses_common_fields_and_ignores_the_rest` (`src/agent.rs:302`).
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

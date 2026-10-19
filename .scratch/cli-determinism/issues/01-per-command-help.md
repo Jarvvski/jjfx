@@ -29,7 +29,7 @@ Derive the flag text from the same definitions the parser reads, so the two cann
 - [x] `jjfx help <unknown>` fails loudly, naming the unknown command.
 - [x] The top-level help lists `hooks install` and `hooks status`.
 - [x] A test asserts every command named in the top-level help has a help page, so a new command without one fails the suite.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -57,3 +57,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `src/cli_help.rs` owns the surface - `PAGES` holds one `CommandHelp` per command, `top_level()` (`:1065`) renders the grouped list, and `page()` (`:1035`) resolves a key to its page, failing with `unknown command: {key}. Run 'jjfx help' ...` (`:1058`) for a typo. The Lifecycle group with `hooks install` / `hooks status` is present (`:598-606`, pages at `:936-945`). Criterion 4 holds: `every_top_level_command_has_a_page` (`:1095`), with `every_page_is_named_at_the_top_level` (`:1135`) catching the reverse direction and `every_page_renders_its_usage_arguments_and_flags` (`:1152`) the rendering; `an_unknown_command_is_named_in_the_error` (`:1237`) and `the_top_level_help_lists_the_lifecycle_commands` (`:1244`) cover the other criteria. The parser cannot drift from the pages because each `parse_*` rejects an option its page omits via `reject_unknown_flags` (`src/cli.rs:462`).
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

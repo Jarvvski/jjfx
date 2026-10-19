@@ -30,7 +30,7 @@ rather than silently producing an empty/partial graph.
 
 - [x] A version mismatch is visible, not silent.
 - [x] A matching version is unaffected.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -77,3 +77,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `JJ_LIB_TARGET` is a source constant (`src/engine/workspace.rs:1405`) and `compat_notice` (`:1423`) is the pure major/minor comparison, wrapped by `jj_lib_compat_notice` (`:1417`). The mismatch is surfaced on the graph load (`src/graph.rs:213`) and on stderr for CLI commands (`src/lib.rs:313`). The "matching version is unaffected" half is pinned by `jj_lib_compat_notice_fires_only_on_a_mismatch` (`src/engine/workspace.rs:2027`), which asserts `None` for a match and for an unprobeable `jj`. The follow-on landing note about the (now-deleted) `wsg` compatibility contract is historical and does not affect the criteria.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

@@ -60,7 +60,7 @@ the same defect.
       the same temp directory, and repeat enough times to be convincing.
 - [x] The change does not weaken what the tests assert (they still pin the same
       behaviour; only the path becomes unique).
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -98,3 +98,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `src/store.rs:358` defines the `sibling(repo, tag)` helper, which derives each workspace directory from the unique `test_local_repo` path, and every affected site uses it (`:368`, `:369`, `:424`, `:443`, `:463`). No `with_file_name` with a constant remains in `src/store.rs`, so the fixed-path collision the ticket describes cannot recur. Criterion 2's concurrency claim follows from that uniqueness; the ticket's own recorded evidence (132 invocations across three concurrency configurations, 0 failures) is consistent with it. Criterion 3 holds because only the path derivation changed - the assertions are untouched.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

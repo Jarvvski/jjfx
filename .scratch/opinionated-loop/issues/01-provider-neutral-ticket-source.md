@@ -67,7 +67,7 @@ seam that already exists: `TicketQuery` (`src/engine/ticket.rs:511`) is a trait,
       Worker reservation or Pool mutation.
 - [x] An opencode Worker can discover tickets through a configured non-runtime
       source.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -107,3 +107,5 @@ Evidence: the source is a config decision - `TicketSource` (`src/config.rs:452`)
 Caveat, as in the reconciliation of named-pools 01: the "byte-for-byte" clause is established behaviourally - the `linear` path is the unchanged `AgentRuntimeQuery` and the config-selection tests are additive - not by a literal baseline comparison.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

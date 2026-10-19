@@ -1,7 +1,7 @@
 # Reconcile the remaining batches' unticked acceptance criteria
 
 Type: task
-Status: ready-for-agent
+Status: resolved
 Blocked by: none
 
 ## Problem
@@ -20,12 +20,20 @@ File the flakes against the existing bug-hunt tickets rather than as new work, u
 
 ## Acceptance Criteria
 
-- [ ] Every ticket marked `resolved` has either all its criteria ticked or a Resolution note explaining what remains.
-- [ ] Any criterion that does not hold has re-opened its ticket.
-- [ ] The two flaking tests are either covered by a live ticket or filed as one.
-- [ ] No code changes are made - this is a record reconciliation.
+- [x] Every ticket marked `resolved` has either all its criteria ticked or a Resolution note explaining what remains.
+- [x] Any criterion that does not hold has re-opened its ticket.
+- [x] The two flaking tests are either covered by a live ticket or filed as one.
+- [x] No code changes are made - this is a record reconciliation.
 
 ## References
 
 - PR #92 (the method, and the two batches already reconciled)
 - `.scratch/bug-hunt/issues/35-load-sensitive-helper-deadlines.md`, `42-flaky-process-and-exec-tests.md`
+
+## Resolution
+
+Reconciled every remaining batch (PR #100), oldest first: rebuild, help-menu, pi-support, bug-hunt, release-workflow, remove-pi, opinionated-loop and cli-determinism. Twenty tickets confirmed, two re-opened, one superseded.
+
+Criterion 2 - "any criterion that does not hold has re-opened its ticket" - is met for `bug-hunt/35` and `bug-hunt/42`, whose classes had recurred. It is met differently for `pi-support/02`, which is superseded rather than outstanding and is now `wontfix` by ruling, because re-opening it would ask an agent to re-add a runtime the owner deliberately removed.
+
+Criterion 1 - every resolved ticket fully ticked or explained - holds as of the orchestrator's gate run on `df05f7c9aaef`, which closed the thirteen gate-only boxes the reconciliation left open by design. A repo-wide check now finds no resolved ticket carrying an unexplained unticked box.
