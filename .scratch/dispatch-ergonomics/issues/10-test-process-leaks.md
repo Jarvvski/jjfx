@@ -27,10 +27,10 @@ If the reproduction shows the leak is in product code rather than test code, fix
 
 ## Acceptance Criteria
 
-- [ ] Reproduce it first: run the suite and show the leaked processes - or show they are already gone and identify the mechanism.
-- [ ] The suite leaves no `claude` / `codex` / `opencode` process behind when it finishes.
-- [ ] The fix covers the failure path: a panicking test must not leak.
-- [ ] `mise run check` is green.
+- [x] Reproduce it first: run the suite and show the leaked processes - or show they are already gone and identify the mechanism.
+- [x] The suite leaves no `claude` / `codex` / `opencode` process behind when it finishes.
+- [x] The fix covers the failure path: a panicking test must not leak.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -59,3 +59,11 @@ If the reproduction shows the leak is in product code rather than test code, fix
   panics inside `catch_unwind` and asserts the group is gone; it fails and
   leaks without the guard, and passes with it. `mise run check` green, and the
   full suite leaves no `claude` / `codex` / `opencode` process behind.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.
+
+Caveat: several tests still spawn helpers with a raw `Child`. The guard closes the two identified leak sites, and a full `mise run check` on this tree left no helper, no `claude`/`codex`/`opencode` stub and no test binary behind.

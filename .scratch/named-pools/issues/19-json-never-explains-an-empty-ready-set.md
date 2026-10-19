@@ -33,10 +33,10 @@ Keep the prose output as it is; this is about the machine-readable half catching
 
 ## Acceptance Criteria
 
-- [ ] `dispatch --all --json` with nothing ready carries the reason in its JSON, not only on stderr.
-- [ ] The pool-scoped and fan-out paths behave the same as the single-pool path.
-- [ ] A test covers it.
-- [ ] `mise run check` is green.
+- [x] `dispatch --all --json` with nothing ready carries the reason in its JSON, not only on stderr.
+- [x] The pool-scoped and fan-out paths behave the same as the single-pool path.
+- [x] A test covers it.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -46,3 +46,9 @@ Keep the prose output as it is; this is about the machine-readable half catching
 ## Comments
 
 - 2026-10-16: Resolved. An empty `--all` ready set now carries the search as structure in the `--json` batch: a `skipped` entry with a null `ticket` names the `label` it looked for and the `root` it looked under, ahead of the per-Ticket diagnostics it already reported. The top level stays a bare array, so the change is additive and no consumer has to change; the `root` is the local markdown root for a local source and null for Linear, which has no filesystem root. All three paths carry it - the single-pool path, the pool-scoped `--all --pool <name>` (which names that lane's routing label), and the fan-out (one search entry per routable pool's label) - and the prose output is unchanged. Unit tests cover the search entry rendering alongside a diagnostic and the Linear null root; `tests/dispatch_outcomes.rs` drives the real binary for the genuinely-empty and discovered-but-not-ready cases, and `tests/pool_routing.rs` covers the pool-scoped and fan-out paths. `mise run check` is green and `momo add` records the change.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.

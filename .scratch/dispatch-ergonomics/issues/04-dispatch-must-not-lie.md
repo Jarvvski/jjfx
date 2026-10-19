@@ -36,10 +36,10 @@ Nothing was spawned, nothing changed state, no log was written - and the foregro
 
 ## Acceptance Criteria
 
-- [ ] `jjfx dispatch` exits non-zero when every Ticket failed, and zero when at least one was dispatched or deliberately held back.
-- [ ] A test covers the exit code for both cases.
-- [ ] A background orchestration that fails is reported as a failure, not as `orchestrating`, with the child's error reachable (a log path in the JSON, or an immediate error).
-- [ ] `mise run check` is green.
+- [x] `jjfx dispatch` exits non-zero when every Ticket failed, and zero when at least one was dispatched or deliberately held back.
+- [x] A test covers the exit code for both cases.
+- [x] A background orchestration that fails is reported as a failure, not as `orchestrating`, with the child's error reachable (a log path in the JSON, or an immediate error).
+- [x] `mise run check` is green.
 
 ## References
 
@@ -51,3 +51,9 @@ Nothing was spawned, nothing changed state, no log was written - and the foregro
 
 - 2026-10-16: Filed from the `todo-md` test-drive. Two independent paths (`dispatch <parent>` and `dispatch <typo>`) showed the same silent-success shape, so treat it as a pattern rather than a one-off.
 - 2026-10-16: Resolved. `dispatch_command` now returns the shared `DispatchEntry` batch from `render_dispatch_result` and passes it to `ensure_dispatch_progressed`, which fails with `every Ticket failed to dispatch: <ids>` when the batch is non-empty and every outcome is `Failed`; a `Dispatched` or `Waiting` entry keeps it a success, and an empty batch is left to ticket 07. The prose summary no longer counts a failed Ticket as dispatched (`attempted` counted `Dispatched | Failed`, so an all-failed `--all` printed `Dispatched 1 ticket(s)`): it counts real dispatches and adds a `N ticket(s) failed to dispatch.` line. The background orchestration path now runs the whole fallible front half - config, discovery, the Parent's own fetch, and `runner.prepare` - synchronously through a new `prepare_orchestration`, shared with the foreground `orchestrate_command`, before it spawns anything; the unresolvable-Ticket and missing-Pool cases that used to print `orchestrating` for a dead child now exit non-zero with the error. `orchestrating` is only printed once preparation has succeeded and the child process has started, and a started runner writes stdout and stderr to `.jj/pool/orchestrate-<parent>.log`, whose path the dispatch result names in the JSON `detail` and the prose. A no-children Parent now takes the Direct fallback in the parent process and reports the dispatch directly rather than handing it to a child. `src/cli.rs` unit-tests the exit-code decision (empty, dispatched, waiting, mixed, all-failed) and the `orchestrating` log rendering; the new `tests/dispatch_outcomes.rs` drives the real binary for the all-failed batch, a dispatched batch, a background orchestration with no Pool, an unresolvable Ticket, and a prepared handoff that names its child log. `mise run check` is green and `momo fix` records both changes.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.

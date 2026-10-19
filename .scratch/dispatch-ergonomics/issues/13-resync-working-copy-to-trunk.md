@@ -34,12 +34,12 @@ Out of scope: changing jj's behaviour, or making `@` auto-follow (it does not, a
 
 ## Acceptance Criteria
 
-- [ ] A workspace whose `@` is behind trunk is reported as such by a state-reading command, naming how far behind and the command that fixes it.
-- [ ] A command re-syncs the current workspace onto trunk, covering both an empty `@` and a `@` with changes.
-- [ ] Conflicts are surfaced, not silently resolved.
-- [ ] The distinction from `jjfx refresh` and `jjfx rebase <worker>` is documented in the help.
-- [ ] Tests cover the behind-trunk detection and the re-sync.
-- [ ] `mise run check` is green.
+- [x] A workspace whose `@` is behind trunk is reported as such by a state-reading command, naming how far behind and the command that fixes it.
+- [x] A command re-syncs the current workspace onto trunk, covering both an empty `@` and a `@` with changes.
+- [x] Conflicts are surfaced, not silently resolved.
+- [x] The distinction from `jjfx refresh` and `jjfx rebase <worker>` is documented in the help.
+- [x] Tests cover the behind-trunk detection and the re-sync.
+- [x] `mise run check` is green.
 
 ## References
 
@@ -52,3 +52,9 @@ Out of scope: changing jj's behaviour, or making `@` auto-follow (it does not, a
 
 - 2026-10-16: Filed at the owner's request. Hit by three sessions during the `todo-md` test-drive and the batch that followed it.
 - 2026-10-16: Implemented. `sync` was already an undocumented alias for `refresh`, so the alias is dropped and `sync` now means "fetch and move this workspace onto trunk". The drift warning is shape-neutral (a state-reading command must not snapshot the working copy, ADR 0006), so it names the fix rather than the shape; `sync` snapshots to choose `jj new` for an empty `@` and `jj rebase` when it carries changes, and exits non-zero naming the conflicted commits instead of resolving them.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `6d6f3b689e0e`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`, and `mise run check` was re-run green on `6d6f3b689e0e`. The reconciliation recorded no new work; it confirms what shipped.
