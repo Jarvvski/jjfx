@@ -29,10 +29,10 @@ Reached via the `opencode api` CLI (`opencode api <operationId> [-d <json>]`), w
 
 ## Acceptance Criteria
 
-- [ ] The operations above are wrapped with typed request/response values.
-- [ ] "Unavailable" is distinguishable from "rejected" by callers.
-- [ ] Tests cover parsing and the unavailable path without a live server.
-- [ ] No new dependency; no `unsafe`.
+- [x] The operations above are wrapped with typed request/response values.
+- [x] "Unavailable" is distinguishable from "rejected" by callers.
+- [x] Tests cover parsing and the unavailable path without a live server.
+- [x] No new dependency; no `unsafe`.
 
 ## Out of Scope
 
@@ -77,3 +77,13 @@ not part of the experimental spec — if a future opencode changes it, calls deg
 to `Unavailable` (the safe fallback) rather than misreporting as `Rejected`.
 
 No changelog entry: a library module with no user-visible behaviour change.
+
+## Resolution
+
+Reconciled Mon 19 Oct 2026 against the merged code at `9d6bd0ce6e7b`.
+
+This ticket was marked resolved without its acceptance boxes ticked. Every criterion was re-verified by an independent read-only review of the code and tests on `main`. The reconciliation recorded no new work; it confirms what shipped.
+
+Evidence: `src/engine/opencode_api.rs` wraps the four operations with typed values - `create_session` (`:450`), `get_session` (`:458`), `list_sessions` (`:469`), `interrupt_session` (`:494`) - over the injectable `OpenCodeRunner` seam (`:326`), with `Session` (`:37`) hiding raw JSON behind accessors. `OpenCodeError` (`:376`) keeps `Unavailable` (`:383`) and `Rejected` (`:392`) distinct, with `is_unavailable()` (`:403`) and `status()` (`:409`) for callers. Criterion 3 holds: the module carries a large suite driven through a fake runner with no live server, including `a_missing_executable_is_unavailable`, `a_missing_server_is_unavailable`, `an_older_opencode_that_lacks_the_operation_is_unavailable`, `unparseable_success_output_is_unavailable` and `a_server_rejection_is_rejected_and_carries_the_status`. Criterion 4 holds statically: `unsafe_code = "forbid"` is crate-wide (`Cargo.toml:94`), and the module adds no dependency (it uses the existing `serde`/`serde_json`).
+
+The module has since grown beyond this ticket's four operations (session prompt, permissions, Run-session helpers from tickets 37/38), which does not affect these criteria.

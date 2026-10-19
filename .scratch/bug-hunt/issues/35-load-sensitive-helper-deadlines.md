@@ -1,6 +1,6 @@
 # Helper-subprocess deadlines in the test suite are load-sensitive
 
-Status: resolved
+Status: ready-for-agent
 Type: task
 Blocked by: none
 
@@ -109,3 +109,32 @@ sleeping helper), not liveness guards - raising them would have broken the
 `expect_err` the test exists to make.
 
 No changelog entry: test infrastructure, nothing user-visible.
+
+## Re-opened Mon 19 Oct 2026
+
+Reconciled against the merged code at `9d6bd0ce6e7b`. Criterion 1 does **not**
+hold, so this ticket is not done and is back to `ready-for-agent`. All boxes are
+left unticked rather than partially ticked.
+
+The fix itself shipped and is real. `tests/support/mod.rs:71` defines the shared
+`HELPER_LIVENESS_TIMEOUT = 120s`, documented at `:55-70` as a guard against a
+hang rather than a statement of expected duration, and it is used at the
+helper-spawn sites in `direct_dispatch.rs`, `unix_primitives.rs`, `worker_pool.rs`
+and `agent_runtime.rs`. Criterion 3 (the budget is documented, with the reason)
+holds, and criterion 2 (a genuine hang still fails within the bound) is supported
+by the ticket's own forced-1s measurement above.
+
+What does not hold is the class. The same load-sensitive-deadline failure
+recurred during the named-pools work in a test this ticket never reached:
+`engine::locks::tests::a_blocked_acquisition_does_not_hold_the_pool_lock_while_it_waits`
+(`src/engine/locks.rs:157`) flaked **three times** under load. It is not a helper
+subprocess - it spawns a `thread` and polls a fixed one-second window
+(`src/engine/locks.rs:181`) behind its own `const LIVENESS: Duration =
+Duration::from_secs(30)` (`src/engine/locks.rs:115`) - so the shared
+`HELPER_LIVENESS_TIMEOUT` does not reach it and a load-sensitive wall-clock
+budget for load-dependent work, the exact defect this ticket names, is still
+present there.
+
+To close it: give the locks test the same treatment - a budget that reflects a
+liveness guard against a hang rather than an expected schedule, or progress-based
+liveness - so a loaded machine cannot red it. Do not simply re-run it.
