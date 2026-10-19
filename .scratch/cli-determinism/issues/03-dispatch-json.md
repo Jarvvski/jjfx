@@ -28,7 +28,7 @@ Build it from the same outcome model the prose is rendered from (`DirectDispatch
 - [x] Each entry names the Ticket, its outcome, and the Worker when one took it.
 - [x] Without `--json` the prose output is unchanged.
 - [x] Tests cover a dispatched Ticket, a held-back Ticket, and a failure.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -55,3 +55,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `DispatchArgs` carries `json: bool` (`src/cli.rs:192`), and `render_dispatch_entries` (`:3861`) routes to `dispatch_json` (`:3941`) or the unchanged `dispatch_prose` (`:3870`) from the one `DispatchEntry` model. Criterion 4 holds: `dispatch_json_names_each_ticket_outcome_worker_and_detail` (`:6221`), `dispatch_json_reports_a_skipped_ticket_with_its_reason` (`:6249`), `dispatch_json_is_an_empty_array_when_no_ticket_was_requested` (`:6244`) and `dispatch_parser_accepts_json` (`:5215`), plus the integration coverage in `tests/dispatch_outcomes.rs`. Criterion 3 holds because the prose path is a separate rendering of the same entries, unchanged.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

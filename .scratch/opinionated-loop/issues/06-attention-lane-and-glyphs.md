@@ -43,7 +43,7 @@ Adopt the converged vocabulary on top of the existing Attention model:
 - [x] Each lifecycle/attention state has a distinct, documented glyph.
 - [x] Idle rows are folded by default and revealable.
 - [x] A hook-driven transition updates the row without a poll tick.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -79,3 +79,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: the per-state glyph vocabulary is documented and implemented in the render layer (`src/render/style.rs:86-204`, including `AgentState::QuotaBlocked => ('⊘', Color::Red)` at `:204`), with the reserved `NEEDS_YOU_AMBER` (`src/render/style.rs:79`) for the needs-you lane and red kept for blocked/failed. The lane glyph leads each group header and row (`src/render/home.rs:148`, `:210`). Idle rows start folded (`idle_collapsed`, `src/render/home.rs:44`) and are revealed with `c`; the folded default is a launch default rather than persisted state. Tests: `src/render/home.rs` asserts the `⚑ needs you` header and that the lane glyph is amber (`:549`, `:558-559`). Criterion 4 holds: transitions are hook-driven - `on_agent_event` updates the row and revalidates the selection, so a row moving into the folded idle lane cannot leave a dangling selection - and the ticket's comment records that the `idle_collapsed` UI-state field was retired in favour of the launch default.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

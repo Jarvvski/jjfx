@@ -64,7 +64,7 @@ not YAML front-matter.
       silently skipped and never collapsed into an empty ready list (the "no
       plausible zero" rule from bug-hunt ticket 21).
 - [x] Works end-to-end on opencode with no Pi and no Linear configured.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -116,3 +116,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `LocalMarkdownQuery` (`src/engine/local_tickets.rs`) implements `TicketQuery` over the `.scratch/<feature>/issues/<NN>-<slug>.md` tree - `ready_payload` (`:275`) builds the ready set, `is_ready` (`:412`) requires the ready status and every blocker resolved, and the dependency graph resolves `Blocked by:` against `Status:`. Malformed entries become diagnostics rather than being dropped (`:279-305`, `:679`), satisfying the "no plausible zero" rule. Writeback is wired through `apply_local_writeback` (`src/ticket_source.rs:57`), called from both the TUI adapter (`src/workspace_dispatch/adapter.rs:502`) and the CLI pass (`src/cli.rs:2800`), using `claim` (`src/engine/local_tickets.rs:163`) and `resolve` (`:179`). Integration tests: `tests/local_tickets.rs::dispatch_all_with_a_local_source_discovers_from_scratch`, `a_local_source_discovers_ready_tickets_and_inlines_the_body`, `a_local_ticket_resolves_and_records_a_dated_comment`, `a_reconciled_blocker_readies_its_dependent_in_the_same_dispatch`; plus the `src/engine/local_tickets.rs` diagnostic and readiness tests. Criterion 6 holds: the source needs no runtime, no Linear and no Pi - it reads the repository's own tree.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

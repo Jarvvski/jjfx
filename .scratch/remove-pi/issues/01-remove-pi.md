@@ -88,7 +88,7 @@ must reach a terminal, non-busy state rather than being stranded.
 - [x] The Pi tests and fixtures are deleted, and `docs/pi-workers.md` and its
       README references are removed.
 - [x] The compatibility contract is amended and remains internally consistent.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -125,3 +125,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: a search for every Pi type, transport and environment variable named in this ticket (`PiEvent`, `PiToolCall`, `PiUsage`, `PiCost`, `PiMessage`, `PiSessionHeader`, `PiProfileProbe`, `PiMcpAdapter`, `PiDispatchProfile`, `PiDiscoveryHelper`, `JJFX_PI_LINEAR_HELPER`, `pi-sessions`, `AgentRuntime::Pi`, `AgentKind::Pi`) returns nothing in `src/` or `tests/` - criterion 1 holds. The only surviving Pi references are the deliberate removal guard: `REMOVED_PI_RUNTIME` (`src/engine/runtime.rs:33`), `is_removed_runtime` (`:42`) and `removed_runtime_message` (`:48`), which `from_configured` (`:1476`) and the pool reconciliation (`src/engine/pool.rs:1558-1569`) use to reject a persisted `"agent": "pi"` with a message naming the removal - criterion 3, covered by `tests/agent_runtime.rs:65` and `tests/worker_pool.rs:1525,1997`. `docs/pi-workers.md` and `tests/fixtures/pi/` are gone and no README reference remains - criterion 4. Criterion 5 is satisfied vacuously, per the deviation note above. Criterion 2 (Claude/Codex/opencode unchanged) is supported by the surviving runtime match arms and their test suites; it is not separately re-established here.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.

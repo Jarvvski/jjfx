@@ -76,7 +76,7 @@ is the data layer only.
 - [x] A Run with no parseable cost still appends a record and does not break
       aggregation.
 - [x] The store is append-only and never truncated.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Out of Scope
 
@@ -130,3 +130,5 @@ This ticket was marked resolved without its acceptance boxes ticked. Every crite
 Evidence: `RunRecord` (`src/engine/state.rs:449`) is the jjfx-owned document for one completed Run, kept in the append-only `runs.jsonl` (`:44`, `:437`) beside `sessions.json`. `RunRecordRepository` (`:969`, `:2384`) appends one JSON line under its own sidecar lock via `append` (`:2391`) and never truncates; `records` (`:2424`) decodes them, skipping a line that cannot be decoded so one torn tail never hides the rest. `Reservation::finalize` (`src/engine/pool.rs`) writes the record once the Worker commit applies, populated from the `RunResult` plus the Run-owned Worker state. The ticket's own comment records the coverage: 5 store unit tests and 5 finalization unit tests - one record per completed Run; a failed Run and a Run with no cost still record; two consecutive Runs in one Worker both survive; a stale finalization appends nothing; concurrent appends never interleave. An unusable or missing provider cost is recorded as absent, per bug-hunt 28, so criterion 3 holds. Documented in `docs/run-records.md`.
 
 Not ticked: the `mise run check` criterion. It is a landing-commit property, and this reconciliation deliberately does not run the full suite (the orchestrator runs the gate once at the end).
+
+Gate verified by the orchestrator on `df05f7c9aaef`: `mise run check` is green (changelog validation, fmt, clippy with warnings as errors, build and the full test suite), with no leaked test processes afterwards. The reconciliation above left this box unticked only because it ran no suite.
