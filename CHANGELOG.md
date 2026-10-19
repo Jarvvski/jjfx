@@ -82,6 +82,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - A non-GitHub `origin` (a filesystem path or another forge) is now refused by name - `origin is not a GitHub remote` - before any Worker Pool state is written, and again when Dispatch resolves the repository identity, instead of persisting a slug guessed from its last two path segments and failing much later with a `gh` error naming a repository that never existed.
 - A local Ticket is resolved only when the repository's [checks] command ran against its Run's change and passed - not merely when the agent's Run reported success. A Run whose check failed, could not run, or had none configured leaves the Ticket not-done and the writeback names why, so a repository with no [checks] never silently claims verification.
 - jjfx dispatch, jjfx send and jjfx status --json report an opencode background Run by its session rather than a pid: the Run now starts by prompting its session through the daemon API with no client process, so an opencode Worker is busy with no pid, a dispatch's pid field is null and its detail names the session, and a send to a Worker with no session to resume delivers to a fresh session instead of spawning a client.
+- The review loop is bounded by progress, not just the pass cap: a round that finds nothing new or retires nothing stops the loop and escalates its unresolved findings, instead of buying another pass.
 
 ## [0.55.0] - 2026-10-16
 

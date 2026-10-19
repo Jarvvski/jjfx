@@ -399,7 +399,7 @@ failing checks and human comments, and nothing else runs.
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `reviewer` | `"none"` | Which reviewer produces findings: `none`, `coderabbit`, or `opencode-action`. |
-| `max_passes` | `2` | The pass cap for the re-review loop; must be at least 1. |
+| `max_passes` | `2` | The pass cap for the re-review loop; must be at least 1. The loop also stops early when a round makes no progress, so this is a ceiling, not a target. |
 
 ```toml
 [review]
@@ -412,7 +412,8 @@ is accepted but not implemented yet: selecting it fails at load with a setup
 error rather than silently skipping the review.
 
 See [The review loop](review-loop.md) for what a configured reviewer does, how
-the pass cap bounds it, and how it authenticates without leaking credentials.
+the pass cap and the progress rule bound it, and how it authenticates without
+leaking credentials.
 
 ## `[migrations]`
 

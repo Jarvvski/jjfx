@@ -7,6 +7,7 @@
 //! emitted before a failure and reports the run as incomplete rather than
 //! discarding them.
 
+use std::collections::HashSet;
 use std::io;
 use std::process::Command;
 
@@ -52,7 +53,7 @@ impl ReviewRequest {
 }
 
 /// How severe a reviewer judged one finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ReviewSeverity {
     /// A correctness or security defect.
     Critical,
@@ -96,7 +97,10 @@ impl ReviewSeverity {
 }
 
 /// One normalised finding from a reviewer, independent of its vendor's schema.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Equality is by content: the review loop compares passes by it to tell a
+/// finding it has already seen from one it has not.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ReviewFinding {
     severity: ReviewSeverity,
     file: Option<String>,
@@ -489,6 +493,9 @@ pub enum ReviewStop {
     PassCap,
     /// A pass produced nothing to address, so there was nothing left to iterate.
     Converged,
+    /// A round made no progress: it surfaced nothing new, or retired nothing, so
+    /// another pass would only spend compute for the same findings.
+    NoProgress,
 }
 
 impl ReviewStop {
@@ -497,19 +504,82 @@ impl ReviewStop {
         match self {
             Self::PassCap => "the pass cap",
             Self::Converged => "convergence (a pass found nothing)",
+            Self::NoProgress => "no progress (a round found nothing new or retired nothing)",
         }
+    }
+
+    /// Returns whether the loop stopped with findings it could not resolve, so a
+    /// human must pick them up rather than the loop reporting success.
+    pub const fn needs_escalation(self) -> bool {
+        !matches!(self, Self::Converged)
+    }
+}
+
+/// The findings a bounded loop stopped with, for a human to pick up.
+///
+/// A loop that stops without converging has not resolved its last round's
+/// findings - either it never addressed them, or it addressed them and had no
+/// pass left to confirm they are gone. It reports them here instead of
+/// discarding them, so hitting the bound escalates rather than silently
+/// succeeding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewEscalation {
+    findings: Vec<ReviewFinding>,
+    stop: ReviewStop,
+}
+
+impl ReviewEscalation {
+    /// Creates an escalation for the findings a loop stopped with.
+    fn new(findings: Vec<ReviewFinding>, stop: ReviewStop) -> Self {
+        Self { findings, stop }
+    }
+
+    /// Returns the findings the loop could not resolve, in the reviewer's order.
+    pub fn findings(&self) -> &[ReviewFinding] {
+        &self.findings
+    }
+
+    /// Returns why the loop stopped.
+    pub const fn stop(&self) -> ReviewStop {
+        self.stop
     }
 }
 
 /// What a bounded review loop did.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewLoopSummary {
     passes: usize,
     findings: usize,
     stop: ReviewStop,
+    escalation: Option<ReviewEscalation>,
 }
 
 impl ReviewLoopSummary {
+    /// A loop that stopped because a pass produced nothing to address.
+    fn converged(passes: usize, findings: usize) -> Self {
+        Self {
+            passes,
+            findings,
+            stop: ReviewStop::Converged,
+            escalation: None,
+        }
+    }
+
+    /// A loop that stopped with findings still unresolved.
+    fn escalated(
+        passes: usize,
+        findings: usize,
+        stop: ReviewStop,
+        unresolved: Vec<ReviewFinding>,
+    ) -> Self {
+        Self {
+            passes,
+            findings,
+            stop,
+            escalation: Some(ReviewEscalation::new(unresolved, stop)),
+        }
+    }
+
     /// Returns the number of reviewer passes that ran.
     pub const fn passes(&self) -> usize {
         self.passes
@@ -523,6 +593,20 @@ impl ReviewLoopSummary {
     /// Returns why the loop stopped.
     pub const fn stop(&self) -> ReviewStop {
         self.stop
+    }
+
+    /// Returns the escalation a loop that did not converge stopped with, or
+    /// `None` when it converged.
+    pub fn escalation(&self) -> Option<&ReviewEscalation> {
+        self.escalation.as_ref()
+    }
+
+    /// Returns the findings the loop could not resolve, or an empty slice when it
+    /// converged.
+    pub fn unresolved(&self) -> &[ReviewFinding] {
+        self.escalation
+            .as_ref()
+            .map_or(&[], |escalation| escalation.findings())
     }
 }
 
@@ -538,12 +622,19 @@ pub enum ReviewLoopError<E> {
 }
 
 /// A bounded re-review loop: review, address, review again - never more than the
-/// pass cap.
+/// pass cap, and never another pass for a round that made no progress.
 ///
-/// The cap is the bound. A pass that produces nothing to address stops the loop
-/// early because there is nothing to send a Worker, not because a findings count
-/// was reached; the loop can never run longer than the cap, whatever the reviewer
-/// reports.
+/// Two bounds hold, not one. The pass cap is the hard ceiling: the loop can
+/// never run longer than `max_passes`, whatever the reviewer reports. The
+/// progress rule stops it earlier. A round must both surface a finding the
+/// previous pass had not and retire one it had, so a reviewer repeating itself
+/// finds nothing new and a Worker fixing nothing retires nothing - either way
+/// the round is a stall, and another pass would only buy the same findings
+/// again. A pass that produces no findings at all has converged.
+///
+/// Whatever stops it, a loop that has not converged escalates its unresolved
+/// findings rather than reporting success, so the bound hands work to a human
+/// instead of spinning or silently passing.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewLoop {
     max_passes: usize,
@@ -573,24 +664,38 @@ impl ReviewLoop {
     {
         let mut passes = 0;
         let mut findings = 0;
+        let mut previous: Option<HashSet<ReviewFinding>> = None;
+        let mut unresolved = Vec::new();
         for pass in 1..=self.max_passes {
             let outcome = reviewer.review(request)?;
             passes = pass;
             findings += outcome.findings().len();
             if outcome.findings().is_empty() {
-                return Ok(ReviewLoopSummary {
-                    passes,
-                    findings,
-                    stop: ReviewStop::Converged,
-                });
+                return Ok(ReviewLoopSummary::converged(passes, findings));
             }
+            let current: HashSet<ReviewFinding> = outcome.findings().iter().cloned().collect();
+            if let Some(previous) = previous.as_ref() {
+                let found_new = current.difference(previous).next().is_some();
+                let retired = previous.difference(&current).next().is_some();
+                if !(found_new && retired) {
+                    return Ok(ReviewLoopSummary::escalated(
+                        passes,
+                        findings,
+                        ReviewStop::NoProgress,
+                        outcome.findings().to_vec(),
+                    ));
+                }
+            }
+            previous = Some(current);
+            unresolved = outcome.findings().to_vec();
             address(pass, &outcome).map_err(ReviewLoopError::Address)?;
         }
-        Ok(ReviewLoopSummary {
+        Ok(ReviewLoopSummary::escalated(
             passes,
             findings,
-            stop: ReviewStop::PassCap,
-        })
+            ReviewStop::PassCap,
+            unresolved,
+        ))
     }
 }
 
@@ -617,15 +722,27 @@ mod tests {
         ReviewRequest::new("owner/repo", "main", "adam/feature")
     }
 
-    fn finding() -> ReviewFinding {
+    /// A finding with a distinct title, so two scripted findings are never equal
+    /// and a pass can be told from the one before it.
+    fn finding_titled(title: &str) -> ReviewFinding {
         ReviewFinding::new(
             ReviewSeverity::Major,
             Some("src/x.rs".to_owned()),
             Some((12, 14)),
-            Some("Unbounded loop".to_owned()),
+            Some(title.to_owned()),
             "Cap the loop.",
             vec!["n = 3".to_owned()],
         )
+    }
+
+    /// A scripted pass's findings, one per title.
+    fn pass(titles: &[&str]) -> Vec<ReviewFinding> {
+        titles.iter().map(|title| finding_titled(title)).collect()
+    }
+
+    /// The titles of a set of findings, for asserting which a report carries.
+    fn titles(findings: &[ReviewFinding]) -> Vec<&str> {
+        findings.iter().filter_map(ReviewFinding::title).collect()
     }
 
     #[test]
@@ -772,15 +889,16 @@ mod tests {
         assert!(outcome.findings()[0].location().is_none());
     }
 
+    /// A reviewer that returns a scripted set of findings per pass, then nothing.
     struct ScriptedReviewer {
-        findings_per_pass: Vec<usize>,
+        passes: Vec<Vec<ReviewFinding>>,
         calls: AtomicUsize,
     }
 
     impl ScriptedReviewer {
-        fn new(findings_per_pass: Vec<usize>) -> Self {
+        fn new(passes: Vec<Vec<ReviewFinding>>) -> Self {
             Self {
-                findings_per_pass,
+                passes,
                 calls: AtomicUsize::new(0),
             }
         }
@@ -789,8 +907,25 @@ mod tests {
     impl Reviewer for ScriptedReviewer {
         fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
             let call = self.calls.fetch_add(1, Ordering::SeqCst);
-            let count = self.findings_per_pass.get(call).copied().unwrap_or(0);
-            let findings = (0..count).map(|_| finding()).collect();
+            let findings = self.passes.get(call).cloned().unwrap_or_default();
+            Ok(ReviewOutcome::new(findings, ReviewCompleteness::Complete))
+        }
+    }
+
+    /// A reviewer that never stops producing a fresh finding and never retires
+    /// one, as a reviewer whose rounds would otherwise run to the cap does: every
+    /// pass adds a finding and clears none.
+    #[derive(Default)]
+    struct EndlessReviewer {
+        calls: AtomicUsize,
+    }
+
+    impl Reviewer for EndlessReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let findings = (0..=call)
+                .map(|n| finding_titled(&format!("finding {n}")))
+                .collect();
             Ok(ReviewOutcome::new(findings, ReviewCompleteness::Complete))
         }
     }
@@ -808,7 +943,10 @@ mod tests {
 
     #[test]
     fn the_loop_stops_at_the_pass_cap() {
-        let reviewer = ScriptedReviewer::new(vec![1, 1, 1, 1, 1]);
+        // Each round both surfaces a finding and retires one, so it makes
+        // progress - and the cap still ends it.
+        let reviewer =
+            ScriptedReviewer::new(vec![pass(&["a"]), pass(&["b"]), pass(&["c"]), pass(&["d"])]);
         let mut addressed = Vec::new();
 
         let summary = ReviewLoop::new(3)
@@ -822,11 +960,15 @@ mod tests {
         assert_eq!(summary.findings(), 3);
         assert_eq!(summary.stop(), ReviewStop::PassCap);
         assert_eq!(addressed, [(1, 1), (2, 1), (3, 1)]);
+        // The cap did not converge, so it escalates the last pass's findings.
+        let escalation = summary.escalation().expect("escalation");
+        assert_eq!(escalation.stop(), ReviewStop::PassCap);
+        assert_eq!(titles(escalation.findings()), ["c"]);
     }
 
     #[test]
     fn the_loop_stops_when_a_pass_finds_nothing() {
-        let reviewer = ScriptedReviewer::new(vec![2, 0, 5]);
+        let reviewer = ScriptedReviewer::new(vec![pass(&["a", "b"]), pass(&[]), pass(&["c"])]);
         let mut addressed = 0;
 
         let summary = ReviewLoop::new(5)
@@ -840,11 +982,15 @@ mod tests {
         assert_eq!(summary.findings(), 2);
         assert_eq!(summary.stop(), ReviewStop::Converged);
         assert_eq!(addressed, 1);
+        // Convergence is the one stop that is not an escalation.
+        assert!(summary.escalation().is_none());
+        assert!(summary.unresolved().is_empty());
+        assert!(!summary.stop().needs_escalation());
     }
 
     #[test]
     fn the_loop_never_runs_more_than_the_cap() {
-        let reviewer = ScriptedReviewer::new(vec![1; 10]);
+        let reviewer = ScriptedReviewer::new(vec![pass(&["a"]); 10]);
 
         let summary = ReviewLoop::new(1)
             .run(&reviewer, &request(), |_, _| Ok::<(), String>(()))
@@ -852,11 +998,77 @@ mod tests {
 
         assert_eq!(summary.passes(), 1);
         assert_eq!(summary.stop(), ReviewStop::PassCap);
+        assert_eq!(titles(summary.unresolved()), ["a"]);
+    }
+
+    #[test]
+    fn the_loop_stops_when_a_round_finds_nothing_new() {
+        // The reviewer repeats itself exactly: the second pass buys nothing.
+        let reviewer = ScriptedReviewer::new(vec![pass(&["a", "b"]), pass(&["a", "b"])]);
+        let mut addressed = 0;
+
+        let summary = ReviewLoop::new(10)
+            .run(&reviewer, &request(), |_, _| {
+                addressed += 1;
+                Ok::<(), String>(())
+            })
+            .expect("loop");
+
+        assert_eq!(summary.passes(), 2);
+        assert_eq!(summary.findings(), 4);
+        assert_eq!(summary.stop(), ReviewStop::NoProgress);
+        assert_eq!(addressed, 1);
+        assert_eq!(titles(summary.unresolved()), ["a", "b"]);
+    }
+
+    #[test]
+    fn the_loop_stops_when_a_round_retires_nothing() {
+        // The measured failure: every round finds something new and fixes
+        // nothing, so the findings never come down.
+        let reviewer = ScriptedReviewer::new(vec![
+            pass(&["a"]),
+            pass(&["a", "b"]),
+            pass(&["a", "b", "c"]),
+        ]);
+
+        let summary = ReviewLoop::new(10)
+            .run(&reviewer, &request(), |_, _| Ok::<(), String>(()))
+            .expect("loop");
+
+        assert_eq!(summary.passes(), 2);
+        assert_eq!(summary.stop(), ReviewStop::NoProgress);
+        assert_eq!(titles(summary.unresolved()), ["a", "b"]);
+    }
+
+    #[test]
+    fn a_reviewer_that_never_converges_terminates_on_the_progress_rule() {
+        // Without the progress rule this loop runs a million passes, each adding
+        // a finding and clearing none. The bound is what makes it terminate - and
+        // terminate with a report, not a silent success.
+        let reviewer = EndlessReviewer::default();
+        let mut addressed = 0;
+
+        let summary = ReviewLoop::new(1_000_000)
+            .run(&reviewer, &request(), |_, _| {
+                addressed += 1;
+                Ok::<(), String>(())
+            })
+            .expect("loop");
+
+        assert_eq!(summary.passes(), 2);
+        assert_eq!(summary.findings(), 3);
+        assert_eq!(summary.stop(), ReviewStop::NoProgress);
+        assert_eq!(addressed, 1);
+        assert_eq!(titles(summary.unresolved()), ["finding 0", "finding 1"]);
+        assert_eq!(
+            summary.escalation().expect("escalation").stop(),
+            ReviewStop::NoProgress
+        );
     }
 
     #[test]
     fn an_address_failure_surfaces_from_the_loop() {
-        let reviewer = ScriptedReviewer::new(vec![1]);
+        let reviewer = ScriptedReviewer::new(vec![pass(&["a"])]);
 
         let error = ReviewLoop::new(3)
             .run(&reviewer, &request(), |_, _| Err("address boom".to_owned()))

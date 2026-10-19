@@ -77,15 +77,26 @@ they sit on. The prompt says so: resolve every conflict absorb reports, or
 belong in an existing commit - a new file, a new test - stays an ordinary edit on
 `@`.
 
-## The pass cap
+## The bound
 
 The re-review loop is **review, address, review again**, bounded by
-`max_passes`. Two things stop it:
+`max_passes` and by a progress requirement. Three things stop it:
 
 - **The pass cap.** The loop never runs more reviewer passes than `max_passes`,
-  whatever the reviewer reports. This is the bound.
+  whatever the reviewer reports. This is the hard ceiling.
+- **Progress.** A round must both surface a finding the previous pass had not
+  and retire one it had. A reviewer that repeats itself finds nothing new, and a
+  Worker that fixes nothing retires nothing: either way the round is a stall, and
+  another pass would only buy the same findings again.
 - **Convergence.** A pass that produces no findings has nothing to send a
   Worker, so the loop stops early.
+
+Only convergence means the review passed. A loop that stops on the cap or on a
+stalled round has **not** resolved its last round's findings, so it does not
+report success: it prints them and stops for a human to decide. That is the
+point of the bound - the failure it exists to prevent is a loop that reaches
+zero findings by repetition, spending reviewer compute to learn nothing. The
+tool enforces the bound; the prompt does not.
 
 The loop reports how many passes ran, how many findings it saw, and why it
 stopped, so the cost of a review is visible rather than implied.
