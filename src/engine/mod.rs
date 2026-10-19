@@ -81,9 +81,9 @@ pub use pool::{
     WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use reviewer::{
-    CodeRabbitReviewer, ReviewCompleteness, ReviewFinding, ReviewLoop, ReviewLoopError,
-    ReviewLoopSummary, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop, Reviewer,
-    ReviewerError,
+    CodeRabbitReviewer, ReviewCompleteness, ReviewEscalation, ReviewFinding, ReviewLoop,
+    ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop,
+    Reviewer, ReviewerError,
 };
 pub use run_log::{
     AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,

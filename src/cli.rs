@@ -3986,6 +3986,17 @@ fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result
         summary.findings(),
         summary.stop().as_str()
     );
+    // A loop that did not converge has findings nobody has resolved, so it hands
+    // them to a human instead of reporting a review that quietly passed.
+    if let Some(escalation) = summary.escalation() {
+        eprintln!(
+            "Escalating {} unresolved finding(s) - the loop will not iterate again:",
+            escalation.findings().len()
+        );
+        for finding in escalation.findings() {
+            eprintln!("  {}", finding.summary());
+        }
+    }
     Ok(())
 }
 
