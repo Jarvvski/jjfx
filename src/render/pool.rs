@@ -9,8 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::engine::{
-    AgentSessionResolution, PoolCostSnapshot, RunActivity, RunActivityKind, RunConclusion,
-    RunResult, RunUsage, StuckWindow, WorkerPoolSnapshot, WorkerStatus,
+    AgentSessionResolution, PoolCostSnapshot, PoolName, RunActivity, RunActivityKind,
+    RunConclusion, RunResult, RunUsage, StuckWindow, WorkerPoolSnapshot, WorkerStatus,
 };
 use crate::pool_session::PoolSession;
 use crate::render::style::dim_line;
@@ -27,6 +27,10 @@ pub(crate) enum PoolPane<'a> {
     LogDetail {
         worker: &'a str,
     },
+    /// Choosing which Worker Pool lane the view acts on.
+    LaneChoice {
+        index: usize,
+    },
 }
 
 /// A read-only projection for the Worker Pool view: the session state plus the
@@ -38,6 +42,13 @@ pub(crate) struct PoolView<'a> {
     pub selected_worker: Option<&'a str>,
     pub watchdog: StuckWindow,
     pub now: Timestamp,
+    /// The Worker Pool lane this view acts on, or `None` when the Repository
+    /// holds several and none has been named yet.
+    pub pool: Option<&'a str>,
+    /// Every Worker Pool the Repository holds, for the lane chooser.
+    pub lanes: &'a [PoolName],
+    /// Why no lane is named, when none is: the refusal naming the lanes.
+    pub refusal: Option<&'a str>,
 }
 
 /// Draw the Worker Pool view body; `footer` is rendered into the bottom strip.
@@ -49,13 +60,48 @@ pub(crate) fn draw(frame: &mut Frame, view: &PoolView<'_>, footer: Paragraph<'_>
     ])
     .horizontal_margin(2)
     .areas(frame.area());
+    let title = match view.pool {
+        Some(pool) => format!("Worker Pool: {pool}  [p management]"),
+        None => "Worker Pool: no lane selected  [p management]".to_owned(),
+    };
     frame.render_widget(
         Paragraph::new(Span::styled(
-            "Worker Pool  [p management]",
+            title,
             Style::default().add_modifier(Modifier::BOLD),
         )),
         header,
     );
+
+    // With no lane named the Repository holds several pools and one must be
+    // chosen: showing a lane's Workers here would be the silent single-lane view
+    // this ticket removes, so the chooser stands in its place.
+    if matches!(view.pane, PoolPane::LaneChoice { .. }) || view.pool.is_none() {
+        let index = match view.pane {
+            PoolPane::LaneChoice { index } => index,
+            _ => 0,
+        };
+        let mut lines = Vec::new();
+        if let Some(refusal) = view.refusal {
+            lines.push(Line::from(Span::styled(
+                format!(" {refusal}"),
+                Style::default().fg(Color::Yellow),
+            )));
+        } else {
+            lines.push(dim_line(" Choose the Worker Pool this view acts on:"));
+        }
+        for (position, name) in view.lanes.iter().enumerate() {
+            let marker = if position == index { "▸" } else { "·" };
+            lines.push(Line::from(format!("  {marker} {name}")));
+        }
+        lines.push(dim_line(" j / k move  enter choose"));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(Block::default().borders(Borders::ALL).title(" pool lane ")),
+            body,
+        );
+        frame.render_widget(footer, footer_area);
+        return;
+    }
 
     let mut lines = Vec::new();
     if let Some(snapshot) = &view.session.worker_pool {
@@ -495,14 +541,22 @@ mod tests {
         now: Timestamp,
         watchdog: StuckWindow,
     ) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
-        let view = PoolView {
+        let lanes = [PoolName::default()];
+        render_view(PoolView {
             session,
             pane,
             selected_worker: selected,
             watchdog,
             now,
-        };
+            pool: Some("default"),
+            lanes: &lanes,
+            refusal: None,
+        })
+    }
+
+    /// Draw one view into a test terminal and return the frame as a string.
+    fn render_view(view: PoolView<'_>) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(100, 20)).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, &view, Paragraph::new("")))
             .expect("draw");
@@ -513,6 +567,76 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect()
+    }
+
+    #[test]
+    fn the_pool_view_names_the_lane_it_acts_on() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot(false)),
+            ..PoolSession::default()
+        };
+        let lanes = [
+            PoolName::default(),
+            PoolName::parse("bugs").expect("pool name"),
+        ];
+
+        let text = render_view(PoolView {
+            session: &session,
+            pane: PoolPane::View,
+            selected_worker: Some("worker-01"),
+            watchdog: StuckWindow::DEFAULT,
+            now: Timestamp::now(),
+            pool: Some("bugs"),
+            lanes: &lanes,
+            refusal: None,
+        });
+
+        assert!(
+            text.contains("Worker Pool: bugs"),
+            "the view must name the lane it acts on: {text}"
+        );
+    }
+
+    /// A Repository holding several lanes and none named shows the refusal and
+    /// the lanes to choose from - never a single lane's Workers, which would be
+    /// the silent single-lane view this view no longer has.
+    #[test]
+    fn an_unnamed_lane_refuses_and_lists_the_lanes() {
+        let session = PoolSession {
+            worker_pool: Some(snapshot(false)),
+            ..PoolSession::default()
+        };
+        let lanes = [
+            PoolName::default(),
+            PoolName::parse("bugs").expect("pool name"),
+        ];
+        let refusal =
+            "this Repository holds 2 Worker Pools (default, bugs); name one with --pool <name>";
+
+        let text = render_view(PoolView {
+            session: &session,
+            pane: PoolPane::LaneChoice { index: 1 },
+            selected_worker: None,
+            watchdog: StuckWindow::DEFAULT,
+            now: Timestamp::now(),
+            pool: None,
+            lanes: &lanes,
+            refusal: Some(refusal),
+        });
+
+        assert!(
+            text.contains("this Repository holds 2 Worker Pools"),
+            "the refusal must be shown: {text}"
+        );
+        assert!(
+            text.contains("default"),
+            "every lane must be listed: {text}"
+        );
+        assert!(text.contains("bugs"), "every lane must be listed: {text}");
+        assert!(
+            !text.contains("worker-01"),
+            "no lane's Workers may show while none is named: {text}"
+        );
     }
 
     #[test]

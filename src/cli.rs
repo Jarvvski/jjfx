@@ -37,6 +37,7 @@ use crate::cli_help::{
 };
 use crate::config::{
     Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, TicketSource, TicketsConfig,
+    global_ready_label, ready_label_for, resolve_pool,
 };
 use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeProfile, CapacityShortage, CleanDecision, CleanScope,
@@ -2893,70 +2894,6 @@ fn report_named_ticket_readiness(
     Ok(())
 }
 
-/// The Worker Pool a Dispatch fills, from the pools a Repository holds.
-///
-/// One pool implies it; several require `--pool`, and an unqualified Dispatch
-/// against several is refused loudly, naming the pools that exist - never a
-/// silent choice of one (`.scratch/multi-pool/issues/04-how-tickets-reach-a-pool.md`).
-/// An explicit `--pool` naming a pool the Repository does not hold is refused
-/// the same way, so a typo cannot quietly fill a lane that is not there.
-fn resolve_pool(available: &[PoolName], requested: Option<&str>) -> Result<PoolName> {
-    let names = || {
-        available
-            .iter()
-            .map(PoolName::as_str)
-            .collect::<Vec<_>>()
-            .join(", ")
-    };
-    if let Some(name) = requested {
-        let pool = PoolName::parse(name.to_owned())
-            .map_err(|_| anyhow::anyhow!("`{name}` is not a valid Worker Pool name"))?;
-        if available.contains(&pool) {
-            return Ok(pool);
-        }
-        bail!(
-            "no Worker Pool named `{name}`; this Repository holds: {}",
-            names()
-        );
-    }
-    match available {
-        [] => bail!("this Repository holds no Worker Pools"),
-        [only] => Ok(only.clone()),
-        several => bail!(
-            "this Repository holds {} Worker Pools ({}); name one with --pool <name>",
-            several.len(),
-            names()
-        ),
-    }
-}
-
-/// The label a Dispatch discovers by when neither `--label` nor a pool's own
-/// declaration overrides it.
-///
-/// This is also the label a local Ticket that declares no `Labels:` of its own
-/// carries, so a Repository that never adopted labels discovers exactly the work
-/// it always did.
-fn global_ready_label(requested: Option<&str>) -> String {
-    requested.unwrap_or(DEFAULT_READY_LABEL).to_owned()
-}
-
-/// The ready label in force for one selected pool.
-///
-/// `--label` overrides the pool's declared routing label, which overrides the
-/// global default - the ready label is per pool, because each pool's source may
-/// select work by a different label.
-fn ready_label_for(requested: Option<&str>, pool: &PoolName, routes: &[PoolRoute]) -> String {
-    requested
-        .map(str::to_owned)
-        .or_else(|| {
-            routes
-                .iter()
-                .find(|route| route.name() == pool)
-                .map(|route| route.label().to_owned())
-        })
-        .unwrap_or_else(|| DEFAULT_READY_LABEL.to_owned())
-}
-
 /// One Direct Dispatch request per ready Ticket, in request order.
 ///
 /// The details fetch, the model, the budget and the dependency basis are the
@@ -5243,96 +5180,6 @@ mod tests {
                 "{arguments:?}"
             );
         }
-    }
-
-    /// One pool implies it: a Repository that declares none has one implicit
-    /// `default`, so an unqualified Dispatch fills it - today's behaviour,
-    /// untouched.
-    #[test]
-    fn one_pool_implies_the_target() {
-        let only = [PoolName::default()];
-        assert_eq!(
-            resolve_pool(&only, None).expect("one pool implies it"),
-            PoolName::default()
-        );
-    }
-
-    /// Several pools require `--pool`: an unqualified Dispatch is refused loudly,
-    /// naming the pools that exist, never silently filling one.
-    #[test]
-    fn several_pools_require_an_explicit_one() {
-        let available = [
-            PoolName::default(),
-            PoolName::parse("bugs").expect("pool name"),
-            PoolName::parse("features").expect("pool name"),
-        ];
-        let error = resolve_pool(&available, None).expect_err("several pools must be refused");
-        let message = error.to_string();
-        for name in ["default", "bugs", "features"] {
-            assert!(message.contains(name), "{message}");
-        }
-        assert!(message.contains("--pool"), "{message}");
-    }
-
-    /// An explicit `--pool` selects the lane, so reservation, eligibility and
-    /// size are read from that pool's state.
-    #[test]
-    fn an_explicit_pool_selects_the_lane() {
-        let available = [
-            PoolName::default(),
-            PoolName::parse("bugs").expect("pool name"),
-        ];
-        assert_eq!(
-            resolve_pool(&available, Some("bugs")).expect("an explicit pool"),
-            PoolName::parse("bugs").expect("pool name")
-        );
-        // An explicit `--pool default` works on a multi-pool Repository too.
-        assert_eq!(
-            resolve_pool(&available, Some("default")).expect("an explicit pool"),
-            PoolName::default()
-        );
-    }
-
-    /// Naming a pool the Repository does not hold is refused the same way, so a
-    /// typo cannot quietly fill a lane that is not there.
-    #[test]
-    fn an_unknown_pool_is_refused_naming_the_pools_that_exist() {
-        let available = [PoolName::default()];
-        let error =
-            resolve_pool(&available, Some("ghost")).expect_err("an undeclared pool is refused");
-        let message = error.to_string();
-        assert!(message.contains("ghost"), "{message}");
-        assert!(message.contains("default"), "{message}");
-    }
-
-    /// The ready label is per pool: `--label` overrides the pool's declared
-    /// routing label, which overrides the global default.
-    #[test]
-    fn the_ready_label_falls_back_from_the_flag_to_the_pool_to_the_default() {
-        let bugs = PoolName::parse("bugs").expect("pool name");
-        let routes = [PoolRoute::new(bugs.clone(), "bug")];
-
-        assert_eq!(
-            ready_label_for(Some("urgent"), &bugs, &routes),
-            "urgent",
-            "an explicit --label wins"
-        );
-        assert_eq!(
-            ready_label_for(None, &bugs, &routes),
-            "bug",
-            "a pool's declared label is the next fallback"
-        );
-        assert_eq!(
-            ready_label_for(None, &PoolName::default(), &routes),
-            DEFAULT_READY_LABEL,
-            "a pool that declares none falls back to the global default"
-        );
-        assert_eq!(
-            global_ready_label(None),
-            DEFAULT_READY_LABEL,
-            "the global default is the ready label a local Ticket carries"
-        );
-        assert_eq!(global_ready_label(Some("urgent")), "urgent");
     }
 
     #[test]

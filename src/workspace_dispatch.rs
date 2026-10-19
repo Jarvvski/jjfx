@@ -12,8 +12,8 @@ use crate::engine::{
     AgentRuntime, AgentSessionResolution, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
     DispatchGroupProgress, DispatchGroupStatusCounts, MutationKind, PermissionDecision,
-    PoolCapacity, ReadyTicketFilter, RunActivity, RunMode, RunResult, TicketDiscovery, TicketId,
-    TicketStatus, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
+    PoolCapacity, PoolName, ReadyTicketFilter, RunActivity, RunMode, RunResult, TicketDiscovery,
+    TicketId, TicketStatus, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 mod adapter;
@@ -22,6 +22,41 @@ pub(crate) use adapter::{RealWorkspaceDispatch, WorkspaceDispatchAdapter};
 
 /// A user-visible operation identity used to ignore stale results.
 pub type OperationId = u64;
+
+/// The Worker Pool a TUI session acts on, shared between the App that names a
+/// lane and the adapter that reads it for every pool-scoped operation.
+///
+/// The lane is chosen once at launch and may be changed while the session runs,
+/// which is why it is a shared cell rather than a value captured at
+/// construction: the App owns the choice for rendering and the background
+/// controller - including the refresh poller - reads the same cell, so a lane
+/// change reaches every operation without rebuilding the controller.
+#[derive(Clone)]
+pub struct PoolSelection {
+    pool: Arc<Mutex<PoolName>>,
+}
+
+impl PoolSelection {
+    /// Names the lane every operation acts on.
+    pub fn new(pool: PoolName) -> Self {
+        Self {
+            pool: Arc::new(Mutex::new(pool)),
+        }
+    }
+
+    /// Returns the lane in force right now.
+    pub fn get(&self) -> PoolName {
+        self.pool
+            .lock()
+            .expect("Worker Pool selection lock")
+            .clone()
+    }
+
+    /// Replaces the lane every subsequent operation acts on.
+    pub fn set(&self, pool: PoolName) {
+        *self.pool.lock().expect("Worker Pool selection lock") = pool;
+    }
+}
 
 /// Immutable latest activity from one Worker's provider-neutral Run log.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -317,11 +352,9 @@ pub enum WorkspaceDispatchCommand {
         tickets: Vec<String>,
         worker: Option<String>,
     },
-    /// Discover provider-ready Tickets for the configured dispatch label.
-    DiscoverReady {
-        operation: OperationId,
-        label: String,
-    },
+    /// Discover provider-ready Tickets through the selected Worker Pool's own
+    /// routing label and ready status.
+    DiscoverReady { operation: OperationId },
     /// Start or resume one Parent Ticket's dependency-aware orchestration.
     Orchestrate {
         operation: OperationId,
@@ -948,8 +981,8 @@ impl WorkspaceDispatchController {
                     emit(WorkspaceDispatchEvent::Failed { operation, message })
                 }
             },
-            WorkspaceDispatchCommand::DiscoverReady { operation, label } => {
-                match adapter.discover_ready(&label) {
+            WorkspaceDispatchCommand::DiscoverReady { operation } => {
+                match adapter.discover_ready() {
                     Ok(result) => emit(WorkspaceDispatchEvent::ReadyTickets { operation, result }),
                     Err(message) => emit(WorkspaceDispatchEvent::Failed { operation, message }),
                 }
@@ -1296,13 +1329,11 @@ impl WorkspaceDispatchAdapter for RecordingAdapter {
         Ok(self.result(tickets, worker))
     }
 
-    fn discover_ready(&self, _label: &str) -> Result<ReadyTicketResult, String> {
-        self.commands.lock().expect("recording adapter lock").push(
-            WorkspaceDispatchCommand::DiscoverReady {
-                operation: 0,
-                label: _label.to_owned(),
-            },
-        );
+    fn discover_ready(&self) -> Result<ReadyTicketResult, String> {
+        self.commands
+            .lock()
+            .expect("recording adapter lock")
+            .push(WorkspaceDispatchCommand::DiscoverReady { operation: 0 });
         Ok(ReadyTicketResult {
             tickets: vec![ReadyTicket {
                 id: "ENG-42".to_owned(),
@@ -1607,10 +1638,7 @@ mod tests {
             events_tx.send(event).expect("event receiver");
         });
 
-        controller.submit(WorkspaceDispatchCommand::DiscoverReady {
-            operation: 11,
-            label: "ready-for-agent".to_owned(),
-        });
+        controller.submit(WorkspaceDispatchCommand::DiscoverReady { operation: 11 });
 
         assert!(matches!(
             events_rx.recv().expect("discovery event"),
@@ -1620,8 +1648,7 @@ mod tests {
         ));
         assert!(adapter.commands().iter().any(|command| matches!(
             command,
-            WorkspaceDispatchCommand::DiscoverReady { operation: 0, label }
-                if label == "ready-for-agent"
+            WorkspaceDispatchCommand::DiscoverReady { operation: 0 }
         )));
     }
 

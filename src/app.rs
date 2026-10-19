@@ -18,7 +18,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::agent::{self, AgentState};
 use crate::diff::FileDiff;
 use crate::diff_view::Detail;
-use crate::engine::{PermissionDecision, RunHealth, WorkerPoolSnapshot, WorkerStatus};
+use crate::engine::{PermissionDecision, PoolName, RunHealth, WorkerPoolSnapshot, WorkerStatus};
 use crate::forge::{self, Target};
 use crate::graph;
 use crate::pool_session::{PoolSession, PoolUpdate};
@@ -35,8 +35,8 @@ use crate::terminal::Terminal;
 use crate::viewport::Viewport;
 use crate::work::{Work, WorkState};
 use crate::workspace_dispatch::{
-    OperationId, RealWorkspaceDispatch, WorkspaceDispatchCommand, WorkspaceDispatchController,
-    WorkspaceDispatchEvent,
+    OperationId, PoolSelection, RealWorkspaceDispatch, WorkspaceDispatchCommand,
+    WorkspaceDispatchController, WorkspaceDispatchEvent,
 };
 use crate::workspace_list::{Row, RowInput, WorkspaceList, WorkspaceRow};
 use jiff::Timestamp;
@@ -85,6 +85,52 @@ enum PoolMode {
         worker: Option<String>,
         shortage: crate::workspace_dispatch::DispatchCapacityShortage,
     },
+    /// Choosing which Worker Pool lane the view acts on.
+    LaneChoice {
+        index: usize,
+    },
+}
+
+/// Which Worker Pool the TUI acts on, and - when the Repository holds several
+/// and none has been named yet - the refusal naming them.
+///
+/// The lane is resolved through the same [`crate::config::resolve_pool`] seam
+/// `dispatch` uses, so one pool implies it and several refuse loudly rather than
+/// silently filling `default`: the TUI can no longer show a single-lane view of
+/// a multi-lane Repository without saying so.
+struct PoolLane {
+    /// Every Worker Pool the Repository holds, `default` first.
+    names: Vec<PoolName>,
+    /// The lane the TUI acts on, or `None` until one is named.
+    selected: Option<PoolName>,
+    /// Why no lane is selected, when none is: the `resolve_pool` refusal.
+    refusal: Option<String>,
+}
+
+impl PoolLane {
+    /// Resolves the lane from the Repository's routing, refusing an ambiguous
+    /// one rather than choosing.
+    fn resolve(routing: &crate::config::PoolRouting) -> Self {
+        let names = routing.names().to_vec();
+        match routing.resolve(None) {
+            Ok(pool) => Self {
+                names,
+                selected: Some(pool),
+                refusal: None,
+            },
+            Err(error) => Self {
+                names,
+                selected: None,
+                refusal: Some(error.to_string()),
+            },
+        }
+    }
+
+    /// Names a lane, clearing the refusal that stood in its place.
+    fn choose(&mut self, pool: PoolName) {
+        self.selected = Some(pool);
+        self.refusal = None;
+    }
 }
 
 /// What the key handler is currently collecting: normal navigation, a new
@@ -163,6 +209,7 @@ const POOL_BINDINGS: &[(&str, &str)] = &[
     ("Dismiss Worker", "x"),
     ("Worker log", "l"),
     ("Ready Ticket discovery", "a"),
+    ("Choose Worker Pool", "w"),
     ("Dispatch Group orchestration", "o"),
     ("Resize Pool", "r"),
     ("Reset Worker", "K"),
@@ -360,6 +407,12 @@ pub struct App {
     dispatch: WorkspaceDispatchController,
     /// All Worker Pool interaction state and its operation-identity rules.
     pool: PoolSession,
+    /// The Worker Pool lane the TUI acts on, named by the operator when the
+    /// Repository holds several.
+    lane: PoolLane,
+    /// The shared lane handle the dispatch adapter reads for every pool-scoped
+    /// operation.
+    pool_selection: PoolSelection,
     /// Operation generation used to reject stale mutation results. Shared by
     /// Pool commands and workspace deletion.
     next_operation: OperationId,
@@ -441,6 +494,12 @@ impl App {
     ) -> Self {
         let dispatch_tx = tx.clone();
         let watchdog = settings.watchdog.stuck_window();
+        // The lane is resolved once, through the same seam `dispatch` uses: one
+        // pool implies it, several leave it unnamed and refuse until the
+        // operator picks one. The adapter shares the handle, so a lane chosen
+        // here reaches every operation - including the refresh poller.
+        let lane = PoolLane::resolve(&settings.pool_routing);
+        let pool_selection = PoolSelection::new(lane.selected.clone().unwrap_or_default());
         let dispatch = WorkspaceDispatchController::new(
             RealWorkspaceDispatch::new(store.repo_root())
                 .with_colocate(store.colocate())
@@ -450,7 +509,9 @@ impl App {
                 // cap cannot arrive from a real launch; a hand-built one falls
                 // back to no cap rather than refusing the whole TUI.
                 .with_concurrency_cap(settings.dispatch.cap().ok().flatten())
-                .with_terminal(Arc::clone(&terminal)),
+                .with_terminal(Arc::clone(&terminal))
+                .with_pool_selection(pool_selection.clone())
+                .with_pool_routing(settings.pool_routing),
             move |event| {
                 let _ = dispatch_tx.send(Msg::WorkspaceDispatch(event));
             },
@@ -462,6 +523,8 @@ impl App {
             migrations: crate::migrations::Report::default(),
             dispatch,
             pool: PoolSession::default(),
+            lane,
+            pool_selection,
             next_operation: 0,
             forge_progress: HashMap::new(),
             fetching: false,
@@ -1069,6 +1132,41 @@ impl App {
     }
 
     fn open_pool(&mut self) {
+        if self.lane.selected.is_none() {
+            // The Repository holds several lanes and none is named: refuse to
+            // show a lane until the operator picks one, exactly as `dispatch`
+            // refuses an ambiguous target rather than silently filling `default`.
+            self.mode = Mode::Pool(PoolMode::LaneChoice {
+                index: self.lane_index(),
+            });
+            return;
+        }
+        self.mode = Mode::Pool(PoolMode::View { selected: None });
+        self.refresh_worker_pool();
+    }
+
+    /// The chooser index of the lane in force, or the first lane when none is.
+    fn lane_index(&self) -> usize {
+        self.lane
+            .selected
+            .as_ref()
+            .and_then(|selected| self.lane.names.iter().position(|name| name == selected))
+            .unwrap_or(0)
+    }
+
+    /// Names the lane the view acts on, so every subsequent pool-scoped
+    /// operation - including the refresh poller - reads that lane's state.
+    fn choose_lane(&mut self, pool: PoolName) {
+        // Cancel the outgoing lane's log watcher, then drop its lane-scoped
+        // presentation: nothing read from one lane may be shown under another.
+        if let Some(operation) = self.pool.stop_log() {
+            self.dispatch
+                .submit(WorkspaceDispatchCommand::StopWorkerLog { operation });
+        }
+        self.pool.begin_lane_change();
+        self.lane.choose(pool.clone());
+        self.pool_selection.set(pool.clone());
+        self.set_status(format!("Worker Pool: {pool}"));
         self.mode = Mode::Pool(PoolMode::View { selected: None });
         self.refresh_worker_pool();
     }
@@ -1220,6 +1318,11 @@ impl App {
                     self.mode = Mode::Pool(PoolMode::PermissionChoice { worker });
                 }
                 KeyCode::Char('a') => self.discover_ready_tickets(),
+                KeyCode::Char('w') => {
+                    self.mode = Mode::Pool(PoolMode::LaneChoice {
+                        index: self.lane_index(),
+                    });
+                }
                 KeyCode::Char('o') => {
                     self.mode = Mode::Pool(PoolMode::ParentInput {
                         buffer: String::new(),
@@ -1261,6 +1364,31 @@ impl App {
                 }
                 KeyCode::Char('D') => self.mode = Mode::ConfirmPoolDestroy,
                 _ => self.mode = Mode::Pool(PoolMode::View { selected }),
+            },
+            Mode::Pool(PoolMode::LaneChoice { index }) => match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    let index = (index + 1).min(self.lane.names.len().saturating_sub(1));
+                    self.mode = Mode::Pool(PoolMode::LaneChoice { index });
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    let index = index.saturating_sub(1);
+                    self.mode = Mode::Pool(PoolMode::LaneChoice { index });
+                }
+                KeyCode::Enter => match self.lane.names.get(index).cloned() {
+                    Some(pool) => self.choose_lane(pool),
+                    None => self.mode = Mode::Pool(PoolMode::LaneChoice { index }),
+                },
+                // Esc returns to the lane in force, or leaves the view entirely
+                // when none is named - the chooser must not trap an operator who
+                // only opened it to look.
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.mode = if self.lane.selected.is_some() {
+                        Mode::Pool(PoolMode::View { selected: None })
+                    } else {
+                        Mode::Normal
+                    };
+                }
+                _ => self.mode = Mode::Pool(PoolMode::LaneChoice { index }),
             },
             Mode::Pool(PoolMode::Capacity {
                 mut buffer,
@@ -1544,10 +1672,7 @@ impl App {
         let operation = self.begin_dispatch();
         self.pin_status("discovering Ready Tickets...".to_string());
         self.dispatch
-            .submit(WorkspaceDispatchCommand::DiscoverReady {
-                operation,
-                label: "ready-for-agent".to_owned(),
-            });
+            .submit(WorkspaceDispatchCommand::DiscoverReady { operation });
     }
 
     fn on_key_confirm_dispatch_capacity(
@@ -2602,17 +2727,22 @@ impl App {
             },
             Row::Ws(row) => HomeRowKind::Workspace(self.home_row(row)),
         }));
+        // The pool diagnostics belong to the lane in force: with several lanes
+        // and none named, the snapshot is a placeholder's and must not be read
+        // as the Repository's.
         let title = match &self.pool.worker_pool {
-            Some(snapshot) if snapshot.diagnostics().is_empty() => format!(
-                "jjfx - {} workspace(s)  [pool]",
-                self.store.workspaces().len()
-            ),
-            Some(snapshot) => format!(
+            Some(snapshot) if self.lane.selected.is_some() && snapshot.diagnostics().is_empty() => {
+                format!(
+                    "jjfx - {} workspace(s)  [pool]",
+                    self.store.workspaces().len()
+                )
+            }
+            Some(snapshot) if self.lane.selected.is_some() => format!(
                 "jjfx - {} workspace(s)  [pool, {} issue(s)]",
                 self.store.workspaces().len(),
                 snapshot.diagnostics().len()
             ),
-            None => format!("jjfx - {} workspace(s)", self.store.workspaces().len()),
+            _ => format!("jjfx - {} workspace(s)", self.store.workspaces().len()),
         };
         HomeView {
             rows,
@@ -2654,7 +2784,7 @@ impl App {
             PoolMode::AliasInput { worker, .. }
             | PoolMode::LogDetail { worker }
             | PoolMode::PermissionChoice { worker } => Some(worker),
-            PoolMode::ParentInput { .. } => None,
+            PoolMode::ParentInput { .. } | PoolMode::LaneChoice { .. } => None,
         }
     }
 
@@ -2673,6 +2803,7 @@ impl App {
             },
             Some(PoolMode::ReadyPreview { .. }) => PoolPane::ReadyPreview,
             Some(PoolMode::LogDetail { worker }) => PoolPane::LogDetail { worker },
+            Some(PoolMode::LaneChoice { index }) => PoolPane::LaneChoice { index: *index },
             _ => PoolPane::View,
         };
         PoolView {
@@ -2681,6 +2812,9 @@ impl App {
             selected_worker: self.pool_selected(),
             watchdog: self.watchdog,
             now: Timestamp::now(),
+            pool: self.lane.selected.as_ref().map(PoolName::as_str),
+            lanes: &self.lane.names,
+            refusal: self.lane.refusal.as_deref(),
         }
     }
 
@@ -2760,7 +2894,11 @@ impl App {
                 Style::default().fg(Color::Red),
             )),
             Mode::Pool(PoolMode::View { .. }) => Paragraph::new(Span::styled(
-                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  u undo  p permission  o orchestrate  a ready  r resize  D destroy  esc back ",
+                " Pool: j/k select  d dispatch  s selected-send  S any-send  v review  g rebase  P PR  e alias  x dismiss  u undo  p permission  o orchestrate  a ready  w lane  r resize  D destroy  esc back ",
+                Style::default().add_modifier(Modifier::DIM),
+            )),
+            Mode::Pool(PoolMode::LaneChoice { .. }) => Paragraph::new(Span::styled(
+                " Worker Pool lane: j/k move  enter choose  esc back ",
                 Style::default().add_modifier(Modifier::DIM),
             )),
             Mode::Pool(PoolMode::Capacity { buffer, .. }) => Paragraph::new(Span::styled(
@@ -3332,6 +3470,101 @@ mod tests {
             app.mode,
             Mode::Pool(PoolMode::View { ref selected }) if selected.as_deref() == Some("worker-01")
         ));
+    }
+
+    /// An App whose Repository declares `routing` in its `.jjfx/config.toml`, so
+    /// the lane it resolves is the multi-lane one rather than the implicit
+    /// `default`.
+    fn app_with_routing(routing: &str) -> (tempfile::TempDir, App) {
+        let repo = tempfile::tempdir().expect("temp repository");
+        let config_dir = repo.path().join(".jjfx");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        std::fs::write(config_dir.join("config.toml"), routing).expect("repository config");
+        let user: crate::config::Config = toml::from_str("").expect("user config");
+        let pool_routing =
+            crate::config::PoolRouting::load(&user, repo.path()).expect("routing resolves");
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let terminal: Box<dyn Terminal> = Box::new(FakeTerminal::default());
+        let mut app = App::new(
+            Store::from_workspaces_for_test(repo.path().to_path_buf(), Vec::new()),
+            agent::AgentStates::default(),
+            terminal.into(),
+            false,
+            tx,
+            crate::config::DispatchSettings {
+                pool_routing,
+                ..Default::default()
+            },
+        );
+        reveal_idle(&mut app);
+        (repo, app)
+    }
+
+    /// The rendered frame as one string, for asserting on what the operator sees.
+    fn app_text(app: &mut App) -> String {
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 20))
+            .expect("test terminal");
+        terminal.draw(|frame| app.render(frame)).expect("draw");
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect()
+    }
+
+    /// A Repository that declares nothing has one implicit lane, so the view
+    /// names it and no choice is asked for.
+    #[test]
+    fn a_single_pool_repository_names_its_lane() {
+        let mut app = app_with(&["default"]);
+        assert_eq!(app.lane.selected, Some(PoolName::default()));
+        assert!(app.lane.refusal.is_none());
+
+        app.handle(press(KeyCode::Char('p')));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+
+        let text = app_text(&mut app);
+        assert!(
+            text.contains("Worker Pool: default"),
+            "the view must name the lane it acts on: {text}"
+        );
+    }
+
+    /// A Repository holding several lanes refuses to show one until the
+    /// operator names it - the same loud refusal `dispatch` gives - and choosing
+    /// a lane reaches the adapter, not just the view.
+    #[test]
+    fn a_multi_pool_repository_refuses_a_lane_until_one_is_chosen() {
+        let (_repo, mut app) = app_with_routing("[pools.bugs]\nlabel = \"bug\"\n");
+        assert!(
+            app.lane.selected.is_none(),
+            "a lane must never be chosen silently"
+        );
+        let refusal = app.lane.refusal.clone().expect("an ambiguous lane refuses");
+        assert!(refusal.contains("bugs"), "{refusal}");
+
+        // `p` opens the chooser rather than a lane's view, so no lane's Workers
+        // can be mistaken for the Repository's.
+        app.handle(press(KeyCode::Char('p')));
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::LaneChoice { .. })));
+        let text = app_text(&mut app);
+        assert!(text.contains("bugs"), "every lane must be listed: {text}");
+        assert!(
+            !text.contains("worker-01"),
+            "no lane's Workers may show while none is named: {text}"
+        );
+
+        // Choosing `bugs` names the lane for the view and the shared handle the
+        // adapter reads.
+        app.handle(press(KeyCode::Char('j')));
+        app.handle(press(KeyCode::Enter));
+        let bugs = PoolName::parse("bugs").expect("pool name");
+        assert_eq!(app.lane.selected, Some(bugs.clone()));
+        assert_eq!(app.pool_selection.get(), bugs);
+        assert!(matches!(app.mode, Mode::Pool(PoolMode::View { .. })));
+        assert!(app.lane.refusal.is_none());
     }
 
     #[test]

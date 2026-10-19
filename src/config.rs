@@ -11,8 +11,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, DEFAULT_POOL_NAME, PaneLayout, PoolCapacity,
-    PoolName, SpendCap, SpendCapMode, SpendWindow, WireAgent,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, DEFAULT_POOL_NAME, DEFAULT_READY_LABEL,
+    PaneLayout, PoolCapacity, PoolName, SpendCap, SpendCapMode, SpendWindow, WireAgent,
 };
 use anyhow::Context;
 use serde::Deserialize;
@@ -236,7 +236,135 @@ impl Config {
             spend: self.spend,
             dispatch: self.dispatch,
             watchdog: self.watchdog,
+            pool_routing: PoolRouting::load(self, repo_root)?,
         })
+    }
+}
+
+/// The Worker Pool a Dispatch fills, from the pools a Repository holds.
+///
+/// One pool implies it; several require an explicit choice, and an unqualified
+/// target against several is refused loudly, naming the pools that exist - never
+/// a silent choice of one
+/// (`.scratch/multi-pool/issues/04-how-tickets-reach-a-pool.md`). A requested
+/// name the Repository does not hold is refused the same way, so a typo cannot
+/// quietly fill a lane that is not there.
+///
+/// This is the one seam `dispatch`, `wait`, `clean` and the TUI all resolve
+/// their lane through, so none of them can drift on what "several pools" means.
+pub fn resolve_pool(available: &[PoolName], requested: Option<&str>) -> anyhow::Result<PoolName> {
+    let names = || {
+        available
+            .iter()
+            .map(PoolName::as_str)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(name) = requested {
+        let pool = PoolName::parse(name.to_owned())
+            .map_err(|_| anyhow::anyhow!("`{name}` is not a valid Worker Pool name"))?;
+        if available.contains(&pool) {
+            return Ok(pool);
+        }
+        anyhow::bail!(
+            "no Worker Pool named `{name}`; this Repository holds: {}",
+            names()
+        );
+    }
+    match available {
+        [] => anyhow::bail!("this Repository holds no Worker Pools"),
+        [only] => Ok(only.clone()),
+        several => anyhow::bail!(
+            "this Repository holds {} Worker Pools ({}); name one with --pool <name>",
+            several.len(),
+            names()
+        ),
+    }
+}
+
+/// The label a Dispatch discovers by when neither an explicit override nor a
+/// pool's own declaration overrides it.
+///
+/// This is also the label a local Ticket that declares no `Labels:` of its own
+/// carries, so a Repository that never adopted labels discovers exactly the work
+/// it always did.
+pub fn global_ready_label(requested: Option<&str>) -> String {
+    requested.unwrap_or(DEFAULT_READY_LABEL).to_owned()
+}
+
+/// The ready label in force for one selected pool.
+///
+/// An explicit override beats the pool's declared routing label, which beats the
+/// global default - the ready label is per pool, because each pool's source may
+/// select work by a different label.
+pub fn ready_label_for(requested: Option<&str>, pool: &PoolName, routes: &[PoolRoute]) -> String {
+    requested
+        .map(str::to_owned)
+        .or_else(|| {
+            routes
+                .iter()
+                .find(|route| route.name() == pool)
+                .map(|route| route.label().to_owned())
+        })
+        .unwrap_or_else(|| DEFAULT_READY_LABEL.to_owned())
+}
+
+/// The per-pool routing a frontend reads to resolve a lane and discover its work.
+///
+/// Resolved from config once, so the TUI's lane resolution and Ready Ticket
+/// discovery go through the same [`resolve_pool`], [`ready_label_for`] and
+/// [`RepoConfig::pool_ready_status`] seam `dispatch` uses rather than a second
+/// reading of the file. A `Default` is the pre-pools Repository: one implicit
+/// `default` lane, no routing label and no per-lane ready status.
+#[derive(Debug, Clone)]
+pub struct PoolRouting {
+    names: Vec<PoolName>,
+    routes: Vec<PoolRoute>,
+    repo: RepoConfig,
+}
+
+impl Default for PoolRouting {
+    fn default() -> Self {
+        Self {
+            names: vec![PoolName::default()],
+            routes: Vec::new(),
+            repo: RepoConfig::default(),
+        }
+    }
+}
+
+impl PoolRouting {
+    /// Reads `repo_root`'s declarations into a routing table.
+    pub(crate) fn load(user: &Config, repo_root: &Path) -> anyhow::Result<Self> {
+        let repo = user.repo_config(repo_root)?;
+        Ok(Self {
+            names: repo.pool_names()?,
+            routes: user.pool_routes_for(repo_root)?,
+            repo,
+        })
+    }
+
+    /// Every Worker Pool the Repository holds, `default` first.
+    pub fn names(&self) -> &[PoolName] {
+        &self.names
+    }
+
+    /// Resolves the lane a target names, refusing an ambiguous or unknown one
+    /// through the same [`resolve_pool`] seam `dispatch` uses.
+    pub fn resolve(&self, requested: Option<&str>) -> anyhow::Result<PoolName> {
+        resolve_pool(&self.names, requested)
+    }
+
+    /// The label a lane discovers by: its declared routing label, else the
+    /// global default.
+    pub fn ready_label(&self, pool: &PoolName) -> String {
+        ready_label_for(None, pool, &self.routes)
+    }
+
+    /// The status a Ticket must be in to be ready for `pool`: the lane's own
+    /// declaration, else `global`.
+    pub fn ready_status(&self, pool: &PoolName, global: &str) -> String {
+        self.repo.pool_ready_status(pool, global)
     }
 }
 
@@ -256,6 +384,9 @@ pub struct DispatchSettings {
     pub dispatch: DispatchConfig,
     /// How long a Run may make no progress before the watchdog flags it.
     pub watchdog: WatchdogConfig,
+    /// The Repository's Worker Pools and the routing each declares, so a
+    /// frontend can name a lane and discover through it.
+    pub pool_routing: PoolRouting,
 }
 
 /// Wrap a shell command in `$SHELL -l -i -c <command>` so login and interactive
@@ -867,7 +998,7 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
 /// *define* an agent command, a model or credentials a loud error. `[tickets]`
 /// may likewise only select a configured source: `deny_unknown_fields` on
 /// [`RepoTicketsConfig`] makes defining one a loud error.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
     /// The repository's build check, replacing the user-global `[checks]`
@@ -1667,6 +1798,160 @@ mod tests {
             repo_config.pool_ready_status(&PoolName::default(), config.tickets.ready_status()),
             "ready-for-agent",
             "an implicit default keeps the global value"
+        );
+    }
+
+    /// One pool implies it: a Repository that declares none has one implicit
+    /// `default`, so an unqualified target fills it - today's behaviour,
+    /// untouched.
+    #[test]
+    fn one_pool_implies_the_target() {
+        let only = [PoolName::default()];
+        assert_eq!(
+            resolve_pool(&only, None).expect("one pool implies it"),
+            PoolName::default()
+        );
+    }
+
+    /// Several pools require an explicit one: an unqualified target is refused
+    /// loudly, naming the pools that exist, never silently filling one.
+    #[test]
+    fn several_pools_require_an_explicit_one() {
+        let available = [
+            PoolName::default(),
+            PoolName::parse("bugs").expect("pool name"),
+            PoolName::parse("features").expect("pool name"),
+        ];
+        let error = resolve_pool(&available, None).expect_err("several pools must be refused");
+        let message = error.to_string();
+        for name in ["default", "bugs", "features"] {
+            assert!(message.contains(name), "{message}");
+        }
+        assert!(message.contains("--pool"), "{message}");
+    }
+
+    /// An explicit request selects the lane, so reservation, eligibility and
+    /// size are read from that pool's state.
+    #[test]
+    fn an_explicit_pool_selects_the_lane() {
+        let available = [
+            PoolName::default(),
+            PoolName::parse("bugs").expect("pool name"),
+        ];
+        assert_eq!(
+            resolve_pool(&available, Some("bugs")).expect("an explicit pool"),
+            PoolName::parse("bugs").expect("pool name")
+        );
+        // An explicit `--pool default` works on a multi-pool Repository too.
+        assert_eq!(
+            resolve_pool(&available, Some("default")).expect("an explicit pool"),
+            PoolName::default()
+        );
+    }
+
+    /// Naming a pool the Repository does not hold is refused the same way, so a
+    /// typo cannot quietly fill a lane that is not there.
+    #[test]
+    fn an_unknown_pool_is_refused_naming_the_pools_that_exist() {
+        let available = [PoolName::default()];
+        let error =
+            resolve_pool(&available, Some("ghost")).expect_err("an undeclared pool is refused");
+        let message = error.to_string();
+        assert!(message.contains("ghost"), "{message}");
+        assert!(message.contains("default"), "{message}");
+    }
+
+    /// The ready label is per pool: an explicit override beats the pool's
+    /// declared routing label, which beats the global default.
+    #[test]
+    fn the_ready_label_falls_back_from_the_flag_to_the_pool_to_the_default() {
+        let bugs = PoolName::parse("bugs").expect("pool name");
+        let routes = [PoolRoute::new(bugs.clone(), "bug")];
+
+        assert_eq!(
+            ready_label_for(Some("urgent"), &bugs, &routes),
+            "urgent",
+            "an explicit --label wins"
+        );
+        assert_eq!(
+            ready_label_for(None, &bugs, &routes),
+            "bug",
+            "a pool's declared label is the next fallback"
+        );
+        assert_eq!(
+            ready_label_for(None, &PoolName::default(), &routes),
+            DEFAULT_READY_LABEL,
+            "a pool that declares none falls back to the global default"
+        );
+        assert_eq!(
+            global_ready_label(None),
+            DEFAULT_READY_LABEL,
+            "the global default is the ready label a local Ticket carries"
+        );
+        assert_eq!(global_ready_label(Some("urgent")), "urgent");
+    }
+
+    /// The default routing a frontend starts from is the pre-pools Repository:
+    /// one implicit `default` lane, so a frontend that never reads a repository
+    /// file resolves exactly the pool it always did.
+    #[test]
+    fn the_default_routing_is_the_single_implicit_pool() {
+        let routing = PoolRouting::default();
+        assert_eq!(routing.names(), &[PoolName::default()]);
+        assert_eq!(
+            routing.resolve(None).expect("one pool implies it"),
+            PoolName::default()
+        );
+        assert_eq!(
+            routing.ready_label(&PoolName::default()),
+            DEFAULT_READY_LABEL
+        );
+        assert_eq!(
+            routing.ready_status(&PoolName::default(), "ready-for-agent"),
+            "ready-for-agent"
+        );
+    }
+
+    /// The routing a frontend reads carries the same lane set, labels and ready
+    /// statuses `dispatch` resolves: it is the one seam both go through.
+    #[test]
+    fn the_routing_table_matches_the_dispatch_seam() {
+        let config = Config::from_toml("[tickets]\nsource = \"local\"\n");
+        let repo = repo_with_config(Some(
+            "[pools.bugs]\nlabel = \"bug\"\n\n[pools.review]\nready_status = \"ready-for-review\"\n",
+        ));
+
+        let routing = PoolRouting::load(&config, repo.path()).expect("routing resolves");
+        let bugs = PoolName::parse("bugs").expect("pool name");
+        let review = PoolName::parse("review").expect("pool name");
+
+        assert_eq!(
+            routing.names(),
+            &[PoolName::default(), bugs.clone(), review.clone()],
+            "the lane set is `default` plus every declaration"
+        );
+        assert_eq!(routing.ready_label(&bugs), "bug");
+        assert_eq!(
+            routing.ready_label(&PoolName::default()),
+            DEFAULT_READY_LABEL
+        );
+        assert_eq!(
+            routing.ready_status(&review, "ready-for-agent"),
+            "ready-for-review"
+        );
+        assert_eq!(
+            routing.ready_status(&bugs, "ready-for-agent"),
+            "ready-for-agent"
+        );
+        // Several lanes with no explicit request refuse, naming them - the same
+        // refusal `dispatch` gives, because it is the same function.
+        let error = routing
+            .resolve(None)
+            .expect_err("several lanes are ambiguous");
+        assert!(error.to_string().contains("bugs"), "{error}");
+        assert_eq!(
+            routing.resolve(Some("review")).expect("an explicit lane"),
+            review
         );
     }
 
