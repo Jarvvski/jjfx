@@ -103,6 +103,9 @@ fn notes(key: &str) -> &'static str {
         "dispatch" => {
             "\n--fg blocks until every Run this Dispatch started has finished, inside\nthat one call. `jjfx wait` re-attaches to a Worker any session started, and\ncarries the answer in its exit code.\n\nA Repository with one Worker Pool implies it, so `--pool` is optional. A\nRepository with several requires it: an unqualified Dispatch refuses, naming\nthe pools that exist, rather than choosing one.\n\nThe exception is `--all`, which fans out across the pools that declare a\nrouting label (`[pools.bugs] label = \"bug\"`) and sends each Ticket to the pool\nwhose label it carries. A Ticket matching no pool is reported, not dropped,\nand an explicit `--pool` overrides routing to mean only that lane.\n"
         }
+        "resume" => {
+            "\nAn interruption leaves the work it had in flight recorded in the pool's\ndurable queue. `resume` re-runs that work: it reads the queue's per-step\nstate, so a step that reached `done` is left alone rather than redone, and a\nstep whose Run is still live is left running. Everything else - accepted and\nwaiting, claimed without a Run, failed, or abandoned - is re-opened and\ndispatched again, with the same capacity governor, spend limits and\noccupancy exclusions a Dispatch obeys.\n\nResumption is explicit rather than an automatic retry, because re-running a\nstep may have side effects. Naming Tickets narrows it to those steps; a Ticket\nwith no recorded step is reported, not dispatched (`jjfx dispatch` runs new\nwork). A Repository with one Worker Pool implies it, so `--pool` is optional,\nand one with several requires it, exactly as `dispatch` does.\n\nThe queue is reconciled first, so a Run that ended is settled and a Run still\nlive is recognised. To abandon a Run the queue still believes is live, reset\nits Worker (`jjfx pool reset <worker>`) and then resume.\n"
+        }
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
         }
@@ -430,6 +433,32 @@ pub(crate) const WAIT_FLAGS: &[Flag] = &[
     },
 ];
 
+/// `resume` re-runs the work the durable queue records as unfinished. It takes
+/// no `--until`/`--all`: with no Ticket named it resumes every unfinished step,
+/// so the bare command is the recovery an operator runs after an interruption.
+pub(crate) const RESUME_FLAGS: &[Flag] = &[
+    FG,
+    BG,
+    Flag {
+        long: "--pool",
+        short: None,
+        value: Some("NAME"),
+        help: "Worker Pool whose queue to resume; an explicit one means only this lane",
+    },
+    Flag {
+        long: "--force",
+        short: None,
+        value: None,
+        help: "Resume even into a Worker whose Workspace is open",
+    },
+    Flag {
+        long: "--json",
+        short: None,
+        value: None,
+        help: "Print one machine-readable object per Ticket instead of prose",
+    },
+];
+
 /// The top-level command list, grouped. Each entry names a command that
 /// [`PAGES`] must document, which is what `every_top_level_command_has_a_page`
 /// enforces.
@@ -546,6 +575,11 @@ const TOP_LEVEL: &[Group] = &[
                 key: "dispatch",
                 args: "<TICKET>...",
                 summary: "Dispatch Tickets (d; --text/--from-file/--provider/--model/--json)",
+            },
+            Entry {
+                key: "resume",
+                args: "[<TICKET>...]",
+                summary: "Re-run the queue's unfinished steps (interrupted work)",
             },
             Entry {
                 key: "wait",
@@ -833,6 +867,16 @@ const PAGES: &[CommandHelp] = &[
             },
         ],
         flags: DISPATCH_FLAGS,
+    },
+    CommandHelp {
+        key: "resume",
+        summary: "Re-run the work the durable queue records as unfinished",
+        usage: "resume [<TICKET>...] [--fg|--bg] [--pool NAME] [--force] [--json]",
+        arguments: &[Argument {
+            name: "[<TICKET>...]",
+            help: "Tickets to resume; omit to resume every unfinished step the queue holds",
+        }],
+        flags: RESUME_FLAGS,
     },
     CommandHelp {
         key: "wait",

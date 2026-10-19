@@ -202,6 +202,39 @@ impl WorkQueue {
         })
     }
 
+    /// Re-opens `step` for another attempt, reporting whether it was resumable.
+    ///
+    /// A resumption is explicit - an operator asked for it - and it re-opens the
+    /// record rather than leaving a terminal state in place, so the claim and
+    /// the settlement of the new Run apply to this step. A step that is already
+    /// done, or one whose Run is still in flight, is refused: the first would
+    /// redo completed work, the second would race a Run jjfx believes is live.
+    ///
+    /// The state it was resumed from, and why it was in that state, are carried
+    /// into `detail`, so "what happened to this?" answers while the new attempt
+    /// runs; once that attempt settles, `detail` is its own outcome again and the
+    /// Run Records keep each attempt separately.
+    pub fn resume(&self, step: &StepKey) -> Result<bool, StateError> {
+        self.store().transition(step, |item| {
+            if !item.state.is_resumable() {
+                return false;
+            }
+            let previous = item.state;
+            let reason = match item.detail.take().filter(|detail| !detail.is_empty()) {
+                Some(detail) => format!("resumed after {previous}: {detail}"),
+                None => format!("resumed after {previous}"),
+            };
+            item.state = QueueItemState::Queued;
+            item.claimed_at = None;
+            item.claimed_by = None;
+            item.started_at = None;
+            item.finished_at = None;
+            item.in_flight = None;
+            item.detail = Some(reason);
+            true
+        })
+    }
+
     /// Resolves every claimed or in-flight step against live Worker state.
     ///
     /// The queue is read, not inferred: the pass iterates the durable items, so
@@ -466,6 +499,118 @@ mod tests {
         assert_eq!(item.claimed_by, None);
         assert_eq!(item.in_flight, None);
         assert_eq!(item.detail.as_deref(), Some("released before launch"));
+    }
+
+    /// Ticket 07: a resumption reads the queue's own per-step state to tell what
+    /// is already done, so completed work is left alone and a Run reconciliation
+    /// has just called live is not raced.
+    #[test]
+    fn the_resumable_rule_is_the_queue_state_rather_than_a_second_progress_notion() {
+        assert!(QueueItemState::Queued.is_resumable());
+        assert!(QueueItemState::Claimed.is_resumable());
+        assert!(!QueueItemState::InFlight.is_resumable());
+        assert!(!QueueItemState::Done.is_resumable());
+        assert!(QueueItemState::Failed.is_resumable());
+        assert!(QueueItemState::Abandoned.is_resumable());
+    }
+
+    /// Re-opening is what makes a settled step runnable again: a claim is
+    /// refused for a terminal step, so a resumption must clear it first.
+    #[test]
+    fn resuming_re_opens_unfinished_work_and_refuses_completed_or_running_work() {
+        let (_temp, queue) = queue();
+        queue
+            .enqueue(&[step("ENG-1"), step("ENG-2"), step("ENG-3")])
+            .expect("enqueue");
+        queue
+            .settle(&StepKey::dispatch("ENG-1"), QueueSettlement::Done, at(1))
+            .expect("settle");
+        queue
+            .claim(&StepKey::dispatch("ENG-2"), record("worker-01"), at(1))
+            .expect("claim");
+        queue
+            .begin(
+                &StepKey::dispatch("ENG-2"),
+                Some("ses_abc".to_owned()),
+                None,
+                at(2),
+            )
+            .expect("begin");
+        queue
+            .claim(&StepKey::dispatch("ENG-3"), record("worker-02"), at(1))
+            .expect("claim");
+        queue
+            .settle(
+                &StepKey::dispatch("ENG-3"),
+                QueueSettlement::Abandoned {
+                    detail: "Worker worker-02 is no longer in the Worker Pool".to_owned(),
+                },
+                at(2),
+            )
+            .expect("settle");
+
+        assert!(
+            !queue
+                .resume(&StepKey::dispatch("ENG-1"))
+                .expect("resume a completed step")
+        );
+        assert!(
+            !queue
+                .resume(&StepKey::dispatch("ENG-2"))
+                .expect("resume a running step")
+        );
+        assert!(
+            !queue
+                .resume(&StepKey::dispatch("ENG-9"))
+                .expect("resume an unrecorded step")
+        );
+        assert!(
+            queue
+                .resume(&StepKey::dispatch("ENG-3"))
+                .expect("resume an abandoned step")
+        );
+
+        // The re-opened step is runnable again and carries why it was resumed.
+        let item = queue
+            .item(&StepKey::dispatch("ENG-3"))
+            .expect("item")
+            .expect("recorded");
+        assert_eq!(item.state, QueueItemState::Queued);
+        assert_eq!(item.claimed_at, None);
+        assert_eq!(item.claimed_by, None);
+        assert_eq!(item.started_at, None);
+        assert_eq!(item.finished_at, None);
+        assert_eq!(item.in_flight, None);
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("resumed after abandoned: Worker worker-02 is no longer in the Worker Pool")
+        );
+        assert!(
+            queue
+                .claim(&StepKey::dispatch("ENG-3"), record("worker-02"), at(3))
+                .expect("claim the re-opened step"),
+            "a re-opened step must be claimable, or the resumption runs nothing"
+        );
+
+        // The completed and the running steps are exactly as they were.
+        let done = queue
+            .item(&StepKey::dispatch("ENG-1"))
+            .expect("item")
+            .expect("recorded");
+        assert_eq!(done.state, QueueItemState::Done);
+        assert_eq!(done.finished_at, Some(at(1)));
+        let running = queue
+            .item(&StepKey::dispatch("ENG-2"))
+            .expect("item")
+            .expect("recorded");
+        assert_eq!(running.state, QueueItemState::InFlight);
+        assert_eq!(
+            running
+                .in_flight
+                .and_then(|record| record.session)
+                .as_deref(),
+            Some("ses_abc")
+        );
     }
 
     /// A step the queue never held is not invented by a transition for it.

@@ -33,7 +33,7 @@ use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
     ADD_FLAGS, CHILDREN_FLAGS, CLEAN_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS,
     POOL_DESTROY_FLAGS, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS,
-    REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
+    RESUME_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
 };
 use crate::config::{
     Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, TicketSource, TicketsConfig,
@@ -45,12 +45,13 @@ use crate::engine::{
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
     FollowUpExecution, FollowUpOutcome, Loaded, OrchestrationEvent, PoolCapacity, PoolCostSnapshot,
-    PoolName, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets, Repository, RunActivity,
-    RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendDecision, SpendLimit,
-    SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
-    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
-    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
+    PoolName, QueueItemState, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets,
+    Repository, RunActivity, RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode,
+    SpendDecision, SpendLimit, SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome,
+    WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot,
+    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis,
+    resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
@@ -98,6 +99,9 @@ pub enum Command {
         json: bool,
     },
     Dispatch(DispatchArgs),
+    /// `resume [<TICKET>...]`: re-dispatch the work the durable queue records as
+    /// unfinished, without redoing the steps that completed.
+    Resume(ResumeArgs),
     Send {
         worker: String,
         prompt: String,
@@ -199,6 +203,27 @@ pub struct DispatchArgs {
     /// A Ticket handed in directly (`--text`, `--from-file`, or stdin) rather
     /// than resolved through a configured source. `None` for the ordinary path.
     pub input: Option<AdHocInput>,
+}
+
+/// The `resume` command's arguments: what to resume and how to run it.
+///
+/// Resumption is explicit - an operator asks for it - because re-running a step
+/// may have side effects an automatic retry must not take on. With no Ticket
+/// named, every step the queue records as unfinished is resumed; naming Tickets
+/// narrows it to those.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ResumeArgs {
+    /// Tickets to resume; empty means every unfinished step the queue holds.
+    pub tickets: Vec<String>,
+    /// Whether a resumed Run runs in the foreground or detaches.
+    pub mode: RunMode,
+    /// The Worker Pool whose queue to resume. `None` means "the Repository's only
+    /// pool", resolved exactly as `dispatch` resolves it.
+    pub pool: Option<String>,
+    /// Resume even into a Worker whose Workspace is open in a terminal.
+    pub force: bool,
+    /// Print one machine-readable object per Ticket instead of prose.
+    pub json: bool,
 }
 
 /// The `wait` command's arguments: the Workers to wait for and what to wait for.
@@ -402,6 +427,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         )
         .map(|worker| Command::Pool(PoolCommand::Reset { worker })),
         "dispatch" | "d" => parse_dispatch(&args[1..]),
+        "resume" => parse_resume(&args[1..]),
         "send" | "s" => parse_send(&args[1..]),
         "review" | "rev" => parse_review(&args[1..]),
         "logs" | "log" => parse_worker_command(
@@ -1119,6 +1145,46 @@ fn parse_dispatch(args: &[String]) -> Result<Command> {
     }))
 }
 
+/// Parse `resume [<TICKET>...] [--pool NAME] [--fg|--bg] [--force] [--json]`.
+///
+/// No Ticket means "every unfinished step the queue records", so the bare
+/// command is the recovery an operator runs after an interruption; naming
+/// Tickets narrows the resumption to those steps.
+fn parse_resume(args: &[String]) -> Result<Command> {
+    reject_unknown_flags("resume", RESUME_FLAGS, args)?;
+    let mut tickets = Vec::new();
+    let mut mode = None;
+    let mut pool = None;
+    let mut force = false;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--fg" | "--bg" => parse_mode(&args[index], &mut mode)?,
+            "--force" => force = true,
+            "--json" => json = true,
+            "--pool" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --pool"))?;
+                pool = Some(value.clone());
+                index += 1;
+            }
+            value if value.starts_with('-') => bail!("unknown option for resume: {value}"),
+            value => tickets.push(value.to_owned()),
+        }
+        index += 1;
+    }
+    Ok(Command::Resume(ResumeArgs {
+        tickets,
+        mode: mode.unwrap_or(RunMode::Background),
+        pool,
+        force,
+        json,
+    }))
+}
+
 /// Records an ad-hoc Ticket input, rejecting a second one: a Dispatch carries
 /// exactly one Ticket when it is handed in directly.
 fn set_adhoc_source(input: &mut Option<AdHocSource>, source: AdHocSource) -> Result<()> {
@@ -1296,6 +1362,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Children { session, json } => crate::children::run(session.as_deref(), json)?,
         Command::Dispatch(args) => {
             dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
+        }
+        Command::Resume(args) => {
+            resume_command(&repository(colocate)?, &args, open_workspaces, tickets)?
         }
         Command::Send {
             worker,
@@ -3212,6 +3281,152 @@ fn dispatch_all_across_pools(
     Ok(())
 }
 
+/// `resume`: re-dispatch the work the durable queue records as unfinished.
+///
+/// Resumption is explicit - an operator asks for it - because re-running a step
+/// may have side effects an automatic retry must not take on. It reads the
+/// queue's own per-step state rather than a second notion of progress: a step
+/// that reached `done` completed and is left alone, and a step whose Run
+/// reconciliation has just called live is left running. Everything else - work
+/// accepted and waiting, claimed without a Run, failed or abandoned - is
+/// re-opened and dispatched again on the same seam a Dispatch uses, so the
+/// capacity governor, the spend limits and the occupancy exclusions all apply.
+///
+/// Reconciliation runs first, so a Run that ended is settled and a Run that is
+/// still live is recognised: the resumption reads the queue's verdict rather
+/// than a stale in-flight record, and never races a live Run.
+fn resume_command(
+    repository: &Repository,
+    args: &ResumeArgs,
+    open_workspaces: fn() -> Result<BTreeSet<String>>,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
+) -> Result<()> {
+    let config = crate::config::load()?;
+    let repo_config = config.repo_config(repository.root())?;
+    let available = config.pool_names_for(repository.root())?;
+    let pool = resolve_pool(&available, args.pool.as_deref())?;
+    let pool_name = pool.as_str().to_owned();
+    let scoped = repository.clone().with_pool(pool);
+    let repository = &scoped;
+
+    // The spend limits bind a resumption exactly as they bind a Dispatch: work
+    // jjfx accepted earlier must not spend past the ceiling now. They are
+    // evaluated before anything is created, so a refused resumption creates
+    // nothing.
+    match spend_gate(repository, &repo_config, &config)? {
+        SpendDecision::Allowed => {}
+        SpendDecision::Warned(message) => eprintln!("{message}"),
+        SpendDecision::Refused(message) => bail!("{message}"),
+    }
+    materialise_declared_pool(repository, &config)?;
+
+    let tickets = tickets_config(repository)?;
+    let (snapshot, failures) = reconcile_pass(repository, &tickets);
+    report_writeback_failures(&failures);
+
+    // A resumed Run gets the same prompt a Dispatch would: the Ticket's details
+    // are inlined when the source can still resolve it. A resumption must not
+    // depend on that - the queue recorded the step, so the work is re-run even
+    // when the source cannot answer, with the Ticket id alone in the prompt.
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository.root(),
+        &tickets,
+        configured_runtime(repository),
+        &global_ready_label(None),
+    )?);
+    let ticket_hint = ticket_source_hint(&tickets, repository);
+
+    let queue = repository.work_queue();
+    let mut requests = Vec::new();
+    let mut resumed_tickets = Vec::new();
+    let mut skipped = Vec::new();
+    for item in snapshot.queue() {
+        if !args.tickets.is_empty() && !args.tickets.iter().any(|ticket| ticket == &item.subject) {
+            continue;
+        }
+        if !item.state.is_resumable() {
+            skipped.push(DispatchEntry::Skipped {
+                ticket: item.subject.clone(),
+                detail: match item.state {
+                    QueueItemState::InFlight => format!(
+                        "still in flight on {}; reset the Worker to abandon it, then resume",
+                        item.claimed_by
+                            .as_ref()
+                            .map_or("an unrecorded Worker", WorkerId::as_str)
+                    ),
+                    state => format!("already {state}"),
+                },
+            });
+            continue;
+        }
+        // The queue re-opens the record, so the new Run's claim and settlement
+        // apply to this step. A step another process re-opened or settled first
+        // is left to it rather than dispatched twice - reported rather than
+        // dropped, because a resumption that quietly ignored a step would look
+        // like one that resumed it.
+        if !queue.resume(&item.step)? {
+            skipped.push(DispatchEntry::Skipped {
+                ticket: item.subject.clone(),
+                detail: "was resumed or settled by another process first".to_owned(),
+            });
+            continue;
+        }
+        let id = TicketId::parse(item.subject.as_str())?;
+        let mut request = DirectDispatchRequest::for_ticket_id(id.clone(), args.mode)?;
+        match fetch_ticket_details(&discovery, &id, &ticket_hint) {
+            Ok(Some(details)) => request = request.with_ticket_details(details),
+            Ok(None) => {}
+            Err(error) => eprintln!("warning: {error}"),
+        }
+        resumed_tickets.push(item.subject.clone());
+        requests.push(request);
+    }
+    // A Ticket named by hand with no recorded step is reported rather than
+    // dispatched: `dispatch` is the command that runs work jjfx has not accepted.
+    for ticket in &args.tickets {
+        if !snapshot.queue().iter().any(|item| &item.subject == ticket) {
+            skipped.push(DispatchEntry::Skipped {
+                ticket: ticket.clone(),
+                detail: "no step is recorded for it; use `dispatch` to run new work".to_owned(),
+            });
+        }
+    }
+
+    let mut entries = Vec::new();
+    if !requests.is_empty() {
+        let exclusions = dispatch_exclusions(repository, args.force, open_workspaces)?;
+        let result = dispatch_with_capacity_prompt(repository, &requests, &exclusions)?;
+        entries.extend(result.outcomes().iter().map(DispatchEntry::from_outcome));
+    }
+    // The resumed entries come first, so the slice is the batch this command
+    // actually attempted: a resumption whose every step failed is an error, while
+    // one that skipped everything already done is not.
+    let resumed = entries.len();
+    entries.extend(skipped);
+    if args.json {
+        render_dispatch_entries(&entries, true);
+        return ensure_dispatch_progressed(&entries[..resumed]);
+    }
+    if entries.is_empty() {
+        eprintln!("No unfinished steps recorded in pool '{pool_name}'");
+    } else {
+        render_dispatch_entries(&entries, false);
+        // A resumed Run reports its Worker rather than its Ticket in the
+        // Dispatch prose, so the summary names every Ticket this command
+        // re-opened - the answer an operator runs `resume` to get.
+        if resumed_tickets.is_empty() {
+            eprintln!("Resumed 0 step(s) in pool '{pool_name}'");
+        } else {
+            eprintln!(
+                "Resumed {} step(s) in pool '{pool_name}': {}",
+                resumed_tickets.len(),
+                resumed_tickets.join(", ")
+            );
+        }
+    }
+    ensure_dispatch_progressed(&entries[..resumed])
+}
+
 fn dispatch_command(
     repository: &Repository,
     args: &DispatchArgs,
@@ -3723,6 +3938,10 @@ fn ensure_dispatch_progressed(entries: &[DispatchEntry]) -> Result<()> {
 
 /// The result for one Ticket in a Dispatch, the shared model both the prose and
 /// the JSON renderings are built from.
+///
+/// A resumption reuses it: a resumed step's outcome is a Direct Dispatch
+/// outcome, and the steps a resumption left alone are `Skipped` with the reason,
+/// so `resume` reports through the same shape `dispatch` does.
 ///
 /// [`DispatchEntry::from_outcome`] is the only place that matches
 /// [`DirectDispatchOutcome`], so a new engine outcome breaks compilation here
@@ -5198,6 +5417,46 @@ mod tests {
         // `--id` names the ad-hoc Ticket, so it needs one.
         assert!(parse(&args(&["dispatch", "AMBA-42", "--id", "ENG-7"])).is_err());
         assert!(parse(&args(&["dispatch", "--id", "ENG-7"])).is_err());
+    }
+
+    /// A bare `resume` is the recovery an operator runs after an interruption:
+    /// it names no Ticket and means every unfinished step the queue holds.
+    #[test]
+    fn resume_parser_reads_the_steps_to_resume() {
+        assert_eq!(
+            parse(&args(&["resume"])).expect("a bare resume parses"),
+            Command::Resume(ResumeArgs {
+                tickets: Vec::new(),
+                mode: RunMode::Background,
+                pool: None,
+                force: false,
+                json: false,
+            })
+        );
+
+        assert_eq!(
+            parse(&args(&[
+                "resume", "ENG-1", "ENG-2", "--fg", "--pool", "bugs", "--force", "--json",
+            ]))
+            .expect("resume with every flag parses"),
+            Command::Resume(ResumeArgs {
+                tickets: vec!["ENG-1".to_owned(), "ENG-2".to_owned()],
+                mode: RunMode::Foreground,
+                pool: Some("bugs".to_owned()),
+                force: true,
+                json: true,
+            })
+        );
+    }
+
+    #[test]
+    fn resume_parser_rejects_unknown_options_and_a_missing_value() {
+        let error = parse(&args(&["resume", "--all"]))
+            .expect_err("resume has no --all: a bare resume already means everything");
+        assert!(error.to_string().contains("--all"), "{error}");
+        let error =
+            parse(&args(&["resume", "--pool"])).expect_err("--pool needs a Worker Pool name");
+        assert!(error.to_string().contains("--pool"), "{error}");
     }
 
     #[test]
