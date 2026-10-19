@@ -22,10 +22,10 @@ landing; if the latter, reconciliation needs a landing signal.
 
 ## Acceptance Criteria
 
-- [ ] The meaning of `resolved` is decided and written down.
-- [ ] The board distinguishes "the run finished" from "the change landed", or
+- [x] The meaning of `resolved` is decided and written down.
+- [x] The board distinguishes "the run finished" from "the change landed", or
       says plainly that it does not.
-- [ ] A drive where landing fails does not leave every Ticket reading as done.
+- [x] A drive where landing fails does not leave every Ticket reading as done.
 
 ## Resolution
 
@@ -40,3 +40,12 @@ exists in the database"; Huang et al. on self-correction failing without externa
 feedback; the Replit post-mortem, where the root cause was architectural and no
 prompt could have prevented it). Ticket 18 already built the `[checks]` gate, so
 this was mostly wiring the status to it.
+
+Closed 2026-10-19 by `.scratch/harness/issues/02-verified-done.md`: the check's
+outcome is now recorded on the Run Record, a local Ticket is resolved only when
+its most recent Run succeeded **and** passed the check, a failed or unrun check
+leaves the Ticket not-done with the reason named, and a repository with no
+`[checks]` configured never silently claims verification. So the board now
+distinguishes the run finishing (the Worker's `done` status) from the change
+being verified (the Ticket's `resolved`), and a drive where the check does not
+pass no longer leaves every Ticket reading as done.

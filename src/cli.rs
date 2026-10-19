@@ -1344,9 +1344,11 @@ fn repository(colocate: fn() -> Result<bool>) -> Result<Repository> {
     // commands that touch a repository pay for it; a broken config is a loud
     // error, exactly as it is in the TUI.
     let colocate = colocate()?;
-    Repository::open(".")
-        .map(|repository| repository.with_colocate(colocate))
-        .map_err(|_| anyhow::anyhow!("Not in a jj repo"))
+    let repository = Repository::open(".").map_err(|_| anyhow::anyhow!("Not in a jj repo"))?;
+    // The repo-owned build check a finished Run is verified against (ticket 02):
+    // the repository's own `[checks]` when it sets one, else the user-global one.
+    let checks = crate::config::load()?.checks_for(repository.root())?;
+    Ok(repository.with_colocate(colocate).with_checks(checks))
 }
 
 fn print_hook_output(_stream: WorkspaceHookStream, line: &str) {
@@ -6724,6 +6726,7 @@ mod tests {
                 duration_ms: None,
                 turns: None,
                 conclusion: crate::engine::RunRecordConclusion::Succeeded,
+                check: None,
                 error: None,
                 started_at: None,
                 completed_at: Some(crate::engine::WireTimestamp::new(

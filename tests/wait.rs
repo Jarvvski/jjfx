@@ -130,7 +130,7 @@ fn write_run_record(root: &Path, worker: &str, ticket: &str) {
     fs::create_dir_all(&pool).expect("pool directory");
     let line = format!(
         "{{\"run_id\":\"{worker}@2026-01-01T00:00:00Z\",\"worker\":\"{worker}\",\
-         \"ticket\":\"{ticket}\",\"conclusion\":\"succeeded\"}}\n"
+         \"ticket\":\"{ticket}\",\"conclusion\":\"succeeded\",\"check\":\"passed\"}}\n"
     );
     fs::write(pool.join("runs.jsonl"), line).expect("run record");
 }

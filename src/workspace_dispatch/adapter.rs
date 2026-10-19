@@ -123,6 +123,9 @@ pub struct RealWorkspaceDispatch {
     tickets: TicketsConfig,
     /// The optional aggregate spend cap (`[spend]`) that gates Dispatch.
     spend: SpendConfig,
+    /// The repo-owned build check a finished Run is verified against before its
+    /// Ticket reaches done (`[checks]`, ticket 02).
+    checks: crate::config::ChecksConfig,
     /// The optional ceiling on how many Runs Dispatch may keep in flight.
     cap: Option<crate::engine::ConcurrencyCap>,
     /// The multiplexer jjfx drives, used to keep Workspaces that are open in a
@@ -183,6 +186,7 @@ impl RealWorkspaceDispatch {
             colocate: true,
             tickets: TicketsConfig::default(),
             spend: SpendConfig::default(),
+            checks: crate::config::ChecksConfig::default(),
             cap: None,
             terminal: None,
             pool: PoolSelection::new(crate::engine::PoolName::default()),
@@ -205,6 +209,13 @@ impl RealWorkspaceDispatch {
     /// Sets the aggregate spend cap that gates Dispatch (builder form).
     pub fn with_spend(mut self, spend: SpendConfig) -> Self {
         self.spend = spend;
+        self
+    }
+
+    /// Sets the repo-owned build check a finished Run is verified against before
+    /// its Ticket reaches done (builder form).
+    pub fn with_checks(mut self, checks: crate::config::ChecksConfig) -> Self {
+        self.checks = checks;
         self
     }
 
@@ -278,6 +289,7 @@ impl RealWorkspaceDispatch {
                 repository
                     .with_colocate(self.colocate)
                     .with_pool(self.selected_pool())
+                    .with_checks(self.checks.clone())
             })
             .map_err(|error| error.to_string())
     }
@@ -956,6 +968,7 @@ mod tests {
                 duration_ms: None,
                 turns: None,
                 conclusion: RunRecordConclusion::Succeeded,
+                check: None,
                 error: None,
                 started_at: None,
                 completed_at: Some(WireTimestamp::new(jiff::Timestamp::now().to_string())),

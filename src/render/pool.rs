@@ -733,6 +733,7 @@ mod tests {
                 duration_ms: None,
                 turns: None,
                 conclusion: crate::engine::RunRecordConclusion::Succeeded,
+                check: None,
                 error: None,
                 started_at: None,
                 completed_at: Some(crate::engine::WireTimestamp::new("2026-07-27T10:05:00Z")),

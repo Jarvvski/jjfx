@@ -10,8 +10,8 @@ use std::path::Path;
 
 use crate::config::{TicketSource, TicketsConfig};
 use crate::engine::{
-    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, Repository, TicketQuery,
-    TicketQueryError, WorkerPoolSnapshot, WorkerStatus,
+    AgentRuntime, AgentRuntimeQuery, LocalMarkdownQuery, LocalTickets, Repository,
+    RunRecordConclusion, TicketQuery, TicketQueryError, WorkerPoolSnapshot, WorkerStatus,
 };
 
 /// Builds the [`TicketQuery`] selected by `[tickets] source`, independent of the
@@ -44,14 +44,18 @@ pub(crate) fn configured_ticket_query(
 }
 
 /// Writes local Tickets back for the reconciled Worker Pool: a Worker running a
-/// local Ticket claims it, and a Ticket whose Run finished is resolved.
+/// local Ticket claims it, and a Ticket whose Run finished **and whose change
+/// passed the repository's check** is resolved.
 ///
 /// The completion signal is the durable Run Record store, not live Worker state:
 /// `pool reset` clears a Worker's Ticket association, so a finished Worker that
-/// was reset would otherwise never resolve its Ticket. Live `done` Workers are
-/// folded in as well, so a Run whose record was never written - a runtime that
-/// finalizes lazily - still resolves while its Worker is intact. A no-op for
-/// every other source. The failures are returned rather than raised: the
+/// was reset would otherwise never resolve its Ticket. The record carries the
+/// check the repository's `[checks]` command produced against the Run's change,
+/// so a Ticket is done only when that check ran and passed - the agent's own
+/// terminal report is not enough (ticket 02). A Run that finished with a failed
+/// check, one that could not run, or none configured leaves the Ticket not-done
+/// and returns the reason, rather than silently claiming verification. A no-op
+/// for every other source. The failures are returned rather than raised: the
 /// writeback is a side effect of a command that already succeeded, and the caller
 /// decides how loudly to report it.
 pub(crate) fn apply_local_writeback(
@@ -73,18 +77,36 @@ pub(crate) fn apply_local_writeback(
         .filter(|worker| worker.status() == WorkerStatus::Busy)
         .filter_map(|worker| worker.ticket())
         .collect::<Vec<_>>();
-    let mut completed = snapshot
-        .workers()
-        .iter()
-        .filter(|worker| worker.status() == WorkerStatus::Done)
-        .filter_map(|worker| worker.ticket().map(str::to_owned))
-        .collect::<Vec<_>>();
+    let mut completed = Vec::new();
     let mut failures = Vec::new();
-    match repository.state_store().runs().completed_tickets() {
-        Ok(recorded) => {
-            for ticket in recorded {
-                if !completed.contains(&ticket) {
-                    completed.push(ticket);
+    match repository.state_store().runs().latest_ticket_records() {
+        Ok(records) => {
+            for (ticket, record) in records {
+                // A Run that did not finish successfully is not done, and needs
+                // no explanation here: the Worker's own status already carries it.
+                if record.conclusion != RunRecordConclusion::Succeeded {
+                    continue;
+                }
+                // A live Worker still owns the Ticket, so it is in flight, not
+                // finished - a claim wins over a stale verified record.
+                if in_flight.contains(&ticket.as_str()) {
+                    continue;
+                }
+                match &record.check {
+                    // Only a check that ran and passed makes the Ticket done.
+                    Some(check) if check.passed() => completed.push(ticket),
+                    // Everything else - a failed check, one that could not run,
+                    // none configured, or a record written before verification
+                    // existed - leaves the Ticket demonstrably not-done and names
+                    // what happened, so a finished Run is never mistaken for
+                    // finished work.
+                    Some(check) => failures.push(format!(
+                        "Ticket {ticket} is not verified: {}",
+                        check.reason().unwrap_or_default()
+                    )),
+                    None => failures.push(format!(
+                        "Ticket {ticket} is not verified: its Run recorded no check"
+                    )),
                 }
             }
         }
@@ -107,8 +129,9 @@ mod tests {
 
     use super::*;
     use crate::engine::{
-        DEFAULT_READY_LABEL, ParentTicket, ReadyTicketFilter, RepositoryIdentity, RunRecord,
-        RunRecordConclusion, TicketDiscovery, TicketId, TicketQueryRequest, TicketStatus, WorkerId,
+        DEFAULT_READY_LABEL, ParentTicket, ReadyTicketFilter, RepositoryIdentity, RunCheck,
+        RunRecord, RunRecordConclusion, TicketDiscovery, TicketId, TicketQueryRequest,
+        TicketStatus, WorkerId,
     };
     use tempfile::TempDir;
 
@@ -198,6 +221,7 @@ mod tests {
             duration_ms: None,
             turns: None,
             conclusion: RunRecordConclusion::Succeeded,
+            check: Some(RunCheck::Passed),
             error: None,
             started_at: None,
             completed_at: None,
@@ -263,6 +287,136 @@ mod tests {
         assert_eq!(ready.tickets().len(), 1, "{:?}", ready.diagnostics());
         assert_eq!(ready.tickets()[0].id().as_str(), "widgets--02-dependent");
     }
+
+    /// A finished Run whose change did not pass the repository's check is not
+    /// done: the Ticket stays as it was and the writeback names what failed, so a
+    /// failed check is never mistaken for finished work (ticket 02).
+    #[test]
+    fn a_finished_run_whose_check_failed_does_not_resolve_its_ticket() {
+        let temporary = TempDir::new().expect("temporary repository");
+        fs::create_dir(temporary.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temporary.path()).expect("repository");
+        write_local_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: claimed\n",
+        );
+        let mut record = completed_record("widgets--01-foundation");
+        record.check = Some(RunCheck::Failed {
+            command: "cargo check".to_owned(),
+            detail: "error: could not compile".to_owned(),
+        });
+        repository
+            .state_store()
+            .runs()
+            .append(&record)
+            .expect("append");
+        let tickets = local();
+        let snapshot = repository.worker_pool().snapshot();
+
+        let failures = apply_local_writeback(&repository, &snapshot, &tickets);
+
+        let foundation = fs::read_to_string(
+            temporary
+                .path()
+                .join(".scratch/widgets/issues/01-foundation.md"),
+        )
+        .expect("foundation Ticket");
+        assert!(
+            foundation.contains("Status: claimed"),
+            "a failed check leaves the Ticket not-done: {foundation}"
+        );
+        assert!(
+            failures.iter().any(|failure| {
+                failure.contains("not verified")
+                    && failure.contains("cargo check")
+                    && failure.contains("could not compile")
+            }),
+            "{failures:?}"
+        );
+    }
+
+    /// A repository with no check configured does not silently claim
+    /// verification: the Ticket is not resolved and the writeback says so.
+    #[test]
+    fn a_repository_with_no_check_configured_does_not_resolve_and_says_so() {
+        let temporary = TempDir::new().expect("temporary repository");
+        fs::create_dir(temporary.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temporary.path()).expect("repository");
+        write_local_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: claimed\n",
+        );
+        let mut record = completed_record("widgets--01-foundation");
+        record.check = Some(RunCheck::NotConfigured);
+        repository
+            .state_store()
+            .runs()
+            .append(&record)
+            .expect("append");
+        let tickets = local();
+        let snapshot = repository.worker_pool().snapshot();
+
+        let failures = apply_local_writeback(&repository, &snapshot, &tickets);
+
+        let foundation = fs::read_to_string(
+            temporary
+                .path()
+                .join(".scratch/widgets/issues/01-foundation.md"),
+        )
+        .expect("foundation Ticket");
+        assert!(foundation.contains("Status: claimed"), "{foundation}");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("no check is configured")),
+            "{failures:?}"
+        );
+    }
+
+    /// A record written before jjfx recorded verification does not read as done
+    /// either: no check having run is never a pass.
+    #[test]
+    fn a_record_without_a_check_does_not_resolve_its_ticket() {
+        let temporary = TempDir::new().expect("temporary repository");
+        fs::create_dir(temporary.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temporary.path()).expect("repository");
+        write_local_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: claimed\n",
+        );
+        let mut record = completed_record("widgets--01-foundation");
+        record.check = None;
+        repository
+            .state_store()
+            .runs()
+            .append(&record)
+            .expect("append");
+        let tickets = local();
+        let snapshot = repository.worker_pool().snapshot();
+
+        let failures = apply_local_writeback(&repository, &snapshot, &tickets);
+
+        let foundation = fs::read_to_string(
+            temporary
+                .path()
+                .join(".scratch/widgets/issues/01-foundation.md"),
+        )
+        .expect("foundation Ticket");
+        assert!(foundation.contains("Status: claimed"), "{foundation}");
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("recorded no check")),
+            "{failures:?}"
+        );
+    }
+
     /// A non-runtime `TicketQuery` stands in for a configured source: it proves
     /// discovery, the dependency graph, and ticket details all route through
     /// whichever source is selected, with no Agent Runtime involved.

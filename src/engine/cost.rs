@@ -548,6 +548,7 @@ mod tests {
             duration_ms: None,
             turns: None,
             conclusion: RunRecordConclusion::Succeeded,
+            check: None,
             error: None,
             started_at: None,
             completed_at: completed_at.map(WireTimestamp::new),
