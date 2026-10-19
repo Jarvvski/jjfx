@@ -41,8 +41,9 @@ pub trait WorkspaceDispatchAdapter: Send + Sync + 'static {
         tickets: &[String],
         worker: Option<&str>,
     ) -> Result<DispatchAdapterResult, WorkspaceDispatchError>;
-    /// Discover Tickets ready for Dispatch through the configured Agent Runtime.
-    fn discover_ready(&self, label: &str) -> Result<ReadyTicketResult, String>;
+    /// Discover Tickets ready for Dispatch through the selected Worker Pool's
+    /// own routing label and ready status.
+    fn discover_ready(&self) -> Result<ReadyTicketResult, String>;
     /// Prepare and run one Parent orchestration, emitting durable progress updates.
     fn orchestrate(
         &self,
@@ -127,6 +128,12 @@ pub struct RealWorkspaceDispatch {
     /// The multiplexer jjfx drives, used to keep Workspaces that are open in a
     /// terminal out of Worker selection. `None` (tests) excludes nothing.
     terminal: Option<std::sync::Arc<dyn crate::terminal::Terminal>>,
+    /// The Worker Pool every pool-scoped operation acts on, shared with the
+    /// frontend that names it (ADR 0012).
+    pool: PoolSelection,
+    /// The Repository's declared pools and the routing each declares, so
+    /// discovery goes through the same seam `dispatch` does.
+    routing: crate::config::PoolRouting,
 }
 
 impl std::fmt::Debug for RealWorkspaceDispatch {
@@ -178,6 +185,8 @@ impl RealWorkspaceDispatch {
             spend: SpendConfig::default(),
             cap: None,
             terminal: None,
+            pool: PoolSelection::new(crate::engine::PoolName::default()),
+            routing: crate::config::PoolRouting::default(),
         }
     }
 
@@ -214,6 +223,23 @@ impl RealWorkspaceDispatch {
         self
     }
 
+    /// Shares the Worker Pool every pool-scoped operation acts on (builder form).
+    pub fn with_pool_selection(mut self, pool: PoolSelection) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// Sets the Repository's declared pools and their routing (builder form).
+    pub fn with_pool_routing(mut self, routing: crate::config::PoolRouting) -> Self {
+        self.routing = routing;
+        self
+    }
+
+    /// The Worker Pool this adapter's operations act on right now.
+    fn selected_pool(&self) -> crate::engine::PoolName {
+        self.pool.get()
+    }
+
     /// The Workers excluded from Dispatch because their Workspace is open.
     ///
     /// Fails closed when the terminal cannot be queried: with no way to tell
@@ -243,9 +269,16 @@ impl RealWorkspaceDispatch {
         })
     }
 
+    /// Opens the Repository narrowed to the selected Worker Pool, so Worker
+    /// reservation, Dispatch Eligibility and the pool's size are all read from
+    /// that lane's state rather than from an implicit `default` (ADR 0012).
     fn repository(&self) -> Result<crate::engine::Repository, String> {
         crate::engine::Repository::open(&self.repository_root)
-            .map(|repository| repository.with_colocate(self.colocate))
+            .map(|repository| {
+                repository
+                    .with_colocate(self.colocate)
+                    .with_pool(self.selected_pool())
+            })
             .map_err(|error| error.to_string())
     }
 
@@ -532,7 +565,7 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .map_err(|error| error.to_string())
     }
 
-    fn discover_ready(&self, label: &str) -> Result<ReadyTicketResult, String> {
+    fn discover_ready(&self) -> Result<ReadyTicketResult, String> {
         let repository = self.repository()?;
         let runtime = repository
             .worker_pool()
@@ -540,15 +573,24 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             .pool()
             .and_then(|pool| pool.agent_runtime())
             .unwrap_or(AgentRuntime::Claude);
+        // The ready label and status are the selected pool's, resolved through
+        // the same seam `dispatch` uses: a lane that declares a routing label
+        // discovers by it, and a lane that declares its own `ready_status`
+        // draws work by that status. The *source's* fallback label is the
+        // global one, never the pool's, so a Ticket that declares no `Labels:`
+        // cannot match every lane at once.
+        let pool = repository.selected_pool();
+        let label = self.routing.ready_label(pool);
         let status =
-            TicketStatus::parse(self.tickets.ready_status()).map_err(|error| error.to_string())?;
-        let filter = ReadyTicketFilter::new(label, status).map_err(|error| error.to_string())?;
+            TicketStatus::parse(self.routing.ready_status(pool, self.tickets.ready_status()))
+                .map_err(|error| error.to_string())?;
+        let filter = ReadyTicketFilter::new(&label, status).map_err(|error| error.to_string())?;
         let discovery = TicketDiscovery::new(
             configured_ticket_query(
-                self.repository_root.as_path(),
+                repository.root(),
                 &self.tickets,
                 runtime,
-                label,
+                &crate::config::global_ready_label(None),
             )
             .map_err(|error| error.to_string())?,
         );
@@ -851,7 +893,31 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
 mod tests {
     use super::*;
 
+    use crate::config::TicketSource;
     use crate::engine::{Repository, RunRecord, RunRecordConclusion, SpendCapMode, WireTimestamp};
+
+    /// Writes one local Ticket under `<repo>/<root>/<feature>/issues/<file>`.
+    fn write_local_ticket(
+        root: &std::path::Path,
+        feature: &str,
+        file: &str,
+        status: &str,
+        labels: Option<&str>,
+    ) {
+        let directory = root.join(".scratch").join(feature).join("issues");
+        std::fs::create_dir_all(&directory).expect("issues directory");
+        let labels = labels.map_or_else(String::new, |labels| format!("Labels: {labels}\n"));
+        std::fs::write(
+            directory.join(file),
+            format!("# {file}\n\nStatus: {status}\n{labels}"),
+        )
+        .expect("Ticket file");
+    }
+
+    /// The Ticket ids a discovery result carries, in order.
+    fn ready_ids(result: &ReadyTicketResult) -> Vec<&str> {
+        result.tickets().iter().map(ReadyTicket::id).collect()
+    }
 
     /// A repository with one recorded Run costing `cost_micro_usd`.
     fn repository_with_record(cost_micro_usd: u64) -> (tempfile::TempDir, Repository) {
@@ -929,5 +995,83 @@ mod tests {
             ..SpendConfig::default()
         });
         assert_eq!(adapter.spend_gate(&repository).expect("under"), None);
+    }
+
+    /// Discovery draws the selected lane's work: the lane's declared routing
+    /// label decides which Tickets are drawn, and the lane's declared
+    /// `ready_status` decides which are ready. A second lane drawing the same
+    /// Tickets under different rules must not be able to reach them, so the two
+    /// lanes cannot collapse into one.
+    #[test]
+    fn discovery_honours_the_selected_pools_routing_label_and_ready_status() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        std::fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        write_local_ticket(
+            temp.path(),
+            "bugs",
+            "01-fix.md",
+            "ready-for-agent",
+            Some("bug"),
+        );
+        write_local_ticket(
+            temp.path(),
+            "bugs",
+            "02-review.md",
+            "ready-for-review",
+            Some("bug"),
+        );
+        write_local_ticket(
+            temp.path(),
+            "features",
+            "01-ship.md",
+            "ready-for-agent",
+            Some("feature"),
+        );
+        let config_dir = temp.path().join(".jjfx");
+        std::fs::create_dir_all(&config_dir).expect("config directory");
+        std::fs::write(
+            config_dir.join("config.toml"),
+            "[pools.bugs]\nlabel = \"bug\"\n\n[pools.review]\nready_status = \"ready-for-review\"\n",
+        )
+        .expect("repository config");
+
+        let user: crate::config::Config =
+            toml::from_str("[tickets]\nsource = \"local\"\n").expect("user config");
+        let routing =
+            crate::config::PoolRouting::load(&user, temp.path()).expect("routing resolves");
+        let tickets = TicketsConfig {
+            source: TicketSource::Local,
+            ..TicketsConfig::default()
+        };
+
+        // The `bugs` lane routes by its declared label and keeps the global
+        // ready status, so it draws only the Ticket that carries `bug` and is
+        // ready for an agent.
+        let bugs = RealWorkspaceDispatch::new(temp.path())
+            .with_tickets(tickets.clone())
+            .with_pool_routing(routing.clone())
+            .with_pool_selection(PoolSelection::new(
+                PoolName::parse("bugs").expect("pool name"),
+            ));
+        assert_eq!(
+            ready_ids(&bugs.discover_ready().expect("discovery")),
+            ["bugs--01-fix"],
+            "the `bugs` lane draws its label in the global status"
+        );
+
+        // The `review` lane declares no label but its own ready status, so it
+        // draws the Ticket that is ready for review - a different Ticket, from
+        // the same tree.
+        let review = RealWorkspaceDispatch::new(temp.path())
+            .with_tickets(tickets)
+            .with_pool_routing(routing)
+            .with_pool_selection(PoolSelection::new(
+                PoolName::parse("review").expect("pool name"),
+            ));
+        assert_eq!(
+            ready_ids(&review.discover_ready().expect("discovery")),
+            ["bugs--02-review"],
+            "the `review` lane draws its declared ready status"
+        );
     }
 }

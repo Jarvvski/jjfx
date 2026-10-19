@@ -97,6 +97,27 @@ impl PoolSession {
         self.active_operation = None;
     }
 
+    /// Drop the lane-scoped presentation and operation identities when the
+    /// selected Worker Pool changes.
+    ///
+    /// A Worker list, a Worker log, a Dispatch result or a ready preview
+    /// belongs to the lane it was read from, so none may be shown under the
+    /// lane that replaces it; the operation identities go too, so a result from
+    /// the outgoing lane is not folded into the incoming one.
+    pub(crate) fn begin_lane_change(&mut self) {
+        self.worker_pool = None;
+        self.worker_log = None;
+        self.worker_log_error = None;
+        self.worker_session = None;
+        self.worker_command_result = None;
+        self.ready_tickets = None;
+        self.dispatch_result = None;
+        self.active_operation = None;
+        self.worker_reset_operation = None;
+        self.orchestration_operation = None;
+        self.worker_log_operation = None;
+    }
+
     /// Fold one Dispatch event through the operation-identity rules.
     pub(crate) fn apply(&mut self, event: WorkspaceDispatchEvent) -> Vec<PoolUpdate> {
         match event {
@@ -586,6 +607,27 @@ mod tests {
         pool.begin_dispatch(3);
         pool.cancel_dispatch();
         assert_eq!(pool.active_operation, None);
+    }
+
+    /// Nothing read from one Worker Pool lane may survive into the next: a
+    /// Worker list, a log, a Dispatch result and the operation identities that
+    /// let a late result land are all the outgoing lane's.
+    #[test]
+    fn a_lane_change_drops_the_outgoing_lanes_presentation() {
+        let mut pool = PoolSession::default();
+        pool.begin_dispatch(3);
+        pool.begin_log(4);
+        pool.dispatch_result = Some(dispatch_result(false));
+        pool.ready_tickets = Some(ReadyTicketResult::new(Vec::new(), Vec::new()));
+
+        pool.begin_lane_change();
+
+        assert!(pool.worker_pool.is_none());
+        assert!(pool.dispatch_result.is_none());
+        assert!(pool.ready_tickets.is_none());
+        assert!(pool.worker_log.is_none());
+        assert_eq!(pool.active_operation, None);
+        assert_eq!(pool.worker_log_operation, None);
     }
 
     #[test]
