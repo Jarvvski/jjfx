@@ -630,6 +630,82 @@ fn creates_a_pool_with_one_worker_visible_through_its_snapshot() {
     assert!(snapshot.diagnostics().is_empty());
 }
 
+/// A local-path `origin` - a real repository on disk, as the dogfood drive's
+/// was - is not a GitHub remote. Its last two path segments are not an
+/// identity, so Pool creation must refuse it by name before it persists a
+/// `gh_repo` naming a repository that does not exist.
+#[test]
+fn pool_creation_refuses_a_non_github_origin_before_persisting_a_slug() {
+    let origin = tempfile::tempdir().expect("origin directory");
+    let origin_path = origin.path().join("dogfood-site-origin.git");
+    let init = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--colocate",
+        ])
+        .arg(&origin_path)
+        .output()
+        .expect("jj should be installed");
+    assert!(init.status.success(), "jj init origin failed: {init:?}");
+
+    let temporary_directory = tempfile::tempdir().expect("temporary directory");
+    let init = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
+        .arg(temporary_directory.path())
+        .output()
+        .expect("jj should be installed");
+    assert!(init.status.success(), "jj init failed: {init:?}");
+    let repository = Repository::open(temporary_directory.path()).expect("repository");
+    let add = Command::new("jj")
+        .args([
+            "git",
+            "remote",
+            "add",
+            "origin",
+            &origin_path.to_string_lossy(),
+        ])
+        .current_dir(repository.root())
+        .output()
+        .expect("jj remote add should run");
+    assert!(add.status.success(), "jj remote add failed: {add:?}");
+
+    let error = repository
+        .worker_pool()
+        .resize_to(jjfx::engine::PoolCapacity::new(1).expect("capacity should be valid"))
+        .expect_err("a non-GitHub origin must refuse Pool creation");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("origin is not a GitHub remote"),
+        "the failure must name the non-GitHub origin: {message}"
+    );
+    assert!(
+        message.contains("dogfood-site-origin"),
+        "the failure must name the remote it refused: {message}"
+    );
+    // The fabricated `personal/dogfood-site-origin` slug must never be written.
+    assert!(
+        matches!(
+            repository
+                .state_store()
+                .pool()
+                .load()
+                .expect("load Pool state"),
+            jjfx::engine::Loaded::Missing
+        ),
+        "a refused Pool must not persist any state"
+    );
+}
+
 #[test]
 fn grows_a_pool_without_changing_existing_worker_ids_or_metadata() {
     let (_temporary_directory, repository) = local_repository_with_origin();

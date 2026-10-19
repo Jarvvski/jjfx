@@ -1513,21 +1513,17 @@ fn worker_claimed(repository: &Repository, worker: &WorkerId) -> bool {
             .is_ok_and(|state| matches!(state, Loaded::Present(_)))
 }
 
+/// Derives the Worker Pool's initial `gh_repo` from the Repository's `origin`.
+///
+/// A Repository with no `origin` yields an empty slug, which Dispatch fills
+/// from the remote once one exists. An `origin` that is present but not a
+/// GitHub remote is refused before any Pool state is written: deriving a slug
+/// from its last two path segments would persist a repository that does not
+/// exist and only surface much later, as a `gh` error naming the wrong one.
 fn discover_gh_repo(repository: &Repository) -> Result<String, WorkerPoolError> {
-    let output = crate::engine::workspace::git_remotes(repository.root())
-        .map_err(|error| WorkerPoolError::RepositoryDiscovery(error.to_string()))?;
-    if !output.status.success() {
-        return Err(WorkerPoolError::RepositoryDiscovery(
-            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
-        ));
-    }
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let fields = line.split_whitespace().collect::<Vec<_>>();
-        if fields.len() >= 2 && fields[0] == "origin" {
-            return Ok(crate::engine::workspace::remote_slug(fields[1]));
-        }
-    }
-    Ok(String::new())
+    crate::engine::workspace::origin_slug(repository.root())
+        .map(|slug| slug.unwrap_or_default())
+        .map_err(|error| WorkerPoolError::RepositoryDiscovery(error.to_string()))
 }
 
 /// Clears every Run-owned Worker field, leaving alias metadata and unknown
