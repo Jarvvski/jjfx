@@ -64,8 +64,14 @@ fn jj_repository() -> (TempDir, TempDir) {
 
 /// Writes the Worker Pool manifest naming `workers`.
 fn write_manifest(root: &Path, workers: &[&str]) {
-    let pool = root.join(".jj").join("pools").join("default");
-    fs::create_dir_all(&pool).expect("pool directory");
+    write_pool_manifest(root, "default", workers);
+}
+
+/// Writes one Worker Pool's manifest naming `workers`, in that lane's state
+/// directory.
+fn write_pool_manifest(root: &Path, pool: &str, workers: &[&str]) {
+    let directory = root.join(".jj").join("pools").join(pool);
+    fs::create_dir_all(&directory).expect("pool directory");
     let manifest = serde_json::json!({
         "created_at": "2026-07-27T10:00:00Z",
         "gh_repo": "Jarvvski/jjfx",
@@ -74,7 +80,7 @@ fn write_manifest(root: &Path, workers: &[&str]) {
         "workers": workers,
     });
     fs::write(
-        pool.join("pool.json"),
+        directory.join("pool.json"),
         serde_json::to_vec(&manifest).expect("manifest json"),
     )
     .expect("pool manifest");
@@ -82,8 +88,13 @@ fn write_manifest(root: &Path, workers: &[&str]) {
 
 /// Writes one Worker state document with the given status and Ticket.
 fn write_worker(root: &Path, id: &str, status: &str, ticket: Option<&str>) {
-    let pool = root.join(".jj").join("pools").join("default");
-    fs::create_dir_all(&pool).expect("pool directory");
+    write_pool_worker(root, "default", id, status, ticket);
+}
+
+/// Writes one Worker's state document into `pool`'s state directory.
+fn write_pool_worker(root: &Path, pool: &str, id: &str, status: &str, ticket: Option<&str>) {
+    let directory = root.join(".jj").join("pools").join(pool);
+    fs::create_dir_all(&directory).expect("pool directory");
     let exit_code = match status {
         "done" => Some(0),
         "failed" => Some(1),
@@ -95,20 +106,25 @@ fn write_worker(root: &Path, id: &str, status: &str, ticket: Option<&str>) {
         "completed_at": matches!(status, "done" | "failed").then_some("2026-07-27T10:10:00Z"),
         "error": (status == "failed").then_some("the Run failed"),
         "exit_code": exit_code,
-        "log_file": format!("/repo/.jj/pools/default/{id}.log"),
+        "log_file": format!("/repo/.jj/pools/{pool}/{id}.log"),
         "pid": null,
         "started_at": (status != "idle").then_some("2026-07-27T10:02:00Z"),
         "status": status,
         "ticket": ticket,
     });
     fs::write(
-        root.join(".jj")
-            .join("pools")
-            .join("default")
-            .join(format!("{id}.json")),
+        directory.join(format!("{id}.json")),
         serde_json::to_vec(&state).expect("worker json"),
     )
     .expect("worker state");
+}
+
+/// Declares the lanes a Repository holds, as `[pools.<name>]` sections in its
+/// repository-local config. `default` is always present, declared or not.
+fn write_repo_config(root: &Path, content: &str) {
+    let directory = root.join(".jjfx");
+    fs::create_dir_all(&directory).expect("repository config directory");
+    fs::write(directory.join("config.toml"), content).expect("repository config file");
 }
 
 /// Appends one succeeded Run Record, the durable completion signal a local
@@ -374,4 +390,167 @@ fn wait_rejects_an_unknown_worker_rather_than_blocking() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+/// A `jjfx dispatch` invocation against `repository`, for the message a refusal
+/// shares with `wait`. It never reaches a terminal: a refused pool is resolved
+/// before anything is launched.
+fn dispatch_command(repository: &Path, config_home: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
+    command
+        .arg("dispatch")
+        .args(args)
+        .current_dir(repository)
+        .env("XDG_CONFIG_HOME", config_home);
+    command
+}
+
+/// With several pools an unqualified `wait --all` must refuse and name them,
+/// rather than silently acting on `default` alone. This is the silent-wrong-pool
+/// failure `dispatch` removed, and `wait` is the last command that carried it.
+#[test]
+fn wait_all_with_several_pools_refuses_naming_them() {
+    let (repository, config_home) = jj_repository();
+    write_repo_config(repository.path(), "[pools.bugs]\nsize = 1\n");
+    write_manifest(repository.path(), &["worker-1"]);
+    write_worker(repository.path(), "worker-1", "done", None);
+
+    let output = run_bounded(
+        wait_command(repository.path(), config_home.path(), &["--all"]),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("default"), "{stderr}");
+    assert!(stderr.contains("bugs"), "{stderr}");
+    assert!(stderr.contains("--pool"), "{stderr}");
+}
+
+/// `--pool <name> --all` waits on that lane's Workers only: the other lane's
+/// finished Worker must not satisfy the wait, and the lane's own Worker does.
+#[test]
+fn wait_pool_all_acts_on_that_lane_only() {
+    let (repository, config_home) = jj_repository();
+    write_repo_config(repository.path(), "[pools.bugs]\nsize = 1\n");
+    // `default` holds a finished Worker; `bugs` holds an idle one that never
+    // finishes. If the wait read `default`, it would return 0 at once.
+    write_pool_manifest(repository.path(), "default", &["worker-1"]);
+    write_pool_worker(repository.path(), "default", "worker-1", "done", None);
+    write_pool_manifest(repository.path(), "bugs", &["worker-1"]);
+    write_pool_worker(repository.path(), "bugs", "worker-1", "idle", None);
+
+    let output = run_bounded(
+        wait_command(
+            repository.path(),
+            config_home.path(),
+            &["--pool", "bugs", "--all", "--timeout", "1"],
+        ),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+
+    // Once the lane's own Worker is terminal the same wait returns 0.
+    write_pool_worker(repository.path(), "bugs", "worker-1", "done", None);
+    let output = run_bounded(
+        wait_command(
+            repository.path(),
+            config_home.path(),
+            &["--pool", "bugs", "--all"],
+        ),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("worker-1 done"),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+}
+
+/// A named Worker is resolved in the selected lane too, so `--pool bugs 1`
+/// refuses the `default` Worker it names rather than waiting on it.
+#[test]
+fn wait_pool_scopes_a_named_worker() {
+    let (repository, config_home) = jj_repository();
+    write_repo_config(repository.path(), "[pools.bugs]\nsize = 1\n");
+    write_pool_manifest(repository.path(), "default", &["worker-1"]);
+    write_pool_worker(repository.path(), "default", "worker-1", "done", None);
+
+    let output = run_bounded(
+        wait_command(
+            repository.path(),
+            config_home.path(),
+            &["1", "--pool", "bugs"],
+        ),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no such Worker"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// An unknown pool name is refused with the same message `dispatch` gives: both
+/// resolve the target through one seam, so the two cannot drift.
+#[test]
+fn wait_refuses_an_unknown_pool_the_same_way_dispatch_does() {
+    let (repository, config_home) = jj_repository();
+    write_repo_config(repository.path(), "[pools.bugs]\nsize = 1\n");
+    write_manifest(repository.path(), &["worker-1"]);
+    write_worker(repository.path(), "worker-1", "done", None);
+
+    let wait = run_bounded(
+        wait_command(
+            repository.path(),
+            config_home.path(),
+            &["--pool", "ghost", "--all"],
+        ),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+    let dispatched = run_bounded(
+        dispatch_command(
+            repository.path(),
+            config_home.path(),
+            &["AMBA-1", "--pool", "ghost"],
+        ),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+
+    assert!(!wait.status.success(), "{wait:?}");
+    assert!(!dispatched.status.success(), "{dispatched:?}");
+    let wait_stderr = String::from_utf8_lossy(&wait.stderr);
+    assert!(
+        wait_stderr.contains("no Worker Pool named `ghost`"),
+        "{wait_stderr}"
+    );
+    assert!(wait_stderr.contains("bugs"), "{wait_stderr}");
+    assert!(
+        wait_stderr.contains("default"),
+        "the refusal names the pools that exist: {wait_stderr}"
+    );
+    assert_eq!(
+        wait_stderr.trim(),
+        String::from_utf8_lossy(&dispatched.stderr).trim(),
+        "wait and dispatch must refuse a pool with one message"
+    );
+}
+
+/// With one pool nothing changes: `--pool` is not required, and the implicit
+/// `default` is what an unqualified wait acts on.
+#[test]
+fn wait_with_one_pool_needs_no_pool_flag() {
+    let (repository, config_home) = jj_repository();
+    write_manifest(repository.path(), &["worker-1"]);
+    write_worker(repository.path(), "worker-1", "done", Some("ENG-1"));
+
+    let output = run_bounded(
+        wait_command(repository.path(), config_home.path(), &["--all"]),
+        WAIT_LIVENESS_TIMEOUT,
+    );
+
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
 }

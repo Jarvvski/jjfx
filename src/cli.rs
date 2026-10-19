@@ -202,6 +202,10 @@ pub struct WaitArgs {
     pub workers: Vec<String>,
     /// Wait for every Worker in the pool rather than the named ones.
     pub all: bool,
+    /// The Worker Pool this wait acts on. `None` means "the Repository's only
+    /// pool", which is `default` for a Repository that declares none; several
+    /// pools with no `--pool` is a loud refusal, never a silent choice.
+    pub pool: Option<String>,
     /// The condition to wait for. `terminal` unless `--until` says otherwise.
     pub until: WaitCondition,
     /// Give up after this many seconds, exiting with the timeout code. `None`
@@ -617,7 +621,8 @@ fn parse_status(args: &[String]) -> Result<Command> {
     Ok(Command::Status { json })
 }
 
-/// Parse `wait <worker>... [--until CONDITION] [--timeout SECS] [--json] [--all]`.
+/// Parse `wait <worker>... [--until CONDITION] [--timeout SECS] [--json] [--all]
+/// [--pool <name>]`.
 ///
 /// The parser only shapes the request; the answer is the exit code. The
 /// condition defaults to `terminal`, and a missing `--timeout` means wait
@@ -626,11 +631,12 @@ fn parse_wait(args: &[String]) -> Result<Command> {
     let usage = concat!(
         "Usage: ",
         env!("CARGO_PKG_NAME"),
-        " wait <worker>... [--until done|failed|terminal|ticket-resolved] [--timeout SECS] [--json] [--all]"
+        " wait <worker>... [--until done|failed|terminal|ticket-resolved] [--timeout SECS] [--json] [--all] [--pool <name>]"
     );
     reject_unknown_flags("wait", WAIT_FLAGS, args)?;
     let mut workers = Vec::new();
     let mut all = false;
+    let mut pool = None;
     let mut until = None;
     let mut timeout = None;
     let mut json = false;
@@ -639,6 +645,14 @@ fn parse_wait(args: &[String]) -> Result<Command> {
         match args[index].as_str() {
             "--all" => all = true,
             "--json" => json = true,
+            "--pool" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --pool"))?;
+                pool = Some(value.clone());
+                index += 1;
+            }
             "--until" => {
                 let value = args
                     .get(index + 1)
@@ -677,6 +691,7 @@ fn parse_wait(args: &[String]) -> Result<Command> {
     Ok(Command::Wait(WaitArgs {
         workers,
         all,
+        pool,
         until: until.unwrap_or(WaitCondition::Terminal),
         timeout,
         json,
@@ -4221,6 +4236,18 @@ type TicketResolver = Box<dyn Fn(&str) -> bool>;
 /// wakeup.
 fn wait_command(repository: &Repository, args: &WaitArgs) -> Result<()> {
     let config = crate::config::load()?;
+    // Resolve the pool this wait acts on through the same seam `dispatch` uses,
+    // so the two cannot drift: one pool implies it - every Repository that
+    // declares none has one implicit `default` - while several require `--pool`,
+    // and an unknown name is refused naming the pools that exist. `--all` then
+    // means every Worker in the selected pool, and a Worker `wait` prints names
+    // the same pool `status` would. Without this, a multi-pool Repository would
+    // act on `default` alone and neither refuse nor say which lane it meant.
+    let available = config.pool_names_for(repository.root())?;
+    let pool = resolve_pool(&available, args.pool.as_deref())?;
+    let scoped = repository.clone().with_pool(pool);
+    let repository = &scoped;
+
     let tickets = config.tickets_for(repository.root())?;
     let targets = wait_targets(repository, args)?;
     let ticket_resolved = wait_ticket_resolver(repository, args, &tickets, &targets)?;
@@ -4985,6 +5012,7 @@ _jjfx() {
     'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
     'resolve:Resolve a Workspace conflict'
     'absorb:Fold Worker edits into base commits'
+    'wait:Block until Workers reach a condition'
     'undo:Undo the last jjfx mutation' 'ticket:Reconcile local Tickets' 'completion:Print shell completion' 'help:Show help'
   _arguments -C '1:command:->command' '*::arg:->args'
   case $state in
@@ -4996,6 +5024,7 @@ _jjfx() {
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
         mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
+        wait) _arguments '--until[condition to wait for]:condition:(done failed terminal ticket-resolved)' '--timeout[give up after N seconds]:secs:' '--all[wait for every Worker in the pool]' '--json[print machine-readable results]' '--pool[Worker Pool to wait on]:pool:' '*:worker:__jjfx_workers' ;;
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
         ticket) _arguments '1:subcommand:(reconcile)' ;;
@@ -5359,6 +5388,7 @@ mod tests {
             Command::Wait(WaitArgs {
                 workers: vec!["3".to_owned()],
                 all: false,
+                pool: None,
                 until: WaitCondition::Terminal,
                 timeout: None,
                 json: false,
@@ -5379,6 +5409,7 @@ mod tests {
             Command::Wait(WaitArgs {
                 workers: vec!["3".to_owned(), "worker-4".to_owned()],
                 all: false,
+                pool: None,
                 until: WaitCondition::Done,
                 timeout: Some(5),
                 json: true,
@@ -5389,11 +5420,34 @@ mod tests {
             Command::Wait(WaitArgs {
                 workers: Vec::new(),
                 all: true,
+                pool: None,
                 until: WaitCondition::Terminal,
                 timeout: None,
                 json: false,
             })
         );
+    }
+
+    /// `--pool` names the lane a wait acts on, for a named Worker and `--all`
+    /// alike - both pass through the same resolution `dispatch` uses.
+    #[test]
+    fn wait_parser_reads_the_pool_flag() {
+        for arguments in [
+            args(&["wait", "3", "--pool", "bugs"]),
+            args(&["wait", "--all", "--pool", "bugs"]),
+        ] {
+            let command = parse(&arguments).expect("--pool should parse");
+            assert!(
+                matches!(
+                    command,
+                    Command::Wait(WaitArgs {
+                        pool: Some(ref name),
+                        ..
+                    }) if name == "bugs"
+                ),
+                "{arguments:?}"
+            );
+        }
     }
 
     #[test]
@@ -5408,6 +5462,7 @@ mod tests {
         // A missing value is not silently swallowed.
         assert!(parse(&args(&["wait", "3", "--until"])).is_err());
         assert!(parse(&args(&["wait", "3", "--timeout"])).is_err());
+        assert!(parse(&args(&["wait", "3", "--pool"])).is_err());
         // An unknown flag is named.
         let error = parse(&args(&["wait", "3", "--wat"])).unwrap_err();
         assert!(error.to_string().contains("--wat"), "{error}");
