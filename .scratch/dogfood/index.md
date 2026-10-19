@@ -23,6 +23,7 @@ half. Three of the landing verbs failed, one of them silently and destructively.
 | 06 | `resolved` means the run finished, not that the work landed | design |
 | 07 | the skill's preconditions and ordering are wrong | docs |
 | 08 | `colocation status` hung once, unreproduced | bug |
+| 09 | `absorb` can still fold a stacked Worker into its blocker's commit | bug |
 
 ## What worked, and should not be refactored away
 
