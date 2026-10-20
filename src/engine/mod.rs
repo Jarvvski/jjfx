@@ -70,7 +70,8 @@ pub use local_tickets::{
 };
 pub use opencode_api::{
     CommandOutput, ModelRef, NewSession, OpenCodeApi, OpenCodeError, OpenCodeRunner,
-    PermissionDecision, PermissionRequest, ProcessOpenCodeRunner, Session, SessionOutcome,
+    PermissionDecision, PermissionRequest, ProcessOpenCodeRunner, Session, SessionMessage,
+    SessionOutcome,
 };
 pub(crate) use opencode_api::{OPENCODE_SESSION_ENV, dispatching_session};
 pub use orchestration::{

@@ -204,8 +204,8 @@ guess, or read the source to discover:
 8. **Delivery.** Perform the push+PR the prompt promises. (§4)
 9. **Capacity.** Let the repository set its own ceiling. (finding 10, done for
    the concurrency cap; the pool size is still `jjfx pool`.)
-10. **Watch.** `jjfx logs` should show a session-delivered Run, or say there is no
-    log. (finding 11)
+10. **Watch.** `jjfx logs` shows a session-delivered Run's activity, or says there
+    is no log. (finding 11, done)
 
 An agent that has to remember ten things to land a change is being asked to be
 the control plane. The point of jjfx is that it is.
