@@ -1,5 +1,7 @@
 //! The CLI's command surface: the top-level command list and one help page per
-//! command, reachable as `jjfx help <command>`.
+//! command, reachable as `jjfx help <command>`. A multi-word group (`ticket`)
+//! answers with its subcommands too, derived from the same top-level table, so
+//! `jjfx help ticket` never reports the group as an unknown command.
 //!
 //! The pages and the parser read the *same* flag definitions. Each command's
 //! `flags` slice is the exact one `cli::reject_unknown_flags` validates
@@ -1101,8 +1103,9 @@ const PAGES: &[CommandHelp] = &[
 ///
 /// The parser accepts more words than [`TOP_LEVEL`] lists - short aliases
 /// (`d`, `rb`), the `reset` shorthand, and pool synonyms (`pool c`, `pool r`) -
-/// so `jjfx help <spelling>` must answer for each. A word absent here and absent
-/// from [`PAGES`] is an unknown command, which is the error a typo gets.
+/// so `jjfx help <spelling>` must answer for each. A word absent here, absent
+/// from [`PAGES`], and heading no group is an unknown command, which is the
+/// error a typo gets.
 ///
 /// `every_parser_alias_resolves_to_its_page` holds this table to `text`, and
 /// `cli::tests::the_parser_accepts_every_documented_alias` holds it to the
@@ -1152,20 +1155,93 @@ fn canonical(key: &str) -> &str {
         .map_or(key, |(_, canonical)| *canonical)
 }
 
-/// The rendered help text: a command's page when `key` names one, otherwise the
-/// top-level command list. An unknown command is a loud error naming it, so a
-/// typo never silently prints the wrong thing.
-pub(crate) fn text(key: Option<&str>) -> Result<String> {
-    match key {
-        None => Ok(top_level()),
-        Some(key) => page(canonical(key))
-            .map(CommandHelp::render)
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "unknown command: {key}. Run '{PROGRAM} help' for the command list."
-                )
-            }),
+/// The top-level entries that name a subcommand of `key`: those whose key is
+/// `key` followed by another word. This is what makes `ticket`, `hooks` and
+/// `check` groups, and `pool` both a command and a group.
+///
+/// Membership is read from [`TOP_LEVEL`], the same table the top-level list
+/// renders, so a group cannot exist in the list and not in `help <group>`:
+/// adding `ticket foo` to the list gives `help ticket` its page with no further
+/// edit.
+fn group_entries(key: &str) -> Vec<&'static Entry> {
+    TOP_LEVEL
+        .iter()
+        .flat_map(|group| group.entries.iter())
+        .filter(|entry| {
+            entry
+                .key
+                .strip_prefix(key)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
+        .collect()
+}
+
+/// The page for a group that is not itself a command (`ticket`, `hooks`,
+/// `check`): a heading, a usage line naming its subcommands, and their rows
+/// follow from [`group_commands`]. `None` when `key` heads no group, or heads
+/// one - `pool` - that already has a page of its own.
+fn group_page(key: &str) -> Option<String> {
+    let entries = group_entries(key);
+    if entries.is_empty() || page(key).is_some() {
+        return None;
     }
+    let subcommands = entries
+        .iter()
+        .filter_map(|entry| entry.key.strip_prefix(key))
+        .map(str::trim)
+        .collect::<Vec<_>>()
+        .join("|");
+    Some(format!(
+        "{PROGRAM} {key} - the `{key}` subcommands\n\nUsage: {PROGRAM} {key} <{subcommands}>\n"
+    ))
+}
+
+/// The `Commands:` block a group page ends with, one line per subcommand, or
+/// `None` when `key` heads no group. Appended to a group's own page too, so
+/// `help pool` lists what `pool` can do rather than only `pool <N>`.
+fn group_commands(key: &str) -> Option<String> {
+    let entries = group_entries(key);
+    if entries.is_empty() {
+        return None;
+    }
+    let mut out = String::from("\nCommands:\n");
+    for entry in entries {
+        out.push_str(&command_line(entry));
+    }
+    Some(out)
+}
+
+/// One line of a command list: the command's words and arguments, padded, then
+/// its summary. Shared by the top-level list and a group page, so a command is
+/// spelled the same in both.
+fn command_line(entry: &Entry) -> String {
+    let field = if entry.args.is_empty() {
+        entry.key.to_owned()
+    } else {
+        format!("{} {}", entry.key, entry.args)
+    };
+    format!("  {PROGRAM} {field:<25} {}\n", entry.summary)
+}
+
+/// The rendered help text: a command's page when `key` names one, a group's
+/// subcommands when it names a group (`ticket`, `hooks`), otherwise the
+/// top-level command list for a bare `help`. An unknown command is a loud error
+/// naming it, so a typo never silently prints the wrong thing.
+pub(crate) fn text(key: Option<&str>) -> Result<String> {
+    let Some(key) = key else {
+        return Ok(top_level());
+    };
+    let key = canonical(key);
+    let mut out = match page(key) {
+        Some(page) => page.render(),
+        None => group_page(key).ok_or_else(|| {
+            anyhow::anyhow!("unknown command: {key}. Run '{PROGRAM} help' for the command list.")
+        })?,
+    };
+    if let Some(commands) = group_commands(key) {
+        out.push_str(&commands);
+    }
+    Ok(out)
 }
 
 /// The rendered top-level command list.
@@ -1177,12 +1253,7 @@ pub(crate) fn top_level() -> String {
             out.push_str(&format!("\n{title}:\n"));
         }
         for entry in group.entries {
-            let field = if entry.args.is_empty() {
-                entry.key.to_owned()
-            } else {
-                format!("{} {}", entry.key, entry.args)
-            };
-            out.push_str(&format!("  {PROGRAM} {field:<25} {}\n", entry.summary));
+            out.push_str(&command_line(entry));
         }
     }
     out
@@ -1361,6 +1432,74 @@ mod tests {
         let error = text(Some("definitely-not-a-command"))
             .expect_err("an unknown command must fail loudly");
         assert!(error.to_string().contains("definitely-not-a-command"));
+    }
+
+    /// A group is a command word the top-level list only ever spells with a
+    /// subcommand after it (`ticket list`). `jjfx help ticket` must answer with
+    /// that group's subcommands rather than calling the group unknown - the
+    /// obvious next probe after reading a two-word command in the list.
+    #[test]
+    fn a_multi_word_group_prints_its_subcommands() {
+        let ticket = text(Some("ticket")).expect("`ticket` heads a group");
+        assert!(ticket.contains("ticket list"), "{ticket}");
+        assert!(ticket.contains("ticket reconcile"), "{ticket}");
+        assert!(ticket.contains("Commands:"), "{ticket}");
+        assert!(!ticket.contains("unknown command"), "{ticket}");
+    }
+
+    /// The other half of the group page: naming the subcommand still prints its
+    /// own page, not the group's.
+    #[test]
+    fn a_group_subcommand_still_prints_its_page() {
+        let list = text(Some("ticket list")).expect("ticket list has a page");
+        assert!(list.contains("Usage: jjfx ticket list"), "{list}");
+        assert!(!list.contains("Commands:"), "{list}");
+    }
+
+    /// Every group the top-level table spells must resolve, so adding a
+    /// `foo bar` command to the list cannot leave `help foo` an unknown
+    /// command. The check is derived from [`TOP_LEVEL`], so it covers `ticket`,
+    /// `hooks` and `check` without naming them.
+    #[test]
+    fn every_group_head_resolves_and_names_its_commands() {
+        for group in TOP_LEVEL {
+            for entry in group.entries {
+                let Some((head, _)) = entry.key.split_once(' ') else {
+                    continue;
+                };
+                let rendered = text(Some(head))
+                    .unwrap_or_else(|error| panic!("group `{head}` has no help page: {error}"));
+                assert!(
+                    rendered.contains(entry.key),
+                    "group page `{head}` omits its command `{}`",
+                    entry.key
+                );
+            }
+        }
+    }
+
+    /// `pool` is both a command and a group: its own page must still render,
+    /// and it must also list the subcommands a reader would otherwise have to
+    /// find in the top-level list.
+    #[test]
+    fn a_page_that_heads_a_group_also_lists_its_commands() {
+        let pool = text(Some("pool")).expect("pool has a page");
+        assert!(
+            pool.contains("Manage the Repository's Worker Pools"),
+            "{pool}"
+        );
+        assert!(pool.contains("Commands:"), "{pool}");
+        assert!(pool.contains("pool create"), "{pool}");
+        assert!(pool.contains("pool profile"), "{pool}");
+    }
+
+    /// An unknown word is still a loud error, even when it looks like a group
+    /// with a subcommand glued on.
+    #[test]
+    fn an_unknown_group_is_named_in_the_error() {
+        let error = text(Some("ticket missing"))
+            .expect_err("an unknown subcommand of a real group must fail loudly");
+        assert!(error.to_string().contains("ticket missing"), "{error}");
     }
 
     #[test]
