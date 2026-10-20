@@ -944,6 +944,115 @@ fn prepare_refuses_a_non_github_origin_instead_of_guessing_a_slug() {
     );
 }
 
+/// A Pool created before `dogfood/03` still carries the slug the old derivation
+/// mined from a non-GitHub `origin`. Resolving identity must refuse that value by
+/// name - the same named refusal - rather than carry it into a `gh` lookup for a
+/// repository that never existed.
+#[test]
+fn prepare_refuses_a_legacy_fabricated_gh_repo_by_name() {
+    let directory = TempDir::new().expect("temporary repository");
+    init_colocated_repository(directory.path());
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    // The exact state the dogfood drive left behind: the fabricated slug is
+    // already persisted, and `origin` is still the filesystem path it came from.
+    install_idle_worker_with_gh_repo(&repository, &worker, "personal/dogfood-site-origin");
+    let origin = TempDir::new().expect("origin repository");
+    add_local_origin(&repository, origin.path());
+
+    let parent = ParentTicket::new(TicketId::parse("ENG-100").expect("Parent Ticket"));
+    let discovery = TicketDiscovery::new(StaticQuery(r#"{"sub_issues":[]}"#));
+
+    let error = repository
+        .orchestration_runner()
+        .prepare(
+            &OrchestrationRequest::new(parent.id().clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+        )
+        .expect_err("a legacy fabricated gh_repo must be refused at the read");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("origin is not a GitHub remote"),
+        "the failure must reuse the message `dogfood/03` introduced: {message}"
+    );
+    assert!(
+        message.contains("dogfood-site-origin"),
+        "the failure must name the remote it refused: {message}"
+    );
+}
+
+/// A `gh_repo` that is not the fabricated value is the operator's own decision,
+/// so a non-GitHub `origin` must not refuse it: a validation that rejects real
+/// slugs would be worse than the bug it fixes.
+#[test]
+fn prepare_keeps_a_configured_gh_repo_that_is_not_the_fabricated_slug() {
+    let directory = TempDir::new().expect("temporary repository");
+    init_colocated_repository(directory.path());
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker_with_gh_repo(&repository, &worker, "owner/repo");
+    let origin = TempDir::new().expect("origin repository");
+    add_local_origin(&repository, origin.path());
+
+    let parent_id = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+    let discovery = TicketDiscovery::new(StaticQuery(
+        r#"{"sub_issues":[{"id":"ENG-101","title":"Foundation","status":"Todo","blocked_by":[],"cross_repo":false}]}"#,
+    ));
+
+    let preparation = repository
+        .orchestration_runner()
+        .prepare(
+            &OrchestrationRequest::new(parent_id.clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+        )
+        .expect("a configured gh_repo must survive a non-GitHub origin");
+    assert!(matches!(
+        preparation.start(),
+        jjfx::engine::OrchestrationStart::Group
+    ));
+
+    let loaded = match repository
+        .state_store()
+        .dispatch_group(parent_id)
+        .load()
+        .expect("load group")
+    {
+        jjfx::engine::Loaded::Present(value) => value.value,
+        jjfx::engine::Loaded::Missing => panic!("group missing"),
+    };
+    assert_eq!(loaded.gh_repo, "owner/repo");
+}
+
+/// Point `origin` at a real repository on disk - the shape the dogfood drive's
+/// remote had, whose last two path segments (`personal/dogfood-site-origin`) are
+/// not a GitHub identity.
+fn add_local_origin(repository: &Repository, root: &std::path::Path) {
+    let path = root.join("personal").join("dogfood-site-origin.git");
+    fs::create_dir_all(path.parent().expect("origin parent")).expect("origin parent directory");
+    let init = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--colocate",
+        ])
+        .arg(&path)
+        .output()
+        .expect("jj executable");
+    assert!(init.status.success(), "jj init origin failed: {init:?}");
+    let add = Command::new("jj")
+        .args(["git", "remote", "add", "origin", &path.to_string_lossy()])
+        .current_dir(repository.root())
+        .output()
+        .expect("add origin");
+    assert!(add.status.success(), "jj remote add failed: {add:?}");
+}
+
 /// The same empty `gh_repo` must not block dispatch once an `origin` exists:
 /// orchestration derives the identity from the remote and records it on the
 /// group instead of failing on the empty slug.

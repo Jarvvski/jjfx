@@ -398,7 +398,9 @@ impl WorkerActions {
         self.follow_up(
             worker,
             &prompt,
-            Some(send_system_prompt(&repository_slug(&self.repository))),
+            Some(send_system_prompt(
+                &self.persisted_gh_repo()?.unwrap_or_default(),
+            )),
             mode,
         )
     }
@@ -418,7 +420,7 @@ impl WorkerActions {
             .map(|worker| worker.worker_id().clone())
             .filter(|worker| !self.exclusions.contains(worker))
             .collect::<Vec<_>>();
-        let system_prompt = send_system_prompt(&repository_slug(&self.repository));
+        let system_prompt = send_system_prompt(&self.persisted_gh_repo()?.unwrap_or_default());
 
         for worker in candidates {
             match self.follow_up(&worker, &prompt, Some(system_prompt.clone()), mode) {
@@ -493,10 +495,9 @@ impl WorkerActions {
         worker: &WorkerId,
     ) -> Result<OpenPullRequestOutcome, WorkerActionError> {
         let (branch, _) = self.branch_and_workspace(worker)?;
-        let repository = repository_slug(&self.repository);
-        if repository.is_empty() {
+        let Some(repository) = self.persisted_gh_repo()? else {
             return Err(WorkerActionError::RepositoryUnavailable);
-        }
+        };
         self.commands.open_pull_request(&repository, &branch)?;
         Ok(OpenPullRequestOutcome { branch })
     }
@@ -758,10 +759,9 @@ impl WorkerActions {
         worker: &WorkerId,
     ) -> Result<(String, PullRequest), WorkerActionError> {
         let branch = self.worker_branch(worker)?;
-        let repository = repository_slug(&self.repository);
-        if repository.is_empty() {
+        let Some(repository) = self.persisted_gh_repo()? else {
             return Err(WorkerActionError::RepositoryUnavailable);
-        }
+        };
         let pull_request = self
             .commands
             .pull_request(&repository, &branch)?
@@ -769,6 +769,27 @@ impl WorkerActions {
                 branch: branch.clone(),
             })?;
         Ok((repository, pull_request))
+    }
+
+    /// The Worker Pool's persisted `gh_repo`, or `None` when it records none.
+    ///
+    /// A slug that could not have come from a GitHub remote - the value a Pool
+    /// created before `dogfood/03` still holds - is refused by name here, before
+    /// any `gh` call, rather than looked up and reported as a repository that
+    /// does not exist. Every Worker verb that resolves the persisted slug goes
+    /// through this one read, so none of them can contact `gh` with a
+    /// fabricated one.
+    fn persisted_gh_repo(&self) -> Result<Option<String>, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let configured = snapshot.pool().map_or("", |pool| pool.gh_repo());
+        if configured.is_empty() {
+            return Ok(None);
+        }
+        crate::engine::workspace::refuse_a_fabricated_slug(self.repository.root(), configured)
+            .map_err(|error| WorkerActionError::RepositoryIdentity {
+                detail: error.to_string(),
+            })?;
+        Ok(Some(configured.to_owned()))
     }
 
     /// The Worker's delivered bookmark, resolved against the repository.
@@ -1471,14 +1492,6 @@ fn classify_absorb(stderr: &str) -> AbsorbReport {
     }
 }
 
-fn repository_slug(repository: &Repository) -> String {
-    repository
-        .worker_pool()
-        .snapshot()
-        .pool()
-        .map_or_else(String::new, |pool| pool.gh_repo().to_owned())
-}
-
 fn send_system_prompt(repository: &str) -> String {
     format!(
         "You are an autonomous agent in a jj (Jujutsu VCS) workspace.\n\n\
@@ -1542,6 +1555,10 @@ pub enum WorkerActionError {
     /// The Repository has no compatible GitHub slug.
     #[error("cannot detect GitHub repository")]
     RepositoryUnavailable,
+    /// The Worker Pool's persisted `gh_repo` could not have come from a GitHub
+    /// remote, so the repository it names cannot be resolved.
+    #[error("cannot resolve GitHub repository: {detail}")]
+    RepositoryIdentity { detail: String },
     /// No open pull request exists for the Worker bookmark.
     #[error("no pull request found for branch {branch}")]
     PullRequestNotFound { branch: String },
