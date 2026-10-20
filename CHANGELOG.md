@@ -93,6 +93,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - open-pr, review and send refuse a Worker Pool's persisted gh_repo when it is the slug a non-GitHub origin fabricated - the value a Pool created before the earlier origin fix still holds - reusing the existing 'origin is not a GitHub remote' refusal before any gh call, instead of looking up a repository that never existed and failing with a GraphQL error naming it; a gh_repo that is not that fabricated value is untouched.
 - jjfx colocation status answers without snapshotting the working copy, so the read can no longer block silently behind another jj process holding the repository's lock
 - jjfx's two remaining snapshotting reads - resolving a Ticket's bookmark (the landing path's source of truth for which bookmark carries a Ticket's work) and checking whether a dependent's revision still exists - now read with --ignore-working-copy, so they answer instead of blocking silently behind another jj process holding the repository's working-copy lock
+- The forge's own slug derivation refuses a non-GitHub `origin` - a filesystem path or another forge - by name, `origin is not a GitHub remote`, instead of mining its last two path segments into an `owner/name` slug and handing it to `gh`; the Pull Request step reports that refusal and reaches no network call, and the Pull Request read behind `jjfx status` treats it as unknown rather than a confident empty, while a legitimate GitHub `origin` is unchanged.
 
 ## [0.55.0] - 2026-10-16
 

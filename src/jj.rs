@@ -221,6 +221,15 @@ pub fn update_stale(dir: &Path) -> anyhow::Result<()> {
 
 /// Derive the `owner/repo` slug from jj's `origin` remote URL. Every `gh` call
 /// must pass this explicitly because auto-detection fails in jj workspaces.
+///
+/// `Ok(None)` means the Repository has no `origin` remote at all: there is no
+/// forge to talk to, which is a supported state, not a failure. An `origin` that
+/// is present but not a GitHub remote is an error carrying
+/// [`not_github_remote`] - its last two path segments are not an identity, and
+/// handing one to `gh` invents a repository that never existed. Returning `None`
+/// for it would instead read as "no forge", and a caller that treats that as
+/// "nothing to do" would silently skip the Pull Request step rather than report
+/// the problem.
 pub(crate) fn derive_repo_slug(repo_root: &Path) -> anyhow::Result<Option<String>> {
     let out = read_at_repo(repo_root, &["git", "remote", "list"])?;
     let Some(url) = out
@@ -231,23 +240,71 @@ pub(crate) fn derive_repo_slug(repo_root: &Path) -> anyhow::Result<Option<String
     else {
         return Ok(None);
     };
-    Ok(slug_from_url(url))
+    remote_slug(url)
+        .map(Some)
+        .ok_or_else(|| anyhow::anyhow!(not_github_remote(url)))
 }
 
-fn slug_from_url(url: &str) -> Option<String> {
-    let url = url.strip_suffix(".git").unwrap_or(url);
-    let parts: Vec<&str> = url
-        .split(['/', ':'])
-        .filter(|part| !part.is_empty())
-        .collect();
-    if parts.len() < 2 {
+/// The one refusal for an `origin` that is not a GitHub remote: the named message
+/// `dogfood/03` introduced. Both this module's live derivation and the engine's
+/// check of a persisted slug build their refusal from it, so the family has a
+/// single message rather than one per seam.
+pub(crate) fn not_github_remote(remote: &str) -> String {
+    format!(
+        "origin is not a GitHub remote: {remote}; point `origin` at GitHub (or set \
+         the pool's `gh_repo`)"
+    )
+}
+
+/// Derives an `owner/name` slug from a GitHub git remote URL.
+///
+/// Accepts the two shapes a remote takes: the scp-like
+/// `[user@]github.com:owner/name(.git)` and the URL
+/// `scheme://[user@]github.com[:port]/owner/name(.git)`. Returns `None` for any
+/// remote whose host is not `github.com` - a filesystem path or another forge
+/// has no GitHub identity, and deriving one from its last two path segments
+/// invents a repository that does not exist.
+///
+/// The one derivation: [`derive_repo_slug`] and the engine's
+/// `origin_slug` both call it, so the two can no longer agree by hand.
+pub(crate) fn remote_slug(remote: &str) -> Option<String> {
+    let (host, path) = split_remote(remote)?;
+    if !host.eq_ignore_ascii_case("github.com") {
         return None;
     }
-    Some(format!(
-        "{}/{}",
-        parts[parts.len() - 2],
-        parts[parts.len() - 1]
-    ))
+    let path = path.trim_end_matches(".git");
+    let mut parts = path.rsplitn(3, '/');
+    match (parts.next(), parts.next()) {
+        (Some(name), Some(owner)) => Some(format!("{owner}/{name}")),
+        _ => Some(path.to_owned()),
+    }
+}
+
+/// Splits a git remote into its `(host, path)`.
+///
+/// Handles the URL form `scheme://[user@]host[:port]/path` and the scp-like
+/// form `[user@]host:path`. Returns `None` for a bare filesystem path, which has
+/// no host to speak of.
+fn split_remote(remote: &str) -> Option<(&str, &str)> {
+    let remote = remote.trim();
+    if let Some((_, rest)) = remote.split_once("://") {
+        let rest = rest
+            .rsplit_once('@')
+            .map_or(rest, |(_, authority)| authority);
+        let (authority, path) = rest.split_once('/')?;
+        let host = authority
+            .split_once(':')
+            .map_or(authority, |(host, _port)| host);
+        return Some((host, path));
+    }
+    let (authority, path) = remote.split_once(':')?;
+    if authority.contains('/') {
+        return None;
+    }
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    Some((host, path))
 }
 
 /// A Workspace jj knows in this repo: its name and, when jj records one, its
@@ -859,20 +916,94 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slug_from_ssh_and_https() {
+    fn remote_slug_reads_a_github_remote_and_refuses_anything_else() {
+        for remote in [
+            "git@github.com:Jarvvski/jjfx.git",
+            "https://github.com/Jarvvski/jjfx.git",
+            "ssh://git@github.com:22/Jarvvski/jjfx",
+            "git@github.com:Jarvvski/jjfx",
+        ] {
+            assert_eq!(
+                remote_slug(remote).as_deref(),
+                Some("Jarvvski/jjfx"),
+                "{remote} is a GitHub remote"
+            );
+        }
+
+        // A filesystem path has no host, so its last two path segments are not
+        // an identity: this is the slug the dogfood drive invented.
+        for remote in [
+            "/Users/jarvis/Code/personal/dogfood-site-origin.git",
+            "./relative/repo.git",
+            "file:///Users/jarvis/Code/personal/repo.git",
+        ] {
+            assert_eq!(remote_slug(remote), None, "{remote} is not a GitHub remote");
+        }
+
+        // Another forge is a real host, but not GitHub's.
+        for remote in [
+            "git@gitlab.com:owner/name.git",
+            "https://gitlab.com/owner/name",
+            "https://codeberg.org/owner/name",
+        ] {
+            assert_eq!(remote_slug(remote), None, "{remote} is not a GitHub remote");
+        }
+
+        assert_eq!(remote_slug("nonsense"), None);
+    }
+
+    /// The forge's own derivation, driven through jj: a non-GitHub `origin` is
+    /// refused by name rather than fabricated into an `owner/name` slug, and a
+    /// legitimate GitHub `origin` is unaffected.
+    #[test]
+    fn derive_repo_slug_refuses_a_non_github_origin_by_name() {
+        let repo = temp_repo("derive-slug");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+
+        // No `origin` is a supported state: there is simply no forge.
         assert_eq!(
-            slug_from_url("git@github.com:Jarvvski/jjfx.git").as_deref(),
-            Some("Jarvvski/jjfx")
+            derive_repo_slug(&root).expect("no origin is not a failure"),
+            None
         );
+
+        // A local-path origin has no GitHub identity. Its last two path segments
+        // are not an identity, so it is refused rather than mined for
+        // `personal/dogfood-site-origin`.
+        let origin = std::env::temp_dir().join("jjfx-derive-slug-origin.git");
+        run_mut(
+            &root,
+            &["git", "remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .expect("add a local origin");
+        let error = derive_repo_slug(&root).expect_err("a non-GitHub origin is refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("origin is not a GitHub remote"),
+            "the refusal reuses the family's named message: {message}"
+        );
+        assert!(
+            message.contains("jjfx-derive-slug-origin"),
+            "the refusal names the remote it refused: {message}"
+        );
+
+        // A legitimate GitHub origin is unaffected.
+        run_mut(
+            &root,
+            &[
+                "git",
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:Jarvvski/jjfx.git",
+            ],
+        )
+        .expect("point origin at GitHub");
         assert_eq!(
-            slug_from_url("https://github.com/Jarvvski/jjfx.git").as_deref(),
-            Some("Jarvvski/jjfx")
+            derive_repo_slug(&root).expect("a GitHub origin derives a slug"),
+            Some("Jarvvski/jjfx".to_string())
         );
-        assert_eq!(
-            slug_from_url("git@github.com:Jarvvski/jjfx").as_deref(),
-            Some("Jarvvski/jjfx")
-        );
-        assert_eq!(slug_from_url("nonsense"), None);
+
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]
