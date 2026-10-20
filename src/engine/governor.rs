@@ -1,14 +1,25 @@
 //! The dispatch capacity governor: an optional ceiling on how many Runs may be
 //! in flight at once.
 //!
-//! `pool N` sizes the `default` pool and `dispatch --all` fires the whole batch,
-//! so a large Worker Pool plus a large batch can trip a provider's rate limit in
-//! one go. A cap paces a batch instead: the first `limit - in_flight` Tickets
-//! fire, and the rest are held back in a waiting state the owner can see.
+//! Two dials bound concurrency, and they are not the same dial:
 //!
-//! The cap is a *ceiling on concurrent Runs*, not a batch size: it counts the
-//! Runs already in flight, so repeated Dispatches stay under the same limit
-//! rather than each firing a fresh batch of `limit`.
+//! - **Worker Pool capacity** is a declaration of *how many Workers exist*. A
+//!   pool of N can hold at most N Runs, because every Run needs a Worker to run
+//!   on. It is a property of the pool (`jjfx pool N`), sized for the work a lane
+//!   is expected to hold.
+//! - **The governor** is a ceiling on *how much is in flight*. It is a property
+//!   of the Repository's dispatch settings (`[dispatch] max_concurrent`), and it
+//!   exists to pace a burst rather than to size a lane: a pool of ten under a cap
+//!   of three still fires three.
+//!
+//! Both bind, and the smaller wins. A pool smaller than the cap is
+//! capacity-bound; a cap smaller than the pool is governor-bound, and the excess
+//! Tickets are held back rather than fired.
+//!
+//! The cap counts the Runs already in flight - every Worker the Pool records as
+//! busy, however that Run started - so repeated Dispatches stay under the same
+//! limit rather than each firing a fresh batch of `limit`. That is what makes it
+//! a governor rather than a batch size: it survives across Dispatches.
 
 /// The most Runs Dispatch may keep in flight at once.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

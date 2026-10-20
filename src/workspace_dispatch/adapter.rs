@@ -652,6 +652,10 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         {
             request = request.with_model(model.clone());
         }
+        // The concurrency cap bounds a wave as well as a batch, so a Parent's
+        // Sub-issues obey the same `[dispatch] max_concurrent` ceiling a
+        // `dispatch --all` batch does.
+        request = request.with_concurrency_cap(self.cap);
         let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)
             .map_err(|error| error.to_string())?
             .ticket()

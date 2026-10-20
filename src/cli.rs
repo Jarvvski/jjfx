@@ -2068,13 +2068,23 @@ impl PoolStatus {
 }
 
 /// Everything `status` and `pool list` report: every pool, the Repository-wide
-/// spend their subtotals sit under, and the orphan pool directories no pool
-/// claims.
+/// spend their subtotals sit under, the concurrency governor's view, and the
+/// orphan pool directories no pool claims.
 struct PoolReport {
     pools: Vec<PoolStatus>,
     /// The Repository-wide recorded spend, or `None` when a record store could
     /// not be read.
     total_cost: Option<PoolCostSnapshot>,
+    /// The concurrency cap in force for this Repository, or `None` when no
+    /// `[dispatch] max_concurrent` is set. One number, not per pool: the cap is
+    /// a property of the Repository's dispatch settings, while a pool's size is
+    /// its own capacity declaration.
+    limit: Option<usize>,
+    /// The Runs in flight across every pool: each Worker the Pool records as
+    /// busy, whatever Dispatch started it.
+    running: usize,
+    /// The Tickets the last capped Dispatch held back, across every pool.
+    held: usize,
     /// Pool directories under `.jj/pools/` that no pool the Repository holds
     /// claims. Reported by name, never adopted.
     orphans: Vec<String>,
@@ -2183,9 +2193,22 @@ fn pool_report(
         });
     }
     let total_cost = repository.repository_cost(&names).ok();
+    let limit = config
+        .dispatch
+        .cap()?
+        .map(crate::engine::ConcurrencyCap::limit);
+    let running = pools
+        .iter()
+        .flat_map(|pool| &pool.members)
+        .filter(|worker| worker.status() == WorkerStatus::Busy)
+        .count();
+    let held = pools.iter().map(|pool| pool.waiting.len()).sum();
     Ok(PoolReport {
         pools,
         total_cost,
+        limit,
+        running,
+        held,
         orphans,
         diagnostics,
         failures,
@@ -2321,6 +2344,28 @@ fn render_pool_workers(report: &PoolReport, now: Timestamp, watchdog: StuckWindo
     );
     println!("{}", spend_summary(report.total_cost.as_ref()));
     render_waiting(&report.pools);
+    render_governor(report);
+}
+
+/// The concurrency governor's view: the cap in force, how many Runs are in
+/// flight, and how many Tickets the last capped Dispatch held back.
+///
+/// Printed whatever the state, so the limit is visible on a quiet Repository
+/// too - the point of a governor is that the ceiling is known before it binds.
+fn render_governor(report: &PoolReport) {
+    let limit = report.limit.map_or_else(
+        || "no cap".to_owned(),
+        |limit| format!("dispatch.max_concurrent = {limit}"),
+    );
+    let held = if report.held > 0 {
+        format!(", {} held back", report.held)
+    } else {
+        String::new()
+    };
+    println!(
+        "Concurrency: {} Run(s) in flight ({limit}){held}",
+        report.running
+    );
 }
 
 /// The held-back Tickets, each named with the pool whose Dispatch held it.
@@ -2373,8 +2418,8 @@ fn short_worker_id(worker_id: &str) -> &str {
 }
 
 /// The Pool status JSON document:
-/// `{"workers": [ ... ], "waiting": [ ... ], "queue": [ ... ], "pools": [ ... ],
-/// "orphans": [ ... ]}`.
+/// `{"workers": [ ... ], "waiting": [ ... ], "governor": { ... },
+/// "queue": [ ... ], "pools": [ ... ], "orphans": [ ... ]}`.
 ///
 /// A top-level object rather than the bare Worker array: the human table prints
 /// state that is not per-Worker (the `Waiting:` line), and a bare array has
@@ -2427,6 +2472,7 @@ fn pool_list_json_string(report: &PoolReport, now: Timestamp, watchdog: StuckWin
         }
     }
     out.push_str("],\n");
+    out.push_str(&governor_json(report));
     out.push_str("  \"queue\": [");
     let mut first = true;
     for pool in &report.pools {
@@ -2470,6 +2516,25 @@ fn waiting_json(ticket: &str, pool: &str) -> String {
         "{{\"ticket\": {}, \"pool\": {}}}",
         json_string(ticket),
         json_string(pool)
+    )
+}
+
+/// The concurrency governor, the shape `status --json` emits as `governor`:
+/// what the limit is (`limit`, null when uncapped), how many Runs are in flight
+/// (`running`), and how many Tickets the last capped Dispatch held back
+/// (`held`).
+///
+/// One object for the whole Repository rather than one per pool: the limit is a
+/// single `[dispatch] max_concurrent` setting, while a pool's own capacity is
+/// the `size` on its `pools` entry. A frontend reads this to answer "am I at the
+/// ceiling, and if so why is nothing starting?" without counting Workers.
+fn governor_json(report: &PoolReport) -> String {
+    let limit = report
+        .limit
+        .map_or_else(|| "null".to_owned(), |limit| limit.to_string());
+    format!(
+        "  \"governor\": {{\"limit\": {limit}, \"running\": {}, \"held\": {}}},\n",
+        report.running, report.held
     )
 }
 
@@ -5028,6 +5093,10 @@ fn prepare_orchestration(
         Some(selection) => request.with_model(selection),
         None => request,
     };
+    // The concurrency cap bounds a wave too, not just a batch: a Parent's
+    // Sub-issues are Runs the same governor counts, so a wave that would exceed
+    // `dispatch.max_concurrent` holds the excess ready rather than firing it.
+    let request = request.with_concurrency_cap(crate::config::load()?.dispatch.cap()?);
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();
@@ -6323,6 +6392,11 @@ mod tests {
         let profile = snapshot.pool().and_then(|pool| pool.profile()).cloned();
         let size = snapshot.pool().map(|pool| pool.size() as u64);
         let workers = snapshot.pool().map(|_| members.len());
+        let running = members
+            .iter()
+            .filter(|worker| worker.status() == WorkerStatus::Busy)
+            .count();
+        let held = waiting.len();
         PoolReport {
             pools: vec![PoolStatus {
                 name: DEFAULT_POOL_NAME.to_owned(),
@@ -6338,6 +6412,9 @@ mod tests {
                 profile,
             }],
             total_cost: cost,
+            limit: None,
+            running,
+            held,
             orphans: Vec::new(),
             diagnostics: Vec::new(),
             failures: Vec::new(),
@@ -6628,7 +6705,9 @@ mod tests {
     fn waiting_entry() -> DispatchEntry {
         DispatchEntry::Waiting {
             ticket: "ENG-2".to_owned(),
-            detail: "concurrency cap 1 reached (1 Run(s) in flight)".to_owned(),
+            detail: "held back by the concurrency cap (dispatch.max_concurrent = 1): 1 Run(s) in \
+                     flight, so a Run must finish before another may start"
+                .to_owned(),
         }
     }
 

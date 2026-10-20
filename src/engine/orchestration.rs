@@ -14,14 +14,14 @@ use thiserror::Error;
 use crate::engine::atomic::{self, LockOutcome};
 use crate::engine::pool::current_timestamp;
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, DirectDispatchError,
-    DirectDispatchRequest, DirectDispatchSuccess, DispatchDependencyContext, DispatchExclusions,
-    DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError, DispatchGroupEvent,
-    DispatchGroupOptions, DispatchGroupProgress, DispatchGroupState, DispatchGroupStatusCounts,
-    ExclusionsProvider, Expected, Loaded, ParentTicket, Repository, RepositoryIdentity,
-    Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket, TicketDetails,
-    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent, WireTimestamp,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, CommitOutcome, ConcurrencyCap,
+    DirectDispatchError, DirectDispatchRequest, DirectDispatchSuccess, DispatchDependencyContext,
+    DispatchExclusions, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError,
+    DispatchGroupEvent, DispatchGroupOptions, DispatchGroupProgress, DispatchGroupState,
+    DispatchGroupStatusCounts, ExclusionsProvider, Expected, Loaded, ParentTicket, Repository,
+    RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket,
+    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent,
+    WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -30,6 +30,7 @@ pub struct OrchestrationRequest {
     parent: TicketId,
     profile: AgentRuntimeProfile,
     ticket_details: Option<TicketDetails>,
+    concurrency_cap: Option<ConcurrencyCap>,
 }
 
 /// Polling and retry limits for one foreground or detached orchestration run.
@@ -84,7 +85,26 @@ impl OrchestrationRequest {
             parent,
             profile: AgentRuntimeProfile::new(agent_runtime),
             ticket_details: None,
+            concurrency_cap: None,
         }
+    }
+
+    /// Caps how many Runs the orchestration wave may keep in flight at once.
+    ///
+    /// A wave holds a ready Sub-issue back - reported as
+    /// [`OrchestrationEvent::WaitingForCapacity`] - once the cap is reached,
+    /// counting the Runs already in flight from earlier Dispatches as well as
+    /// the ones this wave launches. `None` (the default) bounds the wave by the
+    /// Pool alone, the behaviour that predates the governor.
+    pub fn with_concurrency_cap(mut self, cap: Option<ConcurrencyCap>) -> Self {
+        self.concurrency_cap = cap;
+        self
+    }
+
+    /// Returns the ceiling on concurrent Runs, or `None` when the wave is
+    /// bounded only by the Worker Pool.
+    pub const fn concurrency_cap(&self) -> Option<ConcurrencyCap> {
+        self.concurrency_cap
     }
 
     /// Supplies the Parent Ticket's fetched details for the no-children direct
@@ -429,6 +449,14 @@ fn run_with_execution<E: OrchestrationExecution>(
         .into_iter()
         .map(|worker| (worker.worker.clone(), worker))
         .collect::<BTreeMap<_, _>>();
+    // The Runs already in flight, however they started: every Worker the Pool
+    // records as busy is a Run the governor counts, so a wave that follows an
+    // earlier Dispatch stays under the same ceiling rather than firing a fresh
+    // batch of `limit`.
+    let mut in_flight = workers
+        .values()
+        .filter(|worker| worker.status == WorkerStatus::Busy)
+        .count();
     let dispatched = group
         .state()
         .sub_issues
@@ -473,6 +501,10 @@ fn run_with_execution<E: OrchestrationExecution>(
                     branch,
                 });
                 execution.reset_worker(&worker)?;
+                // The Run finished and its Worker is idle again, so it no longer
+                // counts against the cap: the freed slot is what lets the ready
+                // loop below start the next Sub-issue.
+                in_flight = in_flight.saturating_sub(1);
             }
             WorkerStatus::Failed if retries < 1 => {
                 if observation.quota_blocked {
@@ -509,6 +541,9 @@ fn run_with_execution<E: OrchestrationExecution>(
                 // Worker against a `dispatched` group and the parent could never
                 // be resumed.
                 execution.reset_worker(&worker)?;
+                // The retried Run is no longer in flight, so its slot is free
+                // again for the ready loop below.
+                in_flight = in_flight.saturating_sub(1);
                 observer(OrchestrationEvent::Retrying {
                     ticket,
                     worker,
@@ -533,7 +568,15 @@ fn run_with_execution<E: OrchestrationExecution>(
     }
 
     let profile = persisted_group_profile(&group, request)?;
+    let cap = request.concurrency_cap();
     for ticket in group.ready() {
+        // The cap bounds the whole wave, counting Runs already in flight from
+        // earlier Dispatches. A ready Sub-issue over it waits rather than firing,
+        // exactly as one the Pool has no idle Worker for does.
+        if cap.is_some_and(|cap| in_flight >= cap.limit()) {
+            observer(OrchestrationEvent::WaitingForCapacity { ticket });
+            continue;
+        }
         let dispatch = dispatch_request(&group, &ticket, &profile)?;
         let Some(claim) = execution.claim(&dispatch)? else {
             observer(OrchestrationEvent::WaitingForCapacity { ticket });
@@ -557,7 +600,12 @@ fn run_with_execution<E: OrchestrationExecution>(
             }
         };
         match execution.launch(claim, &dispatch) {
-            Ok(()) => observer(OrchestrationEvent::Dispatched { ticket, worker }),
+            Ok(()) => {
+                // The launched Run is in flight now, so it counts against the
+                // cap for the rest of this wave.
+                in_flight += 1;
+                observer(OrchestrationEvent::Dispatched { ticket, worker });
+            }
             Err(failure) if failure.compensated => {
                 group.apply(DispatchGroupEvent::DispatchAborted {
                     ticket: ticket.clone(),
@@ -1686,6 +1734,81 @@ mod tests {
             ] if first.as_str() == "ENG-101"
                 && second.as_str() == "ENG-102"
                 && waiting.as_str() == "ENG-103"
+        ));
+    }
+
+    /// The governor bounds the wave: with a cap of one and three ready
+    /// Sub-issues, the first fires and the rest wait, even though the Pool has a
+    /// free Worker for each of them. That is what makes it a governor rather than
+    /// pool capacity.
+    #[test]
+    fn a_concurrency_cap_holds_a_wave_back_once_the_cap_is_reached() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        )
+        .with_concurrency_cap(ConcurrencyCap::new(1));
+        let mut execution = FakeExecution::independent_pending(
+            &["ENG-101", "ENG-102", "ENG-103"],
+            &["worker-01", "worker-02", "worker-03"],
+        );
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("a capped wave dispatches only its prefix");
+
+        // Only the first ready Ticket was claimed; the free Workers the others
+        // could have taken are left untouched.
+        assert_eq!(
+            execution.calls,
+            vec![
+                "workers".to_owned(),
+                "claim:ENG-101".to_owned(),
+                "save:r0:ENG-101:dispatched".to_owned(),
+                "launch:worker-01:ENG-101".to_owned(),
+            ]
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [
+                OrchestrationEvent::Dispatched { ticket, .. },
+                OrchestrationEvent::WaitingForCapacity { ticket: second },
+                OrchestrationEvent::WaitingForCapacity { ticket: third },
+            ] if ticket.as_str() == "ENG-101"
+                && second.as_str() == "ENG-102"
+                && third.as_str() == "ENG-103"
+        ));
+    }
+
+    /// The cap counts Runs already in flight from an earlier Dispatch, so a wave
+    /// that arrives while the Repository is at the ceiling fires nothing.
+    #[test]
+    fn a_concurrency_cap_counts_runs_already_in_flight_from_an_earlier_dispatch() {
+        let request = OrchestrationRequest::new(
+            TicketId::parse("ENG-100").expect("Parent Ticket"),
+            AgentRuntime::Claude,
+        )
+        .with_concurrency_cap(ConcurrencyCap::new(1));
+        let mut execution = FakeExecution::independent_pending(&["ENG-101"], &["worker-02"]);
+        // A Run from an earlier Dispatch is still busy on worker-01, so the cap
+        // of one is already spent.
+        execution.workers = vec![WorkerObservation {
+            worker: WorkerId::parse("worker-01").expect("Worker"),
+            status: WorkerStatus::Busy,
+            ticket: Some("ENG-099".to_owned()),
+            branch: None,
+            error: None,
+            quota_blocked: false,
+        }];
+        let mut events = Vec::new();
+
+        run_with_execution(&request, &mut execution, &mut |event| events.push(event))
+            .expect("a wave at the ceiling holds its whole ready set");
+
+        assert_eq!(execution.calls, vec!["workers".to_owned()]);
+        assert!(matches!(
+            events.as_slice(),
+            [OrchestrationEvent::WaitingForCapacity { ticket }] if ticket.as_str() == "ENG-101"
         ));
     }
 
