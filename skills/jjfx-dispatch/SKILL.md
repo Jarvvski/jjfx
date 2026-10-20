@@ -13,6 +13,8 @@ That surface is only as good as the binary answering it, so check which one you 
 
 Every step ends on a checkable condition, and every condition is read from a command's `--json` output rather than from its prose — so the same command decides the same way on every run.
 
+[`PLAYBOOK.md`](PLAYBOOK.md), beside this file, is the working guide: the loop as it actually runs, the traps a real drive hits and the workaround for each, and what jjfx should be doing for you rather than asking you to remember. Read it before the first `dispatch`.
+
 ## Before dispatching
 
 Settle four things first, so a dispatch does not fail on setup:
