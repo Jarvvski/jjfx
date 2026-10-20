@@ -7,6 +7,14 @@ comments: the owner is the reviewer for every PR. Nothing else runs - jjfx does
 not ingest an external review bot's findings, and the prompt has no AI-reviewer
 step to act on.
 
+**No command drives this loop.** `jjfx review` sends one prompt and produces no
+findings, so it has nothing to bound and no pass to record or replay. The bound
+described below is reached only through the harness seam
+(`RecordedReviewLoop` in `src/engine/review_run.rs`); this page is what that
+seam enforces when a harness drives it. Whether `jjfx review` should own a
+reviewer after all is an open question - ADR 0016 cut the only reviewer jjfx had
+- not something the command does today.
+
 ## Where a fix belongs
 
 Review feedback often belongs in a **base commit**, not in a new commit stacked
@@ -71,8 +79,11 @@ findings by repetition, spending reviewer compute to learn nothing. The tool
 enforces the bound; the prompt does not.
 
 The bound lives in `ReviewLoop` (`src/engine/reviewer.rs`) and is generic over
-whatever supplies each pass's findings. jjfx runs no reviewer of its own, so the
-loop stands on its own until the harness drives it.
+whatever supplies each pass's findings. jjfx runs no reviewer of its own, so
+nothing in the binary drives the loop: its only caller is the harness seam
+(`RecordedReviewLoop` in `src/engine/review_run.rs`), and `jjfx review` - which
+sends one prompt and produces no findings - is not that caller. The bound is
+enforced when the harness drives the loop, not by `jjfx review`.
 
 ## Replaying a decided pass
 
@@ -80,7 +91,9 @@ The loop is driven through the pool's decision log
 (`.jj/pools/<name>/decisions.json`). Each pass is keyed by the step identity
 `review:<ticket>:<dimension>:<pass>`, so a pass already recorded is replayed
 rather than reaching the reviewer again, and its findings are not re-addressed -
-they were addressed when the decision was first made.
+they were addressed when the decision was first made. This applies to a loop the
+harness drives; no command records a review pass, so `jjfx status --json`'s
+queue holds none until one does.
 
 Replay does not change the bound. A replayed pass carries the decision it
 recorded, so the cap and the progress rule see exactly the rounds the first drive

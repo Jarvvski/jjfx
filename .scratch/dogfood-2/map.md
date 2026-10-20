@@ -107,6 +107,14 @@ the reduction the parent ticket was filed for (seven review dimensions recurring
 the honest question is whether an agent working a backlog through jjfx ever
 repeats a dimension, and whether anything notices if it does.
 
+**Answered (2026-10-20).** An agent working a backlog through jjfx never repeats
+a review dimension, because it never runs one: no command reaches `ReviewLoop`,
+so nothing runs a pass to repeat and nothing notices a repeat
+([04](issues/04-the-bounded-review-loop-has-no-caller.md)). The boundary stays
+where ADR 0016 put it - the review *bound* lives in jjfx, the reviewer does not -
+and `jjfx review` no longer claims otherwise; owning the loop would need a
+reviewer jjfx deliberately cut, which is the owner's decision to reopen.
+
 ## References
 
 - `.scratch/dogfood/` - the first drive, its report and its ten findings
