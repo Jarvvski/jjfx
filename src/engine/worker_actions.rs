@@ -463,6 +463,16 @@ impl WorkerActions {
     }
 
     /// Rebases the Worker's bookmark onto `main` and pushes it.
+    ///
+    /// A rebase can succeed and still record a conflict in the commit it rewrote
+    /// (the normal case once `main` has moved under the Worker). jj refuses to
+    /// push a conflicted commit, so the push is never attempted and the rebase is
+    /// left in place, reported as the state the Workspace is actually in
+    /// ([`WorkerActionError::RebaseConflicted`]) rather than as a push failure
+    /// whose `rollback` implies a rollback happened. The `jj undo` rollback the
+    /// push-failure path uses cannot be trusted here: it undoes the repository's
+    /// *last* operation, which in a shared operation log may belong to another
+    /// Workspace.
     pub fn rebase(&self, worker: &WorkerId) -> Result<RebaseOutcome, WorkerActionError> {
         let (branch, workspace) = self.branch_and_workspace(worker)?;
         // A rebase rewrites the working copy, so serialise it with preparation
@@ -478,6 +488,21 @@ impl WorkerActions {
                 operation: "rebase Worker bookmark",
                 detail,
             })?;
+        // The rebase moved the Worker's own stack onto `main`; a conflict in that
+        // stack is what jj refuses to push.
+        if self
+            .commands
+            .conflicted(&workspace, &branch)
+            .map_err(|detail| WorkerActionError::Command {
+                operation: "read whether the rebased bookmark has conflicts",
+                detail,
+            })?
+        {
+            return Err(WorkerActionError::RebaseConflicted {
+                worker: worker.clone(),
+                branch,
+            });
+        }
         if let Err(push) = self.commands.push(&workspace, &branch) {
             let rollback = self.commands.undo(&workspace).err();
             return Err(WorkerActionError::RebasePush {
@@ -1243,6 +1268,17 @@ impl SystemCommands {
         self.run_status(workspace, "jj", &["rebase", "-b", branch, "-d", "main"])
     }
 
+    /// Whether the rebased bookmark's own stack - everything the rebase moved
+    /// above `main` - carries an unresolved conflict.
+    ///
+    /// The chain above `main`, not just the bookmark's commit: jj records a
+    /// conflict in the commit it rewrote, and a push of the bookmark carries
+    /// every commit above `main` whether or not the tip itself is the owner.
+    fn conflicted(self, workspace: &Path, branch: &str) -> Result<bool, String> {
+        let revset = format!("::{} ~ ::main", crate::jj::revset_symbol(branch));
+        crate::jj::conflicted(workspace, &revset).map_err(|error| error.to_string())
+    }
+
     fn push(self, workspace: &Path, branch: &str) -> Result<(), String> {
         // `jj git push -b <name>` exits zero and pushes nothing both when the
         // bookmark is already published and when the name matches no bookmark,
@@ -1695,6 +1731,15 @@ pub enum WorkerActionError {
     /// No open pull request exists for the Worker bookmark.
     #[error("no pull request found for branch {branch}")]
     PullRequestNotFound { branch: String },
+    /// The rebase succeeded but left the bookmark conflicted, so jj will not
+    /// push it. The rebase is deliberately left in place and the state is named,
+    /// rather than reported as a push failure with a rollback that did not happen.
+    #[error(
+        "rebased branch {branch} onto main, but it has conflicts to resolve: resolve them in \
+         Worker {worker}'s Workspace (`jj resolve`), then re-run to push; the rebase is left in \
+         place"
+    )]
+    RebaseConflicted { worker: WorkerId, branch: String },
     /// Pushing a rebased bookmark failed after the local operation completed.
     #[error("cannot push rebased branch {branch}: {push}; rollback: {rollback:?}")]
     RebasePush {
