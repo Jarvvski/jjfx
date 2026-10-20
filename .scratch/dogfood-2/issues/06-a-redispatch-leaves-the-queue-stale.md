@@ -1,6 +1,6 @@
 # A re-dispatch that succeeds leaves the durable queue reporting the failure
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -44,13 +44,13 @@ runs for 01/02.)
 
 ## Acceptance Criteria
 
-- [ ] A successful Dispatch of a Ticket whose step is `failed` settles that step
+- [x] A successful Dispatch of a Ticket whose step is `failed` settles that step
       `done` (or records the successful attempt), so the queue reflects the
       latest outcome rather than the first failure.
-- [ ] `resume` does not re-open a step whose work has since completed - either
+- [x] `resume` does not re-open a step whose work has since completed - either
       because the queue no longer reads `failed`, or because it consults the Run
       record / the Ticket's status before re-opening.
-- [ ] A test drives a failed step, re-dispatches the same Ticket to success, and
+- [x] A test drives a failed step, re-dispatches the same Ticket to success, and
       asserts the queue reads `done` and `resume` leaves it alone.
 
 ## References
@@ -70,3 +70,27 @@ Not independently re-verified - the drive reproduced it live against the queue.
 
 The acceptance criteria are unchanged - they were already specific and
 testable, which is why this needed triage rather than a rewrite.
+
+## Resolution
+
+The stale read was the claim, not the settlement: `WorkQueue::claim` refused a
+terminal step, so a second Dispatch of the same Ticket could not re-open the
+`failed` record it had settled - the Run ran, but every later transition
+(`claim`, `begin`, `settle`) was a no-op against the terminal item, and the queue
+reported the first failure forever. `resume` then read that `failed` step as
+unfinished and re-dispatched landed work.
+
+`claim` now re-opens a step a new attempt may supersede, using
+`QueueItemState::is_resumable` - the same rule `resume` uses - as its guard: a
+step that settled `failed` or `abandoned` is re-claimed (its claim, start, end
+and reason cleared so the record tracks the latest attempt), while a step that is
+`done` or whose Run is `in_flight` is refused, so a Dispatch cannot redo completed
+work or clobber a live Run. The subsequent `begin`/`settle` then land normally,
+and the queue reads `done` after a successful re-dispatch - so `resume` leaves it
+alone.
+
+Verified by `tests/work_queue_resume.rs::a_redispatch_that_succeeds_supersedes_the_earlier_failure`:
+a step is seeded `failed` with its reason, the same Ticket is dispatched again to
+success, and the queue reads `done` with no stale detail while `jjfx resume`
+reports it `already done` and runs nothing. The queue unit tests cover the
+re-open directly, and the refusal of `done` and `in_flight`.

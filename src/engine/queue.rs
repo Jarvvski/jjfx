@@ -89,6 +89,15 @@ impl WorkQueue {
     /// This is the record ticket 07 reads: it is written before the Run starts,
     /// so a jjfx killed between the claim and the launch still knows what was in
     /// flight and on which Worker.
+    ///
+    /// A step keyed by identity means a second Dispatch of the same Ticket is
+    /// the *same* step, so this is also where a later attempt supersedes an
+    /// earlier one: a step that settled `failed` or `abandoned` is re-opened
+    /// rather than left terminal, so the new Run's settlement replaces the stale
+    /// outcome instead of the queue reporting the first failure forever
+    /// (dogfood-2 ticket 06). [`QueueItemState::is_resumable`] is the one rule
+    /// for what a new attempt may re-open, so a Dispatch cannot redo completed
+    /// work, and a live `in_flight` Run is not clobbered by a second claim.
     pub fn claim(
         &self,
         step: &StepKey,
@@ -96,15 +105,29 @@ impl WorkQueue {
         at: WireTimestamp,
     ) -> Result<bool, StateError> {
         self.store().transition(step, |item| {
-            if item.state.is_terminal() {
+            if !item.state.is_resumable() {
                 return false;
             }
-            let changed = item.state != QueueItemState::Claimed
+            let reopened = item.state.is_terminal();
+            let mut changed = item.state != QueueItemState::Claimed
                 || item.claimed_by != in_flight.worker
                 || item.in_flight.as_ref() != Some(&in_flight);
             item.state = QueueItemState::Claimed;
             item.claimed_by = in_flight.worker.clone();
-            item.claimed_at.get_or_insert(at);
+            if reopened {
+                // The earlier attempt is superseded: its claim, start, end and
+                // reason described work that is no longer this step's latest
+                // outcome. The Run Records keep that attempt; the queue tracks
+                // the new one, so "what happened to this?" answers with what
+                // actually happened last.
+                item.claimed_at = Some(at);
+                item.started_at = None;
+                item.finished_at = None;
+                item.detail = None;
+                changed = true;
+            } else {
+                item.claimed_at.get_or_insert(at);
+            }
             item.in_flight = Some(in_flight);
             changed
         })
@@ -742,6 +765,128 @@ mod tests {
                 .and_then(|record| record.session)
                 .as_deref(),
             Some("ses_abc")
+        );
+    }
+
+    /// Dogfood-2 ticket 06: a step keyed by identity means a second Dispatch of
+    /// the same Ticket is the same step. A later claim re-opens a step that
+    /// settled `failed`, so the new attempt's settlement supersedes the earlier
+    /// failure rather than the queue reporting the first outcome forever.
+    #[test]
+    fn a_later_claim_supersedes_an_earlier_failure() {
+        let (_temp, queue) = queue();
+        queue.enqueue(&[step("ENG-1")]).expect("enqueue");
+        let key = StepKey::dispatch("ENG-1");
+        queue
+            .claim(&key, record("worker-01"), at(1))
+            .expect("claim");
+        queue
+            .begin(&key, Some("ses_first".to_owned()), None, at(2))
+            .expect("begin");
+        queue
+            .settle(
+                &key,
+                QueueSettlement::Failed {
+                    detail: "cannot anchor the session".to_owned(),
+                },
+                at(3),
+            )
+            .expect("settle the first attempt failed");
+
+        // A second Dispatch of the same Ticket claims the same step, re-opening
+        // the record so the new Run's claim and settlement apply to it.
+        assert!(
+            queue
+                .claim(&key, record("worker-02"), at(4))
+                .expect("re-claim the failed step"),
+            "a failed step must be re-claimable by a later Dispatch"
+        );
+        let claimed = queue.item(&key).expect("item").expect("recorded");
+        assert_eq!(claimed.state, QueueItemState::Claimed);
+        assert_eq!(
+            claimed.claimed_by.as_ref().map(WorkerId::as_str),
+            Some("worker-02")
+        );
+        assert_eq!(claimed.claimed_at, Some(at(4)), "the new attempt's claim");
+        assert_eq!(claimed.started_at, None, "the new attempt has not started");
+        assert_eq!(
+            claimed.finished_at, None,
+            "the earlier failure's end no longer applies"
+        );
+        assert_eq!(
+            claimed.detail, None,
+            "the earlier failure's reason no longer applies"
+        );
+
+        queue
+            .begin(&key, Some("ses_second".to_owned()), None, at(5))
+            .expect("begin the retry");
+        queue
+            .settle(&key, QueueSettlement::Done, at(6))
+            .expect("settle the retry succeeded");
+
+        let done = queue.item(&key).expect("item").expect("recorded");
+        assert_eq!(
+            done.state,
+            QueueItemState::Done,
+            "the queue must reflect the latest outcome, not the first failure"
+        );
+        assert_eq!(done.finished_at, Some(at(6)));
+        assert_eq!(done.detail, None, "a successful step carries no failure");
+        // The queue no longer reads failed, so a resumption leaves it alone.
+        assert!(
+            !queue.resume(&key).expect("resume a completed step"),
+            "completed work must not be re-opened"
+        );
+    }
+
+    /// The re-open is bounded by the same rule a resumption uses: a completed
+    /// step is not redone, and a live Run is not clobbered by a second claim.
+    #[test]
+    fn a_claim_refuses_completed_and_running_steps() {
+        let (_temp, queue) = queue();
+        queue
+            .enqueue(&[step("ENG-1"), step("ENG-2")])
+            .expect("enqueue");
+
+        let completed = StepKey::dispatch("ENG-1");
+        queue
+            .settle(&completed, QueueSettlement::Done, at(1))
+            .expect("settle");
+        assert!(
+            !queue
+                .claim(&completed, record("worker-01"), at(2))
+                .expect("claim a completed step"),
+            "a completed step must not be re-claimed"
+        );
+        let item = queue.item(&completed).expect("item").expect("recorded");
+        assert_eq!(item.state, QueueItemState::Done);
+        assert_eq!(item.finished_at, Some(at(1)), "completion is left intact");
+
+        let running = StepKey::dispatch("ENG-2");
+        queue
+            .claim(&running, record("worker-01"), at(1))
+            .expect("claim");
+        queue
+            .begin(&running, Some("ses_live".to_owned()), None, at(2))
+            .expect("begin");
+        assert!(
+            !queue
+                .claim(&running, record("worker-02"), at(3))
+                .expect("claim a running step"),
+            "a live Run must not be re-claimed by a second Dispatch"
+        );
+        let item = queue.item(&running).expect("item").expect("recorded");
+        assert_eq!(item.state, QueueItemState::InFlight);
+        assert_eq!(
+            item.claimed_by.as_ref().map(WorkerId::as_str),
+            Some("worker-01"),
+            "the live Run's claim must be left intact"
+        );
+        assert_eq!(
+            item.in_flight.and_then(|record| record.session).as_deref(),
+            Some("ses_live"),
+            "the live Run's record must be left intact"
         );
     }
 
