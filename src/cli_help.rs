@@ -848,7 +848,7 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "pool list",
-        summary: "Show every pool, and the `default` pool's Workers",
+        summary: "Show every pool, and each pool's Workers",
         usage: "pool list [--json]",
         arguments: &[],
         flags: POOL_LIST_FLAGS,
@@ -987,7 +987,7 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "open-pr",
-        summary: "Weld a Worker's chain onto trunk and open its Pull Request",
+        summary: "Open a Worker's Pull Request in the browser",
         usage: "open-pr <worker>",
         arguments: &[Argument {
             name: "<worker>",
@@ -1299,44 +1299,60 @@ mod tests {
         }
     }
 
-    /// A flag a page documents must be one the parser accepts. The parser
-    /// rejects any option the page's flag slice does not contain (see
-    /// `cli::reject_unknown_flags`), so a page that drifts from its command
-    /// fails here rather than shipping.
+    /// The promise this module makes, made checkable: a command's page and its
+    /// parser read the same flag definitions, so the set of flags the parser
+    /// accepts for a command must equal the set its page documents. The parser
+    /// is probed through its public `parse` - not by comparing the two slices,
+    /// which would be tautological - so a `parse_*` that stops validating
+    /// against the page's slice fails here, in either direction: a page flag the
+    /// parser rejects, or a flag the parser accepts that no page documents.
+    ///
+    /// Scoped to the pages that declare flags. A command with none parses a bare
+    /// positional and never inspects options, so `open-pr --json` is accepted as
+    /// a Worker named `--json` rather than as a flag - there is no accepted-flag
+    /// set to hold it to, and its surface is covered by
+    /// `every_page_renders_its_usage_arguments_and_flags`.
     #[test]
-    fn documented_flags_are_accepted_by_the_parser() {
+    fn the_parser_accepts_exactly_the_flags_a_page_documents() {
+        // Every spelling any page defines, with whether it takes a value: the
+        // probe set every command is asked about.
+        let mut probes: Vec<(&str, bool)> = Vec::new();
         for page in PAGES {
             for flag in page.flags {
-                let mut args: Vec<String> = page.key.split(' ').map(str::to_owned).collect();
-                args.push(flag.long.to_owned());
-                if flag.value.is_some() {
-                    args.push("value".to_owned());
-                }
-                if let Err(error) = parse(&args) {
-                    assert!(
-                        !error.to_string().contains("unknown option"),
-                        "`{} {}` is documented but the parser rejects it: {error}",
-                        page.key,
-                        flag.long
-                    );
+                for spelling in [Some(flag.long), flag.short].into_iter().flatten() {
+                    if !probes.iter().any(|(known, _)| *known == spelling) {
+                        probes.push((spelling, flag.value.is_some()));
+                    }
                 }
             }
         }
-    }
-
-    /// The other direction: a flag the parser does not document must be
-    /// rejected, so the page cannot silently under-report the surface.
-    #[test]
-    fn an_undocumented_flag_is_rejected_by_the_parser() {
         for page in PAGES.iter().filter(|page| !page.flags.is_empty()) {
-            let mut args: Vec<String> = page.key.split(' ').map(str::to_owned).collect();
-            args.push("--definitely-not-a-flag".to_owned());
-            let error = parse(&args).expect_err("an undocumented flag must be rejected");
-            assert!(
-                error.to_string().contains("--definitely-not-a-flag"),
-                "`{}` did not name the rejected flag: {error}",
-                page.key
-            );
+            for (spelling, takes_value) in &probes {
+                let documented = page.flags.iter().any(|flag| flag.matches(spelling));
+                let mut args: Vec<String> = page.key.split(' ').map(str::to_owned).collect();
+                args.push((*spelling).to_owned());
+                if *takes_value {
+                    args.push("value".to_owned());
+                }
+                let outcome = parse(&args);
+                let rejected = outcome
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.to_string().contains("unknown option"));
+                assert_eq!(
+                    documented,
+                    !rejected,
+                    "`{} {}`: documented = {documented}, but the parser {} ({:?})",
+                    page.key,
+                    spelling,
+                    if rejected {
+                        "rejected it"
+                    } else {
+                        "did not reject it"
+                    },
+                    outcome.err().map(|error| error.to_string())
+                );
+            }
         }
     }
 
