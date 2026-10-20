@@ -2280,10 +2280,16 @@ fn reserve_refuses_a_worker_excluded_as_occupied() {
     ));
 }
 
+/// An excluded Worker is not capacity: a Dispatch with no eligible Worker
+/// reports the gap rather than reserving one. Every Worker is excluded - an
+/// occupied one is not capacity whatever its status reads.
 #[test]
-fn dispatch_reports_capacity_when_the_only_idle_worker_is_excluded() {
+fn dispatch_reports_capacity_when_no_worker_is_eligible() {
     let (_temp, repository) = repository_with_pool();
-    let exclusions = DispatchExclusions::new([WorkerId::parse("worker-01").expect("worker id")]);
+    let exclusions = DispatchExclusions::new(
+        ["worker-01", "worker-02", "worker-03", "worker-04"]
+            .map(|id| WorkerId::parse(id).expect("worker id")),
+    );
     let dispatcher = repository.direct_dispatch().with_exclusions(exclusions);
     let request = DirectDispatchRequest::for_ticket_id(
         TicketId::parse("ENG-2").expect("ticket id"),

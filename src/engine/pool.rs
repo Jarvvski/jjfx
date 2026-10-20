@@ -595,6 +595,38 @@ impl WorkerPool {
         }
     }
 
+    /// Returns every finished Worker to idle so a later Dispatch can reuse it.
+    ///
+    /// A Worker is finished once its Run's outcome has been collected: it reads
+    /// `done` or `failed`, its Run Record is durable and its queue step settled,
+    /// so nothing is still executing on it. Releasing that slot is what lets a
+    /// Pool of N work a backlog larger than N - without it the Pool serves only
+    /// as many Tickets as it has Workers, ever, and an operator has to run
+    /// `jjfx pool reset` between rounds. The Workspace is left as it is, so the
+    /// finished Run's changes stay for inspection and the next Dispatch's `jj
+    /// new` starts over them; this is the same release as Dismiss.
+    ///
+    /// Reconciled first, so a Run whose process died is collected to a terminal
+    /// status before it is reclaimed. Best effort, like reconciliation: a Worker
+    /// another writer has already reclaimed, detached, or moved on from is left
+    /// to it.
+    pub fn reclaim_finished(&self) -> Vec<WorkerId> {
+        let finished = self
+            .reconcile_runs()
+            .workers()
+            .iter()
+            .filter(|worker| matches!(worker.status(), WorkerStatus::Done | WorkerStatus::Failed))
+            .map(|worker| worker.worker_id().clone())
+            .collect::<Vec<_>>();
+        let mut reclaimed = Vec::with_capacity(finished.len());
+        for worker in finished {
+            if self.clear_terminal(&worker).is_ok() {
+                reclaimed.push(worker);
+            }
+        }
+        reclaimed
+    }
+
     /// Returns a Worker to idle once its Run is no longer executing.
     ///
     /// A natural finalization of the same Run only changes completion fields,
@@ -2610,5 +2642,75 @@ mod tests {
         ));
 
         assert_eq!(records(&repository).len(), 1);
+    }
+
+    #[test]
+    fn reclaiming_a_finished_worker_returns_it_to_idle() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-9");
+        assert!(matches!(
+            finalize(&reservation, &RunResult::succeeded()),
+            RunFinalization::Applied
+        ));
+
+        assert_eq!(
+            repository.worker_pool().reclaim_finished(),
+            vec![worker.clone()]
+        );
+
+        assert_eq!(
+            repository
+                .worker_pool()
+                .snapshot()
+                .worker(worker.as_str())
+                .expect("Worker")
+                .status(),
+            WorkerStatus::Idle
+        );
+        // The outcome was already collected: the Run Record outlives the reclaim,
+        // so the finished Run is still readable once its slot is free again.
+        assert_eq!(records(&repository).len(), 1);
+    }
+
+    #[test]
+    fn reclaiming_a_failed_worker_also_frees_it() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let reservation = reserve(&repository, &worker, "ENG-11");
+        assert!(matches!(
+            finalize(&reservation, &RunResult::failed("boom")),
+            RunFinalization::Applied
+        ));
+
+        assert_eq!(
+            repository.worker_pool().reclaim_finished(),
+            vec![worker.clone()]
+        );
+        assert_eq!(
+            repository
+                .worker_pool()
+                .snapshot()
+                .worker(worker.as_str())
+                .expect("Worker")
+                .status(),
+            WorkerStatus::Idle
+        );
+    }
+
+    #[test]
+    fn reclaiming_leaves_a_live_run_alone() {
+        let (_temporary, repository, worker) = reserved_worker();
+        let _reservation = reserve(&repository, &worker, "ENG-10");
+
+        assert!(repository.worker_pool().reclaim_finished().is_empty());
+
+        assert_eq!(
+            repository
+                .worker_pool()
+                .snapshot()
+                .worker(worker.as_str())
+                .expect("Worker")
+                .status(),
+            WorkerStatus::Busy
+        );
     }
 }

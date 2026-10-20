@@ -1,6 +1,6 @@
 # A finished Worker is never returned to the pool, so a pool of N does N tickets
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -41,13 +41,13 @@ own.
 
 ## Acceptance Criteria
 
-- [ ] A finished Worker is available to a later Dispatch (returned to `idle`
+- [x] A finished Worker is available to a later Dispatch (returned to `idle`
       automatically once its Run's outcome is collected), or the flow that
       reclaims it is part of the documented dispatch loop and is what a
       no-capacity Dispatch names - not "grow the pool".
-- [ ] `dispatch` and `dispatch --all` report the same thing when the pool has no
+- [x] `dispatch` and `dispatch --all` report the same thing when the pool has no
       free Worker (see the separate finding on `failed` vs `waiting`).
-- [ ] A test dispatches more Tickets than the pool size across successive rounds
+- [x] A test dispatches more Tickets than the pool size across successive rounds
       and asserts every Ticket runs without a manual `pool reset`.
 
 ## References

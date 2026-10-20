@@ -37,6 +37,8 @@ jjfx status --json   # {"workers": [one object per Worker, naming its pool], "wa
 
 `jjfx pool <N>` is a **safe shrink**: it removes only idle Workers. `jjfx status` is an alias for `jjfx pool list`.
 
+Capacity is how many Runs may be in flight at once, not how many Tickets the pool may ever run: a Worker whose Run finishes is returned to the pool automatically, so a pool of N serves a backlog larger than N without you reclaiming anything between rounds.
+
 **Done when** the pool holds the capacity you want and at least one Worker reads `"status": "idle"`.
 
 ### 2. Decide the tickets
@@ -70,7 +72,7 @@ A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues a
 
 Before launching, jjfx fetches each Ticket's title and description through the configured source and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the source cannot be read, Dispatch fails before anything is reserved.
 
-**Done when** every Ticket you named has an object in the JSON: `dispatched` or `orchestrating` naming what took it, or `waiting` / `failed` naming why. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` can hold one back deliberately - its object reads `"outcome": "waiting"`, and `jjfx status --json` carries the held set in its pool-level `waiting` array.
+**Done when** every Ticket you named has an object in the JSON: `dispatched` or `orchestrating` naming what took it, or `waiting` / `failed` naming why. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` can hold one back deliberately - its object reads `"outcome": "waiting"`, and `jjfx status --json` carries the held set in its pool-level `waiting` array. A finished Worker is returned to the pool on the next Dispatch, so a `waiting` Ticket is one a Run is genuinely running on, not one a `done` Worker is sitting on: run the next round once the Runs finish.
 
 **Pace the backlog from the repository, not the user's config.** To bound how much you fan out, set `[dispatch] max_concurrent` in the **repository** config, `<repo>/.jjfx/config.toml` - never in `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, which would change every repository the user drives:
 
@@ -136,6 +138,8 @@ jjfx pool reset worker-01  # reset a Worker to idle
 jjfx undo worker-01        # undo the last jjfx mutation on a Worker (list when omitted)
 jjfx pool destroy          # tear down the pool
 ```
+
+You do not have to reclaim a finished Worker to reuse it: one whose Run has finished is returned to `idle` automatically on the next Dispatch, so `pool reset` is for a Worker you want to reclaim *now* - an abandoned Run, or a finished one whose Workspace you want restored before the next round - rather than a step the loop depends on.
 
 **Done when** the pool matches the capacity the user wants.
 
