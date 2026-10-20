@@ -5657,18 +5657,6 @@ mod tests {
         repo
     }
 
-    /// Hold jj's working-copy lock for as long as the returned file is alive,
-    /// exactly as a concurrent `jj` process does while it snapshots the working
-    /// copy. jj blocks on `flock` for the whole snapshot and prints nothing
-    /// while it waits.
-    fn hold_the_working_copy_lock(root: &std::path::Path) -> std::fs::File {
-        let lock = std::fs::File::create(root.join(".jj/working_copy/working_copy.lock"))
-            .expect("working-copy lock file");
-        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
-            .expect("hold the working-copy lock");
-        lock
-    }
-
     /// `colocation status` is a read, so it must not wait on jj's working-copy
     /// lock - a plain `jj git colocation status` snapshots, and while another jj
     /// process holds that lock it blocks silently for as long as the holder runs
@@ -5680,7 +5668,7 @@ mod tests {
     fn colocation_status_does_not_wait_on_the_working_copy_lock() {
         let repo = colocated_repo();
         let repository = Repository::open(repo.path()).expect("repository");
-        let _lock = hold_the_working_copy_lock(repository.root());
+        let _lock = crate::test_support::hold_the_working_copy_lock(repository.root());
 
         let mut snapshotting = std::process::Command::new("jj")
             .args(["git", "colocation", "status"])

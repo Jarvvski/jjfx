@@ -8,6 +8,8 @@
 //! `#[doc(hidden)]` and the functions that drive the real terminal stay behind
 //! the `test-support` feature rather than being compiled into a normal binary.
 
+use std::fs::File;
+use std::path::Path;
 use std::time::Duration;
 
 /// The one liveness budget every test waits on concurrent work with.
@@ -31,6 +33,25 @@ use std::time::Duration;
 /// not add a second, tighter budget at a new wait: that reintroduces the
 /// load-sensitive flake this exists to remove.
 pub const LIVENESS_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Hold jj's working-copy lock for as long as the returned file is alive,
+/// exactly as a concurrent `jj` process does while it snapshots the working
+/// copy.
+///
+/// jj takes an exclusive `flock(2)` on
+/// `<root>/.jj/working_copy/working_copy.lock` for the whole of a working-copy
+/// snapshot, and prints nothing while it waits for another process to release
+/// it. A read that forgets `--ignore-working-copy` therefore blocks silently
+/// behind the holder for as long as it runs. A test that proves a read is
+/// lock-free holds this lock and requires the read to return anyway (dogfood
+/// 08, 12).
+pub fn hold_the_working_copy_lock(root: &Path) -> File {
+    let lock = File::create(root.join(".jj/working_copy/working_copy.lock"))
+        .expect("working-copy lock file");
+    rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+        .expect("hold the working-copy lock");
+    lock
+}
 
 /// Enter the terminal and panic, for an external PTY restoration test.
 #[cfg(feature = "test-support")]
