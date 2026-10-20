@@ -1,6 +1,6 @@
 # A re-dispatch that succeeds leaves the durable queue reporting the failure
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -58,3 +58,15 @@ runs for 01/02.)
 - `.scratch/harness/issues/06-durable-queue.md`,
   `.scratch/harness/issues/07-checkpoint-and-resume.md`
 - `src/engine/queue.rs`, `src/engine/state.rs` (`QueueItemState::is_resumable`)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Not independently re-verified - the drive reproduced it live against the queue.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

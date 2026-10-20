@@ -1,6 +1,6 @@
 # `jjfx help ticket` is an unknown command
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -38,3 +38,16 @@ own right).
 ## References
 
 - `src/cli_help.rs`, `src/cli.rs` (`parse_help`)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently **confirmed**: `jjfx help ticket` prints
+`Error: unknown command: ticket.`
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

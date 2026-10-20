@@ -1,6 +1,6 @@
 # The concurrency cap can only be set user-globally
 
-Status: needs-triage
+Status: ready-for-agent
 Type: feature
 Blocked by: none
 
@@ -36,3 +36,17 @@ should be doing to test or to pace one backlog.
 - `src/config.rs` (`DispatchConfig`, `RepoConfig`), `src/engine/governor.rs`
 - `.scratch/harness/issues/05-capacity-governor.md`
 - `docs/adr/0014-*.md` (a repository may select, not grant)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently **confirmed**: `docs/configuration.md` allows a repository to set
+only `[checks]`, `[pools]` and `[tickets]`, so the cap has no repository-level
+home.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

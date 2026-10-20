@@ -1,6 +1,6 @@
 # Landing verbs refuse a fresh (unpushed) bookmark: the same name counted twice
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -78,3 +78,17 @@ stack base recorded `78874ee`, the Blocker's commit.)
   (stacked-base resolution)
 - `src/jj.rs:660` (the same `bookmark list -T name` read)
 - `.scratch/dogfood/issues/02-resolve-the-worker-bookmark-before-mutating.md`
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently **confirmed**: in the drive fixture, `jj bookmark list -T name`
+printed `adam/sift--03-top-messages` **twice** - a bookmark with a remote
+counterpart is listed more than once, so one bookmark reads as two.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

@@ -1,6 +1,6 @@
 # No CLI verb performs the delivery the dispatch prompt promises
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -52,3 +52,16 @@ thing that opens it, and no command bridges the two.
 - `src/engine/worker_actions.rs:466` (`rebase`), `:493` (`open_pull_request`)
 - `.scratch/harness/issues/10-cut-the-forge-to-one-path.md`
 - `.scratch/dogfood/issues/13-open-pr-docs-contradict-the-tool.md`
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently **confirmed**: no CLI verb opens a Pull Request; the only
+push-shaped verb is `rebase`, which pushes a Worker's branch and nothing more.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

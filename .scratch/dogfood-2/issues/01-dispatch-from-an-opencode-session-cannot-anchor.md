@@ -1,6 +1,6 @@
 # Dispatching from inside an opencode session cannot launch a Worker
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -67,3 +67,17 @@ Workspace the Run never ran in), and nothing deletes them:
   (`dispatching_session`), `:250` (`with_parent`)
 - `.scratch/harness/issues/08-child-session-topology.md`
 - `.scratch/dogfood-2/report.md` (the drive this was found in)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently checked: this agent's own shell carries `OPENCODE_SESSION_ID`, and
+`opencode_api` asserts the anchor opencode actually stored. The failing launch
+itself was **not** re-reproduced here, because doing so spends a Run.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.
