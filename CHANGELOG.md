@@ -99,6 +99,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx help answers for a multi-word command group: `jjfx help ticket` prints the group's subcommands (and a group with its own page, like `pool`, also lists them) instead of reporting the group as an unknown command.
 - a Dispatch issued from inside an opencode session launches a Worker: the Run's session is anchored to the Worker Workspace as a root session whenever a child session could not be (opencode anchors a child to its parent's directory), and a launch that fails the anchor check removes the session it created instead of leaving an orphan for `jjfx children` to report
 - jjfx absorb, rebase and open-pr land a freshly dispatched Worker's bookmark without a manual push first - a local bookmark whose remote-tracking ref does not exist yet is no longer counted twice and read as ambiguous - and a dependent whose Blocker has no usable branch is reported once, naming the Blocker's bookmark state (missing, ambiguous, or trunk) instead of a bare 'no branch'.
+- a re-dispatch of a Ticket whose queue step had settled failed now supersedes the stale failure, so the durable queue reports the latest outcome and resume no longer re-runs work that has landed
 
 ## [0.55.0] - 2026-10-16
 

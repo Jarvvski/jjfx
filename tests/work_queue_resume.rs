@@ -448,3 +448,108 @@ fn resuming_nothing_is_a_no_op_and_names_what_it_could_not_resume() {
         stderr(&nothing)
     );
 }
+
+/// Dogfood-2 ticket 06: a step that settled `failed` and was then dispatched
+/// again to success reads `done`, not the first failure - and a resumption
+/// leaves the completed step alone rather than re-running landed work.
+///
+/// A step is keyed by identity, so the second Dispatch of the same Ticket is
+/// the *same* step. Without the fix the first claim settled the step `failed`
+/// and every later transition was refused as terminal, so the queue reported
+/// the first failure forever and `resume` re-opened work that had already
+/// landed.
+#[test]
+fn a_redispatch_that_succeeds_supersedes_the_earlier_failure() {
+    let fixture = Fixture::new();
+    fixture.with_fake_agent();
+    let (repository, worker, _free) = fixture.repository_with_two_workers();
+
+    // The failure the anchor bug left behind: the step settled `failed` with its
+    // reason, exactly as `queue.json` read in the report.
+    let at = WireTimestamp::new("2026-10-19T00:00:00Z");
+    let queue = repository.work_queue();
+    queue
+        .enqueue(&[QueuedStep::dispatch("ENG-1", at.clone(), None)])
+        .expect("queue the step");
+    queue
+        .claim(
+            &StepKey::dispatch("ENG-1"),
+            InFlightRecord::for_run(
+                worker.clone(),
+                repository
+                    .worker_workspace_path(&worker)
+                    .to_string_lossy()
+                    .into_owned(),
+                "eng-1",
+                &AgentRuntimeProfile::new(AgentRuntime::Claude),
+            ),
+            at.clone(),
+        )
+        .expect("claim the first attempt");
+    queue
+        .begin(&StepKey::dispatch("ENG-1"), None, None, at.clone())
+        .expect("begin the first attempt");
+    queue
+        .settle(
+            &StepKey::dispatch("ENG-1"),
+            QueueSettlement::Failed {
+                detail: "cannot anchor Worker worker-01's opencode session".to_owned(),
+            },
+            at.clone(),
+        )
+        .expect("settle the first attempt failed");
+    drop(queue);
+
+    // A second Dispatch of the same Ticket is the same step: it re-runs and
+    // settles `done`.
+    let dispatched = fixture.jjfx(&["dispatch", "--text", "ENG-1", "--id", "ENG-1", "--fg"]);
+    assert!(
+        dispatched.status.success(),
+        "re-dispatch failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout(&dispatched),
+        stderr(&dispatched)
+    );
+
+    let after = Repository::open(fixture.path()).expect("reopen the Repository");
+    let item = after
+        .work_queue()
+        .item(&StepKey::dispatch("ENG-1"))
+        .expect("item")
+        .expect("recorded");
+    assert_eq!(
+        item.state,
+        QueueItemState::Done,
+        "the queue must reflect the latest outcome, not the first failure"
+    );
+    assert_eq!(
+        item.detail, None,
+        "the stale failure's reason must not survive a successful re-dispatch"
+    );
+    assert!(item.finished_at.is_some(), "the successful attempt ended");
+
+    // `resume` reads the queue, which now says done: it leaves the completed
+    // step alone instead of re-dispatching landed work.
+    let resumed = fixture.jjfx(&["resume", "--fg"]);
+    assert!(
+        resumed.status.success(),
+        "resume failed:\nstdout:\n{}\nstderr:\n{}",
+        stdout(&resumed),
+        stderr(&resumed)
+    );
+    let report = stderr(&resumed);
+    assert!(report.contains("Resumed 0 step(s)"), "{report}");
+    assert!(report.contains("ENG-1 already done"), "{report}");
+
+    // Nothing re-ran: the seeded attempt never launched, so the successful
+    // re-dispatch is the only Run Record, and the resumption added none.
+    let records = run_records(&after);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.ticket.as_deref() == Some("ENG-1"))
+            .count(),
+        1,
+        "the resumption must not re-run the completed step: {records:?}"
+    );
+    assert_eq!(records[0].conclusion, RunRecordConclusion::Succeeded);
+}
