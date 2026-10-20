@@ -849,16 +849,28 @@ pub fn mainline_commit(dir: &Path) -> anyhow::Result<String> {
 }
 
 /// The revset `jj absorb` may fold a Worker's working-copy edits into: the
-/// Worker's own mutable commits above the mainline base, and never the mainline
-/// itself.
+/// Worker's own mutable commits above the mainline base and above the commit(s)
+/// its Workspace was stacked on, and never the mainline or a stacked Blocker's
+/// commit.
 ///
 /// `jj absorb` defaults its destination to `mutable()`, which is safe only while
 /// trunk is immutable. Pinning the destination to `(mainline)..@` keeps trunk
 /// out of reach whether or not it is immutable, so a Worker whose change is
 /// already committed stays put instead of being folded into the branch it sits
 /// on.
-pub fn absorb_destinations() -> String {
-    format!("mutable() & ::@ & ~::({})", crate::trunk::as_revset())
+///
+/// `stack_base` is the commit, or commits, the Worker's Workspace was stacked on
+/// when it was materialised - a Blocker's deliverable, which belongs to another
+/// Ticket's pull request. It is above the mainline and mutable, so it is a legal
+/// destination unless it is excluded here: without it, a dependent Worker's
+/// change would be folded into its Blocker's commit, rewriting a change that
+/// another Ticket delivered. It is excluded the same way trunk is.
+pub fn absorb_destinations(stack_base: Option<&[String]>) -> String {
+    let mut destinations = format!("mutable() & ::@ & ~::({})", crate::trunk::as_revset());
+    if let Some(base) = stack_base.filter(|base| !base.is_empty()) {
+        destinations.push_str(&format!(" & ~::({})", base.join(" | ")));
+    }
+    destinations
 }
 
 /// Build a `jj` invocation for a command that may write.
@@ -1423,8 +1435,18 @@ mod tests {
         std::fs::write(root.join("f.txt"), "base\n").expect("writing f.txt");
         run_mut(&root, &["describe", "-m", "main"]).expect("describe");
         run_mut(&root, &["bookmark", "create", "main", "-r", "@"]).expect("bookmark");
+        // The Blocker's deliverable: another Ticket's commit, above the mainline
+        // and mutable, so a legal `jj absorb` destination unless it is excluded.
+        run_mut(&root, &["new", "-m", "B"]).expect("new");
+        std::fs::write(root.join("g.txt"), "b\n").expect("writing g.txt");
+        run_mut(&root, &["describe", "-m", "B"]).expect("describe");
+        let blocker = read_in_dir(&root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"])
+            .expect("the Blocker's commit id reads")
+            .trim()
+            .to_owned();
+        // The dependent Worker's own commit, stacked on the Blocker.
         run_mut(&root, &["new", "-m", "A"]).expect("new");
-        std::fs::write(root.join("f.txt"), "a\n").expect("writing f.txt");
+        std::fs::write(root.join("h.txt"), "a\n").expect("writing h.txt");
         run_mut(&root, &["describe", "-m", "A"]).expect("describe");
 
         let descriptions = |revset: &str| {
@@ -1447,8 +1469,10 @@ mod tests {
         let mutable = descriptions("mutable()");
         assert!(mutable.lines().any(|line| line == "main"), "{mutable}");
 
-        // The pinned destination does not, and keeps the Worker's own commit.
-        let destinations = descriptions(&absorb_destinations());
+        // The pinned destination drops the mainline and keeps the Worker's own
+        // commit - but the Blocker is still above the mainline and mutable, so
+        // without the recorded stack base it remains a destination.
+        let destinations = descriptions(&absorb_destinations(None));
         assert!(
             !destinations.lines().any(|line| line == "main"),
             "{destinations}"
@@ -1456,6 +1480,22 @@ mod tests {
         assert!(
             destinations.lines().any(|line| line == "A"),
             "{destinations}"
+        );
+        assert!(
+            destinations.lines().any(|line| line == "B"),
+            "the unstacked destination still reaches the Blocker: {destinations}"
+        );
+
+        // Excluding the recorded stack base drops the Blocker's commit too, and
+        // the Worker's own commit above it survives.
+        let stacked = descriptions(&absorb_destinations(Some(&[blocker])));
+        assert!(
+            !stacked.lines().any(|line| line == "B"),
+            "the Blocker's commit must not be an absorb destination: {stacked}"
+        );
+        assert!(
+            stacked.lines().any(|line| line == "A"),
+            "the Worker's own commit must survive: {stacked}"
         );
 
         std::fs::remove_dir_all(&repo).ok();

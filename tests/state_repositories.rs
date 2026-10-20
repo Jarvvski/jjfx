@@ -399,6 +399,70 @@ fn session_sidecar_records_reads_and_replaces_worker_sessions() {
 }
 
 #[test]
+fn stack_base_sidecar_records_reads_and_replaces_worker_bases() {
+    let (temp, repository) = repository();
+    let bases = repository.state_store().stack_bases();
+    let worker = WorkerId::parse("worker-01").expect("Worker ID");
+    let other = WorkerId::parse("worker-02").expect("Worker ID");
+    let blocker = "de8626600e67f236e9a3db9f9c93ebe7273843d1".to_owned();
+
+    // A missing sidecar is an empty read surface, not an error: no base recorded
+    // is the unstacked Worker, which the trunk exclusion already covers.
+    assert_eq!(bases.base(&worker).expect("read"), None);
+
+    bases
+        .record(&worker, vec![blocker.clone()])
+        .expect("record");
+    assert_eq!(
+        bases.base(&worker).expect("read"),
+        Some(vec![blocker.clone()])
+    );
+
+    // Each Worker's stack base is independent.
+    bases
+        .record(
+            &other,
+            vec!["f6867b5be87dcfdd1951ab4506439563af0abfab".to_owned()],
+        )
+        .expect("record other");
+    assert_eq!(
+        bases.base(&worker).expect("read"),
+        Some(vec![blocker.clone()])
+    );
+    assert_eq!(
+        bases.base(&other).expect("read"),
+        Some(vec!["f6867b5be87dcfdd1951ab4506439563af0abfab".to_owned()])
+    );
+
+    // A Worker re-dispatched on a different Blocker replaces its base rather than
+    // keeping the stale one, which would exclude a commit it never sat on.
+    bases
+        .record(
+            &worker,
+            vec!["1111111111111111111111111111111111111111".to_owned()],
+        )
+        .expect("replace");
+    assert_eq!(
+        bases.base(&worker).expect("read"),
+        Some(vec!["1111111111111111111111111111111111111111".to_owned()])
+    );
+
+    // It is jjfx-owned sidecar state, not part of the pool and Worker documents.
+    let path = temp.path().join(".jj/pools/default/stack-bases.json");
+    let value: Value =
+        serde_json::from_slice(&fs::read(&path).expect("stack base sidecar")).expect("JSON");
+    assert_eq!(
+        value["bases"]["worker-01"][0],
+        "1111111111111111111111111111111111111111"
+    );
+    assert_eq!(
+        value["bases"]["worker-02"][0],
+        "f6867b5be87dcfdd1951ab4506439563af0abfab"
+    );
+    assert!(!temp.path().join(".jj/pools/default/pool.json").exists());
+}
+
+#[test]
 fn a_legacy_repository_converts_to_a_directory_per_pool_on_first_access() {
     let (_temp, root) = legacy_repository();
     let repository = Repository::open(&root).expect("open converts the legacy layout");
