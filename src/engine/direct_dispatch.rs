@@ -220,6 +220,19 @@ impl DirectDispatch {
         self
     }
 
+    /// Returns every finished Worker to the pool before reserving capacity.
+    ///
+    /// A Worker whose Run has finished reads `done`/`failed` until its outcome
+    /// is reclaimed, and a Pool that never reclaims it serves only as many
+    /// Tickets as it has Workers. Reclaiming here - as part of the Dispatch,
+    /// before it looks for a free slot - is what makes a finished Worker
+    /// available to a later Dispatch without an operator running `jjfx pool
+    /// reset` between rounds. Best effort: the Reservation below reports any
+    /// capacity that is still missing.
+    fn reclaim_finished(&self) {
+        self.repository.worker_pool().reclaim_finished();
+    }
+
     /// Splits a batch at the capacity governor.
     ///
     /// The held-back Tickets are the tail of the requested batch, so a caller
@@ -361,6 +374,7 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
+        self.reclaim_finished();
         let (fire, waiting) = self.governed(requests);
         if fire.is_empty() {
             return Ok(self.finish(DirectDispatchResult::default().with_waiting(waiting)));
@@ -399,6 +413,7 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
+        self.reclaim_finished();
         let (fire, waiting) = self.governed(requests);
         if fire.is_empty() {
             return Ok(self.finish(DirectDispatchResult::default().with_waiting(waiting)));
@@ -437,6 +452,7 @@ impl DirectDispatch {
         if requests.is_empty() {
             return Ok(DirectDispatchResult::default());
         }
+        self.reclaim_finished();
         let (fire, waiting) = self.governed(requests);
         if fire.is_empty() {
             return Ok(self.finish(DirectDispatchResult::default().with_waiting(waiting)));

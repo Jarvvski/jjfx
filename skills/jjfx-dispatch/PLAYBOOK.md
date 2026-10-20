@@ -124,21 +124,24 @@ driving `ReviewLoop` (finding 04). Until then, treat `review` as one prompt.
 
 ### 3d. A pool of N serves N Tickets
 
-A Worker that finished a Run reads `done`, not `idle`, and is not reused. After N
-Runs `dispatch --all` reports `failed` for the overflow and stderr says "Grow pool
-by 1"; a named `dispatch` errors `no idle Worker is available`. Finding 07.
+**Fixed.** A Worker that finished a Run reads `done`, not `idle`, and used not to
+be reused: after N Runs `dispatch --all` reported `failed` for the overflow and
+stderr said "Grow pool by 1", and a named `dispatch` errored `no idle Worker is
+available`. Finding 07.
 
-**Workaround:** reclaim a finished Worker before the next round:
+A finished Worker's outcome is collected once it reads `done`/`failed`, and the
+next Dispatch now returns it to `idle` automatically before it looks for
+capacity. A pool of N therefore serves a backlog larger than N across successive
+rounds with no manual step:
 
 ```sh
-jjfx pool reset worker-XXXX       # returns it to idle
+jjfx dispatch --all --json   # round 1 fills the pool
+jjfx wait --all --until terminal --timeout 600
+jjfx dispatch --all --json   # round 2 reuses the finished Workers
 ```
 
-or size the pool to the whole backlog up front (`jjfx pool 8`).
-
-**What jjfx should own:** returning a Worker to the pool once its outcome is
-collected, or at least having the no-capacity Dispatch name `pool reset` rather
-than "grow the pool".
+`jjfx pool reset worker-XXXX` remains the explicit reclaim, for a Worker you want
+to reset *now* rather than at the next Dispatch.
 
 ### 3e. `resume` can re-run landed work
 
@@ -196,8 +199,7 @@ guess, or read the source to discover:
 4. **The check reader.** Read the `gh` the operator has. (§3c)
 5. **The review loop.** Wire `ReviewLoop` to a command, or stop advertising it.
    (§3c, finding 04)
-6. **Worker reuse.** Return a finished Worker to the pool, or name `pool reset`.
-   (§3d)
+6. **Worker reuse.** Return a finished Worker to the pool. (§3d, done)
 7. **Resume safety.** Do not re-run a resolved Ticket. (§3e)
 8. **Delivery.** Perform the push+PR the prompt promises. (§4)
 9. **Capacity.** Let the repository set its own ceiling. (finding 10, done for
@@ -217,7 +219,7 @@ the control plane. The point of jjfx is that it is.
 - [ ] Pool sized; `hooks status` reported.
 - [ ] `dispatch --all --json`; every Ticket has an outcome.
 - [ ] `status --json` read for `workers[]`/`governor{}`/`queue[]`, not logs.
-- [ ] `pool reset` a finished Worker before the next round (or pool >= backlog).
+- [ ] Next round after `wait --until terminal`; a finished Worker is reused automatically.
 - [ ] `resume` named, never bare.
 - [ ] Push bookmarks before `absorb`/`rebase`/`open-pr`.
 - [ ] PR + `gh pr checks` + merge on green; expect conflicts from parallel work.

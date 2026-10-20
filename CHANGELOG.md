@@ -105,6 +105,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch reports a Ticket with no free Worker as `waiting` rather than `failed` - `dispatch --all` and a named `dispatch` agree on the same capacity gap, and the Ticket is queued for a later Dispatch - and a Ticket held back by the concurrency cap names the in-flight count that actually bound the batch (the count `jjfx status --json` reports), not the pre-launch `0` a first Dispatch used to print
 - jjfx rebase reports a conflicted rebase as a named outcome instead of a push failure whose rollback implied the rebase was undone
 - jjfx help review no longer claims to run a bounded review loop: no command drives ReviewLoop, so the review page and the docs now state that jjfx runs no reviewer of its own and the loop's only caller is the harness seam
+- A finished Worker is returned to the pool automatically: a Worker whose Run has finished (done or failed) is reclaimed to idle on the next Dispatch, so a Pool of N serves a backlog larger than N across successive rounds without a manual jjfx pool reset.
 
 ## [0.55.0] - 2026-10-16
 
