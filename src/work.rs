@@ -214,8 +214,11 @@ impl SystemWorkReads {
 impl WorkReads for SystemWorkReads {
     fn pull_requests(&self) -> Result<Vec<crate::prs::Pr>, String> {
         match crate::jj::derive_repo_slug(&self.repo_root) {
-            // Not a GitHub Repository: there is nothing to read, and that is not a
-            // failure.
+            // No `origin` remote at all: there is no forge to read from, and that
+            // is not a failure. A present-but-non-GitHub `origin` is an `Err`
+            // instead, so it reads as an unknown Pull Request state rather than a
+            // confident "no Pull Requests" - which would claim a pushed commit
+            // needs no forge.
             Ok(None) => Ok(Vec::new()),
             Ok(Some(slug)) => crate::prs::list(&slug),
             Err(error) => Err(error.to_string()),
@@ -1392,6 +1395,35 @@ mod tests {
             snapshot(&failed, &["feat".to_string()])["feat"].state,
             WorkState::Unknown
         );
+    }
+
+    /// The production read port refuses a non-GitHub `origin` by name rather than
+    /// fabricating a slug for `gh`. It is an `Err`, not an empty list: "no Pull
+    /// Requests" is a confident claim this read cannot make.
+    #[test]
+    fn pull_requests_refuses_a_non_github_origin_by_name() {
+        let repo = temp_repo("non-github-origin");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        jj(
+            &root,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                "/Users/jarvis/Code/personal/dogfood-site-origin.git",
+            ],
+        );
+
+        let error = SystemWorkReads::new(root.clone())
+            .pull_requests()
+            .expect_err("a non-GitHub origin is refused");
+        assert!(
+            error.contains("origin is not a GitHub remote"),
+            "the refusal reuses the family's named message: {error}"
+        );
+
+        std::fs::remove_dir_all(&repo).ok();
     }
 
     #[test]

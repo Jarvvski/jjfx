@@ -1562,10 +1562,7 @@ pub(crate) enum RepositoryIdentityError {
     /// Raised both when deriving the slug from `origin` and when resolving a
     /// persisted `gh_repo` that this `origin` fabricated, so a Pool left holding
     /// one is told what is wrong rather than sent to `gh`.
-    #[error(
-        "origin is not a GitHub remote: {0}; point `origin` at GitHub (or set \
-         the pool's `gh_repo`)"
-    )]
+    #[error("{}", crate::jj::not_github_remote(.0))]
     NotGitHub(String),
     /// Reading the Repository's git remotes failed.
     #[error("{0}")]
@@ -1625,7 +1622,7 @@ pub(crate) fn refuse_a_fabricated_slug(
     let Ok(Some(remote)) = origin_remote(root) else {
         return Ok(());
     };
-    if remote_slug(&remote).is_some() {
+    if crate::jj::remote_slug(&remote).is_some() {
         // A GitHub `origin` gives a persisted slug a GitHub provenance, so
         // there is no fabrication to refuse.
         return Ok(());
@@ -1643,11 +1640,14 @@ pub(crate) fn refuse_a_fabricated_slug(
 /// are not an identity, and guessing one invents a repository that does not
 /// exist. Direct Dispatch, orchestration and Worker Pool discovery share this
 /// one read, so a non-GitHub `origin` is refused the same way everywhere.
+///
+/// The derivation itself is [`crate::jj::remote_slug`] - the same one the
+/// forge's `derive_repo_slug` uses - so the two can no longer agree by hand.
 pub(crate) fn origin_slug(root: &Path) -> Result<Option<String>, RepositoryIdentityError> {
     let Some(remote) = origin_remote(root)? else {
         return Ok(None);
     };
-    remote_slug(&remote)
+    crate::jj::remote_slug(&remote)
         .map(Some)
         .ok_or(RepositoryIdentityError::NotGitHub(remote))
 }
@@ -1681,8 +1681,8 @@ fn origin_remote(root: &Path) -> Result<Option<String>, RepositoryIdentityError>
 /// the last two `/`-separated segments.
 ///
 /// Kept only to recognise the value a legacy Pool may already hold, so it can be
-/// refused by name. Nothing derives an identity from it - [`remote_slug`] is the
-/// one derivation, and it refuses anything that is not a GitHub remote.
+/// refused by name. Nothing derives an identity from it - [`crate::jj::remote_slug`]
+/// is the one derivation, and it refuses anything that is not a GitHub remote.
 fn fabricated_slug(remote: &str) -> String {
     let remote = remote.trim_end_matches(".git");
     if let Some((_, path)) = remote.rsplit_once(':') {
@@ -1693,54 +1693,6 @@ fn fabricated_slug(remote: &str) -> String {
         (Some(name), Some(owner)) => format!("{owner}/{name}"),
         _ => remote.to_owned(),
     }
-}
-
-/// Derives an `owner/name` slug from a GitHub git remote URL.
-///
-/// Accepts the two shapes a remote takes: the scp-like
-/// `[user@]github.com:owner/name(.git)` and the URL
-/// `scheme://[user@]github.com[:port]/owner/name(.git)`. Returns `None` for any
-/// remote whose host is not `github.com` - a filesystem path or another forge
-/// has no GitHub identity, and deriving one from its last two path segments
-/// invents a repository that does not exist.
-pub(crate) fn remote_slug(remote: &str) -> Option<String> {
-    let (host, path) = split_remote(remote)?;
-    if !host.eq_ignore_ascii_case("github.com") {
-        return None;
-    }
-    let path = path.trim_end_matches(".git");
-    let mut parts = path.rsplitn(3, '/');
-    match (parts.next(), parts.next()) {
-        (Some(name), Some(owner)) => Some(format!("{owner}/{name}")),
-        _ => Some(path.to_owned()),
-    }
-}
-
-/// Splits a git remote into its `(host, path)`.
-///
-/// Handles the URL form `scheme://[user@]host[:port]/path` and the scp-like
-/// form `[user@]host:path`. Returns `None` for a bare filesystem path, which has
-/// no host to speak of.
-fn split_remote(remote: &str) -> Option<(&str, &str)> {
-    let remote = remote.trim();
-    if let Some((_, rest)) = remote.split_once("://") {
-        let rest = rest
-            .rsplit_once('@')
-            .map_or(rest, |(_, authority)| authority);
-        let (authority, path) = rest.split_once('/')?;
-        let host = authority
-            .split_once(':')
-            .map_or(authority, |(host, _port)| host);
-        return Some((host, path));
-    }
-    let (authority, path) = remote.split_once(':')?;
-    if authority.contains('/') {
-        return None;
-    }
-    let host = authority
-        .rsplit_once('@')
-        .map_or(authority, |(_, host)| host);
-    Some((host, path))
 }
 
 /// List workspace names through an explicit template. The default
@@ -2337,41 +2289,6 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&repo).ok();
-    }
-
-    #[test]
-    fn remote_slug_reads_a_github_remote_and_refuses_anything_else() {
-        for remote in [
-            "git@github.com:owner/name.git",
-            "https://github.com/owner/name.git",
-            "ssh://git@github.com:22/owner/name",
-            "git@github.com:owner/name",
-        ] {
-            assert_eq!(
-                remote_slug(remote).as_deref(),
-                Some("owner/name"),
-                "{remote} is a GitHub remote"
-            );
-        }
-
-        // A filesystem path has no host, so its last two path segments are not
-        // an identity: this is the slug the dogfood drive invented.
-        for remote in [
-            "/Users/jarvis/Code/personal/dogfood-site-origin.git",
-            "./relative/repo.git",
-            "file:///Users/jarvis/Code/personal/repo.git",
-        ] {
-            assert_eq!(remote_slug(remote), None, "{remote} is not a GitHub remote");
-        }
-
-        // Another forge is a real host, but not GitHub's.
-        for remote in [
-            "git@gitlab.com:owner/name.git",
-            "https://gitlab.com/owner/name",
-            "https://codeberg.org/owner/name",
-        ] {
-            assert_eq!(remote_slug(remote), None, "{remote} is not a GitHub remote");
-        }
     }
 
     #[test]

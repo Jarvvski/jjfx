@@ -1131,6 +1131,49 @@ mod tests {
         }
     }
 
+    /// A jj whose `origin` is present but not a GitHub remote: the derivation
+    /// refuses it, and the forge must report that refusal rather than fabricate
+    /// an `owner/name` slug from the remote's last two path segments.
+    struct NonGitHubOriginJj;
+
+    impl JjAdapter for NonGitHubOriginJj {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
+        }
+
+        fn origin_slug(&self) -> Result<Option<String>, String> {
+            Err(crate::jj::not_github_remote(
+                "/Users/jarvis/Code/personal/dogfood-site-origin.git",
+            ))
+        }
+    }
+
+    /// A GitHub that panics on every call: the proof that a refused `origin`
+    /// never reaches `gh`, which is the whole point of refusing it.
+    struct NoGitHub;
+
+    impl GitHubAdapter for NoGitHub {
+        fn default_branch(&self, slug: &str) -> Result<String, String> {
+            panic!("`gh` must not be consulted for a non-GitHub origin, got {slug}")
+        }
+
+        fn exists(&self, _slug: &str, _head: &str) -> Result<bool, String> {
+            panic!("`gh` must not be consulted for a non-GitHub origin")
+        }
+
+        fn create(&self, _request: NewPullRequest) -> Result<(), String> {
+            panic!("`gh` must not be consulted for a non-GitHub origin")
+        }
+    }
+
     struct RepositoryGitHub;
 
     impl GitHubAdapter for RepositoryGitHub {
@@ -2318,6 +2361,43 @@ mod tests {
         assert!(matches!(
             updates.last(),
             Some(Update::Finished { progress: None, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_non_github_origin_is_reported_rather_than_fabricated_into_a_gh_lookup() {
+        // Pull Requests are on, but `origin` is not a GitHub remote, so no slug
+        // can be derived. The step must report that and never reach `gh`: a
+        // fabricated `owner/name` is the failure this refusal replaces.
+        let forge = Forge::with_github(
+            settings(true, true),
+            Arc::new(NonGitHubOriginJj),
+            Arc::new(UnlockedGpg),
+            Arc::new(NoGitHub),
+        );
+
+        let updates = updates(forge.start(vec![Target::new(
+            "feat".to_string(),
+            PathBuf::from("/workspace/feat"),
+        )]))
+        .await;
+
+        assert!(updates.iter().any(|update| matches!(
+            update,
+            Update::Progress { progress, .. }
+                if status(progress, Step::PullRequest) == Status::Skipped
+                    && progress.reason().is_some_and(|reason| reason
+                        .contains("origin is not a GitHub remote"))
+        )));
+        // A refused forge is a failure, not an absence: unlike a repository with
+        // no `origin` at all, the run is not a clean success and the reason is
+        // retained.
+        assert!(matches!(
+            updates.last(),
+            Some(Update::Finished {
+                progress: Some(progress),
+                ..
+            }) if !progress.active()
         ));
     }
 
