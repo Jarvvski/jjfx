@@ -49,17 +49,33 @@ a way that is visible rather than aesthetic. A site cannot fail a check.
   backlog, as the first drive did.
 - Leave the fixture's evidence behind deliberately.
 
-## Open decisions
+## Decisions (2026-10-20)
 
-- **Language**: a non-Rust tool would prove jjfx is toolchain-agnostic; Rust
-  reuses a toolchain already known to work end to end.
-- **Forge**: a real throwaway GitHub repository validates the one blessed forge
-  path end to end (push, open a PR, merge on green); a local bare origin is
-  cheaper and offline but cannot exercise merge-on-green at all.
-- **Topology**: jjfx's own dispatch (pool, queue, governor) is the thing to
-  drive; whether the drive should also reproduce the owner's real
-  `build -> general -> reviewer` shape, and see whether jjfx can host it, is the
-  crux of "agent usage" and is not yet settled.
+- **Language: Python.** A tool in a language unlike Rust, so the drive proves
+  jjfx is toolchain-agnostic rather than accidentally Rust-shaped.
+- **Forge: a real throwaway GitHub repository.** The one blessed forge path is
+  validated end to end - push, open a PR, read the check, merge on green - which
+  a local bare origin cannot exercise at all.
+- **Topology: jjfx dispatch, hosting the real shape.** Driven through jjfx
+  (pool, queue, governor, review bound) with the review step included, so jjfx
+  hosts the owner's real `build -> general -> reviewer` shape. Whether it can is
+  the crux of "agent usage".
+
+## A question the drive must answer
+
+`harness/09` and `harness/12` built step identity, a decision log and a review
+loop that replays a recorded pass without reaching the model - proven end to
+end at the harness seam, by driving the loop twice through a reviewer that
+panics if asked.
+
+**No command invokes that loop**, and that is not an oversight in either ticket:
+`jjfx review` *sends a prompt* and produces no findings of its own, so jjfx
+holds no decision to replay until something calls the loop. The drive should
+settle whether that is the right boundary - jjfx is not a reviewer - or whether
+the reduction the parent ticket was filed for (seven review dimensions recurring
+8-11x) needs jjfx to own the loop after all. **Measure it, do not assume it**:
+the honest question is whether an agent working a backlog through jjfx ever
+repeats a dimension, and whether anything notices if it does.
 
 ## References
 
