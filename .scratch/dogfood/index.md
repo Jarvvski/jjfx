@@ -25,6 +25,7 @@ half. Three of the landing verbs failed, one of them silently and destructively.
 | 08 | `colocation status` hung once, unreproduced | bug |
 | 09 | `absorb` can still fold a stacked Worker into its blocker's commit | bug |
 | 10 | `open-pr` still reads a stale fabricated `gh_repo` from existing pool state | bug |
+| 11 | the forge's own slug derivation still fabricates one from a non-GitHub origin | bug |
 
 ## What worked, and should not be refactored away
 
@@ -37,7 +38,11 @@ half. Three of the landing verbs failed, one of them silently and destructively.
 
 ## Provenance
 
-Filed from the drive's report, 2026-10-19. The severity-1 findings (01, 02, 03)
+Filed from the drive's report, 2026-10-19. `11` was found while closing `10`
+(#131): the persisted slug read was one derivation, and the forge's live one
+was a second.
+
+The rest was filed from the drive's report, 2026-10-19. The severity-1 findings (01, 02, 03)
 were verified against the merged source before filing - including re-running
 `jj log -r 'trunk()'` and `jj log -r 'mutable() & bookmarks(exact:main)'` to
 establish the precondition - rather than taken from the report on trust.
