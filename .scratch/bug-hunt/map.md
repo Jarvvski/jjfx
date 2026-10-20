@@ -316,3 +316,12 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
 - [43](issues/43-concurrent-provisioning-blocks-under-load.md) - F4, filed from two
   independent sightings while fixing `35` and `42`; the third load-sensitive
   failure, and the first where the work itself did not complete.
+  **resolved** - not a shared cache: the hypothesis is ruled out (per-copy
+  `TMPDIR` isolation does not change the scaling, and neither does bypassing the
+  `mise` shim), there is no deadlock or lock-ordering bug, and the blocking is
+  not reproducible (~350 runs under load, including the 42 harness, 0
+  failures). The one genuinely shared, serialised resource in the path is the
+  developer's GPG smartcard, which `jj workspace add` uses to sign the
+  workspace's working-copy commit whenever `JJFX_TEST_SIGNING_OFF` is unset;
+  `mise run test` sets it. Harness reconstructed at
+  `.scratch/bug-hunt/load-harness.sh`.
