@@ -37,6 +37,36 @@ Why a tool rather than a site: it has a real build and a real test suite, so the
 verified-done check has something to verify, and a Ticket can fail its check in
 a way that is visible rather than aesthetic. A site cannot fail a check.
 
+## The binary: a local build, not the one on `PATH`
+
+The drive must exercise the **unreleased** changes, so it runs a `jjfx` built
+from this repository's `main` - never a released binary.
+
+This is not hypothetical. Measured 2026-10-20:
+
+- `which -a jjfx` finds `/Users/jarvis/.cargo/bin/jjfx` **first**, reporting
+  `jjfx 0.54.0`; the mise shim beside it is the same version.
+- The build already sitting in `target/` (19 Oct 18:51) reports `0.55.0-dev` but
+  **predates `resume` (#124) and `ticket list` (#141)** - `jjfx help resume` and
+  `jjfx help ticket list` both fail against it. A stale build is not always a
+  released one.
+
+So, before the drive:
+
+- **build from the current `main`** (`mise run build`), *after* the last ticket
+  lands so the build contains everything;
+- run the drive with the built binary **first on `PATH`** (`target/release`), or
+  by absolute path;
+- **verify it** - a claim you did not run is the thing `dogfood/07` was about:
+  `jjfx version` must report `0.55.0-dev` (a checkout build carries the `-dev`
+  suffix), and every verb the drive uses must answer (`jjfx help resume`,
+  `jjfx help ticket`, `jjfx children`, `jjfx absorb`).
+
+`dogfood/07` documented exactly this trap for an agent: a stale binary first on
+`PATH` makes the skill's central promise - that `jjfx help <command>` reflects
+the parser - false, silently. The drive should treat *"which jjfx am I running?"*
+as a precondition, and the playbook should say so.
+
 ## Method
 
 - Drive it **the way an agent would**, through jjfx: dispatch, pool, the queue,
