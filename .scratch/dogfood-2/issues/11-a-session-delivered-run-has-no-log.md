@@ -1,6 +1,6 @@
 # `jjfx logs` follows an empty file for a session-delivered Run
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -33,3 +33,15 @@ have content for the common (opencode, API-reachable) case.
 
 - `.scratch/harness/issues/03-dispatch-without-a-process.md`
 - `src/engine/run_log.rs`, `src/engine/opencode_api.rs`
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Not independently re-verified - the drive reproduced it live.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

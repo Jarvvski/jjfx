@@ -203,6 +203,32 @@ Each is a file under `.scratch/dogfood-2/issues/` on its own branch and PR.
 
 ---
 
+## 5a. Triage of the twelve findings
+
+All twelve were filed as findings and carried `needs-triage`. They are now
+`ready-for-agent`: the evidence for each is a **live reproduction during the
+drive**, and their acceptance criteria were already specific and testable.
+
+Independently re-verified after the drive (by the orchestrator, against the
+merged source and the locally built binary):
+
+| Finding | Independently verified? |
+|---|---|
+| 02 landing verbs refuse a fresh bookmark | **confirmed** - `jj bookmark list -T name` printed the same bookmark twice |
+| 03 `review` cannot parse `gh pr checks` | **confirmed** - `gh 2.102.0` rejects `--json conclusion` |
+| 04 the bounded loop has no caller | **confirmed** - `help review` claims it; nothing reaches it |
+| 05 no CLI verb delivers the push+PR | **confirmed** - no verb opens a Pull Request |
+| 09 `help ticket` is unknown | **confirmed** |
+| 10 the cap is user-global only | **confirmed** - a repository may set only `[checks]`, `[pools]`, `[tickets]` |
+| 01 dispatch from an opencode session | mechanism checked (`OPENCODE_SESSION_ID` is set here; the anchor is asserted); the failing launch was not re-run, because it spends a Run |
+| 06, 07, 08, 11, 12 | not re-verified; the drive reproduced each live |
+
+**One item from the playbook has no finding behind it**: *"say which build a
+command needs"*. That is already covered by `dogfood/07` (#140), which added the
+pin-the-binary paragraph to the skill, so it is not filed again.
+
+---
+
 ## 6. The usage playbook
 
 `skills/jjfx-dispatch/PLAYBOOK.md` (new, beside `SKILL.md`) is the agent-facing

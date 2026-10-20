@@ -1,6 +1,6 @@
 # `jjfx review` cannot read `gh pr checks` on gh 2.102
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -61,3 +61,16 @@ it exists for.
 
 - `src/engine/worker_actions.rs:1317` (`failing_checks`)
 - `src/engine/worker_actions.rs:759` (`WorkerActions::review`)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently **confirmed**: `gh 2.102.0` rejects `--json name,conclusion` -
+`Unknown JSON field: "conclusion". Available fields: bucket`.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

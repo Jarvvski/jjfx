@@ -1,6 +1,6 @@
 # A finished Worker is never returned to the pool, so a pool of N does N tickets
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -54,3 +54,15 @@ own.
 
 - `src/engine/pool.rs` (`WorkerStatus`, reset), `src/engine/eligibility.rs`
 - `skills/jjfx-dispatch/SKILL.md` (steps 1, 7)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Not independently re-verified - the drive reproduced it live against a real pool.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.

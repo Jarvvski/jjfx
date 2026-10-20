@@ -1,6 +1,6 @@
 # The bounded review loop has no caller, and `jjfx review --fg` says it does
 
-Status: needs-triage
+Status: ready-for-agent
 Type: design
 Blocked by: none
 
@@ -62,3 +62,16 @@ end to end against the built binary.)
   `.scratch/harness/issues/09-idempotent-steps.md`,
   `.scratch/harness/issues/12-wire-the-decision-log.md`
 - `.scratch/dogfood-2/map.md` (the question this answers)
+
+## Triage (2026-10-20)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the second drive**, not a code reading: the drive hit this
+while working a real backlog through jjfx, and the report
+(`.scratch/dogfood-2/report.md`) records what happened around it.
+
+Independently **confirmed**: `jjfx help review` prints `--fg  Run the full
+bounded review loop in the foreground`, and no command reaches `ReviewLoop`.
+
+The acceptance criteria are unchanged - they were already specific and
+testable, which is why this needed triage rather than a rewrite.
