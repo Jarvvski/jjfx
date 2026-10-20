@@ -1,6 +1,6 @@
 # Dispatching from inside an opencode session cannot launch a Worker
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -54,11 +54,11 @@ Workspace the Run never ran in), and nothing deletes them:
 
 ## Acceptance Criteria
 
-- [ ] A Dispatch issued from inside an opencode session launches a Worker whose
+- [x] A Dispatch issued from inside an opencode session launches a Worker whose
       session is anchored to the Worker Workspace (or the child-session anchor
       assertion is reconciled with opencode's directory inheritance), so the
       agent-driven path dispatches.
-- [ ] A launch that fails the anchor assertion removes the session it created,
+- [x] A launch that fails the anchor assertion removes the session it created,
       rather than leaving it for `children` to report as an orphan.
 
 ## References
@@ -81,3 +81,57 @@ itself was **not** re-reproduced here, because doing so spends a Run.
 
 The acceptance criteria are unchanged - they were already specific and
 testable, which is why this needed triage rather than a rewrite.
+
+## Resolution
+
+The root cause is opencode's contract, not a bug in jjfx's assertion: **a session
+created with a `parentID` is anchored to its parent's location**, and opencode
+offers no way to move it there (`session.create` ignores `location` when
+`parentID` is set, and `session.move` leaves a child where its parent is).
+Verified live against opencode v2.1.1: a child requested at `/tmp` under a parent
+in a jjfx workspace was stored at the parent's directory, and `session.move` on
+the child was a no-op while the same call moved a root session.
+
+A Run must execute in its Worker Workspace - that anchor is the guard that keeps
+an agent out of the wrong worktree - so the anchor wins over the child-session
+topology. `create_run_session` now asks whether the dispatching session is itself
+anchored to the Worker Workspace (`nestable_parent`): only then does it send
+`parentID`. Otherwise the Run's session is created as a **root** session anchored
+to the Worker Workspace, which opencode honours, so a Dispatch issued from an
+agent's own shell launches a Worker with no workaround. A parent jjfx cannot read
+is not honoured either - the Run gets a session jjfx can vouch for.
+
+A launch that fails after `session.create` now removes the session it created
+(`OpenCodeApi::delete_session`, the `session.remove` route) before returning the
+error, so `children` never reports an orphan nothing drives. The removal is
+best-effort: a failed removal is appended to the anchor reason rather than
+replacing it.
+
+Verified: `mise run check` (changelog validation + fmt + lint + build + test)
+passes. Unit tests over the `OpenCodeRunner` seam cover the child kept when the
+dispatcher is in the Workspace, the root session when it is elsewhere or
+unreadable, the removal on a mismatched anchor and on a rejected read-back, a
+failed removal that does not hide the anchor failure, and `session.remove`'s own
+success and rejection. `tests/agent_runtime.rs` drives the real reserved Run
+against a fake `opencode` that emulates the inheritance rule:
+`opencode_run_anchors_a_root_session_when_the_dispatching_session_is_elsewhere`
+proves the agent-driven path starts, and
+`opencode_run_fails_when_the_session_is_anchored_elsewhere` now also asserts the
+session was removed. `tests/dispatch_outcomes.rs` drives the built binary:
+`a_dispatch_from_an_opencode_session_launches_a_worker` runs
+`OPENCODE_SESSION_ID=ses_dispatcher jjfx dispatch --all --json` against a fake
+`opencode` whose dispatching session is anchored to the repository, and asserts
+`outcome: dispatched` with a root session anchored to the Worker Workspace - the
+exact reproduction in this ticket, red before the fix (`cannot anchor Worker ...
+instead of the Worker Workspace`) and green after.
+
+Docs updated: `docs/lifecycle-integration.md` (parentage is conditional on the
+dispatcher's anchor), `skills/jjfx-dispatch/PLAYBOOK.md` (§3a is now a fixed trap,
+and the checklist no longer teaches `env -u OPENCODE_SESSION_ID`), and the
+unreleased changelog entry for the child-session topology.
+
+**Not done, deliberately:** the child-session topology (`harness/08`) is now
+unreachable in the common case, because a dispatching agent runs in the
+repository rather than the Worker Workspace. Recovering it needs opencode to
+anchor a child elsewhere, or jjfx to record the dispatcher link in its own state
+rather than opencode's `parentID`; both are a design change beyond this bug.

@@ -50,6 +50,8 @@ const HELPER_DESCENDANT: &str = "JJFX_AGENT_RUNTIME_HELPER_DESCENDANT";
 const HELPER_PTY_SLAVE: &str = "JJFX_AGENT_RUNTIME_HELPER_PTY_SLAVE";
 const HELPER_OPENCODE_WORKSPACE: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE";
 const HELPER_OPENCODE_GET_DIRECTORY: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY";
+const HELPER_OPENCODE_PARENT_DIRECTORY: &str =
+    "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_PARENT_DIRECTORY";
 const HELPER_OPENCODE_SESSION_ID: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_ID";
 const HELPER_OPENCODE_ACTION: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_ACTION";
 const HELPER_OPENCODE_INTERRUPT: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_INTERRUPT";
@@ -1574,11 +1576,13 @@ fn reserved_background_run_finalizes_worker_after_wait() {
 
 /// A fake `opencode` that answers the session API and records what the Run drove.
 ///
+/// `session.get` for the dispatching session reports the directory in
+/// `JJFX_AGENT_RUNTIME_HELPER_OPENCODE_PARENT_DIRECTORY`, and for any other
+/// session the directory in `JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`.
 /// `session.create` records the request body and reports `ses_test` anchored to
-/// the Worker Workspace; `session.get` reports it anchored to the directory in
-/// `JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY`; `session.prompt` records
-/// the delivered prompt body; `run` records its cwd and arguments, so a test can
-/// prove no client process was spawned.
+/// the Worker Workspace; `session.remove` records the session it was asked to
+/// delete; `session.prompt` records the delivered prompt body; `run` records its
+/// cwd and arguments, so a test can prove no client process was spawned.
 const OPENCODE_SESSION_SCRIPT: &str = r#"#!/bin/sh
 case "$1" in
   --version) printf '%s\n' '2.0.29'; exit 0 ;;
@@ -1589,7 +1593,15 @@ case "$1" in
         printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_WORKSPACE"
         exit 0 ;;
       session.get)
+        case "$4" in
+          sessionID=ses_dispatcher)
+            printf '{"data":{"id":"ses_dispatcher","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_PARENT_DIRECTORY"
+            exit 0 ;;
+        esac
         printf '{"data":{"id":"ses_test","location":{"directory":"%s"}}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_GET_DIRECTORY"
+        exit 0 ;;
+      session.remove)
+        printf '%s' "$4" > "__REMOVE_ARG__"
         exit 0 ;;
       session.prompt)
         printf '%s' "$6" > "__PROMPT_BODY__"
@@ -1624,6 +1636,7 @@ struct OpencodeSessionFixture {
     workspace: PathBuf,
     create_body: PathBuf,
     prompt_body: PathBuf,
+    remove_arg: PathBuf,
     run_args: PathBuf,
     bin_directory: PathBuf,
     result: PathBuf,
@@ -1660,6 +1673,7 @@ fn opencode_session_fixture() -> OpencodeSessionFixture {
     OpencodeSessionFixture {
         create_body: temporary_directory.path().join("opencode-create-body"),
         prompt_body: temporary_directory.path().join("opencode-prompt-body"),
+        remove_arg: temporary_directory.path().join("opencode-remove-arg"),
         run_args: temporary_directory.path().join("opencode-run-args"),
         result: temporary_directory.path().join("result"),
         _temporary_directory: temporary_directory,
@@ -1677,16 +1691,17 @@ impl OpencodeSessionFixture {
             &script
                 .replace("__CREATE_BODY__", &self.create_body.display().to_string())
                 .replace("__PROMPT_BODY__", &self.prompt_body.display().to_string())
+                .replace("__REMOVE_ARG__", &self.remove_arg.display().to_string())
                 .replace("__RUN_ARGS__", &self.run_args.display().to_string()),
         );
     }
 
     fn spawn_helper(&self, get_directory: &Path, session_id: Option<&str>) -> std::process::Output {
-        self.spawn_helper_from(get_directory, session_id, None)
+        self.spawn_helper_from(get_directory, session_id, None, &self.workspace)
     }
 
     /// Spawns the helper as a Dispatch issued from the opencode session
-    /// `dispatcher`, when there is one.
+    /// `dispatcher`, anchored to `parent_directory`, when there is one.
     ///
     /// `OPENCODE_SESSION_ID` is cleared when there is not, so a test run from
     /// inside an opencode session cannot silently make a root-session assertion
@@ -1696,6 +1711,7 @@ impl OpencodeSessionFixture {
         get_directory: &Path,
         session_id: Option<&str>,
         dispatcher: Option<&str>,
+        parent_directory: &Path,
     ) -> std::process::Output {
         let mut helper = Command::new(env::current_exe().expect("test executable"));
         helper
@@ -1703,6 +1719,7 @@ impl OpencodeSessionFixture {
             .env("PATH", runtime_path(&self.bin_directory))
             .env(HELPER_OPENCODE_WORKSPACE, &self.workspace)
             .env(HELPER_OPENCODE_GET_DIRECTORY, get_directory)
+            .env(HELPER_OPENCODE_PARENT_DIRECTORY, parent_directory)
             .env(HELPER_REPOSITORY, self.repository.root())
             .env(HELPER_WORKER, self.worker_id.as_str())
             .env(HELPER_RESULT, &self.result)
@@ -1813,12 +1830,18 @@ fn opencode_run_prompts_its_session_with_no_client_process() {
 
 #[test]
 fn opencode_run_creates_a_child_session_of_the_session_that_dispatched_it() {
-    // The Dispatch was issued from an opencode session, so the Run's session is
-    // created as that session's child and the dispatcher can see it.
+    // The Dispatch was issued from an opencode session that is itself anchored to
+    // the Worker Workspace, so the Run's session is created as that session's
+    // child and the dispatcher can see it.
     let fixture = opencode_session_fixture();
     fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
 
-    let output = fixture.spawn_helper_from(&fixture.workspace, None, Some("ses_dispatcher"));
+    let output = fixture.spawn_helper_from(
+        &fixture.workspace,
+        None,
+        Some("ses_dispatcher"),
+        &fixture.workspace.clone(),
+    );
     assert!(
         output.status.success(),
         "helper failed: {}",
@@ -1843,6 +1866,47 @@ fn opencode_run_creates_a_child_session_of_the_session_that_dispatched_it() {
         body["location"]["directory"].as_str(),
         Some(fixture.workspace.to_str().expect("workspace UTF-8"))
     );
+}
+
+/// The bug this fixes: a Dispatch issued from an opencode session in the
+/// repository failed every launch, because opencode anchors a child session to
+/// its parent's directory and jjfx asserted the Worker Workspace. The Run's
+/// session is now a root session anchored to the Worker Workspace, so the
+/// agent-driven path dispatches.
+#[test]
+fn opencode_run_anchors_a_root_session_when_the_dispatching_session_is_elsewhere() {
+    let fixture = opencode_session_fixture();
+    fixture.write_opencode(OPENCODE_SESSION_SCRIPT);
+    // The dispatching session runs in the repository, not the Worker Workspace.
+    let elsewhere = fixture.repository.root().to_owned();
+
+    let output =
+        fixture.spawn_helper_from(&fixture.workspace, None, Some("ses_dispatcher"), &elsewhere);
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&fixture.result).expect("helper result"),
+        "session ses_test"
+    );
+
+    let body: Value = serde_json::from_slice(
+        &fs::read(&fixture.create_body).expect("recorded session.create body"),
+    )
+    .expect("session.create body JSON");
+    assert!(
+        body.get("parentID").is_none(),
+        "a dispatching session outside the Workspace must not own the Run's session: {body}"
+    );
+    assert_eq!(
+        body["location"]["directory"].as_str(),
+        Some(fixture.workspace.to_str().expect("workspace UTF-8"))
+    );
+    // The Run drove the session it created, with no client process.
+    assert!(fixture.prompt_body.exists());
+    assert!(!fixture.run_args.exists());
 }
 
 #[test]
@@ -1955,6 +2019,12 @@ fn opencode_run_fails_when_the_session_is_anchored_elsewhere() {
     // The Run never spawned, nothing was recorded, and the Worker was released.
     assert!(!fixture.run_args.exists(), "the Run must not start");
     assert_eq!(fixture.recorded_session(), None);
+    // The session the launch created is removed, so `children` never reports an
+    // orphan the Run never drove.
+    assert_eq!(
+        fs::read_to_string(&fixture.remove_arg).expect("recorded session.remove"),
+        "sessionID=ses_test"
+    );
     let snapshot = fixture.repository.worker_pool().snapshot();
     let worker = snapshot
         .worker(fixture.worker_id.as_str())

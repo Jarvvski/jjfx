@@ -245,6 +245,10 @@ impl NewSession {
 
     /// Creates the session as a child of `parent_id`.
     ///
+    /// opencode anchors a child session to its **parent's** location and ignores
+    /// this request's `location`, so a child can only be used where the parent's
+    /// directory is the one the session must run in.
+    ///
     /// A session without a parent is a root session, which is what a Dispatch
     /// that no opencode session owns produces.
     pub fn with_parent(mut self, parent_id: impl Into<String>) -> Self {
@@ -513,6 +517,20 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
             .map(|envelope| envelope.data.into_session())
     }
 
+    /// Deletes a session and its child sessions (`session.remove`).
+    ///
+    /// A launch that has already created a session removes it here when the Run
+    /// must not proceed, so a failed launch leaves no orphan for `children` to
+    /// report.
+    pub fn delete_session(&self, session_id: &str) -> Result<(), OpenCodeError> {
+        self.call(operation_args(
+            "session.remove",
+            &[("sessionID", session_id)],
+            None,
+        ))?;
+        Ok(())
+    }
+
     /// Lists the sessions opencode reports (`session.list`).
     pub fn list_sessions(&self) -> Result<Vec<Session>, OpenCodeError> {
         let raw = self.call(operation_args("session.list", &[], None))?;
@@ -658,9 +676,14 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
 ///
 /// `parent` is the opencode session the Dispatch was issued from, when there is
 /// one ([`dispatching_session`]): the Run's session is then created as that
-/// session's child, so the dispatching session can see it. `None` creates a
-/// root session, which is what a Dispatch with no opencode session behind it
-/// produces.
+/// session's child, so the dispatching session can see it - but only when that is
+/// compatible with the anchor. opencode anchors a **child** session to its
+/// parent's location and offers no way to move it, so a parent is honoured only
+/// when it is already anchored to the Worker Workspace ([`nestable_parent`]);
+/// otherwise the Run's session is created as a root session, because the anchor is
+/// the guard that keeps a Run out of the wrong worktree and it wins over the
+/// child-session topology. `None` creates a root session, which is what a Dispatch
+/// with no opencode session behind it produces.
 ///
 /// `Ok(Some(id))` is the session to drive. `Ok(None)` means the API is
 /// unavailable - no executable, no running server, an older opencode without
@@ -668,7 +691,8 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
 /// back to today's invocation rather than fail the Run. `Err` means opencode
 /// answered but the Run must not proceed: it refused to create the session, or
 /// it anchored the session somewhere other than `workspace`, which would let the
-/// Run commit into the wrong worktree.
+/// Run commit into the wrong worktree. A session the Run will not drive is
+/// removed before the error is returned.
 pub(crate) fn create_run_session<R: OpenCodeRunner>(
     api: &OpenCodeApi<R>,
     workspace: &Path,
@@ -679,7 +703,7 @@ pub(crate) fn create_run_session<R: OpenCodeRunner>(
     if let Some(title) = title.filter(|title| !title.is_empty()) {
         request = request.with_title(title);
     }
-    if let Some(parent) = parent.filter(|parent| !parent.is_empty()) {
+    if let Some(parent) = nestable_parent(api, parent, workspace) {
         request = request.with_parent(parent);
     }
     let created = match api.create_session(&request) {
@@ -696,10 +720,14 @@ pub(crate) fn create_run_session<R: OpenCodeRunner>(
     // not merely echoed from the request.
     match api.get_session(&session_id) {
         Ok(session) => match session.directory() {
-            Some(directory) if !same_directory(directory, workspace) => Err(format!(
-                "opencode anchored the Run's session to {} instead of the Worker Workspace {}",
-                directory.display(),
-                workspace.display()
+            Some(directory) if !same_directory(directory, workspace) => Err(reject_launch(
+                api,
+                &session_id,
+                format!(
+                    "opencode anchored the Run's session to {} instead of the Worker Workspace {}",
+                    directory.display(),
+                    workspace.display()
+                ),
             )),
             // A session opencode reported without a location cannot be checked,
             // and the assertion is best-effort: drive the session we created.
@@ -708,9 +736,56 @@ pub(crate) fn create_run_session<R: OpenCodeRunner>(
         // The session exists and its id is known, so a failed read-back must not
         // discard it: the assertion is best-effort.
         Err(error) if error.is_unavailable() => Ok(Some(session_id)),
-        Err(error) => Err(format!(
-            "cannot confirm the Run's opencode session location: {error}"
+        Err(error) => Err(reject_launch(
+            api,
+            &session_id,
+            format!("cannot confirm the Run's opencode session location: {error}"),
         )),
+    }
+}
+
+/// The dispatching session to nest the Run's session under, or `None` when the
+/// Run's session must be a root session.
+///
+/// opencode anchors a child session to its parent's location and gives no way to
+/// move it: `session.create` ignores `location` when `parentID` is set, and
+/// `session.move` leaves a child where its parent is. A Run must be anchored to
+/// its Worker Workspace, so a dispatching session can be honoured only when it is
+/// already anchored there - otherwise nesting would put the Run in the
+/// dispatching session's worktree instead of its own.
+///
+/// A parent that cannot be read is not honoured either: the anchor is the
+/// correctness guard, so an unreadable parent creates a root session rather than
+/// a child jjfx cannot vouch for.
+fn nestable_parent<R: OpenCodeRunner>(
+    api: &OpenCodeApi<R>,
+    parent: Option<&str>,
+    workspace: &Path,
+) -> Option<String> {
+    let parent = parent.filter(|parent| !parent.is_empty())?;
+    let session = api.get_session(parent).ok()?;
+    let anchored_here = session
+        .directory()
+        .is_some_and(|directory| same_directory(directory, workspace));
+    anchored_here.then(|| parent.to_owned())
+}
+
+/// Reports a launch failure after removing the session the launch created.
+///
+/// A launch that fails after `session.create` has already made a session;
+/// leaving it behind is what `jjfx children` reports as an orphan nothing drives.
+/// The removal is best-effort - the launch failure is the primary error - so a
+/// failed removal is appended to the reason rather than replacing it.
+fn reject_launch<R: OpenCodeRunner>(
+    api: &OpenCodeApi<R>,
+    session_id: &str,
+    reason: String,
+) -> String {
+    match api.delete_session(session_id) {
+        Ok(()) => reason,
+        Err(error) => {
+            format!("{reason} (its session {session_id} could not be removed: {error})")
+        }
     }
 }
 
@@ -1116,6 +1191,32 @@ mod tests {
     }
 
     #[test]
+    fn delete_session_addresses_the_session_by_path_parameter() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok("")]));
+
+        api.delete_session("ses_x").expect("removes");
+
+        assert_eq!(
+            api.runner.calls(),
+            vec![vec!["api", "session.remove", "--param", "sessionID=ses_x"]]
+        );
+    }
+
+    #[test]
+    fn delete_session_surfaces_a_server_rejection() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(
+            1,
+            r#"{"_tag":"SessionNotFoundError","message":"Session not found: ses_nope"}"#,
+            "HTTP 404 Not Found\n",
+        )]));
+
+        let error = api.delete_session("ses_nope").expect_err("server rejects");
+
+        assert!(!error.is_unavailable());
+        assert_eq!(error.status(), Some(404));
+    }
+
+    #[test]
     fn interrupt_session_reports_whether_anything_was_interrupted() {
         let api =
             OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(r#"{"interrupted":false}"#)]));
@@ -1356,9 +1457,12 @@ mod tests {
     }
 
     #[test]
-    fn create_run_session_anchors_to_the_workspace_and_confirms_it() {
+    fn create_run_session_nests_under_a_dispatching_session_in_the_workspace_and_confirms_it() {
+        // The dispatching session is already anchored to the Worker Workspace, so
+        // opencode can honour the parent link and the Run's session is its child.
         // The created session and the read-back both report the Worker Workspace.
         let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_dispatch", "/w/new")),
             ok(&session_body("ses_new", "/w/new")),
             ok(&session_body("ses_new", "/w/new")),
         ]));
@@ -1375,9 +1479,15 @@ mod tests {
         assert_eq!(session_id, "ses_new");
 
         let calls = api.runner.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(&calls[0][..2], ["api", "session.create"]);
-        let body = calls[0]
+        assert_eq!(calls.len(), 3);
+        // The dispatching session is read first, because opencode anchors a child
+        // to its parent's location.
+        assert_eq!(
+            calls[0],
+            vec!["api", "session.get", "--param", "sessionID=ses_dispatch"]
+        );
+        assert_eq!(&calls[1][..2], ["api", "session.create"]);
+        let body = calls[1]
             .windows(2)
             .find(|pair| pair[0] == "--data")
             .map(|pair| pair[1].clone())
@@ -1388,9 +1498,63 @@ mod tests {
         // The dispatching session owns the Run's session.
         assert_eq!(body["parentID"], "ses_dispatch");
         assert_eq!(
-            calls[1],
+            calls[2],
             vec!["api", "session.get", "--param", "sessionID=ses_new"]
         );
+    }
+
+    #[test]
+    fn create_run_session_anchors_a_root_session_when_the_dispatching_session_is_elsewhere() {
+        // opencode anchors a child to its parent's directory, so a dispatching
+        // session in the repository cannot be the Run's parent: the Run would
+        // execute - and commit - in the wrong worktree. The Run's session is a
+        // root session instead, anchored where jjfx asked.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_dispatch", "/repo")),
+            ok(&session_body("ses_new", "/w/new")),
+            ok(&session_body("ses_new", "/w/new")),
+        ]));
+
+        let session_id = create_run_session(&api, Path::new("/w/new"), None, Some("ses_dispatch"))
+            .expect("creates")
+            .expect("drives the created session");
+
+        assert_eq!(session_id, "ses_new");
+        let body = api.runner.calls()[1]
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert!(
+            body.get("parentID").is_none(),
+            "a dispatching session outside the Workspace must not own the Run's session: {body}"
+        );
+        assert_eq!(body["location"]["directory"], "/w/new");
+    }
+
+    #[test]
+    fn create_run_session_anchors_a_root_session_when_the_dispatching_session_cannot_be_read() {
+        // A parent jjfx cannot read is not honoured: the anchor is the guard, so
+        // the Run gets a root session it can vouch for.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            failed(1, "", "no server"),
+            ok(&session_body("ses_new", "/w/new")),
+            ok(&session_body("ses_new", "/w/new")),
+        ]));
+
+        let session_id = create_run_session(&api, Path::new("/w/new"), None, Some("ses_dispatch"))
+            .expect("creates")
+            .expect("drives the created session");
+
+        assert_eq!(session_id, "ses_new");
+        let body = api.runner.calls()[1]
+            .windows(2)
+            .find(|pair| pair[0] == "--data")
+            .map(|pair| pair[1].clone())
+            .expect("request carries a body");
+        let body: serde_json::Value = serde_json::from_str(&body).expect("valid JSON body");
+        assert!(body.get("parentID").is_none(), "{body}");
     }
 
     #[test]
@@ -1480,12 +1644,14 @@ mod tests {
     }
 
     #[test]
-    fn create_run_session_fails_when_the_anchor_differs() {
+    fn create_run_session_removes_the_session_when_the_anchor_differs() {
         // opencode answered and put the session somewhere else: proceeding would
-        // let the Run commit into the wrong worktree.
+        // let the Run commit into the wrong worktree. The session is removed, so
+        // `children` never reports an orphan the Run never drove.
         let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
             ok(&session_body("ses_new", "/w/new")),
             ok(&session_body("ses_new", "/main")),
+            ok(""),
         ]));
 
         let reason = create_run_session(&api, Path::new("/w/new"), None, None)
@@ -1493,6 +1659,54 @@ mod tests {
 
         assert!(reason.contains("/main"), "{reason}");
         assert!(reason.contains("/w/new"), "{reason}");
+        assert_eq!(
+            api.runner.calls()[2],
+            vec!["api", "session.remove", "--param", "sessionID=ses_new"]
+        );
+    }
+
+    #[test]
+    fn create_run_session_reports_a_failed_removal_without_hiding_the_anchor_failure() {
+        // The removal is best-effort: an unreachable opencode must not turn the
+        // anchor failure into a different, less actionable error.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w/new")),
+            ok(&session_body("ses_new", "/main")),
+            failed(1, "", "no server"),
+        ]));
+
+        let reason = create_run_session(&api, Path::new("/w/new"), None, None)
+            .expect_err("mismatch detected");
+
+        assert!(
+            reason.contains("instead of the Worker Workspace"),
+            "{reason}"
+        );
+        assert!(reason.contains("could not be removed"), "{reason}");
+    }
+
+    #[test]
+    fn create_run_session_removes_the_session_when_the_location_cannot_be_confirmed() {
+        // The read-back was rejected, so the Run must not proceed - and the
+        // session it created is removed rather than left behind.
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![
+            ok(&session_body("ses_new", "/w")),
+            failed(
+                1,
+                r#"{"_tag":"SessionNotFoundError","message":"Session not found: ses_new"}"#,
+                "HTTP 404 Not Found\n",
+            ),
+            ok(""),
+        ]));
+
+        let reason =
+            create_run_session(&api, Path::new("/w"), None, None).expect_err("cannot confirm");
+
+        assert!(reason.contains("cannot confirm"), "{reason}");
+        assert_eq!(
+            api.runner.calls()[2],
+            vec!["api", "session.remove", "--param", "sessionID=ses_new"]
+        );
     }
 
     #[test]
