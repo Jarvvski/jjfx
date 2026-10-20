@@ -326,6 +326,16 @@ mod tests {
         QueuedStep::dispatch(ticket, WireTimestamp::new("2026-10-19T00:00:00Z"), None)
     }
 
+    fn review_step(ticket: &str, dimension: &str, pass: u32) -> QueuedStep {
+        QueuedStep::review(
+            ticket,
+            dimension,
+            pass,
+            WireTimestamp::new("2026-10-19T00:00:00Z"),
+            None,
+        )
+    }
+
     fn at(seconds: u32) -> WireTimestamp {
         WireTimestamp::new(format!("2026-10-19T00:00:{seconds:02}Z"))
     }
@@ -398,6 +408,62 @@ mod tests {
             }]
         );
         assert_eq!(queue.items().expect("items").len(), 1);
+    }
+
+    /// Ticket 09: the recurring unit is a review dimension and pass, so the same
+    /// dimension reviewed again on a later round is the same step - a repeat is
+    /// recognised rather than run a second time.
+    #[test]
+    fn re_offering_a_settled_review_step_is_reported_rather_than_requeued() {
+        let (_temp, queue) = queue();
+        let offered = review_step("ENG-1", "security", 1);
+        queue
+            .enqueue(std::slice::from_ref(&offered))
+            .expect("enqueue");
+        let key = StepKey::review("ENG-1", "security", 1);
+        queue
+            .settle(&key, QueueSettlement::Done, at(1))
+            .expect("settle");
+
+        let admissions = queue.enqueue(&[offered]).expect("re-enqueue");
+
+        assert_eq!(
+            admissions,
+            [QueueAdmission::Known {
+                state: QueueItemState::Done
+            }]
+        );
+        assert_eq!(queue.items().expect("items").len(), 1);
+    }
+
+    /// A review step and the Dispatch of the same Ticket are different work, and
+    /// a later pass of one dimension is different again.
+    #[test]
+    fn a_review_step_is_distinct_from_a_dispatch_and_from_another_pass() {
+        let (_temp, queue) = queue();
+        queue
+            .enqueue(&[
+                step("ENG-1"),
+                review_step("ENG-1", "security", 1),
+                review_step("ENG-1", "security", 2),
+            ])
+            .expect("enqueue");
+
+        let items = queue.items().expect("items");
+        assert_eq!(items.len(), 3);
+        assert_eq!(
+            items
+                .iter()
+                .map(|item| item.step.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "dispatch:ENG-1",
+                "review:ENG-1:security:1",
+                "review:ENG-1:security:2"
+            ]
+        );
+        assert_eq!(items[1].kind.as_str(), "review");
+        assert_eq!(items[1].subject, "ENG-1 security pass 1");
     }
 
     #[test]
