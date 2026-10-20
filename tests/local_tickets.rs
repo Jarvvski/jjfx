@@ -391,6 +391,42 @@ fn dispatch_all_prose_explains_an_empty_ready_set() {
     );
 }
 
+/// A dependent whose Blocker has no usable branch is stated exactly once, and
+/// the reason names the Blocker's bookmark state rather than a bare "no branch"
+/// (dogfood-2 02). Here the Blocker is resolved, so its dependent is ready, but
+/// no bookmark names the Blocker's Ticket - so there is no branch to stack on.
+#[test]
+fn dispatch_all_names_an_unstackable_blocker_once_by_its_bookmark_state() {
+    let (repository, config_home) = jj_repository();
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "01-foundation.md",
+        "# Foundation\n\nStatus: resolved\n",
+    );
+    write_ticket(
+        repository.path(),
+        "widgets",
+        "02-dependent.md",
+        "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+    );
+
+    let output = run_jjfx(
+        repository.path(),
+        config_home.path(),
+        &["dispatch", "--all"],
+    );
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let report = "Ticket widgets--02-dependent is blocked by widgets--01-foundation, \
+                  whose bookmark is missing; basing it on trunk";
+    assert_eq!(
+        stderr.matches(report).count(),
+        1,
+        "the unstackable Blocker must be reported exactly once, naming its bookmark state: {stderr}"
+    );
+}
+
 #[test]
 fn dispatch_all_with_an_empty_ready_set_reconciles_finished_tickets() {
     let (repository, config_home) = jj_repository();

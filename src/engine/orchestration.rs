@@ -4,7 +4,7 @@
 //! This module owns orchestration order while keeping Worker Pool, Direct
 //! Dispatch, compatible persistence, and terminal formatting behind one seam.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
@@ -745,6 +745,29 @@ impl TicketBranch {
             Self::Missing | Self::Ambiguous(_) => None,
         }
     }
+
+    /// The bookmark a dependent Ticket may stack on, or `None` when this outcome
+    /// leaves no usable base: no bookmark, an ambiguous one, or `main` (a Blocker
+    /// already merged to trunk, whose branch must not be a Pull Request base).
+    fn stack_base(&self) -> Option<&str> {
+        match self {
+            Self::Resolved(name) if name != "main" => Some(name),
+            Self::Resolved(_) | Self::Missing | Self::Ambiguous(_) => None,
+        }
+    }
+
+    /// Why this outcome leaves no base to stack on, naming the bookmark state
+    /// rather than a bare "no branch".
+    ///
+    /// Only reached for outcomes with no [`stack_base`](Self::stack_base), so the
+    /// `Resolved` arm is `main` - a Blocker merged to trunk.
+    fn unstacked_reason(&self) -> String {
+        match self {
+            Self::Resolved(name) => format!("bookmark `{name}` is trunk"),
+            Self::Missing => "bookmark is missing".to_owned(),
+            Self::Ambiguous(names) => format!("bookmark is ambiguous ({})", names.join(", ")),
+        }
+    }
 }
 
 /// The bookmark a Worker delivered for `ticket`, matched by the Ticket rather
@@ -763,21 +786,25 @@ impl TicketBranch {
 /// `--ignore-working-copy`: this is a landing-path read and a plain
 /// `jj bookmark list` snapshots, so an unflagged read could block silently
 /// behind any other jj process holding the working-copy lock (dogfood 12).
+///
+/// The read counts **local** bookmarks only ([`crate::jj::local_bookmark_names`]):
+/// a remote-tracking entry for a bookmark whose remote counterpart does not
+/// exist yet would otherwise list one fresh bookmark twice and read it as
+/// ambiguous, refusing every landing verb on exactly the case it exists to serve
+/// (dogfood-2 02).
 pub(crate) fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> TicketBranch {
     let ticket = ticket.as_str().to_ascii_lowercase();
-    let Ok(names) = crate::jj::read_in_dir(root, &["bookmark", "list", "-T", "name ++ \"\\n\""])
-    else {
+    let Ok(names) = crate::jj::local_bookmark_names(root) else {
         return TicketBranch::Missing;
     };
     let matches = names
-        .lines()
+        .into_iter()
         .filter(|name| {
             name.rsplit('/').next().is_some_and(|component| {
                 let component = component.to_ascii_lowercase();
                 component == ticket || component.starts_with(&format!("{ticket}-"))
             })
         })
-        .map(str::to_owned)
         .collect::<Vec<_>>();
     match matches.as_slice() {
         [] => TicketBranch::Missing,
@@ -786,18 +813,40 @@ pub(crate) fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> TicketBra
     }
 }
 
+/// A Blocker a dependent Ticket cannot stack on, with the bookmark state that
+/// leaves it unusable as a base.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnstackedBlocker {
+    ticket: TicketId,
+    reason: String,
+}
+
+impl UnstackedBlocker {
+    /// The Blocker Ticket.
+    pub(crate) const fn ticket(&self) -> &TicketId {
+        &self.ticket
+    }
+
+    /// Why the Blocker has no usable branch, naming the bookmark state (missing,
+    /// ambiguous, or trunk) rather than a bare "no branch".
+    pub(crate) fn reason(&self) -> &str {
+        &self.reason
+    }
+}
+
 /// The stacked base resolved for a dependent Ticket from its Blockers' branches.
 ///
 /// A dependent can build on several Blockers at once, so the
 /// [`context`](Self::context) carries every stackable branch in Blocker order.
-/// The Blockers with no branch to stack on are reported in
+/// The Blockers with no usable branch to stack on are reported in
 /// [`unstacked`](Self::unstacked) rather than dropped: the caller states them so
 /// a dependent based on trunk - or on fewer branches than it has Blockers - is
-/// never silent about it.
+/// never silent about it. Each is reported once, even if a Blocker is declared
+/// more than once, so the caller never names the same Blocker twice.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DependencyBasis {
     context: Option<DispatchDependencyContext>,
-    unstacked: Vec<TicketId>,
+    unstacked: Vec<UnstackedBlocker>,
 }
 
 impl DependencyBasis {
@@ -806,33 +855,44 @@ impl DependencyBasis {
         self.context.as_ref()
     }
 
-    /// Returns the Blockers that had no branch to stack on, in declared order.
-    pub(crate) fn unstacked(&self) -> &[TicketId] {
+    /// Returns the Blockers that had no usable branch to stack on, in declared
+    /// order and each reported once.
+    pub(crate) fn unstacked(&self) -> &[UnstackedBlocker] {
         &self.unstacked
     }
 }
 
 /// Resolves the stacked base for a dependent Ticket from its Blockers' branches.
 ///
-/// `branch_of` returns the bookmark a Blocker delivered, or `None`. A `main`
-/// branch counts as no branch: a Blocker merged to trunk must not be used as a
-/// base, or the dependent's Pull Request would open against trunk and silently
-/// swallow an unmerged prerequisite's diff. Such a Blocker is reported in
-/// [`DependencyBasis::unstacked`] instead.
+/// `branch_of` returns how a Blocker's bookmark resolved. A `main` branch counts
+/// as no branch: a Blocker merged to trunk must not be used as a base, or the
+/// dependent's Pull Request would open against trunk and silently swallow an
+/// unmerged prerequisite's diff. Such a Blocker is reported in
+/// [`DependencyBasis::unstacked`] instead, along with the reason its bookmark is
+/// not a usable base.
 pub(crate) fn dependency_basis(
     blockers: &[TicketId],
-    branch_of: impl Fn(&TicketId) -> Option<String>,
+    branch_of: impl Fn(&TicketId) -> TicketBranch,
 ) -> DependencyBasis {
     let mut base_revisions = Vec::new();
     let mut description = Vec::new();
     let mut unstacked = Vec::new();
+    let mut seen = BTreeSet::new();
     for blocker in blockers {
-        match branch_of(blocker) {
-            Some(branch) if branch != "main" => {
+        let outcome = branch_of(blocker);
+        match outcome.stack_base() {
+            Some(branch) => {
                 description.push(format!("- Branch: {branch} (implements {blocker})"));
-                base_revisions.push(branch);
+                base_revisions.push(branch.to_owned());
             }
-            _ => unstacked.push(blocker.clone()),
+            None => {
+                if seen.insert(blocker.clone()) {
+                    unstacked.push(UnstackedBlocker {
+                        ticket: blocker.clone(),
+                        reason: outcome.unstacked_reason(),
+                    });
+                }
+            }
         }
     }
     let pull_request_base = base_revisions.first().cloned();
@@ -1648,7 +1708,11 @@ mod tests {
     fn a_dependent_with_a_blocker_branch_stacks_on_it() {
         let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
         let basis = dependency_basis(std::slice::from_ref(&blocker), |ticket| {
-            (ticket == &blocker).then(|| "adam/eng-101-foundation".to_owned())
+            if ticket == &blocker {
+                TicketBranch::Resolved("adam/eng-101-foundation".to_owned())
+            } else {
+                TicketBranch::Missing
+            }
         });
 
         let context = basis.context().expect("stacked dependency context");
@@ -1662,15 +1726,43 @@ mod tests {
     }
 
     #[test]
-    fn a_dependent_with_no_blocker_branch_is_reported_unstacked() {
+    fn a_dependent_with_no_blocker_bookmark_names_the_missing_state() {
         let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
-        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| None);
+        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| TicketBranch::Missing);
 
         assert!(
             basis.context().is_none(),
-            "no branch means no stack to build on"
+            "no bookmark means no stack to build on"
         );
-        assert_eq!(basis.unstacked(), &[blocker]);
+        let unstacked = basis.unstacked();
+        assert_eq!(unstacked.len(), 1);
+        assert_eq!(unstacked[0].ticket(), &blocker);
+        assert!(
+            unstacked[0].reason().contains("missing"),
+            "the reason must name the bookmark state: {}",
+            unstacked[0].reason()
+        );
+    }
+
+    #[test]
+    fn an_ambiguous_blocker_bookmark_is_reported_by_its_state() {
+        let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| {
+            TicketBranch::Ambiguous(vec![
+                "adam/eng-101-foundation".to_owned(),
+                "adam/eng-101-other".to_owned(),
+            ])
+        });
+
+        assert!(basis.context().is_none());
+        let unstacked = basis.unstacked();
+        assert_eq!(unstacked[0].ticket(), &blocker);
+        assert!(
+            unstacked[0].reason().contains("ambiguous")
+                && unstacked[0].reason().contains("adam/eng-101-foundation"),
+            "the reason must name the ambiguous bookmark: {}",
+            unstacked[0].reason()
+        );
     }
 
     #[test]
@@ -1679,10 +1771,32 @@ mod tests {
         // dependent's Pull Request against trunk and silently swallow an
         // unmerged prerequisite, so it is reported as unstacked instead.
         let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
-        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| Some("main".to_owned()));
+        let basis = dependency_basis(std::slice::from_ref(&blocker), |_| {
+            TicketBranch::Resolved("main".to_owned())
+        });
 
         assert!(basis.context().is_none());
-        assert_eq!(basis.unstacked(), &[blocker]);
+        let unstacked = basis.unstacked();
+        assert_eq!(unstacked[0].ticket(), &blocker);
+        assert!(
+            unstacked[0].reason().contains("trunk"),
+            "the reason must name trunk: {}",
+            unstacked[0].reason()
+        );
+    }
+
+    #[test]
+    fn a_blocker_is_reported_unstacked_once_even_when_declared_twice() {
+        let blocker = TicketId::parse("ENG-101").expect("Blocker Ticket");
+        let basis = dependency_basis(&[blocker.clone(), blocker.clone()], |_| {
+            TicketBranch::Missing
+        });
+
+        assert_eq!(
+            basis.unstacked().len(),
+            1,
+            "a repeated Blocker must be reported once, not once per declaration"
+        );
     }
 
     #[test]
@@ -1690,7 +1804,11 @@ mod tests {
         let merged = TicketId::parse("ENG-101").expect("merged Blocker");
         let stacked = TicketId::parse("ENG-102").expect("stacked Blocker");
         let basis = dependency_basis(&[merged.clone(), stacked.clone()], |ticket| {
-            (ticket == &stacked).then(|| "adam/eng-102-foundation".to_owned())
+            if ticket == &stacked {
+                TicketBranch::Resolved("adam/eng-102-foundation".to_owned())
+            } else {
+                TicketBranch::Resolved("main".to_owned())
+            }
         });
 
         let context = basis.context().expect("stacked dependency context");
@@ -1698,7 +1816,8 @@ mod tests {
             context.base_revisions(),
             &["adam/eng-102-foundation".to_owned()]
         );
-        assert_eq!(basis.unstacked(), &[merged]);
+        assert_eq!(basis.unstacked().len(), 1);
+        assert_eq!(basis.unstacked()[0].ticket(), &merged);
     }
 
     #[test]
@@ -2223,6 +2342,92 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         root
+    }
+
+    /// A freshly dispatched Worker's bookmark has no remote counterpart yet, so
+    /// when the remote auto-tracks bookmarks jj lists it twice under the plain
+    /// `name` template - once locally and once as a not-yet-created remote ref.
+    /// Resolving the Ticket's branch must count local bookmarks only, or the
+    /// landing verbs refuse the branch they exist to land (dogfood-2 02). The
+    /// plain read is asserted to double-list, so a regression that drops the
+    /// filter fails here rather than silently passing.
+    ///
+    /// The tracking is set up in the repository's own config rather than assumed
+    /// from the ambient jj config, so the guard holds on a clean-config runner.
+    #[test]
+    fn a_fresh_bookmark_with_no_remote_ref_resolves_rather_than_reads_as_ambiguous() {
+        let root = crate::store::test_local_repo("fresh-bookmark");
+        // The remote and its tracking must be configured *before* the bookmark:
+        // jj records a remote-tracking entry at bookmark creation from the
+        // configured remotes.
+        let origin = root.join("origin.git");
+        let remote = crate::jj::command()
+            .current_dir(&root)
+            .args(["git", "remote", "add", "origin"])
+            .arg(&origin)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            remote.status.success(),
+            "jj git remote add failed: {}",
+            String::from_utf8_lossy(&remote.stderr)
+        );
+        crate::store::track_bookmarks_from_origin(&root);
+        let created = crate::jj::command()
+            .current_dir(&root)
+            .args(["bookmark", "create", "adam/eng-101-foundation", "-r", "@"])
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            created.status.success(),
+            "jj bookmark create failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        let raw = crate::jj::read_in_dir(&root, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+            .expect("the plain read succeeds");
+        assert_eq!(
+            raw.lines()
+                .filter(|line| *line == "adam/eng-101-foundation")
+                .count(),
+            2,
+            "jj must list the fresh bookmark twice for this test to mean anything: {raw}"
+        );
+
+        let ticket = TicketId::parse("ENG-101").expect("Ticket");
+        assert_eq!(
+            resolve_ticket_branch(&root, &ticket),
+            TicketBranch::Resolved("adam/eng-101-foundation".to_owned())
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Two *real* local bookmarks naming the same Ticket stay ambiguous: the
+    /// local-only filter removes the phantom remote entry, not a genuine
+    /// conflict.
+    #[test]
+    fn two_real_bookmarks_naming_one_ticket_stay_ambiguous() {
+        let root = crate::store::test_local_repo("two-bookmarks");
+        for name in ["adam/eng-101-foundation", "adam/eng-101-second"] {
+            let output = crate::jj::command()
+                .current_dir(&root)
+                .args(["bookmark", "create", name, "-r", "@"])
+                .output()
+                .expect("jj should be installed");
+            assert!(
+                output.status.success(),
+                "jj bookmark create {name} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let ticket = TicketId::parse("ENG-101").expect("Ticket");
+        let branch = resolve_ticket_branch(&root, &ticket);
+        let TicketBranch::Ambiguous(names) = branch else {
+            panic!("two real bookmarks must stay ambiguous: {branch:?}");
+        };
+        assert_eq!(names.len(), 2, "{names:?}");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Both orchestration reads are lock-free: they read through

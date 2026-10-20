@@ -651,14 +651,41 @@ fn classify_push_bookmark(
     }
 }
 
-/// Whether `name` is one of the repository's bookmarks at `dir`.
+/// The names of the repository's local bookmarks at `dir`, one per bookmark.
+///
+/// Remote-tracking entries are excluded. Once a remote is configured, `jj
+/// bookmark list` emits a remote-tracking entry for a local bookmark whose
+/// remote counterpart does not exist yet, so a freshly created (unpushed)
+/// bookmark appears **twice** under the plain `name` template. That is exactly
+/// the state of a Worker that has just created its bookmark and has not been
+/// pushed, so a caller that counts lines - `resolve_ticket_branch` - reads one
+/// bookmark as two and refuses the landing verbs (dogfood-2 02). The template
+/// keeps a local bookmark's name and drops every remote-tracking entry, so a
+/// count over the result counts real bookmarks.
+pub fn local_bookmark_names(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let out = read_in_dir(
+        dir,
+        &[
+            "bookmark",
+            "list",
+            "-T",
+            "if(remote, \"\", name ++ \"\\n\")",
+        ],
+    )?;
+    Ok(out.lines().map(str::to_owned).collect())
+}
+
+/// Whether a local bookmark named `name` exists at `dir`.
 ///
 /// `jj git push --bookmark <name>` leaves identical remote state whether the
 /// bookmark was already published or the name matched nothing, so this read is
-/// what tells those two apart.
+/// what tells those two apart. Only a *local* bookmark counts: a remote-tracking
+/// entry for a name that is not a local bookmark is not something a push could
+/// move.
 fn bookmark_exists(dir: &Path, name: &str) -> anyhow::Result<bool> {
-    let out = read_in_dir(dir, &["bookmark", "list", "-T", "name ++ \"\\n\""])?;
-    Ok(out.lines().any(|candidate| candidate == name))
+    Ok(local_bookmark_names(dir)?
+        .iter()
+        .any(|candidate| candidate == name))
 }
 
 /// Classify one push from its captured run and the remote-bookmark snapshots
@@ -1297,6 +1324,51 @@ mod tests {
 
         assert!(bookmark_exists(&root, "adam/eng-101-foundation").expect("the read succeeds"));
         assert!(!bookmark_exists(&root, "adam/eng-999-missing").expect("the read succeeds"));
+
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A freshly created (unpushed) bookmark in a repository whose `origin`
+    /// auto-tracks bookmarks is listed twice by the plain `name` template - once
+    /// locally and once as a remote-tracking entry whose ref does not exist yet.
+    /// The local read must collapse that to one, or a landing verb reads one
+    /// bookmark as ambiguous (dogfood-2 02).
+    ///
+    /// The tracking is set up in the repository's own config rather than assumed
+    /// from the ambient jj config, so the guard holds on a clean-config runner.
+    #[test]
+    fn local_bookmark_names_ignores_a_remote_tracking_entry_with_no_ref() {
+        let repo = temp_repo("local-bookmarks");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        // The remote must exist *before* the bookmark, and tracking must be on
+        // *before* it too: jj records a remote-tracking entry at creation time.
+        let origin = root.join("origin.git");
+        run_mut(
+            &root,
+            &["git", "remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .expect("remote");
+        crate::store::track_bookmarks_from_origin(&root);
+        run_mut(
+            &root,
+            &["bookmark", "create", "adam/eng-101-foundation", "-r", "@"],
+        )
+        .expect("bookmark");
+
+        let raw =
+            read_in_dir(&root, &["bookmark", "list", "-T", "name ++ \"\\n\""]).expect("raw read");
+        assert_eq!(
+            raw.lines()
+                .filter(|line| *line == "adam/eng-101-foundation")
+                .count(),
+            2,
+            "jj must list the fresh bookmark twice for this test to mean anything: {raw}"
+        );
+        assert_eq!(
+            local_bookmark_names(&root).expect("local read"),
+            vec!["adam/eng-101-foundation".to_owned()]
+        );
+        assert!(bookmark_exists(&root, "adam/eng-101-foundation").expect("the read succeeds"));
 
         std::fs::remove_dir_all(&repo).ok();
     }

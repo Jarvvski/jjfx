@@ -246,10 +246,10 @@ fn rebase_waits_for_the_workspace_operation_lock() {
     assert_eq!(
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
         vec![
-            "bookmark list -T name ++ \"\\n\"",
+            "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             "rebase -b owner/eng-301-action -d main",
             "git push --bookmark owner/eng-301-action",
-            "bookmark list -T name ++ \"\\n\"",
+            "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             // The persisted `gh_repo` is checked against `origin` before any
             // `gh` call, so a fabricated one never reaches the network.
             "git remote list",
@@ -400,10 +400,10 @@ fn rebase_and_open_pull_request_resolve_the_prefixed_bookmark_the_agent_created(
     assert_eq!(
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
         vec![
-            "bookmark list -T name ++ \"\\n\"",
+            "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             "rebase -b owner/eng-301-action -d main",
             "git push --bookmark owner/eng-301-action",
-            "bookmark list -T name ++ \"\\n\"",
+            "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             // The persisted `gh_repo` is checked against `origin` before any
             // `gh` call, so a fabricated one never reaches the network.
             "git remote list",
@@ -587,7 +587,10 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
     assert_eq!(commands.len(), 6, "{commands:?}");
     // The Ticket's bookmark is resolved by a read before anything is mutated, so
     // the prefixed name the agent created is what every later command uses.
-    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert_eq!(
+        commands[0],
+        "bookmark list -T if(remote, \"\", name ++ \"\\n\")"
+    );
     // The precondition is read before anything is mutated, so a repository with
     // no trunk is refused before absorb can run.
     assert_eq!(commands[1], "log -r trunk() ~ root() --count");
@@ -708,7 +711,10 @@ fn absorb_that_moves_nothing_skips_the_push() {
     );
     let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
     assert_eq!(commands.len(), 5, "{commands:?}");
-    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert_eq!(
+        commands[0],
+        "bookmark list -T if(remote, \"\", name ++ \"\\n\")"
+    );
     assert!(commands[3].starts_with("absorb --into "), "{commands:?}");
     assert!(
         !commands
@@ -812,7 +818,10 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
     );
     let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
     assert_eq!(commands.len(), 7, "{commands:?}");
-    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert_eq!(
+        commands[0],
+        "bookmark list -T if(remote, \"\", name ++ \"\\n\")"
+    );
     assert!(commands[3].starts_with("absorb --into "), "{commands:?}");
     assert_eq!(commands[5], "git push --bookmark owner/eng-301-action");
     assert_eq!(commands[6], "undo --allow-cross-workspace");
@@ -985,7 +994,10 @@ fn an_absorb_that_rewrites_the_mainline_is_rolled_back_and_fails() {
     );
     let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
     assert_eq!(commands.len(), 6, "{commands:?}");
-    assert_eq!(commands[0], "bookmark list -T name ++ \"\\n\"");
+    assert_eq!(
+        commands[0],
+        "bookmark list -T if(remote, \"\", name ++ \"\\n\")"
+    );
     assert_eq!(commands[5], "undo --allow-cross-workspace");
     assert!(
         !commands
@@ -1044,7 +1056,7 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
     assert_eq!(
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
         vec![
-            "bookmark list -T name ++ \"\\n\"",
+            "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             "rebase -b owner/eng-301-action -d main",
             "git push --bookmark owner/eng-301-action",
             "undo --allow-cross-workspace",
@@ -1099,7 +1111,7 @@ fn a_missing_worker_bookmark_fails_before_the_workspace_is_touched() {
     );
     assert_eq!(
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
-        vec!["bookmark list -T name ++ \"\\n\""],
+        vec!["bookmark list -T if(remote, \"\", name ++ \"\\n\")"],
         "resolution is a read, so a missing bookmark must fail before any rebase"
     );
 }
@@ -1158,7 +1170,7 @@ fn an_ambiguous_worker_bookmark_fails_before_the_workspace_is_touched() {
     assert!(outcome.contains("owner/eng-301-other"), "{outcome}");
     assert_eq!(
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
-        vec!["bookmark list -T name ++ \"\\n\""],
+        vec!["bookmark list -T if(remote, \"\", name ++ \"\\n\")"],
         "resolution is a read, so an ambiguous bookmark must fail before any rebase"
     );
 }
