@@ -20,6 +20,7 @@ use thiserror::Error;
 use crate::checks::RunCheck;
 use crate::engine::atomic::{self, AtomicWriteError, LockError};
 use crate::engine::locks::{self, ScopedLock};
+use crate::engine::reviewer::{DecisionLog, DecisionLogError, ReviewOutcome};
 use crate::engine::{AgentRuntimeProfile, DispatchExclusions, Repository};
 
 /// The directory holding every Worker Pool's own state, one directory per pool.
@@ -44,6 +45,8 @@ const WAITING_NAME: &str = "waiting.json";
 const WAITING_LOCK_NAME: &str = ".waiting.lock";
 const QUEUE_NAME: &str = "queue.json";
 const QUEUE_LOCK_NAME: &str = ".queue.lock";
+const DECISIONS_NAME: &str = "decisions.json";
+const DECISIONS_LOCK_NAME: &str = ".decisions.lock";
 const RUN_RECORDS_NAME: &str = "runs.jsonl";
 const RUN_RECORDS_LOCK_NAME: &str = ".runs.lock";
 
@@ -715,15 +718,31 @@ impl DispatchGroupState {
 /// The kind of step a queued item records, when it dispatches one Ticket.
 pub const DISPATCH_STEP_KIND: &str = "dispatch";
 
+/// The kind of step a queued item records, when it reviews one dimension of one
+/// Ticket's change for one pass.
+pub const REVIEW_STEP_KIND: &str = "review";
+
 impl StepKey {
     /// The identity of the step that dispatches `ticket`.
     ///
     /// Identity is derived from what the step *is*, not from when it ran, so the
     /// same Ticket offered twice is the same step: a repeat is detectable rather
-    /// than a silent second Run (ticket 09). A later step kind - a review
-    /// dimension and pass, say - composes its own key the same way.
+    /// than a silent second Run (ticket 09).
     pub fn dispatch(ticket: &str) -> Self {
         Self(format!("{DISPATCH_STEP_KIND}:{ticket}"))
+    }
+
+    /// The identity of the step that reviews one dimension of `ticket` for
+    /// `pass`.
+    ///
+    /// The dimension and the pass are the work that actually recurs: the same
+    /// dimension is reviewed again on a later round, and a re-pass re-runs every
+    /// dimension whether or not it found anything last time. Naming all three -
+    /// the Ticket, the dimension and the pass - makes such a repeat the *same*
+    /// step, so it is recognised rather than re-run (ticket 09), while two
+    /// passes, or two dimensions, are distinct steps.
+    pub fn review(ticket: &str, dimension: &str, pass: u32) -> Self {
+        Self(format!("{REVIEW_STEP_KIND}:{ticket}:{dimension}:{pass}"))
     }
 }
 
@@ -882,6 +901,26 @@ impl QueuedStep {
             detail,
         }
     }
+
+    /// The step that reviews one dimension of `ticket` for `pass`.
+    ///
+    /// The subject names all three parts of the identity, because an operator
+    /// reading the queue needs to tell one dimension's pass from another's.
+    pub fn review(
+        ticket: &str,
+        dimension: &str,
+        pass: u32,
+        queued_at: WireTimestamp,
+        detail: Option<String>,
+    ) -> Self {
+        Self {
+            step: StepKey::review(ticket, dimension, pass),
+            kind: QueueStepKind::new(REVIEW_STEP_KIND),
+            subject: format!("{ticket} {dimension} pass {pass}"),
+            queued_at,
+            detail,
+        }
+    }
 }
 
 /// What offering a step to the queue did.
@@ -1011,6 +1050,24 @@ pub struct QueueState {
     /// The queued items, in queue order.
     #[serde(default)]
     pub items: Vec<QueueItem>,
+}
+
+/// The decisions a step recorded, keyed by step identity.
+///
+/// A step's decision is what it concluded - for a review pass, the findings it
+/// produced - kept so it can be replayed from what was stored instead of the
+/// model being asked to derive it again (ticket 09). It is keyed by the same
+/// [`StepKey`] the queue records the step under, so "what did this step decide?"
+/// and "has this step run?" are the same identity.
+///
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
+/// documents so their shape is preserved. A missing or unreadable file means
+/// "nothing is recorded".
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DecisionState {
+    /// The recorded decision per step identity.
+    #[serde(default)]
+    pub decisions: BTreeMap<StepKey, ReviewOutcome>,
 }
 
 /// A loaded state document, including absence as data rather than an error.
@@ -1288,6 +1345,11 @@ pub struct WaitingStateRepository {
 pub struct QueueStateRepository {
     directory: PathBuf,
 }
+/// The jjfx-owned record of the decisions a step recorded, for replay.
+#[derive(Debug, Clone)]
+pub struct DecisionStateRepository {
+    directory: PathBuf,
+}
 /// The jjfx-owned, append-only per-Run cost record store.
 #[derive(Debug, Clone)]
 pub struct RunRecordRepository {
@@ -1445,6 +1507,13 @@ impl StateStore {
     /// Opens the jjfx-owned durable work queue.
     pub fn queue(&self) -> QueueStateRepository {
         QueueStateRepository {
+            directory: self.directory(),
+        }
+    }
+
+    /// Opens the jjfx-owned record of step decisions, for replay.
+    pub fn decisions(&self) -> DecisionStateRepository {
+        DecisionStateRepository {
             directory: self.directory(),
         }
     }
@@ -2549,6 +2618,14 @@ repository_methods!(
     |_s: &QueueStateRepository| "Work Queue".to_owned(),
     validate_queue
 );
+repository_methods!(
+    DecisionStateRepository,
+    DecisionState,
+    |s: &DecisionStateRepository| s.directory.join(DECISIONS_NAME),
+    |s: &DecisionStateRepository| vec![ScopedLock::pool(s.directory.join(DECISIONS_LOCK_NAME))],
+    |_s: &DecisionStateRepository| "Step Decisions".to_owned(),
+    validate_decisions
+);
 
 impl WaitingStateRepository {
     /// Returns the Tickets held back by the last capped Dispatch, in order.
@@ -2684,6 +2761,77 @@ impl QueueStateRepository {
                 Ok(outcome)
             },
         )
+    }
+}
+
+impl DecisionStateRepository {
+    /// The decision recorded for `step`, if any.
+    pub fn decision(&self, step: &StepKey) -> Result<Option<ReviewOutcome>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.decisions.get(step).cloned()),
+            Loaded::Missing => Ok(None),
+        }
+    }
+
+    /// Records `decision` for `step`, replacing any prior one.
+    ///
+    /// Returns whether the store changed. Recording the same decision again is a
+    /// no-op, so a replay that writes back what it read does not touch the store.
+    pub fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<bool, StateError> {
+        self.update(|decisions| {
+            if decisions.get(step) == Some(decision) {
+                return false;
+            }
+            decisions.insert(step.clone(), decision.clone());
+            true
+        })
+    }
+
+    /// Applies `edit` under the sidecar lock, writing only when it changed
+    /// something, and reports whether it did.
+    fn update(
+        &self,
+        edit: impl FnOnce(&mut BTreeMap<StepKey, ReviewOutcome>) -> bool,
+    ) -> Result<bool, StateError> {
+        let subject = "Step Decisions";
+        with_locks(
+            &[ScopedLock::pool(self.directory.join(DECISIONS_LOCK_NAME))],
+            subject,
+            || {
+                let mut decisions = match load_state(
+                    &self.directory.join(DECISIONS_NAME),
+                    subject,
+                    &validate_decisions,
+                )? {
+                    Loaded::Present(versioned) => versioned.value.decisions,
+                    Loaded::Missing => BTreeMap::new(),
+                };
+                if !edit(&mut decisions) {
+                    return Ok(false);
+                }
+                write_atomic(
+                    &self.directory.join(DECISIONS_NAME),
+                    &DecisionState { decisions },
+                    subject,
+                )?;
+                Ok(true)
+            },
+        )
+    }
+}
+
+/// The decision sidecar is the [`DecisionLog`] a replaying reviewer reads and
+/// writes: the same step identity the queue records the step under keys it.
+impl DecisionLog for DecisionStateRepository {
+    fn decision(&self, step: &StepKey) -> Result<Option<ReviewOutcome>, DecisionLogError> {
+        DecisionStateRepository::decision(self, step)
+            .map_err(|error| DecisionLogError::new(error.to_string()))
+    }
+
+    fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<(), DecisionLogError> {
+        DecisionStateRepository::record(self, step, decision)
+            .map(|_| ())
+            .map_err(|error| DecisionLogError::new(error.to_string()))
     }
 }
 
@@ -3553,6 +3701,11 @@ fn validate_queue(queue: &QueueState) -> Result<(), String> {
     }
     Ok(())
 }
+fn validate_decisions(_state: &DecisionState) -> Result<(), String> {
+    // A step key is validated on deserialization and a decision is opaque to this
+    // record: it is read back and replayed, never interpreted here.
+    Ok(())
+}
 fn validate_dispatch_group_for(
     parent: &TicketId,
     group: &DispatchGroupState,
@@ -3840,5 +3993,107 @@ mod tests {
         );
         assert!(message.contains("Worker Pool state"), "{message}");
         assert!(message.contains("jjfx pool"), "{message}");
+    }
+
+    /// Ticket 09: a review step's identity is derived from the Ticket, the
+    /// dimension and the pass, so a repeat of one is the same step while a
+    /// different pass or dimension is a different one.
+    #[test]
+    fn a_review_step_identity_names_the_ticket_dimension_and_pass() {
+        let step = StepKey::review("ENG-1", "security", 2);
+
+        assert_eq!(step.as_str(), "review:ENG-1:security:2");
+        assert_ne!(StepKey::review("ENG-1", "security", 1), step);
+        assert_ne!(StepKey::review("ENG-1", "performance", 2), step);
+        assert_ne!(StepKey::review("ENG-2", "security", 2), step);
+        assert_ne!(StepKey::dispatch("ENG-1"), step);
+    }
+
+    fn decisions_store() -> (tempfile::TempDir, DecisionStateRepository) {
+        let temp = tempfile::tempdir().expect("temp repository");
+        fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path()).expect("repository");
+        let store = repository.state_store().decisions();
+        (temp, store)
+    }
+
+    fn decision(title: &str) -> ReviewOutcome {
+        ReviewOutcome::new(
+            vec![crate::engine::ReviewFinding::new(
+                crate::engine::ReviewSeverity::Major,
+                Some("src/x.rs".to_owned()),
+                Some((12, 14)),
+                Some(title.to_owned()),
+                "Cap the loop.",
+                vec!["n = 3".to_owned()],
+            )],
+            crate::engine::ReviewCompleteness::Complete,
+        )
+    }
+
+    /// Ticket 09: a step's decision is recorded durably, so it can be read back -
+    /// and replayed - by a process that did not write it.
+    #[test]
+    fn a_step_decision_survives_a_reopen() {
+        let (temp, store) = decisions_store();
+        let step = StepKey::review("ENG-1", "security", 1);
+        assert!(store.decision(&step).expect("read").is_none());
+
+        assert!(
+            store.record(&step, &decision("bound")).expect("record"),
+            "recording a step's decision must report the store changed"
+        );
+
+        let reopened = Repository::open(temp.path())
+            .expect("repository")
+            .state_store()
+            .decisions();
+        assert_eq!(
+            reopened.decision(&step).expect("read"),
+            Some(decision("bound"))
+        );
+    }
+
+    /// Recording the same decision again is a no-op, so a replay that writes
+    /// back what it read does not churn the store; a different one replaces it.
+    #[test]
+    fn recording_the_same_decision_again_changes_nothing() {
+        let (_temp, store) = decisions_store();
+        let step = StepKey::review("ENG-1", "security", 1);
+        assert!(store.record(&step, &decision("bound")).expect("first"));
+        assert!(
+            !store
+                .record(&step, &decision("bound"))
+                .expect("the same again")
+        );
+        assert!(store.record(&step, &decision("other")).expect("replaced"));
+        assert_eq!(
+            store.decision(&step).expect("read"),
+            Some(decision("other"))
+        );
+    }
+
+    /// The decision store is keyed by step identity, so two passes of one
+    /// dimension, or two dimensions, do not collide.
+    #[test]
+    fn decisions_are_keyed_by_step_identity() {
+        let (_temp, store) = decisions_store();
+        let first = StepKey::review("ENG-1", "security", 1);
+        let second = StepKey::review("ENG-1", "security", 2);
+        store
+            .record(&first, &decision("first pass"))
+            .expect("first");
+        store
+            .record(&second, &decision("second pass"))
+            .expect("second");
+
+        assert_eq!(
+            store.decision(&first).expect("read"),
+            Some(decision("first pass"))
+        );
+        assert_eq!(
+            store.decision(&second).expect("read"),
+            Some(decision("second pass"))
+        );
     }
 }

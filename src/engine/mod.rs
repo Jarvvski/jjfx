@@ -84,9 +84,9 @@ pub use pool::{
 };
 pub use queue::{QueueResolution, WorkQueue};
 pub use reviewer::{
-    ReviewCompleteness, ReviewEscalation, ReviewFinding, ReviewLoop, ReviewLoopError,
-    ReviewLoopSummary, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop, Reviewer,
-    ReviewerError,
+    DecisionLog, DecisionLogError, ReplayingReviewer, ReviewCompleteness, ReviewEscalation,
+    ReviewFinding, ReviewLoop, ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest,
+    ReviewSeverity, ReviewStop, Reviewer, ReviewerError,
 };
 pub use run_log::{
     AgentSessionResolution, CollaborationEvent, CollaborationParticipant, FreshSessionReason,
@@ -100,15 +100,16 @@ pub use runtime::{
     RunOutcome, RunRequest, RunReset, RunSupervisor, RunSupervisorError, SessionRun,
 };
 pub use state::{
-    CommitOutcome, DEFAULT_POOL_NAME, DISPATCH_STEP_KIND, DispatchGroupOptions, DispatchGroupState,
-    DispatchGroupStateRepository, Expected, IdentifierError, InFlightRecord, InUseState,
-    InUseStateRepository, Loaded, MutationKind, MutationRecord, MutationRecordRepository, PoolName,
-    PoolState, PoolStateRepository, QueueAdmission, QueueItem, QueueItemState, QueueSettlement,
-    QueueState, QueueStateRepository, QueuedStep, REPOSITORY_WIDE_MUTATION, RunRecord,
-    RunRecordConclusion, RunRecordRepository, RunRecordUsage, SessionState, SessionStateRepository,
-    StateChange, StateError, StateRevision, StateStore, StepKey, SubIssueState, TicketId,
-    UndoState, Versioned, WaitingState, WaitingStateRepository, WireAgent, WireStatus,
-    WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
+    CommitOutcome, DEFAULT_POOL_NAME, DISPATCH_STEP_KIND, DecisionState, DecisionStateRepository,
+    DispatchGroupOptions, DispatchGroupState, DispatchGroupStateRepository, Expected,
+    IdentifierError, InFlightRecord, InUseState, InUseStateRepository, Loaded, MutationKind,
+    MutationRecord, MutationRecordRepository, PoolName, PoolState, PoolStateRepository,
+    QueueAdmission, QueueItem, QueueItemState, QueueSettlement, QueueState, QueueStateRepository,
+    QueuedStep, REPOSITORY_WIDE_MUTATION, REVIEW_STEP_KIND, RunRecord, RunRecordConclusion,
+    RunRecordRepository, RunRecordUsage, SessionState, SessionStateRepository, StateChange,
+    StateError, StateRevision, StateStore, StepKey, SubIssueState, TicketId, UndoState, Versioned,
+    WaitingState, WaitingStateRepository, WireAgent, WireStatus, WireTimestamp, WorkerId,
+    WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DEFAULT_READY_LABEL, DependencyGraph, DiscoveredSubIssue,

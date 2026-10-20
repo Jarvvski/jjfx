@@ -31,8 +31,10 @@ what the queue needs: an atomic replace of the whole document and a sidecar lock
 Each item carries:
 
 - `step` - the step's identity, derived from what it is. A Dispatch of one
-  Ticket is `dispatch:<ticket>`, so the same Ticket offered twice is the same
-  step and a repeat is detectable rather than a silent second Run.
+  Ticket is `dispatch:<ticket>`, and a review of one dimension of a Ticket's
+  change for one pass is `review:<ticket>:<dimension>:<pass>`; the same work
+  offered twice is the same step, so a repeat is detectable rather than a
+  silent second Run.
 - `kind`, `subject` - what sort of step it is and the human-facing subject (the
   Ticket).
 - `state` - the lifecycle: `queued`, `claimed`, `in_flight`, `done`, `failed` or
@@ -50,6 +52,34 @@ Each item carries:
 `in_flight` is written before the Run starts, not after, so a jjfx killed between
 the claim and the launch still knows what was in flight and where. That is the
 record a resumption reads.
+
+## What a step is
+
+A step's identity is derived from what it is, never from when it ran, so the same
+work offered twice is the same step rather than two. Two kinds exist:
+
+- `dispatch:<ticket>` - dispatching one Ticket.
+- `review:<ticket>:<dimension>:<pass>` - reviewing one dimension of one Ticket's
+  change for one pass.
+
+The review kind is the one that recurs: the same dimension is reviewed again on
+a later round, and a re-pass re-runs every dimension whether or not it found
+anything last time. Naming the Ticket, the dimension and the pass makes such a
+repeat the *same* step, so offering it again is reported as already known - the
+admission says `known` and the record's state is what it settled to - rather than
+running it a second time. Two passes, or two dimensions, are distinct steps.
+
+## Replaying a decision
+
+A step's *decision* - what it concluded, rather than that it ran - is kept in a
+second sidecar, `.jj/pools/<name>/decisions.json`, keyed by the same step
+identity. For a review pass the decision is the findings it produced, so a repeat
+of that step reads them back instead of asking the model to derive them again.
+
+The store is written atomically under its own lock, exactly as the queue is, and
+recording the same decision twice is a no-op - so a replay does not churn it. A
+step with nothing recorded is the model's to decide, and the fresh decision is
+recorded under the step's identity for the next repeat to replay.
 
 ## The states
 

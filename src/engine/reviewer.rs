@@ -9,7 +9,10 @@
 
 use std::collections::HashSet;
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
+
+use crate::engine::state::StepKey;
 
 /// One pull request for a reviewer to review, addressed without a local checkout.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,7 +53,8 @@ impl ReviewRequest {
 }
 
 /// How severe a reviewer judged one finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewSeverity {
     /// A correctness or security defect.
     Critical,
@@ -97,7 +101,7 @@ impl ReviewSeverity {
 ///
 /// Equality is by content: the review loop compares passes by it to tell a
 /// finding it has already seen from one it has not.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReviewFinding {
     severity: ReviewSeverity,
     file: Option<String>,
@@ -184,7 +188,8 @@ impl ReviewFinding {
 }
 
 /// Whether a reviewer pass covered everything it was asked to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ReviewCompleteness {
     /// The reviewer finished and covered its scope.
     Complete,
@@ -211,7 +216,11 @@ impl ReviewCompleteness {
 }
 
 /// What one reviewer pass produced.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// This is a step's *decision*: what the pass concluded. It is persisted by a
+/// [`DecisionLog`] so a repeat of the same step can be replayed from it rather
+/// than asking the model to derive it again (ticket 09).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReviewOutcome {
     findings: Vec<ReviewFinding>,
     completeness: ReviewCompleteness,
@@ -262,6 +271,103 @@ pub enum ReviewerError {
         /// The underlying failure.
         detail: String,
     },
+    /// A recorded decision could not be read back or written.
+    #[error("the decision log for step {step} failed: {detail}")]
+    DecisionLog {
+        /// The step whose decision could not be read or written.
+        step: String,
+        /// The underlying failure.
+        detail: String,
+    },
+}
+
+/// A durable log of the decisions a step recorded, keyed by step identity.
+///
+/// This is the seam that makes a recorded decision replayable: a reader asks the
+/// log what the step already decided, and only asks the model when the log has
+/// nothing. The production implementation is the pool's decision sidecar
+/// (`.jj/pools/<name>/decisions.json`); a test can supply its own.
+pub trait DecisionLog: Send + Sync {
+    /// The decision recorded for `step`, if any.
+    fn decision(&self, step: &StepKey) -> Result<Option<ReviewOutcome>, DecisionLogError>;
+
+    /// Records `decision` for `step`, replacing any prior one.
+    fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<(), DecisionLogError>;
+}
+
+/// A recorded decision could not be read back or written.
+#[derive(Debug, Error)]
+#[error("{detail}")]
+pub struct DecisionLogError {
+    detail: String,
+}
+
+impl DecisionLogError {
+    /// Creates a failure from its human-facing detail.
+    pub fn new(detail: impl Into<String>) -> Self {
+        Self {
+            detail: detail.into(),
+        }
+    }
+}
+
+/// A [`Reviewer`] that records each decision and replays a recorded one instead
+/// of re-invoking the model behind it.
+///
+/// The first call for its step asks the inner reviewer and records what it
+/// decided. Every later call for the same step - a retry, a later round, a fresh
+/// process - returns the recorded decision without calling the inner reviewer at
+/// all, so a repeated step costs nothing and cannot silently diverge from what
+/// was already decided (ticket 09). The step is what is replayed, so a different
+/// pass or dimension is a different [`ReplayingReviewer`] over a different key.
+pub struct ReplayingReviewer<S, R> {
+    decisions: S,
+    step: StepKey,
+    inner: R,
+}
+
+impl<S, R> ReplayingReviewer<S, R> {
+    /// Creates a reviewer that records and replays decisions for `step`.
+    pub fn new(decisions: S, step: StepKey, inner: R) -> Self {
+        Self {
+            decisions,
+            step,
+            inner,
+        }
+    }
+
+    /// Returns the step whose decision this reviewer records and replays.
+    pub const fn step(&self) -> &StepKey {
+        &self.step
+    }
+}
+
+impl<S, R> Reviewer for ReplayingReviewer<S, R>
+where
+    S: DecisionLog,
+    R: Reviewer,
+{
+    fn review(&self, request: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+        let step = self.step.as_str().to_owned();
+        if let Some(recorded) =
+            self.decisions
+                .decision(&self.step)
+                .map_err(|error| ReviewerError::DecisionLog {
+                    step: step.clone(),
+                    detail: error.to_string(),
+                })?
+        {
+            return Ok(recorded);
+        }
+        let outcome = self.inner.review(request)?;
+        self.decisions
+            .record(&self.step, &outcome)
+            .map_err(|error| ReviewerError::DecisionLog {
+                step,
+                detail: error.to_string(),
+            })?;
+        Ok(outcome)
+    }
 }
 
 /// Why a bounded review loop stopped.
@@ -479,7 +585,9 @@ impl ReviewLoop {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use super::*;
 
@@ -705,5 +813,102 @@ mod tests {
             .expect_err("reviewer failure");
 
         assert!(matches!(error, ReviewLoopError::Reviewer(_)), "{error}");
+    }
+
+    /// An in-memory decision log, standing in for the pool's decision sidecar.
+    ///
+    /// A log is genuinely shared mutable state - that is what makes a decision
+    /// replayable by a reader that did not write it - so the double shares its
+    /// map; it is not standing in for a borrow the real store would not need.
+    #[derive(Default, Clone)]
+    struct InMemoryLog {
+        decisions: Arc<Mutex<BTreeMap<StepKey, ReviewOutcome>>>,
+    }
+
+    impl DecisionLog for InMemoryLog {
+        fn decision(&self, step: &StepKey) -> Result<Option<ReviewOutcome>, DecisionLogError> {
+            Ok(self
+                .decisions
+                .lock()
+                .expect("decision log")
+                .get(step)
+                .cloned())
+        }
+
+        fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<(), DecisionLogError> {
+            self.decisions
+                .lock()
+                .expect("decision log")
+                .insert(step.clone(), decision.clone());
+            Ok(())
+        }
+    }
+
+    /// A reviewer that fails loudly if it is ever asked, so a test can prove a
+    /// replayed decision never reached the model.
+    struct PanickingReviewer;
+
+    impl Reviewer for PanickingReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+            panic!("a replayed decision must not re-invoke the reviewer");
+        }
+    }
+
+    /// Ticket 09: the first pass for a step records its decision, so a later pass
+    /// over the same step is the same decision rather than a second model call.
+    #[test]
+    fn the_first_pass_for_a_step_records_its_decision() {
+        let step = StepKey::review("ENG-1", "security", 1);
+        let log = InMemoryLog::default();
+        let inner = ScriptedReviewer::new(vec![pass(&["bound the loop"])]);
+
+        let outcome = ReplayingReviewer::new(log.clone(), step.clone(), inner)
+            .review(&request())
+            .expect("first pass");
+
+        assert_eq!(titles(outcome.findings()), ["bound the loop"]);
+        assert_eq!(
+            log.decision(&step).expect("read"),
+            Some(ReviewOutcome::new(
+                pass(&["bound the loop"]),
+                ReviewCompleteness::Complete
+            )),
+            "the decision must be recorded under the step's identity"
+        );
+    }
+
+    /// Ticket 09, the strongest criterion: a recorded decision is replayed from
+    /// what was stored, without the model being asked to derive it again.
+    #[test]
+    fn a_recorded_decision_is_replayed_without_calling_the_reviewer() {
+        let step = StepKey::review("ENG-1", "security", 1);
+        let log = InMemoryLog::default();
+        log.record(
+            &step,
+            &ReviewOutcome::new(pass(&["already decided"]), ReviewCompleteness::Complete),
+        )
+        .expect("record a decision");
+
+        let outcome = ReplayingReviewer::new(log, step, PanickingReviewer)
+            .review(&request())
+            .expect("replay");
+
+        assert_eq!(titles(outcome.findings()), ["already decided"]);
+    }
+
+    /// A step the log has nothing for is the model's to decide: the replay
+    /// reviewer records the fresh outcome so the next pass can replay it.
+    #[test]
+    fn a_step_the_log_does_not_know_is_decided_by_the_reviewer() {
+        let step = StepKey::review("ENG-1", "security", 1);
+        let log = InMemoryLog::default();
+        let inner = ScriptedReviewer::new(vec![pass(&["fresh"])]);
+
+        let outcome = ReplayingReviewer::new(log.clone(), step.clone(), inner)
+            .review(&request())
+            .expect("decide");
+
+        assert_eq!(titles(outcome.findings()), ["fresh"]);
+        assert!(log.decision(&step).expect("read").is_some());
     }
 }
