@@ -90,6 +90,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx dispatch, jjfx send and jjfx status --json report an opencode background Run by its session rather than a pid: the Run now starts by prompting its session through the daemon API with no client process, so an opencode Worker is busy with no pid, a dispatch's pid field is null and its detail names the session, and a send to a Worker with no session to resume delivers to a fresh session instead of spawning a client.
 - The review loop is bounded by progress, not just the pass cap: a round that finds nothing new or retires nothing stops the loop and escalates its unresolved findings, instead of buying another pass.
 - open-pr, review and send refuse a Worker Pool's persisted gh_repo when it is the slug a non-GitHub origin fabricated - the value a Pool created before the earlier origin fix still holds - reusing the existing 'origin is not a GitHub remote' refusal before any gh call, instead of looking up a repository that never existed and failing with a GraphQL error naming it; a gh_repo that is not that fabricated value is untouched.
+- jjfx colocation status answers without snapshotting the working copy, so the read can no longer block silently behind another jj process holding the repository's lock
 
 ## [0.55.0] - 2026-10-16
 
