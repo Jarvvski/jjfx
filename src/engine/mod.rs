@@ -60,7 +60,7 @@ pub use dispatch_prompt::{
 };
 pub use eligibility::{DispatchExclusions, ExclusionsProvider, reconcile_occupancy};
 pub use foreground::{FOREGROUND_WRAPPER_ENV, WRAPPER_SUBCOMMAND, run_wrapper};
-pub use governor::ConcurrencyCap;
+pub use governor::{ConcurrencyCap, POOL_CAPACITY_GAP_DETAIL};
 pub use layout::{
     DEFAULT_BIAS, PaneLayout, PanePlacement, PaneRole, SplitLocation, TerminalSettings,
 };

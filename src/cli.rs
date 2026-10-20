@@ -4114,9 +4114,22 @@ fn dispatch_command(
             open_workspaces,
             tickets_config,
         )?;
-        if let crate::engine::OrchestrationStart::Direct(success) = handoff.start {
-            render_dispatch_entries(&[DispatchEntry::from_success(&success)], args.json);
-            return Ok(());
+        match handoff.start {
+            crate::engine::OrchestrationStart::Waiting { ticket, detail } => {
+                render_dispatch_entries(
+                    &[DispatchEntry::Waiting {
+                        ticket: ticket.as_str().to_owned(),
+                        detail,
+                    }],
+                    args.json,
+                );
+                return Ok(());
+            }
+            crate::engine::OrchestrationStart::Direct(success) => {
+                render_dispatch_entries(&[DispatchEntry::from_success(&success)], args.json);
+                return Ok(());
+            }
+            crate::engine::OrchestrationStart::Group => {}
         }
         let log = spawn_background_orchestration(repository, &handoff.parent, args)?;
         render_dispatch_entries(
@@ -5640,15 +5653,36 @@ fn orchestrate_command(
         open_workspaces,
         tickets_config,
     )?;
+    match handoff.start {
+        // No free Worker is a capacity gap, not a failure: the Parent is
+        // reported as waiting, in the same shape a held-back Dispatch uses.
+        crate::engine::OrchestrationStart::Waiting { ticket, detail } => {
+            render_dispatch_entries(
+                &[DispatchEntry::Waiting {
+                    ticket: ticket.as_str().to_owned(),
+                    detail,
+                }],
+                json,
+            );
+            return Ok(());
+        }
+        crate::engine::OrchestrationStart::Direct(success) => {
+            if !json {
+                render_orchestration_event(&OrchestrationEvent::Started {
+                    parent: handoff.parent.clone(),
+                    resumed: handoff.resumed,
+                });
+            }
+            render_dispatch_entries(&[DispatchEntry::from_success(&success)], json);
+            return Ok(());
+        }
+        crate::engine::OrchestrationStart::Group => {}
+    }
     if !json {
         render_orchestration_event(&OrchestrationEvent::Started {
             parent: handoff.parent.clone(),
             resumed: handoff.resumed,
         });
-    }
-    if let crate::engine::OrchestrationStart::Direct(success) = handoff.start {
-        render_dispatch_entries(&[DispatchEntry::from_success(&success)], json);
-        return Ok(());
     }
     let options = crate::engine::OrchestrationOptions::new();
     let summary = handoff.runner.run(&handoff.request, &options, |event| {

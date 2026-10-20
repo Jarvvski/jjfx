@@ -18,10 +18,11 @@ use crate::engine::{
     DirectDispatchError, DirectDispatchRequest, DirectDispatchSuccess, DispatchDependencyContext,
     DispatchExclusions, DispatchGroup, DispatchGroupBuildOptions, DispatchGroupError,
     DispatchGroupEvent, DispatchGroupOptions, DispatchGroupProgress, DispatchGroupState,
-    DispatchGroupStatusCounts, ExclusionsProvider, Expected, Loaded, ParentTicket, Repository,
-    RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision, SubIssueStatus, Ticket,
-    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TicketTitle, WireAgent,
-    WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus, WorkspaceRestoration,
+    DispatchGroupStatusCounts, ExclusionsProvider, Expected, Loaded, POOL_CAPACITY_GAP_DETAIL,
+    ParentTicket, Repository, RepositoryIdentity, Reservation, RunMode, StateChange, StateRevision,
+    SubIssueStatus, Ticket, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
+    TicketTitle, WireAgent, WireTimestamp, WorkerActions, WorkerId, WorkerPoolError, WorkerStatus,
+    WorkspaceRestoration,
 };
 
 /// Inputs required to start or resume one Parent Ticket's orchestration.
@@ -237,6 +238,15 @@ pub enum OrchestrationStart {
     Group,
     /// No children existed, so the reserved placeholder launched the Parent directly.
     Direct(Box<DirectDispatchSuccess>),
+    /// No free Worker: the Parent waits for capacity rather than failing, and
+    /// nothing is discovered or persisted. A capacity gap is not a failure, so
+    /// the Parent is reported as waiting exactly as a held-back Dispatch is.
+    Waiting {
+        /// Parent Ticket left pending.
+        ticket: TicketId,
+        /// Why it is waiting, in the same shape a held-back Dispatch uses.
+        detail: String,
+    },
 }
 
 /// The result of preparing a Parent Ticket for foreground or detached watching.
@@ -1164,6 +1174,17 @@ impl OrchestrationRunner {
             .reserve(&placeholder)
         {
             Ok(reservation) => reservation,
+            // No free Worker is a capacity gap, not a failure: the Parent is
+            // reported as waiting rather than as a broken Dispatch, and nothing
+            // is discovered or persisted.
+            Err(DirectDispatchError::WorkerPool(
+                WorkerPoolError::NoIdleWorkers { .. } | WorkerPoolError::CapacityShortage(_),
+            )) => {
+                return Ok(OrchestrationStart::Waiting {
+                    ticket: parent.id().clone(),
+                    detail: POOL_CAPACITY_GAP_DETAIL.to_owned(),
+                });
+            }
             Err(error) => return Err(OrchestrationError::Execution(error.to_string())),
         };
         let graph = match discovery.dependency_graph(parent, repository) {
@@ -1269,7 +1290,7 @@ impl OrchestrationRunner {
                 }
                 Loaded::Missing => 0,
             },
-            OrchestrationStart::Direct(_) => 0,
+            OrchestrationStart::Direct(_) | OrchestrationStart::Waiting { .. } => 0,
         };
         Ok(OrchestrationPreparation {
             start,

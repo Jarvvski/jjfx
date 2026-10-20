@@ -494,6 +494,48 @@ fn a_local_feature_parent_discovers_its_children_as_a_group() {
 }
 
 #[test]
+fn discovery_reports_a_parent_with_no_free_worker_as_waiting() {
+    let directory = TempDir::new().expect("temporary repository");
+    fs::create_dir(directory.path().join(".jj")).expect("repository marker");
+    let repository = Repository::open(directory.path()).expect("open repository");
+    let worker = WorkerId::parse("worker-01").expect("Worker");
+    install_idle_worker(&repository, &worker);
+    // The only Worker is already running, so there is no free one for the Parent.
+    repository
+        .worker_pool()
+        .reserve_many(&["ENG-099"])
+        .expect("occupy the Worker");
+    let parent_id = TicketId::parse("ENG-100").expect("Parent Ticket");
+    let parent = ParentTicket::new(parent_id.clone());
+    let discovery = TicketDiscovery::new(StaticQuery(r#"{"sub_issues":[]}"#));
+
+    let start = repository
+        .orchestration_runner()
+        .discover(
+            &OrchestrationRequest::new(parent_id.clone(), AgentRuntime::Claude),
+            &parent,
+            &discovery,
+            &RepositoryIdentity::parse("owner/repo").expect("repository identity"),
+            "owner/repo",
+        )
+        .expect("no free Worker is a capacity gap, not a failure");
+    assert!(matches!(
+        start,
+        jjfx::engine::OrchestrationStart::Waiting { ticket, detail }
+            if ticket == parent_id && detail.contains("no idle Worker")
+    ));
+    // Nothing is discovered or persisted: the Parent waits for a later Dispatch.
+    assert!(matches!(
+        repository
+            .state_store()
+            .dispatch_group(parent_id)
+            .load()
+            .expect("load group"),
+        jjfx::engine::Loaded::Missing
+    ));
+}
+
+#[test]
 fn failed_graph_discovery_releases_placeholder_and_surfaces_the_query_error() {
     let directory = TempDir::new().expect("temporary repository");
     fs::create_dir(directory.path().join(".jj")).expect("repository marker");

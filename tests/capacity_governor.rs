@@ -11,6 +11,10 @@
 //! `[dispatch]` setting, the governor at the Dispatch seam, and the document a
 //! frontend reads. The Pool's Workers are seeded as state rather than
 //! provisioned, so a case exercises the governor without spending a Workspace.
+//!
+//! The Worker Pool is the other dial that bounds Dispatch, and the two gaps read
+//! the same way: a Pool with no free Worker is a capacity gap, not a failure, so
+//! `dispatch --all` and a named `dispatch` both report the Ticket as `waiting`.
 #![cfg(unix)]
 
 use std::ffi::OsString;
@@ -154,6 +158,17 @@ fn status_json(fixture: &Fixture) -> Value {
     serde_json::from_str(&stdout(&output)).expect("valid status JSON")
 }
 
+/// The `detail` of every `waiting` entry in a Dispatch batch, in order.
+fn waiting_details(entries: &Value) -> Vec<String> {
+    entries
+        .as_array()
+        .expect("an array of outcomes")
+        .iter()
+        .filter(|entry| entry["outcome"] == "waiting")
+        .map(|entry| entry["detail"].as_str().expect("a reason").to_owned())
+        .collect()
+}
+
 /// The fixture: a four-Worker Pool with two Runs already in flight, and three
 /// ready Tickets - more than the cap of two can hold.
 fn fixture() -> Fixture {
@@ -288,6 +303,7 @@ fn the_limit_survives_across_dispatches() {
     let second = fixture.jjfx(&["dispatch", "--all", "--json"]);
     assert!(second.status.success(), "{}", stderr(&second));
 
+    let first_entries: Value = serde_json::from_str(stdout(&first).trim()).expect("valid JSON");
     let entries: Value = serde_json::from_str(stdout(&second).trim()).expect("valid JSON");
     let held = entries
         .as_array()
@@ -302,9 +318,110 @@ fn the_limit_survives_across_dispatches() {
         stdout(&second)
     );
 
+    // The two Dispatches are the same situation reached twice, and the two
+    // messages must agree about it: both name the count that actually bound the
+    // batch - the two Runs the governor reports in flight - not the pre-launch
+    // count of whichever Dispatch happened to run first.
+    let first_details = waiting_details(&first_entries);
+    let second_details = waiting_details(&entries);
+    assert_eq!(
+        first_details, second_details,
+        "the two Dispatches must agree about the same state"
+    );
+    assert!(
+        first_details
+            .iter()
+            .all(|detail| detail.contains("2 Run(s) in flight")),
+        "{first_details:?}"
+    );
+
     // Nothing was launched by either Dispatch: the two in-flight Runs are still
     // the only ones, and the two free Workers are still free.
     let value = status_json(&fixture);
     assert_eq!(value["governor"]["running"], 2, "{value}");
     assert_eq!(value["governor"]["held"], 3, "{value}");
+}
+
+/// The cap detail names the count that actually bound the batch. A first
+/// Dispatch has nothing in flight, so the pre-launch count is `0`; it fires its
+/// prefix and the cap holds the rest, so the detail must name the count the
+/// governor reports - the two Runs now in flight - not a pre-launch zero.
+#[test]
+fn a_capped_dispatch_names_the_count_that_bound_the_batch() {
+    let fixture = Fixture::new();
+    fixture.write_user_config("[tickets]\nsource = \"local\"\n[dispatch]\nmax_concurrent = 2\n");
+    // Four idle Workers, so the cap is the binding dial, not pool capacity.
+    fixture.seed_pool(4, 0);
+    fixture.write_ticket("01-alpha.md", "Alpha");
+    fixture.write_ticket("02-beta.md", "Beta");
+    fixture.write_ticket("03-gamma.md", "Gamma");
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let entries: Value = serde_json::from_str(stdout(&output).trim()).expect("valid JSON");
+
+    // The cap fires two and holds the third, so one reason stands for the gap.
+    let details = waiting_details(&entries);
+    assert_eq!(details.len(), 1, "{}", stdout(&output));
+    assert!(
+        details[0].contains("2 Run(s) in flight"),
+        "the count that bound the batch is the two it fired: {}",
+        details[0]
+    );
+    assert!(
+        !details[0].contains("0 Run(s) in flight"),
+        "a pre-launch zero is the bug: {}",
+        details[0]
+    );
+}
+
+/// No free Worker is a capacity gap, not a failure, and the two ways to reach it
+/// agree: `dispatch --all` and a named `dispatch` report the same Ticket as
+/// `waiting`, with the same reason.
+#[test]
+fn a_pool_with_no_free_worker_is_reported_as_waiting_by_all_and_by_a_named_dispatch() {
+    let fixture = Fixture::new();
+    // Uncapped, so pool capacity is the only dial that can hold the Ticket.
+    fixture.write_user_config("[tickets]\nsource = \"local\"\n");
+    // Both Workers are busy, so there is no free Worker to run the Ticket.
+    fixture.seed_pool(2, 2);
+    fixture.write_ticket("01-alpha.md", "Alpha");
+
+    let all = fixture.jjfx(&["dispatch", "--all", "--json"]);
+    assert!(all.status.success(), "{}\n{}", stdout(&all), stderr(&all));
+    let all_json: Value = serde_json::from_str(stdout(&all).trim()).expect("valid JSON");
+    assert_eq!(all_json[0]["outcome"], "waiting", "{all_json}");
+    assert!(all_json[0]["worker"].is_null(), "{all_json}");
+
+    let named = fixture.jjfx(&["dispatch", "--json", "widgets--01-alpha"]);
+    assert!(
+        named.status.success(),
+        "{}\n{}",
+        stdout(&named),
+        stderr(&named)
+    );
+    let named_json: Value = serde_json::from_str(stdout(&named).trim()).expect("valid JSON");
+    assert_eq!(named_json[0]["outcome"], "waiting", "{named_json}");
+    assert!(named_json[0]["worker"].is_null(), "{named_json}");
+
+    // One capacity gap, reported the same way by both paths.
+    assert_eq!(
+        all_json[0]["ticket"], named_json[0]["ticket"],
+        "the same Ticket: all {all_json} named {named_json}"
+    );
+    assert_eq!(
+        all_json[0]["detail"], named_json[0]["detail"],
+        "the same reason: all {all_json} named {named_json}"
+    );
+    assert!(
+        all_json[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("no idle Worker")),
+        "{all_json}"
+    );
 }

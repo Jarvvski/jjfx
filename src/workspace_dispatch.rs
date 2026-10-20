@@ -737,6 +737,8 @@ pub enum WorkspaceDispatchOrchestrationEvent {
         /// no client process.
         session_id: Option<String>,
     },
+    /// No free Worker: the Parent is waiting for capacity rather than failing.
+    Waiting { parent: String, detail: String },
     /// The group reached a terminal state.
     Terminal {
         parent: String,
@@ -798,6 +800,12 @@ pub enum WorkspaceDispatchEvent {
         /// The opencode session the prompt was delivered to, when the Run drove
         /// no client process.
         session_id: Option<String>,
+    },
+    /// Orchestration found no free Worker, so the Parent waits for capacity.
+    OrchestrationWaiting {
+        operation: OperationId,
+        parent: String,
+        detail: String,
     },
     /// Orchestration reached a terminal group state.
     OrchestrationTerminal {
@@ -1056,6 +1064,13 @@ impl WorkspaceDispatchController {
                             operation,
                             parent,
                             counts,
+                        });
+                    }
+                    WorkspaceDispatchOrchestrationEvent::Waiting { parent, detail } => {
+                        emit(WorkspaceDispatchEvent::OrchestrationWaiting {
+                            operation,
+                            parent,
+                            detail,
                         });
                     }
                 };

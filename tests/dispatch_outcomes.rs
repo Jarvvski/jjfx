@@ -760,20 +760,28 @@ fn an_explicit_pool_fills_that_lane_not_default() {
     fixture.with_fake_agent();
 
     // Naming `bugs` materialises that lane's own state - empty, because the
-    // declaration names no size - and fails for want of an idle Worker there
-    // rather than falling back to `default`'s idle one.
+    // declaration names no size - and reports the Ticket as waiting for want of
+    // an idle Worker there rather than falling back to `default`'s idle one. No
+    // free Worker is a capacity gap, not a failure, so the Dispatch succeeds
+    // with the Ticket held back.
     let bugs = fixture.dispatch(&[
         "dispatch",
         "widgets--01-ship-the-widget",
         "--pool",
         "bugs",
         "--no-orchestrate",
+        "--json",
     ]);
     assert!(
-        !bugs.status.success(),
-        "a Dispatch into a lane with no idle Worker must fail:\nstdout:\n{}",
-        stdout(&bugs)
+        bugs.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&bugs),
+        stderr(&bugs)
     );
+    let json: serde_json::Value =
+        serde_json::from_str(stdout(&bugs).trim()).expect("valid JSON batch");
+    assert_eq!(json[0]["outcome"], "waiting", "{json}");
+    assert!(json[0]["worker"].is_null(), "{json}");
     let bugs_state =
         fs::read_to_string(fixture.path().join(".jj/pools/bugs/pool.json")).expect("bugs state");
     assert!(bugs_state.contains("\"size\": 0"), "{bugs_state}");

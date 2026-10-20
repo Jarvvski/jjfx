@@ -140,7 +140,9 @@ fn free_text_dispatches_with_no_ticket_source_configured() {
     assert!(!stderr.contains("Linear"), "{stderr}");
     let json = stdout(&output);
     assert!(json.contains("ad-hoc--fix-the-login-bug"), "{json}");
-    assert!(json.contains("\"phase\": \"capacity\""), "{json}");
+    // An empty Pool with no free Worker is a capacity gap, not a failure: the
+    // Ticket waits for one to finish rather than reading as a broken Dispatch.
+    assert!(json.contains("\"outcome\": \"waiting\""), "{json}");
 }
 
 #[test]
@@ -164,7 +166,7 @@ fn a_markdown_file_outside_scratch_dispatches() {
     let json = stdout(&output);
     assert!(json.contains("ad-hoc--plan"), "{}", diagnostics(&output));
     assert!(
-        json.contains("\"phase\": \"capacity\""),
+        json.contains("\"outcome\": \"waiting\""),
         "{}",
         diagnostics(&output)
     );

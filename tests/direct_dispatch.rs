@@ -1036,7 +1036,7 @@ fn default_bulk_dispatch_is_all_or_nothing_before_any_workspace_or_prompt_work()
 }
 
 #[test]
-fn explicit_use_available_dispatch_preserves_ticket_order_and_capacity_failures() {
+fn explicit_use_available_dispatch_preserves_ticket_order_and_capacity_waits() {
     let (_temporary_directory, repository) = local_repository();
     configure_jj_identity(&repository);
     create_main(&repository);
@@ -1069,11 +1069,13 @@ fn explicit_use_available_dispatch_preserves_ticket_order_and_capacity_failures(
             if failure.phase() == DirectDispatchFailurePhase::Identity
                 && failure.worker().is_some()
     ));
+    // No free Worker is a capacity gap, not a failure: the Ticket waits for one
+    // to finish, in the same shape the governor holds a Ticket back with.
     assert!(matches!(
         &result.outcomes()[1],
-        DirectDispatchOutcome::Failed(failure)
-            if failure.phase() == DirectDispatchFailurePhase::Capacity
-                && failure.worker().is_none()
+        DirectDispatchOutcome::Waiting(waiting)
+            if waiting.ticket().id().as_str() == "ENG-411"
+                && waiting.detail().contains("no idle Worker")
     ));
     assert_eq!(
         repository

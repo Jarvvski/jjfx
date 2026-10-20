@@ -237,13 +237,10 @@ impl DirectDispatch {
         let (fire, held) = super::governor::pace(cap, in_flight, requests);
         // The reason names the dial the owner turns and what has to change for
         // the held Ticket to run, not just the count: a held-back Ticket is a
-        // "why" a human acts on, not a number to read.
-        let detail = format!(
-            "held back by the concurrency cap (dispatch.max_concurrent = {}): {} Run(s) in flight, \
-             so a Run must finish before another may start",
-            cap.limit(),
-            in_flight
-        );
+        // "why" a human acts on, not a number to read. The count is the one that
+        // actually bound the batch - the Runs already in flight plus this
+        // batch's own launches - so it agrees with what the governor reports.
+        let detail = super::governor::cap_hold_detail(cap, in_flight, fire.len());
         let waiting = held
             .iter()
             .map(|request| DirectDispatchWaiting::new(request.ticket().clone(), detail.clone()))
@@ -251,28 +248,29 @@ impl DirectDispatch {
         (fire, waiting)
     }
 
-    /// Records the waiting set for this batch and appends it to the outcomes.
+    /// Records the waiting set for this batch.
     ///
     /// The set is rewritten on every batch Dispatch - including an uncapped one,
     /// which clears it - so it always describes the last Dispatch rather than
     /// accumulating Tickets that have since been fired by hand. A waiting record
     /// that cannot be written must not fail a Dispatch that is otherwise fine:
     /// it is how a frontend shows the backlog, nothing more.
-    fn finish(
-        &self,
-        result: DirectDispatchResult,
-        waiting: Vec<DirectDispatchWaiting>,
-    ) -> DirectDispatchResult {
+    ///
+    /// The waiting set is every `Waiting` outcome in the result - the governor's
+    /// held-back tail and any Ticket the Pool had no free Worker for - so the two
+    /// capacity gaps are recorded the same way. The Tickets are also queued
+    /// durably: they are work jjfx has accepted and not yet run, so they must
+    /// survive this process. Best effort, as the waiting set is - a Run in the
+    /// same batch may already be live, and a queue write that failed must not
+    /// misreport the Dispatch.
+    fn finish(&self, result: DirectDispatchResult) -> DirectDispatchResult {
+        let waiting = result.waiting();
         let _ = self.repository.state_store().waiting().replace(
             waiting
                 .iter()
                 .map(|held| held.ticket().id().as_str().to_owned())
                 .collect(),
         );
-        // The held-back Tickets are also queued durably: they are work jjfx has
-        // accepted and not yet run, so they must survive this process. Best
-        // effort, as the waiting set is - a Run in the same batch may already be
-        // live, and a queue write that failed must not misreport the Dispatch.
         if let Ok(at) = current_timestamp() {
             let steps = waiting
                 .iter()
@@ -285,8 +283,16 @@ impl DirectDispatch {
                 })
                 .collect::<Vec<_>>();
             let _ = self.repository.work_queue().enqueue(&steps);
+            // A step the batch already admitted carries no reason yet - `enqueue`
+            // leaves a known step alone - so the reason is recorded separately.
+            for held in &waiting {
+                let _ = self.repository.work_queue().note(
+                    &StepKey::dispatch(held.ticket().id().as_str()),
+                    held.detail(),
+                );
+            }
         }
-        result.with_waiting(waiting)
+        result
     }
 
     /// The Runs already in flight: every Worker the Worker Pool records as busy.
@@ -357,7 +363,7 @@ impl DirectDispatch {
         }
         let (fire, waiting) = self.governed(requests);
         if fire.is_empty() {
-            return Ok(self.finish(DirectDispatchResult::default(), waiting));
+            return Ok(self.finish(DirectDispatchResult::default().with_waiting(waiting)));
         }
         let profiles = self.preflight_all(fire)?;
         let targets = fire
@@ -379,13 +385,9 @@ impl DirectDispatch {
             .repository
             .worker_pool()
             .reserve_targeted(&targets, &self.exclusions)?;
-        let result = self.dispatch_claimed(
-            fire,
-            reservations.into_iter().enumerate().collect(),
-            Vec::new(),
-            false,
-        );
-        Ok(self.finish(result, waiting))
+        let result =
+            self.dispatch_claimed(fire, reservations.into_iter().enumerate().collect(), false);
+        Ok(self.finish(result.with_waiting(waiting)))
     }
 
     /// Provisions only caller-approved missing capacity, then reserves atomically.
@@ -399,7 +401,7 @@ impl DirectDispatch {
         }
         let (fire, waiting) = self.governed(requests);
         if fire.is_empty() {
-            return Ok(self.finish(DirectDispatchResult::default(), waiting));
+            return Ok(self.finish(DirectDispatchResult::default().with_waiting(waiting)));
         }
         let profiles = self.preflight_all(fire)?;
         let targets = fire
@@ -422,13 +424,9 @@ impl DirectDispatch {
             approved_additional,
             &self.exclusions,
         )?;
-        let result = self.dispatch_claimed(
-            fire,
-            reservations.into_iter().enumerate().collect(),
-            Vec::new(),
-            false,
-        );
-        Ok(self.finish(result, waiting))
+        let result =
+            self.dispatch_claimed(fire, reservations.into_iter().enumerate().collect(), false);
+        Ok(self.finish(result.with_waiting(waiting)))
     }
 
     /// Explicitly dispatches only the currently available subset of a batch.
@@ -441,7 +439,7 @@ impl DirectDispatch {
         }
         let (fire, waiting) = self.governed(requests);
         if fire.is_empty() {
-            return Ok(self.finish(DirectDispatchResult::default(), waiting));
+            return Ok(self.finish(DirectDispatchResult::default().with_waiting(waiting)));
         }
         let profiles = self.preflight_all(fire)?;
         let targets = fire
@@ -464,8 +462,8 @@ impl DirectDispatch {
             .worker_pool()
             .reserve_available_targeted(&targets, &self.exclusions)?;
         let partial = !available.unavailable.is_empty();
-        let result = self.dispatch_claimed(fire, available.claimed, available.unavailable, partial);
-        Ok(self.finish(result, waiting))
+        let result = self.dispatch_claimed(fire, available.claimed, partial);
+        Ok(self.finish(result.with_waiting(waiting)))
     }
 
     /// Records a whole batch as held back without firing any of it.
@@ -482,7 +480,7 @@ impl DirectDispatch {
             .iter()
             .map(|request| DirectDispatchWaiting::new(request.ticket().clone(), detail))
             .collect();
-        self.finish(DirectDispatchResult::default(), waiting)
+        self.finish(DirectDispatchResult::default().with_waiting(waiting))
     }
 
     /// Launches a previously persisted Reservation and transfers its ownership.
@@ -664,27 +662,23 @@ impl DirectDispatch {
         &self,
         requests: &[DirectDispatchRequest],
         claimed: Vec<(usize, Reservation)>,
-        unavailable: Vec<usize>,
         partial: bool,
     ) -> DirectDispatchResult {
         self.queue_batch(requests);
+        // Every Ticket starts as waiting for capacity: a Reservation replaces it
+        // with a launched Run, and one the Pool has no free Worker for stays
+        // waiting - the work is outstanding, not failed. A batch only reaches
+        // here with a Ticket left over when it is an explicit use-available
+        // Dispatch, so the whole batch fires when the Pool has room.
         let mut outcomes = requests
             .iter()
             .map(|request| {
-                DirectDispatchOutcome::Failed(DirectDispatchFailure::new(
+                DirectDispatchOutcome::Waiting(DirectDispatchWaiting::new(
                     request.ticket().clone(),
-                    match request.target() {
-                        DirectDispatchTarget::FirstIdle => None,
-                        DirectDispatchTarget::Worker(worker) => Some(worker.clone()),
-                    },
-                    DirectDispatchFailurePhase::Capacity,
-                    "no matching idle Worker was available",
+                    super::governor::POOL_CAPACITY_GAP_DETAIL,
                 ))
             })
             .collect::<Vec<_>>();
-        for index in unavailable {
-            debug_assert!(matches!(outcomes[index], DirectDispatchOutcome::Failed(_)));
-        }
         for (index, reservation) in claimed {
             let worker = reservation.worker_id().clone();
             outcomes[index] = match self.dispatch_preflighted(reservation, &requests[index]) {
@@ -723,10 +717,11 @@ impl DirectDispatch {
 
     /// Records the durable queue outcome of every Ticket in one batch.
     ///
-    /// A Ticket that never started - the governor held it, or an explicit
-    /// use-available Dispatch found no capacity - is queued, not failed: the work
-    /// is outstanding. One that was claimed and failed before its Run started is
-    /// settled as failed, so "what happened to this?" has an answer.
+    /// A Ticket that never started - the governor held it, or the Pool had no
+    /// free Worker - is queued, not failed: the work is outstanding, and
+    /// [`Self::finish`] records it. One that was claimed and failed before its
+    /// Run started is settled as failed, so "what happened to this?" has an
+    /// answer.
     ///
     /// Best effort: a Run in this batch may already be live, so a queue write
     /// that failed must not misreport the Dispatch.
@@ -735,24 +730,16 @@ impl DirectDispatch {
             let DirectDispatchOutcome::Failed(failure) = outcome else {
                 continue;
             };
-            let ticket = failure.ticket().id().as_str();
             let Ok(at) = current_timestamp() else {
                 continue;
             };
-            if failure.phase() == DirectDispatchFailurePhase::Capacity {
-                let _ = self
-                    .repository
-                    .work_queue()
-                    .note(&StepKey::dispatch(ticket), failure.detail());
-            } else {
-                let _ = self.repository.work_queue().settle(
-                    &StepKey::dispatch(ticket),
-                    QueueSettlement::Failed {
-                        detail: failure.detail().to_owned(),
-                    },
-                    at,
-                );
-            }
+            let _ = self.repository.work_queue().settle(
+                &StepKey::dispatch(failure.ticket().id().as_str()),
+                QueueSettlement::Failed {
+                    detail: failure.detail().to_owned(),
+                },
+                at,
+            );
         }
     }
 
@@ -850,9 +837,6 @@ fn failure_phase(error: &DirectDispatchError) -> DirectDispatchFailurePhase {
         DirectDispatchError::Workspace(_) => DirectDispatchFailurePhase::Workspace,
         DirectDispatchError::Identity(_) => DirectDispatchFailurePhase::Identity,
         DirectDispatchError::Prompt(_) => DirectDispatchFailurePhase::Prompt,
-        DirectDispatchError::WorkerPool(WorkerPoolError::CapacityShortage(_)) => {
-            DirectDispatchFailurePhase::Capacity
-        }
         DirectDispatchError::ReservationRelease { primary, .. } => failure_phase(primary),
         DirectDispatchError::WorkerPool(_)
         | DirectDispatchError::ReservationTicketMismatch { .. }
@@ -971,8 +955,6 @@ pub enum DirectDispatchFailurePhase {
     Prompt,
     /// Agent Runtime launch failed.
     Launch,
-    /// Explicit partial Dispatch had no capacity for the Ticket.
-    Capacity,
 }
 
 impl DirectDispatchFailurePhase {
@@ -983,7 +965,6 @@ impl DirectDispatchFailurePhase {
             Self::Identity => "identity",
             Self::Prompt => "prompt",
             Self::Launch => "launch",
-            Self::Capacity => "capacity",
         }
     }
 }

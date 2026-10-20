@@ -5264,7 +5264,7 @@ mod tests {
                     "ENG-43".to_owned(),
                     "Second Ticket".to_owned(),
                     None,
-                    crate::engine::DirectDispatchFailurePhase::Capacity,
+                    crate::engine::DirectDispatchFailurePhase::Launch,
                     "no idle Worker".to_owned(),
                 ),
             ],
@@ -5286,7 +5286,7 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("ENG-42  First Ticket"), "{text}");
-        assert!(text.contains("ENG-43 [Capacity]"), "{text}");
+        assert!(text.contains("ENG-43 [Launch]"), "{text}");
         assert!(text.find("ENG-42").unwrap() < text.find("ENG-43").unwrap());
     }
 
