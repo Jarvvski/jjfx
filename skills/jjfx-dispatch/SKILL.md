@@ -70,7 +70,17 @@ A ticket that has sub-issues is a **Parent**: jjfx orchestrates the sub-issues a
 
 Before launching, jjfx fetches each Ticket's title and description through the configured source and inlines them in the Worker's prompt, so a Worker can implement without tracker tools; if the source cannot be read, Dispatch fails before anything is reserved.
 
-**Done when** every Ticket you named has an object in the JSON: `dispatched` or `orchestrating` naming what took it, or `waiting` / `failed` naming why. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` in the user config can hold one back deliberately - its object reads `"outcome": "waiting"`, and `jjfx status --json` carries the held set in its pool-level `waiting` array.
+**Done when** every Ticket you named has an object in the JSON: `dispatched` or `orchestrating` naming what took it, or `waiting` / `failed` naming why. A ticket with no free Worker reports the capacity gap rather than waiting silently, and a `[spend] cap_usd` or `[dispatch] max_concurrent` can hold one back deliberately - its object reads `"outcome": "waiting"`, and `jjfx status --json` carries the held set in its pool-level `waiting` array.
+
+**Pace the backlog from the repository, not the user's config.** To bound how much you fan out, set `[dispatch] max_concurrent` in the **repository** config, `<repo>/.jjfx/config.toml` - never in `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, which would change every repository the user drives:
+
+```toml
+# <repo>/.jjfx/config.toml
+[dispatch]
+max_concurrent = 2
+```
+
+The repository ceiling may only **tighten** the user-global one, never widen it: with both set the smaller binds, and with no user-global cap a repository ceiling is the only limit. `jjfx status --json` reports the resolved limit as `governor.limit`, so the binding ceiling is visible where you read the pool. This is the deliberate way to hold work back - the same `waiting` outcome a full Pool gives, but by your choice rather than the pool's size.
 
 ### 4. Watch
 
@@ -136,3 +146,4 @@ jjfx pool destroy          # tear down the pool
 - **Never merge.** Dispatch produces pull requests; landing them is the user's call.
 - **Leave open Workspaces alone.** jjfx will not dispatch to (or `send` into) a Workspace that is open in a terminal. If a headless run reports it cannot see the terminal, re-run with `--force`; otherwise do not force past a Workspace a human is using.
 - **Set the runtime deliberately.** The pool profile is repository state that survives a restart — set it with `jjfx pool profile`, not per dispatch, unless the user asks for a one-off `--provider`/`--model` override.
+- **Pace from the repository config, never the user's.** To bound concurrency, set `[dispatch] max_concurrent` in `<repo>/.jjfx/config.toml`. It tightens the user-global ceiling and can never widen it, and `jjfx status --json` reports the resolved limit as `governor.limit`. Do not edit `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml` to pace one backlog — that changes every repository the user drives.

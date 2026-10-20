@@ -50,10 +50,20 @@ Then, per finished Worker, land it (§6). Reconcile by reading `status --json`;
 the local Ticket files flip to `resolved` on a **passing repository check**, not
 on the agent's word - that is real and should be trusted.
 
-**Two settings an agent cannot set today** (finding 10): the concurrency cap
-(`[dispatch] max_concurrent`) and the pool size live outside the repository
-(global config / `jjfx pool <N>`). Size the pool deliberately with `jjfx pool`,
-and treat the cap as the user's, not yours.
+**One setting an agent cannot set today** (finding 10, partly fixed): the pool
+size lives outside the repository (`jjfx pool <N>`). Size the pool deliberately
+with `jjfx pool`. The concurrency cap (`[dispatch] max_concurrent`) is now
+repository-settable - put it in `<repo>/.jjfx/config.toml`, not the user's global
+config, and it tightens the user-global ceiling rather than replacing it:
+
+```toml
+# <repo>/.jjfx/config.toml
+[dispatch]
+max_concurrent = 2
+```
+
+`jjfx status --json` reports the resolved limit as `governor.limit`, so the
+binding ceiling is visible where the pool is read.
 
 ---
 
@@ -190,7 +200,8 @@ guess, or read the source to discover:
    (§3d)
 7. **Resume safety.** Do not re-run a resolved Ticket. (§3e)
 8. **Delivery.** Perform the push+PR the prompt promises. (§4)
-9. **Capacity.** Let the repository set its own ceiling. (finding 10)
+9. **Capacity.** Let the repository set its own ceiling. (finding 10, done for
+   the concurrency cap; the pool size is still `jjfx pool`.)
 10. **Watch.** `jjfx logs` should show a session-delivered Run, or say there is no
     log. (finding 11)
 
