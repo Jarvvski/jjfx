@@ -1,6 +1,6 @@
 # Every jj invocation jjfx makes carries no deadline
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -61,15 +61,15 @@ a bug to patch per site.
 
 ## Acceptance Criteria
 
-- [ ] The two orchestration reads carry `--ignore-working-copy`, and a test
+- [x] The two orchestration reads carry `--ignore-working-copy`, and a test
       holds the working-copy lock and proves they return anyway - the shape
       `08`'s regression test uses (`hold_the_working_copy_lock` in
       `src/cli.rs`).
-- [ ] The mutations are decided explicitly, not left by default: either every
+- [x] The mutations are decided explicitly, not left by default: either every
       lock-taking jj invocation gets a bounded wait that names what it is
       waiting on (the crate already has `cmd::Cmd::run_with_timeout`), or the
       unbounded wait is a recorded, deliberate choice with its reason.
-- [ ] `mise run check` is green.
+- [x] `mise run check` is green.
 
 ## Reproducing
 
@@ -100,3 +100,73 @@ copy holds the lock for ~4s.
 - `src/jj.rs` (`read_at_repo`, `read_in_dir` - the already-correct read path)
 - `src/cmd.rs` (`Cmd::run_with_timeout` - the bounded-run primitive that exists)
 - `.scratch/bug-hunt/load-harness.sh` - the other load harness, for the other class
+
+## Resolution (2026-10-20)
+
+Both halves answered; `mise run check` green.
+
+### 1. The two reads are lock-free (a defect, fixed)
+
+`revision_exists` and `resolve_ticket_branch` (`src/engine/orchestration.rs`)
+now read through `crate::jj::read_in_dir` instead of a bare `crate::jj::command()`.
+`read_in_dir` is the crate's canonical read path and carries
+`--ignore-working-copy`, so neither read snapshots the working copy and neither
+can wait on the lock. Routing through the shared helper rather than appending
+the flag per site is the point: a read can no longer forget it.
+
+A regression test, `orchestration_reads_do_not_wait_on_the_working_copy_lock`
+(`src/engine/orchestration.rs`), holds the working-copy lock with
+`test_support::hold_the_working_copy_lock` and requires both reads to answer
+within `test_support::LIVENESS_TIMEOUT`. It is not vacuous: a negative control
+asserts an unflagged `jj bookmark list` is still blocked after 2s, so the lock
+is demonstrably held. `hold_the_working_copy_lock` moved from `08`'s test module
+in `src/cli.rs` to `src/test_support.rs` so the two tests share one way to hold
+the lock; `08`'s test now calls the shared helper. Measured against a 6s hold, an
+unflagged `jj bookmark list` blocked 5.74s and the flagged form returned in
+0.03s; the test passes in ~2.3s.
+
+### 2. The mutations wait without a deadline - the recorded choice
+
+**Chosen: the unbounded wait is deliberate and recorded, not bounded. jjfx does
+not kill a lock-taking mutation for taking too long.**
+
+Recorded in ADR
+[`0018`](../../../docs/adr/0018-a-lock-taking-jj-invocation-waits-without-a-deadline.md)
+and at the seam every mutation routes through (`jj::command`, `jj::mut_command`,
+`src/jj.rs`).
+
+The reason is that a mutation *must* snapshot, so waiting for the lock is the
+work rather than a stall, while `Cmd::run_with_timeout` works by killing the
+child - and jjfx's mutation callers read a killed run as "the mutation did not
+happen". For a mutation killed part-way (`jj workspace add` before its working
+copy is written, `jj git push` after the remote accepted it, `jj op restore`
+part-way through) that reading is wrong: jjfx's recorded state diverges from the
+repository, or a retry double-applies. jj's op-log transaction is
+crash-consistent, but the remote side of a push is not, and a timeout cannot be
+told from a genuine failure at the call site. A bound long enough not to fire on
+legitimate work (a fetch over a slow network, a rebase of a long chain) is not a
+bound on the *lock wait* at all - it is a bound on the whole operation, which
+the crate already refuses deliberately (`src/cmd.rs`: `run_with_timeout` is "a
+separate method rather than a bound on `run`: agent Runs and `jj` operations are
+legitimately long").
+
+The alternative - a pre-flight probe that detects a held lock and names the
+holder - is deferred rather than taken: probing
+`<root>/.jj/working_copy/working_copy.lock` with a non-blocking `flock` before
+spawning jj is racy (the lock can be taken between probe and attempt) and could
+only ever produce a hint, because jj exposes no lock-wait timeout and no
+"waiting for lock" message to hook. Worth revisiting if jj grows either signal;
+not worth a racy guess today.
+
+The gap this leaves - an operator cannot tell a queued mutation from a working
+one - is known and accepted, and stated in the ADR.
+
+### Verification
+
+`mise run check` green. `momo fix` changelog entry added for the reads, which
+are the operator-visible change; the mutation half records a decision and
+changes no behaviour, so it carries no changelog entry.
+
+No `src/jj.rs` *behaviour* change was needed - only doc comments at the mutation
+seam recording the decision (the file is shared with `dogfood/09`, which edits
+`absorb_destinations`).

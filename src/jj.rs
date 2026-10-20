@@ -806,6 +806,14 @@ pub fn absorb_destinations() -> String {
 
 /// Build a `jj` invocation for a command that may write.
 ///
+/// A write snapshots the working copy, which takes the repository's
+/// working-copy lock, and jj prints nothing while it waits for another process
+/// to release it. That wait is **deliberate and unbounded** - jjfx does not kill
+/// a mutation for taking too long, because a killed mutation may have partly
+/// landed and the caller cannot tell a timeout from a failure. See ADR 0018. A
+/// *read* must never take the lock, so it goes through [`read_at_repo`] or
+/// [`read_in_dir`], which pass `--ignore-working-copy`.
+///
 /// Tests never sign: their commits are throwaway, and signing them made the
 /// suite depend on the developer's GPG key being unlocked. `cfg!(test)` covers
 /// this crate's own tests; `JJFX_TEST_SIGNING_OFF` covers integration tests,
@@ -832,6 +840,9 @@ fn run_mut(repo_root: &Path, args: &[&str]) -> anyhow::Result<()> {
 
 /// Build a `jj` invocation for a command that may write, in the current
 /// directory rather than against a fixed `--repository`.
+///
+/// Like [`command`], the mutation waits for the working-copy lock without a
+/// deadline, deliberately - see ADR 0018.
 ///
 /// Tests never sign: their commits are throwaway, and signing them made the
 /// suite depend on the developer's GPG key being unlocked. `cfg!(test)` covers
