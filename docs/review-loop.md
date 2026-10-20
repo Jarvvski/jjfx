@@ -73,3 +73,19 @@ enforces the bound; the prompt does not.
 The bound lives in `ReviewLoop` (`src/engine/reviewer.rs`) and is generic over
 whatever supplies each pass's findings. jjfx runs no reviewer of its own, so the
 loop stands on its own until the harness drives it.
+
+## Replaying a decided pass
+
+The loop is driven through the pool's decision log
+(`.jj/pools/<name>/decisions.json`). Each pass is keyed by the step identity
+`review:<ticket>:<dimension>:<pass>`, so a pass already recorded is replayed
+rather than reaching the reviewer again, and its findings are not re-addressed -
+they were addressed when the decision was first made.
+
+Replay does not change the bound. A replayed pass carries the decision it
+recorded, so the cap and the progress rule see exactly the rounds the first drive
+saw and the loop stops in the same place; a second drive of the same loop
+therefore reaches no model and buys no pass past where the first stopped. An
+operator sees which passes replayed in `jjfx status --json`'s queue, where the
+step's `detail` names the replay. See
+[the durable work queue](work-queue.md#replaying-a-decision).
