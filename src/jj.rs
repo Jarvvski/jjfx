@@ -595,7 +595,16 @@ pub enum PushOutcome {
 /// failure, never "nothing to push"; a successful push that moved no remote
 /// bookmark is [`PushOutcome::Nothing`]. This replaces sniffing jj's English
 /// `"Nothing changed."` line, which could not tell a no-op from a broken push.
+///
+/// The bookmarks the revset names are tracked on the remote the push targets
+/// first. On a clean jj config `jj git push --revisions` **refuses to create** a
+/// remote bookmark for a local bookmark that is not tracked
+/// (`Refusing to create new remote bookmark <name>@<remote>`), so a fresh
+/// Worker's bookmark is left behind and the push reads as a no-op - a delivery
+/// that cannot deliver. A developer's `remotes.<remote>.auto-track-bookmarks`
+/// masks it; the tracking here does not depend on it (dogfood-2 05).
 pub fn push(dir: &Path, revset: &str) -> anyhow::Result<PushOutcome> {
+    track_bookmarks_in(dir, revset)?;
     let before = remote_bookmark_snapshot(dir)?;
     let run = cmd("jj")
         .current_dir(dir)
@@ -606,6 +615,104 @@ pub fn push(dir: &Path, revset: &str) -> anyhow::Result<PushOutcome> {
         .then(|| remote_bookmark_snapshot(dir))
         .transpose()?;
     Ok(classify_push(&run, &before, after.as_deref()))
+}
+
+/// Track, on the remote `jj git push` will use, every local bookmark whose
+/// commit the revset names, so the push may create its remote bookmark.
+///
+/// The bookmarks are read out of the *same* revset the push uses, so the two
+/// cannot disagree about which changes are being delivered, and a repository
+/// with nothing to push tracks nothing. Tracking is idempotent - jj warns but
+/// exits zero for a bookmark that is already tracked. A repository with no
+/// remote has nowhere to track against, so this is a no-op and the push reports
+/// the missing remote itself.
+fn track_bookmarks_in(dir: &Path, revset: &str) -> anyhow::Result<()> {
+    let Some(remote) = push_remote(dir)? else {
+        return Ok(());
+    };
+    for bookmark in local_bookmarks_in(dir, revset)? {
+        let run = cmd("jj")
+            .current_dir(dir)
+            .args(["bookmark", "track", &bookmark, "--remote", &remote])
+            .run()?;
+        if !run.ok() {
+            return Err(anyhow::anyhow!(
+                "jj bookmark track {bookmark} --remote {remote}: {}",
+                run.stderr().trim()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The local bookmarks pointing at a commit in `revset`, deduplicated.
+///
+/// `local_bookmarks` is local-only: a remote-tracking entry is not a bookmark
+/// this push could create.
+fn local_bookmarks_in(dir: &Path, revset: &str) -> anyhow::Result<Vec<String>> {
+    let out = read_in_dir(
+        dir,
+        &[
+            "log",
+            "-r",
+            revset,
+            "--no-graph",
+            "-T",
+            "local_bookmarks.map(|b| b.name()).join(\"\\n\") ++ \"\\n\"",
+        ],
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .filter(|name| seen.insert(name.clone()))
+        .collect())
+}
+
+/// The remote `jj git push` pushes to by default: the `git.push` setting when it
+/// names one remote, else `origin` when it exists, else the repository's only
+/// remote. `None` when the repository has no remote at all.
+fn push_remote(dir: &Path) -> anyhow::Result<Option<String>> {
+    if let Some(configured) = configured_push_remote(dir)? {
+        return Ok(Some(configured));
+    }
+    let remotes = remote_names(dir)?;
+    if remotes.iter().any(|name| name == "origin") {
+        return Ok(Some("origin".to_owned()));
+    }
+    Ok(remotes.into_iter().next())
+}
+
+/// The `git.push` setting when it names a single remote, else `None`.
+///
+/// A value that is a list (`["origin", "upstream"]`) is left to the fallback in
+/// [`push_remote`]: a multi-remote push is outside the forge's origin-based
+/// model, so `origin` (or the only remote) is the honest target.
+fn configured_push_remote(dir: &Path) -> anyhow::Result<Option<String>> {
+    let run = cmd("jj")
+        .current_dir(dir)
+        .args(["--ignore-working-copy", "config", "get", "git.push"])
+        .run()?;
+    let Some(value) = run.stdout_ok() else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() || value.starts_with('[') {
+        return Ok(None);
+    }
+    Ok(Some(value.to_owned()))
+}
+
+/// The names of the repository's Git remotes.
+fn remote_names(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let out = read_in_dir(dir, &["git", "remote", "list"])?;
+    Ok(out
+        .lines()
+        .filter_map(|line| line.split_once(char::is_whitespace))
+        .map(|(name, _)| name.to_owned())
+        .collect())
 }
 
 /// Push one named bookmark from `dir` (`jj git push --bookmark`), classified
@@ -1338,6 +1445,114 @@ mod tests {
             classify_push_bookmark(&failed, "", None, "x", true),
             PushOutcome::Failed("rejected".to_string())
         );
+    }
+
+    /// A fresh, *untracked* bookmark is pushed when the revset is pushed.
+    ///
+    /// `jj git push --revisions` refuses to *create* a remote bookmark for a
+    /// local bookmark that is not tracked, so on a clean jj config the forge's
+    /// revset push is a no-op and a fresh Worker's change never reaches the
+    /// remote. The developer's `remotes.origin.auto-track-bookmarks` masks it, so
+    /// this pins the behaviour down with auto-tracking *off* rather than
+    /// inheriting whatever the machine sets (dogfood-2 05).
+    #[test]
+    fn a_fresh_untracked_bookmark_is_pushed_when_the_revset_is_pushed() {
+        let repo = temp_repo("push-fresh-bookmark");
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        let origin = root.with_extension("origin.git");
+        git_init_bare(&origin);
+        // Neutralise any ambient auto-tracking, and set an identity: the bug
+        // only shows without the first, and the push needs the second.
+        hermetic_push_config(&root);
+        jj(
+            &root,
+            &["git", "remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("write seed");
+        jj(&root, &["commit", "-m", "seed"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        jj(&root, &["git", "push", "--bookmark", "main"]);
+        jj(&root, &["git", "fetch"]);
+        std::fs::write(root.join("change.txt"), "the change\n").expect("write change");
+        jj(&root, &["commit", "-m", "the change"]);
+        jj(&root, &["bookmark", "create", "adam/x", "-r", "@-"]);
+
+        let outcome = push(&root, "::@ ~ trunk() ~ conflicts()").expect("the push runs");
+
+        assert_eq!(
+            outcome,
+            PushOutcome::Pushed,
+            "a fresh, untracked bookmark must be pushed"
+        );
+        assert!(
+            git_refs(&origin).contains("refs/heads/adam/x"),
+            "the change must reach the remote: {}",
+            git_refs(&origin)
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&origin).ok();
+    }
+
+    /// A bare Git repository at `dir` with `main` as its default branch, so
+    /// `trunk()` resolves after a fetch and a push has a target.
+    fn git_init_bare(dir: &Path) {
+        let init = std::process::Command::new("git")
+            .args(["init", "--bare", "--quiet"])
+            .arg(dir)
+            .output()
+            .expect("git should be installed");
+        assert!(
+            init.status.success(),
+            "git init --bare: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        let head = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", dir.display()))
+            .args(["symbolic-ref", "HEAD", "refs/heads/main"])
+            .output()
+            .expect("git should be installed");
+        assert!(head.status.success(), "git symbolic-ref HEAD");
+    }
+
+    /// The refs a bare repository holds, one per line.
+    fn git_refs(dir: &Path) -> String {
+        let output = std::process::Command::new("git")
+            .arg(format!("--git-dir={}", dir.display()))
+            .args(["for-each-ref", "--format=%(refname)"])
+            .output()
+            .expect("git should be installed");
+        assert!(output.status.success(), "git for-each-ref");
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
+    /// Write the repository's *own* jj config for this test: an identity, and
+    /// `origin` auto-tracking turned *off*.
+    ///
+    /// Both are pinned here so the clean-config push behaviour is under test
+    /// rather than the developer's `~/.config/jj/config.toml`.
+    ///
+    /// `remotes.origin.auto-track-bookmarks` is a *configuration*, not a jj
+    /// default (see `store::track_bookmarks_from_origin`), and a non-matching
+    /// glob overrides any the machine sets. The identity is needed because jj has
+    /// none on a clean config, and `jj git push` refuses a commit with no author
+    /// or committer - so a fixture that pushes must set its own.
+    fn hermetic_push_config(root: &Path) {
+        let config = root.join(".jj/repo/config.toml");
+        std::fs::create_dir_all(config.parent().expect("config has a parent"))
+            .expect("repo config directory");
+        std::fs::write(
+            &config,
+            concat!(
+                "[user]\n",
+                "name = \"jjfx tests\"\n",
+                "email = \"tests@jjfx.invalid\"\n",
+                "\n",
+                "[remotes.origin]\n",
+                "auto-track-bookmarks = \"glob:jjfx-never\"\n",
+            ),
+        )
+        .expect("repo-local jj config");
     }
 
     #[test]

@@ -154,7 +154,7 @@ impl DispatchPromptBuilder {
     ) -> Result<AgentRuntimeInvocation, DispatchPromptError> {
         let ticket_lower = context.ticket.id().as_str().to_ascii_lowercase();
         let mut system_prompt = format!(
-            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- Name your change's bookmark {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- Describe the change with jj describe; its description becomes the Pull Request body. jjfx delivers the change to {}: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens the Pull Request. Do not push or open the Pull Request yourself.\n- Use Linear tools to update status only when they are available; never block on their absence.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the change description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
+            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- Name your change's bookmark {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- Describe the change with jj describe; its description becomes the Pull Request body. jjfx delivers the change to {} with `jjfx deliver <worker>`: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens one Pull Request. Do not push or open the Pull Request yourself.\n- Use Linear tools to update status only when they are available; never block on their absence.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the change description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
             context.delivery.branch_prefix,
             ticket_lower,
             context.repository.as_str(),
@@ -202,7 +202,7 @@ impl DispatchPromptBuilder {
             ));
         }
         worker_prompt.push_str(&format!(
-            "3. Derive a bookmark beginning {}/{ticket_lower}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe; its description becomes the Pull Request body.\n8. jjfx delivers the change: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens the Pull Request. Do not push or open the Pull Request yourself.\n",
+            "3. Derive a bookmark beginning {}/{ticket_lower}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe; its description becomes the Pull Request body.\n8. jjfx delivers the change with `jjfx deliver <worker>`: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens one Pull Request. Do not push or open the Pull Request yourself.\n",
             context.delivery.branch_prefix,
         ));
         if context.ticket_details.is_some() {

@@ -93,7 +93,7 @@ The same binary carries the non-interactive command surface alongside the TUI:
 | --- | --- |
 | Workspaces | `add`, `rm`, `list`, `clean`, `root`, `where`, `path`, `refresh`, `sync`, `colocation` |
 | Pool | `pool <N>`, `pool create`, `pool destroy`, `pool resize`, `pool list`, `pool rm`, `pool reset`, `pool profile` |
-| Dispatch & sessions | `dispatch`, `send`, `review`, `logs`, `mount`, `rebase`, `absorb`, `open-pr` |
+| Dispatch & sessions | `dispatch`, `send`, `review`, `logs`, `mount`, `rebase`, `absorb`, `open-pr`, `deliver` |
 | Lifecycle | `hooks install`, `hooks status` |
 
 Run `jjfx help` for the command list, or `jjfx help <command>` for one

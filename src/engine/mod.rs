@@ -129,6 +129,7 @@ pub use worker_actions::{
     WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
 pub use workspace::jj_lib_compat_notice;
+pub(crate) use workspace::worker_path;
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, CleanScope,
     SyncAction, TrunkDrift, TrunkSync, TrunkSyncError, WorkerWorkspace, WorkerWorkspaceError,
