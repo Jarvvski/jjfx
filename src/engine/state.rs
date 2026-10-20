@@ -773,6 +773,20 @@ impl QueueItemState {
     pub const fn is_terminal(self) -> bool {
         !self.is_open()
     }
+
+    /// Reports whether a resumption would re-run this step (ticket 07).
+    ///
+    /// The queue's per-step state is the one notion of what is already done, so
+    /// a resumption reads it rather than inventing its own progress: a step that
+    /// reached `done` completed and must not be redone, and a step `in_flight`
+    /// is one reconciliation has just asserted is still running, so re-running
+    /// it would be the automatic retry of something with side effects a
+    /// resumption must not be. Everything else - accepted and waiting, claimed
+    /// without a Run, failed, or abandoned - is work jjfx took on and did not
+    /// finish, which is exactly what resuming is for.
+    pub const fn is_resumable(self) -> bool {
+        !matches!(self, Self::Done | Self::InFlight)
+    }
 }
 
 impl fmt::Display for QueueItemState {

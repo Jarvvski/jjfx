@@ -120,6 +120,45 @@ Without the queue those cases are indistinguishable from a step that never
 existed, which is how an interrupted Run's work was lost. A queued step is left
 alone: it is work jjfx has accepted and not yet run, and only a Dispatch moves it.
 
+## Resumption
+
+An interruption - jjfx killed with Runs in flight - leaves the queue holding
+steps that were claimed or in flight, with the `in_flight` record naming where
+each one was. `jjfx resume [<TICKET>...]` re-runs that work. Resumption is
+explicit: an operator asks for it, because re-running a step may have side
+effects an automatic retry must not take on.
+
+What a resumption re-runs is the queue's own per-step state, not a second notion
+of progress:
+
+| State | A resumption |
+|---|---|
+| `queued` | re-offers it: the work was accepted and has not run |
+| `claimed` | re-offers it: the claim was written, the Run never started |
+| `in_flight` | leaves it: reconciliation has just asserted its Run is live |
+| `done` | leaves it: the step completed, and a resumption must not redo it |
+| `failed` | re-opens it: the work did not finish |
+| `abandoned` | re-opens it: the work did not finish |
+
+`resume` reconciles first, so a Run that ended is settled and a Run that is
+still live is recognised before anything is re-opened. Re-opening clears the
+attempt's claim and its end and records why the step was resumed in `detail`,
+so the new Run's claim and settlement apply to this step; a step another process
+re-opened first is left to it rather than dispatched twice.
+
+A Run the queue still believes is live is not raced. To abandon one anyway,
+reset its Worker first - `jjfx pool reset <worker>` ends the Run, and the
+reconciliation `resume` runs then abandons the step, because the Worker no
+longer holds the Ticket - and then resume. Naming Tickets narrows a resumption
+to those steps; a Ticket with no recorded step is reported rather than
+dispatched, because `jjfx dispatch` is the command that runs work jjfx has not
+accepted.
+
+A resumed Run is dispatched on the same seam a Dispatch uses, so the capacity
+governor, the spend limits and the occupancy exclusions all apply. The Run
+Records keep the interrupted attempt and the resumed one as separate entries,
+so what the interruption cost and what the resumption cost are both readable.
+
 ## Durability, and what it costs
 
 The queue is written atomically and read from disk, never recomputed from live
