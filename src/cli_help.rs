@@ -111,6 +111,15 @@ fn notes(key: &str) -> &'static str {
         "review" => {
             "\n`review` sends one Follow-up prompt that addresses the pull request's\nreview state once. It runs no reviewer and no bounded loop: jjfx has no\nreviewer of its own (ADR 0016 cut review-bot ingestion), so no command\ndrives `ReviewLoop` - the loop and its decision log stand ready for the\nharness, which is their only caller. `--fg` selects when this Run returns,\nnot how many passes run.\n"
         }
+        "deliver" => {
+            "\n`deliver` is the one forge path, and what the Dispatch prompt means by\n\"jjfx delivers the change\": it welds the Worker's chain onto trunk, runs the\nrepository's own build check (`<repo>/.jjfx/config.toml` `[checks]`), pushes\nthe chain, and opens one Pull Request per change based on the repository's\ndefault branch. A failed check, a conflict, or an unreachable forge stops the\nrun before the push and names why, and the verb exits non-zero. A change that\nalready has a Pull Request is left alone, so re-running is safe.\n\nA repository with no forge is a supported path, not a degraded one: with\n`[forge] pull_requests = false`, or no `origin` remote to open a Pull Request\nagainst, the Pull Request step does not apply and a clean weld, check and push\nstill succeeds.\n\nThis is the whole path. `rebase` pushes without opening a Pull Request, and\n`open-pr` only opens one that already exists.\n"
+        }
+        "rebase" => {
+            "\n`rebase` rebases the Worker's bookmark onto `main` and pushes it - nothing\nmore. It runs no build check and opens no Pull Request, so the pull request\n`deliver` would open is left for you to create. Use `deliver` for the whole\npath.\n"
+        }
+        "open-pr" => {
+            "\n`open-pr` opens a Pull Request that already exists in the browser; it\ndoes not create one, weld onto trunk, or run the repository's check. To create\nthe Pull Request, run `deliver`.\n"
+        }
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
         }
@@ -653,6 +662,11 @@ const TOP_LEVEL: &[Group] = &[
                 summary: "Open a Worker's Pull Request (pr)",
             },
             Entry {
+                key: "deliver",
+                args: "<worker>",
+                summary: "Deliver a Worker: weld, check, push, open one PR",
+            },
+            Entry {
                 key: "resolve",
                 args: "<workspace>",
                 summary: "Resolve a Workspace's conflicted commits (jj resolve)",
@@ -997,6 +1011,16 @@ const PAGES: &[CommandHelp] = &[
         arguments: &[Argument {
             name: "<worker>",
             help: "Worker whose Pull Request to open",
+        }],
+        flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "deliver",
+        summary: "Deliver a Worker's change: weld, check, push, open one Pull Request",
+        usage: "deliver <worker>",
+        arguments: &[Argument {
+            name: "<worker>",
+            help: "Worker whose change to deliver",
         }],
         flags: NO_FLAGS,
     },

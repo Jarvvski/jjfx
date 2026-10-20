@@ -116,19 +116,23 @@ jjfx mount worker-01                              # open the Worker in kitty (m)
 ### 6. Land
 
 ```bash
+jjfx deliver worker-01   # weld, check, push, open one Pull Request (the one forge path)
+```
+
+`deliver` is the delivery the Dispatch prompt promises ("jjfx delivers the change"): it welds the Worker's chain onto trunk, runs the repository's own build check (`<repo>/.jjfx/config.toml` `[checks]`), pushes the chain, and opens one Pull Request per change based on the repository's default branch. A failed check, a conflict, or an unreachable forge stops the run before the push, names why, and exits non-zero; a change that already has a Pull Request is left alone, so re-running is safe. **Do not run `gh pr create` yourself** — `deliver` is that step. A repository with no forge (`[forge] pull_requests = false`, or no `origin` remote to open one against) is still delivered: the Pull Request step does not apply, and a clean weld, check and push succeeds.
+
+The narrower verbs each do one thing, and check their precondition before they mutate anything, so a refusal leaves the Workspace as it found it:
+
+```bash
 jjfx absorb worker-01    # fold its working-copy edits into the commits they belong to (ab)
 jjfx rebase worker-01    # rebase and push its bookmark (rb)
-jjfx open-pr worker-01   # open the Worker's Pull Request (pr)
+jjfx open-pr worker-01   # open the Worker's existing Pull Request (pr)
 jjfx resolve worker-01   # run jj resolve over a Workspace's conflicted commits
 ```
 
-Each verb checks its precondition before it mutates anything, so a refusal leaves the Workspace as it found it:
-
 - **`absorb`** needs `trunk()` to resolve - a fetched `main@origin`. Without it every commit is mutable and the fold could rewrite trunk, so it refuses by name rather than running. It resolves the Worker's bookmark by Ticket (a missing or ambiguous bookmark is an error, never a guess) and excludes the commit(s) the Workspace was stacked on, so the fold can only reach the Worker's own commits above the mainline and its stack base. It pushes only when it absorbed something, so running it speculatively is safe.
-- **`rebase`** needs the Worker's bookmark to resolve by Ticket; it rebases that bookmark onto `main` and pushes. A push whose name matches no bookmark is a failure, not a silent success.
-- **`open-pr`** needs the Worker's bookmark to resolve by Ticket, and the Pool's `gh_repo` to be a real GitHub repository: a missing `origin`, or one that is not GitHub, is refused by name (`origin is not a GitHub remote`) rather than guessed from a path. It then opens the existing Pull Request in the browser (`gh -R <repo> pr view <branch> --web`).
-
-Welding a chain onto trunk, running the repository's own build check (`<repo>/.jjfx/config.toml` `[checks]`) and pushing are the forge's steps, not `open-pr`'s - it only opens the Pull Request they produce. A check that fails stops the push and names the command and its output, so fix the tree and re-run rather than forcing.
+- **`rebase`** needs the Worker's bookmark to resolve by Ticket; it rebases that bookmark onto `main` and pushes. It runs no build check and opens no Pull Request - it is not the whole delivery.
+- **`open-pr`** needs the Worker's bookmark to resolve by Ticket, and the Pool's `gh_repo` to be a real GitHub repository: a missing `origin`, or one that is not GitHub, is refused by name (`origin is not a GitHub remote`) rather than guessed from a path. It then opens the Pull Request that already exists in the browser (`gh -R <repo> pr view <branch> --web`); it does not create one, so it is not how a change gets delivered.
 
 **Done when** each Worker's PR exists, or the user has taken the branch over.
 

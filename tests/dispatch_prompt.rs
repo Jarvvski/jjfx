@@ -118,6 +118,7 @@ fn initial_dispatch_prompt_pins_delivery_obligations_and_supported_overrides() {
     // Delivery is jjfx's job, not a command list the agent must run: the prompt
     // says jjfx delivers and the agent does not push or open the Pull Request.
     assert!(prompt.contains("jjfx delivers the change"));
+    assert!(prompt.contains("jjfx deliver"));
     assert!(prompt.contains("Do not push or open the Pull Request yourself"));
     assert!(!prompt.contains("jj git push"));
     assert!(!prompt.contains("gh -R"));

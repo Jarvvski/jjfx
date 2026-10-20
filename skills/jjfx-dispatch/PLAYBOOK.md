@@ -163,25 +163,35 @@ re-opening a step whose Ticket is already resolved.
 ## 4. Landing through the forge
 
 The dispatch prompt tells the Worker jjfx will deliver (push, run the check, open
-the PR) and not to push or open it itself. **No CLI verb does that** - the forge
-is TUI-only, `rebase` pushes without a PR, and `open-pr` only opens an existing
-one. Finding 05. Until it is fixed, the agent must bridge the gap:
+the PR) and not to push or open it itself. That is `jjfx deliver` - the one forge
+path, and the command the prompt and the skill now name:
 
 ```sh
-jj git push --all                                   # or per bookmark (§3b)
-gh pr create -R <owner>/<repo> --base main \
-  --head adam/<ticket> --title "<title>" --body "<jj describe text>"
-gh pr checks <n> -R <owner>/<repo>                  # wait for green
-gh pr merge  <n> -R <owner>/<repo> --squash         # merge on green
+jjfx deliver worker-XXXX      # weld, check, push, open one PR
 ```
+
+It welds the Worker's chain onto trunk, runs the repository's own check
+(`<repo>/.jjfx/config.toml` `[checks]`), pushes the chain, and opens one Pull
+Request per change based on the repository's default branch. A failed check, a
+conflict, or an unreachable forge stops the run before the push, names why and
+exits non-zero; a change that already has a PR is left alone, so re-running is
+safe. A repository with no forge (`[forge] pull_requests = false`, or no `origin`
+remote to open one against) is still delivered - the PR step does not apply, and
+a clean weld, check and push succeeds. **Do not run `gh pr create` yourself**:
+that is `deliver`. `rebase` pushes without a PR and `open-pr` only opens an
+existing one, so neither is the delivery on its own.
 
 Parallel Workers editing the same files **will conflict** at merge time - the
 fixture produced three clean merges and five conflicts out of eight. Rebase the
 survivors onto the new trunk and resolve with `jj resolve` / conflict markers;
 `jj rebase -b adam/<ticket> -d main` shows the conflict as data.
 
-**What jjfx should own:** the whole of §4 as one command - the "one blessed forge
-path" the prompt already promises.
+The merge itself is still the loop's: `gh pr checks <n> -R <owner>/<repo>` then
+`gh pr merge <n> -R <owner>/<repo> --squash` once it is green. jjfx has no merge
+step (10-opinionated-landing).
+
+**What jjfx should own:** the whole of this as one command - the "one blessed
+forge path" the prompt already promises. **Done:** `jjfx deliver`.
 
 ---
 
@@ -201,7 +211,7 @@ guess, or read the source to discover:
    (§3c, finding 04)
 6. **Worker reuse.** Return a finished Worker to the pool. (§3d, done)
 7. **Resume safety.** Do not re-run a resolved Ticket. (§3e)
-8. **Delivery.** Perform the push+PR the prompt promises. (§4)
+8. **Delivery.** Perform the push+PR the prompt promises. (§4, done: `jjfx deliver`)
 9. **Capacity.** Let the repository set its own ceiling. (finding 10, done for
    the concurrency cap; the pool size is still `jjfx pool`.)
 10. **Watch.** `jjfx logs` shows a session-delivered Run's activity, or says there
@@ -221,5 +231,5 @@ the control plane. The point of jjfx is that it is.
 - [ ] `status --json` read for `workers[]`/`governor{}`/`queue[]`, not logs.
 - [ ] Next round after `wait --until terminal`; a finished Worker is reused automatically.
 - [ ] `resume` named, never bare.
-- [ ] Push bookmarks before `absorb`/`rebase`/`open-pr`.
-- [ ] PR + `gh pr checks` + merge on green; expect conflicts from parallel work.
+- [ ] `jjfx deliver worker-XXXX` to land: weld, check, push, one PR (no `gh pr create`).
+- [ ] `gh pr checks` + merge on green; expect conflicts from parallel work.

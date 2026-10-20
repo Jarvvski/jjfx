@@ -63,6 +63,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - The review loop now drives every pass through the pool's decision log: a pass already recorded replays instead of reaching the reviewer, so a repeated review dimension and pass is avoided rather than only detected, and jjfx status --json shows the replayed step's detail so an operator can tell a replay from a pass that ran.
 - jjfx ticket list lists every Ticket the configured source discovers - its Status, its Blockers and whether it is ready - as prose or stable --json, without dispatching; the blocked reason is the same line a dispatch --all prints, and the command is read-only, reconciling no Run and writing no Ticket.
 - A repository can bound its own dispatch concurrency: a [dispatch] max_concurrent in <repo>/.jjfx/config.toml tightens the user-global ceiling (never widens it), so an agent can pace one backlog without editing the user's global config, and jjfx status --json reports the resolved limit as governor.limit.
+- jjfx deliver performs the delivery the Dispatch prompt promises - weld onto trunk, run the repository check, push, and open one Pull Request - the same one forge path the TUI f key drives, now reachable from the shell so an agent lands without running gh pr create itself; the prompt, jjfx help and the skill name the command, rebase and open-pr state their narrower scope, and a repository with no forge still delivers cleanly.
 
 ### Fixed
 
@@ -107,6 +108,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx help review no longer claims to run a bounded review loop: no command drives ReviewLoop, so the review page and the docs now state that jjfx runs no reviewer of its own and the loop's only caller is the harness seam
 - A finished Worker is returned to the pool automatically: a Worker whose Run has finished (done or failed) is reclaimed to idle on the next Dispatch, so a Pool of N serves a backlog larger than N across successive rounds without a manual jjfx pool reset.
 - jjfx logs follows a session-delivered Run's opencode session - reading the session's messages and printing its activity - instead of tailing a process log that stays empty, and says plainly that there is no process log and names the session when the daemon cannot be reached
+- jjfx deliver tracks a fresh Worker bookmark on the push remote before pushing, so it delivers on a clean jj config - jj git push --revisions refuses to create a remote bookmark for a local one that is not tracked, which only a developer remotes.origin.auto-track-bookmarks setting masked.
 
 ## [0.55.0] - 2026-10-16
 

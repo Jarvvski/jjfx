@@ -185,6 +185,89 @@ pub(crate) enum Update {
     Aborted { reason: String },
 }
 
+/// What one synchronous delivery did, folded from the pipeline's updates.
+///
+/// The CLI verb and the TUI drive the *same* pipeline ([`Forge::run`] and
+/// [`Forge::start`]); this is the one fact a caller with no progress widget
+/// acts on - whether every step finished cleanly, and why it did not when it
+/// didn't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum DeliveryOutcome {
+    /// Every step finished cleanly: welded, checked (or nothing to check),
+    /// pushed, and the Pull Request opened (or no forge to open one against).
+    Delivered,
+    /// The run did not finish cleanly, naming the step and why.
+    Stopped(String),
+}
+
+impl DeliveryOutcome {
+    /// Whether the delivery finished cleanly.
+    pub(crate) fn delivered(&self) -> bool {
+        matches!(self, Self::Delivered)
+    }
+
+    /// Why the run stopped, when it did.
+    pub(crate) fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Delivered => None,
+            Self::Stopped(reason) => Some(reason),
+        }
+    }
+
+    /// Fold a run's updates into its outcome.
+    pub(crate) fn fold(updates: &[Update]) -> Self {
+        // An aborted run never reached per-Workspace completion, so its reason
+        // is the whole answer.
+        if let Some(Update::Aborted { reason }) = updates.last() {
+            return Self::Stopped(reason.clone());
+        }
+        match updates.iter().find_map(|update| match update {
+            Update::Finished { progress, .. } => Some(progress),
+            _ => None,
+        }) {
+            // A clean success carries no retained progress.
+            Some(None) => Self::Delivered,
+            Some(Some(progress)) => Self::Stopped(
+                progress
+                    .reason()
+                    .unwrap_or("the delivery did not finish cleanly")
+                    .to_owned(),
+            ),
+            // The pipeline always ends with `Finished` or `Aborted`; a stream
+            // that carries neither is a failure, never a silent success.
+            None => Self::Stopped("the delivery ended without finishing".to_owned()),
+        }
+    }
+}
+
+/// The folded result of one delivery: what happened, and the skip notices the
+/// pipeline streamed along the way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DeliveryReport {
+    outcome: DeliveryOutcome,
+    notices: Vec<String>,
+}
+
+impl DeliveryReport {
+    /// Whether the delivery finished cleanly.
+    pub(crate) fn delivered(&self) -> bool {
+        self.outcome.delivered()
+    }
+
+    /// Why the run stopped, when it did.
+    pub(crate) fn reason(&self) -> Option<&str> {
+        self.outcome.reason()
+    }
+
+    /// The skip notices the run streamed, in order.
+    ///
+    /// Every step that did not succeed retains its reason here, so a caller
+    /// reports each one rather than only the last.
+    pub(crate) fn notices(&self) -> &[String] {
+        &self.notices
+    }
+}
+
 trait JjAdapter: Send + Sync {
     fn signing_key(&self) -> Result<Option<String>, String> {
         Ok(None)
@@ -331,6 +414,50 @@ impl Forge {
             )
         });
         rx
+    }
+
+    /// Run the pipeline synchronously and return every streamed update.
+    ///
+    /// The pipeline sends each update before it returns and the channel is
+    /// unbounded, so the whole stream is drained from the calling thread: no
+    /// runtime and no message loop. This is the CLI's frontend onto the *same*
+    /// pipeline [`Forge::start`] hands to the TUI - one forge path, two
+    /// frontends - so `jjfx deliver` cannot drift from the `f` key.
+    fn run(&self, targets: Vec<Target>) -> Vec<Update> {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        run_pipeline(
+            &tx,
+            &targets,
+            self.settings.clone(),
+            &*self.jj,
+            &*self.gpg,
+            &*self.github,
+            self.repository.as_ref(),
+        );
+        drop(tx);
+        let mut updates = Vec::new();
+        while let Ok(update) = rx.try_recv() {
+            updates.push(update);
+        }
+        updates
+    }
+
+    /// Deliver one Workspace through the one forge path and report the outcome.
+    pub(crate) fn deliver(&self, target: Target) -> DeliveryReport {
+        let updates = self.run(vec![target]);
+        DeliveryReport {
+            outcome: DeliveryOutcome::fold(&updates),
+            notices: updates
+                .iter()
+                .filter_map(|update| match update {
+                    Update::Progress {
+                        notice: Some(notice),
+                        ..
+                    } => Some(notice.clone()),
+                    _ => None,
+                })
+                .collect(),
+        }
     }
 }
 
@@ -2482,5 +2609,116 @@ mod tests {
         let pull_requests = github.snapshot();
         assert_eq!(pull_requests.len(), 3);
         assert_eq!(pull_requests[0].body, "human-edited body");
+    }
+
+    /// A jj whose Workspace carries exactly one bookmarked change, so a
+    /// delivery opens exactly one Pull Request.
+    struct OneChangeJj;
+
+    impl JjAdapter for OneChangeJj {
+        fn fetch(&self) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn weld(&self, _dir: &Path) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        fn push(&self, _dir: &Path) -> Result<PushOutcome, String> {
+            Ok(PushOutcome::Pushed)
+        }
+
+        fn origin_slug(&self) -> Result<Option<String>, String> {
+            Ok(Some("owner/repo".to_string()))
+        }
+
+        fn changes(&self, _dir: &Path) -> Result<Vec<Change>, String> {
+            Ok(vec![Change {
+                bookmark: "adam/eng-1".to_string(),
+                description: "Ship the thing\n\nWhat it does.\n".to_string(),
+            }])
+        }
+    }
+
+    /// `jjfx deliver`'s engine path: a repository with a forge welds, pushes and
+    /// opens exactly one Pull Request, and the run is a clean delivery.
+    #[test]
+    fn deliver_opens_one_pull_request_and_reports_delivered() {
+        let github = Arc::new(MemoryGitHub::default());
+        let forge = Forge::with_github(
+            settings(true, true),
+            Arc::new(OneChangeJj),
+            Arc::new(UnlockedGpg),
+            github.clone(),
+        );
+
+        let report = forge.deliver(Target::new(
+            "worker-01".to_string(),
+            PathBuf::from("/workspace/worker-01"),
+        ));
+
+        assert!(report.delivered(), "{:?}", report.reason());
+        assert_eq!(report.reason(), None);
+        assert!(report.notices().is_empty());
+        assert_eq!(
+            github.snapshot(),
+            vec![CreatedPullRequest {
+                head: "adam/eng-1".to_string(),
+                base: "main".to_string(),
+                title: "Ship the thing".to_string(),
+                body: "What it does.".to_string(),
+                draft: true,
+            }]
+        );
+    }
+
+    /// A repository with no forge is a supported delivery, not a degraded one:
+    /// the change is pushed and the run is clean, with no Pull Request step to
+    /// taint it.
+    #[test]
+    fn deliver_without_a_forge_pushes_cleanly() {
+        let forge = Forge::with_adapters(
+            settings(false, true),
+            Arc::new(SuccessfulJj),
+            Arc::new(UnlockedGpg),
+        );
+
+        let report = forge.deliver(Target::new(
+            "worker-01".to_string(),
+            PathBuf::from("/workspace/worker-01"),
+        ));
+
+        assert!(report.delivered());
+        assert!(report.notices().is_empty());
+    }
+
+    /// A delivery whose check fails stops before the push and names the check,
+    /// so a CLI caller can report why rather than a bare failure.
+    #[test]
+    fn deliver_stops_and_names_a_failed_check() {
+        let dir = workspace_dir("deliver-check-fails");
+        let forge = Forge::with_adapters(
+            settings_with_check(false, "echo 'error: cannot find value x' >&2; exit 1"),
+            Arc::new(CheckMustStopThePush),
+            Arc::new(UnlockedGpg),
+        );
+
+        let report = forge.deliver(Target::new("worker-01".to_string(), dir.clone()));
+
+        assert!(!report.delivered());
+        let reason = report.reason().expect("a stopped delivery names why");
+        assert!(reason.contains("check:"), "{reason}");
+        assert!(reason.contains("error: cannot find value x"), "{reason}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A stream that never reaches a terminal update is a failure, never a
+    /// silent success - the one case the pipeline is not expected to produce.
+    #[test]
+    fn a_stream_with_no_terminal_update_is_not_a_success() {
+        assert_eq!(
+            DeliveryOutcome::fold(&[]),
+            DeliveryOutcome::Stopped("the delivery ended without finishing".to_string())
+        );
     }
 }

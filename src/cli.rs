@@ -130,6 +130,11 @@ pub enum Command {
     OpenPullRequest {
         worker: String,
     },
+    /// `deliver <worker>`: the one forge path - weld, check, push, open one
+    /// Pull Request - as a shell verb, so an agent need not run `gh pr create`.
+    Deliver {
+        worker: String,
+    },
     Resolve {
         workspace: String,
         tool: Option<String>,
@@ -498,6 +503,11 @@ pub fn parse(args: &[String]) -> Result<Command> {
             &args[1..],
         )
         .map(|worker| Command::OpenPullRequest { worker }),
+        "deliver" => parse_worker_command(
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " deliver <worker>"),
+            &args[1..],
+        )
+        .map(|worker| Command::Deliver { worker }),
         "undo" => parse_undo(&args[1..]),
         "resolve" => parse_resolve(&args[1..]),
         "completion" => parse_completion(&args[1..]),
@@ -1479,6 +1489,7 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Rebase { worker } => rebase_command(&repository(colocate)?, &worker)?,
         Command::Absorb { worker } => absorb_command(&repository(colocate)?, &worker)?,
         Command::OpenPullRequest { worker } => open_pr_command(&repository(colocate)?, &worker)?,
+        Command::Deliver { worker } => deliver_command(&repository(colocate)?, &worker)?,
         Command::Resolve { workspace, tool } => {
             resolve_command(&repository(colocate)?, &workspace, tool.as_deref())?
         }
@@ -5524,6 +5535,55 @@ fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Deliver one Worker's change through the one forge path: weld onto trunk, run
+/// the repository's check, push, and open one Pull Request.
+///
+/// This is the delivery the Dispatch prompt promises ("jjfx delivers the
+/// change"), reachable from the shell so an agent need not run `gh pr create`
+/// itself. It drives the *same* pipeline the TUI's `f` key does (ADR 0016's one
+/// forge path), so the two cannot disagree about what delivering means. A
+/// repository with no forge - `[forge] pull_requests = false`, or no `origin`
+/// remote to open one against - is a supported path: the Pull Request step does
+/// not apply, and a clean weld, check and push still succeeds.
+fn deliver_command(repository: &Repository, value: &str) -> Result<()> {
+    let worker = normalize_worker(value)?;
+    let workspace = crate::engine::worker_path(repository.root(), &worker);
+    if !workspace.is_dir() {
+        bail!(
+            "no Workspace directory for {worker} at {}",
+            workspace.display()
+        );
+    }
+    // The repository's own `[checks]` when it sets one, else the user-global
+    // one, resolved exactly as the TUI resolves it.
+    let config = crate::config::load()?;
+    let forge = crate::forge::Forge::new(
+        repository.root().to_path_buf(),
+        crate::forge::Settings {
+            forge: config.forge,
+            checks: config.checks_for(repository.root())?,
+        },
+    );
+    eprintln!("Delivering {worker}: weld, check, push, Pull Request");
+    let report = forge.deliver(crate::forge::Target::new(
+        worker.as_str().to_owned(),
+        workspace,
+    ));
+    for notice in report.notices() {
+        eprintln!("  {notice}");
+    }
+    if report.delivered() {
+        eprintln!("Delivered {worker}");
+        return Ok(());
+    }
+    bail!(
+        "delivery of {worker} stopped: {}",
+        report
+            .reason()
+            .unwrap_or("the delivery did not finish cleanly")
+    )
+}
+
 /// Resolve a Workspace's conflicted commits with `jj resolve`.
 ///
 /// Interactive: the merge tool inherits this terminal, so a caller that has no
@@ -5981,6 +6041,7 @@ _jjfx() {
     'review:Address review comments' 'mount:Open Worker in kitty'
     'reset:Reset Worker' 'status:Show Pool status' 'logs:Follow Worker log'
     'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
+    'deliver:Deliver Worker change (weld, check, push, PR)'
     'resolve:Resolve a Workspace conflict'
     'absorb:Fold Worker edits into base commits'
     'wait:Block until Workers reach a condition'
@@ -5994,7 +6055,7 @@ _jjfx() {
         clean) _arguments '--pool[Worker Pool to scope the sweep to]:name:' ;;
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
-        mount|m|reset|logs|log|rebase|rb|open-pr|pr|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
+        mount|m|reset|logs|log|rebase|rb|open-pr|pr|deliver|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
         wait) _arguments '--until[condition to wait for]:condition:(done failed terminal ticket-resolved)' '--timeout[give up after N seconds]:secs:' '--all[wait for every Worker in the pool]' '--json[print machine-readable results]' '--pool[Worker Pool to wait on]:pool:' '*:worker:__jjfx_workers' ;;
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;
@@ -7670,6 +7731,19 @@ mod tests {
             parse(&args(&["pr", "worker-1"])),
             Ok(Command::OpenPullRequest { .. })
         ));
+    }
+
+    /// `deliver` is the one forge path as a shell verb; it takes the Worker and
+    /// nothing else.
+    #[test]
+    fn deliver_parser_takes_a_worker() {
+        assert_eq!(
+            parse(&args(&["deliver", "worker-1"])).unwrap(),
+            Command::Deliver {
+                worker: "worker-1".to_owned(),
+            }
+        );
+        assert!(parse(&args(&["deliver"])).is_err());
     }
 
     #[test]
