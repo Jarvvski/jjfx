@@ -848,7 +848,7 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "pool list",
-        summary: "Show every pool, and the `default` pool's Workers",
+        summary: "Show every pool, and each pool's Workers",
         usage: "pool list [--json]",
         arguments: &[],
         flags: POOL_LIST_FLAGS,
@@ -987,7 +987,7 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "open-pr",
-        summary: "Weld a Worker's chain onto trunk and open its Pull Request",
+        summary: "Open a Worker's Pull Request in the browser",
         usage: "open-pr <worker>",
         arguments: &[Argument {
             name: "<worker>",
