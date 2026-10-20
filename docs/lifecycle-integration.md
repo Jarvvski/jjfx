@@ -73,11 +73,15 @@ reporting never interrupts an OpenCode session.
 The plugin also reports **parentage**. opencode nests sessions: a child session
 is one created with a `parentID`, and jjfx creates a Worker's session as a child
 of the session that dispatched it (the `OPENCODE_SESSION_ID` opencode puts in
-that session's shell environment). A Dispatch from outside opencode - the TUI, a
-terminal, CI - creates a root session instead. The plugin remembers each
-session's parent when it is created and stamps `parent_id` on that session's
-whole lifecycle, so a parent can enumerate and read its children's state rather
-than polling.
+that session's shell environment) **when that session is already anchored to the
+Worker Workspace**. opencode anchors a child session to its parent's directory
+and offers no way to move it, so a Dispatch from a session in the repository -
+an agent's own shell - creates a root session anchored to the Worker Workspace
+instead; the anchor is the guard that keeps a Run out of the wrong worktree. A
+Dispatch from outside opencode - the TUI, a terminal, CI - creates a root session
+too. The plugin remembers each session's parent when it is created and stamps
+`parent_id` on that session's whole lifecycle, so a parent can enumerate and read
+its children's state rather than polling.
 
 ## Installation guarantees
 

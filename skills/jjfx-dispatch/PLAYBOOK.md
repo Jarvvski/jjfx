@@ -61,24 +61,18 @@ and treat the cap as the user's, not yours.
 
 ### 3a. Dispatching from your own opencode session fails every launch
 
-With `OPENCODE_SESSION_ID` set, jjfx creates each Worker's session as a **child**
-of yours, opencode anchors the child to *your* directory, and jjfx refuses the Run
-(`cannot anchor Worker ...'s opencode session: opencode anchored the Run's session
-to <repo root> instead of <worker workspace>`) - every Ticket fails at launch.
-Finding 01.
+**Fixed.** With `OPENCODE_SESSION_ID` set, jjfx used to create each Worker's
+session as a **child** of yours; opencode anchors a child to *your* directory, so
+the anchor assertion refused every Run (`cannot anchor Worker ...'s opencode
+session: opencode anchored the Run's session to <repo root> instead of <worker
+workspace>`) and no Ticket launched. Finding 01.
 
-**Workaround:** unset the dispatching session for `dispatch` / `resume`:
-
-```sh
-env -u OPENCODE_SESSION_ID jjfx dispatch --all --json
-```
-
-This costs the child-session topology, but it is the only way to dispatch from an
-agent's shell today.
-
-**What jjfx should own:** either make the child session anchor correctly, or
-detect the case and say "re-run with `OPENCODE_SESSION_ID` unset" instead of
-failing with an internal anchor message. An agent should not have to know this.
+jjfx now asks opencode for a **root** session anchored to the Worker Workspace
+whenever a child session could not be anchored there, so `dispatch` from your own
+session works and needs no workaround. The child-session topology is kept only
+when your session is itself anchored to the Worker Workspace; a launch that fails
+the anchor check still fails closed, and now removes the session it created rather
+than leaving it for `jjfx children` to report.
 
 ### 3b. Landing verbs refuse a fresh bookmark - push first
 
@@ -185,8 +179,8 @@ guess, or read the source to discover:
 
 1. **The binary.** Say which build a command needs, instead of relying on the
    agent to pin `PATH`. (§1)
-2. **The dispatch session.** Make child-session dispatch anchor correctly, or say
-   how to dispatch without it. (§3a)
+2. **The dispatch session.** Anchor the Worker's session to its Workspace whatever
+   dispatched it, and say which session (if any) owns it. (§3a, done)
 3. **Bookmark resolution.** One bookmark is not two; landing verbs work on a fresh
    branch. (§3b)
 4. **The check reader.** Read the `gh` the operator has. (§3c)
@@ -210,7 +204,6 @@ the control plane. The point of jjfx is that it is.
 - [ ] `jjfx version` is the build under test; the verbs answer.
 - [ ] `jjfx ticket list` read; ready vs blocked understood.
 - [ ] Pool sized; `hooks status` reported.
-- [ ] `env -u OPENCODE_SESSION_ID` on `dispatch`/`resume` if driving from opencode.
 - [ ] `dispatch --all --json`; every Ticket has an outcome.
 - [ ] `status --json` read for `workers[]`/`governor{}`/`queue[]`, not logs.
 - [ ] `pool reset` a finished Worker before the next round (or pool >= backlog).

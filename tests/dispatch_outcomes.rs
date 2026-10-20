@@ -6,7 +6,9 @@
 //! non-zero, a batch that dispatched (or held back) a Ticket must exit zero, a
 //! background orchestration that fails must be reported as a failure rather than
 //! as `orchestrating`, and a Ticket named by hand that is not ready is dispatched
-//! anyway with the reason it was not ready reported first.
+//! anyway with the reason it was not ready reported first. One case is about the
+//! path an agent drives: a Dispatch issued from inside an opencode session must
+//! launch a Worker, not fail every launch on the anchor opencode inherits.
 #![cfg(unix)]
 
 use std::ffi::OsString;
@@ -145,6 +147,79 @@ impl DispatchFixture {
         fs::set_permissions(&agent, fs::Permissions::from_mode(0o755)).expect("executable agent");
     }
 
+    /// Puts a fake `opencode` on the fixture's `PATH` that serves the session API
+    /// the way a real opencode does: a session created with a `parentID` is
+    /// anchored to its **parent's** directory, while a root session is anchored to
+    /// the directory the request asked for, and a read-back reports the anchor
+    /// opencode stored.
+    ///
+    /// The dispatching session `ses_dispatcher` is anchored to the Repository,
+    /// which is where an agent issuing a Dispatch from its own shell runs - not
+    /// the Worker Workspace it is dispatching into.
+    fn with_fake_opencode(&self) {
+        let script = OPENCODE_SESSION_SCRIPT
+            .replace(
+                "__CREATE_BODY__",
+                &self.opencode_create_body().display().to_string(),
+            )
+            .replace(
+                "__PROMPT_BODY__",
+                &self.opencode_prompt_body().display().to_string(),
+            )
+            .replace(
+                "__SESSION_DIRECTORY__",
+                &self.opencode_session_directory().display().to_string(),
+            )
+            .replace("__DISPATCHER__", &self.path().display().to_string());
+        let agent = self.bin.path().join("opencode");
+        fs::write(&agent, script).expect("fake opencode");
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))
+            .expect("executable opencode");
+    }
+
+    /// Where the fake `opencode` records the `session.create` request body.
+    fn opencode_create_body(&self) -> std::path::PathBuf {
+        self.bin.path().join("opencode-create-body")
+    }
+
+    /// Where the fake `opencode` records the `session.prompt` request body.
+    fn opencode_prompt_body(&self) -> std::path::PathBuf {
+        self.bin.path().join("opencode-prompt-body")
+    }
+
+    /// Where the fake `opencode` remembers the directory it anchored a session
+    /// to, so a read-back reports the anchor opencode stored rather than the one
+    /// the request asked for.
+    fn opencode_session_directory(&self) -> std::path::PathBuf {
+        self.bin.path().join("opencode-session-directory")
+    }
+
+    /// The single Worker Workspace a pool of one provisioned.
+    fn worker_workspace(&self) -> std::path::PathBuf {
+        let name = self
+            .path()
+            .file_name()
+            .expect("repository name")
+            .to_string_lossy()
+            .into_owned();
+        let base = self
+            .path()
+            .parent()
+            .expect("workspace base parent")
+            .join(format!("{name}-workspaces"));
+        let mut workspaces: Vec<std::path::PathBuf> = fs::read_dir(&base)
+            .expect("workspace base")
+            .map(|entry| entry.expect("Workspace entry").path())
+            .collect();
+        workspaces.sort();
+        assert_eq!(
+            workspaces.len(),
+            1,
+            "a pool of one provisions one Worker Workspace"
+        );
+        workspaces.pop().expect("one Worker Workspace")
+    }
+
     /// Puts a fake `claude` on the fixture's `PATH` that answers a Ticket query
     /// with an empty ready set.
     ///
@@ -184,7 +259,58 @@ impl DispatchFixture {
     fn dispatch(&self, args: &[&str]) -> Output {
         support::run_jjfx_tolerating_a_starved_terminal(|| self.jjfx(args))
     }
+
+    /// Runs `dispatch` as if issued from the opencode session `session_id`, which
+    /// is how opencode hands a session's id to a command it runs.
+    fn dispatch_from_session(&self, session_id: &str, args: &[&str]) -> Output {
+        support::run_jjfx_tolerating_a_starved_terminal(|| {
+            let mut command = self.jjfx(args);
+            command.env("OPENCODE_SESSION_ID", session_id);
+            command
+        })
+    }
 }
+
+/// A fake `opencode` that serves the session API the way a real opencode does:
+/// a child session inherits its parent's directory, a root session is anchored to
+/// the directory the request asked for, and a read-back reports the anchor
+/// opencode stored. `session.get` reports the dispatching session anchored to
+/// `__DISPATCHER__`.
+const OPENCODE_SESSION_SCRIPT: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.0.29'; exit 0 ;;
+  api)
+    case "$2" in
+      session.create)
+        printf '%s' "$4" > "__CREATE_BODY__"
+        case "$4" in
+          *parentID*) directory="__DISPATCHER__" ;;
+          *) directory=$(printf '%s' "$4" | sed -n 's/.*"directory":"\([^"]*\)".*/\1/p') ;;
+        esac
+        printf '%s' "$directory" > "__SESSION_DIRECTORY__"
+        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$directory"
+        exit 0 ;;
+      session.get)
+        case "$4" in
+          sessionID=ses_dispatcher)
+            printf '{"data":{"id":"ses_dispatcher","location":{"directory":"__DISPATCHER__"}}}'
+            exit 0 ;;
+        esac
+        printf '{"data":{"id":"ses_new","location":{"directory":"%s"}}}' "$(cat "__SESSION_DIRECTORY__")"
+        exit 0 ;;
+      session.prompt)
+        printf '%s' "$6" > "__PROMPT_BODY__"
+        printf '{"data":{"id":"msg_1"}}'
+        exit 0 ;;
+      session.remove)
+        exit 0 ;;
+    esac
+    exit 1 ;;
+  run)
+    exit 0 ;;
+esac
+exit 1
+"#;
 
 fn stdout(output: &Output) -> String {
     String::from_utf8_lossy(&output.stdout).into_owned()
@@ -238,6 +364,72 @@ fn a_batch_with_a_dispatched_ticket_exits_zero() {
         stdout(&output).contains("\"outcome\": \"dispatched\""),
         "{}",
         stdout(&output)
+    );
+}
+
+/// The wall this removes: a Dispatch issued from inside an opencode session -
+/// the documented way an agent drives jjfx - launched no Worker at all.
+///
+/// jjfx created each Worker's session as a **child** of the dispatching session,
+/// and opencode anchors a child to its parent's directory. The dispatching agent
+/// runs in the Repository, so the Worker Workspace anchor assertion failed every
+/// launch and the only workaround was to unset `OPENCODE_SESSION_ID`, giving up
+/// the child-session topology. The Run's session is now a root session anchored to
+/// the Worker Workspace whenever a child could not be, so the agent-driven path
+/// dispatches.
+#[test]
+fn a_dispatch_from_an_opencode_session_launches_a_worker() {
+    let fixture = DispatchFixture::new();
+    fixture.with_pool(1);
+    fixture.with_origin();
+    let workspace = fixture.worker_workspace();
+    fixture.with_fake_opencode();
+    let profile = fixture
+        .jjfx(&["pool", "profile", "opencode"])
+        .output()
+        .expect("pool profile");
+    assert!(profile.status.success(), "{}", stderr(&profile));
+
+    let output = fixture.dispatch_from_session("ses_dispatcher", &["dispatch", "--all", "--json"]);
+
+    assert!(
+        output.status.success(),
+        "a Dispatch from an opencode session must launch a Worker:\nstdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    assert!(
+        stdout(&output).contains("\"outcome\": \"dispatched\""),
+        "{}",
+        stdout(&output)
+    );
+
+    // The Run's session is a root session anchored to the Worker Workspace: the
+    // dispatching session runs in the Repository, and a child session would have
+    // inherited that directory instead.
+    let body: serde_json::Value = serde_json::from_slice(
+        &fs::read(fixture.opencode_create_body()).expect("recorded session.create body"),
+    )
+    .expect("session.create body JSON");
+    assert!(
+        body.get("parentID").is_none(),
+        "a dispatching session outside the Workspace must not own the Run's session: {body}"
+    );
+    let anchored = body["location"]["directory"]
+        .as_str()
+        .expect("the session names its directory");
+    assert_eq!(
+        Path::new(anchored)
+            .canonicalize()
+            .expect("session directory canonical"),
+        workspace.canonicalize().expect("workspace canonical"),
+        "the Run's session must be anchored to the Worker Workspace"
+    );
+
+    // The prompt reached the session, so the Run started without a client process.
+    assert!(
+        fixture.opencode_prompt_body().exists(),
+        "the Run should deliver its prompt to the session it created"
     );
 }
 
