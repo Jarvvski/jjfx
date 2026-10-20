@@ -1,0 +1,30 @@
+# jjfx's own repository config. See docs/configuration.md for every key.
+#
+# This repository is local-ticket: its work lives as markdown under
+# .scratch/<feature>/issues/ (docs/agents/issue-tracker.md), so the default
+# `linear` source would discover nothing here and a dispatched Ticket could
+# never be written back as resolved.
+[tickets]
+source = "local"
+
+# The check jjfx runs against a Run's change - on itself, here. `mise run test`
+# is the repository's own full workspace test suite: the external signal that
+# supersedes the agent's "done", per the verified-done decision (ticket 02).
+#
+# Deliberately not `mise run check`, the landing gate. The gate adds fmt, clippy,
+# a release build and changelog validation, none of which say whether the change
+# works, and the release build is its most expensive step. CI re-runs the whole
+# gate on every pull request (.github/workflows/ci.yml), so the loop's job is the
+# narrower one: prove the change behaves, cheaply enough to run on every Run.
+#
+# The command is the mise task, not bare `cargo test`: mise owns the toolchain
+# pin (mise.toml), and the suite spawns `jj`, which on this machine resolves
+# through a mise shim - a bare `cargo test` run without mise's environment fails
+# the direct-dispatch tests with "No version is set for shim: jj".
+#
+# timeout_secs is generous because a worker's workspace is fresh: its first Run
+# pays a cold compile of the workspace, which the 600s default would kill and
+# record as a check that could not run.
+[checks]
+command = "mise run test"
+timeout_secs = 1800
