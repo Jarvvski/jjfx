@@ -10,8 +10,9 @@
 use std::fs;
 
 use jjfx::engine::{
-    QueueAdmission, QueueItemState, QueueSettlement, QueuedStep, ReplayingReviewer, Repository,
-    ReviewCompleteness, ReviewFinding, ReviewOutcome, ReviewRequest, ReviewSeverity, Reviewer,
+    QueueAdmission, QueueItemState, QueueSettlement, QueuedStep, REPLAYED_DETAIL,
+    RecordedReviewLoop, ReplayingReviewer, Repository, ReviewCompleteness, ReviewFinding,
+    ReviewLoop, ReviewOutcome, ReviewRequest, ReviewSeverity, ReviewStop, ReviewSubject, Reviewer,
     ReviewerError, StepKey, WireTimestamp,
 };
 use tempfile::TempDir;
@@ -138,4 +139,62 @@ fn a_recorded_decision_is_replayed_from_disk_without_the_model() {
         replayed, decided,
         "a replay must reproduce exactly what was recorded"
     );
+}
+
+/// Ticket 12, at the loop level: a repeated `(ticket, dimension, pass)` does not
+/// reach the model. The first drive decides through a scripted reviewer; the
+/// second runs through a reviewer that panics if it is asked, so a pass that
+/// reached the model fails the test - and the replay is visible in the durable
+/// queue an operator reads.
+#[test]
+fn a_review_loop_driven_twice_replays_without_reaching_the_model() {
+    let (temp, repository) = repository();
+    let subject = ReviewSubject::new("ENG-1", "security");
+
+    let first = RecordedReviewLoop::new(
+        repository.state_store().decisions(),
+        repository.work_queue(),
+        subject.clone(),
+    )
+    .run(ReviewLoop::new(3), &ScriptedReviewer, &request(), |_, _| {
+        Ok::<(), String>(())
+    })
+    .expect("the first drive decides");
+
+    assert_eq!(first.passes(), 2);
+    assert_eq!(first.stop(), ReviewStop::NoProgress);
+    assert_eq!(first.replayed(), 0, "the first drive decided every pass");
+
+    // A fresh handle over the same Repository: the decisions and the queue are
+    // read from disk, so a replay is durable rather than this process's memory.
+    let reopened = Repository::open(temp.path()).expect("reopen repository");
+    let second = RecordedReviewLoop::new(
+        reopened.state_store().decisions(),
+        reopened.work_queue(),
+        subject.clone(),
+    )
+    .run(
+        ReviewLoop::new(3),
+        &PanickingReviewer,
+        &request(),
+        |_, _| Ok::<(), String>(()),
+    )
+    .expect("the second drive replays");
+
+    assert_eq!(second.passes(), 2);
+    assert_eq!(second.stop(), ReviewStop::NoProgress);
+    assert_eq!(second.replayed(), 2);
+    assert_eq!(second.replayed_passes(), [1, 2]);
+
+    // The operator sees the replay in `status --json`'s queue: the step is still
+    // done, and its detail names the replay rather than leaving it silent.
+    for pass in 1..=2 {
+        let item = reopened
+            .work_queue()
+            .item(&subject.step(pass))
+            .expect("item")
+            .expect("recorded");
+        assert_eq!(item.state, QueueItemState::Done);
+        assert_eq!(item.detail.as_deref(), Some(REPLAYED_DETAIL));
+    }
 }

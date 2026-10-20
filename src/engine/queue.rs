@@ -183,6 +183,27 @@ impl WorkQueue {
         })
     }
 
+    /// Records that a settled step was replayed rather than run again.
+    ///
+    /// A replay does not move a step: it is still the work that was already done,
+    /// so this annotates the existing record's `detail` instead of transitioning
+    /// it. That is how an operator tells a pass that replayed a recorded decision
+    /// from one that ran and found nothing - a silent replay and an empty pass
+    /// would otherwise read identically (ticket 12). A step the queue does not
+    /// know is reported unchanged rather than invented.
+    pub fn record_replay(
+        &self,
+        step: &StepKey,
+        detail: impl Into<String>,
+    ) -> Result<bool, StateError> {
+        let detail = detail.into();
+        self.store().transition(step, |item| {
+            let changed = item.detail.as_deref() != Some(detail.as_str());
+            item.detail = Some(detail);
+            changed
+        })
+    }
+
     /// Returns a claimed or in-flight step to the queue.
     ///
     /// A launch that never happened leaves the work outstanding rather than
@@ -565,6 +586,51 @@ mod tests {
         assert_eq!(item.claimed_by, None);
         assert_eq!(item.in_flight, None);
         assert_eq!(item.detail.as_deref(), Some("released before launch"));
+    }
+
+    /// Ticket 12: a replayed step is still done, so the replay annotates the
+    /// record rather than moving it - which is how `status --json` tells a
+    /// replayed pass from a pass that ran and found nothing.
+    #[test]
+    fn a_replay_is_recorded_on_the_settled_step() {
+        let (_temp, queue) = queue();
+        let offered = review_step("ENG-1", "security", 1);
+        queue
+            .enqueue(std::slice::from_ref(&offered))
+            .expect("enqueue");
+        let key = StepKey::review("ENG-1", "security", 1);
+        queue
+            .settle(&key, QueueSettlement::Done, at(1))
+            .expect("settle");
+
+        assert!(
+            queue
+                .record_replay(&key, "replayed from the recorded decision")
+                .expect("record the replay")
+        );
+
+        let item = queue.item(&key).expect("item").expect("recorded");
+        assert_eq!(
+            item.state,
+            QueueItemState::Done,
+            "a replay does not move the step"
+        );
+        assert_eq!(
+            item.detail.as_deref(),
+            Some("replayed from the recorded decision")
+        );
+        // Recording the same replay again is a no-op, and a step the queue never
+        // held is not invented.
+        assert!(
+            !queue
+                .record_replay(&key, "replayed from the recorded decision")
+                .expect("re-record the replay")
+        );
+        assert!(
+            !queue
+                .record_replay(&StepKey::review("ENG-9", "security", 1), "replayed")
+                .expect("record a replay for an unrecorded step")
+        );
     }
 
     /// Ticket 07: a resumption reads the queue's own per-step state to tell what

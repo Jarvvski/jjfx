@@ -81,6 +81,24 @@ recording the same decision twice is a no-op - so a replay does not churn it. A
 step with nothing recorded is the model's to decide, and the fresh decision is
 recorded under the step's identity for the next repeat to replay.
 
+A review loop drives every pass through that log. Each pass is keyed by its step
+identity, so the same `(ticket, dimension, pass)` offered again - a retry, a
+resumed harness, a duplicate dispatch - is served from the log rather than
+reaching the reviewer, and its findings are not re-addressed: they were addressed
+when the decision was first made. Replay is transparent to the bound in
+[the review loop](review-loop.md), so the pass cap and the progress rule see
+exactly the rounds the first drive saw.
+
+An operator tells a replayed pass from a pass that ran: the step stays `done`, and
+its `detail` names the replay rather than leaving it silent.
+
+```bash
+jjfx status --json | jq '.queue[] | select(.step | startswith("review:"))'
+```
+
+A pass that ran carries no such detail, so "it replayed" and "it did nothing" are
+never confused - which is the failure this record exists to remove.
+
 ## The states
 
 | State | Means |

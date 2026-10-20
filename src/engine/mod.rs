@@ -25,6 +25,7 @@ mod opencode_api;
 mod orchestration;
 mod pool;
 mod queue;
+mod review_run;
 mod reviewer;
 mod run_log;
 mod runtime;
@@ -83,6 +84,7 @@ pub use pool::{
     WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use queue::{QueueResolution, WorkQueue};
+pub use review_run::{REPLAYED_DETAIL, RecordedReviewLoop, ReviewSubject};
 pub use reviewer::{
     DecisionLog, DecisionLogError, ReplayingReviewer, ReviewCompleteness, ReviewEscalation,
     ReviewFinding, ReviewLoop, ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest,

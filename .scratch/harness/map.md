@@ -111,7 +111,8 @@ verifying agent output and integrating parallel work, which is what jjfx's
   and tested but not yet wired, which is [12](issues/12-wire-the-decision-log.md).
 - [12](issues/12-wire-the-decision-log.md) - task: drive the review loop
   through the decision log so a repeated dimension and pass replays rather
-  than reaching the model. Follow-up to 09.
+  than reaching the model. Follow-up to 09. Landed; the loop drives each pass
+  through the log, and a replay is recorded in the queue.
 
 ### Phase 2 - topology
 
