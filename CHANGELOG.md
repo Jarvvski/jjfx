@@ -106,6 +106,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx rebase reports a conflicted rebase as a named outcome instead of a push failure whose rollback implied the rebase was undone
 - jjfx help review no longer claims to run a bounded review loop: no command drives ReviewLoop, so the review page and the docs now state that jjfx runs no reviewer of its own and the loop's only caller is the harness seam
 - A finished Worker is returned to the pool automatically: a Worker whose Run has finished (done or failed) is reclaimed to idle on the next Dispatch, so a Pool of N serves a backlog larger than N across successive rounds without a manual jjfx pool reset.
+- jjfx logs follows a session-delivered Run's opencode session - reading the session's messages and printing its activity - instead of tailing a process log that stays empty, and says plainly that there is no process log and names the session when the daemon cannot be reached
 
 ## [0.55.0] - 2026-10-16
 

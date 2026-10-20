@@ -243,11 +243,18 @@ impl OpenPullRequestOutcome {
     }
 }
 
-/// A typed reference to one Worker's structured provider log.
+/// A typed reference to one Worker's Run activity, and where it is written.
+///
+/// A Run normally writes a structured provider log a process owns. A Run
+/// delivered through its opencode session spawns no client process at all, so
+/// the log it would have written stays empty and the activity lives in the
+/// session instead: [`WorkerLogs::session`] names the session to read in that
+/// case, and is `None` when the log is the Run's activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerLogs {
     path: std::path::PathBuf,
     runtime: AgentRuntime,
+    session: Option<String>,
 }
 
 impl WorkerLogs {
@@ -264,6 +271,12 @@ impl WorkerLogs {
     /// Opens the log through the provider-neutral parser facade.
     pub fn open(&self) -> RunLog {
         RunLog::new(&self.path, self.runtime)
+    }
+
+    /// Returns the opencode session the Run is delivered through, when the Run
+    /// writes no process log and drives one.
+    pub fn session(&self) -> Option<&str> {
+        self.session.as_deref()
     }
 }
 
@@ -434,6 +447,12 @@ impl WorkerActions {
     }
 
     /// Returns the Worker's structured Run log without choosing a rendering.
+    ///
+    /// A Run delivered through its opencode session writes no process log: the
+    /// daemon records its activity in the session, so the log the Run's process
+    /// would have written stays empty. The session is named instead, but only
+    /// when the log really is empty, so a process-delivered Run keeps the log
+    /// that is actually being written.
     pub fn logs(&self, worker: &WorkerId) -> Result<WorkerLogs, WorkerActionError> {
         let snapshot = self.repository.worker_pool().snapshot();
         let state =
@@ -442,24 +461,43 @@ impl WorkerActions {
                 .ok_or_else(|| WorkerActionError::WorkerNotFound {
                     worker: worker.clone(),
                 })?;
-        let path = state
-            .log_file()
-            .filter(|path| !path.is_empty())
-            .map(std::path::PathBuf::from)
-            .ok_or_else(|| WorkerActionError::MissingLog {
-                worker: worker.clone(),
-            })?;
-        if !path.is_file() {
-            return Err(WorkerActionError::MissingLog {
-                worker: worker.clone(),
-            });
-        }
         let runtime = state
             .agent_runtime()
             .ok_or_else(|| WorkerActionError::MissingRuntime {
                 worker: worker.clone(),
             })?;
-        Ok(WorkerLogs { path, runtime })
+        let path = state
+            .log_file()
+            .filter(|path| !path.is_empty())
+            .map(std::path::PathBuf::from);
+        if runtime == AgentRuntime::OpenCode
+            && path.as_deref().is_none_or(|path| !log_has_content(path))
+            && let Some(session_id) = crate::engine::runtime::identify_run_session(
+                &crate::engine::OpenCodeApi::new(),
+                &self.repository,
+                worker,
+                state.ticket(),
+            )
+        {
+            return Ok(WorkerLogs {
+                path: path.unwrap_or_else(|| self.repository.state_store().worker_log(worker)),
+                runtime,
+                session: Some(session_id),
+            });
+        }
+        let path = path.ok_or_else(|| WorkerActionError::MissingLog {
+            worker: worker.clone(),
+        })?;
+        if !path.is_file() {
+            return Err(WorkerActionError::MissingLog {
+                worker: worker.clone(),
+            });
+        }
+        Ok(WorkerLogs {
+            path,
+            runtime,
+            session: None,
+        })
     }
 
     /// Rebases the Worker's bookmark onto `main` and pushes it.
@@ -1494,6 +1532,18 @@ impl SystemCommands {
             detail: source.to_string(),
         })
     }
+}
+
+/// Whether a Run log has anything in it yet.
+///
+/// A Run delivered through its opencode session leaves its log empty, so an
+/// empty log is what tells the two apart. A log that cannot be read counts as
+/// empty: reading the session is the better answer, and the session reader
+/// reports its own failure plainly.
+fn log_has_content(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|metadata| metadata.len() > 0)
+        .unwrap_or(false)
 }
 
 /// The command for a plain mount shell: an interactive shell with the

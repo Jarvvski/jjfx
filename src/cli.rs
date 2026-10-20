@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::{IsTerminal, Read};
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -45,14 +45,15 @@ use crate::engine::{
     DEFAULT_POOL_NAME, DEFAULT_READY_LABEL, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
-    FollowUpExecution, FollowUpOutcome, Loaded, LocalTicketReadiness, LocalTickets,
-    OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, QueueItemState,
+    FollowUpExecution, FollowUpOutcome, Loaded, LocalTicketReadiness, LocalTickets, OpenCodeApi,
+    OpenCodeError, OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, QueueItemState,
     REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets, Repository, RunActivity,
-    RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendDecision, SpendLimit,
-    SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
+    RunActivityKind, RunLogError, RunMode, SessionMessage, SpendCap, SpendCapMode, SpendDecision,
+    SpendLimit, SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
     TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
-    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
+    WorkerActions, WorkerId, WorkerLogs, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot,
+    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis,
+    resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
@@ -4915,6 +4916,17 @@ impl FollowStop {
 fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let logs = WorkerActions::new(repository.clone()).logs(&worker)?;
+    match logs.session() {
+        // A Run delivered through its opencode session writes no process log:
+        // its activity is recorded in the session, so follow that instead of a
+        // file that will never have content.
+        Some(session_id) => follow_session(repository, &worker, logs.runtime(), session_id),
+        None => follow_log(repository, &worker, &logs),
+    }
+}
+
+/// Follow a Worker's process log, printing its tail and then each new activity.
+fn follow_log(repository: &Repository, worker: &WorkerId, logs: &WorkerLogs) -> Result<()> {
     // Print the existing log first so the command never blocks silently: a
     // terminal Worker whose log does not parse would otherwise follow forever
     // with no output.
@@ -4922,7 +4934,7 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
     // A Worker that is already terminal has a complete log, and an idle Worker
     // has no Run at all, so return at once rather than follow a log that will
     // never write again.
-    if follow_stop(repository, &worker).is_some() {
+    if follow_stop(repository, worker).is_some() {
         return Ok(());
     }
     eprintln!("Following {} log for {worker}", logs.runtime());
@@ -4944,7 +4956,7 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
             Err(RunLogError::Io { source, .. })
                 if source.kind() == std::io::ErrorKind::NotFound =>
             {
-                FollowStop::LogGone.report(&worker);
+                FollowStop::LogGone.report(worker);
                 return Ok(());
             }
             // Anything else is a log the command was asked to show but cannot
@@ -4955,11 +4967,135 @@ fn logs_command(repository: &Repository, value: &str) -> Result<()> {
         // attached must not keep it alive once there is no Run left to follow -
         // because the Run ended, or because the Worker was reset to idle. The
         // check is one more reconciliation on a pass that already sleeps.
-        if let Some(stop) = follow_stop(repository, &worker) {
-            stop.report(&worker);
+        if let Some(stop) = follow_stop(repository, worker) {
+            stop.report(worker);
             return Ok(());
         }
         std::thread::sleep(LOG_FOLLOW_INTERVAL);
+    }
+}
+
+/// How many of a session's newest messages `logs` reads on each pass.
+///
+/// A Run's session can hold far more messages than a follower needs, and the
+/// newest are the ones still moving, so the page is bounded rather than read in
+/// full.
+const SESSION_MESSAGE_PAGE: usize = 20;
+
+/// How many activity lines `logs` prints before it starts following a session.
+///
+/// The process log's tail is bounded by bytes; a session's is bounded by lines,
+/// because a single message can carry a long stretch of activity.
+const SESSION_TAIL_ACTIVITIES: usize = 40;
+
+/// Follow a Run delivered through its opencode session.
+///
+/// A session-delivered Run has no process log to read, so its activity is the
+/// session's messages. The session is durable, so a finished Run still has one
+/// to show. Reading it needs the daemon: when that is unreachable the command
+/// says plainly that there is no process log and names the session to look at,
+/// rather than following an empty file forever.
+fn follow_session(
+    repository: &Repository,
+    worker: &WorkerId,
+    runtime: AgentRuntime,
+    session_id: &str,
+) -> Result<()> {
+    let api = OpenCodeApi::new();
+    let mut feed = SessionFeed::default();
+    // Print the activity already recorded first, so the command never blocks
+    // silently, exactly as a process log's tail does.
+    match session_activity(&api, session_id, &mut feed) {
+        Ok(lines) => {
+            let tail = lines.len().saturating_sub(SESSION_TAIL_ACTIVITIES);
+            for line in &lines[tail..] {
+                println!("{line}");
+            }
+        }
+        Err(error) => {
+            report_unreadable_session(worker, session_id, &error);
+            return Ok(());
+        }
+    }
+    // A Worker that is already terminal has a complete session, and an idle
+    // Worker has no Run at all, so return rather than follow activity that will
+    // never arrive.
+    if follow_stop(repository, worker).is_some() {
+        return Ok(());
+    }
+    eprintln!("Following {runtime} session {session_id} for {worker}");
+    loop {
+        match session_activity(&api, session_id, &mut feed) {
+            Ok(lines) => {
+                for line in lines {
+                    println!("{line}");
+                }
+            }
+            // A session that stops answering mid-follow is a clean end: there is
+            // nothing left to read, and the reason is reported rather than
+            // swallowed.
+            Err(error) => {
+                report_unreadable_session(worker, session_id, &error);
+                return Ok(());
+            }
+        }
+        if let Some(stop) = follow_stop(repository, worker) {
+            stop.report(worker);
+            return Ok(());
+        }
+        std::thread::sleep(LOG_FOLLOW_INTERVAL);
+    }
+}
+
+/// The activity lines a session has produced that `feed` has not printed yet.
+fn session_activity(
+    api: &OpenCodeApi,
+    session_id: &str,
+    feed: &mut SessionFeed,
+) -> Result<Vec<String>, OpenCodeError> {
+    let messages = api.session_messages(session_id, SESSION_MESSAGE_PAGE)?;
+    Ok(feed.fresh(&messages))
+}
+
+/// Says plainly that a session-delivered Run has no process log, naming the
+/// session its activity is in, why that could not be read, and where to look
+/// instead.
+fn report_unreadable_session(worker: &WorkerId, session_id: &str, error: &OpenCodeError) {
+    eprintln!(
+        "No process log for {worker}: its Run is delivered through opencode session \
+         {session_id}, whose activity could not be read ({error})."
+    );
+    eprintln!("Follow that session from opencode, or re-run once its server is reachable.");
+}
+
+/// The activity lines already printed for each of a session's messages.
+///
+/// A message is not immutable: an assistant message grows as its content
+/// streams, and a tool part moves from running to completed in place. Tracking
+/// the rendered lines per message, rather than which messages have been seen,
+/// prints each new or updated activity exactly once and never reprints one that
+/// has not changed.
+#[derive(Debug, Default)]
+struct SessionFeed {
+    seen: HashMap<String, Vec<String>>,
+}
+
+impl SessionFeed {
+    /// Records `messages` and returns the activity lines that are new or changed
+    /// since the last pass, in message order.
+    fn fresh(&mut self, messages: &[SessionMessage]) -> Vec<String> {
+        let mut fresh = Vec::new();
+        for message in messages {
+            let rendered: Vec<String> = message.activities().iter().map(render_activity).collect();
+            let previous = self.seen.entry(message.id().to_owned()).or_default();
+            for (index, line) in rendered.iter().enumerate() {
+                if previous.get(index) != Some(line) {
+                    fresh.push(line.clone());
+                }
+            }
+            *previous = rendered;
+        }
+        fresh
     }
 }
 
@@ -5884,9 +6020,91 @@ fn default_command(launch: fn(PathBuf) -> Result<()>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::RunActivityStatus;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    fn text_activity(text: &str) -> RunActivity {
+        RunActivity::new(RunActivityKind::Message {
+            text: text.to_owned(),
+        })
+    }
+
+    fn tool_activity(status: RunActivityStatus) -> RunActivity {
+        RunActivity::new(RunActivityKind::Tool {
+            name: "bash".to_owned(),
+            detail: Some("cargo test".to_owned()),
+            status,
+        })
+    }
+
+    #[test]
+    fn session_feed_prints_a_message_that_grows_one_activity_at_a_time() {
+        let mut feed = SessionFeed::default();
+        let first = SessionMessage::new("msg_1", vec![text_activity("reading the ticket")]);
+
+        assert_eq!(
+            feed.fresh(&[first]),
+            ["reading the ticket"],
+            "the first pass prints the message's activity"
+        );
+
+        // An unchanged message is not reprinted: the follower only reports what
+        // is new.
+        let unchanged = SessionMessage::new("msg_1", vec![text_activity("reading the ticket")]);
+        assert!(feed.fresh(&[unchanged]).is_empty());
+
+        // The assistant message grows as its content streams, and only the part
+        // that arrived is printed.
+        let grown = SessionMessage::new(
+            "msg_1",
+            vec![
+                text_activity("reading the ticket"),
+                tool_activity(RunActivityStatus::InProgress),
+            ],
+        );
+        assert_eq!(feed.fresh(&[grown]), ["tool bash InProgress cargo test"]);
+    }
+
+    #[test]
+    fn session_feed_reprints_an_activity_that_changed_in_place() {
+        let mut feed = SessionFeed::default();
+        let running =
+            SessionMessage::new("msg_1", vec![tool_activity(RunActivityStatus::InProgress)]);
+        feed.fresh(&[running]);
+
+        // A tool part moves from running to completed in place: the updated line
+        // is printed even though the message already existed.
+        let completed =
+            SessionMessage::new("msg_1", vec![tool_activity(RunActivityStatus::Completed)]);
+
+        assert_eq!(feed.fresh(&[completed]), ["tool bash Completed cargo test"]);
+    }
+
+    #[test]
+    fn session_feed_prints_messages_in_order_and_skips_inactivity() {
+        let mut feed = SessionFeed::default();
+        let messages = [
+            SessionMessage::new("msg_1", Vec::new()),
+            SessionMessage::new("msg_2", vec![text_activity("first")]),
+            SessionMessage::new("msg_3", vec![text_activity("second")]),
+        ];
+
+        assert_eq!(feed.fresh(&messages), ["first", "second"]);
+    }
+
+    #[test]
+    fn session_feed_does_not_reprint_a_message_that_leaves_the_page() {
+        let mut feed = SessionFeed::default();
+        let older = SessionMessage::new("msg_1", vec![text_activity("older")]);
+        let newer = SessionMessage::new("msg_2", vec![text_activity("newer")]);
+        feed.fresh(&[older.clone(), newer.clone()]);
+
+        // The page only ever holds the newest messages, so an older one drops
+        // out. It must not be printed again when the page is read.
+        assert!(feed.fresh(&[newer]).is_empty());
     }
 
     /// `clean` is Repository-wide by default, and `--pool <name>` scopes it.

@@ -25,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::engine::WorkerId;
+use crate::engine::run_log::{RunActivity, opencode_message_activities};
 
 /// The opencode executable looked up on `PATH`.
 const OPENCODE_EXECUTABLE: &str = "opencode";
@@ -114,6 +115,41 @@ pub enum SessionOutcome {
     Interrupted,
     /// An outcome newer than this client. The wire value is preserved.
     Unknown(String),
+}
+
+/// One message opencode reports for a session (`session.message.list`).
+///
+/// A Run delivered through its session writes no process log, so this is where
+/// its activity is. Only the activity a frontend shows is kept: opencode's own
+/// message shape is wide, and `jjfx logs` renders the same provider-neutral
+/// values the Run log parser produces, so both sources read through one path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionMessage {
+    id: String,
+    activities: Vec<RunActivity>,
+}
+
+impl SessionMessage {
+    /// Builds a message from its id and the activity it reports.
+    pub(crate) fn new(id: impl Into<String>, activities: Vec<RunActivity>) -> Self {
+        Self {
+            id: id.into(),
+            activities,
+        }
+    }
+
+    /// The message id, which orders messages within a session.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// The provider-neutral activity this message reports, in provider order.
+    ///
+    /// A message that reports no activity - a prompt, a system note, the idle
+    /// marker - carries an empty list rather than a placeholder.
+    pub fn activities(&self) -> &[RunActivity] {
+        &self.activities
+    }
 }
 
 /// How a human answered a pending permission request (`Permission.Reply`).
@@ -565,6 +601,39 @@ impl<R: OpenCodeRunner> OpenCodeApi<R> {
         })
     }
 
+    /// The newest messages of a session (`session.message.list`), oldest of the
+    /// page first.
+    ///
+    /// A Run delivered through its session writes no process log, so this is
+    /// where its activity is. The page is bounded by `limit` and asked for
+    /// newest-first: a Run's session can hold far more messages than a follower
+    /// needs, and the newest are the ones still moving. The page is reversed so
+    /// a caller renders it in the order the Run happened.
+    pub fn session_messages(
+        &self,
+        session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<SessionMessage>, OpenCodeError> {
+        let limit = limit.to_string();
+        let raw = self.call(operation_args(
+            "session.message.list",
+            &[
+                ("sessionID", session_id),
+                ("order", "desc"),
+                ("limit", &limit),
+            ],
+            None,
+        ))?;
+        let mut messages: Vec<SessionMessage> =
+            parse_envelope::<SessionMessagesEnvelope>(&raw, "session.message.list")?
+                .data
+                .into_iter()
+                .map(SessionMessageInfo::into_message)
+                .collect();
+        messages.reverse();
+        Ok(messages)
+    }
+
     /// The ids of the sessions opencode currently reports as active
     /// (`session.active`).
     ///
@@ -856,6 +925,31 @@ struct SessionEnvelope {
 }
 
 #[derive(Deserialize)]
+struct SessionMessagesEnvelope {
+    data: Vec<SessionMessageInfo>,
+}
+
+/// One `session.message.list` entry: its id, and opencode's own message fields.
+///
+/// The message body is kept as the provider reported it and handed to the
+/// provider-neutral parser, because the entry is one of several shapes
+/// (assistant, shell, prompt, idle) that the Run log parser already knows how to
+/// read.
+#[derive(Deserialize)]
+struct SessionMessageInfo {
+    id: String,
+    #[serde(flatten)]
+    message: serde_json::Map<String, serde_json::Value>,
+}
+
+impl SessionMessageInfo {
+    fn into_message(self) -> SessionMessage {
+        let message = serde_json::Value::Object(self.message);
+        SessionMessage::new(self.id, opencode_message_activities(&message))
+    }
+}
+
+#[derive(Deserialize)]
 struct SessionsEnvelope {
     data: Vec<SessionInfo>,
 }
@@ -1045,6 +1139,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::engine::run_log::{RunActivityKind, RunActivityStatus};
 
     /// A runner that returns canned outputs and records the arguments it saw.
     /// This is the seam that lets parsing and the unavailable path be tested
@@ -1886,6 +1981,86 @@ mod tests {
         assert_eq!(session_from_env(Some("")), None);
         assert_eq!(session_from_env(Some("   ")), None);
         assert_eq!(session_from_env(None), None);
+    }
+
+    #[test]
+    fn session_messages_are_read_newest_first_and_returned_oldest_first() {
+        let payload = r#"{"data":[
+            {"id":"msg_3","type":"assistant","content":[{"type":"text","text":"finished"}]},
+            {"id":"msg_2","type":"assistant","content":[{"type":"tool","name":"bash","state":{"status":"running","input":{"command":"cargo test"}}}]},
+            {"id":"msg_1","type":"user","text":"Implement the ticket."}
+        ],"cursor":{"previous":"p","next":"n"}}"#;
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(payload)]));
+
+        let messages = api.session_messages("ses_x", 20).expect("reads");
+
+        assert_eq!(
+            api.runner.calls(),
+            vec![vec![
+                "api",
+                "session.message.list",
+                "--param",
+                "sessionID=ses_x",
+                "--param",
+                "order=desc",
+                "--param",
+                "limit=20"
+            ]]
+        );
+        let ids: Vec<&str> = messages.iter().map(SessionMessage::id).collect();
+        assert_eq!(ids, ["msg_1", "msg_2", "msg_3"]);
+        // A prompt reports no activity; the tool and the message report theirs.
+        assert!(messages[0].activities().is_empty());
+        assert_eq!(
+            messages[1].activities()[0].kind(),
+            &RunActivityKind::Tool {
+                name: "bash".to_owned(),
+                detail: Some("cargo test".to_owned()),
+                status: RunActivityStatus::InProgress,
+            }
+        );
+        assert_eq!(
+            messages[2].activities()[0].kind(),
+            &RunActivityKind::Message {
+                text: "finished".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn session_messages_report_an_empty_page_as_no_messages() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(
+            r#"{"data":[],"cursor":{"previous":null,"next":null}}"#,
+        )]));
+
+        assert!(api.session_messages("ses_x", 20).expect("reads").is_empty());
+    }
+
+    #[test]
+    fn session_messages_are_unavailable_when_the_server_cannot_be_reached() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(
+            1,
+            "",
+            "Error: Could not reach server at http://127.0.0.1:1\n",
+        )]));
+
+        let error = api.session_messages("ses_x", 20).expect_err("no server");
+
+        assert!(error.is_unavailable());
+    }
+
+    #[test]
+    fn session_messages_surface_a_server_rejection() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![failed(
+            1,
+            r#"{"_tag":"SessionNotFoundError","message":"Session not found: ses_nope"}"#,
+            "HTTP 404 Not Found\n",
+        )]));
+
+        let error = api.session_messages("ses_nope", 20).expect_err("rejected");
+
+        assert!(!error.is_unavailable());
+        assert_eq!(error.status(), Some(404));
     }
 
     fn sessions_titled(ids: &[&str], title: &str) -> String {

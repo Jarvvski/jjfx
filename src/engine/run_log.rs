@@ -725,6 +725,110 @@ fn parse_opencode_tool(
     ))])
 }
 
+/// The provider-neutral activity one opencode session message reports.
+///
+/// A Run delivered through its opencode session spawns no client process, so it
+/// writes no process log: the daemon records its activity as the session's
+/// messages instead. `jjfx logs` reads them here. The values are the same
+/// provider-neutral ones the process-log parser produces, so both sources render
+/// through one path.
+///
+/// A message that reports no agent activity - a user prompt, a system or skill
+/// note, the idle marker - contributes nothing rather than a placeholder: the
+/// command shows what the agent did, not the bookkeeping around it.
+pub fn opencode_message_activities(message: &Value) -> Vec<RunActivity> {
+    match message.get("type").and_then(Value::as_str) {
+        Some("assistant") => message
+            .get("content")
+            .and_then(Value::as_array)
+            .map(|parts| parts.iter().filter_map(opencode_assistant_part).collect())
+            .unwrap_or_default(),
+        Some("shell") => opencode_shell_activity(message).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// One opencode assistant content part as a provider-neutral activity.
+fn opencode_assistant_part(part: &Value) -> Option<RunActivity> {
+    match part.get("type").and_then(Value::as_str)? {
+        "text" => {
+            opencode_part_text(part).map(|text| RunActivity::new(RunActivityKind::Message { text }))
+        }
+        "reasoning" => opencode_part_text(part)
+            .map(|text| RunActivity::new(RunActivityKind::Reasoning { text })),
+        "tool" => opencode_session_tool(part),
+        _ => None,
+    }
+}
+
+/// The text a session content part carries, when it carries any.
+fn opencode_part_text(part: &Value) -> Option<String> {
+    part.get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+        .map(str::to_owned)
+}
+
+/// One opencode session tool part, whose `state` carries its progress.
+fn opencode_session_tool(part: &Value) -> Option<RunActivity> {
+    let name = part
+        .get("name")
+        .and_then(Value::as_str)
+        .filter(|name| !name.is_empty())?;
+    let state = part.get("state");
+    let detail = summarize_tool_value(state.and_then(|state| state.get("input")))
+        .or_else(|| summarize_tool_value(state.and_then(|state| state.get("output"))));
+    Some(RunActivity::new(RunActivityKind::Tool {
+        name: name.to_owned(),
+        detail,
+        status: opencode_tool_state(state),
+    }))
+}
+
+/// Maps an opencode tool part's state onto a provider-neutral status.
+fn opencode_tool_state(state: Option<&Value>) -> RunActivityStatus {
+    match state
+        .and_then(|state| state.get("status"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "completed" => RunActivityStatus::Completed,
+        "error" => RunActivityStatus::Failed {
+            message: state
+                .and_then(|state| state.pointer("/error/message"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+        },
+        // `streaming` while the model is still emitting the call's arguments and
+        // `running` while it executes; an unknown state is still in progress.
+        _ => RunActivityStatus::InProgress,
+    }
+}
+
+/// One opencode session shell message, which is a command the agent ran.
+fn opencode_shell_activity(message: &Value) -> Option<RunActivity> {
+    let command = message
+        .get("command")
+        .and_then(Value::as_str)
+        .filter(|command| !command.is_empty())?;
+    let status = match message
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "running" => RunActivityStatus::InProgress,
+        "exited" => RunActivityStatus::Completed,
+        other => RunActivityStatus::Failed {
+            message: (!other.is_empty()).then(|| other.to_owned()),
+        },
+    };
+    Some(RunActivity::new(RunActivityKind::Tool {
+        name: "Shell".to_owned(),
+        detail: Some(command.to_owned()),
+        status,
+    }))
+}
+
 fn summarize_tool_value(value: Option<&Value>) -> Option<String> {
     let value = value?;
     if let Some(text) = value.as_str() {
@@ -1609,5 +1713,121 @@ mod tests {
         let missing = with_opencode_totals(RunResult::succeeded(), Path::new("absent.log"));
         assert_eq!(missing.cost(), None);
         assert_eq!(missing.usage(), None);
+    }
+
+    fn message(contents: &str) -> Value {
+        serde_json::from_str(contents).expect("valid session message")
+    }
+
+    #[test]
+    fn opencode_session_message_reports_text_reasoning_and_tool_activity() {
+        let message = message(
+            r#"{"id":"msg_1","type":"assistant","content":[
+                {"type":"reasoning","text":"weighing the options"},
+                {"type":"text","text":"reading the ticket"},
+                {"type":"tool","id":"call_1","name":"read","state":{"status":"running","input":{"path":"ticket.md"}}},
+                {"type":"tool","id":"call_2","name":"bash","state":{"status":"completed","input":{"command":"cargo test"},"content":[]}}
+            ]}"#,
+        );
+
+        let activities = opencode_message_activities(&message);
+
+        assert_eq!(activities.len(), 4);
+        assert_eq!(
+            activities[0].kind(),
+            &RunActivityKind::Reasoning {
+                text: "weighing the options".to_owned()
+            }
+        );
+        assert_eq!(
+            activities[1].kind(),
+            &RunActivityKind::Message {
+                text: "reading the ticket".to_owned()
+            }
+        );
+        assert_eq!(
+            activities[2].kind(),
+            &RunActivityKind::Tool {
+                name: "read".to_owned(),
+                detail: Some("ticket.md".to_owned()),
+                status: RunActivityStatus::InProgress,
+            }
+        );
+        assert_eq!(
+            activities[3].kind(),
+            &RunActivityKind::Tool {
+                name: "bash".to_owned(),
+                detail: Some("cargo test".to_owned()),
+                status: RunActivityStatus::Completed,
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_session_message_reports_a_failed_tool_with_its_error() {
+        let message = message(
+            r#"{"type":"assistant","content":[
+                {"type":"tool","name":"bash","state":{"status":"error","input":{"command":"cargo test"},"error":{"type":"exit","message":"exit code 101"}}}
+            ]}"#,
+        );
+
+        let activities = opencode_message_activities(&message);
+
+        assert_eq!(
+            activities[0].kind(),
+            &RunActivityKind::Tool {
+                name: "bash".to_owned(),
+                detail: Some("cargo test".to_owned()),
+                status: RunActivityStatus::Failed {
+                    message: Some("exit code 101".to_owned()),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_session_shell_message_is_a_command_the_agent_ran() {
+        let running = message(
+            r#"{"type":"shell","command":"cargo test","status":"running","output":{"output":"","cursor":0,"size":0,"truncated":false}}"#,
+        );
+        let killed = message(r#"{"type":"shell","command":"sleep 100","status":"killed"}"#);
+
+        assert_eq!(
+            opencode_message_activities(&running)[0].kind(),
+            &RunActivityKind::Tool {
+                name: "Shell".to_owned(),
+                detail: Some("cargo test".to_owned()),
+                status: RunActivityStatus::InProgress,
+            }
+        );
+        assert_eq!(
+            opencode_message_activities(&killed)[0].kind(),
+            &RunActivityKind::Tool {
+                name: "Shell".to_owned(),
+                detail: Some("sleep 100".to_owned()),
+                status: RunActivityStatus::Failed {
+                    message: Some("killed".to_owned()),
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn opencode_session_messages_without_agent_activity_report_none() {
+        // The prompt the Run was dispatched with, the bookkeeping messages and
+        // empty parts are not activity: the command shows what the agent did.
+        for contents in [
+            r#"{"type":"user","text":"Implement the ticket."}"#,
+            r#"{"type":"idle","outcome":"succeeded"}"#,
+            r#"{"type":"system","text":"compacting"}"#,
+            r#"{"type":"assistant","content":[{"type":"text","text":""}]}"#,
+            r#"{"type":"assistant"}"#,
+            r#"{"type":"assistant","content":[{"type":"tool","name":"","state":{"status":"running"}}]}"#,
+        ] {
+            assert!(
+                opencode_message_activities(&message(contents)).is_empty(),
+                "no activity expected for {contents}"
+            );
+        }
     }
 }
