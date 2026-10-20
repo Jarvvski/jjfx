@@ -75,6 +75,15 @@ impl Fixture {
         fs::write(directory.join("config.toml"), content).expect("config file");
     }
 
+    /// The repository-local jjfx config, `<repo>/.jjfx/config.toml` - where a
+    /// Repository declares its own `[dispatch]` ceiling without touching the
+    /// user's global config.
+    fn write_repo_config(&self, content: &str) {
+        let directory = self.path().join(".jjfx");
+        fs::create_dir_all(&directory).expect(".jjfx directory");
+        fs::write(directory.join("config.toml"), content).expect("repository config file");
+    }
+
     /// Seeds `.jj/pools/default/` with `size` Workers, the first `busy` of which
     /// are recorded as running a Run - the in-flight Runs a later Dispatch must
     /// count against the cap.
@@ -377,6 +386,104 @@ fn a_capped_dispatch_names_the_count_that_bound_the_batch() {
         !details[0].contains("0 Run(s) in flight"),
         "a pre-launch zero is the bug: {}",
         details[0]
+    );
+}
+
+/// A repository may declare its own `[dispatch] max_concurrent`, and it binds
+/// with no user-global cap at all - the case the governor was unreachable for,
+/// because the cap's only home was the user's global config. This is the
+/// repository-owned ceiling the finding asked for, read without touching the
+/// user's config.
+#[test]
+fn a_repository_dispatch_ceiling_binds_without_touching_the_user_global_config() {
+    let fixture = Fixture::new();
+    // The user-global config sets no ceiling - the repository owns this one.
+    fixture.write_user_config("[tickets]\nsource = \"local\"\n");
+    fixture.write_repo_config("[dispatch]\nmax_concurrent = 2\n");
+    // Four Workers with two Runs already in flight: the cap, not capacity, is
+    // what must hold the ready work.
+    fixture.seed_pool(4, 2);
+    fixture.write_ticket("01-alpha.md", "Alpha");
+    fixture.write_ticket("02-beta.md", "Beta");
+    fixture.write_ticket("03-gamma.md", "Gamma");
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let entries: Value = serde_json::from_str(stdout(&output).trim()).expect("valid JSON");
+    let held = waiting_details(&entries);
+    assert_eq!(held.len(), 3, "all three must be held: {}", stdout(&output));
+    for detail in &held {
+        assert!(
+            detail.contains("max_concurrent = 2"),
+            "the reason must name the repository ceiling: {detail}"
+        );
+    }
+
+    // The binding limit is visible where the pool is read.
+    let value = status_json(&fixture);
+    assert_eq!(value["governor"]["limit"], 2, "{value}");
+    assert_eq!(value["governor"]["running"], 2, "{value}");
+    assert_eq!(value["governor"]["held"], 3, "{value}");
+}
+
+/// A repository ceiling only *tightens* the user-global one: with both set, the
+/// smaller binds.
+#[test]
+fn a_repository_dispatch_ceiling_tightens_the_user_global_one() {
+    let fixture = Fixture::new();
+    fixture.write_user_config("[tickets]\nsource = \"local\"\n[dispatch]\nmax_concurrent = 4\n");
+    fixture.write_repo_config("[dispatch]\nmax_concurrent = 1\n");
+    // Four idle Workers, so the ceiling is the binding dial, not capacity.
+    fixture.seed_pool(4, 0);
+    fixture.write_ticket("01-alpha.md", "Alpha");
+    fixture.write_ticket("02-beta.md", "Beta");
+    fixture.write_ticket("03-gamma.md", "Gamma");
+
+    let output = fixture.jjfx(&["dispatch", "--all", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let entries: Value = serde_json::from_str(stdout(&output).trim()).expect("valid JSON");
+    let held = waiting_details(&entries);
+    assert_eq!(
+        held.len(),
+        2,
+        "a ceiling of one fires one and holds two: {}",
+        stdout(&output)
+    );
+    for detail in &held {
+        assert!(
+            detail.contains("max_concurrent = 1"),
+            "the smaller repository ceiling binds: {detail}"
+        );
+    }
+
+    let value = status_json(&fixture);
+    assert_eq!(value["governor"]["limit"], 1, "{value}");
+}
+
+/// A repository ceiling may never *widen* the user-global one: a repository that
+/// declares a larger value leaves the user-global limit binding (ADR 0014 - a
+/// repository-local declaration selects, never grants).
+#[test]
+fn a_repository_dispatch_ceiling_never_widens_the_user_global_one() {
+    let fixture = Fixture::new();
+    fixture.write_user_config("[tickets]\nsource = \"local\"\n[dispatch]\nmax_concurrent = 2\n");
+    fixture.write_repo_config("[dispatch]\nmax_concurrent = 8\n");
+    fixture.seed_pool(2, 1);
+
+    let value = status_json(&fixture);
+    assert_eq!(
+        value["governor"]["limit"], 2,
+        "the user-global ceiling still binds: {value}"
     );
 }
 

@@ -2292,8 +2292,7 @@ fn pool_report(
     }
     let total_cost = repository.repository_cost(&names).ok();
     let limit = config
-        .dispatch
-        .cap()?
+        .dispatch_cap_for(repository.root())?
         .map(crate::engine::ConcurrencyCap::limit);
     let running = pools
         .iter()
@@ -4394,8 +4393,9 @@ fn dispatch_with_capacity_prompt(
 ) -> Result<crate::engine::DirectDispatchResult> {
     // The concurrency cap is jjfx's own setting, read here rather than passed
     // down: `cli::run` is already at the argument limit, and this is the only
-    // place a whole batch is dispatched.
-    let cap = crate::config::load()?.dispatch.cap()?;
+    // place a whole batch is dispatched. Resolved for the Repository so its own
+    // `[dispatch]` ceiling tightens the user-global one.
+    let cap = crate::config::load()?.dispatch_cap_for(repository.root())?;
     let dispatcher = repository
         .direct_dispatch()
         .with_exclusions(exclusions.clone())
@@ -5615,8 +5615,10 @@ fn prepare_orchestration(
     };
     // The concurrency cap bounds a wave too, not just a batch: a Parent's
     // Sub-issues are Runs the same governor counts, so a wave that would exceed
-    // `dispatch.max_concurrent` holds the excess ready rather than firing it.
-    let request = request.with_concurrency_cap(crate::config::load()?.dispatch.cap()?);
+    // the Repository's `dispatch.max_concurrent` holds the excess ready rather
+    // than firing it. The Repository's own ceiling tightens the user-global one.
+    let request =
+        request.with_concurrency_cap(crate::config::load()?.dispatch_cap_for(repository.root())?);
     let ticket = DirectDispatchRequest::for_ticket_id(id.clone(), RunMode::Background)?
         .ticket()
         .clone();

@@ -4,12 +4,13 @@ jjfx reads its own settings from two files. The **user config**,
 `${XDG_CONFIG_HOME:-~/.config}/jjfx/config.toml`, is read once at startup and
 applies everywhere. The **repository config**, `<repo>/.jjfx/config.toml`, is
 read per repository and may set only the settings that are a property of the
-repository - [`[checks]`](#checks), [`[pools]`](#pools) and
-[`[tickets]`](#repository-local-ticket-source). Both are distinct from jj config
-(read through the `jj` CLI) and the lifecycle event log. A missing file means
-defaults; a file that exists but fails to parse is an error naming the offending
-key and file, surfaced before the TUI takes over the screen. Unknown keys are
-rejected, so a typo fails loudly rather than being silently ignored.
+repository - [`[checks]`](#checks), [`[dispatch]`](#dispatch),
+[`[pools]`](#pools) and [`[tickets]`](#repository-local-ticket-source). Both are
+distinct from jj config (read through the `jj` CLI) and the lifecycle event log.
+A missing file means defaults; a file that exists but fails to parse is an error
+naming the offending key and file, surfaced before the TUI takes over the screen.
+Unknown keys are rejected, so a typo fails loudly rather than being silently
+ignored.
 
 Every section is optional. This is a complete example:
 
@@ -358,6 +359,34 @@ kept out of the pool and Worker documents, and it is rewritten by every Dispatch
 - including an uncapped one, which clears it - so it always describes the last
 Dispatch rather than accumulating Tickets you have since dispatched by hand.
 
+### Repository-local dispatch ceiling
+
+A Repository may set its own `[dispatch] max_concurrent` in
+`<repo>/.jjfx/config.toml`, beside `[checks]`, `[pools]` and `[tickets]`, so an
+agent about to fan work out can pace one backlog without editing the user's
+global config - which would change every repository that user drives:
+
+```toml
+# <repo>/.jjfx/config.toml
+[dispatch]
+max_concurrent = 2
+```
+
+The two ceilings compose by taking the smaller: a repository-local ceiling may
+only **tighten** the user-global one, never loosen it. A repository that sets
+none keeps the user-global limit; a repository that sets one above it is held to
+the user-global limit rather than quietly widening it. That is the capability
+rule of [ADR 0014](adr/0014-repository-local-pool-declarations.md): a cap is a
+restriction that can only lower, so selecting among the concurrency the user
+config already granted grants no new capability - and a repository with no
+user-global ceiling can still bound itself, because a tighter cap is only ever a
+restriction.
+
+The binding limit is reported wherever the pool is read: `jjfx status --json`
+carries it as `governor.limit`, and the prose `status` prints it as
+`dispatch.max_concurrent = N`. Both report the resolved limit, so a repository
+ceiling is visible as the limit in force, not only the user-global one.
+
 ## `[watchdog]`
 
 How long a Run may make no progress before jjfx surfaces it as stuck. A Worker
@@ -482,12 +511,13 @@ none configured leaves the Ticket not-done with the reason named. See
 
 ### Repository-local checks
 
-`[checks]` is one of the three settings a repository may own. When the
+`[checks]` is one of the settings a repository may own. When the
 forge runs, jjfx reads `<repo>/.jjfx/config.toml`, and a `[checks]` section
 there **replaces** the user-global one for that repository - a repository either
 owns its check or inherits the user's. Any other section in that file is
 rejected, so a repository cannot silently configure the agent, the terminal, or
-anything else. The other repository-owned sections are [`[pools]`](#pools) and
+anything else. The other repository-owned sections are
+[`[dispatch]`](#repository-local-dispatch-ceiling), [`[pools]`](#pools) and
 [`[tickets]`](#repository-local-ticket-source).
 
 ```toml

@@ -506,10 +506,10 @@ impl App {
                 .with_tickets(settings.tickets)
                 .with_spend(settings.spend)
                 .with_checks(settings.checks)
-                // The config was validated when it was loaded, so an unusable
-                // cap cannot arrive from a real launch; a hand-built one falls
-                // back to no cap rather than refusing the whole TUI.
-                .with_concurrency_cap(settings.dispatch.cap().ok().flatten())
+                // The ceiling was resolved against this Repository's own
+                // `[dispatch]`, so the TUI paces to the same binding limit
+                // `dispatch` does. `None` is the uncapped Repository.
+                .with_concurrency_cap(settings.concurrency_cap)
                 .with_terminal(Arc::clone(&terminal))
                 .with_pool_selection(pool_selection.clone())
                 .with_pool_routing(settings.pool_routing),

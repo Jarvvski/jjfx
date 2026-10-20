@@ -11,8 +11,9 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::engine::{
-    AgentModel, AgentRuntime, AgentRuntimeProfile, DEFAULT_POOL_NAME, DEFAULT_READY_LABEL,
-    PaneLayout, PoolCapacity, PoolName, SpendCap, SpendCapMode, SpendWindow, WireAgent,
+    AgentModel, AgentRuntime, AgentRuntimeProfile, ConcurrencyCap, DEFAULT_POOL_NAME,
+    DEFAULT_READY_LABEL, PaneLayout, PoolCapacity, PoolName, SpendCap, SpendCapMode, SpendWindow,
+    WireAgent,
 };
 use anyhow::Context;
 use serde::Deserialize;
@@ -162,9 +163,35 @@ impl Config {
             .unwrap_or_else(|| self.checks.clone()))
     }
 
+    /// The concurrency ceiling in force for `repo_root`: the Repository's own
+    /// `[dispatch] max_concurrent` when it declares one, tightened by the
+    /// user-global ceiling, so the smaller binds.
+    ///
+    /// A repository-local ceiling may only **lower** the limit the user granted,
+    /// never raise it (ADR 0014): a cap is a restriction, so selecting among the
+    /// concurrency the user config already allows grants no new capability. A
+    /// repository that declares none keeps the user-global limit; a repository
+    /// that declares one above the user-global limit is held to the user-global
+    /// limit rather than quietly widening it.
+    pub fn dispatch_cap_for(&self, repo_root: &Path) -> anyhow::Result<Option<ConcurrencyCap>> {
+        let global = self.dispatch.cap()?;
+        let local = match self.repo_config(repo_root)?.dispatch {
+            Some(dispatch) => dispatch.cap()?,
+            None => None,
+        };
+        let limit = match (global, local) {
+            (Some(global), Some(local)) => Some(global.limit().min(local.limit())),
+            (Some(global), None) => Some(global.limit()),
+            (None, Some(local)) => Some(local.limit()),
+            (None, None) => None,
+        };
+        Ok(limit.and_then(ConcurrencyCap::new))
+    }
+
     /// The repository-local settings for `repo_root`, read and validated against
     /// this user-global config. The single entry point for the repository file,
-    /// so `[checks]`, `[pools]` and `[tickets]` are read - and fail - together.
+    /// so `[checks]`, `[dispatch]`, `[pools]` and `[tickets]` are read - and
+    /// fail - together.
     pub fn repo_config(&self, repo_root: &Path) -> anyhow::Result<RepoConfig> {
         load_repo(repo_root, self)
     }
@@ -228,13 +255,14 @@ impl Config {
     /// The settings the TUI and Dispatch both act on, loaded once and handed
     /// together: where Ready Tickets come from, what Dispatch may spend, how many
     /// Runs it may keep in flight, and how long a Run may stall before the list
-    /// surfaces it as stuck. The Ticket source is resolved for `repo_root`, so a
-    /// Repository's own `[tickets]` selection is honoured.
+    /// surfaces it as stuck. The Ticket source and the concurrency ceiling are
+    /// both resolved for `repo_root`, so a Repository's own `[tickets]` and
+    /// `[dispatch]` selections are honoured.
     pub fn dispatch_settings(&self, repo_root: &Path) -> anyhow::Result<DispatchSettings> {
         Ok(DispatchSettings {
             tickets: self.tickets_for(repo_root)?,
             spend: self.spend,
-            dispatch: self.dispatch,
+            concurrency_cap: self.dispatch_cap_for(repo_root)?,
             watchdog: self.watchdog,
             pool_routing: PoolRouting::load(self, repo_root)?,
             checks: self.checks_for(repo_root)?,
@@ -381,8 +409,10 @@ pub struct DispatchSettings {
     pub tickets: TicketsConfig,
     /// The optional aggregate spend cap.
     pub spend: SpendConfig,
-    /// The optional ceiling on concurrent Runs.
-    pub dispatch: DispatchConfig,
+    /// The concurrency ceiling in force for the Repository: the smaller of the
+    /// user-global and repository-local `[dispatch] max_concurrent`, or `None`
+    /// when neither sets one.
+    pub concurrency_cap: Option<ConcurrencyCap>,
     /// How long a Run may make no progress before the watchdog flags it.
     pub watchdog: WatchdogConfig,
     /// The Repository's Worker Pools and the routing each declares, so a
@@ -705,6 +735,11 @@ impl Default for SpendConfig {
 ///
 /// Absent `max_concurrent` (the default) is no cap: a Dispatch fires its whole
 /// batch, exactly as it did before the governor existed.
+///
+/// The same section is repo-owned: a repository may set `[dispatch]` in its own
+/// `.jjfx/config.toml` to **tighten** the user-global ceiling, and the smaller
+/// of the two binds (ADR 0014). It can never loosen it, because a cap only
+/// restricts and so grants no capability the user config did not already give.
 #[derive(Debug, Clone, Copy, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct DispatchConfig {
@@ -977,16 +1012,19 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
 /// lifecycle hooks, because a value that is a property of the repository cannot
 /// live in a file read once for every repository.
 ///
-/// `[checks]`, `[pools]` and `[tickets]` are the repo-owned sections.
-/// `deny_unknown_fields` is deliberate: a repository must not be able to
-/// silently configure jjfx beyond its build check, its Worker Pools and its
-/// Ticket source, so any other section is a loud error rather than a quiet
-/// ignore. A pool may only *select* - reference a user-global Agent Runtime
-/// Profile and Ticket source, set a size, cap a spend, name a routing label -
-/// and `deny_unknown_fields` on [`PoolConfig`] is what makes an attempt to
-/// *define* an agent command, a model or credentials a loud error. `[tickets]`
-/// may likewise only select a configured source: `deny_unknown_fields` on
-/// [`RepoTicketsConfig`] makes defining one a loud error.
+/// `[checks]`, `[dispatch]`, `[pools]` and `[tickets]` are the repo-owned
+/// sections. `deny_unknown_fields` is deliberate: a repository must not be able
+/// to silently configure jjfx beyond its build check, its dispatch ceiling, its
+/// Worker Pools and its Ticket source, so any other section is a loud error
+/// rather than a quiet ignore. A pool may only *select* - reference a
+/// user-global Agent Runtime Profile and Ticket source, set a size, cap a spend,
+/// name a routing label - and `deny_unknown_fields` on [`PoolConfig`] is what
+/// makes an attempt to *define* an agent command, a model or credentials a loud
+/// error. `[tickets]` may likewise only select a configured source:
+/// `deny_unknown_fields` on [`RepoTicketsConfig`] makes defining one a loud
+/// error. `[dispatch]` may only **tighten** the user-global ceiling, never
+/// loosen it: a repository-local `max_concurrent` selects among the concurrency
+/// the user config already granted (ADR 0014).
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
@@ -994,6 +1032,10 @@ pub struct RepoConfig {
     /// wholesale when present. `None` (no `[checks]` section) leaves the
     /// user-global value in place.
     pub checks: Option<ChecksConfig>,
+    /// The repository's own concurrency ceiling, tightening the user-global
+    /// `[dispatch]` when present. `None` (no `[dispatch]` section) leaves the
+    /// user-global ceiling in place.
+    pub dispatch: Option<DispatchConfig>,
     /// One declaration per named Worker Pool, keyed by name. Empty (the default)
     /// means the Repository's single implicit `default` pool and today's
     /// behaviour, unchanged.
@@ -1044,6 +1086,9 @@ impl RepoConfig {
     fn validate(&self, user: &Config) -> anyhow::Result<()> {
         if let Some(checks) = &self.checks {
             checks.validate()?;
+        }
+        if let Some(dispatch) = &self.dispatch {
+            dispatch.cap()?;
         }
         let mut labels: BTreeMap<&str, &str> = BTreeMap::new();
         for (name, pool) in &self.pools {
@@ -1222,9 +1267,10 @@ pub fn load_repo(repo_root: &Path, user: &Config) -> anyhow::Result<RepoConfig> 
 /// file parses but is wrong, so the two cannot drift.
 fn repo_config_hint(path: &Path) -> String {
     format!(
-        "parsing config {} - a repository may set only [checks], [pools] and [tickets]; a \
-         pool and a [tickets] selection may select a user-global profile and Ticket source, \
-         never define one",
+        "parsing config {} - a repository may set only [checks], [dispatch], [pools] and \
+         [tickets]; a pool and a [tickets] selection may select a user-global profile and \
+         Ticket source, never define one, and [dispatch] may only tighten the user-global \
+         ceiling",
         path.display()
     )
 }
@@ -1517,8 +1563,8 @@ mod tests {
     fn the_user_global_check_applies_when_the_repository_sets_none() {
         let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
         // No repository file at all, and one that sets nothing (a comment only -
-        // any section other than `[checks]`, `[pools]` and `[tickets]` is
-        // rejected, not ignored).
+        // any section other than `[checks]`, `[dispatch]`, `[pools]` and
+        // `[tickets]` is rejected, not ignored).
         for repo in [
             repo_with_config(None),
             repo_with_config(Some("# nothing repo-owned here yet\n")),
@@ -1554,9 +1600,9 @@ mod tests {
     fn an_invalid_repository_config_is_an_error_naming_the_file() {
         let config = Config::from_toml("");
 
-        // `[checks]`, `[pools]` and `[tickets]` are the repo-owned sections, so a
-        // repository cannot reconfigure the agent, the terminal, or anything
-        // else.
+        // `[checks]`, `[dispatch]`, `[pools]` and `[tickets]` are the repo-owned
+        // sections, so a repository cannot reconfigure the agent, the terminal,
+        // or anything else.
         let repo = repo_with_config(Some("[agent]\ncommand = \"rm -rf /\"\n"));
         let error = config
             .checks_for(repo.path())
@@ -2609,6 +2655,112 @@ mod tests {
         let err = toml::from_str::<Config>("[dispatch]\nmax_concurrent_runs = 2\n")
             .expect_err("unknown key is an error");
         assert!(err.to_string().contains("max_concurrent_runs"), "{err}");
+    }
+
+    /// A repository may set its own `[dispatch] max_concurrent`, and it binds
+    /// with no user-global cap at all - the case the governor was unreachable
+    /// for, because the only home for the cap was the user's global config.
+    #[test]
+    fn a_repository_dispatch_ceiling_binds_with_no_user_global_cap() {
+        let config = Config::from_toml("[tickets]\nsource = \"local\"\n");
+        let repo = repo_with_config(Some("[dispatch]\nmax_concurrent = 2\n"));
+        let cap = config
+            .dispatch_cap_for(repo.path())
+            .expect("the repository config parses")
+            .expect("the repository sets a ceiling");
+        assert_eq!(cap.limit(), 2);
+    }
+
+    /// A repository ceiling only *tightens* the user-global one: with both set,
+    /// the smaller binds.
+    #[test]
+    fn a_repository_dispatch_ceiling_tightens_the_user_global_one() {
+        let config = Config::from_toml("[dispatch]\nmax_concurrent = 4\n");
+        let repo = repo_with_config(Some("[dispatch]\nmax_concurrent = 2\n"));
+        let cap = config
+            .dispatch_cap_for(repo.path())
+            .expect("the repository config parses")
+            .expect("a ceiling is in force");
+        assert_eq!(cap.limit(), 2, "the repository ceiling is the smaller");
+    }
+
+    /// A repository ceiling may never *widen* the user-global one: declaring a
+    /// larger value leaves the user-global limit binding (ADR 0014 - a
+    /// repository-local declaration selects, never grants).
+    #[test]
+    fn a_repository_dispatch_ceiling_never_widens_the_user_global_one() {
+        let config = Config::from_toml("[dispatch]\nmax_concurrent = 2\n");
+        let repo = repo_with_config(Some("[dispatch]\nmax_concurrent = 8\n"));
+        let cap = config
+            .dispatch_cap_for(repo.path())
+            .expect("the repository config parses")
+            .expect("a ceiling is in force");
+        assert_eq!(cap.limit(), 2, "the user-global ceiling still binds");
+    }
+
+    /// A repository that declares no `[dispatch]` keeps the user-global ceiling,
+    /// and one with neither stays uncapped.
+    #[test]
+    fn a_repository_with_no_dispatch_ceiling_keeps_the_user_global_one() {
+        let config = Config::from_toml("[dispatch]\nmax_concurrent = 3\n");
+        for repo in [
+            repo_with_config(None),
+            repo_with_config(Some("# nothing repo-owned here yet\n")),
+        ] {
+            let cap = config
+                .dispatch_cap_for(repo.path())
+                .expect("no repository override")
+                .expect("the user-global ceiling stands");
+            assert_eq!(cap.limit(), 3);
+        }
+
+        let uncapped = Config::from_toml("");
+        assert!(
+            uncapped
+                .dispatch_cap_for(repo_with_config(None).path())
+                .expect("no repository override")
+                .is_none()
+        );
+    }
+
+    /// The resolved ceiling is what a frontend reads from the dispatch settings,
+    /// so the TUI and `dispatch` act on the same binding limit.
+    #[test]
+    fn dispatch_settings_carry_the_repository_resolved_ceiling() {
+        let config = Config::from_toml("[dispatch]\nmax_concurrent = 4\n");
+        let repo = repo_with_config(Some("[dispatch]\nmax_concurrent = 1\n"));
+        let settings = config
+            .dispatch_settings(repo.path())
+            .expect("the repository config parses");
+        assert_eq!(
+            settings.concurrency_cap.expect("a ceiling").limit(),
+            1,
+            "the settings carry the tightened ceiling, not the user-global one"
+        );
+    }
+
+    #[test]
+    fn a_repository_dispatch_ceiling_below_one_is_a_loud_error_naming_the_file() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[dispatch]\nmax_concurrent = 0\n"));
+        let error = config
+            .dispatch_cap_for(repo.path())
+            .expect_err("a ceiling of zero is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("dispatch.max_concurrent"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_repository_dispatch_section_is_rejected() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[dispatch]\nmax_concurrent_runs = 2\n"));
+        let error = config
+            .dispatch_cap_for(repo.path())
+            .expect_err("a typo is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("max_concurrent_runs"), "{message}");
     }
 
     #[test]
