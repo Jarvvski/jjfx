@@ -1,6 +1,6 @@
 # `jjfx review` cannot read `gh pr checks` on gh 2.102
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -50,11 +50,11 @@ it exists for.
 
 ## Acceptance Criteria
 
-- [ ] `jjfx review` reads the failing checks from a field the installed `gh`
+- [x] `jjfx review` reads the failing checks from a field the installed `gh`
       actually returns (`bucket` and/or `state`), so it runs on a current gh.
-- [ ] A gh that returns a shape jjfx does not understand fails with a message
+- [x] A gh that returns a shape jjfx does not understand fails with a message
       naming the command and gh's own output, not a raw serde error.
-- [ ] A test pins the parse against a captured `gh pr checks --json` body for a
+- [x] A test pins the parse against a captured `gh pr checks --json` body for a
       current gh (and, if the old shape must keep working, both).
 
 ## References
