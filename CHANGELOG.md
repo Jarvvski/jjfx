@@ -96,6 +96,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx's two remaining snapshotting reads - resolving a Ticket's bookmark (the landing path's source of truth for which bookmark carries a Ticket's work) and checking whether a dependent's revision still exists - now read with --ignore-working-copy, so they answer instead of blocking silently behind another jj process holding the repository's working-copy lock
 - The forge's own slug derivation refuses a non-GitHub `origin` - a filesystem path or another forge - by name, `origin is not a GitHub remote`, instead of mining its last two path segments into an `owner/name` slug and handing it to `gh`; the Pull Request step reports that refusal and reaches no network call, and the Pull Request read behind `jjfx status` treats it as unknown rather than a confident empty, while a legitimate GitHub `origin` is unchanged.
 - jjfx absorb no longer folds a stacked Worker's change into its Blocker's commit: the commit a dependent Workspace is materialised on is recorded as its stack base and excluded from the absorb destination the same way trunk is, so a landing verb cannot rewrite a change that belongs to another Ticket's pull request
+- jjfx help answers for a multi-word command group: `jjfx help ticket` prints the group's subcommands (and a group with its own page, like `pool`, also lists them) instead of reporting the group as an unknown command.
 
 ## [0.55.0] - 2026-10-16
 

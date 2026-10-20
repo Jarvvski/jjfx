@@ -1,6 +1,6 @@
 # `jjfx help ticket` is an unknown command
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
