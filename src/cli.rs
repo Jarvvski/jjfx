@@ -174,6 +174,29 @@ pub enum ColocationAction {
     Status,
 }
 
+impl ColocationAction {
+    /// The verb `jj git colocation` takes for this action.
+    fn verb(&self) -> &'static str {
+        match self {
+            Self::Enable => "enable",
+            Self::Disable => "disable",
+            Self::Status => "status",
+        }
+    }
+
+    /// Whether this action only reads the repository's state.
+    ///
+    /// Only `status` does, and a read must never snapshot the working copy. A
+    /// snapshot takes the repository's working-copy lock, and jj prints nothing
+    /// while it waits on another jj process holding it - so a plain
+    /// `jj git colocation status` can block silently for as long as that process
+    /// runs, which is the hang dogfood 08 recorded. Enabling and disabling are
+    /// mutations and must snapshot.
+    fn is_read(&self) -> bool {
+        matches!(self, Self::Status)
+    }
+}
+
 /// The read-only cross-workspace checks `jjfx check` can run.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CheckCommand {
@@ -1606,14 +1629,19 @@ fn workspace_path(repository: &Repository, name: &str) -> PathBuf {
 
 /// Transition this repository's Git colocation through jj. Enabling lets jjfx
 /// create colocated workspaces here; disabling restores plain jj workspaces.
+///
+/// `status` is answered with `--ignore-working-copy`, so the read is lock-free:
+/// colocation is a property of the workspace layout rather than of the
+/// working-copy contents, so not snapshotting cannot change the answer, while
+/// snapshotting let another jj process block the query silently (dogfood 08).
 fn colocation_command(repository: &Repository, action: &ColocationAction) -> Result<()> {
-    let verb = match action {
-        ColocationAction::Enable => "enable",
-        ColocationAction::Disable => "disable",
-        ColocationAction::Status => "status",
-    };
-    let status = std::process::Command::new("jj")
-        .args(["git", "colocation", verb])
+    let verb = action.verb();
+    let mut command = std::process::Command::new("jj");
+    command.args(["git", "colocation", verb]);
+    if action.is_read() {
+        command.arg("--ignore-working-copy");
+    }
+    let status = command
         .current_dir(repository.root())
         .status()
         .with_context(|| format!("run jj git colocation {verb}"))?;
@@ -5610,6 +5638,77 @@ mod tests {
         assert!(parse(&args(&["colocation"])).is_err());
         assert!(parse(&args(&["colocation", "wat"])).is_err());
         assert!(parse(&args(&["colocation", "enable", "extra"])).is_err());
+    }
+
+    /// A colocated jj repository in a temporary directory, signing disabled.
+    /// `colocation status` reports colocation, so the test has to ask for it.
+    fn colocated_repo() -> tempfile::TempDir {
+        let repo = tempfile::tempdir().expect("temporary repository");
+        let output = crate::jj::command()
+            .args(["git", "init", "--colocate"])
+            .arg(repo.path())
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj git init --colocate failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        repo
+    }
+
+    /// Hold jj's working-copy lock for as long as the returned file is alive,
+    /// exactly as a concurrent `jj` process does while it snapshots the working
+    /// copy. jj blocks on `flock` for the whole snapshot and prints nothing
+    /// while it waits.
+    fn hold_the_working_copy_lock(root: &std::path::Path) -> std::fs::File {
+        let lock = std::fs::File::create(root.join(".jj/working_copy/working_copy.lock"))
+            .expect("working-copy lock file");
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::LockExclusive)
+            .expect("hold the working-copy lock");
+        lock
+    }
+
+    /// `colocation status` is a read, so it must not wait on jj's working-copy
+    /// lock - a plain `jj git colocation status` snapshots, and while another jj
+    /// process holds that lock it blocks silently for as long as the holder runs
+    /// (dogfood 08). The read carries `--ignore-working-copy` and returns anyway.
+    ///
+    /// The negative control re-establishes that the lock really is held, so a
+    /// prompt result is the flag's doing and not a lock that was never taken.
+    #[test]
+    fn colocation_status_does_not_wait_on_the_working_copy_lock() {
+        let repo = colocated_repo();
+        let repository = Repository::open(repo.path()).expect("repository");
+        let _lock = hold_the_working_copy_lock(repository.root());
+
+        let mut snapshotting = std::process::Command::new("jj")
+            .args(["git", "colocation", "status"])
+            .current_dir(repository.root())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("jj should be installed");
+        std::thread::sleep(Duration::from_secs(2));
+        let blocked = snapshotting.try_wait().expect("polling jj").is_none();
+        snapshotting.kill().ok();
+        snapshotting.wait().ok();
+        assert!(
+            blocked,
+            "the working-copy lock must block a snapshotting jj, or the lock is not held"
+        );
+
+        // Bounded and detached rather than joined: the defect this guards is an
+        // *unbounded* wait, so a regression must fail the test rather than hang
+        // the suite. Dropping the lock on the way out unblocks the child.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(colocation_command(&repository, &ColocationAction::Status));
+        });
+        match receiver.recv_timeout(crate::test_support::LIVENESS_TIMEOUT) {
+            Ok(outcome) => outcome.expect("colocation status succeeds"),
+            Err(_) => panic!("colocation status waited on the working-copy lock"),
+        }
     }
 
     #[test]
