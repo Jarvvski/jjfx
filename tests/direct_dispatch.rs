@@ -87,7 +87,16 @@ fn a_capped_dispatch_holds_a_batch_back_when_the_pool_is_full() {
             .collect::<Vec<_>>(),
         ["ENG-10", "ENG-11", "ENG-12"]
     );
-    assert!(result.waiting()[0].detail().contains("cap 2"));
+    assert!(
+        result.waiting()[0].detail().contains("max_concurrent = 2"),
+        "the held-back reason must name the binding limit: {}",
+        result.waiting()[0].detail()
+    );
+    assert!(
+        result.waiting()[0].detail().contains("must finish"),
+        "the held-back reason must say why nothing may start: {}",
+        result.waiting()[0].detail()
+    );
 
     // Nothing was reserved: the free Worker is still idle, and the two running
     // Workers still hold their own Tickets.
@@ -127,7 +136,7 @@ fn a_capped_dispatch_holds_a_batch_back_when_the_pool_is_full() {
         queue[0]
             .detail
             .as_deref()
-            .is_some_and(|detail| detail.contains("cap 2")),
+            .is_some_and(|detail| detail.contains("max_concurrent = 2")),
         "a queued step must record why it did not run: {:?}",
         queue[0].detail
     );

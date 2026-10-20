@@ -235,8 +235,12 @@ impl DirectDispatch {
         };
         let in_flight = self.in_flight();
         let (fire, held) = super::governor::pace(cap, in_flight, requests);
+        // The reason names the dial the owner turns and what has to change for
+        // the held Ticket to run, not just the count: a held-back Ticket is a
+        // "why" a human acts on, not a number to read.
         let detail = format!(
-            "concurrency cap {} reached ({} Run(s) in flight)",
+            "held back by the concurrency cap (dispatch.max_concurrent = {}): {} Run(s) in flight, \
+             so a Run must finish before another may start",
             cap.limit(),
             in_flight
         );
