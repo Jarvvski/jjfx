@@ -5,9 +5,12 @@
 //! This is the bound ADR 0016 keeps in jjfx rather than in a prompt. It is
 //! generic over the [`Reviewer`] that supplies each pass's findings; jjfx no
 //! longer ingests an external review bot's findings into the review verb, so the
-//! bound stands on its own until the harness drives it.
+//! bound stands on its own. [`ReviewLoop::run_recorded`] drives it through the
+//! decision log, so a pass already recorded replays rather than reaching the
+//! reviewer again (ticket 12).
 
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -252,6 +255,14 @@ pub trait Reviewer: Send + Sync {
     fn review(&self, request: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError>;
 }
 
+/// A borrowed reviewer is a reviewer, so a caller that holds one by reference
+/// can hand it to a [`ReplayingReviewer`] without giving up ownership.
+impl<T: Reviewer + ?Sized> Reviewer for &T {
+    fn review(&self, request: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+        (**self).review(request)
+    }
+}
+
 /// A reviewer could not be run or could not be understood.
 #[derive(Debug, Error)]
 pub enum ReviewerError {
@@ -295,6 +306,18 @@ pub trait DecisionLog: Send + Sync {
     fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<(), DecisionLogError>;
 }
 
+/// A borrowed log is a log, so a caller that holds one can hand it to a
+/// [`ReplayingReviewer`] without giving up ownership.
+impl<T: DecisionLog + ?Sized> DecisionLog for &T {
+    fn decision(&self, step: &StepKey) -> Result<Option<ReviewOutcome>, DecisionLogError> {
+        (**self).decision(step)
+    }
+
+    fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<(), DecisionLogError> {
+        (**self).record(step, decision)
+    }
+}
+
 /// A recorded decision could not be read back or written.
 #[derive(Debug, Error)]
 #[error("{detail}")]
@@ -320,10 +343,16 @@ impl DecisionLogError {
 /// all, so a repeated step costs nothing and cannot silently diverge from what
 /// was already decided (ticket 09). The step is what is replayed, so a different
 /// pass or dimension is a different [`ReplayingReviewer`] over a different key.
+///
+/// [`replayed`](Self::replayed) reports what the last call did, so a caller can
+/// tell a pass that was replayed from one that ran - a replayed pass that found
+/// nothing is otherwise indistinguishable from a pass that did nothing at all
+/// (ticket 12).
 pub struct ReplayingReviewer<S, R> {
     decisions: S,
     step: StepKey,
     inner: R,
+    replayed: AtomicBool,
 }
 
 impl<S, R> ReplayingReviewer<S, R> {
@@ -333,12 +362,19 @@ impl<S, R> ReplayingReviewer<S, R> {
             decisions,
             step,
             inner,
+            replayed: AtomicBool::new(false),
         }
     }
 
     /// Returns the step whose decision this reviewer records and replays.
     pub const fn step(&self) -> &StepKey {
         &self.step
+    }
+
+    /// Reports whether the last [`review`](Reviewer::review) call was served from
+    /// the log rather than from the reviewer behind it.
+    pub fn replayed(&self) -> bool {
+        self.replayed.load(Ordering::SeqCst)
     }
 }
 
@@ -357,6 +393,7 @@ where
                     detail: error.to_string(),
                 })?
         {
+            self.replayed.store(true, Ordering::SeqCst);
             return Ok(recorded);
         }
         let outcome = self.inner.review(request)?;
@@ -436,16 +473,19 @@ pub struct ReviewLoopSummary {
     findings: usize,
     stop: ReviewStop,
     escalation: Option<ReviewEscalation>,
+    /// The numbers of the passes served from a recorded decision, in pass order.
+    replayed: Vec<u32>,
 }
 
 impl ReviewLoopSummary {
     /// A loop that stopped because a pass produced nothing to address.
-    fn converged(passes: usize, findings: usize) -> Self {
+    fn converged(passes: usize, findings: usize, replayed: Vec<u32>) -> Self {
         Self {
             passes,
             findings,
             stop: ReviewStop::Converged,
             escalation: None,
+            replayed,
         }
     }
 
@@ -455,12 +495,14 @@ impl ReviewLoopSummary {
         findings: usize,
         stop: ReviewStop,
         unresolved: Vec<ReviewFinding>,
+        replayed: Vec<u32>,
     ) -> Self {
         Self {
             passes,
             findings,
             stop,
             escalation: Some(ReviewEscalation::new(unresolved, stop)),
+            replayed,
         }
     }
 
@@ -492,6 +534,20 @@ impl ReviewLoopSummary {
             .as_ref()
             .map_or(&[], |escalation| escalation.findings())
     }
+
+    /// Returns how many passes were replayed from a recorded decision.
+    pub fn replayed(&self) -> usize {
+        self.replayed.len()
+    }
+
+    /// Returns the numbers of the passes that were replayed, in pass order.
+    ///
+    /// A pass the decision log already knew is replayed rather than run, so a
+    /// caller can name it: a replayed pass is otherwise a pass that reported
+    /// nothing, which is the failure mode replay exists to remove (ticket 12).
+    pub fn replayed_passes(&self) -> &[u32] {
+        &self.replayed
+    }
 }
 
 /// A review loop step failed.
@@ -519,6 +575,10 @@ pub enum ReviewLoopError<E> {
 /// Whatever stops it, a loop that has not converged escalates its unresolved
 /// findings rather than reporting success, so the bound hands work to a human
 /// instead of spinning or silently passing.
+///
+/// [`run`](Self::run) decides every pass; [`run_recorded`](Self::run_recorded)
+/// drives each pass through the decision log, so a pass already recorded replays
+/// instead of reaching the reviewer again - with the same bound either way.
 #[derive(Debug, Clone, Copy)]
 pub struct ReviewLoop {
     max_passes: usize,
@@ -540,22 +600,82 @@ impl ReviewLoop {
         &self,
         reviewer: &R,
         request: &ReviewRequest,
-        mut address: A,
+        address: A,
     ) -> Result<ReviewLoopSummary, ReviewLoopError<E>>
     where
         R: Reviewer + ?Sized,
+        A: FnMut(usize, &ReviewOutcome) -> Result<(), E>,
+    {
+        self.drive(
+            |_pass| reviewer.review(request).map(|outcome| (outcome, false)),
+            address,
+        )
+    }
+
+    /// Runs the loop with each pass keyed by its step identity -
+    /// `review:<ticket>:<dimension>:<pass>` - and served through `decisions`, so
+    /// a pass already recorded is replayed rather than reaching `reviewer`
+    /// (ticket 12).
+    ///
+    /// Replay is transparent to the bound: a replayed pass carries the decision it
+    /// recorded, so the pass cap and the progress rule see exactly the rounds the
+    /// first drive saw and the loop stops in the same place - which is what makes
+    /// a second drive cost nothing instead of running a fresh pass past where the
+    /// first stopped. What replay removes is the reviewer call and the
+    /// re-address: a replayed pass's findings were addressed when the decision was
+    /// first made, so `address` is not called for it.
+    pub fn run_recorded<R, S, A, E>(
+        &self,
+        reviewer: &R,
+        decisions: &S,
+        ticket: &str,
+        dimension: &str,
+        request: &ReviewRequest,
+        address: A,
+    ) -> Result<ReviewLoopSummary, ReviewLoopError<E>>
+    where
+        R: Reviewer + ?Sized,
+        S: DecisionLog,
+        A: FnMut(usize, &ReviewOutcome) -> Result<(), E>,
+    {
+        self.drive(
+            |pass| {
+                let step = StepKey::review(ticket, dimension, pass as u32);
+                let replaying = ReplayingReviewer::new(decisions, step, reviewer);
+                let outcome = replaying.review(request)?;
+                Ok((outcome, replaying.replayed()))
+            },
+            address,
+        )
+    }
+
+    /// The bound itself, over a source that supplies each pass's decision and
+    /// whether it was replayed. Both public entries differ only in that source,
+    /// so the cap and the progress rule hold the same way for a replayed pass as
+    /// for one the reviewer just decided.
+    fn drive<F, A, E>(
+        &self,
+        mut next_pass: F,
+        mut address: A,
+    ) -> Result<ReviewLoopSummary, ReviewLoopError<E>>
+    where
+        F: FnMut(usize) -> Result<(ReviewOutcome, bool), ReviewerError>,
         A: FnMut(usize, &ReviewOutcome) -> Result<(), E>,
     {
         let mut passes = 0;
         let mut findings = 0;
         let mut previous: Option<HashSet<ReviewFinding>> = None;
         let mut unresolved = Vec::new();
+        let mut replayed = Vec::new();
         for pass in 1..=self.max_passes {
-            let outcome = reviewer.review(request)?;
+            let (outcome, was_replayed) = next_pass(pass)?;
             passes = pass;
             findings += outcome.findings().len();
+            if was_replayed {
+                replayed.push(pass as u32);
+            }
             if outcome.findings().is_empty() {
-                return Ok(ReviewLoopSummary::converged(passes, findings));
+                return Ok(ReviewLoopSummary::converged(passes, findings, replayed));
             }
             let current: HashSet<ReviewFinding> = outcome.findings().iter().cloned().collect();
             if let Some(previous) = previous.as_ref() {
@@ -567,18 +687,22 @@ impl ReviewLoop {
                         findings,
                         ReviewStop::NoProgress,
                         outcome.findings().to_vec(),
+                        replayed,
                     ));
                 }
             }
             previous = Some(current);
             unresolved = outcome.findings().to_vec();
-            address(pass, &outcome).map_err(ReviewLoopError::Address)?;
+            if !was_replayed {
+                address(pass, &outcome).map_err(ReviewLoopError::Address)?;
+            }
         }
         Ok(ReviewLoopSummary::escalated(
             passes,
             findings,
             ReviewStop::PassCap,
             unresolved,
+            replayed,
         ))
     }
 }
@@ -910,5 +1034,142 @@ mod tests {
 
         assert_eq!(titles(outcome.findings()), ["fresh"]);
         assert!(log.decision(&step).expect("read").is_some());
+    }
+
+    /// Ticket 12: the replay seam reports what its last call did, so a caller can
+    /// tell a replay from a run rather than inferring it.
+    #[test]
+    fn the_replay_seam_reports_whether_it_replayed() {
+        let step = StepKey::review("ENG-1", "security", 1);
+        let log = InMemoryLog::default();
+        let decided = ReplayingReviewer::new(
+            log.clone(),
+            step.clone(),
+            ScriptedReviewer::new(vec![pass(&["fresh"])]),
+        );
+        decided.review(&request()).expect("the first call decides");
+        assert!(
+            !decided.replayed(),
+            "a call that reached the reviewer did not replay"
+        );
+
+        let replayed = ReplayingReviewer::new(log, step, PanickingReviewer);
+        replayed
+            .review(&request())
+            .expect("the second call replays");
+        assert!(replayed.replayed());
+    }
+
+    /// Ticket 12: the loop drives every pass through the decision log, so a pass
+    /// the log already knows replays rather than reaching the reviewer behind it.
+    /// The second drive runs through a reviewer that panics if it is asked, so a
+    /// pass that reached the model fails the test.
+    #[test]
+    fn the_loop_replays_a_recorded_pass_without_reaching_the_reviewer() {
+        let log = InMemoryLog::default();
+        let first = ScriptedReviewer::new(vec![pass(&["a"]), pass(&["a"])]);
+        let mut addressed = 0;
+
+        let summary = ReviewLoop::new(5)
+            .run_recorded(&first, &log, "ENG-1", "security", &request(), |_, _| {
+                addressed += 1;
+                Ok::<(), String>(())
+            })
+            .expect("the first drive decides");
+
+        assert_eq!(summary.passes(), 2);
+        assert_eq!(summary.stop(), ReviewStop::NoProgress);
+        assert_eq!(summary.replayed(), 0, "the first drive decided every pass");
+        assert_eq!(addressed, 1);
+
+        // The second drive reaches neither the reviewer nor the address callback:
+        // a replayed pass's findings were addressed when they were first decided.
+        let mut re_addressed = 0;
+        let second = ReviewLoop::new(5)
+            .run_recorded(
+                &PanickingReviewer,
+                &log,
+                "ENG-1",
+                "security",
+                &request(),
+                |_, _| {
+                    re_addressed += 1;
+                    Ok::<(), String>(())
+                },
+            )
+            .expect("the second drive replays");
+
+        assert_eq!(second.passes(), 2);
+        assert_eq!(second.stop(), ReviewStop::NoProgress);
+        assert_eq!(second.replayed(), 2);
+        assert_eq!(second.replayed_passes(), [1, 2]);
+        assert_eq!(re_addressed, 0, "a replayed pass must not re-address");
+    }
+
+    /// Ticket 12: a replayed pass is a round the bound counts, so a second drive
+    /// stops exactly where the first did rather than running a fresh pass past it.
+    /// Without that, replay would be visible to the progress rule as a pass that
+    /// found nothing and the loop would buy another, unrecorded pass.
+    #[test]
+    fn a_replayed_pass_still_counts_against_the_pass_cap() {
+        let log = InMemoryLog::default();
+        // Each pass retires the previous finding and surfaces a new one, so every
+        // round makes progress and only the cap ends the loop.
+        let first = ScriptedReviewer::new(vec![pass(&["a"]), pass(&["b"]), pass(&["c"])]);
+
+        let summary = ReviewLoop::new(3)
+            .run_recorded(&first, &log, "ENG-3", "performance", &request(), |_, _| {
+                Ok::<(), String>(())
+            })
+            .expect("the first drive decides");
+        assert_eq!(summary.passes(), 3);
+        assert_eq!(summary.stop(), ReviewStop::PassCap);
+
+        let second = ReviewLoop::new(3)
+            .run_recorded(
+                &PanickingReviewer,
+                &log,
+                "ENG-3",
+                "performance",
+                &request(),
+                |_, _| Ok::<(), String>(()),
+            )
+            .expect("the second drive replays");
+
+        assert_eq!(second.passes(), 3);
+        assert_eq!(second.stop(), ReviewStop::PassCap);
+        assert_eq!(second.replayed(), 3);
+        assert_eq!(titles(second.unresolved()), ["c"]);
+    }
+
+    /// Ticket 12: a replayed pass that recorded no findings is named as a replay,
+    /// not silently reported as a pass that did nothing.
+    #[test]
+    fn a_replayed_pass_that_found_nothing_is_reported_as_a_replay() {
+        let log = InMemoryLog::default();
+        let first = ScriptedReviewer::new(vec![pass(&[])]);
+
+        let summary = ReviewLoop::new(3)
+            .run_recorded(&first, &log, "ENG-4", "tests", &request(), |_, _| {
+                Ok::<(), String>(())
+            })
+            .expect("the first drive converges");
+        assert_eq!(summary.stop(), ReviewStop::Converged);
+        assert_eq!(summary.replayed(), 0);
+
+        let second = ReviewLoop::new(3)
+            .run_recorded(
+                &PanickingReviewer,
+                &log,
+                "ENG-4",
+                "tests",
+                &request(),
+                |_, _| Ok::<(), String>(()),
+            )
+            .expect("the second drive replays");
+
+        assert_eq!(second.stop(), ReviewStop::Converged);
+        assert_eq!(second.replayed(), 1);
+        assert_eq!(second.replayed_passes(), [1]);
     }
 }
