@@ -794,13 +794,13 @@ impl Default for WatchdogConfig {
 ///
 /// The bound itself lives in `crate::engine::ReviewLoop`; this is its cap. jjfx
 /// does not run a reviewer of its own - the review verb inlines the pull
-/// request's human comments and failing checks - so the cap is the ceiling the
-/// loop enforces when the harness drives it.
+/// request's human comments and failing checks, and drives no loop at all - so
+/// the cap is the ceiling the loop enforces when the harness drives it.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewConfig {
-    /// The pass cap for the re-review loop: the most reviewer passes jjfx runs
-    /// before it stops. One pass reviews and addresses once.
+    /// The pass cap for the re-review loop: the most reviewer passes a driven
+    /// loop runs before it stops. One pass reviews and addresses once.
     pub max_passes: usize,
 }
 

@@ -150,8 +150,8 @@ pool directories no declaration claims, which jjfx reports and never adopts.
 
 - [Configuration](docs/configuration.md) - the `config.toml` reference: agent,
   terminal layouts, first-pane command, forge.
-- [The review loop](docs/review-loop.md) - the configured AI reviewer, its
-  bounded re-review loop, and how it authenticates.
+- [The review loop](docs/review-loop.md) - how `jjfx review` addresses a pull
+  request, and the tool-enforced bound the harness drives.
 - [Workspace hooks](docs/workspace-hooks.md) - repository-local `.jjfx/setup.sh`
   and `.jjfx/teardown.sh`.
 - [Agent lifecycle integration](docs/lifecycle-integration.md) - how Claude Code,

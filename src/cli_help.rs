@@ -108,6 +108,9 @@ fn notes(key: &str) -> &'static str {
         "resume" => {
             "\nAn interruption leaves the work it had in flight recorded in the pool's\ndurable queue. `resume` re-runs that work: it reads the queue's per-step\nstate, so a step that reached `done` is left alone rather than redone, and a\nstep whose Run is still live is left running. Everything else - accepted and\nwaiting, claimed without a Run, failed, or abandoned - is re-opened and\ndispatched again, with the same capacity governor, spend limits and\noccupancy exclusions a Dispatch obeys.\n\nResumption is explicit rather than an automatic retry, because re-running a\nstep may have side effects. Naming Tickets narrows it to those steps; a Ticket\nwith no recorded step is reported, not dispatched (`jjfx dispatch` runs new\nwork). A Repository with one Worker Pool implies it, so `--pool` is optional,\nand one with several requires it, exactly as `dispatch` does.\n\nThe queue is reconciled first, so a Run that ended is settled and a Run still\nlive is recognised. To abandon a Run the queue still believes is live, reset\nits Worker (`jjfx pool reset <worker>`) and then resume.\n"
         }
+        "review" => {
+            "\n`review` sends one Follow-up prompt that addresses the pull request's\nreview state once. It runs no reviewer and no bounded loop: jjfx has no\nreviewer of its own (ADR 0016 cut review-bot ingestion), so no command\ndrives `ReviewLoop` - the loop and its decision log stand ready for the\nharness, which is their only caller. `--fg` selects when this Run returns,\nnot how many passes run.\n"
+        }
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
         }
@@ -306,13 +309,13 @@ pub(crate) const REVIEW_FLAGS: &[Flag] = &[
         long: "--fg",
         short: None,
         value: None,
-        help: "Run the full bounded review loop in the foreground",
+        help: "Wait for the review Run before returning",
     },
     Flag {
         long: "--bg",
         short: None,
         value: None,
-        help: "Run a single background review pass (default)",
+        help: "Return once the review Run's pid is persisted (default)",
     },
 ];
 

@@ -429,7 +429,10 @@ automatically: a stuck Run is surfaced, and the human decides.
 The pass cap for the tool-enforced re-review loop. `jjfx review <worker>` itself
 runs no reviewer: its prompt inlines the PR's review state, failing checks and
 human comments, and nothing else. jjfx does not ingest an external review bot's
-findings - the loop is bounded by the tool, not by a prompt (ADR 0016).
+findings, and no command drives the loop either - `ReviewLoop` is reached only
+through the harness seam (`RecordedReviewLoop`), so this cap applies when a
+harness drives the loop, not to `jjfx review`. The loop is bounded by the tool,
+not by a prompt (ADR 0016).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -440,12 +443,8 @@ findings - the loop is bounded by the tool, not by a prompt (ADR 0016).
 max_passes = 2
 ```
 
-See [The review loop](review-loop.md) for the bound and how a review's feedback
-is addressed.
-
-See [The review loop](review-loop.md) for what a configured reviewer does, how
-the pass cap and the progress rule bound it, and how it authenticates without
-leaking credentials.
+See [The review loop](review-loop.md) for the bound, who drives it, and how a
+review's feedback is addressed.
 
 ## `[migrations]`
 
