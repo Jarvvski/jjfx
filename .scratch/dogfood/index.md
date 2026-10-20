@@ -27,6 +27,7 @@ half. Three of the landing verbs failed, one of them silently and destructively.
 | 10 | `open-pr` still reads a stale fabricated `gh_repo` from existing pool state | bug |
 | 11 | the forge's own slug derivation still fabricates one from a non-GitHub origin | bug |
 | 12 | every jj invocation carries no deadline (split out of 08's triage) | bug |
+| 13 | the documented `open-pr` contradicts the tool | bug |
 
 ## What worked, and should not be refactored away
 
