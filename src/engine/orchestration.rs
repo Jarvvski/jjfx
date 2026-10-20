@@ -698,9 +698,17 @@ fn revalidate_branches(root: &Path, group: &mut DispatchGroup) -> Vec<BranchRepa
     repairs
 }
 
+/// Whether `revision` resolves in `root`, read without snapshotting the working
+/// copy.
+///
+/// Through [`crate::jj::read_in_dir`], so it carries `--ignore-working-copy`:
+/// a revision that exists does not change because a snapshot was skipped, and
+/// the flagged read never waits on the repository's working-copy lock (dogfood
+/// 12).
 fn revision_exists(root: &Path, revision: &str) -> bool {
-    crate::jj::command()
-        .args([
+    crate::jj::read_in_dir(
+        root,
+        &[
             "log",
             "-r",
             revision,
@@ -709,10 +717,9 @@ fn revision_exists(root: &Path, revision: &str) -> bool {
             "\"ok\"",
             "--limit",
             "1",
-        ])
-        .current_dir(root)
-        .output()
-        .is_ok_and(|output| output.status.success() && output.stdout == b"ok")
+        ],
+    )
+    .is_ok_and(|out| out == "ok")
 }
 
 /// How a Ticket's delivered bookmark resolved against the repository's bookmarks.
@@ -751,18 +758,15 @@ impl TicketBranch {
 /// dispatch prompt appends a description the persisted state never learns. A
 /// bookmark whose final component is `<ticket>` or `<ticket>-<slug>` is the only
 /// match that survives both.
+///
+/// Read through [`crate::jj::read_in_dir`], so it carries
+/// `--ignore-working-copy`: this is a landing-path read and a plain
+/// `jj bookmark list` snapshots, so an unflagged read could block silently
+/// behind any other jj process holding the working-copy lock (dogfood 12).
 pub(crate) fn resolve_ticket_branch(root: &Path, ticket: &TicketId) -> TicketBranch {
     let ticket = ticket.as_str().to_ascii_lowercase();
-    let Some(output) = crate::jj::command()
-        .args(["bookmark", "list", "-T", "name ++ \"\\n\""])
-        .current_dir(root)
-        .output()
-        .ok()
-        .filter(|output| output.status.success())
+    let Ok(names) = crate::jj::read_in_dir(root, &["bookmark", "list", "-T", "name ++ \"\\n\""])
     else {
-        return TicketBranch::Missing;
-    };
-    let Ok(names) = String::from_utf8(output.stdout) else {
         return TicketBranch::Missing;
     };
     let matches = names
@@ -2202,5 +2206,76 @@ mod tests {
                 .worker_id(),
             &second
         );
+    }
+
+    /// A jj repository carrying one bookmark, so the orchestration reads have
+    /// something real to answer.
+    fn orchestration_repo(tag: &str) -> std::path::PathBuf {
+        let root = crate::store::test_local_repo(tag);
+        let output = crate::jj::command()
+            .current_dir(&root)
+            .args(["bookmark", "create", "adam/eng-101-foundation", "-r", "@"])
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj bookmark create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        root
+    }
+
+    /// Both orchestration reads are lock-free: they read through
+    /// [`crate::jj::read_in_dir`], so they carry `--ignore-working-copy` and must
+    /// answer while another jj process holds the working-copy lock, rather than
+    /// blocking silently for the whole hold (dogfood 12). `revision_exists` and
+    /// `resolve_ticket_branch` are the two production reads that used to omit
+    /// the flag, and the latter is on the landing path.
+    ///
+    /// The negative control re-establishes that the lock really is held, so a
+    /// prompt result is the flag's doing and not a lock that was never taken.
+    #[test]
+    fn orchestration_reads_do_not_wait_on_the_working_copy_lock() {
+        let root = orchestration_repo("orchestration-reads");
+        let ticket = TicketId::parse("ENG-101").expect("Ticket");
+        let _lock = crate::test_support::hold_the_working_copy_lock(&root);
+
+        let mut snapshotting = std::process::Command::new("jj")
+            .args(["bookmark", "list"])
+            .current_dir(&root)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("jj should be installed");
+        std::thread::sleep(Duration::from_secs(2));
+        let blocked = snapshotting.try_wait().expect("polling jj").is_none();
+        snapshotting.kill().ok();
+        snapshotting.wait().ok();
+        assert!(
+            blocked,
+            "the working-copy lock must block a snapshotting jj, or the lock is not held"
+        );
+
+        // Bounded and detached rather than joined: the defect is an *unbounded*
+        // wait, so a regression must fail the test rather than hang the suite.
+        // Dropping the lock on the way out unblocks the child.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let read_root = root.clone();
+        std::thread::spawn(move || {
+            let exists = revision_exists(&read_root, "adam/eng-101-foundation");
+            let branch = resolve_ticket_branch(&read_root, &ticket);
+            let _ = sender.send((exists, branch));
+        });
+        match receiver.recv_timeout(crate::test_support::LIVENESS_TIMEOUT) {
+            Ok((exists, branch)) => {
+                assert!(exists, "revision_exists must see the bookmark's revision");
+                assert_eq!(
+                    branch,
+                    TicketBranch::Resolved("adam/eng-101-foundation".to_owned())
+                );
+            }
+            Err(_) => panic!("an orchestration read waited on the working-copy lock"),
+        }
+        std::fs::remove_dir_all(&root).ok();
     }
 }
