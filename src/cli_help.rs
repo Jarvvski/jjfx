@@ -109,6 +109,9 @@ fn notes(key: &str) -> &'static str {
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
         }
+        "ticket list" => {
+            "\nEvery Ticket the configured source discovers is listed with its `Status`,\nits Blockers and its state: `ready` (a Dispatch would take it now), `blocked`\n(something stops it, and the reason names what) or `done` (resolved). The\nblocked reason is the same line `jjfx dispatch --all` prints, because both read\none verdict.\n\nThe lanes are the lanes a `dispatch --all` would fill: several routable pools\nfan out one lane each, and `--pool` narrows it to one. A Repository that holds\nseveral pools and declares no routing labels requires `--pool`, exactly as an\nunqualified Dispatch does.\n\nThe command is read-only: it reconciles no Run and writes no Ticket, so a\n`--json` consumer can poll it. Use `jjfx ticket reconcile` (or a Dispatch) to\nsettle finished Runs.\n"
+        }
         "children" => {
             "\nA parent reaches this from its own shell: opencode puts the session's id\nin OPENCODE_SESSION_ID, so a bare `jjfx children` lists the sessions that\nsession dispatched, and naming one lists another session's. It needs no jj\nrepository, so a parent can ask from anywhere.\n\nThe children are the union of what opencode reports and what the lifecycle\nlog has seen; each state is the fold's. opencode also supplies each child's\ntitle and directory - which Worker it is - when it is reachable, and the log\nalone still names every child and its state when it is not.\n"
         }
@@ -184,6 +187,29 @@ pub(crate) const CHILDREN_FLAGS: &[Flag] = &[Flag {
     value: None,
     help: "Emit machine-readable JSON",
 }];
+
+/// `ticket list` is a read-only read, so it takes only what narrows the lane and
+/// the output format.
+pub(crate) const TICKET_LIST_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--label",
+        short: None,
+        value: Some("LABEL"),
+        help: "Ticket label to discover by (default: the lane's routing label, else ready-for-agent)",
+    },
+    Flag {
+        long: "--pool",
+        short: None,
+        value: Some("NAME"),
+        help: "Evaluate only this Worker Pool's lane",
+    },
+    Flag {
+        long: "--json",
+        short: None,
+        value: None,
+        help: "Emit machine-readable JSON",
+    },
+];
 
 pub(crate) const DISPATCH_FLAGS: &[Flag] = &[
     FG,
@@ -632,6 +658,11 @@ const TOP_LEVEL: &[Group] = &[
                 summary: "Undo the last jjfx mutation on a Worker (list when omitted)",
             },
             Entry {
+                key: "ticket list",
+                args: "[--json] [--label <LABEL>] [--pool <name>]",
+                summary: "List every Ticket and whether it is ready (read-only)",
+            },
+            Entry {
                 key: "ticket reconcile",
                 args: "",
                 summary: "Resolve finished local Tickets without a Dispatch",
@@ -990,6 +1021,13 @@ const PAGES: &[CommandHelp] = &[
         usage: "ticket reconcile",
         arguments: &[],
         flags: NO_FLAGS,
+    },
+    CommandHelp {
+        key: "ticket list",
+        summary: "List every Ticket the configured source discovers, and whether it is ready",
+        usage: "ticket list [--json] [--label <LABEL>] [--pool <name>]",
+        arguments: &[],
+        flags: TICKET_LIST_FLAGS,
     },
     CommandHelp {
         key: "hooks install",
@@ -1356,6 +1394,19 @@ mod tests {
         assert!(wait.contains("the condition was reached"), "{wait}");
         assert!(wait.contains("timed out"), "{wait}");
         assert!(wait.contains("does not satisfy --until"), "{wait}");
+    }
+
+    /// `ticket list` is the read-only backlog view, and the one thing a reader
+    /// must not get wrong is that it changes nothing: its page says so, and says
+    /// where its readiness comes from.
+    #[test]
+    fn the_ticket_list_page_documents_the_read_only_backlog() {
+        let list = text(Some("ticket list")).expect("ticket list has a page");
+        assert!(list.contains("--json"), "{list}");
+        assert!(list.contains("--pool"), "{list}");
+        assert!(list.contains("read-only"), "{list}");
+        assert!(list.contains("reconciles no Run"), "{list}");
+        assert!(list.contains("dispatch --all"), "{list}");
     }
 
     /// The dispatch page must say how `--fg` relates to `wait`: one blocks for
