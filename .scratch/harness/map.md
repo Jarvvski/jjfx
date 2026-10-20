@@ -107,7 +107,11 @@ verifying agent output and integrating parallel work, which is what jjfx's
 - [07](issues/07-checkpoint-and-resume.md) - task: an interruption must not
   orphan in-flight work. Blocked by 06.
 - [09](issues/09-idempotent-steps.md) - task: steps keyed by identity, so a
-  re-run does not duplicate work. Blocked by 06.
+  re-run does not duplicate work. Blocked by 06. Landed; replay is built
+  and tested but not yet wired, which is [12](issues/12-wire-the-decision-log.md).
+- [12](issues/12-wire-the-decision-log.md) - task: drive the review loop
+  through the decision log so a repeated dimension and pass replays rather
+  than reaching the model. Follow-up to 09.
 
 ### Phase 2 - topology
 
