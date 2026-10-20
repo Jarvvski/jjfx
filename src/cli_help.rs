@@ -1345,7 +1345,11 @@ mod tests {
                     "`{} {}`: documented = {documented}, but the parser {} ({:?})",
                     page.key,
                     spelling,
-                    if rejected { "rejected it" } else { "did not reject it" },
+                    if rejected {
+                        "rejected it"
+                    } else {
+                        "did not reject it"
+                    },
                     outcome.err().map(|error| error.to_string())
                 );
             }
