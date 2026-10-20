@@ -603,6 +603,69 @@ fn absorb_folds_working_copy_edits_into_their_base_commits_and_pushes() {
     assert_eq!(commands[5], "git push --bookmark owner/eng-301-action");
 }
 
+/// A dependent Worker materialised on a Blocker's commit has that commit recorded
+/// as its stack base, and `jjfx absorb` excludes it from the destination. Without
+/// it the Blocker's commit - another Ticket's deliverable - is a legal fold
+/// target, so this asserts the recorded base reaches the revset that pins it.
+#[test]
+fn absorb_excludes_the_recorded_stack_base_from_the_destination() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("absorb-stacked.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    // The commit the dependent was stacked on, recorded when it was materialised.
+    let blocker = "cccccccccccccccccccccccccccccccccccccccc";
+    repository
+        .state_store()
+        .stack_bases()
+        .record(&worker, vec![blocker.to_owned()])
+        .expect("record the stack base");
+
+    let bin = temporary_directory.path().join("absorb-stacked-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        &format!(
+            "#!/bin/sh\nprintf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\ncase \" $* \" in\n{LANDING_JJ_ARMS}  *' --count '*) printf '1\\n' ;;\n  *' log '*) printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n' ;;\n  *' absorb '*) printf 'Nothing changed.\\n' >&2 ;;\nesac\n"
+        ),
+    );
+    let capture = temporary_directory.path().join("absorb-stacked-commands");
+    let result = temporary_directory.path().join("absorb-stacked-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "absorb")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("absorb helper should run");
+
+    assert!(
+        output.status.success(),
+        "absorb helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    let destination = commands
+        .iter()
+        .find(|command| command.starts_with("absorb --into "))
+        .expect("the absorb destination is pinned");
+    assert!(
+        destination.contains(&format!("~::({blocker})")),
+        "the recorded stack base must be excluded from the destination: {destination}"
+    );
+}
+
 #[test]
 fn absorb_that_moves_nothing_skips_the_push() {
     let (temporary_directory, repository) = local_repository();

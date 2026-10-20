@@ -516,6 +516,11 @@ impl WorkerActions {
     /// rewrite of the branch it sits on, and the mainline is checked before and
     /// after. A repository whose `trunk()` does not resolve is refused outright:
     /// there is nothing for absorb to stop at.
+    ///
+    /// The commit(s) the Workspace was stacked on are excluded too, from the base
+    /// recorded when the dependent was materialised: a Blocker's commit is above
+    /// the mainline and mutable, so without that exclusion the fold would rewrite
+    /// another Ticket's deliverable.
     pub fn absorb(&self, worker: &WorkerId) -> Result<AbsorbOutcome, WorkerActionError> {
         let (branch, workspace) = self.branch_and_workspace(worker)?;
         // `jj absorb` folds the source revision's hunks into the closest
@@ -532,19 +537,30 @@ impl WorkerActions {
             });
         }
         // Absorb rewrites the working copy, so serialise it with preparation and
-        // Reset restoration like every other Workspace operation.
+        // Reset restoration like every other Workspace operation. The stack base
+        // is read under the lock, so it cannot be replaced by a concurrent
+        // re-dispatch between the read and the fold.
         let _operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
             .map_err(|source| WorkerActionError::WorkspaceOperation {
                 worker: worker.clone(),
                 detail: source.to_string(),
             })?;
-        let report =
-            self.commands
-                .absorb(&workspace)
-                .map_err(|detail| WorkerActionError::Command {
-                    operation: "absorb Worker working-copy edits",
-                    detail,
-                })?;
+        let stack_base = self
+            .repository
+            .state_store()
+            .stack_bases()
+            .base(worker)
+            .map_err(|source| WorkerActionError::Command {
+                operation: "read the Worker's stack base",
+                detail: source.to_string(),
+            })?;
+        let report = self
+            .commands
+            .absorb(&workspace, stack_base.as_deref())
+            .map_err(|detail| WorkerActionError::Command {
+                operation: "absorb Worker working-copy edits",
+                detail,
+            })?;
         if report.is_empty() {
             return Ok(AbsorbOutcome { branch, report });
         }
@@ -1168,14 +1184,22 @@ impl SystemCommands {
     ///
     /// The destination is pinned to the Worker's own mutable commits above the
     /// mainline ([`crate::jj::absorb_destinations`]) rather than jj's default
-    /// `mutable()`, which is only safe while trunk is immutable. The mainline is
+    /// `mutable()`, which is only safe while trunk is immutable. `stack_base` is
+    /// the commit(s) the Workspace was stacked on, excluded the same way: a
+    /// Blocker's commit is above the mainline and mutable, so it would otherwise
+    /// take the fold and rewrite another Ticket's pull request. The mainline is
     /// then re-read: if it moved anyway, the absorb is rolled back with
     /// `jj undo` and reported as a failure, never as a success.
-    fn absorb(self, workspace: &Path) -> Result<AbsorbReport, String> {
+    fn absorb(
+        self,
+        workspace: &Path,
+        stack_base: Option<&[String]>,
+    ) -> Result<AbsorbReport, String> {
         let mainline =
             crate::jj::mainline_commit(workspace).map_err(|source| source.to_string())?;
+        let destinations = crate::jj::absorb_destinations(stack_base);
         let output = crate::jj::command()
-            .args(["absorb", "--into", &crate::jj::absorb_destinations()])
+            .args(["absorb", "--into", &destinations])
             .current_dir(workspace)
             .output()
             .map_err(|source| source.to_string())?;
@@ -1739,7 +1763,7 @@ mod tests {
         // The destination is pinned to the Worker's own commits, so a change
         // already committed as the deliverable has nowhere to go: absorb is the
         // no-op it should be, rather than the rewrite of `main` it used to be.
-        let report = SystemCommands.absorb(&root).expect("absorb runs");
+        let report = SystemCommands.absorb(&root, None).expect("absorb runs");
 
         assert!(report.is_empty(), "nothing belongs in an earlier commit");
         assert_eq!(
@@ -1787,7 +1811,7 @@ mod tests {
         std::fs::write(root.join("a.rs"), "let a = 0;\n").expect("feedback edit");
         let main = commit_id(&root, "main");
 
-        let report = SystemCommands.absorb(&root).expect("absorb runs");
+        let report = SystemCommands.absorb(&root, None).expect("absorb runs");
 
         assert_eq!(report.revisions(), 1, "the edit folds into one commit");
         assert_eq!(commit_id(&root, "main"), main, "`main` must not move");
@@ -1805,6 +1829,93 @@ mod tests {
             file(&root, &base_change, "b.rs"),
             "let b = 2;\n",
             "the base commit keeps its own change"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The corruption one level down from the mutable-main case: a dependent
+    /// Worker materialised stacked on its Blocker's commit. The Blocker's commit
+    /// is above the mainline and mutable, so it is a legal `jj absorb`
+    /// destination unless the recorded stack base excludes it - and folding into
+    /// it rewrites a change that belongs to another Ticket's pull request.
+    #[test]
+    fn absorb_never_folds_a_stacked_workers_change_into_its_blockers_commit() {
+        let root = crate::store::test_local_repo("absorb-stacked-worker");
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("seed file");
+        jj(&root, &["describe", "-m", "main: initial"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@"]);
+
+        // Ticket 01's deliverable: a commit above the mainline, on its own
+        // bookmark, as a Blocker's is. The bookmark is the moving handle a
+        // rewrite would drag - a commit id would resolve to itself either way.
+        jj(&root, &["new", "-m", "01: add the contact form"]);
+        std::fs::write(root.join("form.rs"), "fn form() {}\n").expect("01's file");
+        jj(&root, &["describe", "-m", "01: add the contact form"]);
+        jj(
+            &root,
+            &[
+                "bookmark",
+                "create",
+                "adam/dogfood--01-contact-form",
+                "-r",
+                "@",
+            ],
+        );
+        let blocker = commit_id(&root, "adam/dogfood--01-contact-form");
+
+        // Ticket 02, materialised stacked on 01's commit: `prepare_for_dispatch`
+        // runs `jj new <Blocker's branch>` and records the parents it lands on.
+        jj(&root, &["new", "-m", "02: add validation"]);
+        std::fs::write(root.join("validation.rs"), "fn validate() {}\n").expect("02's file");
+        jj(&root, &["describe", "-m", "02: add validation"]);
+        jj(
+            &root,
+            &[
+                "bookmark",
+                "create",
+                "adam/dogfood--02-validation",
+                "-r",
+                "@",
+            ],
+        );
+        let dependent = commit_id(&root, "adam/dogfood--02-validation");
+        assert_ne!(blocker, dependent);
+
+        // Feedback for 02 that edits a line 01 introduced. This is exactly the
+        // hunk jj folds into the closest mutable ancestor - 01's commit - if the
+        // stack base is not excluded.
+        jj(&root, &["new"]);
+        std::fs::write(root.join("form.rs"), "fn form() -> bool { true }\n")
+            .expect("feedback edit");
+
+        let report = SystemCommands
+            .absorb(&root, Some(std::slice::from_ref(&blocker)))
+            .expect("absorb runs");
+
+        assert_eq!(
+            commit_id(&root, "adam/dogfood--01-contact-form"),
+            blocker,
+            "01's deliverable - another Ticket's pull request - must not be rewritten"
+        );
+        assert_eq!(
+            file(&root, "adam/dogfood--01-contact-form", "form.rs"),
+            "fn form() {}\n",
+            "01's own change must stay in 01's commit"
+        );
+        assert_eq!(
+            commit_id(&root, "adam/dogfood--02-validation"),
+            dependent,
+            "02's own commit must not be rewritten either"
+        );
+        assert_eq!(
+            file(&root, "@", "form.rs"),
+            "fn form() -> bool { true }\n",
+            "with no destination above the base the edit stays in the source revision"
+        );
+        assert!(
+            report.is_empty(),
+            "nothing above the base owns the edited lines, so absorb folds nothing: {report:?}"
         );
 
         std::fs::remove_dir_all(&root).ok();

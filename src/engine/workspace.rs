@@ -1002,6 +1002,23 @@ pub(crate) fn prepare_for_dispatch(
             command_error(&output)
         )));
     }
+    // The commit(s) the fresh `@` sits on are this Workspace's stack base: the
+    // mainline when nothing is stacked, or a Blocker's deliverable when the
+    // dependent is materialised on one. Recorded here, where it is known, so
+    // `jjfx absorb` can exclude it the same way it excludes trunk - a Blocker's
+    // commit is above the mainline and mutable, so it is otherwise a legal
+    // absorb destination, and folding into it would rewrite another Ticket's
+    // pull request.
+    let bases = stack_base_commits(&path)?;
+    repository
+        .state_store()
+        .stack_bases()
+        .record(worker, bases)
+        .map_err(|error| {
+            WorkerWorkspaceError::new(format!(
+                "record the stack base for Worker {worker}: {error}"
+            ))
+        })?;
     Ok(PreparedWorkerWorkspace {
         _workspace: WorkerWorkspace {
             worker_id: worker.clone(),
@@ -1009,6 +1026,36 @@ pub(crate) fn prepare_for_dispatch(
         },
         _operation: operation,
     })
+}
+
+/// The commit ids a Workspace's `@` sits on, read as its stack base.
+///
+/// Read straight after `jj new <base>`, when `@` is the fresh commit and its
+/// parents are exactly the revisions the Worker was based on: the mainline for
+/// an unstacked Worker, or one commit per Blocker for a stacked one. A merge of
+/// several Blockers reports every parent, so excluding the union excludes them
+/// all. `--ignore-working-copy` keeps it a pure read.
+fn stack_base_commits(path: &Path) -> Result<Vec<String>, WorkerWorkspaceError> {
+    let out = crate::jj::read_in_dir(
+        path,
+        &[
+            "log",
+            "-r",
+            "parents(@)",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ],
+    )
+    .map_err(|error| {
+        WorkerWorkspaceError::new(format!("read the stacked base for a Worker: {error}"))
+    })?;
+    Ok(out
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect())
 }
 
 /// Provisions one Worker Workspace and its idle Worker state.
@@ -2568,6 +2615,52 @@ mod tests {
         let content = fs::read_to_string(root.join("f.txt")).unwrap();
         assert!(content.contains("<<<<<<<"), "{content}");
 
+        std::fs::remove_dir_all(&repo).ok();
+    }
+
+    /// A dependent Worker is materialised on its Blocker's branch, and the commit
+    /// it lands on is recorded as its stack base there, where it is known. Absorb
+    /// reads it later so it can exclude the Blocker's commit the same way it
+    /// excludes trunk - re-deriving it from a Ticket source or a Blocker branch
+    /// that may since have moved would fail open exactly when it matters.
+    #[test]
+    fn preparing_a_dependent_records_its_blockers_commit_as_the_stack_base() {
+        let repo = temp_repo("stack-base");
+        let root = repo.canonicalize().unwrap();
+        fs::write(root.join("f.txt"), "base\n").unwrap();
+        jj_text(&root, &["commit", "-m", "base"]);
+        jj_text(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        // The Blocker's deliverable: above the mainline, on its own branch.
+        fs::write(root.join("form.txt"), "form\n").unwrap();
+        jj_text(&root, &["describe", "-m", "01: add a form"]);
+        let blocker_branch = "adam/dogfood--01-form";
+        jj_text(&root, &["bookmark", "create", blocker_branch, "-r", "@"]);
+        let blocker = jj_text(&root, &["log", "-r", "@", "--no-graph", "-T", "commit_id"]);
+
+        let repository = Repository::open(&root).unwrap();
+        let worker = WorkerId::parse("worker-01").unwrap();
+        provision(&repository, &worker).unwrap();
+        prepare_for_dispatch(&repository, &worker, &[blocker_branch.to_owned()]).unwrap();
+
+        assert_eq!(
+            repository
+                .state_store()
+                .stack_bases()
+                .base(&worker)
+                .unwrap(),
+            Some(vec![blocker.clone()]),
+            "the Blocker's commit is recorded as the dependent's stack base"
+        );
+        // And the Workspace really does sit on it, so the record is not a guess.
+        let workspace = worker_path(&root, &worker);
+        let parent = crate::jj::read_in_dir(
+            &workspace,
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"],
+        )
+        .unwrap();
+        assert_eq!(parent.trim(), blocker);
+
+        deprovision(&repository, &worker).unwrap();
         std::fs::remove_dir_all(&repo).ok();
     }
 }

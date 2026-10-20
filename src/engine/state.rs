@@ -41,6 +41,8 @@ const DESTROY_MARKER_NAME: &str = ".destroying";
 const CLEANUP_SUFFIX: &str = ".cleanup";
 const SESSION_NAME: &str = "sessions.json";
 const SESSION_LOCK_NAME: &str = ".sessions.lock";
+const STACK_BASE_NAME: &str = "stack-bases.json";
+const STACK_BASE_LOCK_NAME: &str = ".stack-bases.lock";
 const WAITING_NAME: &str = "waiting.json";
 const WAITING_LOCK_NAME: &str = ".waiting.lock";
 const QUEUE_NAME: &str = "queue.json";
@@ -422,6 +424,29 @@ pub struct SessionState {
     /// Session identifier keyed by the Worker whose current Run drives it.
     #[serde(default)]
     pub sessions: BTreeMap<WorkerId, String>,
+}
+
+/// The commit(s) each Worker's Workspace was stacked on when it was materialised.
+///
+/// A dependent Ticket is dispatched as a real stacked Workspace, so the Worker's
+/// chain sits on top of its Blocker's deliverable. That commit is above the
+/// mainline and mutable, so it is otherwise a legal `jj absorb` destination - and
+/// folding the dependent's change into it rewrites a change that belongs to
+/// another Ticket's pull request. Recording the base where it is known (at
+/// materialisation) lets absorb exclude it the same way it excludes trunk,
+/// without re-deriving it from a Ticket source or from a Blocker branch that may
+/// since have moved or been deleted.
+///
+/// This is jjfx-owned state, deliberately kept out of the pool and Worker
+/// documents so their shape is preserved. A missing file means "no base
+/// recorded", which is the unstacked case - and the case the trunk exclusion
+/// already covers. A file that is present but unreadable is an error rather than
+/// a silent absence: for a safety record, failing closed is the only safe read.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StackBaseState {
+    /// The commit ids each Worker's stack is based on, keyed by Worker.
+    #[serde(default)]
+    pub bases: BTreeMap<WorkerId, Vec<String>>,
 }
 
 /// The Tickets the Dispatch capacity governor held back rather than fired.
@@ -1335,6 +1360,11 @@ pub struct InUseStateRepository {
 pub struct SessionStateRepository {
     directory: PathBuf,
 }
+/// The jjfx-owned record of the commit(s) each Worker's stack is based on.
+#[derive(Debug, Clone)]
+pub struct StackBaseStateRepository {
+    directory: PathBuf,
+}
 /// The jjfx-owned record of Tickets the Dispatch capacity governor held back.
 #[derive(Debug, Clone)]
 pub struct WaitingStateRepository {
@@ -1493,6 +1523,14 @@ impl StateStore {
     /// Opens the jjfx-owned Agent Runtime Session sidecar repository.
     pub fn sessions(&self) -> SessionStateRepository {
         SessionStateRepository {
+            directory: self.directory(),
+        }
+    }
+
+    /// Opens the jjfx-owned record of the commit(s) each Worker's stack is based
+    /// on.
+    pub fn stack_bases(&self) -> StackBaseStateRepository {
+        StackBaseStateRepository {
             directory: self.directory(),
         }
     }
@@ -2595,6 +2633,14 @@ repository_methods!(
     validate_sessions
 );
 repository_methods!(
+    StackBaseStateRepository,
+    StackBaseState,
+    |s: &StackBaseStateRepository| s.directory.join(STACK_BASE_NAME),
+    |s: &StackBaseStateRepository| vec![ScopedLock::pool(s.directory.join(STACK_BASE_LOCK_NAME))],
+    |_s: &StackBaseStateRepository| "Worker Stack Bases".to_owned(),
+    validate_stack_bases
+);
+repository_methods!(
     MutationRecordRepository,
     UndoState,
     |s: &MutationRecordRepository| s.root.join(UNDO_PATH),
@@ -2963,6 +3009,67 @@ impl SessionStateRepository {
                 write_atomic(
                     &self.directory.join(SESSION_NAME),
                     &SessionState { sessions },
+                    subject,
+                )
+            },
+        )
+    }
+}
+
+impl StackBaseStateRepository {
+    /// Returns the commit(s) `worker`'s stack was based on, if any.
+    ///
+    /// Absence means the Worker was not materialised on a stacked base - it was
+    /// based on the mainline, which the absorb destination already excludes - so
+    /// a missing record is the safe case, never an error.
+    pub fn base(&self, worker: &WorkerId) -> Result<Option<Vec<String>>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.bases.get(worker).cloned()),
+            Loaded::Missing => Ok(None),
+        }
+    }
+
+    /// Records the commit(s) `worker`'s stack is based on, replacing any prior
+    /// set.
+    ///
+    /// Replacing is the point: a Worker re-dispatched on a different Blocker must
+    /// not keep the previous base, or absorb would exclude a commit this stack
+    /// never sat on while leaving the real one reachable.
+    pub fn record(&self, worker: &WorkerId, bases: Vec<String>) -> Result<(), StateError> {
+        self.update(|recorded| match recorded.get(worker) {
+            Some(existing) if existing == &bases => false,
+            _ => {
+                recorded.insert(worker.clone(), bases);
+                true
+            }
+        })
+    }
+
+    /// Applies `edit` under the sidecar lock, writing only when it changed
+    /// something.
+    fn update(
+        &self,
+        edit: impl FnOnce(&mut BTreeMap<WorkerId, Vec<String>>) -> bool,
+    ) -> Result<(), StateError> {
+        let subject = "Worker Stack Bases";
+        with_locks(
+            &[ScopedLock::pool(self.directory.join(STACK_BASE_LOCK_NAME))],
+            subject,
+            || {
+                let mut bases = match load_state(
+                    &self.directory.join(STACK_BASE_NAME),
+                    subject,
+                    &validate_stack_bases,
+                )? {
+                    Loaded::Present(versioned) => versioned.value.bases,
+                    Loaded::Missing => BTreeMap::new(),
+                };
+                if !edit(&mut bases) {
+                    return Ok(());
+                }
+                write_atomic(
+                    &self.directory.join(STACK_BASE_NAME),
+                    &StackBaseState { bases },
                     subject,
                 )
             },
@@ -3672,6 +3779,11 @@ fn validate_in_use(_state: &InUseState) -> Result<(), String> {
 }
 fn validate_sessions(_state: &SessionState) -> Result<(), String> {
     // Worker ids are validated on deserialization and session ids are opaque
+    // strings; there is nothing else to check.
+    Ok(())
+}
+fn validate_stack_bases(_state: &StackBaseState) -> Result<(), String> {
+    // Worker ids are validated on deserialization and commit ids are opaque
     // strings; there is nothing else to check.
     Ok(())
 }
