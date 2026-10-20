@@ -9,6 +9,8 @@ jjfx runs background agents as **Workers**. A Worker is one reusable slot backed
 
 `jjfx help <command>` is the command surface: it prints a command's usage, arguments and flags, derived from the same definitions the parser validates against, so the two cannot drift. Take the flag surface from there — `jjfx help dispatch`, `jjfx help pool list`, `jjfx help send` — rather than transcribing it here. This skill carries the judgement a help page cannot: when to dispatch, what a flag *means* for how you drive the pool, and how to read the state back.
 
+That surface is only as good as the binary answering it, so check which one you are driving. `command -v jjfx` names the binary and `jjfx version` the build; a stale `jjfx` earlier on `PATH` answers `jjfx help <command>` with an older flag set (and refuses a command it does not have), which makes the promise above false against it. Pin the binary you mean - run it by its path, or install the version you are driving - and re-check `jjfx version` after any upgrade.
+
 Every step ends on a checkable condition, and every condition is read from a command's `--json` output rather than from its prose — so the same command decides the same way on every run.
 
 ## Before dispatching
@@ -17,8 +19,8 @@ Settle four things first, so a dispatch does not fail on setup:
 
 1. **Repository** — `jjfx root` prints the repo jjfx creates Workers beside. Run from inside it.
 2. **Colocation** — `jjfx colocation status`. Colocated Workers carry a working `.git`, which `gh stack` and other Git tools need. If it reports not colocated, run `jjfx colocation enable`.
-3. **Runtime** — `jjfx pool profile <runtime> [--provider P --model M]` sets the agent every Worker runs. `claude`, `codex`, and `opencode` are supported; provider and model are optional where the runtime picks them itself.
-4. **Lifecycle hooks** — `jjfx hooks status`. The hooks are how each runtime reports needs-input, quota-blocked and subagent progress; without them a Worker waiting on you still reads `busy`, which is exactly the state you cannot tell from a working one. `jjfx hooks install` writes them into each agent's own config, so run it when the user asks and otherwise report which integrations are missing.
+3. **Runtime** — `jjfx pool profile <runtime> [--provider P --model M]` sets the agent every Worker runs. `claude`, `codex`, and `opencode` are supported; provider and model are optional where the runtime picks them itself. Naming a runtime provisions the empty Pool document when the Pool does not exist yet, so this is safe before `jjfx pool <N>` - either order works, and neither one creates capacity.
+4. **Lifecycle hooks** — `jjfx hooks status`. The hooks are how each runtime reports needs-input, quota-blocked and subagent progress; without them a Worker waiting on you still reads `busy`, which is exactly the state you cannot tell from a working one. Claude Code and Codex integrate through hook entries in their own config, but opencode integrates through a plugin jjfx writes to `~/.config/opencode/plugins/jjfx-lifecycle.ts`, so an opencode runtime with no plugin installed reports nothing at all and `jjfx hooks status` names the gap (`opencode: missing: lifecycle plugin`). `jjfx hooks install` writes them into each agent's own config, so run it when the user asks and otherwise report which integrations are missing.
 
 **Done when** `jjfx root` resolves, colocation is enabled, the profile names the runtime the user wants, and you have reported the hook state.
 
@@ -100,11 +102,17 @@ jjfx mount worker-01                              # open the Worker in kitty (m)
 ```bash
 jjfx absorb worker-01    # fold its working-copy edits into the commits they belong to (ab)
 jjfx rebase worker-01    # rebase and push its bookmark (rb)
-jjfx open-pr worker-01   # weld its chain onto trunk, then open the pull request (pr)
+jjfx open-pr worker-01   # open the Worker's Pull Request (pr)
 jjfx resolve worker-01   # run jj resolve over a Workspace's conflicted commits
 ```
 
-`open-pr` runs the repository's own build check between welding and pushing, when `<repo>/.jjfx/config.toml` configures one under `[checks]`. A check that fails stops the push and names the command and its output, so fix the tree and re-run rather than forcing.
+Each verb checks its precondition before it mutates anything, so a refusal leaves the Workspace as it found it:
+
+- **`absorb`** needs `trunk()` to resolve - a fetched `main@origin`. Without it every commit is mutable and the fold could rewrite trunk, so it refuses by name rather than running. It resolves the Worker's bookmark by Ticket (a missing or ambiguous bookmark is an error, never a guess) and excludes the commit(s) the Workspace was stacked on, so the fold can only reach the Worker's own commits above the mainline and its stack base. It pushes only when it absorbed something, so running it speculatively is safe.
+- **`rebase`** needs the Worker's bookmark to resolve by Ticket; it rebases that bookmark onto `main` and pushes. A push whose name matches no bookmark is a failure, not a silent success.
+- **`open-pr`** needs the Worker's bookmark to resolve by Ticket, and the Pool's `gh_repo` to be a real GitHub repository: a missing `origin`, or one that is not GitHub, is refused by name (`origin is not a GitHub remote`) rather than guessed from a path. It then opens the existing Pull Request in the browser (`gh -R <repo> pr view <branch> --web`).
+
+Welding a chain onto trunk, running the repository's own build check (`<repo>/.jjfx/config.toml` `[checks]`) and pushing are the forge's steps, not `open-pr`'s - it only opens the Pull Request they produce. A check that fails stops the push and names the command and its output, so fix the tree and re-run rather than forcing.
 
 **Done when** each Worker's PR exists, or the user has taken the branch over.
 
