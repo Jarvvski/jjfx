@@ -1558,6 +1558,10 @@ pub(crate) enum RepositoryIdentityError {
     /// there is no GitHub `owner/name` slug to derive. Taking the last two path
     /// segments of a filesystem path or another forge's URL would invent a
     /// repository that does not exist.
+    ///
+    /// Raised both when deriving the slug from `origin` and when resolving a
+    /// persisted `gh_repo` that this `origin` fabricated, so a Pool left holding
+    /// one is told what is wrong rather than sent to `gh`.
     #[error(
         "origin is not a GitHub remote: {0}; point `origin` at GitHub (or set \
          the pool's `gh_repo`)"
@@ -1578,16 +1582,58 @@ pub(crate) enum RepositoryIdentityError {
 /// command that adds it, rather than failing with a format complaint about an
 /// empty slug. Direct Dispatch and orchestration share this one helper so the
 /// user-facing message cannot drift between them.
+///
+/// A persisted slug is refused when it is the one this Repository's non-GitHub
+/// `origin` fabricates: a Pool created before `dogfood/03` may still carry it,
+/// and it names a repository that does not exist, so resolving it would only
+/// fail much later, inside `gh`, naming the wrong repository.
 pub(crate) fn repository_identity(
     root: &Path,
     configured: &str,
 ) -> Result<RepositoryIdentity, RepositoryIdentityError> {
     let configured = configured.trim_end_matches(".git");
     if !configured.is_empty() {
+        refuse_a_fabricated_slug(root, configured)?;
         return Ok(RepositoryIdentity::parse(configured)?);
     }
     let slug = origin_slug(root)?.ok_or(RepositoryIdentityError::MissingOrigin)?;
     Ok(RepositoryIdentity::parse(slug)?)
+}
+
+/// Refuses a persisted `gh_repo` that this Repository's non-GitHub `origin`
+/// fabricates.
+///
+/// The pre-`dogfood/03` derivation mined an `owner/name` slug from *any*
+/// remote's last two path segments, so a Pool created against a filesystem path
+/// or another forge may still hold the value it invented. That slug could not
+/// have come from a GitHub remote, and using it fails far from its cause: `gh`
+/// looks up a repository that never existed. Refusing it here names the
+/// `origin` instead, before any `gh` call.
+///
+/// A slug that is not that value is left alone. The Repository cannot tell a
+/// hand-configured `gh_repo` from a derived one, so the only value refused is
+/// the one this `origin` demonstrably produced - which is exactly what keeps a
+/// legitimate slug working.
+///
+/// Deliberately best-effort: an `origin` that is absent or unreadable is not a
+/// fabrication to recognise, and a remotes read that failed must not fail a verb
+/// that only needed the persisted slug.
+pub(crate) fn refuse_a_fabricated_slug(
+    root: &Path,
+    configured: &str,
+) -> Result<(), RepositoryIdentityError> {
+    let Ok(Some(remote)) = origin_remote(root) else {
+        return Ok(());
+    };
+    if remote_slug(&remote).is_some() {
+        // A GitHub `origin` gives a persisted slug a GitHub provenance, so
+        // there is no fabrication to refuse.
+        return Ok(());
+    }
+    if fabricated_slug(&remote) == configured {
+        return Err(RepositoryIdentityError::NotGitHub(remote));
+    }
+    Ok(())
 }
 
 /// Derives the GitHub `owner/name` slug of the Repository's `origin` remote.
@@ -1598,6 +1644,19 @@ pub(crate) fn repository_identity(
 /// exist. Direct Dispatch, orchestration and Worker Pool discovery share this
 /// one read, so a non-GitHub `origin` is refused the same way everywhere.
 pub(crate) fn origin_slug(root: &Path) -> Result<Option<String>, RepositoryIdentityError> {
+    let Some(remote) = origin_remote(root)? else {
+        return Ok(None);
+    };
+    remote_slug(&remote)
+        .map(Some)
+        .ok_or(RepositoryIdentityError::NotGitHub(remote))
+}
+
+/// The Repository's `origin` remote URL, or `None` when it has no `origin`.
+///
+/// A failed read is an error, never a silent `None`: "no `origin`" and "could
+/// not tell" must not look alike.
+fn origin_remote(root: &Path) -> Result<Option<String>, RepositoryIdentityError> {
     let output =
         git_remotes(root).map_err(|error| RepositoryIdentityError::Remotes(error.to_string()))?;
     if !output.status.success() {
@@ -1605,7 +1664,7 @@ pub(crate) fn origin_slug(root: &Path) -> Result<Option<String>, RepositoryIdent
             String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         ));
     }
-    let remote = String::from_utf8_lossy(&output.stdout)
+    Ok(String::from_utf8_lossy(&output.stdout)
         .lines()
         .find_map(|line| {
             let mut fields = line.split_whitespace();
@@ -1614,13 +1673,26 @@ pub(crate) fn origin_slug(root: &Path) -> Result<Option<String>, RepositoryIdent
                 _ => None,
             }
         })
-        .filter(|remote| !remote.is_empty());
-    let Some(remote) = remote else {
-        return Ok(None);
-    };
-    remote_slug(&remote)
-        .map(Some)
-        .ok_or(RepositoryIdentityError::NotGitHub(remote))
+        .filter(|remote| !remote.is_empty()))
+}
+
+/// The slug the pre-`dogfood/03` derivation invented for *any* remote: the path
+/// after the last `:` when the remote has one (the scp-like shape), otherwise
+/// the last two `/`-separated segments.
+///
+/// Kept only to recognise the value a legacy Pool may already hold, so it can be
+/// refused by name. Nothing derives an identity from it - [`remote_slug`] is the
+/// one derivation, and it refuses anything that is not a GitHub remote.
+fn fabricated_slug(remote: &str) -> String {
+    let remote = remote.trim_end_matches(".git");
+    if let Some((_, path)) = remote.rsplit_once(':') {
+        return path.to_owned();
+    }
+    let mut parts = remote.rsplitn(3, '/');
+    match (parts.next(), parts.next()) {
+        (Some(name), Some(owner)) => format!("{owner}/{name}"),
+        _ => remote.to_owned(),
+    }
 }
 
 /// Derives an `owner/name` slug from a GitHub git remote URL.
@@ -2300,6 +2372,28 @@ mod tests {
         ] {
             assert_eq!(remote_slug(remote), None, "{remote} is not a GitHub remote");
         }
+    }
+
+    #[test]
+    fn fabricated_slug_reproduces_the_legacy_derivation_a_legacy_pool_may_hold() {
+        // The exact value the dogfood drive's Pool was left holding: the old
+        // derivation took the last two path segments of a filesystem `origin`.
+        assert_eq!(
+            fabricated_slug("/Users/jarvis/Code/personal/dogfood-site-origin.git"),
+            "personal/dogfood-site-origin"
+        );
+        // The scp-like shape took everything after the last `:`, so another
+        // forge's remote fabricated the same slug a GitHub remote would have.
+        assert_eq!(
+            fabricated_slug("git@gitlab.com:owner/name.git"),
+            "owner/name"
+        );
+        // A GitHub remote fabricates the slug it legitimately has, which is why
+        // the refusal only applies where `remote_slug` refuses the remote.
+        assert_eq!(
+            fabricated_slug("git@github.com:owner/name.git"),
+            "owner/name"
+        );
     }
 
     #[test]

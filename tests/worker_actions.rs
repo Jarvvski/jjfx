@@ -250,6 +250,9 @@ fn rebase_waits_for_the_workspace_operation_lock() {
             "rebase -b owner/eng-301-action -d main",
             "git push --bookmark owner/eng-301-action",
             "bookmark list -T name ++ \"\\n\"",
+            // The persisted `gh_repo` is checked against `origin` before any
+            // `gh` call, so a fabricated one never reaches the network.
+            "git remote list",
             "gh -R owner/repo pr view owner/eng-301-action --web",
         ]
     );
@@ -401,8 +404,138 @@ fn rebase_and_open_pull_request_resolve_the_prefixed_bookmark_the_agent_created(
             "rebase -b owner/eng-301-action -d main",
             "git push --bookmark owner/eng-301-action",
             "bookmark list -T name ++ \"\\n\"",
+            // The persisted `gh_repo` is checked against `origin` before any
+            // `gh` call, so a fabricated one never reaches the network.
+            "git remote list",
             "gh -R owner/repo pr view owner/eng-301-action --web",
         ]
+    );
+}
+
+/// A Pool created before `dogfood/03` still carries the slug the old derivation
+/// mined from a non-GitHub `origin`. `open-pr` must refuse that value by name,
+/// before it contacts `gh`: reaching the network to discover that a slug is not
+/// a slug is the failure being fixed.
+#[test]
+fn open_pull_request_refuses_a_legacy_fabricated_gh_repo_before_calling_gh() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("legacy-gh-repo.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+    jj_at(
+        repository.root(),
+        &["bookmark", "create", "owner/eng-301-action", "-r", "@"],
+    );
+    let origin = TempDir::new().expect("origin repository");
+    install_legacy_fabricated_gh_repo(&repository, origin.path());
+
+    let bin = temporary_directory.path().join("legacy-gh-repo-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\nexit 1\n",
+    );
+    let capture = temporary_directory.path().join("legacy-gh-repo-commands");
+    let result = temporary_directory.path().join("legacy-gh-repo-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "open-pr")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("open-pr helper should run");
+
+    assert!(
+        output.status.success(),
+        "open-pr helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = fs::read_to_string(&result).expect("open-pr result");
+    assert!(
+        reported.contains("origin is not a GitHub remote"),
+        "the failure must reuse the message `dogfood/03` introduced: {reported}"
+    );
+    assert!(
+        reported.contains("dogfood-site-origin"),
+        "the failure must name the remote it refused: {reported}"
+    );
+    // The fake `gh` records every invocation, so its absence is proof the
+    // refusal happened before the network was reached.
+    assert!(
+        !fs::read_to_string(&capture)
+            .unwrap_or_default()
+            .contains("gh "),
+        "`gh` must not be contacted for a fabricated slug"
+    );
+}
+
+/// A `gh_repo` the operator configured by hand is not the fabricated value, so a
+/// non-GitHub `origin` must not refuse it: the slug must still reach `gh`.
+#[test]
+fn open_pull_request_still_reaches_gh_with_a_configured_gh_repo() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("configured-gh-repo.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+    jj_at(
+        repository.root(),
+        &["bookmark", "create", "owner/eng-301-action", "-r", "@"],
+    );
+    let origin = TempDir::new().expect("origin repository");
+    install_local_origin(&repository, origin.path());
+
+    let bin = temporary_directory.path().join("configured-gh-repo-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\nprintf 'gh %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\nexit 1\n",
+    );
+    let capture = temporary_directory
+        .path()
+        .join("configured-gh-repo-commands");
+    let result = temporary_directory.path().join("configured-gh-repo-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "open-pr")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("open-pr helper should run");
+
+    assert!(
+        output.status.success(),
+        "open-pr helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = fs::read_to_string(&capture).expect("gh capture");
+    assert!(
+        captured.contains("gh -R owner/repo pr view owner/eng-301-action --web"),
+        "a configured gh_repo must still reach `gh`: {captured}"
+    );
+    let reported = fs::read_to_string(&result).expect("open-pr result");
+    assert!(
+        !reported.contains("origin is not a GitHub remote"),
+        "a configured gh_repo must not be refused: {reported}"
     );
 }
 
@@ -1846,6 +1979,7 @@ fn repository_action_helper() {
         && mode != "rebase-failure"
         && mode != "rebase"
         && mode != "absorb"
+        && mode != "open-pr"
         && mode != "missing-bookmark"
     {
         return;
@@ -1863,6 +1997,11 @@ fn repository_action_helper() {
     } else if mode == "rebase" {
         match actions.rebase(&worker) {
             Ok(rebase) => format!("rebased={}\n", rebase.branch()),
+            Err(error) => error.to_string(),
+        }
+    } else if mode == "open-pr" {
+        match actions.open_pull_request(&worker) {
+            Ok(open) => format!("opened={}\n", open.branch()),
             Err(error) => error.to_string(),
         }
     } else if mode == "absorb" {
@@ -1993,6 +2132,55 @@ fn grow_one_worker(repository: &Repository) -> WorkerId {
         .expect("Worker Workspace should be provisioned")
         .added_workers()[0]
         .clone()
+}
+
+/// Run one jj command against the fixture repository, asserting success.
+fn jj_at(root: &Path, args: &[&str]) {
+    let output = Command::new("jj")
+        .args(["--config", "signing.behavior=drop"])
+        .args(args)
+        .current_dir(root)
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// Re-point `origin` at a real repository on disk - the shape the dogfood
+/// drive's remote had, whose last two path segments (`personal/dogfood-site-origin`)
+/// are not a GitHub identity.
+fn install_local_origin(repository: &Repository, root: &Path) {
+    let origin = root.join("personal").join("dogfood-site-origin.git");
+    fs::create_dir_all(origin.parent().expect("origin parent")).expect("origin parent directory");
+    jj_at(
+        root,
+        &["git", "init", "--colocate", &origin.to_string_lossy()],
+    );
+    jj_at(repository.root(), &["git", "remote", "remove", "origin"]);
+    jj_at(
+        repository.root(),
+        &["git", "remote", "add", "origin", &origin.to_string_lossy()],
+    );
+}
+
+/// Leave the Repository in the state a Pool created before `dogfood/03` is in:
+/// `origin` is a filesystem path, and the Pool still carries the slug the old
+/// derivation mined from it.
+fn install_legacy_fabricated_gh_repo(repository: &Repository, root: &Path) {
+    install_local_origin(repository, root);
+    let state = repository.state_store().pool();
+    let Loaded::Present(versioned) = state.load().expect("load Pool") else {
+        panic!("Pool state should exist");
+    };
+    let (mut current, revision) = versioned.into_parts();
+    current.gh_repo = "personal/dogfood-site-origin".to_owned();
+    let outcome = state
+        .commit(Expected::Match(revision), StateChange::Replace(current))
+        .expect("rewrite the Pool gh_repo");
+    assert!(matches!(outcome, jjfx::engine::CommitOutcome::Applied(_)));
 }
 
 /// The `jj` subcommands a fake-`jj` capture recorded, with the global flags
