@@ -48,6 +48,29 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
     repo.canonicalize().unwrap()
 }
 
+#[cfg(test)]
+/// Make a repository's `origin` auto-track every bookmark, in the repository's
+/// *own* config (`.jj/repo/config.toml`).
+///
+/// A bookmark created after this is written gets a `remote=origin present=false`
+/// remote-tracking entry even though no remote ref exists, so jj lists it twice
+/// under the plain `name` template. That double-listing is a *configuration*
+/// (`remotes.origin.auto-track-bookmarks`), not a jj default: with a clean jj
+/// config the same bookmark lists once. A test that depends on it must therefore
+/// construct it here rather than inherit it from the developer's
+/// `~/.config/jj/config.toml`, or it passes only on a machine that sets the
+/// option and fails on a clean-config CI runner (dogfood-2 02).
+pub(crate) fn track_bookmarks_from_origin(root: &Path) {
+    let config = root.join(".jj/repo/config.toml");
+    std::fs::create_dir_all(config.parent().expect("config has a parent"))
+        .expect("repo config directory");
+    std::fs::write(
+        &config,
+        "[remotes.origin]\nauto-track-bookmarks = \"glob:*\"\n",
+    )
+    .expect("repo-local jj config");
+}
+
 /// A single workspace. `path` records where the workspace's directory is, as
 /// far as the projection can tell: a recorded path whose directory is gone is
 /// [`WorkspacePath::Missing`] (the Workspace moved or was removed), while a

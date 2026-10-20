@@ -3598,13 +3598,12 @@ fn ready_ticket_requests<Q: TicketQuery>(
             }
             // Base a dependent on its Blockers' branches, exactly as
             // orchestration does, so a chain lands as a stack rather than as
-            // parallel branches off trunk. A Blocker with no branch to stack on
-            // is stated rather than left silent, so a dependent that is not fully
+            // parallel branches off trunk. A Blocker with no usable branch to
+            // stack on is stated with the bookmark state that leaves it
+            // unusable, rather than left silent, so a dependent that is not fully
             // stacked is never a surprise.
             let basis = dependency_basis(ready.blockers(ticket.id()), |blocker| {
                 resolve_ticket_branch(repository.root(), blocker)
-                    .name()
-                    .map(str::to_owned)
             });
             if let Some(context) = basis.context() {
                 request = request.with_dependency_context(context.clone());
@@ -3614,8 +3613,10 @@ fn ready_ticket_requests<Q: TicketQuery>(
                 .map_or("trunk", DispatchDependencyContext::pull_request_base);
             for blocker in basis.unstacked() {
                 eprintln!(
-                    "Ticket {} is blocked by {blocker}, which has no branch; basing it on {base}",
-                    ticket.id()
+                    "Ticket {} is blocked by {}, whose {}; basing it on {base}",
+                    ticket.id(),
+                    blocker.ticket(),
+                    blocker.reason()
                 );
             }
             Ok(request)
