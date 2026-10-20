@@ -245,6 +245,17 @@ impl PoolSession {
                 }
                 Vec::new()
             }
+            WorkspaceDispatchEvent::OrchestrationWaiting {
+                operation,
+                parent,
+                detail,
+            } => {
+                if self.orchestration_operation == Some(operation) {
+                    self.orchestration_operation = None;
+                    return vec![PoolUpdate::Status(format!("{parent}: {detail}"))];
+                }
+                Vec::new()
+            }
             WorkspaceDispatchEvent::OrchestrationTerminal {
                 operation,
                 parent,

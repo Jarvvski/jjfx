@@ -1,6 +1,6 @@
 # `dispatch --all` reports a capacity gap as `failed`, and the cap detail says "0 in flight"
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -41,9 +41,9 @@ situation, so the two messages disagree about the same state.
 
 ## Acceptance Criteria
 
-- [ ] A Ticket with no free Worker is reported the same way by `dispatch --all`
+- [x] A Ticket with no free Worker is reported the same way by `dispatch --all`
       and by a named `dispatch`, as a capacity gap (`waiting`), not `failed`.
-- [ ] A held-back-by-cap detail states the in-flight count that actually bound
+- [x] A held-back-by-cap detail states the in-flight count that actually bound
       the batch (the count the `governor` object reports), not a pre-launch zero.
 
 ## References
@@ -63,3 +63,35 @@ Not independently re-verified - the drive reproduced it live.
 
 The acceptance criteria are unchanged - they were already specific and
 testable, which is why this needed triage rather than a rewrite.
+
+## Resolution
+
+The Worker Pool is the other dial that bounds Dispatch, and a Pool with no idle
+Worker is a capacity gap, not a failure - the Ticket is *waiting* for a Run to
+finish, exactly as one the concurrency cap holds back is. The two ways to reach
+the gap now say the same thing:
+
+- One shared reason, `POOL_CAPACITY_GAP_DETAIL`, is carried by both paths: the
+  `--all` path (`src/engine/orchestration.rs`) and the named path
+  (`src/engine/direct_dispatch.rs`), which previously turned the gap into a
+  `Failed` outcome in phase `Capacity`.
+- A named `dispatch` whose reservation finds no idle Worker now returns
+  `OrchestrationStart::Waiting { ticket, detail }` instead of a hard
+  `Execution` error, so `src/cli.rs` renders it as `DispatchEntry::Waiting` -
+  the same shape `--all` already used. The removed `Capacity` failure phase and
+  its now-dead branches are gone.
+- `cap_hold_detail(cap, in_flight, fired)` names `in_flight + fired`: the count
+  that actually bound the batch, and the count `jjfx status --json`'s
+  `governor.running` reports once the batch has fired. The pre-launch count read
+  `0` for a first Dispatch even though the cap was exactly what held it.
+
+The TUI consumes `OrchestrationStart` exhaustively, so the new `Waiting` start is
+forwarded and shown as a status (`src/workspace_dispatch.rs`, its `adapter.rs`,
+`src/pool_session.rs`).
+
+Verified: `mise run check` (changelog validation + fmt + clippy -D warnings +
+build + test) passes.
+`a_pool_with_no_free_worker_is_reported_as_waiting_by_all_and_by_a_named_dispatch`
+asserts both paths report the same Ticket as `waiting` with the same detail, and
+`a_capped_dispatch_names_the_count_that_bound_the_batch` asserts the detail names
+`2 Run(s) in flight` and not the pre-launch `0`.

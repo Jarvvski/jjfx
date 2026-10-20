@@ -57,6 +57,32 @@ pub fn pace<T>(cap: ConcurrencyCap, in_flight: usize, batch: &[T]) -> (&[T], &[T
     batch.split_at(room(cap, in_flight).min(batch.len()))
 }
 
+/// The reason a Ticket the concurrency cap held back carries.
+///
+/// `in_flight` is the Runs already in flight and `fired` the prefix this batch
+/// launches before the cap is reached. The two together are the count that
+/// actually bound the batch - the count `status --json`'s `governor.running`
+/// reports once the batch has fired. Naming the pre-launch count instead reads
+/// `0` for a first Dispatch even though the cap is exactly what held it, and
+/// disagrees with a later Dispatch that reports the same state.
+pub fn cap_hold_detail(cap: ConcurrencyCap, in_flight: usize, fired: usize) -> String {
+    format!(
+        "held back by the concurrency cap (dispatch.max_concurrent = {}): {} Run(s) in flight, \
+         so a Run must finish before another may start",
+        cap.limit(),
+        in_flight.saturating_add(fired)
+    )
+}
+
+/// The reason a Ticket held back for want of a free Worker carries.
+///
+/// The Worker Pool is the other dial that bounds Dispatch, and a Pool with no
+/// idle Worker is a capacity gap, not a failure: the Ticket is *waiting* for a
+/// Run to finish, exactly as one the cap holds back is. The same detail is used
+/// wherever a Ticket cannot get a Worker, so `dispatch --all` and a named
+/// `dispatch` report the gap the same way.
+pub const POOL_CAPACITY_GAP_DETAIL: &str = "held back by the Worker Pool: no idle Worker is available, so a Run must finish before another may start";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +128,34 @@ mod tests {
             assert_eq!(held, ["A", "B"]);
             assert_eq!(room(cap(4), in_flight), 0);
         }
+    }
+
+    #[test]
+    fn a_first_dispatch_names_the_count_its_own_launches_reach() {
+        // Nothing is in flight yet, so the pre-launch count is 0; the batch
+        // fires its two and the cap is what holds the rest, so the count that
+        // actually bound it is 2.
+        let detail = cap_hold_detail(cap(2), 0, 2);
+        assert!(detail.contains("2 Run(s) in flight"), "{detail}");
+        assert!(!detail.contains("0 Run(s) in flight"), "{detail}");
+        assert!(detail.contains("max_concurrent = 2"), "{detail}");
+    }
+
+    #[test]
+    fn the_same_state_reached_twice_names_the_same_count() {
+        // The first Dispatch fired two Runs; a second Dispatch in the same
+        // window finds two already in flight and fires none. Both name the
+        // count the governor reports, so the two messages agree about one state.
+        let first = cap_hold_detail(cap(2), 0, 2);
+        let second = cap_hold_detail(cap(2), 2, 0);
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn a_pool_over_a_lowered_cap_names_its_real_in_flight_count() {
+        // A cap lowered under Runs already in flight fires nothing, so the
+        // count that bound the batch is what is really running, not the cap.
+        let detail = cap_hold_detail(cap(2), 5, 0);
+        assert!(detail.contains("5 Run(s) in flight"), "{detail}");
     }
 }

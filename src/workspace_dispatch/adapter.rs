@@ -676,12 +676,22 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
         let preparation = runner
             .prepare(&request, &parent_ticket, &discovery)
             .map_err(|error| error.to_string())?;
-        emit(WorkspaceDispatchOrchestrationEvent::Started {
-            parent: id.to_string(),
-            resumed: preparation.resumed(),
-        });
+        let resumed = preparation.resumed();
         match preparation.into_start() {
+            // No free Worker is a capacity gap, not a failure: report the
+            // Parent as waiting rather than as a Dispatch that broke.
+            crate::engine::OrchestrationStart::Waiting { ticket, detail } => {
+                emit(WorkspaceDispatchOrchestrationEvent::Waiting {
+                    parent: ticket.to_string(),
+                    detail,
+                });
+                return Ok(());
+            }
             crate::engine::OrchestrationStart::Direct(success) => {
+                emit(WorkspaceDispatchOrchestrationEvent::Started {
+                    parent: id.to_string(),
+                    resumed,
+                });
                 let (pid, session_id) = match success.execution() {
                     crate::engine::DirectDispatchExecution::Background { pid } => {
                         (Some(*pid), None)
@@ -705,6 +715,10 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
             }
             crate::engine::OrchestrationStart::Group => {}
         }
+        emit(WorkspaceDispatchOrchestrationEvent::Started {
+            parent: id.to_string(),
+            resumed,
+        });
 
         let mut projection_error = None;
         let options = crate::engine::OrchestrationOptions::new();
