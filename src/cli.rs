@@ -33,7 +33,8 @@ use crate::adhoc_ticket::{AdHocInput, AdHocSource, AdHocTicket};
 use crate::cli_help::{
     ADD_FLAGS, CHILDREN_FLAGS, CLEAN_FLAGS, DISPATCH_FLAGS, Flag, POOL_CREATE_FLAGS,
     POOL_DESTROY_FLAGS, POOL_LIST_FLAGS, POOL_PROFILE_FLAGS, POOL_RESIZE_FLAGS, RESOLVE_FLAGS,
-    RESUME_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, UNDO_FLAGS, WAIT_FLAGS,
+    RESUME_FLAGS, REVIEW_FLAGS, RM_FLAGS, SEND_FLAGS, STATUS_FLAGS, TICKET_LIST_FLAGS, UNDO_FLAGS,
+    WAIT_FLAGS,
 };
 use crate::config::{
     Config, MigrationsConfig, PoolConfig, PoolRoute, RepoConfig, TicketSource, TicketsConfig,
@@ -44,14 +45,14 @@ use crate::engine::{
     DEFAULT_POOL_NAME, DEFAULT_READY_LABEL, DirectDispatchError, DirectDispatchExecution,
     DirectDispatchFailurePhase, DirectDispatchOutcome, DirectDispatchRequest,
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
-    FollowUpExecution, FollowUpOutcome, Loaded, OrchestrationEvent, PoolCapacity, PoolCostSnapshot,
-    PoolName, QueueItemState, REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets,
-    Repository, RunActivity, RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode,
-    SpendDecision, SpendLimit, SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings,
-    TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome,
-    WireAgent, WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot,
-    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis,
-    resolve_ticket_branch,
+    FollowUpExecution, FollowUpOutcome, Loaded, LocalTicketReadiness, LocalTickets,
+    OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, QueueItemState,
+    REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets, Repository, RunActivity,
+    RunActivityKind, RunLogError, RunMode, SpendCap, SpendCapMode, SpendDecision, SpendLimit,
+    SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
+    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
+    WorkerActions, WorkerId, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus,
+    WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
@@ -159,11 +160,28 @@ pub enum Command {
     Ticket(TicketCommand),
 }
 
-/// The `ticket` subcommands: local Ticket state, reconciled on demand.
+/// The `ticket` subcommands: local Ticket state, reconciled on demand, and the
+/// read-only backlog view.
 #[derive(Debug, PartialEq, Eq)]
 pub enum TicketCommand {
     /// `ticket reconcile`: resolve finished local Tickets without a Dispatch.
     Reconcile,
+    /// `ticket list`: every Ticket the configured source discovers, with its
+    /// Status, Blockers and current readiness. Read-only: it reconciles nothing.
+    List(TicketListArgs),
+}
+
+/// The `ticket list` command's arguments: the lane whose readiness to report and
+/// the output format.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TicketListArgs {
+    /// The Worker Pool whose lane to evaluate. `None` fans out across the pools
+    /// that declare a routing label, exactly as `dispatch --all` does.
+    pub pool: Option<String>,
+    /// The label discovery looks for, overriding the pool's routing label.
+    pub label: Option<String>,
+    /// Print the Tickets as JSON rather than prose.
+    pub json: bool,
 }
 
 /// Which colocation transition the `colocation` command performs.
@@ -552,11 +570,60 @@ fn parse_check(args: &[String]) -> Result<Command> {
 }
 
 fn parse_ticket(args: &[String]) -> Result<Command> {
-    let usage = concat!("Usage: ", env!("CARGO_PKG_NAME"), " ticket reconcile");
+    let usage = concat!(
+        "Usage: ",
+        env!("CARGO_PKG_NAME"),
+        " ticket <reconcile|list> [--json] [--label <LABEL>] [--pool <name>]"
+    );
     match args.first().map(String::as_str) {
         Some("reconcile") if args.len() == 1 => Ok(Command::Ticket(TicketCommand::Reconcile)),
+        Some("list") => parse_ticket_list(&args[1..]),
         _ => bail!("{usage}"),
     }
+}
+
+/// Parse `ticket list [--json] [--label <LABEL>] [--pool <name>]`.
+///
+/// The parser only shapes the request; which lane a `--pool` names, and whether
+/// an unqualified request is ambiguous, is settled against the Repository's
+/// declarations when the command runs, so a parse never reads state.
+fn parse_ticket_list(args: &[String]) -> Result<Command> {
+    let usage = concat!(
+        "Usage: ",
+        env!("CARGO_PKG_NAME"),
+        " ticket list [--json] [--label <LABEL>] [--pool <name>]"
+    );
+    reject_unknown_flags("ticket list", TICKET_LIST_FLAGS, args)?;
+    let mut pool = None;
+    let mut label = None;
+    let mut json = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--json" => json = true,
+            "--pool" | "--label" => {
+                let flag = args[index].clone();
+                let value = args
+                    .get(index + 1)
+                    .ok_or_else(|| anyhow::anyhow!("missing value for {flag}"))?
+                    .clone();
+                if flag == "--pool" {
+                    pool = Some(value);
+                } else {
+                    label = Some(value);
+                }
+                index += 2;
+                continue;
+            }
+            value => bail!("unexpected argument for ticket list: {value}\n{usage}"),
+        }
+        index += 1;
+    }
+    Ok(Command::Ticket(TicketCommand::List(TicketListArgs {
+        pool,
+        label,
+        json,
+    })))
 }
 
 fn parse_colocation(args: &[String]) -> Result<Command> {
@@ -1450,6 +1517,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::Pool(command) => pool_command(&repository(colocate)?, command)?,
         Command::Ticket(TicketCommand::Reconcile) => {
             ticket_reconcile_command(&repository(colocate)?, tickets)?
+        }
+        Command::Ticket(TicketCommand::List(args)) => {
+            ticket_list_command(&repository(colocate)?, &args, tickets)?
         }
     }
     Ok(())
@@ -2747,6 +2817,19 @@ fn json_option(value: Option<&str>) -> String {
     value.map_or_else(|| "null".to_owned(), json_string)
 }
 
+/// Encode a slice of strings as a JSON array, in order.
+fn json_string_array(values: &[String]) -> String {
+    let mut out = String::from("[");
+    for (index, value) in values.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&json_string(value));
+    }
+    out.push(']');
+    out
+}
+
 fn normalize_worker(value: &str) -> Result<WorkerId> {
     let value = if value.starts_with("worker-") {
         value.to_owned()
@@ -3095,6 +3178,342 @@ fn ticket_reconcile_command(
     bail!("local Ticket reconcile failed")
 }
 
+/// How one Ticket stands in the backlog `ticket list` reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TicketVerdict {
+    /// In the Ready set: a `dispatch --all` would take it right now.
+    Ready,
+    /// Discovered but not runnable, with the reason a Dispatch would print.
+    Blocked(String),
+    /// Resolved: the work is finished, so nothing stops it and nothing is
+    /// waiting for it.
+    Done,
+}
+
+impl TicketVerdict {
+    /// The stable machine-readable state.
+    const fn state(&self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Blocked(_) => "blocked",
+            Self::Done => "done",
+        }
+    }
+
+    /// Whether the Ticket is ready right now.
+    const fn ready(&self) -> bool {
+        matches!(self, Self::Ready)
+    }
+
+    /// Why the Ticket is not ready, or `None` when it is ready or resolved.
+    fn reason(&self) -> Option<&str> {
+        match self {
+            Self::Blocked(reason) => Some(reason),
+            Self::Ready | Self::Done => None,
+        }
+    }
+}
+
+/// One Ticket in the `ticket list` output: what it is, its Status, its
+/// Blockers, and how it stands right now.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TicketListEntry {
+    ticket: String,
+    /// The Ticket's title, absent for a source that reports a Ticket it cannot
+    /// describe in full.
+    title: Option<String>,
+    /// The Ticket's own `Status:`, absent when the source did not report one.
+    status: Option<String>,
+    verdict: TicketVerdict,
+    /// The Ticket's declared Blockers, resolved to Ticket ids.
+    blockers: Vec<String>,
+}
+
+/// The backlog `ticket list` reports, folded across the lanes a `--all`
+/// Dispatch would discover over.
+///
+/// A Ticket several lanes see is one entry: ready wins, because a Ticket any
+/// lane would take is dispatchable, and when no lane takes it the first lane's
+/// reason is kept - one reason is enough to say what stops it. Entries keep
+/// discovery order, so the list reads like the source's own scan.
+#[derive(Debug, Default)]
+struct TicketBacklog {
+    entries: Vec<TicketListEntry>,
+    index: BTreeMap<String, usize>,
+}
+
+impl TicketBacklog {
+    /// Folds one local Ticket's readiness in, with the lane's verdict.
+    ///
+    /// The verdict is the lane's `ReadyTickets`, so it carries the label gate
+    /// only `TicketDiscovery` applies; the Status and Blockers come from the
+    /// readiness, which the source computed for the same status. A Ticket the
+    /// lane neither took nor diagnosed is resolved - the local source reports no
+    /// reason for a finished Ticket, so its absence from both sets is what
+    /// "finished" means.
+    fn record(&mut self, readiness: &LocalTicketReadiness, ready: &ReadyTickets) {
+        let ticket = readiness.ticket();
+        let id = ticket.id();
+        let verdict = if ready
+            .tickets()
+            .iter()
+            .any(|candidate| candidate.id().as_str() == id)
+        {
+            TicketVerdict::Ready
+        } else if let Some(diagnostic) = ready
+            .diagnostics()
+            .iter()
+            .find(|diagnostic| diagnostic.subject() == id)
+        {
+            TicketVerdict::Blocked(diagnostic.reason().to_owned())
+        } else {
+            TicketVerdict::Done
+        };
+        self.insert(TicketListEntry {
+            ticket: id.to_owned(),
+            title: (!ticket.title().is_empty()).then(|| ticket.title().to_owned()),
+            status: (!ticket.status().is_empty()).then(|| ticket.status().to_owned()),
+            verdict,
+            blockers: readiness.blockers().to_vec(),
+        });
+    }
+
+    /// Folds one lane's discovery in for a source with no richer backlog: the
+    /// Ready Tickets it returned, and a blocked entry for each diagnostic it
+    /// produced.
+    fn record_discovery(&mut self, ready: &ReadyTickets) {
+        for ticket in ready.tickets() {
+            self.insert(TicketListEntry {
+                ticket: ticket.id().as_str().to_owned(),
+                title: Some(ticket.title().as_str().to_owned()),
+                status: Some(ticket.status().as_str().to_owned()),
+                verdict: TicketVerdict::Ready,
+                blockers: ready
+                    .blockers(ticket.id())
+                    .iter()
+                    .map(|blocker| blocker.as_str().to_owned())
+                    .collect(),
+            });
+        }
+        for diagnostic in ready.diagnostics() {
+            self.insert(TicketListEntry {
+                ticket: diagnostic.subject().to_owned(),
+                title: None,
+                status: None,
+                verdict: TicketVerdict::Blocked(diagnostic.reason().to_owned()),
+                blockers: Vec::new(),
+            });
+        }
+    }
+
+    /// Inserts one entry, merging it with an entry for the same Ticket.
+    fn insert(&mut self, entry: TicketListEntry) {
+        if let Some(&position) = self.index.get(&entry.ticket) {
+            let existing = &mut self.entries[position];
+            // A lane that takes the Ticket wins outright, and brings its fuller
+            // description with it; otherwise the first lane's reason stands.
+            if entry.verdict.ready() && !existing.verdict.ready() {
+                *existing = entry;
+            }
+            return;
+        }
+        self.index.insert(entry.ticket.clone(), self.entries.len());
+        self.entries.push(entry);
+    }
+
+    /// Returns the folded entries in discovery order.
+    fn entries(&self) -> &[TicketListEntry] {
+        &self.entries
+    }
+}
+
+/// `ticket list`: every Ticket the configured source discovers, with its Status,
+/// its Blockers and whether it is ready right now.
+///
+/// **Read-only.** It discovers through the source and reports what it finds: it
+/// reconciles no Run, writes no Ticket and moves no Worker, so a `--json`
+/// consumer can poll it in a loop without changing what it is reading. That is
+/// the point of the command - `status`/`pool list` reconcile local Tickets as
+/// they read, which is right for a frontend but wrong for a consumer asking only
+/// "what is there".
+///
+/// Readiness is the verdict `dispatch --all` prints its blocked line from: the
+/// lanes are the lanes a `--all` Dispatch would fill (`discovery_lanes`), the
+/// filter each lane discovers by is `lane_filter`, and for a local source the
+/// Status and Blockers come from the same `LocalTickets::backlog` the Dispatch
+/// discovery payload is built on. The two cannot disagree.
+fn ticket_list_command(
+    repository: &Repository,
+    args: &TicketListArgs,
+    tickets_config: fn(&Repository) -> Result<TicketsConfig>,
+) -> Result<()> {
+    let config = crate::config::load()?;
+    let repo_config = config.repo_config(repository.root())?;
+    let available = config.pool_names_for(repository.root())?;
+    let routes = config.pool_routes_for(repository.root())?;
+    let tickets = tickets_config(repository)?;
+    // The list always fans out the way `dispatch --all` does: an operator asking
+    // "what is ready" is asking about every lane that would take work, and
+    // `--pool` narrows it to one.
+    let lanes = discovery_lanes(
+        &available,
+        &routes,
+        args.pool.as_deref(),
+        args.label.as_deref(),
+        true,
+    )?;
+    let filters = lanes
+        .iter()
+        .map(|lane| lane_filter(lane, &repo_config, &tickets))
+        .collect::<Result<Vec<_>>>()?;
+    let discovery = TicketDiscovery::new(configured_ticket_query(
+        repository.root(),
+        &tickets,
+        configured_runtime(repository),
+        &global_ready_label(args.label.as_deref()),
+    )?);
+
+    let mut backlog = TicketBacklog::default();
+    let local = (tickets.source == TicketSource::Local).then(|| {
+        LocalTickets::new(
+            repository.root().join(&tickets.local.root),
+            tickets.local.ready_status.clone(),
+            tickets.local.resolved_status.clone(),
+        )
+    });
+    for filter in &filters {
+        let ready = discovery.ready_tickets(filter)?;
+        match &local {
+            // The lane's Ready set is the verdict - it is what a Dispatch would
+            // take, label gate and all - and the backlog supplies the Status and
+            // Blockers the verdict alone does not carry.
+            Some(local) => {
+                for readiness in local.backlog(filter.status().as_str())? {
+                    backlog.record(&readiness, &ready);
+                }
+            }
+            None => backlog.record_discovery(&ready),
+        }
+    }
+
+    let reports = lanes
+        .iter()
+        .zip(&filters)
+        .map(|(lane, filter)| LaneReport {
+            pool: lane.pool.as_str(),
+            label: filter.label(),
+            status: filter.status().as_str(),
+        })
+        .collect::<Vec<_>>();
+    if args.json {
+        println!("{}", ticket_list_json(&reports, backlog.entries()));
+        return Ok(());
+    }
+    render_ticket_backlog(&reports, backlog.entries());
+    Ok(())
+}
+
+/// One lane `ticket list` evaluated, as the prose and JSON report it.
+struct LaneReport<'a> {
+    pool: &'a str,
+    label: &'a str,
+    status: &'a str,
+}
+
+/// The prose rendering of the backlog: the lanes searched, then one row per
+/// Ticket, so an empty list still says which lanes were looked at.
+fn render_ticket_backlog(lanes: &[LaneReport<'_>], entries: &[TicketListEntry]) {
+    println!("Lanes: {}", lane_summary(lanes));
+    if entries.is_empty() {
+        println!("No Tickets found");
+        return;
+    }
+    println!("{:<32} {:<16} {:<8} DETAIL", "TICKET", "STATUS", "STATE");
+    println!("{:<32} {:<16} {:<8} ------", "------", "------", "-----");
+    let mut counts = [0usize; 3];
+    for entry in entries {
+        counts[match entry.verdict {
+            TicketVerdict::Ready => 0,
+            TicketVerdict::Blocked(_) => 1,
+            TicketVerdict::Done => 2,
+        }] += 1;
+        println!(
+            "{:<32} {:<16} {:<8} {}",
+            entry.ticket,
+            entry.status.as_deref().unwrap_or("-"),
+            entry.verdict.state(),
+            entry.verdict.reason().unwrap_or("")
+        );
+    }
+    println!();
+    println!(
+        "{} ticket(s): {} ready, {} blocked, {} done",
+        entries.len(),
+        counts[0],
+        counts[1],
+        counts[2]
+    );
+}
+
+/// The lanes a report evaluated, as one readable clause.
+fn lane_summary(lanes: &[LaneReport<'_>]) -> String {
+    lanes
+        .iter()
+        .map(|lane| {
+            format!(
+                "{} (label {:?}, status {:?})",
+                lane.pool, lane.label, lane.status
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The machine-readable rendering of the backlog.
+///
+/// An object naming the lanes searched and the Tickets found, so an empty list
+/// still says which lanes were looked at and under which label and status. Each
+/// Ticket carries the same fields whichever source produced it.
+fn ticket_list_json(lanes: &[LaneReport<'_>], entries: &[TicketListEntry]) -> String {
+    let mut out = String::from("{\n  \"lanes\": [");
+    for (index, lane) in lanes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "\n    {{\n      \"pool\": {},\n      \"label\": {},\n      \"status\": {}\n    }}",
+            json_string(lane.pool),
+            json_string(lane.label),
+            json_string(lane.status)
+        ));
+    }
+    out.push_str("\n  ],\n  \"tickets\": [");
+    for (index, entry) in entries.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        let fields = [
+            ("ticket", json_string(&entry.ticket)),
+            ("title", json_option(entry.title.as_deref())),
+            ("status", json_option(entry.status.as_deref())),
+            ("state", json_string(entry.verdict.state())),
+            ("ready", entry.verdict.ready().to_string()),
+            ("blockers", json_string_array(&entry.blockers)),
+            ("reason", json_option(entry.verdict.reason())),
+        ];
+        out.push_str("\n    {\n");
+        for (position, (key, value)) in fields.iter().enumerate() {
+            if position > 0 {
+                out.push_str(",\n");
+            }
+            out.push_str(&format!("      \"{key}\": {value}"));
+        }
+        out.push_str("\n    }");
+    }
+    out.push_str("\n  ]\n}");
+    out
+}
+
 /// Reports why a Ticket the user named by hand is not in the Ready set, then lets
 /// the Dispatch proceed: naming a Ticket is deliberate, so naming it is the
 /// override.
@@ -3204,6 +3623,58 @@ fn ready_ticket_requests<Q: TicketQuery>(
         .collect()
 }
 
+/// One lane a `--all` Dispatch discovers over: the Worker Pool it fills and the
+/// label its Ready Tickets carry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiscoveryLane {
+    pool: PoolName,
+    label: String,
+}
+
+/// The lanes a `--all` Dispatch discovers over.
+///
+/// Several routable pools with no `--pool` fan out one lane each; every other
+/// shape resolves the single pool a Dispatch would fill, which is the loud
+/// refusal when a Repository holds several and none is named. `dispatch` and
+/// `ticket list` both read their lanes here, so the list and the Dispatch cannot
+/// disagree about which lanes exist or which label discovers each one.
+fn discovery_lanes(
+    available: &[PoolName],
+    routes: &[PoolRoute],
+    requested_pool: Option<&str>,
+    requested_label: Option<&str>,
+    all: bool,
+) -> Result<Vec<DiscoveryLane>> {
+    if all && requested_pool.is_none() && available.len() > 1 && !routes.is_empty() {
+        return Ok(routes
+            .iter()
+            .map(|route| DiscoveryLane {
+                pool: route.name().clone(),
+                label: route.label().to_owned(),
+            })
+            .collect());
+    }
+    let pool = resolve_pool(available, requested_pool)?;
+    let label = ready_label_for(requested_label, &pool, routes);
+    Ok(vec![DiscoveryLane { pool, label }])
+}
+
+/// The Ready Ticket filter one lane discovers by.
+///
+/// The label is the lane's; the status is the pool's own `ready_status`, falling
+/// back to the user-global value. Both `dispatch --all` and `ticket list` build
+/// their filter here, so a Ticket cannot be ready to one and blocked to the
+/// other.
+fn lane_filter(
+    lane: &DiscoveryLane,
+    repo_config: &RepoConfig,
+    tickets: &TicketsConfig,
+) -> Result<ReadyTicketFilter> {
+    let status =
+        TicketStatus::parse(repo_config.pool_ready_status(&lane.pool, tickets.ready_status()))?;
+    Ok(ReadyTicketFilter::new(&lane.label, status)?)
+}
+
 /// Fans a `--all` Dispatch out across the pools that declare a routing label.
 ///
 /// Each routable pool discovers its own ready work by its own label and the
@@ -3218,7 +3689,7 @@ fn ready_ticket_requests<Q: TicketQuery>(
 fn dispatch_all_across_pools(
     repository: &Repository,
     args: &DispatchArgs,
-    routes: &[PoolRoute],
+    lanes: &[DiscoveryLane],
     tickets_config: fn(&Repository) -> Result<TicketsConfig>,
     user_config: &Config,
     repo_config: &RepoConfig,
@@ -3242,8 +3713,8 @@ fn dispatch_all_across_pools(
     let mut routed = BTreeSet::new();
     let mut reported: Vec<(String, String)> = Vec::new();
 
-    for route in routes {
-        let scoped = repository.clone().with_pool(route.name().clone());
+    for lane in lanes {
+        let scoped = repository.clone().with_pool(lane.pool.clone());
         // Reconcile this pool's finished Runs before discovering its ready work,
         // so a Ticket whose Run completed since the last Dispatch resolves and
         // readies its dependent in this same fan-out.
@@ -3254,16 +3725,12 @@ fn dispatch_all_across_pools(
         }
         eprintln!(
             "Fetching tickets with label '{}' for pool '{}'...",
-            route.label(),
-            route.name()
+            lane.label, lane.pool
         );
         // The status a Ticket must be in to be ready is per pool, exactly as its
         // label routes it: a lane that declares its own `ready_status` draws work
         // by that status, and one that declares none keeps the user-global value.
-        let status = TicketStatus::parse(
-            repo_config.pool_ready_status(route.name(), tickets.ready_status()),
-        )?;
-        let filter = ReadyTicketFilter::new(route.label(), status)?;
+        let filter = lane_filter(lane, repo_config, &tickets)?;
         let ready = discovery.ready_tickets(&filter)?;
         // Fold by subject: every pool reports the same not-ready Ticket, and one
         // reason is enough to say what stops it.
@@ -3326,9 +3793,9 @@ fn dispatch_all_across_pools(
             // Name every search the fan-out ran - one label per routable pool -
             // ahead of the Tickets that were found but routed nowhere, so an
             // empty batch says which labels it looked for and under which root.
-            let mut batch = routes
+            let mut batch = lanes
                 .iter()
-                .map(|route| search_entry(route.label(), &tickets, repository))
+                .map(|lane| search_entry(&lane.label, &tickets, repository))
                 .collect::<Vec<_>>();
             batch.extend(skipped);
             render_dispatch_entries(&batch, true);
@@ -3535,16 +4002,25 @@ fn dispatch_command(
     let available = config.pool_names_for(repository.root())?;
     let routes = config.pool_routes_for(repository.root())?;
 
-    // `--all` with no `--pool` fans out across the pools that declare a routing
-    // label, sending each Ticket to the pool whose label it carries. The
-    // convenience is opt-in: a Repository whose pools declare no labels keeps
-    // ticket 06's loud refusal, so an unqualified Dispatch is never a silent
-    // choice, and an explicit `--pool` always means "only this lane".
-    if args.all && args.pool.is_none() && available.len() > 1 && !routes.is_empty() {
+    // The lanes this Dispatch may discover over: `--all` with no `--pool` fans
+    // out across the pools that declare a routing label, sending each Ticket to
+    // the pool whose label it carries. The convenience is opt-in: a Repository
+    // whose pools declare no labels keeps ticket 06's loud refusal, so an
+    // unqualified Dispatch is never a silent choice, and an explicit `--pool`
+    // always means "only this lane". `ticket list` reads its lanes from the same
+    // helper, so the two cannot disagree about which lanes exist.
+    let lanes = discovery_lanes(
+        &available,
+        &routes,
+        args.pool.as_deref(),
+        args.label.as_deref(),
+        args.all,
+    )?;
+    if lanes.len() > 1 {
         return dispatch_all_across_pools(
             repository,
             args,
-            &routes,
+            &lanes,
             tickets_config,
             &config,
             &repo_config,
@@ -3558,18 +4034,21 @@ fn dispatch_command(
     // Dispatch into a Repository with several pools refuses loudly, naming them,
     // rather than silently filling one. `--text` and `--from-file` follow the
     // same rule because they pass through here too.
-    let pool = resolve_pool(&available, args.pool.as_deref())?;
+    let lane = lanes
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("this Repository holds no Worker Pools"))?;
     // The ready label is per pool: `--label` overrides the pool's declared
     // routing label, which overrides the global default. The source's fallback
     // label is the global one, never the pool's: a Ticket that declares no
     // `Labels:` carries that, so it cannot match every lane at once.
-    let ready_label = ready_label_for(args.label.as_deref(), &pool, &routes);
+    let ready_label = lane.label.clone();
     let source_label = global_ready_label(args.label.as_deref());
     // Every pool-scoped read and write below - the pool document, its Workers,
     // its Run Records, its locks, its spend - follows the handle, so Worker
     // reservation, Dispatch Eligibility and the pool's size are all the selected
     // pool's (ADR 0012).
-    let scoped = repository.clone().with_pool(pool);
+    let scoped = repository.clone().with_pool(lane.pool.clone());
     let repository = &scoped;
 
     let model = selected_model(args.provider.as_deref(), args.model.as_deref())?;
@@ -3676,11 +4155,10 @@ fn dispatch_command(
     if args.all {
         // The ready status is per pool, exactly as the ready label is: a lane
         // that declares its own `ready_status` draws work by that status, and one
-        // that declares none keeps the user-global value.
-        let status = TicketStatus::parse(
-            repo_config.pool_ready_status(repository.selected_pool(), tickets.ready_status()),
-        )?;
-        let filter = ReadyTicketFilter::new(&ready_label, status)?;
+        // that declares none keeps the user-global value. The filter comes from
+        // the same helper `ticket list` reads, so the two cannot disagree about
+        // whether a Ticket is ready.
+        let filter = lane_filter(&lane, &repo_config, &tickets)?;
         eprintln!("Fetching tickets with label '{ready_label}'...");
         let ready = discovery.ready_tickets(&filter)?;
         if ready.tickets().is_empty() {
@@ -5394,6 +5872,37 @@ mod tests {
         assert!(
             parse(&args(&["clean", "bugs"])).is_err(),
             "clean takes no positional argument"
+        );
+    }
+
+    #[test]
+    fn ticket_list_parser_takes_the_lane_and_the_output_format() {
+        assert_eq!(
+            parse(&args(&["ticket", "list"])).expect("a bare list parses"),
+            Command::Ticket(TicketCommand::List(TicketListArgs {
+                pool: None,
+                label: None,
+                json: false,
+            }))
+        );
+        assert_eq!(
+            parse(&args(&[
+                "ticket", "list", "--json", "--label", "bug", "--pool", "bugs"
+            ]))
+            .expect("the flags parse"),
+            Command::Ticket(TicketCommand::List(TicketListArgs {
+                pool: Some("bugs".to_owned()),
+                label: Some("bug".to_owned()),
+                json: true,
+            }))
+        );
+        assert!(
+            parse(&args(&["ticket", "list", "--label"])).is_err(),
+            "a value-taking flag with no value must fail"
+        );
+        assert!(
+            parse(&args(&["ticket", "list", "bugs"])).is_err(),
+            "the list takes no positional argument"
         );
     }
 

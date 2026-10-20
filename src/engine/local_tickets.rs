@@ -155,6 +155,40 @@ impl LocalTickets {
         Ok(self.scan()?.into_iter().find(|ticket| ticket.id == id))
     }
 
+    /// Every Ticket the source holds, each with the readiness the Ready set
+    /// judges it by.
+    ///
+    /// This is the single computation both the Ready Ticket payload a Dispatch
+    /// discovers through and `ticket list` read, so a Ticket cannot be ready to
+    /// one and blocked to the other. It reports Tickets the Ready set omits as
+    /// well - a resolved one is finished rather than blocked, and a malformed
+    /// file is named with the rule it breaks - so a caller sees the whole
+    /// backlog rather than only its runnable head.
+    pub fn backlog(
+        &self,
+        ready_status: &str,
+    ) -> Result<Vec<LocalTicketReadiness>, LocalTicketError> {
+        let tickets = self.scan()?;
+        Ok(tickets
+            .iter()
+            .map(|ticket| {
+                let blockers = self.blocker_ids(ticket, &tickets);
+                match ticket.malformation() {
+                    Some(malformation) => {
+                        LocalTicketReadiness::malformed(ticket.clone(), blockers, malformation)
+                    }
+                    None => {
+                        let ready = self.is_ready(ticket, &tickets, ready_status);
+                        let reason = (!ready)
+                            .then(|| self.not_ready_reason(ticket, &tickets, ready_status))
+                            .flatten();
+                        LocalTicketReadiness::new(ticket.clone(), blockers, ready, reason)
+                    }
+                }
+            })
+            .collect())
+    }
+
     /// Marks a Ticket as `claimed` when a Worker reserves it.
     ///
     /// Only the `Status:` line is rewritten, so every other byte of the file is
@@ -273,32 +307,34 @@ impl LocalTickets {
     /// draws its work by that status while the source's own value stays the
     /// user-global default.
     fn ready_payload(&self, filter: &ReadyTicketFilter) -> Result<String, TicketQueryError> {
-        let tickets = self.scan().map_err(TicketQueryError::from)?;
-        let ready_status = filter.status().as_str();
+        let backlog = self.backlog(filter.status().as_str())?;
         let mut entries = Vec::new();
         let mut diagnostics = Vec::new();
-        for ticket in &tickets {
-            if let Some(malformation) = ticket.malformation() {
+        for readiness in &backlog {
+            let ticket = readiness.ticket();
+            if let Some(malformation) = readiness.malformation() {
                 // A malformed file must never be dropped silently: emit it so
                 // `TicketDiscovery` reports a diagnostic rather than the ready
                 // list collapsing to a plausible-looking zero.
                 entries.push(ticket.malformed_entry(filter, malformation));
                 continue;
             }
-            if self.is_ready(ticket, &tickets, ready_status) {
+            if readiness.is_ready() {
                 entries.push(json!({
                     "id": ticket.id,
                     "title": ticket.title,
                     "status": filter.status().as_str(),
                     "labels": ticket.routing_labels(&self.ready_label),
-                    "blocked_by": self.blocker_ids(ticket, &tickets),
+                    "blocked_by": readiness.blockers(),
                 }));
                 continue;
             }
             // A well-formed Ticket that is not ready is the case the bare `[]`
             // used to hide: name it and say what stops it, so a caller can tell
-            // "nothing to do" from "nothing can be done".
-            if let Some(reason) = self.not_ready_reason(ticket, &tickets, ready_status) {
+            // "nothing to do" from "nothing can be done". A resolved Ticket has
+            // no reason - it is finished, not blocked - and needs no
+            // explanation.
+            if let Some(reason) = readiness.reason() {
                 diagnostics.push(json!({ "subject": ticket.id, "reason": reason }));
             }
         }
@@ -476,6 +512,82 @@ impl LocalTickets {
             Some(blocker) => Some(format!("{} ({})", blocker.id, blocker.status)),
             None => Some(format!("{number} (unknown)")),
         }
+    }
+}
+
+/// One local Ticket's readiness, as the Ready set judges it.
+///
+/// The value both the Dispatch discovery payload and `ticket list` read, so the
+/// blocked line a `dispatch --all` prints and the line the list prints come from
+/// one computation and cannot disagree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTicketReadiness {
+    ticket: LocalTicket,
+    /// The Ticket's declared Blockers, resolved to sibling Ticket ids - a bare
+    /// number when no sibling in the feature declares it.
+    blockers: Vec<String>,
+    malformation: Option<LocalTicketMalformation>,
+    ready: bool,
+    /// Why the Ticket is not ready: the rule a malformed file breaks, or what
+    /// stops a well-formed one. `None` when it is ready, and when it is resolved
+    /// - a finished Ticket is not blocked by anything.
+    reason: Option<String>,
+}
+
+impl LocalTicketReadiness {
+    fn new(
+        ticket: LocalTicket,
+        blockers: Vec<String>,
+        ready: bool,
+        reason: Option<String>,
+    ) -> Self {
+        Self {
+            ticket,
+            blockers,
+            malformation: None,
+            ready,
+            reason,
+        }
+    }
+
+    fn malformed(
+        ticket: LocalTicket,
+        blockers: Vec<String>,
+        malformation: LocalTicketMalformation,
+    ) -> Self {
+        Self {
+            ticket,
+            blockers,
+            malformation: Some(malformation),
+            ready: false,
+            reason: Some(malformation.reason().to_owned()),
+        }
+    }
+
+    /// Returns the Ticket this readiness describes.
+    pub fn ticket(&self) -> &LocalTicket {
+        &self.ticket
+    }
+
+    /// Returns the Ticket's declared Blockers, resolved to sibling Ticket ids.
+    pub fn blockers(&self) -> &[String] {
+        &self.blockers
+    }
+
+    /// Returns the convention rule the Ticket file breaks, when it breaks one.
+    pub fn malformation(&self) -> Option<LocalTicketMalformation> {
+        self.malformation
+    }
+
+    /// Returns whether the Ticket is in the Ready set right now.
+    pub fn is_ready(&self) -> bool {
+        self.ready
+    }
+
+    /// Returns why the Ticket is not ready, or `None` when it is ready or
+    /// already resolved.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }
 
@@ -1378,6 +1490,88 @@ mod tests {
         let foundation =
             &graph.sub_issues()[&TicketId::parse("widgets--01-foundation").expect("id")];
         assert_eq!(foundation.ticket().status().as_str(), "done");
+    }
+
+    /// The backlog is the one computation the Dispatch discovery payload and
+    /// `ticket list` share, so it must report the same verdicts: a ready Ticket,
+    /// a blocked one with its Blocker and status, and a resolved one with no
+    /// reason at all.
+    #[test]
+    fn the_backlog_reports_every_ticket_with_its_readiness() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-foundation.md",
+            "# Foundation\n\nStatus: claimed\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "02-dependent.md",
+            "# Dependent\n\nStatus: ready-for-agent\nBlocked by: 01\n",
+        );
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "03-done.md",
+            "# Done\n\nStatus: resolved\n",
+        );
+
+        let backlog = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved")
+            .backlog("ready-for-agent")
+            .expect("backlog");
+
+        assert_eq!(backlog.len(), 3);
+        let foundation = &backlog[0];
+        assert_eq!(foundation.ticket().id(), "widgets--01-foundation");
+        assert_eq!(foundation.ticket().status(), "claimed");
+        assert!(!foundation.is_ready());
+        assert_eq!(
+            foundation.reason(),
+            Some("expected status \"ready-for-agent\", found \"claimed\"")
+        );
+
+        let dependent = &backlog[1];
+        assert_eq!(dependent.ticket().id(), "widgets--02-dependent");
+        assert!(!dependent.is_ready());
+        assert_eq!(dependent.blockers(), ["widgets--01-foundation"]);
+        assert_eq!(
+            dependent.reason(),
+            Some("blocked by widgets--01-foundation (claimed)")
+        );
+
+        // A resolved Ticket is finished, not blocked: it carries no reason, so a
+        // caller can tell "nothing is waiting for it" from "something stops it".
+        let done = &backlog[2];
+        assert_eq!(done.ticket().id(), "widgets--03-done");
+        assert!(!done.is_ready());
+        assert_eq!(done.reason(), None);
+    }
+
+    /// A malformed file is named with the rule it breaks rather than dropped,
+    /// and it never reads as ready.
+    #[test]
+    fn the_backlog_names_a_malformed_file_with_the_rule_it_breaks() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-no-status.md",
+            "# No status\n\nA body with no Status line.\n",
+        );
+
+        let backlog = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved")
+            .backlog("ready-for-agent")
+            .expect("backlog");
+
+        assert_eq!(backlog.len(), 1);
+        assert!(!backlog[0].is_ready());
+        assert_eq!(
+            backlog[0].malformation(),
+            Some(LocalTicketMalformation::MissingStatus)
+        );
+        assert_eq!(backlog[0].reason(), Some("missing a `Status:` line"));
     }
 
     #[test]
