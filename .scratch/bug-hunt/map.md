@@ -325,3 +325,14 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   workspace's working-copy commit whenever `JJFX_TEST_SIGNING_OFF` is unset;
   `mise run test` sets it. Harness reconstructed at
   `.scratch/bug-hunt/load-harness.sh`.
+
+### Filed - 2026-10-20
+
+- [44](issues/44-concurrent-operations-diverge-the-op-log.md) - F5, filed from a
+  sighting while implementing `dogfood/13`: concurrent `jj` operations across
+  Workspaces made jj report `reconcile divergent operations` and swallowed a
+  worker's commit into a divergent head. The worker noticed and re-applied the
+  edit, so nothing was lost - but only because it read its own history. jjfx is
+  built to run concurrent jj operations against one shared operation log, and jj
+  attributes an operation to no tool or process, so a lost commit has no
+  attribution. Reproduce or rule out; if real, either serialise or report it.
