@@ -122,6 +122,18 @@ pub fn conflicted_commits(repo_root: &Path, workspace: &str) -> anyhow::Result<V
     Ok(ids)
 }
 
+/// Whether any commit matched by `revset` carries an unresolved conflict.
+///
+/// jj records a conflict in the commit a rebase rewrote and still exits zero, so
+/// a conflict is read from the commits themselves - jj's `conflicts()` revset -
+/// never inferred from a rebase's exit code. `--count` makes the answer a
+/// number, so "no conflict" is distinguishable from "jj could not be read".
+pub fn conflicted(dir: &Path, revset: &str) -> anyhow::Result<bool> {
+    let query = format!("({revset}) & conflicts()");
+    let out = read_in_dir(dir, &["log", "-r", &query, "--count"])?;
+    Ok(parse_count(&out)? > 0)
+}
+
 /// Resolve the conflicts in one revision with `jj resolve`, honouring the user's
 /// own merge tool. `tool` overrides it, including jj's built-in `:ours`/`:theirs`
 /// side pickers.
@@ -1192,6 +1204,22 @@ mod tests {
                 .expect("resolve")
                 .is_empty(),
             "a clean chain resolves nothing rather than opening a merge tool"
+        );
+    }
+
+    #[test]
+    fn a_conflict_is_read_from_the_commits_not_a_rebase_exit_code() {
+        let (root, ws_a) = conflicted_repo("jj-conflicted-read");
+
+        // `ws-a`'s chain carries the conflict the rebase recorded; the root
+        // workspace's own chain does not.
+        assert!(
+            conflicted(&ws_a, "::@").expect("conflict read"),
+            "the rewritten commit holds the conflict"
+        );
+        assert!(
+            !conflicted(&root, "::@").expect("conflict read"),
+            "an unrelated workspace stays clean"
         );
     }
 

@@ -248,6 +248,7 @@ fn rebase_waits_for_the_workspace_operation_lock() {
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             "rebase -b owner/eng-301-action -d main",
+            REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             // The persisted `gh_repo` is checked against `origin` before any
@@ -402,6 +403,7 @@ fn rebase_and_open_pull_request_resolve_the_prefixed_bookmark_the_agent_created(
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             "rebase -b owner/eng-301-action -d main",
+            REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             // The persisted `gh_repo` is checked against `origin` before any
@@ -1024,6 +1026,9 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \" $* \" in\n",
             "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
+            // The rebase is clean; the push fails for a non-conflict reason, so
+            // the verb rolls the rebase back as before.
+            "  *' conflicts() '*) printf '0\\n' ;;\n",
             "  *' git push '*) echo rejected >&2; exit 1 ;;\n",
             "esac\n"
         ),
@@ -1058,9 +1063,93 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
             "rebase -b owner/eng-301-action -d main",
+            REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
             "undo --allow-cross-workspace",
         ]
+    );
+}
+
+/// The drive's failure shape: `main` moved under the Worker, so the rebase
+/// records a conflict, and jj refuses to push a conflicted commit. The verb must
+/// not attempt the doomed push - and must not report a `rollback: None` that
+/// implies the rebase was undone when it was not. It names the state the
+/// Workspace is actually in: rebased, conflicts to resolve.
+#[test]
+fn a_rebase_that_conflicts_names_the_state_and_never_pushes_or_rolls_back() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let log = repository.root().join("conflicted-rebase.log");
+    fs::write(&log, "{}\n").expect("Worker log");
+    set_terminal_worker(&repository, &worker, &log);
+
+    let bin = temporary_directory.path().join("conflicted-rebase-bin");
+    fs::create_dir(&bin).expect("fake command directory");
+    write_executable(
+        &bin.join("jj"),
+        concat!(
+            "#!/bin/sh\n",
+            "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
+            "case \" $* \" in\n",
+            "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
+            // The rebase rewrote the bookmark's commit and recorded a conflict in
+            // it. jj exits zero either way, so the conflict is read from the
+            // commit; the push below would be refused, so it must never run.
+            "  *' conflicts() '*) printf '1\\n' ;;\n",
+            "  *' git push '*) printf 'SHOULD NOT PUSH\\n' >&2; exit 1 ;;\n",
+            "esac\n"
+        ),
+    );
+    let capture = temporary_directory
+        .path()
+        .join("conflicted-rebase-commands");
+    let result = temporary_directory.path().join("conflicted-rebase-result");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        env::var("PATH").expect("PATH should exist")
+    );
+
+    let output = Command::new(env::current_exe().expect("current test executable"))
+        .args(["--ignored", "--exact", "repository_action_helper"])
+        .env(HELPER_MODE, "rebase")
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .env(HELPER_CAPTURE, &capture)
+        .env("PATH", path)
+        .output()
+        .expect("rebase helper should run");
+
+    assert!(output.status.success());
+    let outcome = fs::read_to_string(&result).expect("rebase result");
+    assert!(
+        outcome.contains("conflicts to resolve"),
+        "the conflicted rebase must be named, not a generic push failure: {outcome}"
+    );
+    assert!(
+        outcome.contains("owner/eng-301-action"),
+        "the named outcome identifies the branch: {outcome}"
+    );
+    let commands = jj_operations(&fs::read_to_string(&capture).expect("command capture"));
+    assert_eq!(
+        commands,
+        vec![
+            "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
+            "rebase -b owner/eng-301-action -d main",
+            REBASE_CONFLICT_QUERY,
+        ],
+        "a conflicted rebase is left in place, so it is never pushed or rolled back"
+    );
+    assert!(
+        !commands
+            .iter()
+            .any(|command| command.starts_with("git push")),
+        "jj refuses a conflicted commit, so the push is not attempted: {commands:?}"
+    );
+    assert!(
+        !commands.iter().any(|command| command.starts_with("undo")),
+        "a rollback that cannot be trusted must not be claimed: {commands:?}"
     );
 }
 
@@ -1274,6 +1363,8 @@ fn re_running_rebase_on_an_already_pushed_worker_succeeds_without_rolling_back()
             "printf 'jj %s\\n' \"$*\" >> \"$JJFX_ACTION_CAPTURE\"\n",
             "case \" $* \" in\n",
             "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
+            // The rebase is clean, so the verb proceeds to push.
+            "  *' conflicts() '*) printf '0\\n' ;;\n",
             // The remote already carries the bookmark, and the push moves
             // nothing, so the snapshot is identical either side of it.
             "  *' remote_bookmarks() '*) printf 'origin/owner/eng-301-action aaaa\\n' ;;\n",
@@ -2361,6 +2452,12 @@ fn jj_operations(capture: &str) -> Vec<String> {
         .collect()
 }
 
+/// The read `rebase` makes after the rebase and before the push: whether the
+/// Worker's own stack above `main` - what the rebase moved and a push would
+/// carry - holds a conflict. A conflict here is why jj refuses the push.
+const REBASE_CONFLICT_QUERY: &str =
+    "log -r (::\"owner/eng-301-action\" ~ ::main) & conflicts() --count";
+
 /// The fake-`jj` arms every landing verb needs: the bookmark the Worker's Ticket
 /// actually carries - prefixed and described, unlike the bare id Worker state
 /// records - and a push that moves a remote bookmark so the classified outcome
@@ -2374,6 +2471,8 @@ const LANDING_JJ_ARMS: &str = concat!(
     "      printf 'origin/owner/eng-301-action aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\n'\n",
     "    fi ;;\n",
     "  *' git push '*) : > \"$JJFX_ACTION_CAPTURE.mark\" ;;\n",
+    // The rebased stack is clean, so the verb proceeds to push.
+    "  *' conflicts() '*) printf '0\\n' ;;\n",
 );
 
 /// Run one jj command against a fixture repository with its own `JJ_CONFIG`,
