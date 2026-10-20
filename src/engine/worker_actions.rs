@@ -1037,10 +1037,91 @@ struct PullRequest {
     review_decision: String,
 }
 
+/// The `--json` fields [`SystemCommands::failing_checks`] asks `gh` for.
+///
+/// `gh` changed the field that carries a check's outcome: releases up to 2.x
+/// report `conclusion` (`SUCCESS`/`FAILURE`/...), while 2.102 dropped it for
+/// `bucket` (`pass`/`fail`/`pending`/`skipping`/`cancel`) and `state`. Requesting
+/// a field this `gh` does not have fails the call outright, so the request names
+/// only the current pair; [`Check`] still decodes `conclusion` if a body carries
+/// it.
+const CHECK_FIELDS: &str = "name,bucket,state";
+
 #[derive(Debug, Deserialize)]
 struct Check {
     name: String,
-    conclusion: String,
+    #[serde(default)]
+    bucket: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    conclusion: Option<String>,
+}
+
+impl Check {
+    /// The check's outcome, from whichever field this `gh` filled in.
+    ///
+    /// `bucket` is preferred, then `state`, then the legacy `conclusion`; an
+    /// unrecognised value falls through to the next field. `None` means the body
+    /// carried none of them, which is the shape [`parse_checks`] refuses.
+    fn outcome(&self) -> Option<CheckOutcome> {
+        self.bucket
+            .as_deref()
+            .and_then(CheckOutcome::from_bucket)
+            .or_else(|| self.state.as_deref().and_then(CheckOutcome::from_state))
+            .or_else(|| {
+                self.conclusion
+                    .as_deref()
+                    .and_then(CheckOutcome::from_state)
+            })
+    }
+
+    /// Whether the check ran and failed - the only outcome `review` acts on.
+    fn is_failing(&self) -> bool {
+        matches!(self.outcome(), Some(CheckOutcome::Fail))
+    }
+}
+
+/// A check's outcome, normalised across the fields `gh` has reported it in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckOutcome {
+    /// The check passed, or reported nothing actionable.
+    Pass,
+    /// The check ran and failed.
+    Fail,
+    /// The check has not finished.
+    Pending,
+    /// The check was skipped.
+    Skipping,
+    /// The check was cancelled.
+    Cancel,
+}
+
+impl CheckOutcome {
+    /// Decodes one of `gh`'s `bucket` values.
+    fn from_bucket(bucket: &str) -> Option<Self> {
+        match bucket.to_ascii_lowercase().as_str() {
+            "pass" => Some(Self::Pass),
+            "fail" => Some(Self::Fail),
+            "pending" => Some(Self::Pending),
+            "skipping" => Some(Self::Skipping),
+            "cancel" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
+
+    /// Decodes a `state`, which is the check-run conclusion the legacy
+    /// `conclusion` field reported verbatim.
+    fn from_state(state: &str) -> Option<Self> {
+        match state.to_ascii_uppercase().as_str() {
+            "SUCCESS" | "NEUTRAL" => Some(Self::Pass),
+            "FAILURE" | "ACTION_REQUIRED" | "TIMED_OUT" | "STARTUP_FAILURE" => Some(Self::Fail),
+            "PENDING" | "QUEUED" | "IN_PROGRESS" | "WAITING" | "REQUESTED" => Some(Self::Pending),
+            "SKIPPED" | "STALE" => Some(Self::Skipping),
+            "CANCELLED" => Some(Self::Cancel),
+            _ => None,
+        }
+    }
 }
 
 impl SystemCommands {
@@ -1320,6 +1401,7 @@ impl SystemCommands {
         number: u64,
     ) -> Result<Vec<Check>, WorkerActionError> {
         let number = number.to_string();
+        let command = format!("gh -R {repository} pr checks {number} --json {CHECK_FIELDS}");
         let output = Command::new("gh")
             .args([
                 "-R",
@@ -1328,33 +1410,27 @@ impl SystemCommands {
                 "checks",
                 &number,
                 "--json",
-                "name,conclusion",
+                CHECK_FIELDS,
             ])
             .output()
             .map_err(|source| WorkerActionError::Command {
                 operation: "query pull-request checks",
                 detail: source.to_string(),
             })?;
+        // `gh pr checks` exits non-zero when a check has failed, but still
+        // prints the checks as JSON, so only an empty stdout is a real failure.
         if !output.status.success() && output.stdout.is_empty() {
             return Err(WorkerActionError::Command {
                 operation: "query pull-request checks",
-                detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                detail: format!(
+                    "`{command}` failed: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
             });
         }
-        let checks = serde_json::from_slice::<Vec<Check>>(&output.stdout).map_err(|source| {
-            WorkerActionError::Command {
-                operation: "decode pull-request checks",
-                detail: source.to_string(),
-            }
-        })?;
-        Ok(checks
+        Ok(parse_checks(&command, &output.stdout)?
             .into_iter()
-            .filter(|check| {
-                matches!(
-                    check.conclusion.to_ascii_uppercase().as_str(),
-                    "FAILURE" | "STARTUP_FAILURE" | "TIMED_OUT"
-                )
-            })
+            .filter(Check::is_failing)
             .collect())
     }
 
@@ -1437,6 +1513,39 @@ fn interactive_agent_command(runtime: AgentRuntime, session_id: Option<&str>) ->
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Decodes a `gh pr checks` body into the checks it reports.
+///
+/// `command` is the invocation the body came from; it is quoted back in every
+/// error so a `gh` whose output jjfx cannot read is diagnosable from the message
+/// alone. A body carrying none of the outcome fields `gh` has used - a shape
+/// from an unexpected `gh` - is refused rather than read as "no failing checks",
+/// which would send a Worker to review a pull request whose failures it never
+/// saw. `gh`'s own output is included so the mismatch can be seen directly.
+fn parse_checks(command: &str, body: &[u8]) -> Result<Vec<Check>, WorkerActionError> {
+    let raw = String::from_utf8_lossy(body);
+    let checks = serde_json::from_str::<Vec<Check>>(raw.as_ref()).map_err(|source| {
+        WorkerActionError::Command {
+            operation: "query pull-request checks",
+            detail: format!(
+                "`{command}` returned a shape jjfx cannot read ({source}); output: {}",
+                raw.trim()
+            ),
+        }
+    })?;
+    if let Some(check) = checks.iter().find(|check| check.outcome().is_none()) {
+        return Err(WorkerActionError::Command {
+            operation: "query pull-request checks",
+            detail: format!(
+                "`{command}` returned a check without a `bucket`, `state` or `conclusion` field: \
+                 {}; output: {}",
+                check.name,
+                raw.trim()
+            ),
+        });
+    }
+    Ok(checks)
 }
 
 fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[Check]) -> String {
@@ -1670,6 +1779,115 @@ mod tests {
         );
         // Absorb can conflict the commits above it, so the prompt says so.
         assert!(prompt.contains("conflicted"), "{prompt}");
+    }
+
+    /// The body `gh -R Jarvvski/jjfx pr checks 163 --json name,bucket,state`
+    /// returned on gh 2.102.0, captured 2026-10-20.
+    const CAPTURED_CHECKS: &str = include_str!("../../tests/fixtures/gh/pr-checks-2.102.json");
+
+    /// The command string `failing_checks` quotes back in any parse error.
+    const CHECKS_COMMAND: &str = "gh -R o/r pr checks 7 --json name,bucket,state";
+
+    /// The parse must read the body a current `gh` actually returns - a shape
+    /// with no `conclusion` field - rather than reject it. This pins it against
+    /// a captured body so a future gh rename is caught here.
+    #[test]
+    fn the_parse_reads_a_captured_current_gh_checks_body() {
+        let checks = parse_checks(CHECKS_COMMAND, CAPTURED_CHECKS.as_bytes())
+            .expect("the captured body parses");
+
+        assert_eq!(checks.len(), 1, "the captured body reports one check");
+        assert_eq!(checks[0].name, "check");
+        assert_eq!(checks[0].outcome(), Some(CheckOutcome::Pass));
+        assert!(!checks[0].is_failing());
+    }
+
+    /// The failing check is the one `review` acts on, read from `bucket`, while
+    /// a passing check is left alone.
+    #[test]
+    fn a_failing_bucket_is_the_check_review_acts_on() {
+        let checks = parse_checks(
+            CHECKS_COMMAND,
+            br#"[{"bucket":"fail","name":"tests","state":"FAILURE"},
+                 {"bucket":"pass","name":"lint","state":"SUCCESS"}]"#,
+        )
+        .expect("a current-gh body parses");
+
+        let failing: Vec<&str> = checks
+            .iter()
+            .filter(|check| check.is_failing())
+            .map(|check| check.name.as_str())
+            .collect();
+        assert_eq!(failing, vec!["tests"]);
+    }
+
+    /// A body with only `state` - no `bucket` - still classifies, so the parse
+    /// does not hinge on a single field name.
+    #[test]
+    fn a_state_only_body_still_classifies() {
+        let checks = parse_checks(CHECKS_COMMAND, br#"[{"name":"tests","state":"FAILURE"}]"#)
+            .expect("a state-only body parses");
+
+        assert!(checks[0].is_failing());
+    }
+
+    /// The legacy shape - the `conclusion` field gh 2.102 dropped - keeps
+    /// decoding, so a body captured from an older gh is not a hard failure.
+    #[test]
+    fn the_legacy_conclusion_field_still_decodes() {
+        let checks = parse_checks(
+            CHECKS_COMMAND,
+            br#"[{"conclusion":"FAILURE","name":"tests"}]"#,
+        )
+        .expect("a legacy body parses");
+
+        assert!(checks[0].is_failing());
+    }
+
+    /// An all-passing set yields no failing checks.
+    #[test]
+    fn an_all_passing_set_reports_no_failing_checks() {
+        let checks = parse_checks(
+            CHECKS_COMMAND,
+            br#"[{"bucket":"pass","name":"tests","state":"SUCCESS"},
+                 {"bucket":"pass","name":"lint","state":"SUCCESS"}]"#,
+        )
+        .expect("a current-gh body parses");
+
+        assert!(!checks.iter().any(Check::is_failing));
+    }
+
+    /// An empty set is a valid body - a pull request with no checks - not an
+    /// unrecognised shape.
+    #[test]
+    fn an_empty_checks_body_is_no_failing_checks() {
+        let checks = parse_checks(CHECKS_COMMAND, b"[]").expect("an empty body parses");
+
+        assert!(checks.is_empty());
+    }
+
+    /// A body with none of the outcome fields is refused by name, quoting the
+    /// command and gh's own output, rather than read as "no failing checks".
+    #[test]
+    fn an_unrecognised_checks_shape_names_the_command_and_gh_output() {
+        let body = br#"[{"name":"tests"}]"#;
+        let error = parse_checks(CHECKS_COMMAND, body).expect_err("the shape is refused");
+        let message = error.to_string();
+
+        assert!(message.contains(CHECKS_COMMAND), "{message}");
+        assert!(message.contains(r#"[{"name":"tests"}]"#), "{message}");
+    }
+
+    /// A body that is not a checks array at all is refused the same way - the
+    /// command and the raw output, never a bare serde error.
+    #[test]
+    fn a_body_that_is_not_a_checks_array_names_the_command_and_gh_output() {
+        let error =
+            parse_checks(CHECKS_COMMAND, b"not json").expect_err("a non-array body is refused");
+        let message = error.to_string();
+
+        assert!(message.contains(CHECKS_COMMAND), "{message}");
+        assert!(message.contains("not json"), "{message}");
     }
 
     #[test]

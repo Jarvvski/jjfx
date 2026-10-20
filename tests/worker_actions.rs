@@ -1784,7 +1784,7 @@ fn review_builds_one_provider_neutral_follow_up_from_pr_state() {
     );
     write_executable(
         &bin.join("gh"),
-        "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"mergeable\":\"CONFLICTING\",\"reviewDecision\":\"CHANGES_REQUESTED\"}]' ;;\n  *\"pr checks\"*) printf '%s\\n' '[{\"name\":\"tests\",\"conclusion\":\"FAILURE\"},{\"name\":\"lint\",\"conclusion\":\"SUCCESS\"}]'; exit 1 ;;\nesac\n",
+        "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"mergeable\":\"CONFLICTING\",\"reviewDecision\":\"CHANGES_REQUESTED\"}]' ;;\n  *\"pr checks\"*) printf '%s\\n' '[{\"bucket\":\"fail\",\"name\":\"tests\",\"state\":\"FAILURE\"},{\"bucket\":\"pass\",\"name\":\"lint\",\"state\":\"SUCCESS\"}]'; exit 1 ;;\nesac\n",
     );
     write_executable(
         &bin.join("claude"),
@@ -1823,6 +1823,63 @@ fn review_builds_one_provider_neutral_follow_up_from_pr_state() {
     assert!(prompt.contains("has merge conflicts"));
     assert!(prompt.contains("tests"));
     assert!(!prompt.contains("   - lint"));
+}
+
+/// A `gh` whose `pr checks` output jjfx cannot read must fail by naming the
+/// command and quoting gh's own output, never by surfacing a bare serde error -
+/// otherwise a field rename is invisible behind "missing field".
+#[test]
+fn review_fails_loudly_when_gh_returns_an_unrecognised_checks_shape() {
+    let (temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+    let prior_log = repository.root().join("review-unreadable-prior.log");
+    fs::write(
+        &prior_log,
+        "{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"review-session\"}\n",
+    )
+    .expect("prior Session log");
+    set_terminal_worker(&repository, &worker, &prior_log);
+    let bin = temporary_directory.path().join("review-unreadable-bin");
+    fs::create_dir(&bin).expect("fake executable directory");
+    write_executable(
+        &bin.join("jj"),
+        "#!/bin/sh\ncase \" $* \" in\n  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\nesac\n",
+    );
+    // A shape with none of the outcome fields gh has used.
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"REVIEW_REQUIRED\"}]' ;;\n  *\"pr checks\"*) printf '%s\\n' '[{\"name\":\"tests\"}]' ;;\nesac\n",
+    );
+    let result = temporary_directory.path().join("review-unreadable-result");
+    let path = env::join_paths([
+        bin.as_os_str(),
+        PathBuf::from("/usr/bin").as_os_str(),
+        PathBuf::from("/bin").as_os_str(),
+    ])
+    .expect("review PATH");
+    let output = Command::new(env::current_exe().expect("test executable"))
+        .args(["--exact", "failed_review_action_helper", "--ignored"])
+        .env("PATH", path)
+        .env(HELPER_REPOSITORY, repository.root())
+        .env(HELPER_WORKER, worker.as_str())
+        .env(HELPER_RESULT, &result)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed Review helper should run");
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let reported = fs::read_to_string(&result).expect("failed Review result");
+    assert!(
+        reported.contains("gh -R owner/repo pr checks 42 --json name,bucket,state"),
+        "the failure must name the command: {reported}"
+    );
+    assert!(
+        reported.contains(r#"[{"name":"tests"}]"#),
+        "the failure must quote gh's own output: {reported}"
+    );
 }
 
 #[test]
@@ -2120,6 +2177,22 @@ fn review_action_helper() {
         format!("session={session}; completed={completed}"),
     )
     .expect("Review result");
+}
+
+#[test]
+#[ignore]
+fn failed_review_action_helper() {
+    let repository =
+        Repository::open(env::var_os(HELPER_REPOSITORY).expect("repository")).expect("repository");
+    let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
+    let error = WorkerActions::new(repository)
+        .review(&worker, RunMode::Foreground)
+        .expect_err("an unreadable checks body should fail");
+    fs::write(
+        env::var_os(HELPER_RESULT).expect("result path"),
+        error.to_string(),
+    )
+    .expect("failed Review result");
 }
 
 #[test]
