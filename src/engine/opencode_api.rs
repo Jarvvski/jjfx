@@ -25,7 +25,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::engine::WorkerId;
-use crate::engine::run_log::{RunActivity, opencode_message_activities};
+use crate::engine::run_log::{
+    RunActivity, RunUsage, micro_usd, opencode_message_activities, opencode_usage,
+};
 
 /// The opencode executable looked up on `PATH`.
 const OPENCODE_EXECUTABLE: &str = "opencode";
@@ -57,7 +59,13 @@ fn session_from_env(value: Option<&str>) -> Option<String> {
 ///
 /// Only the fields jjfx's Run path needs are kept: the id, the session that
 /// owns it when it is a child, the directory the session is anchored to, how it
-/// ended, and its title.
+/// ended, its title, and the spend it has accumulated.
+///
+/// A session reports its **cumulative** cost and token usage - the whole
+/// session, not one Run - because opencode aggregates them per session. jjfx
+/// keeps them so a Run delivered through its session, which writes no process
+/// log, can still record what it cost: the Run's own spend is this total less
+/// the total the session carried when the Run started.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Session {
     id: String,
@@ -65,6 +73,8 @@ pub struct Session {
     directory: Option<PathBuf>,
     outcome: Option<SessionOutcome>,
     title: Option<String>,
+    cost_micro_usd: Option<u64>,
+    usage: Option<RunUsage>,
 }
 
 impl Session {
@@ -98,6 +108,17 @@ impl Session {
     /// The session's human title, when opencode reported one.
     pub fn title(&self) -> Option<&str> {
         self.title.as_deref()
+    }
+
+    /// The session's cumulative cost in millionths of one US dollar, when
+    /// opencode reported a usable one.
+    pub const fn cost_micro_usd(&self) -> Option<u64> {
+        self.cost_micro_usd
+    }
+
+    /// The session's cumulative token usage, when opencode reported it.
+    pub const fn usage(&self) -> Option<&RunUsage> {
+        self.usage.as_ref()
     }
 }
 
@@ -1001,6 +1022,10 @@ struct SessionInfo {
     outcome: Option<String>,
     #[serde(default)]
     location: Option<LocationRef>,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    tokens: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -1016,6 +1041,8 @@ impl SessionInfo {
             directory: self.location.map(|location| location.directory),
             outcome: self.outcome.map(session_outcome),
             title: self.title,
+            cost_micro_usd: self.cost.and_then(micro_usd),
+            usage: self.tokens.as_ref().map(opencode_usage),
         }
     }
 }
@@ -1212,6 +1239,40 @@ mod tests {
         assert_eq!(sessions[1].directory(), Some(Path::new("/w/two")));
         assert_eq!(sessions[1].title(), None);
         assert_eq!(sessions[1].outcome(), None);
+    }
+
+    #[test]
+    fn a_session_carries_the_cost_and_tokens_opencode_reported() {
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(SESSIONS)]));
+
+        let sessions = api.list_sessions().expect("parses");
+
+        assert_eq!(sessions[0].cost_micro_usd(), Some(500_000));
+        let usage = sessions[0].usage().expect("reported tokens");
+        assert_eq!(usage.input_tokens(), 1);
+        assert_eq!(usage.output_tokens(), 2);
+        // A zero cost is a measurement of zero, not an absent one.
+        assert_eq!(sessions[1].cost_micro_usd(), Some(0));
+        assert_eq!(
+            sessions[1].usage().map(|usage| usage.input_tokens()),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn a_session_without_cost_or_tokens_reports_neither() {
+        let payload = r#"{"data":[{"id":"ses_x","location":{"directory":"/w"}}]}"#;
+        let api = OpenCodeApi::with_runner(FakeRunner::replying(vec![ok(payload)]));
+
+        let session = api
+            .list_sessions()
+            .expect("parses")
+            .into_iter()
+            .next()
+            .expect("one session");
+
+        assert_eq!(session.cost_micro_usd(), None);
+        assert_eq!(session.usage(), None);
     }
 
     #[test]

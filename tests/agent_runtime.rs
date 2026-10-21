@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use jjfx::engine::{
     AgentRuntime, AgentRuntimeCapabilities, AgentRuntimeInvocation, AgentRuntimeProbeError,
-    BackgroundStart, Expected, FollowUpExecution, PoolCapacity, Repository, RunMode, RunRequest,
-    RunReset, RunSupervisor, RunSupervisorError, StateChange, WireAgent, WireStatus, WorkerActions,
-    WorkerId, WorkerStatus,
+    BackgroundStart, Expected, FollowUpExecution, PoolCapacity, Repository, RunMode,
+    RunRecordUsage, RunRequest, RunReset, RunSupervisor, RunSupervisorError, SessionBaseline,
+    StateChange, WireAgent, WireStatus, WorkerActions, WorkerId, WorkerStatus,
 };
 use jjfx::test_support::LIVENESS_TIMEOUT;
 use rustix::process::{
@@ -59,6 +59,8 @@ const HELPER_OPENCODE_UNAVAILABLE: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_UN
 const HELPER_OPENCODE_OUTCOME: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME";
 const HELPER_OPENCODE_SEND_PROMPT: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SEND_PROMPT";
 const HELPER_OPENCODE_PERMISSIONS: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_PERMISSIONS";
+const HELPER_OPENCODE_SESSION_COST: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_COST";
+const HELPER_OPENCODE_SESSION_TOKENS: &str = "JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_TOKENS";
 
 #[test]
 fn removed_pi_runtime_is_rejected_with_a_clear_message() {
@@ -1750,7 +1752,7 @@ impl OpencodeSessionFixture {
         self.repository
             .state_store()
             .sessions()
-            .record(&self.worker_id, session_id)
+            .record(&self.worker_id, session_id, SessionBaseline::default())
             .expect("record session");
     }
 
@@ -2082,11 +2084,10 @@ case "$1" in
     fi
     case "$2" in
       session.get)
-        if [ -n "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME" ]; then
-          printf '{"data":{"id":"ses_test","outcome":"%s"}}' "$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME"
-        else
-          printf '{"data":{"id":"ses_test"}}'
-        fi
+        printf '{"data":{"id":"ses_test"%s%s%s}}' \
+          "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME:+,\"outcome\":\"$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_OUTCOME\"}" \
+          "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_COST:+,\"cost\":$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_COST}" \
+          "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_TOKENS:+,\"tokens\":$JJFX_AGENT_RUNTIME_HELPER_OPENCODE_SESSION_TOKENS}"
         exit 0 ;;
       session.active)
         printf '{"data":%s}' "${JJFX_AGENT_RUNTIME_HELPER_OPENCODE_ACTIVE:-{}}"
@@ -2185,10 +2186,16 @@ impl OpencodeControlFixture {
 
     /// Records the session the Worker's Run drives, as ticket 38 would.
     fn record_session(&self, session_id: &str) {
+        self.record_session_from(session_id, SessionBaseline::default());
+    }
+
+    /// Records the session with the spend it already carried, the way a resumed
+    /// session's Run records its baseline.
+    fn record_session_from(&self, session_id: &str, baseline: SessionBaseline) {
         self.repository
             .state_store()
             .sessions()
-            .record(&self.worker_id, session_id)
+            .record(&self.worker_id, session_id, baseline)
             .expect("record session");
     }
 
@@ -2453,6 +2460,135 @@ fn reconcile_runs_finishes_a_busy_opencode_worker_on_its_session_outcome() {
     );
 }
 
+/// A session-delivered opencode Run writes no process log, so its cost and
+/// tokens come from its session: reconciling the Run records the session's
+/// reported spend on the durable Run record.
+#[test]
+fn reconcile_runs_records_a_session_delivered_runs_cost_and_tokens() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("opencode", dead_pid(), "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper_with(
+        "reconcile",
+        &[
+            (HELPER_OPENCODE_OUTCOME, "succeeded"),
+            (HELPER_OPENCODE_SESSION_COST, "0.125"),
+            (
+                HELPER_OPENCODE_SESSION_TOKENS,
+                r#"{"input":100,"output":20,"reasoning":5,"cache":{"read":10,"write":2}}"#,
+            ),
+        ],
+    );
+    let status = fs::read_to_string(&fixture.result).expect("helper result");
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(status, "Done");
+    let records = fixture
+        .repository
+        .state_store()
+        .runs()
+        .records()
+        .expect("Run records");
+    assert_eq!(records.len(), 1, "the Run must append exactly one record");
+    assert_eq!(records[0].cost_micro_usd, Some(125_000));
+    let usage = records[0].usage.expect("the session reported tokens");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(usage.reasoning_output_tokens, 5);
+    assert_eq!(usage.cached_input_tokens, 10);
+    assert_eq!(usage.cache_write_input_tokens, 2);
+}
+
+/// A resumed session's cost is cumulative, so the Run records its own spend -
+/// the session total less the baseline it started from - not the whole session.
+#[test]
+fn reconcile_runs_records_a_resumed_sessions_cost_as_the_runs_own_spend() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("opencode", dead_pid(), "ENG-42");
+    fixture.record_session_from(
+        "ses_run",
+        SessionBaseline {
+            cost_micro_usd: 200_000,
+            usage: RunRecordUsage {
+                input_tokens: 50,
+                output_tokens: 5,
+                reasoning_output_tokens: 1,
+                cached_input_tokens: 3,
+                cache_write_input_tokens: 4,
+            },
+        },
+    );
+
+    let output = fixture.run_helper_with(
+        "reconcile",
+        &[
+            (HELPER_OPENCODE_OUTCOME, "succeeded"),
+            (HELPER_OPENCODE_SESSION_COST, "0.5"),
+            (
+                HELPER_OPENCODE_SESSION_TOKENS,
+                r#"{"input":150,"output":25,"reasoning":6,"cache":{"read":13,"write":9}}"#,
+            ),
+        ],
+    );
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = fixture
+        .repository
+        .state_store()
+        .runs()
+        .records()
+        .expect("Run records");
+    assert_eq!(
+        records[0].cost_micro_usd,
+        Some(300_000),
+        "the recorded cost is the Run's own spend, not the session total"
+    );
+    let usage = records[0].usage.expect("usage");
+    assert_eq!(usage.input_tokens, 100);
+    assert_eq!(usage.output_tokens, 20);
+    assert_eq!(usage.reasoning_output_tokens, 5);
+    assert_eq!(usage.cached_input_tokens, 10);
+    assert_eq!(usage.cache_write_input_tokens, 5);
+}
+
+/// A session that reports no cost leaves the Run's record without one: an
+/// unmeasured Run is recorded as unpriced, never as a Run that cost nothing.
+#[test]
+fn reconcile_runs_records_no_cost_when_the_session_reports_none() {
+    let fixture = opencode_control_fixture();
+    fixture.write_opencode();
+    fixture.write_busy_worker("opencode", dead_pid(), "ENG-42");
+    fixture.record_session("ses_run");
+
+    let output = fixture.run_helper_with("reconcile", &[(HELPER_OPENCODE_OUTCOME, "succeeded")]);
+
+    assert!(
+        output.status.success(),
+        "helper failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let records = fixture
+        .repository
+        .state_store()
+        .runs()
+        .records()
+        .expect("Run records");
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].cost_micro_usd, None);
+    assert_eq!(records[0].usage, None);
+}
+
 /// Liveness is `session outcome` *or* a Run-log result: a Run whose session is
 /// still open but whose log carries a provider terminal event is finished. An
 /// open session is not evidence of a running one - opencode reports a session
@@ -2660,7 +2796,7 @@ impl OpencodeSendFixture {
         self.repository
             .state_store()
             .sessions()
-            .record(&self.worker_id, session_id)
+            .record(&self.worker_id, session_id, SessionBaseline::default())
             .expect("record session");
     }
 

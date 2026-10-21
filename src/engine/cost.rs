@@ -45,6 +45,16 @@ impl PoolCost {
         self.unpriced_runs
     }
 
+    /// Whether every Run totalled reported no usable cost, so the cost total is
+    /// not a measurement of what was spent - only an absence of data.
+    ///
+    /// A window with no Runs is not unmeasured: there is nothing to measure, and
+    /// nothing was spent. This is the case a spend total must never present as
+    /// `$0.0000` without saying so.
+    pub const fn is_unmeasured(self) -> bool {
+        self.runs > 0 && self.unpriced_runs == self.runs
+    }
+
     /// The total cost in millionths of one US dollar.
     pub const fn cost_micro_usd(self) -> u64 {
         self.cost_micro_usd
@@ -406,8 +416,22 @@ impl SpendCap {
     /// The cap fires at or above its limit - a Run at exactly the cap would push
     /// the total past it - and the message names the scope, the current total and
     /// the setting that overrides it.
+    ///
+    /// A window whose Runs all reported no cost is not a measurement, so the cap
+    /// cannot be enforced against it: the decision says so rather than letting a
+    /// configured cap appear to be in force. It proceeds rather than refusing -
+    /// there is no evidence of spend to refuse on - so the operator learns the
+    /// cap is inert without work being halted on an unknown.
     pub fn evaluate(self, scope: &SpendScope, snapshot: &PoolCostSnapshot) -> SpendDecision {
-        let cost = self.window.cost(snapshot).cost_micro_usd();
+        let window = self.window.cost(snapshot);
+        if window.is_unmeasured() {
+            return SpendDecision::Warned(format!(
+                "no Run in the spend window reported a cost, so {} cannot be enforced - \
+                 dispatching anyway",
+                scope.describe(self.limit_micro_usd)
+            ));
+        }
+        let cost = window.cost_micro_usd();
         if cost < self.limit_micro_usd {
             return SpendDecision::Allowed;
         }
@@ -492,7 +516,9 @@ pub fn evaluate_spend(limits: impl IntoIterator<Item = SpendLimit>) -> SpendDeci
 pub enum SpendDecision {
     /// Under the cap, or no cap configured.
     Allowed,
-    /// Over the cap in warn mode: Dispatch proceeds, with this message.
+    /// Dispatch proceeds, with this message: either the cap was exceeded in warn
+    /// mode, or it could not be enforced because the window's Runs reported no
+    /// cost.
     Warned(String),
     /// Over the cap in block mode: Dispatch is refused, with this message.
     Refused(String),
@@ -707,6 +733,65 @@ mod tests {
             panic!("expected a warning");
         };
         assert!(message.contains("dispatching anyway"), "{message}");
+    }
+
+    #[test]
+    fn a_window_whose_runs_all_report_no_cost_is_not_a_measurement() {
+        let records = [
+            record("worker-01", Some("2026-10-15T09:00:00Z"), None),
+            record("worker-01", Some("2026-10-15T10:00:00Z"), None),
+        ];
+
+        let snapshot = PoolCostSnapshot::from_records(&records, now());
+
+        assert!(snapshot.total().is_unmeasured());
+        assert_eq!(snapshot.total().cost_micro_usd(), 0);
+        // A window with no Runs is not unmeasured: there is nothing to measure.
+        assert!(!PoolCost::default().is_unmeasured());
+    }
+
+    #[test]
+    fn a_window_with_some_priced_runs_is_a_measurement() {
+        let records = [
+            record("worker-01", Some("2026-10-15T09:00:00Z"), None),
+            record("worker-01", Some("2026-10-15T10:00:00Z"), Some(1_000_000)),
+        ];
+
+        let snapshot = PoolCostSnapshot::from_records(&records, now());
+
+        assert!(!snapshot.total().is_unmeasured());
+        assert_eq!(snapshot.total().unpriced_runs(), 1);
+    }
+
+    #[test]
+    fn a_cap_over_an_unmeasured_window_says_it_cannot_be_enforced() {
+        let snapshot = PoolCostSnapshot::from_records(
+            &[record("worker-01", Some("2026-10-15T09:00:00Z"), None)],
+            now(),
+        );
+        // Even a blocking cap proceeds rather than refusing on an unknown: there
+        // is no evidence of spend to refuse on, and the message says the cap is
+        // inert rather than letting it appear to be in force.
+        let cap = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block);
+        let SpendDecision::Warned(message) = cap.evaluate(&SpendScope::Repository, &snapshot)
+        else {
+            panic!("expected a warning");
+        };
+        assert!(message.contains("cannot be enforced"), "{message}");
+        assert!(message.contains("$5.0000"), "{message}");
+        assert!(message.contains("Repository"), "{message}");
+    }
+
+    #[test]
+    fn a_cap_with_no_runs_at_all_allows_dispatch() {
+        // Nothing has run, so there is nothing unmeasured to report: the cap is
+        // trivially under its limit.
+        let snapshot = PoolCostSnapshot::from_records(&[], now());
+        let cap = SpendCap::new(5_000_000, SpendWindow::Week, SpendCapMode::Block);
+        assert_eq!(
+            cap.evaluate(&SpendScope::Repository, &snapshot),
+            SpendDecision::Allowed
+        );
     }
 
     #[test]

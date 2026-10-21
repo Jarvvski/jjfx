@@ -310,6 +310,18 @@ gate.
 | `window` | `"week"` | The window the cap totals over: `today`, `week` (the last seven days), or `total` (every recorded Run). |
 | `on_exceed` | `"block"` | What Dispatch does once the aggregate reaches the cap: `block` refuses it, `warn` lets it through and reports the overage. |
 
+Each Run's cost is the provider's own report for that Run. A Claude or Codex Run
+carries it on its terminal event; an opencode Run reports cost and tokens per
+step, so jjfx sums them from the Run's own log - and, for a Run delivered through
+its opencode session (which writes no process log), from the session's
+cumulative total less what that session had already spent when the Run started.
+A Run whose runtime reports no usable cost is recorded as **unpriced**: it adds
+nothing to the aggregate. A spend total that no Run measured is not presented as
+`$0.0000`; `jjfx status` says the total is not a measurement, and a cap over a
+window whose Runs all reported no cost reports that it cannot be enforced rather
+than appearing to be in force. That is the one case a cap does not gate: there
+is no evidence of spend to refuse on, so Dispatch proceeds with the report.
+
 The cap fires at or above its limit - a Run at exactly the cap would push the
 total past it. A blocked Dispatch is refused before any Worker is reserved or
 launched, with a message naming the cap, the current total and the setting that
