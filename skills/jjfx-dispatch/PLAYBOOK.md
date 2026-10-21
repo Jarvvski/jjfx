@@ -109,18 +109,18 @@ jjfx rebase worker-XXXX
 **What jjfx should own:** not counting one bookmark twice. The verbs should work on
 exactly the branch a Worker just produced.
 
-### 3c. `jjfx review` cannot run on a current `gh`
+### 3c. `jjfx review` runs the bounded loop
 
-`jjfx review` aborts with `cannot query pull-request checks: Unknown JSON field:
-"conclusion"` on gh 2.102 (the field is now `bucket` / `state`). Findings 03, 04.
+**Fixed.** `jjfx review` used to abort with `cannot query pull-request checks:
+Unknown JSON field: "conclusion"` on gh 2.102 (the field is now `bucket` /
+`state`), and it sent one prompt that produced no findings - so the bounded loop
+its `--fg` help advertised had no caller. Findings 03, 04.
 
-**Workaround:** none via `jjfx review`. Address review comments directly in the
-Worker's Workspace (`jjfx mount`, or `jjfx send <worker> "<prompt>"`), or open the
-PR and work it by hand.
-
-**What jjfx should own:** reading the checks `gh` actually returns, and - if
-`review` is meant to be the bounded loop its `--fg` help advertises - actually
-driving `ReviewLoop` (finding 04). Until then, treat `review` as one prompt.
+`jjfx review <worker>` now drives that loop: each pass reads the PR's unresolved
+review threads through `gh`, and a pass that found something sends its findings
+to the Worker to address. It stops on `[review] max_passes` or on a stalled
+round, and only a pass that finds nothing is success; any other stop escalates
+the unresolved findings for a human and exits non-zero.
 
 ### 3d. A pool of N serves N Tickets
 
@@ -207,8 +207,8 @@ guess, or read the source to discover:
 3. **Bookmark resolution.** One bookmark is not two; landing verbs work on a fresh
    branch. (§3b)
 4. **The check reader.** Read the `gh` the operator has. (§3c)
-5. **The review loop.** Wire `ReviewLoop` to a command, or stop advertising it.
-   (§3c, finding 04)
+5. **The review loop.** Wire `ReviewLoop` to a command. (§3c, finding 04, done:
+   `jjfx review`)
 6. **Worker reuse.** Return a finished Worker to the pool. (§3d, done)
 7. **Resume safety.** Do not re-run a resolved Ticket. (§3e)
 8. **Delivery.** Perform the push+PR the prompt promises. (§4, done: `jjfx deliver`)

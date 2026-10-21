@@ -3,11 +3,12 @@
 //! rather than a silent success when the bound stops it.
 //!
 //! This is the bound ADR 0016 keeps in jjfx rather than in a prompt. It is
-//! generic over the [`Reviewer`] that supplies each pass's findings; jjfx no
-//! longer ingests an external review bot's findings into the review verb, so the
-//! bound stands on its own. [`ReviewLoop::run_recorded`] drives it through the
-//! decision log, so a pass already recorded replays rather than reaching the
-//! reviewer again (ticket 12).
+//! generic over the [`Reviewer`] that supplies each pass's findings; jjfx owns
+//! the loop again, and the [`Reviewer`] the binary supplies reads the Pull
+//! Request's unresolved review threads (see `review_threads`). The bound itself
+//! names no vendor, so a different findings source is a different [`Reviewer`].
+//! [`ReviewLoop::run_recorded`] drives it through the decision log, so a pass
+//! already recorded replays rather than reaching the reviewer again (ticket 12).
 
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,6 +24,7 @@ pub struct ReviewRequest {
     repository: String,
     base: String,
     source_branch: String,
+    number: Option<u64>,
 }
 
 impl ReviewRequest {
@@ -36,7 +38,20 @@ impl ReviewRequest {
             repository: repository.into(),
             base: base.into(),
             source_branch: source_branch.into(),
+            number: None,
         }
+    }
+
+    /// Returns this request with the Pull Request number a reviewer can address
+    /// it by.
+    ///
+    /// A reviewer that reads a Pull Request through the forge needs the number;
+    /// one that resolves it from `source_branch` does not. It is optional rather
+    /// than required so the branch-addressed request stays valid, and a reviewer
+    /// that needs the number says so when it is absent.
+    pub fn with_number(mut self, number: u64) -> Self {
+        self.number = Some(number);
+        self
     }
 
     /// Returns the `owner/repo` the review targets.
@@ -52,6 +67,11 @@ impl ReviewRequest {
     /// Returns the head ref the review reviews.
     pub fn source_branch(&self) -> &str {
         &self.source_branch
+    }
+
+    /// Returns the Pull Request number, when the request names one.
+    pub const fn number(&self) -> Option<u64> {
+        self.number
     }
 }
 
@@ -417,6 +437,10 @@ pub enum ReviewStop {
     /// A round made no progress: it surfaced nothing new, or retired nothing, so
     /// another pass would only spend compute for the same findings.
     NoProgress,
+    /// A pass could not read its findings source, so the loop cannot say whether
+    /// the review is clean. An unreadable review is not an empty one, and it must
+    /// never converge.
+    Incomplete,
 }
 
 impl ReviewStop {
@@ -426,6 +450,7 @@ impl ReviewStop {
             Self::PassCap => "the pass cap",
             Self::Converged => "convergence (a pass found nothing)",
             Self::NoProgress => "no progress (a round found nothing new or retired nothing)",
+            Self::Incomplete => "an unreadable review",
         }
     }
 
@@ -442,17 +467,32 @@ impl ReviewStop {
 /// findings - either it never addressed them, or it addressed them and had no
 /// pass left to confirm they are gone. It reports them here instead of
 /// discarding them, so hitting the bound escalates rather than silently
-/// succeeding.
+/// succeeding. A stop that had a cause beyond the findings - a review that could
+/// not be read - carries it in `reason`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReviewEscalation {
     findings: Vec<ReviewFinding>,
     stop: ReviewStop,
+    reason: Option<String>,
 }
 
 impl ReviewEscalation {
     /// Creates an escalation for the findings a loop stopped with.
     fn new(findings: Vec<ReviewFinding>, stop: ReviewStop) -> Self {
-        Self { findings, stop }
+        Self {
+            findings,
+            stop,
+            reason: None,
+        }
+    }
+
+    /// Creates an escalation for a pass that could not read its findings source.
+    fn incomplete(findings: Vec<ReviewFinding>, reason: String) -> Self {
+        Self {
+            findings,
+            stop: ReviewStop::Incomplete,
+            reason: Some(reason),
+        }
     }
 
     /// Returns the findings the loop could not resolve, in the reviewer's order.
@@ -463,6 +503,11 @@ impl ReviewEscalation {
     /// Returns why the loop stopped.
     pub const fn stop(&self) -> ReviewStop {
         self.stop
+    }
+
+    /// Returns the reason a stop carries beyond its findings, when it has one.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
     }
 }
 
@@ -506,6 +551,23 @@ impl ReviewLoopSummary {
         }
     }
 
+    /// A loop that stopped because a pass could not read its findings source.
+    fn incomplete(
+        passes: usize,
+        findings: usize,
+        reason: String,
+        unresolved: Vec<ReviewFinding>,
+        replayed: Vec<u32>,
+    ) -> Self {
+        Self {
+            passes,
+            findings,
+            stop: ReviewStop::Incomplete,
+            escalation: Some(ReviewEscalation::incomplete(unresolved, reason)),
+            replayed,
+        }
+    }
+
     /// Returns the number of reviewer passes that ran.
     pub const fn passes(&self) -> usize {
         self.passes
@@ -533,6 +595,12 @@ impl ReviewLoopSummary {
         self.escalation
             .as_ref()
             .map_or(&[], |escalation| escalation.findings())
+    }
+
+    /// Returns the reason the loop stopped beyond its findings, when there is
+    /// one - a review that could not be read, rather than a round that stalled.
+    pub fn reason(&self) -> Option<&str> {
+        self.escalation.as_ref().and_then(ReviewEscalation::reason)
     }
 
     /// Returns how many passes were replayed from a recorded decision.
@@ -673,6 +741,19 @@ impl ReviewLoop {
             findings += outcome.findings().len();
             if was_replayed {
                 replayed.push(pass as u32);
+            }
+            // A pass that could not read its source is not a pass that found
+            // nothing: it cannot converge, and its findings - if it managed any -
+            // are escalated with the reason rather than addressed. The loop stops
+            // here, so an unreadable review never reads as a clean one.
+            if let ReviewCompleteness::Incomplete { reason } = outcome.completeness() {
+                return Ok(ReviewLoopSummary::incomplete(
+                    passes,
+                    findings,
+                    reason.clone(),
+                    outcome.findings().to_vec(),
+                    replayed,
+                ));
             }
             if outcome.findings().is_empty() {
                 return Ok(ReviewLoopSummary::converged(passes, findings, replayed));
@@ -937,6 +1018,68 @@ mod tests {
             .expect_err("reviewer failure");
 
         assert!(matches!(error, ReviewLoopError::Reviewer(_)), "{error}");
+    }
+
+    /// A reviewer whose pass could not read its findings source.
+    struct UnreadableReviewer {
+        findings: Vec<ReviewFinding>,
+    }
+
+    impl Reviewer for UnreadableReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+            Ok(ReviewOutcome::new(
+                self.findings.clone(),
+                ReviewCompleteness::Incomplete {
+                    reason: "gh: not authenticated".to_owned(),
+                },
+            ))
+        }
+    }
+
+    /// A read that failed is not "no findings": an unreadable pass must not
+    /// converge, and it escalates rather than reporting success.
+    #[test]
+    fn an_unreadable_pass_stops_the_loop_instead_of_converging() {
+        let reviewer = UnreadableReviewer {
+            findings: Vec::new(),
+        };
+        let mut addressed = 0;
+
+        let summary = ReviewLoop::new(5)
+            .run(&reviewer, &request(), |_, _| {
+                addressed += 1;
+                Ok::<(), String>(())
+            })
+            .expect("loop");
+
+        assert_eq!(summary.stop(), ReviewStop::Incomplete);
+        assert_eq!(summary.passes(), 1);
+        assert_eq!(addressed, 0, "an unreadable pass addresses nothing");
+        assert!(summary.stop().needs_escalation());
+        assert_eq!(summary.reason(), Some("gh: not authenticated"));
+        assert!(summary.unresolved().is_empty());
+    }
+
+    /// An unreadable pass that did see some findings escalates them for a human
+    /// rather than addressing a review the loop could not trust.
+    #[test]
+    fn an_unreadable_pass_escalates_the_findings_it_did_see() {
+        let reviewer = UnreadableReviewer {
+            findings: pass(&["partial"]),
+        };
+        let mut addressed = 0;
+
+        let summary = ReviewLoop::new(5)
+            .run(&reviewer, &request(), |_, _| {
+                addressed += 1;
+                Ok::<(), String>(())
+            })
+            .expect("loop");
+
+        assert_eq!(summary.stop(), ReviewStop::Incomplete);
+        assert_eq!(addressed, 0);
+        assert_eq!(titles(summary.unresolved()), ["partial"]);
+        assert_eq!(summary.reason(), Some("gh: not authenticated"));
     }
 
     /// An in-memory decision log, standing in for the pool's decision sidecar.

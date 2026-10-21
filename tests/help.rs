@@ -79,32 +79,36 @@ fn help_for_an_unknown_group_fails_naming_it() {
     );
 }
 
-/// The `review` page must not claim a bounded loop the binary does not run.
+/// The `review` page must describe the bounded loop the binary now runs.
 ///
-/// `--fg` used to advertise "the full bounded review loop in the foreground",
-/// but no command drives `ReviewLoop` (dogfood-2/04): jjfx has no reviewer of
-/// its own, so a review sends one prompt and produces no findings. The page now
-/// says so, where an operator reading `jjfx help review` sees it.
+/// `dogfood-2`'s finding 04 was the mismatch: the page denied a loop while the
+/// tool advertised one, and no command drove `ReviewLoop`. jjfx owns the loop
+/// again, so the page names the findings source (the PR's unresolved review
+/// threads), the bound (`[review] max_passes`), and the escalation.
 #[test]
-fn help_for_review_does_not_claim_a_bounded_loop_it_does_not_run() {
+fn help_for_review_describes_the_bounded_loop_it_runs() {
     let output = help(&["review"]);
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
 
     assert!(
-        !text.contains("full bounded review loop"),
-        "the page still claims a loop no command drives: {text}"
+        text.contains("bounded re-review loop"),
+        "the page must name the loop: {text}"
     );
     assert!(
-        text.contains("ReviewLoop"),
-        "the page must name the loop whose caller is missing: {text}"
+        text.contains("unresolved review threads"),
+        "the page must name the findings source: {text}"
     );
     assert!(
-        text.contains("no reviewer and no bounded loop"),
-        "the page must state that review runs no bounded loop: {text}"
+        text.contains("max_passes"),
+        "the page must name the bound: {text}"
     );
     assert!(
-        text.contains("harness, which is their only caller"),
-        "the page must state that the loop's only caller is the harness: {text}"
+        text.contains("escalates its unresolved"),
+        "the page must state that a stop escalates: {text}"
+    );
+    assert!(
+        !text.contains("no bounded loop"),
+        "the page must not deny the loop it runs: {text}"
     );
 }

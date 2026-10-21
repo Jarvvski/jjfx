@@ -14,8 +14,8 @@ use crate::engine::{
     AgentModel, AgentRuntime, AgentRuntimeInvocation, AgentRuntimeProbeError,
     AgentSessionResolution, BackgroundRun, BackgroundStart, CompletedRun, DispatchExclusions,
     MutationGuard, MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation,
-    RunLog, RunSupervisor, RunSupervisorError, TicketBranch, TicketId, WorkerId, WorkerPoolError,
-    WorkerStatus, resolve_agent_session_for_runtime, resolve_ticket_branch,
+    ReviewFinding, RunLog, RunSupervisor, RunSupervisorError, TicketBranch, TicketId, WorkerId,
+    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime, resolve_ticket_branch,
 };
 use crate::jj::PushOutcome;
 
@@ -818,17 +818,52 @@ impl WorkerActions {
     /// Builds a pull-request review plan and starts it as a Follow-up Run.
     ///
     /// The prompt inlines the pull request's review state, its failing checks,
-    /// and an instruction to fetch and address human review comments.
+    /// and an instruction to fetch and address human review comments. This is
+    /// the review verb's *address step* when it runs with no findings in hand;
+    /// [`address_review`](Self::address_review) is the same step carrying one
+    /// pass's findings.
     pub fn review(
         &self,
         worker: &WorkerId,
         mode: RunMode,
     ) -> Result<FollowUpOutcome, WorkerActionError> {
+        let target = self.review_target(worker)?;
+        self.address_review(worker, &target, &[], mode)
+    }
+
+    /// Resolves the Pull Request a `review` addresses.
+    ///
+    /// A repository with no forge, or a Worker with no Pull Request, is refused
+    /// here by name, before any pass runs, so the loop never silently reports
+    /// convergence for a Pull Request that does not exist.
+    pub fn review_target(&self, worker: &WorkerId) -> Result<ReviewTarget, WorkerActionError> {
         let (repository, pull_request) = self.pull_request_for(worker)?;
+        let ticket = self.worker_ticket(worker)?;
+        Ok(ReviewTarget {
+            ticket: ticket.as_str().to_owned(),
+            repository,
+            pull_request,
+        })
+    }
+
+    /// Sends one review pass's findings to the Worker as a Follow-up Run.
+    ///
+    /// This is the loop's address step: it builds the review prompt from the
+    /// target Pull Request, its failing checks and the pass's findings. A pass
+    /// with no findings never reaches here - the loop converges before it would
+    /// address - so the findings list is never empty on this path.
+    pub fn address_review(
+        &self,
+        worker: &WorkerId,
+        target: &ReviewTarget,
+        findings: &[ReviewFinding],
+        mode: RunMode,
+    ) -> Result<FollowUpOutcome, WorkerActionError> {
         let checks = self
             .commands
-            .failing_checks(&repository, pull_request.number)?;
-        let prompt = build_review_prompt(&repository, &pull_request, &checks);
+            .failing_checks(&target.repository, target.pull_request.number)?;
+        let prompt =
+            build_review_prompt(&target.repository, &target.pull_request, &checks, findings);
         self.follow_up(worker, &prompt, None, mode)
     }
 
@@ -883,20 +918,7 @@ impl WorkerActions {
     /// nothing to record. It is a read, so it fails before any Workspace is
     /// touched.
     fn worker_branch(&self, worker: &WorkerId) -> Result<String, WorkerActionError> {
-        let snapshot = self.repository.worker_pool().snapshot();
-        let state =
-            snapshot
-                .worker(worker.as_str())
-                .ok_or_else(|| WorkerActionError::WorkerNotFound {
-                    worker: worker.clone(),
-                })?;
-        let ticket = state
-            .ticket()
-            .filter(|ticket| !ticket.is_empty())
-            .and_then(|ticket| TicketId::parse(ticket).ok())
-            .ok_or_else(|| WorkerActionError::MissingBranch {
-                worker: worker.clone(),
-            })?;
+        let ticket = self.worker_ticket(worker)?;
         match resolve_ticket_branch(self.repository.root(), &ticket) {
             TicketBranch::Resolved(branch) => Ok(branch),
             TicketBranch::Missing => Err(WorkerActionError::BranchNotFound {
@@ -909,6 +931,28 @@ impl WorkerActions {
                 branches: branches.join(", "),
             }),
         }
+    }
+
+    /// The Ticket a Worker was reserved for, parsed from its state.
+    ///
+    /// A Worker that was never reserved for a Ticket has none, which is the same
+    /// refusal as a missing branch: the verbs that resolve a branch cannot act
+    /// without one.
+    fn worker_ticket(&self, worker: &WorkerId) -> Result<TicketId, WorkerActionError> {
+        let snapshot = self.repository.worker_pool().snapshot();
+        let state =
+            snapshot
+                .worker(worker.as_str())
+                .ok_or_else(|| WorkerActionError::WorkerNotFound {
+                    worker: worker.clone(),
+                })?;
+        state
+            .ticket()
+            .filter(|ticket| !ticket.is_empty())
+            .and_then(|ticket| TicketId::parse(ticket).ok())
+            .ok_or_else(|| WorkerActionError::MissingBranch {
+                worker: worker.clone(),
+            })
     }
 
     fn branch_and_workspace(
@@ -1089,15 +1133,57 @@ impl WorkerActions {
 #[derive(Debug, Clone, Copy)]
 struct SystemCommands;
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PullRequest {
     number: u64,
     url: String,
     head_ref_name: String,
+    #[serde(default)]
+    base_ref_name: String,
     mergeable: String,
     #[serde(default)]
     review_decision: String,
+}
+
+/// The Pull Request a `review` addresses, resolved once for a whole loop.
+///
+/// The loop resolves the target once and carries it into every pass, so the
+/// Worker's branch and the Pull Request are read once rather than once per pass.
+/// It is also where a repository with no forge, or a Worker with no Pull Request,
+/// is refused by name - before any pass runs.
+#[derive(Debug, Clone)]
+pub struct ReviewTarget {
+    ticket: String,
+    repository: String,
+    pull_request: PullRequest,
+}
+
+impl ReviewTarget {
+    /// Returns the Worker's Ticket, which keys each review pass.
+    pub fn ticket(&self) -> &str {
+        &self.ticket
+    }
+
+    /// Returns the `owner/repo` the Pull Request lives in.
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// Returns the Pull Request number.
+    pub const fn number(&self) -> u64 {
+        self.pull_request.number
+    }
+
+    /// Returns the base ref the Pull Request targets.
+    pub fn base(&self) -> &str {
+        &self.pull_request.base_ref_name
+    }
+
+    /// Returns the head ref the Pull Request is from.
+    pub fn branch(&self) -> &str {
+        &self.pull_request.head_ref_name
+    }
 }
 
 /// The `--json` fields [`SystemCommands::failing_checks`] asks `gh` for.
@@ -1455,7 +1541,7 @@ impl SystemCommands {
                 "--head",
                 branch,
                 "--json",
-                "number,url,headRefName,mergeable,reviewDecision",
+                "number,url,headRefName,baseRefName,mergeable,reviewDecision",
                 "--limit",
                 "1",
             ],
@@ -1634,7 +1720,12 @@ fn parse_checks(command: &str, body: &[u8]) -> Result<Vec<Check>, WorkerActionEr
     Ok(checks)
 }
 
-fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[Check]) -> String {
+fn build_review_prompt(
+    repository: &str,
+    pull_request: &PullRequest,
+    checks: &[Check],
+    findings: &[ReviewFinding],
+) -> String {
     let header = if pull_request.url.is_empty() {
         format!("#{}", pull_request.number)
     } else {
@@ -1657,10 +1748,18 @@ fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[C
         ));
         step += 1;
     }
-    prompt.push_str(&format!(
-        "{step}. Fetch all review comments with `gh -R {repository} pr view {} --comments` and inline threads with `gh api repos/{repository}/pulls/{}/comments`.\n\n",
-        pull_request.number, pull_request.number
-    ));
+    if findings.is_empty() {
+        prompt.push_str(&format!(
+            "{step}. Fetch all review comments with `gh -R {repository} pr view {} --comments` and inline threads with `gh api repos/{repository}/pulls/{}/comments`.\n\n",
+            pull_request.number, pull_request.number
+        ));
+    } else {
+        prompt.push_str(&format!(
+            "{step}. Address each of these unresolved review threads:\n"
+        ));
+        prompt.push_str(&render_findings(findings));
+        prompt.push('\n');
+    }
     step += 1;
     prompt.push_str(&format!(
         "{step}. Address each unresolved comment, or explain a reasoned disagreement in the PR. Decide where each fix belongs before you make it:\n   - A fix to code this PR already introduced belongs in the commit that introduced it - not in a new commit stacked on top, and not in a hand-split. Find that commit with `jj log`, start an edit on top of it with `jj new <commit>`, make the change, then run `jj absorb`. jj moves each hunk into the closest mutable ancestor where those lines last changed, and abandons the edit commit once every hunk has landed (describe the edit if you want to keep it).\n   - `jj absorb` can leave the commits above it conflicted: resolve every conflict it reports, or run `jj undo` and address that feedback on top of `@` instead.\n   - Feedback that does not belong in an existing commit - a new file, a new test - is an ordinary edit on `@`.\n\n"
@@ -1682,6 +1781,28 @@ fn build_review_prompt(repository: &str, pull_request: &PullRequest, checks: &[C
         pull_request.head_ref_name, pull_request.number
     ));
     prompt
+}
+
+/// Renders a pass's findings as the review prompt's thread list.
+///
+/// Each finding is one bullet - its severity, location and title - with the
+/// thread's comments and any suggested change beneath it, indented so the
+/// Worker reads each thread as one unit.
+fn render_findings(findings: &[ReviewFinding]) -> String {
+    let mut rendered = String::new();
+    for finding in findings {
+        rendered.push_str(&format!("   - {}\n", finding.summary()));
+        for line in finding.body().lines() {
+            rendered.push_str(&format!("     {line}\n"));
+        }
+        for suggestion in finding.suggestions() {
+            rendered.push_str("     suggested change:\n");
+            for line in suggestion.lines() {
+                rendered.push_str(&format!("       {line}\n"));
+            }
+        }
+    }
+    rendered
 }
 
 /// Reads `jj absorb`'s stderr summary.
@@ -1847,6 +1968,7 @@ mod tests {
             number: 7,
             url: "https://github.com/o/r/pull/7".to_owned(),
             head_ref_name: "adam/x".to_owned(),
+            base_ref_name: "main".to_owned(),
             mergeable: "MERGEABLE".to_owned(),
             review_decision: "REVIEW_REQUIRED".to_owned(),
         }
@@ -1854,15 +1976,41 @@ mod tests {
 
     #[test]
     fn the_prompt_has_no_reviewer_step_and_fetches_human_comments() {
-        let prompt = build_review_prompt("o/r", &pull_request(), &[]);
+        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[]);
 
         assert!(!prompt.contains("AI reviewer findings"), "{prompt}");
         assert!(prompt.contains("Fetch all review comments"), "{prompt}");
     }
 
+    /// A pass with findings lists them, so the address step sends the review the
+    /// loop read rather than only a pointer at the PR's comments.
+    #[test]
+    fn the_prompt_lists_a_pass_findings() {
+        let findings = vec![ReviewFinding::new(
+            crate::engine::ReviewSeverity::Major,
+            Some("src/x.rs".to_owned()),
+            Some((12, 14)),
+            Some("Cap the loop".to_owned()),
+            "@adam: This can spin forever.",
+            vec!["n = 3".to_owned()],
+        )];
+        let prompt = build_review_prompt("o/r", &pull_request(), &[], &findings);
+
+        assert!(prompt.contains("unresolved review threads"), "{prompt}");
+        assert!(
+            prompt.contains("[major] src/x.rs:12-14 - Cap the loop"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("@adam: This can spin forever."), "{prompt}");
+        assert!(prompt.contains("n = 3"), "{prompt}");
+        // With findings in hand the prompt does not send the Worker back to
+        // re-fetch what the loop already read.
+        assert!(!prompt.contains("Fetch all review comments"), "{prompt}");
+    }
+
     #[test]
     fn the_prompt_sends_base_commit_feedback_through_jj_new_and_absorb() {
-        let prompt = build_review_prompt("o/r", &pull_request(), &[]);
+        let prompt = build_review_prompt("o/r", &pull_request(), &[], &[]);
 
         assert!(prompt.contains("`jj new <commit>`"), "{prompt}");
         assert!(prompt.contains("`jj absorb`"), "{prompt}");

@@ -426,13 +426,13 @@ automatically: a stuck Run is surfaced, and the human decides.
 
 ## `[review]`
 
-The pass cap for the tool-enforced re-review loop. `jjfx review <worker>` itself
-runs no reviewer: its prompt inlines the PR's review state, failing checks and
-human comments, and nothing else. jjfx does not ingest an external review bot's
-findings, and no command drives the loop either - `ReviewLoop` is reached only
-through the harness seam (`RecordedReviewLoop`), so this cap applies when a
-harness drives the loop, not to `jjfx review`. The loop is bounded by the tool,
-not by a prompt (ADR 0016).
+The pass cap for the tool-enforced re-review loop. `jjfx review <worker>` drives
+that loop: each pass reads the Pull Request's unresolved review threads through
+`gh`, and a pass that found something sends its findings to the Worker to
+address. The loop is bounded by the tool, not by a prompt (ADR 0016): it stops on
+this cap, or earlier when a round makes no progress. Only convergence is success;
+a loop that stops on the cap, on a stalled round, or on a review it could not
+read escalates its unresolved findings for a human and exits non-zero.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -443,8 +443,8 @@ not by a prompt (ADR 0016).
 max_passes = 2
 ```
 
-See [The review loop](review-loop.md) for the bound, who drives it, and how a
-review's feedback is addressed.
+See [The review loop](review-loop.md) for the bound, the findings source, and how
+a review's feedback is addressed.
 
 ## `[migrations]`
 
