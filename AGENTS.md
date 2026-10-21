@@ -85,6 +85,20 @@ Rust edition 2024. `Cargo.lock` is committed (this is an app, not a library).
 
 **Testing.** Unit tests live inline in a `#[cfg(test)] mod tests { use super::*; }` block; integration tests go in `tests/`. Cover the happy path, edges (empty/boundary), and error conditions for new logic.
 
+**Test hermeticity (CI parity).** A test must pass on a clean-config runner, not only on the developer's machine, so it must construct the environment it depends on rather than inherit it. Two seams have already cost red CI:
+
+- **Terminal and Dispatch.** An integration test that runs `jjfx dispatch` must use `support::stub_terminal` and `support::run_jjfx_tolerating_a_starved_terminal`; otherwise it depends on kitty being installed and on a terminal query answering inside its deadline.
+- **jj config.** A test that commits, pushes, or reads a jj setting must not inherit `~/.config/jj/config.toml`. The developer's `[user]` identity makes a commit pass locally and fail on a clean runner (`Won't push commit ... since it has no author and/or committer set`), and `remotes.origin.auto-track-bookmarks` changes how jj lists a fresh bookmark (a local bookmark whose remote-tracking entry does not exist yet lists twice). A throwaway repository from `store::test_local_repo` or a `temp_repo` helper owns its jj config (identity included). An integration fixture must give every child a config it owns: pass `support::hermetic_jj_config_file(dir)` as `JJ_CONFIG`, or point `XDG_CONFIG_HOME` at the fixture's own home **and** `env_remove("JJ_CONFIG")` - an inherited `JJ_CONFIG` takes precedence over `XDG_CONFIG_HOME`. A test that depends on a jj setting (auto-tracking, say) must construct that setting itself, e.g. `store::track_bookmarks_from_origin`.
+
+Prove a test change both ways before landing it: once normally, once with the user config out of the picture. The two runs must agree.
+
+```bash
+D=$(mktemp -d); : > "$D/empty-config.toml"
+cargo test --test <name> --no-run
+BIN=$(ls -t target/debug/deps/<name>-* | grep -v '\.d$' | head -1)
+JJFX_TEST_SIGNING_OFF=1 JJ_CONFIG="$D/empty-config.toml" env -u XDG_CONFIG_HOME HOME="$D" "$BIN"
+```
+
 **Unsafe.** Forbidden crate-wide (`unsafe_code = "forbid"` in `Cargo.toml`) - `unsafe` is a hard compile error, not a lint. Do not remove the forbid to work around a problem; find a safe design instead (if `unsafe` ever becomes genuinely unavoidable, that's an owner decision). TUI note: never let a panic corrupt the terminal - rely on the restore-on-panic hook, don't `unwrap` in the render/event loop.
 
 **Layout & style.** rustfmt defaults; no hand-formatting. No wildcard imports (except a deliberate prelude); group std / external / local and reference intra-crate items via `crate::`. Doc-comment (`///`) public items; omit comments that merely restate the code. Revise files in place - no `main_v2.rs` / `foo_improved.rs` variants.

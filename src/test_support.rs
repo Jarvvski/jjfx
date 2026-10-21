@@ -12,6 +12,35 @@ use std::fs::File;
 use std::path::Path;
 use std::time::Duration;
 
+/// The jj config a throwaway test repository owns, so a fixture never inherits
+/// the developer's `~/.config/jj/config.toml`.
+///
+/// Two of the developer's settings make a test pass locally and fail on a
+/// clean-config CI runner: a `[user]` identity (without one a commit or push
+/// fails with "Won't push commit ... since it has no author and/or committer
+/// set") and `remotes.origin.auto-track-bookmarks` (which makes a fresh
+/// bookmark list twice, once with a tracked-but-absent remote entry - dogfood-2
+/// 02). The throwaway-repository helpers write this into the repository's
+/// *own* config, because a unit test cannot set `JJ_CONFIG` on the `jj`
+/// processes jjfx spawns; the repository then carries its identity and its
+/// auto-tracking choice whatever the developer has configured.
+///
+/// `auto_track_origin` flips auto-tracking on, for the tests that assert the
+/// tracked-but-absent state rather than the default.
+pub fn hermetic_jj_config(auto_track_origin: bool) -> String {
+    let auto_track = if auto_track_origin {
+        "glob:*"
+    } else {
+        // jj parses this value as a string pattern and rejects an empty string
+        // as a syntax error, so "auto-track nothing" is a glob that matches no
+        // bookmark name.
+        "glob:jjfx-hermetic-never-matches-a-bookmark"
+    };
+    format!(
+        "[user]\nname = \"jjfx test\"\nemail = \"jjfx@example.com\"\n\n[remotes.origin]\nauto-track-bookmarks = \"{auto_track}\"\n"
+    )
+}
+
 /// The one liveness budget every test waits on concurrent work with.
 ///
 /// This is a guard against a *hang*, not a statement of how long the work is

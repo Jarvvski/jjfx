@@ -87,10 +87,14 @@ fn conflicted_repository() -> (TempDir, PathBuf, PathBuf) {
 }
 
 /// Run `jjfx` with the given arguments in `dir`, returning its output.
+///
+/// An inherited `JJ_CONFIG` would take precedence over `XDG_CONFIG_HOME`, so it
+/// is dropped: the fixture owns its jj config.
 fn jjfx(dir: &Path, config_home: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_jjfx"))
         .args(args)
         .current_dir(dir)
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home)
         .output()
         .expect("jjfx should run")

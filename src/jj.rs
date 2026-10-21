@@ -1897,7 +1897,9 @@ mod tests {
         std::fs::remove_dir_all(&repo).ok();
     }
 
-    /// A throwaway non-colocated jj repository for the real-jj read tests.
+    /// A throwaway non-colocated jj repository for the real-jj read tests. It
+    /// carries its own jj config (see `store::write_repo_jj_config`), so it never
+    /// inherits the developer's identity or auto-tracking.
     fn temp_repo(tag: &str) -> PathBuf {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1917,6 +1919,7 @@ mod tests {
             .status()
             .expect("jj should be installed");
         assert!(status.success(), "jj git init should succeed");
+        crate::store::write_repo_jj_config(&repo, false);
         repo
     }
 

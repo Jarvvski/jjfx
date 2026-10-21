@@ -154,12 +154,16 @@ fn ticket_status(root: &Path, feature: &str, file: &str) -> String {
 }
 
 /// A `jjfx wait` invocation against `repository`, with `config_home` as XDG home.
+///
+/// An inherited `JJ_CONFIG` would take precedence over `XDG_CONFIG_HOME`, so it
+/// is dropped: the fixture owns its jj config.
 fn wait_command(repository: &Path, config_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
     command
         .arg("wait")
         .args(args)
         .current_dir(repository)
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home);
     command
 }
@@ -397,6 +401,7 @@ fn dispatch_command(repository: &Path, config_home: &Path, args: &[&str]) -> Com
         .arg("dispatch")
         .args(args)
         .current_dir(repository)
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home);
     command
 }

@@ -197,12 +197,16 @@ fn write_idle_worker(root: &Path, id: &str) {
 }
 
 /// A `jjfx logs` invocation against `repository`, with `config_home` as XDG home.
+///
+/// An inherited `JJ_CONFIG` would take precedence over `XDG_CONFIG_HOME`, so it
+/// is dropped: the fixture owns its jj config.
 fn logs_command(repository: &Path, config_home: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
     command
         .arg("logs")
         .args(args)
         .current_dir(repository)
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
