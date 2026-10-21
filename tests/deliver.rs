@@ -118,6 +118,10 @@ impl DeliverFixture {
         let output = Command::new("jj")
             .args(["--config", "signing.behavior=drop"])
             .current_dir(dir)
+            // The fixture owns its jj identity through XDG_CONFIG_HOME; a
+            // developer's JJ_CONFIG would take precedence and could leave the
+            // commit without an author, so it is dropped for hermeticity.
+            .env_remove("JJ_CONFIG")
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .args(args)
             .output()
@@ -134,9 +138,17 @@ impl DeliverFixture {
         Command::new(env!("CARGO_BIN_EXE_jjfx"))
             .args(["deliver", worker])
             .current_dir(&self.root)
+            .env_remove("JJ_CONFIG")
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .output()
             .expect("jjfx should run")
+    }
+
+    /// Writes the repository-local settings at `<repo>/.jjfx/config.toml`.
+    fn write_repo_config(&self, text: &str) {
+        let dir = self.root.join(".jjfx");
+        fs::create_dir_all(&dir).expect(".jjfx directory");
+        fs::write(dir.join("config.toml"), text).expect("repository config");
     }
 
     /// Grow the Worker's chain with an empty, undescribed commit below a new
@@ -308,6 +320,29 @@ fn deliver_reaches_the_forge_and_reports_a_non_github_origin() {
         fixture.origin_refs().contains("refs/heads/adam/eng-1"),
         "the push precedes the Pull Request step: {}",
         fixture.origin_refs()
+    );
+}
+
+/// A repository owns its own Pull Request policy: a `[forge]` section in
+/// `<repo>/.jjfx/config.toml` is accepted at load (it used to be refused as an
+/// unknown section), and the delivery reaches the forge rather than failing on
+/// the config. The fixture's `origin` is a local bare repo, so the forge is
+/// refused by name - but only after the repository config was accepted.
+#[test]
+fn deliver_accepts_a_repository_owned_forge_policy() {
+    let fixture = DeliverFixture::new(true, "true");
+    fixture.write_repo_config("[forge]\ndraft = false\n");
+
+    let output = fixture.deliver("worker-01");
+
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("origin is not a GitHub remote"),
+        "a repository-owned [forge] must be accepted and reach the forge: {stderr}"
+    );
+    assert!(
+        !stderr.contains("may set only"),
+        "the repository config must not be refused: {stderr}"
     );
 }
 

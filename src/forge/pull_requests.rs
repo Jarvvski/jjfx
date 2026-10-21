@@ -1,7 +1,11 @@
 use super::{Change, GitHubAdapter, NewPullRequest, PullRequestContext};
 
 pub(super) enum Outcome {
-    Did,
+    /// At least one Pull Request was created; `drafts_opened` counts the ones
+    /// opened as drafts, so a caller can name the `gh pr ready` a draft needs.
+    Did {
+        drafts_opened: usize,
+    },
     Noop(String),
     Failed(String),
 }
@@ -23,7 +27,8 @@ pub(super) fn submit(
         return Outcome::Noop("no bookmark to open a PR".to_string());
     }
 
-    let mut did_work = false;
+    let mut created = 0usize;
+    let mut drafts_opened = 0usize;
     for change in changes {
         match github.exists(&context.slug, &change.bookmark) {
             // A change that already has a Pull Request - open or merged - is
@@ -47,14 +52,17 @@ pub(super) fn submit(
                 if let Err(error) = github.create(request) {
                     return Outcome::Failed(error);
                 }
-                did_work = true;
+                created += 1;
+                if draft {
+                    drafts_opened += 1;
+                }
             }
             Err(error) => return Outcome::Failed(error),
         }
     }
 
-    if did_work {
-        Outcome::Did
+    if created > 0 {
+        Outcome::Did { drafts_opened }
     } else {
         Outcome::Noop("PRs already current".to_string())
     }

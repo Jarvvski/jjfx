@@ -905,22 +905,25 @@ fn run_pipeline(
             Some(Ok(context)) => {
                 state.set(Step::PullRequest, Status::Running);
                 publish_progress(tx, target, state, None);
-                let reason = match jj.changes(&target.dir) {
+                let (reason, notice) = match jj.changes(&target.dir) {
                     Ok(changes) => {
                         match pull_requests::submit(context, changes, config.draft, github) {
-                            pull_requests::Outcome::Did => None,
+                            pull_requests::Outcome::Did { drafts_opened } => (
+                                None,
+                                (drafts_opened > 0).then(|| draft_notice(drafts_opened)),
+                            ),
                             pull_requests::Outcome::Noop(reason)
                             | pull_requests::Outcome::Failed(reason) => {
-                                Some(format!("pr: {reason}"))
+                                (Some(format!("pr: {reason}")), None)
                             }
                         }
                     }
-                    Err(error) => Some(format!("pr: {error}")),
+                    Err(error) => (Some(format!("pr: {error}")), None),
                 };
                 if let Some(reason) = reason {
                     skip_step(tx, target, state, Step::PullRequest, &reason);
                 } else {
-                    succeed_step(tx, target, state, Step::PullRequest);
+                    succeed_step_notice(tx, target, state, Step::PullRequest, notice);
                 }
             }
             // A forge that could not be reached is a failure, not an absence.
@@ -964,8 +967,41 @@ fn succeed_step(
     progress: &mut Progress,
     step: Step,
 ) {
+    succeed_step_notice(tx, target, progress, step, None);
+}
+
+/// Mark a step successful, carrying an informational notice for the footer.
+///
+/// The notice is not a reason: the step is `Ok` and the run stays a clean
+/// success, so a draft Pull Request naming its `gh pr ready` does not taint an
+/// otherwise delivered forge.
+fn succeed_step_notice(
+    tx: &UnboundedSender<Update>,
+    target: &Target,
+    progress: &mut Progress,
+    step: Step,
+    notice: Option<String>,
+) {
     progress.set(step, Status::Ok);
-    publish_progress(tx, target, progress, None);
+    publish_progress(tx, target, progress, notice);
+}
+
+/// The notice a delivery carries when it opened a draft Pull Request.
+///
+/// A draft is the repository's own choice - its `[forge] draft`, else the
+/// user-global setting - and a draft cannot merge until it is marked ready, so
+/// the delivery names the command that does it rather than leaving the landing
+/// flow to stall on a step jjfx never mentions.
+fn draft_notice(drafts_opened: usize) -> String {
+    let (noun, each) = if drafts_opened == 1 {
+        ("Pull Request", "it")
+    } else {
+        ("Pull Requests", "each")
+    };
+    format!(
+        "pr: opened {drafts_opened} draft {noun} - mark {each} ready to merge with \
+         `gh pr ready <number>`"
+    )
 }
 
 fn skip_step(
@@ -2684,7 +2720,14 @@ mod tests {
 
         assert!(report.delivered(), "{:?}", report.reason());
         assert_eq!(report.reason(), None);
-        assert!(report.notices().is_empty());
+        // A draft is the repository's policy, and the delivery names the command
+        // that marks it mergeable rather than stalling silently.
+        assert_eq!(report.notices().len(), 1, "{:?}", report.notices());
+        assert!(
+            report.notices()[0].contains("gh pr ready"),
+            "a draft delivery must name `gh pr ready`: {:?}",
+            report.notices()
+        );
         assert_eq!(
             github.snapshot(),
             vec![CreatedPullRequest {
@@ -2693,6 +2736,42 @@ mod tests {
                 title: "Ship the thing".to_string(),
                 body: "What it does.".to_string(),
                 draft: true,
+            }]
+        );
+    }
+
+    /// A repository whose policy is not to draft delivers a mergeable Pull
+    /// Request: `deliver`'s landing flow completes with no hand-run `gh pr ready`,
+    /// so the delivery carries no notice and the PR is not a draft.
+    #[test]
+    fn deliver_opens_a_mergeable_pull_request_when_the_repository_does_not_draft() {
+        let github = Arc::new(MemoryGitHub::default());
+        let forge = Forge::with_github(
+            settings(true, false),
+            Arc::new(OneChangeJj),
+            Arc::new(UnlockedGpg),
+            github.clone(),
+        );
+
+        let report = forge.deliver(Target::new(
+            "worker-01".to_string(),
+            PathBuf::from("/workspace/worker-01"),
+        ));
+
+        assert!(report.delivered(), "{:?}", report.reason());
+        assert!(
+            report.notices().is_empty(),
+            "a ready Pull Request needs no `gh pr ready`: {:?}",
+            report.notices()
+        );
+        assert_eq!(
+            github.snapshot(),
+            vec![CreatedPullRequest {
+                head: "adam/eng-1".to_string(),
+                base: "main".to_string(),
+                title: "Ship the thing".to_string(),
+                body: "What it does.".to_string(),
+                draft: false,
             }]
         );
     }
