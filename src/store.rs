@@ -18,7 +18,8 @@ use anyhow::Context;
 use crate::engine::{AdHocWorkspacePhase, Repository, WorkspaceHookStream};
 
 #[cfg(test)]
-/// Create an isolated local jj repository with signing disabled for tests.
+/// Create an isolated local jj repository with signing disabled and its own jj
+/// config for tests.
 pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -45,12 +46,51 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
         "jj git init failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+    write_repo_jj_config(&repo, false);
     repo.canonicalize().unwrap()
 }
 
 #[cfg(test)]
+/// Write a throwaway repository's *own* jj config: a test identity and an
+/// auto-tracking choice, so the repository never inherits the developer's
+/// `~/.config/jj/config.toml` (see
+/// [`crate::test_support::hermetic_jj_config`]).
+///
+/// It is written to the path jj itself reports for the repository config
+/// (`jj config path --repo`), not the deprecated `.jj/repo/config.toml`, so jj
+/// reads it directly and no migration warning reaches a test's captured stderr.
+pub(crate) fn write_repo_jj_config(root: &Path, auto_track_origin: bool) {
+    let config = repo_config_path(root);
+    std::fs::create_dir_all(config.parent().expect("config has a parent"))
+        .expect("repo config directory");
+    std::fs::write(
+        &config,
+        crate::test_support::hermetic_jj_config(auto_track_origin),
+    )
+    .expect("repo-local jj config");
+}
+
+#[cfg(test)]
+/// The path jj stores `root`'s repository config at, read from jj rather than
+/// derived, because jj keys it by the repository's own config id.
+fn repo_config_path(root: &Path) -> PathBuf {
+    let output = crate::jj::command()
+        .arg("--repository")
+        .arg(root)
+        .args(["config", "path", "--repo"])
+        .output()
+        .expect("jj should be installed");
+    assert!(
+        output.status.success(),
+        "jj config path --repo failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    PathBuf::from(String::from_utf8_lossy(&output.stdout).trim())
+}
+
+#[cfg(test)]
 /// Make a repository's `origin` auto-track every bookmark, in the repository's
-/// *own* config (`.jj/repo/config.toml`).
+/// *own* config.
 ///
 /// A bookmark created after this is written gets a `remote=origin present=false`
 /// remote-tracking entry even though no remote ref exists, so jj lists it twice
@@ -61,14 +101,7 @@ pub(crate) fn test_local_repo(tag: &str) -> PathBuf {
 /// `~/.config/jj/config.toml`, or it passes only on a machine that sets the
 /// option and fails on a clean-config CI runner (dogfood-2 02).
 pub(crate) fn track_bookmarks_from_origin(root: &Path) {
-    let config = root.join(".jj/repo/config.toml");
-    std::fs::create_dir_all(config.parent().expect("config has a parent"))
-        .expect("repo config directory");
-    std::fs::write(
-        &config,
-        "[remotes.origin]\nauto-track-bookmarks = \"glob:*\"\n",
-    )
-    .expect("repo-local jj config");
+    write_repo_jj_config(root, true);
 }
 
 /// A single workspace. `path` records where the workspace's directory is, as
@@ -383,6 +416,89 @@ mod tests {
             "{}-{tag}",
             repo.file_name().unwrap().to_string_lossy()
         ))
+    }
+
+    /// Runs a jj command in `repo`, asserting it succeeds.
+    fn jj_in(repo: &Path, args: &[&str]) {
+        let output = jj::command()
+            .current_dir(repo)
+            .args(args)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// A throwaway repository owns its jj config, so a fixture never inherits
+    /// the developer's `[user]` identity or auto-tracking (bug-hunt 45).
+    ///
+    /// A unit test cannot set `JJ_CONFIG` on the `jj` processes jjfx spawns, so
+    /// the repository carries its own config instead. This asserts that config
+    /// wins over the developer's, whatever it says - without it a commit or a
+    /// delivery-identity read would pass locally and fail on a clean-config
+    /// runner.
+    #[test]
+    fn a_throwaway_repo_owns_its_jj_identity_and_auto_tracking() {
+        let repo = test_local_repo("hermetic-config");
+        let email = jj::read_at_repo(&repo, &["config", "get", "user.email"])
+            .expect("jj reports the repository's identity");
+        assert_eq!(
+            email.trim(),
+            "jjfx@example.com",
+            "the repository's own identity must win over the developer's"
+        );
+
+        // Auto-tracking is off by default, so a fresh bookmark lists once rather
+        // than twice (the tracked-but-absent shape dogfood-2 02 fixed). A remote
+        // has to exist for the setting to have anything to track.
+        jj_in(
+            &repo,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:owner/name.git",
+            ],
+        );
+        jj_in(&repo, &["bookmark", "create", "fresh", "-r", "@"]);
+        let listed = jj::read_at_repo(&repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+            .expect("bookmark list");
+        assert_eq!(
+            listed.lines().filter(|line| *line == "fresh").count(),
+            1,
+            "a fresh bookmark must list once, not inherit ambient auto-tracking: {listed}"
+        );
+    }
+
+    /// [`track_bookmarks_from_origin`] is the opt-in that flips the default:
+    /// a bookmark created afterwards lists twice, once per remote-tracking
+    /// entry. This is the state the dogfood-2 02 tests assert against.
+    #[test]
+    fn track_bookmarks_from_origin_turns_the_repo_own_auto_tracking_on() {
+        let repo = test_local_repo("hermetic-track");
+        track_bookmarks_from_origin(&repo);
+        jj_in(
+            &repo,
+            &[
+                "git",
+                "remote",
+                "add",
+                "origin",
+                "git@github.com:owner/name.git",
+            ],
+        );
+        jj_in(&repo, &["bookmark", "create", "fresh", "-r", "@"]);
+        let listed = jj::read_at_repo(&repo, &["bookmark", "list", "-T", "name ++ \"\\n\""])
+            .expect("bookmark list");
+        assert_eq!(
+            listed.lines().filter(|line| *line == "fresh").count(),
+            2,
+            "an opted-in repository must list the fresh bookmark twice: {listed}"
+        );
     }
 
     #[test]

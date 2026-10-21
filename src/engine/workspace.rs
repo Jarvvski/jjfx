@@ -2147,6 +2147,7 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "jj git init should succeed");
+        crate::store::write_repo_jj_config(&repo, false);
         repo
     }
 

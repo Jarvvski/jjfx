@@ -69,6 +69,9 @@ fn ticket_file(root: &Path, feature: &str, file: &str) -> String {
 
 /// Runs `jjfx ticket list` with a stub terminal on `PATH`, so the test drives the
 /// real seam the Dispatch commands use rather than depending on kitty.
+///
+/// An inherited `JJ_CONFIG` would take precedence over `XDG_CONFIG_HOME`, so it
+/// is dropped: the fixture owns its jj config.
 fn run_ticket_list(repository: &Path, config_home: &Path, extra: &[&str]) -> std::process::Output {
     let bin = TempDir::new().expect("temporary stub bin");
     let path = support::stub_terminal(bin.path());
@@ -78,6 +81,7 @@ fn run_ticket_list(repository: &Path, config_home: &Path, extra: &[&str]) -> std
     command
         .args(&args)
         .current_dir(repository)
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home)
         .env("PATH", &path);
     command.output().expect("jjfx should run")
@@ -92,6 +96,7 @@ fn run_dispatch_all(repository: &Path, config_home: &Path) -> std::process::Outp
         command
             .args(["dispatch", "--all"])
             .current_dir(repository)
+            .env_remove("JJ_CONFIG")
             .env("XDG_CONFIG_HOME", config_home)
             .env("PATH", &path);
         command
@@ -323,6 +328,7 @@ fn ticket_list_does_not_mutate_durable_state() {
     let reconcile = Command::new(env!("CARGO_BIN_EXE_jjfx"))
         .args(["ticket", "reconcile"])
         .current_dir(repository.path())
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home.path())
         .output()
         .expect("jjfx should run");
@@ -350,6 +356,7 @@ fn ticket_list_needs_neither_the_terminal_nor_jj() {
     let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
         .args(["ticket", "list", "--json"])
         .current_dir(repository.path())
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home.path())
         // A PATH with neither `kitten` nor `jj` on it: if the command consulted
         // the terminal seam it would fail closed, and if it shelled out to jj it

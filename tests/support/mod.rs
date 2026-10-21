@@ -53,6 +53,22 @@ pub fn stub_terminal(bin: &Path) -> OsString {
     std::env::join_paths(paths).expect("PATH with the terminal stub")
 }
 
+/// Writes the jj config a fixture owns into `dir` and returns its path.
+///
+/// A fixture passes it to every `jj` and `jjfx` child as `JJ_CONFIG`, which
+/// *replaces* the developer's `~/.config/jj` rather than layering on it. That is
+/// what makes a fixture hermetic: without it a commit depends on the developer's
+/// `[user]` identity and a fresh bookmark inherits their auto-tracking, so the
+/// test passes here and fails on a clean-config CI runner. Pointing
+/// `XDG_CONFIG_HOME` at the fixture's own home is not enough on its own - an
+/// inherited `JJ_CONFIG` still takes precedence - so a fixture on that route
+/// must also `env_remove("JJ_CONFIG")` on its children.
+pub fn hermetic_jj_config_file(dir: &Path) -> PathBuf {
+    let path = dir.join("jjfx-test-jj.toml");
+    fs::write(&path, jjfx::test_support::hermetic_jj_config(false)).expect("hermetic jj config");
+    path
+}
+
 /// Liveness budget for waiting on a helper subprocess, shared with the crate's
 /// own unit tests. See its documentation in `jjfx::test_support` for why it is
 /// deliberately generous rather than a statement of expected duration.

@@ -11,7 +11,7 @@
 use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use serde_json::Value;
@@ -25,6 +25,8 @@ mod support;
 struct ReuseFixture {
     root: TempDir,
     config_home: TempDir,
+    /// The fixture's own jj config, passed to every child as `JJ_CONFIG`.
+    jj_config: PathBuf,
     /// Holds the stub `kitten` and the fake `claude`; only its lifetime matters.
     _bin: TempDir,
     env_path: OsString,
@@ -47,21 +49,16 @@ impl ReuseFixture {
         assert!(status.success(), "jj git init");
         let config_home = TempDir::new().expect("temporary config home");
         // A jj user identity, because a Dispatch resolves its delivery identity
-        // from `jj user.email`/`user.name` - blank on a clean-config runner, and
-        // only present here because this fixture points `XDG_CONFIG_HOME` at its
-        // own config home.
-        let jj_config = config_home.path().join("jj");
-        fs::create_dir_all(&jj_config).expect("jj config directory");
-        fs::write(
-            jj_config.join("config.toml"),
-            "user.name = \"jjfx test\"\nuser.email = \"jjfx@example.com\"\n",
-        )
-        .expect("jj config");
+        // from `jj user.email`/`user.name` - blank on a clean-config runner. The
+        // fixture owns it through `JJ_CONFIG` rather than the developer's
+        // `~/.config/jj`, which an inherited `JJ_CONFIG` would otherwise shadow.
+        let jj_config = support::hermetic_jj_config_file(config_home.path());
         let bin = TempDir::new().expect("temporary stub bin");
         let env_path = support::stub_terminal(bin.path());
         let fixture = Self {
             root,
             config_home,
+            jj_config,
             _bin: bin,
             env_path,
         };
@@ -91,6 +88,8 @@ impl ReuseFixture {
             .args(["--config", "signing.behavior=drop"])
             .args(args)
             .current_dir(self.path())
+            .env("JJ_CONFIG", &self.jj_config)
+            .env("XDG_CONFIG_HOME", self.config_home.path())
             .output()
             .expect("jj should be installed")
     }
@@ -145,6 +144,7 @@ impl ReuseFixture {
         command
             .args(args)
             .current_dir(self.path())
+            .env("JJ_CONFIG", &self.jj_config)
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("PATH", &self.env_path);
         command

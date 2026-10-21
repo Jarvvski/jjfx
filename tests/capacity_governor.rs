@@ -140,12 +140,16 @@ impl Fixture {
 
     /// Runs `jjfx`, retrying only Dispatch's terminal refusal (see
     /// [`support::run_jjfx_tolerating_a_starved_terminal`]).
+    ///
+    /// An inherited `JJ_CONFIG` would take precedence over `XDG_CONFIG_HOME`, so
+    /// it is dropped: the fixture owns its jj config.
     fn jjfx(&self, args: &[&str]) -> Output {
         support::run_jjfx_tolerating_a_starved_terminal(|| {
             let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
             command
                 .args(args)
                 .current_dir(self.path())
+                .env_remove("JJ_CONFIG")
                 .env("XDG_CONFIG_HOME", self.config_home.path())
                 .env("PATH", &self.env_path);
             command

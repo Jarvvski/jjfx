@@ -26,6 +26,9 @@ fn run_jjfx(repository: &Path, config_home: &Path, args: &[&str]) -> std::proces
         command
             .args(args)
             .current_dir(repository)
+            // An inherited `JJ_CONFIG` would take precedence over
+            // `XDG_CONFIG_HOME`, so it is dropped: the fixture owns its jj config.
+            .env_remove("JJ_CONFIG")
             .env("XDG_CONFIG_HOME", config_home)
             .env("PATH", &path);
         command
@@ -479,6 +482,7 @@ fn ticket_reconcile_resolves_a_finished_run_without_a_dispatch() {
     let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
         .args(["ticket", "reconcile"])
         .current_dir(repository.path())
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home.path())
         .output()
         .expect("jjfx should run");
@@ -512,6 +516,7 @@ fn ticket_reconcile_refuses_to_resolve_a_run_whose_check_did_not_pass() {
     let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
         .args(["ticket", "reconcile"])
         .current_dir(repository.path())
+        .env_remove("JJ_CONFIG")
         .env("XDG_CONFIG_HOME", config_home.path())
         .output()
         .expect("jjfx should run");

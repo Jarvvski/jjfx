@@ -67,11 +67,14 @@ impl BareRepository {
         self.config_home.path().join("jjfx").join("config.toml")
     }
 
+    /// An inherited `JJ_CONFIG` would take precedence over `XDG_CONFIG_HOME`, so
+    /// it is dropped: the fixture owns its jj config.
     fn jjfx(&self, args: &[&str]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_jjfx"));
         command
             .args(args)
             .current_dir(self.root.path())
+            .env_remove("JJ_CONFIG")
             .env("XDG_CONFIG_HOME", self.config_home.path())
             .env("PATH", &self.env_path);
         command
