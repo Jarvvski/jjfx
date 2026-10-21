@@ -272,16 +272,17 @@ async fn run_tui(repo_root: PathBuf) -> anyhow::Result<()> {
         config.agent_command(),
         config.first_pane_command(),
     )) as Box<dyn terminal::Terminal>);
-    // The forge's build check: the repository's own `[checks]` when it has one,
-    // otherwise the user-global one. Resolved here because it is the one setting
-    // whose correct value belongs to the repository, while the user config is
-    // loaded once and applies to every repository jjfx is pointed at.
+    // The forge's build check and Pull Request policy: the repository's own
+    // `[checks]` and `[forge]` when it sets them, otherwise the user-global
+    // values. Resolved here because their correct values belong to the
+    // repository, while the user config is loaded once and applies to every
+    // repository jjfx is pointed at.
     let checks = config.checks_for(&repo_root)?;
     let runtime = Runtime::new(
         tx.clone(),
         repo_root.clone(),
         forge::Settings {
-            forge: config.forge,
+            forge: config.forge_for(&repo_root)?,
             checks,
         },
         config.colocate,

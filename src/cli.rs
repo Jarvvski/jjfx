@@ -5623,6 +5623,11 @@ fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
 /// repository with no forge - `[forge] pull_requests = false`, or no `origin`
 /// remote to open one against - is a supported path: the Pull Request step does
 /// not apply, and a clean weld, check and push still succeeds.
+///
+/// Whether the Pull Request opens as a draft is the repository's own choice
+/// (`<repo>/.jjfx/config.toml` `[forge] draft`, else the user-global setting). A
+/// PR left a draft is reported, naming the `gh pr ready` that marks it mergeable,
+/// so the landing flow never stalls on a step jjfx never mentions.
 fn deliver_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
     let workspace = crate::engine::worker_path(repository.root(), &worker);
@@ -5632,13 +5637,13 @@ fn deliver_command(repository: &Repository, value: &str) -> Result<()> {
             workspace.display()
         );
     }
-    // The repository's own `[checks]` when it sets one, else the user-global
-    // one, resolved exactly as the TUI resolves it.
+    // The repository's own `[checks]` and `[forge]` when it sets them, else the
+    // user-global values, resolved exactly as the TUI resolves them.
     let config = crate::config::load()?;
     let forge = crate::forge::Forge::new(
         repository.root().to_path_buf(),
         crate::forge::Settings {
-            forge: config.forge,
+            forge: config.forge_for(repository.root())?,
             checks: config.checks_for(repository.root())?,
         },
     );

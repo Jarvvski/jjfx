@@ -163,6 +163,27 @@ impl Config {
             .unwrap_or_else(|| self.checks.clone()))
     }
 
+    /// The forge settings in force for `repo_root`: the user-global `[forge]`,
+    /// with the Repository's own `[forge]` overlaid where it makes a choice.
+    ///
+    /// `draft` is a preference about the Repository's own Pull Requests, not a
+    /// capability, so a Repository sets it freely (ADR 0014). `pull_requests`
+    /// gates whether jjfx performs the capability-bearing act of opening a Pull
+    /// Request over `gh`, so a Repository may only turn its own forge **off**,
+    /// never on: a repository that sets `pull_requests = true` while the user
+    /// withheld it is held to the user's setting rather than quietly widening it,
+    /// exactly as `[dispatch]` tightens rather than loosens.
+    pub fn forge_for(&self, repo_root: &Path) -> anyhow::Result<ForgeConfig> {
+        let global = self.forge;
+        let Some(local) = self.repo_config(repo_root)?.forge else {
+            return Ok(global);
+        };
+        Ok(ForgeConfig {
+            pull_requests: global.pull_requests && local.pull_requests.unwrap_or(true),
+            draft: local.draft.unwrap_or(global.draft),
+        })
+    }
+
     /// The concurrency ceiling in force for `repo_root`: the Repository's own
     /// `[dispatch] max_concurrent` when it declares one, tightened by the
     /// user-global ceiling, so the smaller binds.
@@ -190,8 +211,8 @@ impl Config {
 
     /// The repository-local settings for `repo_root`, read and validated against
     /// this user-global config. The single entry point for the repository file,
-    /// so `[checks]`, `[dispatch]`, `[pools]` and `[tickets]` are read - and
-    /// fail - together.
+    /// so `[checks]`, `[dispatch]`, `[forge]`, `[pools]` and `[tickets]` are
+    /// read - and fail - together.
     pub fn repo_config(&self, repo_root: &Path) -> anyhow::Result<RepoConfig> {
         load_repo(repo_root, self)
     }
@@ -1012,19 +1033,21 @@ fn load_from(path: &std::path::Path) -> anyhow::Result<Config> {
 /// lifecycle hooks, because a value that is a property of the repository cannot
 /// live in a file read once for every repository.
 ///
-/// `[checks]`, `[dispatch]`, `[pools]` and `[tickets]` are the repo-owned
-/// sections. `deny_unknown_fields` is deliberate: a repository must not be able
-/// to silently configure jjfx beyond its build check, its dispatch ceiling, its
-/// Worker Pools and its Ticket source, so any other section is a loud error
-/// rather than a quiet ignore. A pool may only *select* - reference a
-/// user-global Agent Runtime Profile and Ticket source, set a size, cap a spend,
-/// name a routing label - and `deny_unknown_fields` on [`PoolConfig`] is what
-/// makes an attempt to *define* an agent command, a model or credentials a loud
-/// error. `[tickets]` may likewise only select a configured source:
-/// `deny_unknown_fields` on [`RepoTicketsConfig`] makes defining one a loud
-/// error. `[dispatch]` may only **tighten** the user-global ceiling, never
-/// loosen it: a repository-local `max_concurrent` selects among the concurrency
-/// the user config already granted (ADR 0014).
+/// `[checks]`, `[dispatch]`, `[forge]`, `[pools]` and `[tickets]` are the
+/// repo-owned sections. `deny_unknown_fields` is deliberate: a repository must
+/// not be able to silently configure jjfx beyond its build check, its dispatch
+/// ceiling, its Pull Request policy, its Worker Pools and its Ticket source, so
+/// any other section is a loud error rather than a quiet ignore. A pool may only
+/// *select* - reference a user-global Agent Runtime Profile and Ticket source,
+/// set a size, cap a spend, name a routing label - and `deny_unknown_fields` on
+/// [`PoolConfig`] is what makes an attempt to *define* an agent command, a model
+/// or credentials a loud error. `[tickets]` may likewise only select a
+/// configured source: `deny_unknown_fields` on [`RepoTicketsConfig`] makes
+/// defining one a loud error. `[dispatch]` may only **tighten** the user-global
+/// ceiling, never loosen it: a repository-local `max_concurrent` selects among
+/// the concurrency the user config already granted (ADR 0014). `[forge] draft`
+/// is a free preference about the Repository's own Pull Requests, while
+/// `[forge] pull_requests` may only turn the Repository's forge **off**.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RepoConfig {
@@ -1036,6 +1059,9 @@ pub struct RepoConfig {
     /// `[dispatch]` when present. `None` (no `[dispatch]` section) leaves the
     /// user-global ceiling in place.
     pub dispatch: Option<DispatchConfig>,
+    /// The Pull Request policy this Repository selects for itself. `None` (no
+    /// `[forge]` section) leaves the user-global `[forge]` in place.
+    pub forge: Option<RepoForgeConfig>,
     /// One declaration per named Worker Pool, keyed by name. Empty (the default)
     /// means the Repository's single implicit `default` pool and today's
     /// behaviour, unchanged.
@@ -1103,6 +1129,27 @@ impl RepoConfig {
         }
         Ok(())
     }
+}
+
+/// A repository-local `[forge]` selection, from `<repo>/.jjfx/config.toml`.
+///
+/// Every key is optional, so a Repository that sets one key keeps the
+/// user-global value for the other. `draft` is a preference about the
+/// Repository's own Pull Requests - the same kind of property as `[checks]` -
+/// so a Repository sets it freely; `pull_requests` gates whether jjfx opens a
+/// Pull Request over `gh` at all, so a Repository may only turn its forge
+/// **off**, never on (ADR 0014). `deny_unknown_fields` keeps an attempt to set
+/// anything else a loud error naming the file.
+#[derive(Debug, Clone, Copy, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RepoForgeConfig {
+    /// Whether this Repository opens Pull Requests at all. Absent leaves the
+    /// user-global setting in place; `false` turns the Repository's forge off,
+    /// while `true` cannot grant a forge the user withheld.
+    pub pull_requests: Option<bool>,
+    /// Whether the Pull Requests this Repository opens are drafts. Absent leaves
+    /// the user-global setting in place.
+    pub draft: Option<bool>,
 }
 
 /// One Worker Pool that declares a routing label, and the label that routes to
@@ -1267,10 +1314,11 @@ pub fn load_repo(repo_root: &Path, user: &Config) -> anyhow::Result<RepoConfig> 
 /// file parses but is wrong, so the two cannot drift.
 fn repo_config_hint(path: &Path) -> String {
     format!(
-        "parsing config {} - a repository may set only [checks], [dispatch], [pools] and \
-         [tickets]; a pool and a [tickets] selection may select a user-global profile and \
-         Ticket source, never define one, and [dispatch] may only tighten the user-global \
-         ceiling",
+        "parsing config {} - a repository may set only [checks], [dispatch], [forge], [pools] \
+         and [tickets]; a pool and a [tickets] selection may select a user-global profile and \
+         Ticket source, never define one, [dispatch] and [forge] pull_requests may only tighten \
+         the user-global setting, and [forge] draft is the repository's own Pull Request \
+         preference",
         path.display()
     )
 }
@@ -1563,8 +1611,8 @@ mod tests {
     fn the_user_global_check_applies_when_the_repository_sets_none() {
         let config = Config::from_toml("[checks]\ncommand = \"cargo check\"\n");
         // No repository file at all, and one that sets nothing (a comment only -
-        // any section other than `[checks]`, `[dispatch]`, `[pools]` and
-        // `[tickets]` is rejected, not ignored).
+        // any section other than `[checks]`, `[dispatch]`, `[forge]`, `[pools]`
+        // and `[tickets]` is rejected, not ignored).
         for repo in [
             repo_with_config(None),
             repo_with_config(Some("# nothing repo-owned here yet\n")),
@@ -1600,9 +1648,9 @@ mod tests {
     fn an_invalid_repository_config_is_an_error_naming_the_file() {
         let config = Config::from_toml("");
 
-        // `[checks]`, `[dispatch]`, `[pools]` and `[tickets]` are the repo-owned
-        // sections, so a repository cannot reconfigure the agent, the terminal,
-        // or anything else.
+        // `[checks]`, `[dispatch]`, `[forge]`, `[pools]` and `[tickets]` are the
+        // repo-owned sections, so a repository cannot reconfigure the agent, the
+        // terminal, or anything else.
         let repo = repo_with_config(Some("[agent]\ncommand = \"rm -rf /\"\n"));
         let error = config
             .checks_for(repo.path())
@@ -1624,6 +1672,91 @@ mod tests {
             .checks_for(repo.path())
             .expect_err("a blank command must be rejected");
         assert!(format!("{error:?}").contains("checks.command"), "{error:?}");
+    }
+
+    /// A Repository may choose its own Pull Request policy: a `[forge]` section
+    /// in `.jjfx/config.toml` is accepted, and `draft` is a free preference
+    /// about the Repository's own Pull Requests.
+    #[test]
+    fn a_repository_may_choose_its_draft_policy() {
+        // The user-global default drafts; the Repository opens ready for review.
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[forge]\ndraft = false\n"));
+        let forge = config
+            .forge_for(repo.path())
+            .expect("the repository config parses");
+        assert!(!forge.draft, "the repository's draft choice wins");
+        assert!(forge.pull_requests, "an omitted key keeps the global value");
+
+        // A Repository that moves the other way over a ready user-global.
+        let config = Config::from_toml("[forge]\ndraft = false\n");
+        let repo = repo_with_config(Some("[forge]\ndraft = true\n"));
+        assert!(
+            config
+                .forge_for(repo.path())
+                .expect("the repository config parses")
+                .draft
+        );
+
+        // With no `[forge]` section the user-global policy stands.
+        let config = Config::from_toml("[forge]\ndraft = false\n");
+        let repo = repo_with_config(None);
+        assert!(
+            !config
+                .forge_for(repo.path())
+                .expect("no repository override")
+                .draft
+        );
+    }
+
+    /// `pull_requests` gates whether jjfx performs the capability-bearing act of
+    /// opening a Pull Request over `gh`, so a Repository may only turn its forge
+    /// **off**, never on: a repository that asks for one the user withheld is
+    /// held to the user's setting rather than quietly widening it (ADR 0014).
+    #[test]
+    fn a_repository_may_only_turn_its_forge_off() {
+        // A repository may turn its own forge off.
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[forge]\npull_requests = false\n"));
+        assert!(
+            !config
+                .forge_for(repo.path())
+                .expect("the repository config parses")
+                .pull_requests
+        );
+
+        // A repository cannot grant a forge the user withheld.
+        let config = Config::from_toml("[forge]\npull_requests = false\n");
+        let repo = repo_with_config(Some("[forge]\npull_requests = true\n"));
+        assert!(
+            !config
+                .forge_for(repo.path())
+                .expect("the repository config parses")
+                .pull_requests,
+            "a repository may not widen the user-global setting"
+        );
+
+        // A repository that sets only `draft` keeps the user's forge setting.
+        let config = Config::from_toml("[forge]\npull_requests = false\n");
+        let repo = repo_with_config(Some("[forge]\ndraft = false\n"));
+        assert!(
+            !config
+                .forge_for(repo.path())
+                .expect("the repository config parses")
+                .pull_requests
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_inside_a_repository_forge_section_is_rejected() {
+        let config = Config::from_toml("");
+        let repo = repo_with_config(Some("[forge]\ndraf = false\n"));
+        let error = config
+            .forge_for(repo.path())
+            .expect_err("a typo is an error");
+        let message = format!("{error:?}");
+        assert!(message.contains("config.toml"), "{message}");
+        assert!(message.contains("draf"), "{message}");
     }
 
     #[test]

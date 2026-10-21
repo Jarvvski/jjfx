@@ -5,7 +5,8 @@ jjfx reads its own settings from two files. The **user config**,
 applies everywhere. The **repository config**, `<repo>/.jjfx/config.toml`, is
 read per repository and may set only the settings that are a property of the
 repository - [`[checks]`](#checks), [`[dispatch]`](#dispatch),
-[`[pools]`](#pools) and [`[tickets]`](#repository-local-ticket-source). Both are
+[`[forge]`](#forge), [`[pools]`](#pools) and
+[`[tickets]`](#repository-local-ticket-source). Both are
 distinct from jj config (read through the `jj` CLI) and the lifecycle event log.
 A missing file means defaults; a file that exists but fails to parse is an error
 naming the offending key and file, surfaced before the TUI takes over the screen.
@@ -189,6 +190,33 @@ never assembles base-chained stacks and never rewrites a PR body beyond the
 change's own description. A repository with no forge - `pull_requests = false`,
 or no `origin` remote to open one against - forges cleanly: the Pull Request
 step does not apply, and it does not taint an otherwise successful run.
+
+### Repository-local Pull Request policy
+
+`[forge]` is also repository-owned. A repository whose Pull Requests should not
+be drafts says so for itself in `<repo>/.jjfx/config.toml`, without editing the
+user-global config:
+
+```toml
+# <repo>/.jjfx/config.toml
+[forge]
+draft = false
+```
+
+`draft` is a preference about the repository's *own* Pull Requests, not a
+capability, so a repository sets it freely. `pull_requests` gates whether jjfx
+performs the act of opening a Pull Request over `gh`, so a repository may only
+turn its own forge **off**: a repository that sets `pull_requests = true` while
+the user withheld it is held to the user's setting, exactly as `[dispatch]`
+tightens rather than loosens. An absent key keeps the user-global value, and any
+other key is a loud error naming the file. See
+[ADR 0014](adr/0014-repository-local-pool-declarations.md).
+
+A delivery that opens a **draft** Pull Request says so and names the command
+that marks it mergeable - `gh pr ready <number>` - because a draft cannot be
+merged until then. A repository whose landing flow is `jjfx deliver` therefore
+sets `draft = false`, so the Pull Request is ready for review when it opens and
+the flow completes without a hand-run step.
 
 ### Formatting before push
 
@@ -390,7 +418,8 @@ Dispatch rather than accumulating Tickets you have since dispatched by hand.
 ### Repository-local dispatch ceiling
 
 A Repository may set its own `[dispatch] max_concurrent` in
-`<repo>/.jjfx/config.toml`, beside `[checks]`, `[pools]` and `[tickets]`, so an
+`<repo>/.jjfx/config.toml`, beside `[checks]`, `[forge]`, `[pools]` and
+`[tickets]`, so an
 agent about to fan work out can pace one backlog without editing the user's
 global config - which would change every repository that user drives:
 
@@ -544,7 +573,8 @@ there **replaces** the user-global one for that repository - a repository either
 owns its check or inherits the user's. Any other section in that file is
 rejected, so a repository cannot silently configure the agent, the terminal, or
 anything else. The other repository-owned sections are
-[`[dispatch]`](#repository-local-dispatch-ceiling), [`[pools]`](#pools) and
+[`[dispatch]`](#repository-local-dispatch-ceiling),
+[`[forge]`](#repository-local-pull-request-policy), [`[pools]`](#pools) and
 [`[tickets]`](#repository-local-ticket-source).
 
 ```toml
