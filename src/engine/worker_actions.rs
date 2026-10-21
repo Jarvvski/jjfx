@@ -868,6 +868,11 @@ impl WorkerActions {
     }
 
     /// Returns the `owner/repo` and open pull request for a Worker's bookmark.
+    ///
+    /// Only an *open* Pull Request is reviewable, so a branch whose Pull Request
+    /// has merged or been closed is refused by naming that state - the answer
+    /// `gh pr view` would give - rather than reported as a Pull Request that does
+    /// not exist. Only a branch with no Pull Request at all reads as missing.
     fn pull_request_for(
         &self,
         worker: &WorkerId,
@@ -876,13 +881,13 @@ impl WorkerActions {
         let Some(repository) = self.persisted_gh_repo()? else {
             return Err(WorkerActionError::RepositoryUnavailable);
         };
-        let pull_request = self
-            .commands
-            .pull_request(&repository, &branch)?
-            .ok_or_else(|| WorkerActionError::PullRequestNotFound {
-                branch: branch.clone(),
-            })?;
-        Ok((repository, pull_request))
+        match self.commands.pull_request(&repository, &branch)? {
+            PullRequestLookup::Open(pull_request) => Ok((repository, pull_request)),
+            PullRequestLookup::NotOpen(state) => {
+                Err(WorkerActionError::PullRequestNotOpen { branch, state })
+            }
+            PullRequestLookup::Missing => Err(WorkerActionError::PullRequestNotFound { branch }),
+        }
     }
 
     /// The Worker Pool's persisted `gh_repo`, or `None` when it records none.
@@ -1146,6 +1151,50 @@ struct PullRequest {
     mergeable: String,
     #[serde(default)]
     review_decision: String,
+}
+
+/// The state `gh` reports for a Pull Request.
+///
+/// `gh`'s `state` field is `OPEN`, `MERGED` or `CLOSED` (the same three values
+/// its `--state` flag accepts). The review verb resolves the *open* Pull
+/// Request, because a merged or closed one has nothing left to review, but names
+/// the state it found rather than reporting a Pull Request that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PullRequestState {
+    /// The Pull Request is open and reviewable.
+    Open,
+    /// The Pull Request was merged.
+    Merged,
+    /// The Pull Request was closed without merging.
+    Closed,
+}
+
+impl std::fmt::Display for PullRequestState {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Open => "open",
+            Self::Merged => "merged",
+            Self::Closed => "closed",
+        })
+    }
+}
+
+/// The result of resolving a Worker bookmark's Pull Request.
+enum PullRequestLookup {
+    /// The open Pull Request, ready to review.
+    Open(PullRequest),
+    /// A Pull Request names the branch, but it is no longer open.
+    NotOpen(PullRequestState),
+    /// No Pull Request names the branch, in any state.
+    Missing,
+}
+
+/// One `state` entry of `gh pr list --json state`, which the state-only lookup
+/// decodes.
+#[derive(Debug, Deserialize)]
+struct PullRequestStateRow {
+    state: PullRequestState,
 }
 
 /// The Pull Request a `review` addresses, resolved once for a whole loop.
@@ -1527,7 +1576,29 @@ impl SystemCommands {
         })
     }
 
+    /// Resolves the branch's Pull Request, naming whether it is open, another
+    /// state, or absent.
+    ///
+    /// The open lookup runs first so an open Pull Request is the one reviewed
+    /// even when an older Pull Request on the same branch merged. Only when no
+    /// open Pull Request exists does the state lookup run, so the common case
+    /// costs one `gh` call.
     fn pull_request(
+        self,
+        repository: &str,
+        branch: &str,
+    ) -> Result<PullRequestLookup, WorkerActionError> {
+        if let Some(pull_request) = self.find_open_pull_request(repository, branch)? {
+            return Ok(PullRequestLookup::Open(pull_request));
+        }
+        match self.pull_request_state(repository, branch)? {
+            Some(state) => Ok(PullRequestLookup::NotOpen(state)),
+            None => Ok(PullRequestLookup::Missing),
+        }
+    }
+
+    /// The branch's open Pull Request, or `None` when it has none open.
+    fn find_open_pull_request(
         self,
         repository: &str,
         branch: &str,
@@ -1555,6 +1626,30 @@ impl SystemCommands {
             }
         })?;
         Ok(requests.into_iter().next())
+    }
+
+    /// The state `gh` reports for the branch's most recent Pull Request in any
+    /// state, or `None` when the branch has no Pull Request at all.
+    fn pull_request_state(
+        self,
+        repository: &str,
+        branch: &str,
+    ) -> Result<Option<PullRequestState>, WorkerActionError> {
+        let output = self.run(
+            "find pull request state",
+            "gh",
+            &[
+                "-R", repository, "pr", "list", "--head", branch, "--state", "all", "--json",
+                "state", "--limit", "1",
+            ],
+        )?;
+        let rows = serde_json::from_str::<Vec<PullRequestStateRow>>(&output).map_err(|source| {
+            WorkerActionError::Command {
+                operation: "decode pull request state",
+                detail: source.to_string(),
+            }
+        })?;
+        Ok(rows.into_iter().next().map(|row| row.state))
     }
 
     fn failing_checks(
@@ -1901,9 +1996,17 @@ pub enum WorkerActionError {
     /// remote, so the repository it names cannot be resolved.
     #[error("cannot resolve GitHub repository: {detail}")]
     RepositoryIdentity { detail: String },
-    /// No open pull request exists for the Worker bookmark.
+    /// No pull request exists for the Worker bookmark, in any state.
     #[error("no pull request found for branch {branch}")]
     PullRequestNotFound { branch: String },
+    /// The Worker's pull request exists but is no longer open, so there is
+    /// nothing left to review. The state found is named - `merged` or `closed` -
+    /// rather than reported as a pull request that does not exist.
+    #[error("pull request for branch {branch} is {state}; there is nothing left to review")]
+    PullRequestNotOpen {
+        branch: String,
+        state: PullRequestState,
+    },
     /// The rebase succeeded but left the bookmark conflicted, so jj will not
     /// push it. The rebase is deliberately left in place and the state is named,
     /// rather than reported as a push failure with a rollback that did not happen.
@@ -2024,6 +2127,40 @@ mod tests {
         );
         // Absorb can conflict the commits above it, so the prompt says so.
         assert!(prompt.contains("conflicted"), "{prompt}");
+    }
+
+    /// `gh` reports a Pull Request's state as `OPEN`, `MERGED` or `CLOSED`; the
+    /// refusal's vocabulary is exactly that state, so the decode must read all
+    /// three rather than guess.
+    #[test]
+    fn a_pull_request_state_decodes_ghs_vocabulary() {
+        let decode = |body: &str| {
+            serde_json::from_str::<PullRequestStateRow>(body)
+                .expect("a gh state decodes")
+                .state
+        };
+
+        assert_eq!(decode(r#"{"state":"OPEN"}"#), PullRequestState::Open);
+        assert_eq!(decode(r#"{"state":"MERGED"}"#), PullRequestState::Merged);
+        assert_eq!(decode(r#"{"state":"CLOSED"}"#), PullRequestState::Closed);
+    }
+
+    /// A Pull Request that is no longer open is refused by naming the state
+    /// `gh` found, so a merged or closed one never reads as one that does not
+    /// exist.
+    #[test]
+    fn the_not_open_refusal_names_the_state() {
+        let merged = WorkerActionError::PullRequestNotOpen {
+            branch: "adam/x".to_owned(),
+            state: PullRequestState::Merged,
+        };
+        assert!(merged.to_string().contains("is merged"), "{merged}");
+
+        let closed = WorkerActionError::PullRequestNotOpen {
+            branch: "adam/x".to_owned(),
+            state: PullRequestState::Closed,
+        };
+        assert!(closed.to_string().contains("is closed"), "{closed}");
     }
 
     /// The body `gh -R Jarvvski/jjfx pr checks 163 --json name,bucket,state`

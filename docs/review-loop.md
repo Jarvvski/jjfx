@@ -14,6 +14,13 @@ agent of its own: the reviewer is the Pull Request's own review threads, read
 through `gh`. A repository with no forge, or a Worker with no Pull Request, is
 refused by name rather than silently reporting convergence.
 
+Only an **open** Pull Request is reviewable, so a Worker whose Pull Request has
+already merged or been closed is refused by name too - naming the state `gh`
+reports - because there is nothing left to review. That is the answer a landed
+Worker gets before it has been reused: its Pull Request is right there, and the
+refusal says so rather than claiming no Pull Request exists. Only a branch with
+no Pull Request in any state reads as "no pull request found".
+
 ## What the loop reads
 
 Each pass asks `gh` for the Pull Request's review threads and keeps the

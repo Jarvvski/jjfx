@@ -1,6 +1,6 @@
 # A merged Pull Request is refused as "no pull request found"
 
-Status: ready-for-agent
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -31,11 +31,50 @@ gets is that no Pull Request exists.
 
 ## Acceptance Criteria
 
-- A Worker whose Pull Request has merged, or been closed, is refused by name with
-  that state - not as a Pull Request that does not exist.
-- Only a branch with no Pull Request at all reads as "no pull request found".
-- `jjfx help review` or `docs/review-loop.md` says what happens to a Worker whose
-  PR has already merged, so the answer is not a surprise.
+- [x] A Worker whose Pull Request has merged, or been closed, is refused by name
+      with that state - not as a Pull Request that does not exist.
+- [x] Only a branch with no Pull Request at all reads as "no pull request found".
+- [x] `jjfx help review` or `docs/review-loop.md` says what happens to a Worker
+      whose PR has already merged, so the answer is not a surprise.
+
+## Resolution
+
+`pull_request_for` (`src/engine/worker_actions.rs`) now resolves the Worker
+bookmark's Pull Request in two steps instead of reading only the open list. The
+open lookup (`gh pr list --head <branch>`, state `open`) runs first, so the
+common case is unchanged and still one `gh` call; a Pull Request it finds is
+reviewed exactly as before. Only when it finds none does a second lookup
+(`gh pr list --head <branch> --state all --json state --limit 1`) read the state
+of any Pull Request on the branch. The result is a typed
+`PullRequestLookup::{Open, NotOpen, Missing}`: `Open` carries the reviewable Pull
+Request, `NotOpen` carries the state `gh` reported, and only `Missing` - no Pull
+Request in any state - produces `WorkerActionError::PullRequestNotFound`.
+
+The state is a new typed value, `PullRequestState { Open, Merged, Closed }`,
+decoded from `gh`'s own `state` vocabulary (`OPEN`/`MERGED`/`CLOSED`, the same
+values its `--state` flag accepts) rather than invented, and it `Display`s as
+`merged`/`closed`. A non-open Pull Request is refused with the new
+`WorkerActionError::PullRequestNotOpen { branch, state }` - a typed variant, not
+a formatted string - whose message names the state: `pull request for branch
+<branch> is merged; there is nothing left to review`. This is the same rule
+`dogfood-2`'s finding 02 applied to a Blocker's bookmark state: name the state
+found, not the absence of one.
+
+`jjfx help review` and `docs/review-loop.md` both now say that a Worker whose
+Pull Request has already merged or been closed is refused by name, naming that
+state, so a landed Worker's answer is not a surprise.
+
+Coverage: `src/engine/worker_actions.rs` unit tests assert `gh`'s three states
+decode and that the refusal names `merged`/`closed`; `tests/review_contract.rs`
+drives `jjfx review` against a fake `gh` and asserts a merged Pull Request is
+refused as `is merged`, a closed one as `is closed`, neither reading as "no pull
+request found", that a branch with no Pull Request still reads as "no pull
+request found", and that an open Pull Request is still reviewed even when an
+earlier Pull Request on the same branch merged. A contract test asserts both the
+help page and the review-loop page name the merged and closed states. Verified
+with `mise run check` (fmt + clippy + build + test green) and re-run hermetically
+(`env -u JJ_CONFIG -u XDG_CONFIG_HOME HOME=$(mktemp -d) JJFX_TEST_SIGNING_OFF=1`
+against the built `review_contract` binary).
 
 ## Triage (2026-10-21)
 
