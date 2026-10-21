@@ -27,11 +27,12 @@ pool under a concurrency cap of two, `dispatch --all`, `status --json`,
 `children`, `logs`, `deliver`, and the forge path (push, PR, `gh pr checks`,
 merge on green). The orchestrator was this agent; jjfx spawned every Worker.
 
-**Result: all eight Tickets resolved and verified, and seven of the eight
-landed.** `runs.jsonl` records `check: passed` for every one, the fixture's CI is
-green on every PR, and the merged trunk's suite grew from 41 tests to 111 with
-881 insertions across 16 files. The eighth PR is open on a merge conflict - see
-§3.2 - and jjfx offers no way to resolve it.
+**Result: every Ticket resolved and verified, and eight of the nine landed.** A
+ninth Ticket was filed mid-drive to give the newly-landed review loop a real
+Pull Request to work on. `runs.jsonl` records `check: passed` for every one, the
+fixture's CI is green on every PR, and the merged trunk's suite grew from 41
+tests to 126 with real work across the fixture. One PR is open on a merge
+conflict - see §3.2 - and jjfx offers no way to resolve it.
 
 ---
 
@@ -90,8 +91,9 @@ green on every PR, and the merged trunk's suite grew from 41 tests to 111 with
 | A landed PR can be merged on green | `gh pr merge` on each PR after `gh pr checks` | **Failed.** Every PR is a draft, and `gh pr merge` refuses one. Finding 01. |
 | A conflicting PR can be fixed through jjfx | `jjfx deliver` / `rebase` / `absorb` on the delivering Worker | **Failed.** The Worker had been reused, and every verb takes a Worker. Finding 02. |
 | An opencode Run's cost is recorded | `jjfx status` after eight Runs | **Failed.** `8 Run(s) (8 without a reported cost)`, so the `[spend]` cap cannot bind. Finding 04. |
-| The review loop can be exercised | `jjfx review` against a PR | **Could not test.** No command drives `ReviewLoop` - the owner's ruling (finding 03) is the answer, and its implementation is in flight. |
+| The review loop can be exercised | `jjfx review` against a real PR with a review thread | **Failed.** It reads threads, sends findings and converges correctly - and then reports convergence on a PR with an *unresolved* thread, because a recorded pass replays forever. Findings 03 (landed), 05. |
 | A Worker can run `jjfx` itself | the prompt names `jjfx deliver <worker>`; a login shell resolves `jjfx` | **Held, by luck.** A Worker's login shell resolves `jjfx` to `~/.cargo/bin/jjfx` (a released binary), not the build under test. No Worker needed it, because the prompt also tells them not to push - but the trap is live. |
+| The binary under test is the source under test | `jjfx help review` after a rebuild | **Failed, and the drive caught itself.** A `mise run build` ran against a stale checkout and no-op'd in 0.41s, so a first pass at the review loop measured the pre-merge binary. The trap the map warns about is not only the Workers'. |
 
 ---
 
@@ -124,11 +126,32 @@ drive left five.
 inert - `cap_usd` cannot bind, and `on_exceed` can never fire. Filed as
 **finding 04**.
 
-### 3.4 The review loop still has no caller
+### 3.4 The loop has a caller, and it lies when a pass replays
 
-Unchanged from the second drive, and now answered rather than left open: the
-owner has ruled that jjfx owns the loop with the PR's review threads as its
-findings source. Filed as **finding 03**, with the implementation in flight.
+The second drive left this open; the owner's ruling answered it, and the
+implementation landed during this drive (PR #176): `jjfx review <worker>` now
+drives the bounded loop over the Pull Request's unresolved review threads, read
+through `gh`.
+
+Exercised live against a real PR, the good half works exactly as designed. With
+no unresolved threads, one pass converges, sends nothing, and exits 0, recording
+`review:<ticket>:threads:1` in the durable queue and its decision in
+`decisions.json`; a second invocation replays it (`1 pass(es) replayed from the
+decision log`) without touching the model. With a thread open, the loop read it,
+sent the finding to the Worker, and the Worker fixed the code, replied on the
+thread and resolved it - after which the loop converged. `gh`'s GraphQL shape was
+parsed correctly, which is what `dogfood-2`'s finding 03 was about.
+
+**Then it lied.** A recorded pass replays forever, because the step key carries
+no review state: a thread opened *after* pass 1 recorded "no findings" is never
+read, and the loop reports `convergence (a pass found nothing)` on a Pull Request
+with an unresolved thread - with `1 pass(es) replayed from the decision log` in
+the same output, saying plainly what it did not do. Filed as **finding 05**;
+this is the one to fix before the loop is trusted.
+
+A smaller dishonesty sits beside it: a Worker whose PR has already merged is
+refused as `no pull request found`, when the PR is right there and merged. Filed
+as **finding 06**.
 
 ---
 
@@ -156,13 +179,18 @@ about the PR that no jjfx verb can act on, and both surfaced only after
 |---|---|---|
 | 01 | Every delivered PR is a draft and a repository cannot choose otherwise, so the landing flow stalls at `gh pr merge` | bug |
 | 02 | A delivered PR whose trunk moved cannot be re-welded, and reusing its Worker destroys the only handle to it | bug |
-| 03 | jjfx owns the bounded review loop again, sourced from the PR's review threads (the owner's ruling) | task |
+| 03 | jjfx owns the bounded review loop again, sourced from the PR's review threads (the owner's ruling) - **landed as #176** | task |
 | 04 | An opencode Run records no cost, so the `[spend]` cap is inert | bug |
+| 05 | A recorded review pass replays forever, so a new review thread is invisible and the loop reports convergence | bug |
+| 06 | A merged Pull Request is refused as "no pull request found" | bug |
 
 ## 6. Evidence left behind
 
 - `~/Code/personal/jjfx-drive-3` - the fixture, its branches, its PRs, its
-  `runs.jsonl`, its `.jj` state.
-- `Jarvvski/jjfx-drive-3` - the real private repository: seven merged PRs, one
-  open on a conflict, CI green on `main`.
-- The fixture's merged trunk: 111 tests passing, 881 insertions across 16 files.
+  `runs.jsonl`, its `.jj` state, its `.jj/pools/default/decisions.json` and the
+  review step in its queue.
+- `Jarvvski/jjfx-drive-3` - the real private repository: eight merged PRs, one
+  open on a conflict, CI green on `main`, and the review threads the loop was
+  exercised against (one resolved by the Worker, one still open and unseen by the
+  loop - finding 05's evidence).
+- The fixture's merged trunk: 126 tests passing.
