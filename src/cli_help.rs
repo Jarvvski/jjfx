@@ -112,13 +112,13 @@ fn notes(key: &str) -> &'static str {
             "\n`review` drives the bounded re-review loop over a Worker's pull request:\neach pass reads the Pull Request's unresolved review threads through `gh`,\nand a pass that found something sends its findings to the Worker to address.\nThe loop runs at most `[review] max_passes` passes and stops early when a\nround makes no progress, so a pass that finds nothing converges and sends\nnothing. Only convergence is success: a loop that stops on the pass cap, on a\nstalled round, or on a review it could not read escalates its unresolved\nfindings for a human and exits non-zero. A repository with no forge, or a\nWorker with no Pull Request, is refused by name. A Worker whose Pull Request\nhas already merged or been closed is refused by name too, naming that state,\nbecause there is nothing left to review. `--fg` selects when each\naddress Run returns, not how many passes run.\n"
         }
         "deliver" => {
-            "\n`deliver` is the one forge path, and what the Dispatch prompt means by\n\"jjfx delivers the change\": it welds the Worker's chain onto trunk, runs the\nrepository's own build check (`<repo>/.jjfx/config.toml` `[checks]`), pushes\nthe chain, and opens one Pull Request per change based on the repository's\ndefault branch. A failed check, a conflict, or an unreachable forge stops the\nrun before the push and names why, and the verb exits non-zero. A change that\nalready has a Pull Request is left alone, so re-running is safe.\n\nWhether the Pull Request opens as a draft is the repository's own choice:\n`<repo>/.jjfx/config.toml` `[forge] draft` sets it per repository, else the\nuser-global `[forge] draft` (a draft by default). A delivery that opened a\ndraft says so and names `gh pr ready <number>` - a draft cannot be merged until\nit is marked ready, so set `draft = false` where you want `deliver` to land a\nmergeable Pull Request.\n\nA repository with no forge is a supported path, not a degraded one: with\n`[forge] pull_requests = false`, or no `origin` remote to open a Pull Request\nagainst, the Pull Request step does not apply and a clean weld, check and push\nstill succeeds.\n\nThis is the whole path. `rebase` pushes without opening a Pull Request, and\n`open-pr` only opens one that already exists.\n"
+            "\n`deliver` is the one forge path, and what the Dispatch prompt means by\n\"jjfx delivers the change\": it welds the change's chain onto trunk, runs the\nrepository's own build check (`<repo>/.jjfx/config.toml` `[checks]`), pushes\nthe chain, and opens one Pull Request per change based on the repository's\ndefault branch. A failed check, a conflict, or an unreachable forge stops the\nrun before the push and names why, and the verb exits non-zero. A change that\nalready has a Pull Request is left alone, so re-running is safe.\n\nWhether the Pull Request opens as a draft is the repository's own choice:\n`<repo>/.jjfx/config.toml` `[forge] draft` sets it per repository, else the\nuser-global `[forge] draft` (a draft by default). A delivery that opened a\ndraft says so and names `gh pr ready <number>` - a draft cannot be merged until\nit is marked ready, so set `draft = false` where you want `deliver` to land a\nmergeable Pull Request.\n\nA repository with no forge is a supported path, not a degraded one: with\n`[forge] pull_requests = false`, or no `origin` remote to open a Pull Request\nagainst, the Pull Request step does not apply and a clean weld, check and push\nstill succeeds.\n\nThe change is named by a Worker (`jjfx deliver worker-a04066`) or by its\nbookmark (`jjfx deliver adam/<ticket>-<slug>`). The two are the same delivery on\nthe same thing. A Worker is a reusable slot - the next Dispatch takes it back\nthe moment its Run ends - while the bookmark it delivered stays in the\nrepository, so the bookmark is the durable name of a delivered change. Naming\nit is how a Pull Request that conflicts after a sibling merged is re-welded:\nrun the same delivery again, on the name that survived.\n\nWhen no Workspace holds the change, `deliver` creates one for it, named\n`branch-<bookmark>`, and says so: the build check runs against a working copy,\nand a conflict the weld records is only reachable through a Workspace's own\nchain. A conflict stops the run and names that Workspace; resolve it with\n`jjfx resolve <workspace>`, then re-run.\n\nThis is the whole path. `rebase` pushes without opening a Pull Request, and\n`open-pr` only opens one that already exists.\n"
         }
         "rebase" => {
-            "\n`rebase` rebases the Worker's bookmark onto `main` and pushes it - nothing\nmore. It runs no build check and opens no Pull Request, so the pull request\n`deliver` would open is left for you to create. Use `deliver` for the whole\npath.\n"
+            "\n`rebase` rebases a change onto `main` and pushes it - nothing more. It runs\nno build check and opens no Pull Request, so the pull request `deliver` would\nopen is left for you to create. Use `deliver` for the whole path.\n\nThe change is named by a Worker (`jjfx rebase worker-a04066`) or by its\nbookmark (`jjfx rebase adam/<ticket>-<slug>`). A Worker is a reusable slot -\nthe next Dispatch takes it back the moment its Run ends - while the bookmark it\ndelivered stays in the repository, so the bookmark is the durable name of a\ndelivered change. Naming it is how a change is re-welded after a sibling merged\nand moved trunk under its Pull Request.\n\nWhen no Workspace holds the change, `rebase` creates one for it, named\n`branch-<bookmark>`, and says so. A conflicted rebase is left in place, names\nthat Workspace, and pushes nothing: resolve the conflict with\n`jjfx resolve <workspace>`, then re-run to push.\n"
         }
         "open-pr" => {
-            "\n`open-pr` opens a Pull Request that already exists in the browser; it\ndoes not create one, weld onto trunk, or run the repository's check. To create\nthe Pull Request, run `deliver`.\n"
+            "\n`open-pr` opens a Pull Request that already exists in the browser; it\ndoes not create one, weld onto trunk, or run the repository's check. To create\nthe Pull Request, run `deliver`.\n\nThe change is named by a Worker or by its bookmark, so a Pull Request whose\nWorker has been reused is still reachable: `jjfx open-pr adam/<ticket>-<slug>`.\n"
         }
         "sync" => {
             "\n`sync` moves the working copy in the current directory onto trunk: it\nfetches first when the repository has a remote, then replaces an empty\nworking copy with a fresh commit above trunk (`jj new`) or rebases one that\ncarries changes (`jj rebase`). A rebase that conflicts is reported, not\nresolved - run `jjfx resolve` on the workspace, or `jj resolve`, and\ncontinue.\n\nNot to be confused with:\n  refresh          rebuild the workspace cache; nothing moves\n  rebase <worker>  rebase and push a named Worker's bookmark\n"
@@ -648,8 +648,8 @@ const TOP_LEVEL: &[Group] = &[
             },
             Entry {
                 key: "rebase",
-                args: "<worker>",
-                summary: "Rebase and push a Worker (rb)",
+                args: "<worker|branch>",
+                summary: "Rebase a change onto main and push it (rb)",
             },
             Entry {
                 key: "absorb",
@@ -658,13 +658,13 @@ const TOP_LEVEL: &[Group] = &[
             },
             Entry {
                 key: "open-pr",
-                args: "<worker>",
-                summary: "Open a Worker's Pull Request (pr)",
+                args: "<worker|branch>",
+                summary: "Open a change's Pull Request (pr)",
             },
             Entry {
                 key: "deliver",
-                args: "<worker>",
-                summary: "Deliver a Worker: weld, check, push, open one PR",
+                args: "<worker|branch>",
+                summary: "Deliver a change: weld, check, push, open one PR",
             },
             Entry {
                 key: "resolve",
@@ -986,11 +986,11 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "rebase",
-        summary: "Rebase and push a Worker's bookmark",
-        usage: "rebase <worker>",
+        summary: "Rebase a change onto main and push it, by Worker or bookmark",
+        usage: "rebase <worker|branch>",
         arguments: &[Argument {
-            name: "<worker>",
-            help: "Worker to rebase and push",
+            name: "<worker|branch>",
+            help: "Worker whose change to re-weld, or the change's bookmark",
         }],
         flags: NO_FLAGS,
     },
@@ -1006,21 +1006,21 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "open-pr",
-        summary: "Open a Worker's Pull Request in the browser",
-        usage: "open-pr <worker>",
+        summary: "Open a change's Pull Request in the browser, by Worker or bookmark",
+        usage: "open-pr <worker|branch>",
         arguments: &[Argument {
-            name: "<worker>",
-            help: "Worker whose Pull Request to open",
+            name: "<worker|branch>",
+            help: "Worker whose Pull Request to open, or the change's bookmark",
         }],
         flags: NO_FLAGS,
     },
     CommandHelp {
         key: "deliver",
-        summary: "Deliver a Worker's change: weld, check, push, open one Pull Request",
-        usage: "deliver <worker>",
+        summary: "Deliver a change: weld, check, push, open one Pull Request",
+        usage: "deliver <worker|branch>",
         arguments: &[Argument {
-            name: "<worker>",
-            help: "Worker whose change to deliver",
+            name: "<worker|branch>",
+            help: "Worker whose change to deliver, or the change's bookmark",
         }],
         flags: NO_FLAGS,
     },

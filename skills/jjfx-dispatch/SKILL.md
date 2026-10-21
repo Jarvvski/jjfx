@@ -131,10 +131,30 @@ jjfx resolve worker-01   # run jj resolve over a Workspace's conflicted commits
 ```
 
 - **`absorb`** needs `trunk()` to resolve - a fetched `main@origin`. Without it every commit is mutable and the fold could rewrite trunk, so it refuses by name rather than running. It resolves the Worker's bookmark by Ticket (a missing or ambiguous bookmark is an error, never a guess) and excludes the commit(s) the Workspace was stacked on, so the fold can only reach the Worker's own commits above the mainline and its stack base. It pushes only when it absorbed something, so running it speculatively is safe.
-- **`rebase`** needs the Worker's bookmark to resolve by Ticket; it rebases that bookmark onto `main` and pushes. It runs no build check and opens no Pull Request - it is not the whole delivery.
-- **`open-pr`** needs the Worker's bookmark to resolve by Ticket, and the Pool's `gh_repo` to be a real GitHub repository: a missing `origin`, or one that is not GitHub, is refused by name (`origin is not a GitHub remote`) rather than guessed from a path. It then opens the Pull Request that already exists in the browser (`gh -R <repo> pr view <branch> --web`); it does not create one, so it is not how a change gets delivered.
+- **`rebase`** needs the change's bookmark to resolve; it rebases that bookmark onto `main` and pushes. It runs no build check and opens no Pull Request - it is not the whole delivery.
+- **`open-pr`** needs the Pool's `gh_repo` to be a real GitHub repository: a missing `origin`, or one that is not GitHub, is refused by name (`origin is not a GitHub remote`) rather than guessed from a path. It then opens the Pull Request that already exists in the browser (`gh -R <repo> pr view <branch> --web`); it does not create one, so it is not how a change gets delivered.
 
-**Done when** each Worker's PR exists, or the user has taken the branch over.
+### When a PR conflicts after a sibling merged
+
+Two Workers delivered from one trunk in a batch; the first merges and moves trunk under the second, whose Pull Request now reads `CONFLICTING`. **`rebase`, `deliver` and `open-pr` name the change by its bookmark as well as by its Worker** - and the bookmark is the durable name to use, because a Worker is a reusable slot and the next Dispatch takes it back the moment its Run ends:
+
+```bash
+jjfx rebase adam/tally--04-json-output     # re-weld the delivered change by its bookmark
+jjfx deliver adam/tally--04-json-output    # the whole path, when the check should run again
+```
+
+Both verbs are the same operation on the same change whichever name you give them. When **no Workspace holds the change** - the Worker that delivered it has been reused, and its Workspace now carries the next Ticket - jjfx creates one for it, named `branch-<bookmark>`, and says so. A rebase that conflicts is left in place and names that Workspace:
+
+```
+$ jjfx rebase adam/tally--04-json-output
+Created Workspace branch-adam-tally--04-json-output to hold adam/tally--04-json-output; remove it with `jjfx rm branch-adam-tally--04-json-output` when you are done
+Error: rebased branch adam/tally--04-json-output onto main, but it has conflicts to resolve: resolve them in Workspace branch-adam-tally--04-json-output (`jjfx resolve branch-adam-tally--04-json-output`), then re-run to push; the rebase is left in place
+
+$ jjfx resolve branch-adam-tally--04-json-output     # the merge tool runs here
+$ jjfx rebase adam/tally--04-json-output             # reuses the same Workspace; pushes clean
+```
+
+**Done when** each Worker's PR exists and is mergeable, or the user has taken the branch over.
 
 ### 7. Reclaim
 

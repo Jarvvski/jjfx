@@ -931,9 +931,31 @@ pub(crate) fn lock_worker_operation(
     repository: &Repository,
     worker: &WorkerId,
 ) -> Result<WorkspaceOperationGuard, WorkerWorkspaceError> {
-    let path = repository.state_store().worker_operation_lock(worker);
+    lock_workspace_operation(repository, worker.as_str())
+}
+
+/// Exclusive ownership of one Workspace's external operations, keyed by the
+/// Workspace's name.
+///
+/// A Worker's Workspace is named for its Worker, and a Workspace jjfx creates to
+/// hold a delivered change is named for that change, so the name is the key
+/// either way: two operations on one Workspace serialise, and two on different
+/// Workspaces do not.
+pub(crate) fn lock_workspace_operation(
+    repository: &Repository,
+    workspace: &str,
+) -> Result<WorkspaceOperationGuard, WorkerWorkspaceError> {
+    // A Workspace name is a single path component by construction, which is
+    // exactly what `WorkerId` validates - it is the lock's filename, not a
+    // Worker identity, that is wanted here.
+    let name = WorkerId::parse(workspace.to_owned()).map_err(|error| {
+        WorkerWorkspaceError::new(format!(
+            "Workspace {workspace} is not a safe operation-lock name: {error}"
+        ))
+    })?;
+    let path = repository.state_store().worker_operation_lock(&name);
     let lock = locks::lock_scoped(&[ScopedLock::pool(path)])
-        .map_err(|error| lock_error(error, "Worker operation"))?;
+        .map_err(|error| lock_error(error, "Workspace operation"))?;
     Ok(WorkspaceOperationGuard { _lock: lock })
 }
 
