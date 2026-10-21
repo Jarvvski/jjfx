@@ -91,6 +91,29 @@ fn the_help_page_the_docs_and_the_config_agree_on_the_loop() {
     assert!(help.contains("Usage: jjfx review <worker>"), "{help}");
 }
 
+/// "What happens to a Worker whose Pull Request has already merged?" is
+/// documented, so the answer is not a surprise: both `jjfx help review` and the
+/// review-loop page name the merged and closed states.
+#[test]
+fn the_surfaces_name_the_merged_and_closed_states() {
+    let help = help("review");
+    let loop_doc = include_str!("../docs/review-loop.md");
+
+    for (name, text) in [
+        ("`jjfx help review`", help.as_str()),
+        ("docs/review-loop.md", loop_doc),
+    ] {
+        assert!(
+            text.contains("merged"),
+            "{name} must say what happens to a merged Pull Request: {text}"
+        );
+        assert!(
+            text.contains("closed"),
+            "{name} must say what happens to a closed Pull Request: {text}"
+        );
+    }
+}
+
 /// A jj Repository with a Pool and one Worker, plus the fakes `jjfx review`
 /// needs on `PATH`.
 ///
@@ -425,6 +448,99 @@ fn a_worker_with_no_pull_request_is_refused_by_name() {
         stderr(&output).contains("no pull request found for branch owner/eng-301-action"),
         "the refusal must name the missing Pull Request: {}",
         stderr(&output)
+    );
+}
+
+/// A Worker whose Pull Request has merged has nothing left to review, and the
+/// refusal names that state rather than reporting no Pull Request - the bug a
+/// live drive hit when a landed Worker was reviewed before reuse. `gh pr list
+/// --state all` still finds it, exactly as `gh pr view` does.
+#[test]
+fn a_merged_pull_request_is_refused_by_name() {
+    let fixture = Fixture::new(true);
+    fixture.write_jj();
+    fixture.write_gh(concat!(
+        "#!/bin/sh\n",
+        "case \"$*\" in\n",
+        "  *\"--state all\"*) printf '%s\\n' '[{\"state\":\"MERGED\"}]' ;;\n",
+        "  *\"pr list\"*) printf '[]\\n' ;;\n",
+        "esac\n"
+    ));
+    let worker = fixture.worker();
+
+    let output = fixture.jjfx(&["review", worker.as_str(), "--fg"]);
+
+    assert!(!output.status.success());
+    let reported = stderr(&output);
+    assert!(
+        reported.contains("pull request for branch owner/eng-301-action is merged"),
+        "the refusal must name the merged state: {reported}"
+    );
+    assert!(
+        !reported.contains("no pull request found"),
+        "a merged Pull Request must not read as missing: {reported}"
+    );
+}
+
+/// A Worker whose Pull Request was closed without merging is refused the same
+/// way, naming `closed` rather than `merged`.
+#[test]
+fn a_closed_pull_request_is_refused_by_name() {
+    let fixture = Fixture::new(true);
+    fixture.write_jj();
+    fixture.write_gh(concat!(
+        "#!/bin/sh\n",
+        "case \"$*\" in\n",
+        "  *\"--state all\"*) printf '%s\\n' '[{\"state\":\"CLOSED\"}]' ;;\n",
+        "  *\"pr list\"*) printf '[]\\n' ;;\n",
+        "esac\n"
+    ));
+    let worker = fixture.worker();
+
+    let output = fixture.jjfx(&["review", worker.as_str(), "--fg"]);
+
+    assert!(!output.status.success());
+    let reported = stderr(&output);
+    assert!(
+        reported.contains("pull request for branch owner/eng-301-action is closed"),
+        "the refusal must name the closed state: {reported}"
+    );
+    assert!(
+        !reported.contains("no pull request found"),
+        "a closed Pull Request must not read as missing: {reported}"
+    );
+}
+
+/// An open Pull Request is reviewed even when an earlier Pull Request on the
+/// same branch merged - a reused Worker. The open lookup runs first, so the
+/// state fallback is never consulted for a branch that is still reviewable.
+#[test]
+fn an_open_pull_request_wins_over_an_earlier_merged_one() {
+    let fixture = Fixture::new(true);
+    fixture.write_jj();
+    fixture.write_gh(
+        concat!(
+            "#!/bin/sh\n",
+            "case \"$*\" in\n",
+            "  *\"--state all\"*) printf '%s\\n' '[{\"state\":\"MERGED\"}]' ;;\n",
+            "  *\"pr list\"*) printf '%s\\n' '[{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"baseRefName\":\"main\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"REVIEW_REQUIRED\"}]' ;;\n",
+            "  *\"pr checks\"*) printf '[]\\n' ;;\n",
+            "  *\"api graphql\"*) printf '%s\\n' '{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}' ;;\n",
+            "esac\n"
+        ),
+    );
+    let worker = fixture.worker();
+
+    let output = fixture.jjfx(&["review", worker.as_str(), "--fg"]);
+
+    let reported = stderr(&output);
+    assert!(
+        output.status.success(),
+        "an open Pull Request must still be reviewed: {reported}"
+    );
+    assert!(
+        reported.contains("stopped on convergence"),
+        "the loop must run rather than refuse: {reported}"
     );
 }
 
