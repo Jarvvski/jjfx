@@ -1,6 +1,6 @@
 # An opencode Run records no cost, so the `[spend]` cap cannot bind
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -56,3 +56,18 @@ cap to bound agent spend gets no signal that it is not being enforced.
   to be in force.
 - `docs/configuration.md`'s `[spend]` section agrees with whichever behaviour is
   chosen.
+
+## Triage (2026-10-21)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+observation during the third drive**: `jjfx status` after eight opencode Runs
+read `8 Run(s) (8 without a reported cost)`.
+
+Independently **confirmed**: the per-Run cost store appends a record for every
+Run, including one that reported no cost (`src/engine/state.rs:482`), and
+`[spend] cap_usd` is enforced from those records (`docs/configuration.md`), so a
+runtime that reports no cost can never reach the cap.
+
+The acceptance criteria are unchanged, and they deliberately allow either answer:
+record the cost, or say plainly that the cap cannot bind for that runtime. What
+they forbid is `$0.0000` presented as a measurement.

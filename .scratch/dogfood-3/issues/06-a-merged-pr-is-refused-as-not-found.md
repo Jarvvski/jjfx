@@ -1,6 +1,6 @@
 # A merged Pull Request is refused as "no pull request found"
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -36,3 +36,19 @@ gets is that no Pull Request exists.
 - Only a branch with no Pull Request at all reads as "no pull request found".
 - `jjfx help review` or `docs/review-loop.md` says what happens to a Worker whose
   PR has already merged, so the answer is not a surprise.
+
+## Triage (2026-10-21)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the third drive**: `Jarvvski/jjfx-drive-3#9` merged,
+`gh pr view` still found it, and `jjfx review worker-348336` answered `no pull
+request found for branch adam/tally--09-json-array-input`.
+
+Independently **confirmed**: `pull_request_for` returns
+`WorkerActionError::PullRequestNotFound { branch }` whenever the open-Pull-Request
+lookup comes back empty (`src/engine/worker_actions.rs:882`), which is one error
+for a merged PR and for no PR at all.
+
+The acceptance criteria are unchanged. This is a message-honesty fix, the same
+rule `dogfood-2`'s finding 02 applied to a Blocker's bookmark state - name the
+state found, not the absence of one.

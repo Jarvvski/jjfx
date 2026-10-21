@@ -1,6 +1,6 @@
 # A delivered PR cannot be updated once trunk moves, and reusing the Worker destroys the only handle
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -72,3 +72,21 @@ before the sibling merged.
   reachable only by branch name and how to get to it.
 - The dispatch prompt, `jjfx help` and the skill agree on what an agent should
   do when its PR conflicts after a sibling merges.
+
+## Triage (2026-10-21)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the third drive**: two Workers delivered from one trunk, the
+first merged, the second's Pull Request read `CONFLICTING` / `DIRTY`, and the
+Worker that had delivered it was already reused for the next Ticket.
+
+Independently **confirmed**: `WorkerActions::pull_request_for`
+(`src/engine/worker_actions.rs:871`) resolves a Worker's branch and nothing else,
+and every landing verb - `rebase`, `deliver`, `absorb`, `review`, `open-pr` -
+takes a `<worker>`. No verb names a branch or a Pull Request, so a delivered
+change whose Worker has been reused is reachable only through `jj` by hand.
+
+The acceptance criteria are unchanged. This is the largest of the drive's
+findings: *what names a delivered change once its Worker is gone* is a model
+decision rather than a patch, and the second criterion (reuse must not silently
+orphan a delivered change) is the half that can be settled without it.

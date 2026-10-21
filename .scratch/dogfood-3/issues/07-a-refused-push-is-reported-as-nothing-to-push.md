@@ -1,6 +1,6 @@
 # A push jj refused is reported as a harmless skip, and the delivery fails later at the Pull Request
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -76,3 +76,23 @@ description.
   the pipeline has already stopped.
 - An empty commit in the welded chain is either dropped by the weld or named in
   the refusal.
+
+## Triage (2026-10-21)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the third drive**: a Worker's chain held an empty commit with
+no description, `jjfx deliver` printed `push: nothing to push` and carried on,
+and the Pull Request step then failed with `gh`'s `GraphQL: Head sha can't be
+blank ... No commits between main and ...`. Removing the empty commit from the
+chain made the same delivery succeed, so the cause is confirmed rather than
+inferred.
+
+Independently **confirmed in the code**: `PushOutcome::Nothing` is a `skip_step`
+that leaves `push_failed` false (`src/forge.rs:853`), so the pipeline carries on
+into the Pull Request step; only `PushOutcome::Failed` stops it (`:857`). jj
+leaves the push a no-op when it refuses a commit, and that no-op classifies as
+`Nothing`.
+
+The acceptance criteria are unchanged. The second problem the ticket names - an
+empty commit surviving the weld - belongs to the same fix; if it is easier to
+land separately, file it as its own finding rather than dropping it.
