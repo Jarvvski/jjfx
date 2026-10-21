@@ -41,6 +41,17 @@ const FIX_SRC: &str = WELD_SRC;
 /// Push revisions: this workspace's chain, minus trunk and any conflicts.
 const PUSH_REVS: &str = "::@ ~ trunk() ~ conflicts()";
 
+/// Empty, undescribed commits in this workspace's chain, which the weld drops
+/// before it rebases.
+///
+/// An empty commit is not a change, but jj refuses to push one that has no
+/// description, and `jj rebase --skip-emptied` deliberately leaves a commit
+/// that was *already* empty alone ("It will not be abandoned if it was already
+/// empty before the rebase"), so such a commit would survive the weld and stop
+/// the delivery at the push. Scoped to `::@-` so the working copy itself is
+/// never abandoned, and to `mutable()` so the immutable root cannot be named.
+const EMPTY_UNDESCRIBED: &str = "::@- ~ trunk() & mutable() & empty() & description(exact:\"\")";
+
 /// The five forge steps, in pipeline order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Step {
@@ -517,6 +528,20 @@ impl JjAdapter for SystemJj {
     }
 
     fn weld(&self, dir: &Path) -> Result<bool, String> {
+        // An already-empty, undescribed commit is not a change, but it is
+        // exactly what jj refuses to push - and `--skip-emptied` only drops
+        // commits that *become* empty, so it would survive the rebase and stop
+        // the delivery at the push. Abandon it first: its descendants are
+        // rebased onto its parents, and the rebase below then moves the cleaned
+        // chain onto trunk. An empty revset is a no-op.
+        let abandoned = cmd("jj")
+            .current_dir(dir)
+            .args(["abandon", "-r", EMPTY_UNDESCRIBED])
+            .run()
+            .map_err(|error| error.to_string())?;
+        if !abandoned.ok() {
+            return Err(format!("jj abandon: {}", abandoned.stderr().trim()));
+        }
         let run = cmd("jj")
             .current_dir(dir)
             .args(["rebase", "--skip-emptied", "-s", WELD_SRC, "-d", "trunk()"])

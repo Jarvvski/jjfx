@@ -110,6 +110,8 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx logs follows a session-delivered Run's opencode session - reading the session's messages and printing its activity - instead of tailing a process log that stays empty, and says plainly that there is no process log and names the session when the daemon cannot be reached
 - jjfx deliver tracks a fresh Worker bookmark on the push remote before pushing, so it delivers on a clean jj config - jj git push --revisions refuses to create a remote bookmark for a local one that is not tracked, which only a developer remotes.origin.auto-track-bookmarks setting masked.
 - jjfx review reads a pull request's review threads on every invocation instead of replaying a pass recorded by an earlier run: a review thread opened after a converged pass is now seen, so the loop no longer reports convergence while the pull request has an unresolved thread.
+- jjfx deliver reports a push jj refused - a commit it will not push, such as one with no description - as a failure naming jj's reason and the offending commit, instead of `push: nothing to push`; the delivery stops before the Pull Request step rather than reaching it with a branch that never arrived and failing there with a blank-head-sha `gh` error
+- jjfx deliver's weld drops an empty, undescribed commit from a Worker's chain before pushing: an empty commit is not a change, jj refuses to push it, and `jj rebase --skip-emptied` leaves a commit that was already empty alone, so such a chain now delivers instead of stopping at the push
 
 ## [0.55.0] - 2026-10-16
 
