@@ -139,6 +139,60 @@ impl DeliverFixture {
             .expect("jjfx should run")
     }
 
+    /// Grow the Worker's chain with an empty, undescribed commit below a new
+    /// `the top` commit, and move the Worker's bookmark onto it - the shape a
+    /// Worker leaves behind when it runs `jj new` without describing the result.
+    fn add_empty_undescribed_below_the_top(&self) {
+        self.jj_in(&self.workspace, &["new"]);
+        fs::write(self.workspace.join("top.txt"), "top\n").expect("top file");
+        self.jj_in(&self.workspace, &["commit", "-m", "the top"]);
+        self.jj_in(
+            &self.workspace,
+            &["bookmark", "set", "adam/eng-1", "-r", "@-"],
+        );
+    }
+
+    /// Grow the Worker's chain with a *non-empty* commit that has no
+    /// description below a new `the top` commit. The weld must not drop it - it
+    /// carries a change - so jj refuses the push and the delivery must name it.
+    fn add_undescribed_change_below_the_top(&self) {
+        fs::write(self.workspace.join("hidden.txt"), "hidden\n").expect("hidden file");
+        self.jj_in(&self.workspace, &["commit", "-m", ""]);
+        fs::write(self.workspace.join("top.txt"), "top\n").expect("top file");
+        self.jj_in(&self.workspace, &["commit", "-m", "the top"]);
+        self.jj_in(
+            &self.workspace,
+            &["bookmark", "set", "adam/eng-1", "-r", "@-"],
+        );
+    }
+
+    /// The Worker's chain above trunk, newest first, as `empty=<bool>
+    /// desc=[<description>]` lines - what the weld left behind. Scoped to
+    /// mutable commits, so the immutable root is not counted.
+    fn chain(&self) -> String {
+        let output = Command::new("jj")
+            .args(["--config", "signing.behavior=drop"])
+            .current_dir(&self.workspace)
+            .env("XDG_CONFIG_HOME", self.config_home.path())
+            .args([
+                "--ignore-working-copy",
+                "log",
+                "-r",
+                "::@- ~ trunk() & mutable()",
+                "--no-graph",
+                "-T",
+                "change_id.short() ++ \" empty=\" ++ empty ++ \" desc=[\" ++ description ++ \"]\\n\"",
+            ])
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj log: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    }
+
     /// The refs the bare `origin` holds.
     fn origin_refs(&self) -> String {
         let output = Command::new("git")
@@ -277,5 +331,69 @@ fn deliver_refuses_a_worker_with_no_workspace() {
     assert!(
         !fixture.origin_refs().contains("adam/eng-1"),
         "nothing may reach origin when the Worker is unknown"
+    );
+}
+
+/// A chain carrying an empty, undescribed commit still delivers: the weld drops
+/// the commit - it is not a change - rather than carrying it into a push jj
+/// refuses.
+#[test]
+fn deliver_drops_an_empty_undescribed_commit_before_pushing() {
+    let fixture = DeliverFixture::new(false, "true");
+    fixture.add_empty_undescribed_below_the_top();
+    assert!(
+        fixture.chain().contains("empty=true"),
+        "the fixture must actually carry an empty commit: {}",
+        fixture.chain()
+    );
+
+    let output = fixture.deliver("worker-01");
+
+    assert!(
+        output.status.success(),
+        "an empty commit must not stop the delivery: {}",
+        stderr(&output)
+    );
+    assert!(
+        fixture.origin_refs().contains("refs/heads/adam/eng-1"),
+        "the cleaned chain must reach origin: {}",
+        fixture.origin_refs()
+    );
+    assert!(
+        !fixture.chain().contains("empty=true"),
+        "the weld must drop the empty commit: {}",
+        fixture.chain()
+    );
+}
+
+/// A commit jj refuses to push stops the delivery and names jj's reason. A
+/// *non-empty* commit with no description is the case the weld must not drop -
+/// it carries a change - so the refusal is what has to stop the pipeline, before
+/// it reaches the Pull Request step with a branch that never reached the remote.
+#[test]
+fn deliver_stops_and_names_a_commit_jj_refuses_to_push() {
+    let fixture = DeliverFixture::new(true, "true");
+    fixture.add_undescribed_change_below_the_top();
+
+    let output = fixture.deliver("worker-01");
+
+    assert!(
+        !output.status.success(),
+        "a refused push must fail the verb: {}",
+        stderr(&output)
+    );
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("push:") && stderr.contains("no description"),
+        "the refusal must name jj's reason: {stderr}"
+    );
+    assert!(
+        !fixture.origin_refs().contains("adam/eng-1"),
+        "the branch must not reach origin when the push was refused: {}",
+        fixture.origin_refs()
+    );
+    assert!(
+        !stderr.contains("origin is not a GitHub remote"),
+        "the delivery must stop before the Pull Request step: {stderr}"
     );
 }

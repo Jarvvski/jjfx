@@ -810,6 +810,13 @@ fn bookmark_exists(dir: &Path, name: &str) -> anyhow::Result<bool> {
 /// Classify one push from its captured run and the remote-bookmark snapshots
 /// taken before and after it (`None` when the push failed, so no after-read was
 /// made). Pure, so every outcome is unit-testable with a stub jj run.
+///
+/// A zero exit that moved no remote bookmark is usually
+/// [`PushOutcome::Nothing`], but not when jj *refused* a commit it will not
+/// push: jj leaves the remote untouched and exits zero for that too, and the
+/// refusal is a failure - the remote will not take the change - not the benign
+/// no-op the two share their remote state with. [`push_refusal`] is what tells
+/// them apart.
 fn classify_push(run: &Run, before: &str, after: Option<&str>) -> PushOutcome {
     if !run.ok() {
         let stderr = run.stderr().trim();
@@ -820,11 +827,36 @@ fn classify_push(run: &Run, before: &str, after: Option<&str>) -> PushOutcome {
         };
         return PushOutcome::Failed(message.to_string());
     }
+    if let Some(refusal) = push_refusal(run.stderr()) {
+        return PushOutcome::Failed(refusal);
+    }
     if after == Some(before) {
         PushOutcome::Nothing
     } else {
         PushOutcome::Pushed
     }
+}
+
+/// The refusal jj printed when it would not push a bookmark, parsed from the
+/// warning it writes on stderr: ``Warning: Won't push bookmark <name>: commit
+/// <id> has no description``. `None` when jj pushed every bookmark it was
+/// asked to.
+///
+/// jj exits zero and leaves the remote untouched when it refuses a commit, so
+/// its remote-bookmark state cannot tell a refusal from a genuine no-op: both
+/// move nothing. Reading one as the other let a delivery report `nothing to
+/// push` and carry on, failing two steps later at the Pull Request with a
+/// `gh` error naming none of the cause. This is the same deliberate, narrow
+/// exception to the typed-jj-access rule as [`fix_tool_failure`]: jj exposes no
+/// machine-readable field for the refusal, so its own warning line is the only
+/// signal. The line is returned verbatim (minus the `Warning: ` prefix) so the
+/// offending commit and jj's reason reach the operator.
+fn push_refusal(stderr: &str) -> Option<String> {
+    const NEEDLE: &str = "Won't push bookmark";
+    stderr
+        .lines()
+        .find(|line| line.contains(NEEDLE))
+        .map(|line| line.trim_start_matches("Warning: ").trim().to_string())
 }
 
 /// The `(remote/name, commit-id)` pairs of every remote bookmark, as one
@@ -1403,6 +1435,55 @@ mod tests {
             classify_push(&run, "origin/feat abc", Some("origin/feat abc")),
             PushOutcome::Nothing
         );
+    }
+
+    /// jj refuses to push a bookmark whose commit has no description, exits
+    /// zero, and leaves the remote where it was - the same remote state a
+    /// genuine no-op leaves. Reading the refusal as `Nothing` is what let a
+    /// delivery report `push: nothing to push`, carry on, and fail at the Pull
+    /// Request with a `gh` error naming none of the cause.
+    #[test]
+    fn classify_push_reads_a_refused_commit_as_a_failure_not_a_no_op() {
+        let run = Run::for_test(
+            true,
+            "Nothing changed.",
+            "Warning: Won't push bookmark adam/x: commit 5722e547527f has no description\n\
+             \x20 yvyqxv 5722e5 (empty) (no description set)\n\
+             Nothing changed.\n",
+        );
+        assert_eq!(
+            classify_push(&run, "origin/main abc", Some("origin/main abc")),
+            PushOutcome::Failed(
+                "Won't push bookmark adam/x: commit 5722e547527f has no description".to_string()
+            )
+        );
+    }
+
+    /// The refusal wins even when the push also moved a remote bookmark: a
+    /// delivery that refused one commit and pushed another is incomplete, not
+    /// `Pushed`.
+    #[test]
+    fn classify_push_reads_a_refusal_ahead_of_a_moved_remote_bookmark() {
+        let run = Run::for_test(
+            true,
+            "",
+            "Warning: Won't push bookmark adam/x: commit 5722e547527f has no description\n",
+        );
+        assert_eq!(
+            classify_push(&run, "origin/main abc", Some("origin/main def")),
+            PushOutcome::Failed(
+                "Won't push bookmark adam/x: commit 5722e547527f has no description".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn push_refusal_is_none_when_jj_pushed_every_bookmark() {
+        // A genuine no-op carries no warning, and neither does a clean push.
+        assert_eq!(push_refusal("Nothing changed.\n"), None);
+        assert_eq!(push_refusal(""), None);
+        // A line that merely mentions a bookmark must not read as a refusal.
+        assert_eq!(push_refusal("Pushed bookmark adam/x\n"), None);
     }
 
     #[test]

@@ -207,6 +207,22 @@ does not build against it fails here rather than on the next person to rebuild.
 With no `[checks]` command configured the step does not apply and the pipeline is
 unchanged. See [`[checks]`](#checks) below.
 
+### Welding and pushing
+
+Weld rebases the Workspace's mutable chain onto `trunk()` and drops any commit
+in it that is empty and has no description. An empty commit is not a change, and
+jj refuses to push one, so leaving it in place would stop the delivery at the
+push; `jj rebase --skip-emptied` alone does not drop a commit that was already
+empty, only one that became empty, so the weld abandons these first.
+
+A push jj **refuses** - a commit it will not push, most often one with no
+description - stops the delivery and reports jj's own reason, naming the
+offending commit. It is not a "nothing to push": the two leave the same remote
+state behind, but one means the change is already published and the other means
+the remote would not take it, so the Pull Request step is never reached with a
+branch that never arrived. A genuine nothing-to-push - the change is already on
+the remote - carries on to the Pull Request step as it always has.
+
 ## `[tickets]`
 
 Where `dispatch --all` and orchestration discover Ready Tickets. The source is a
