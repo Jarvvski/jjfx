@@ -1,6 +1,6 @@
 # Every delivered PR is a draft, and a repository cannot choose its PR policy
 
-Status: needs-triage
+Status: ready-for-agent
 Type: bug
 Blocked by: none
 
@@ -79,3 +79,19 @@ model, a credential or a runtime. `pull_requests = false` is arguably the same:
   deliver`) says so and names the command that undoes it.
 - `docs/configuration.md`'s `[forge]` section and the repository-owned sections
   list agree with the behaviour.
+
+## Triage (2026-10-21)
+
+Triaged from `needs-triage` to `ready-for-agent`. The evidence is a **live
+reproduction during the third drive**: the fixture's own `.jjfx/config.toml` was
+rejected at load for naming `[forge]`, and both delivered Pull Requests were
+drafts whose merge `gh` then refused.
+
+Independently **confirmed** in the code: `ForgeConfig` (`src/config.rs:531`)
+carries `pull_requests` and `draft`, both defaulting to true, and the
+repository-config loader accepts only `[checks]`, `[dispatch]`, `[pools]` and
+`[tickets]`.
+
+The acceptance criteria are unchanged. The open question - a repository-owned
+`[forge]`, or `deliver` marking the Pull Request ready when the policy is not to
+draft - is left to the implementer, who should record the decision and why.
