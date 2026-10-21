@@ -87,8 +87,14 @@ offered again - a retry, a resumed harness, a duplicate dispatch - is served fro
 the log rather than reaching the reviewer, and its findings are not re-addressed:
 they were addressed when the decision was first made. Replay is transparent to
 the bound in [the review loop](review-loop.md), so the pass cap and the progress
-rule see exactly the rounds the first drive saw. No command drives a review pass
-yet, so nothing in the queue carries a `review:` step until one does.
+rule see exactly the rounds the first drive saw.
+
+`jjfx review` drives the same bound but keeps replay to a single invocation: its
+passes are keyed and recorded in the queue, but its decisions are not written to
+the durable sidecar. A review pass decides on the Pull Request's *current* review
+threads, so a decision replayed by a later invocation would serve a verdict the
+threads have since contradicted - a recorded "no findings" hiding a thread opened
+afterwards.
 
 An operator tells a replayed pass from a pass that ran: the step stays `done`, and
 its `detail` names the replay rather than leaving it silent.

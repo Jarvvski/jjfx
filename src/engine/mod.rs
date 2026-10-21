@@ -86,7 +86,7 @@ pub use pool::{
     WorkerPoolSnapshot, WorkerReference, WorkerSnapshot, WorkerStatus,
 };
 pub use queue::{QueueResolution, WorkQueue};
-pub use review_run::{REPLAYED_DETAIL, RecordedReviewLoop, ReviewSubject};
+pub use review_run::{EphemeralDecisionLog, REPLAYED_DETAIL, RecordedReviewLoop, ReviewSubject};
 pub use review_threads::{
     GhReviewThreads, REVIEW_THREADS_DIMENSION, ReviewThread, ReviewThreadComment, ReviewThreads,
     ThreadReviewer,

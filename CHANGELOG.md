@@ -109,6 +109,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - A finished Worker is returned to the pool automatically: a Worker whose Run has finished (done or failed) is reclaimed to idle on the next Dispatch, so a Pool of N serves a backlog larger than N across successive rounds without a manual jjfx pool reset.
 - jjfx logs follows a session-delivered Run's opencode session - reading the session's messages and printing its activity - instead of tailing a process log that stays empty, and says plainly that there is no process log and names the session when the daemon cannot be reached
 - jjfx deliver tracks a fresh Worker bookmark on the push remote before pushing, so it delivers on a clean jj config - jj git push --revisions refuses to create a remote bookmark for a local one that is not tracked, which only a developer remotes.origin.auto-track-bookmarks setting masked.
+- jjfx review reads a pull request's review threads on every invocation instead of replaying a pass recorded by an earlier run: a review thread opened after a converged pass is now seen, so the loop no longer reports convergence while the pull request has an unresolved thread.
 
 ## [0.55.0] - 2026-10-16
 
