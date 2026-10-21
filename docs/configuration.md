@@ -251,6 +251,54 @@ the remote would not take it, so the Pull Request step is never reached with a
 branch that never arrived. A genuine nothing-to-push - the change is already on
 the remote - carries on to the Pull Request step as it always has.
 
+### Naming the change: a Worker or its bookmark
+
+The forge acts on a change, and `deliver`, `rebase` and `open-pr` name it either
+by the **Worker** that carried it (`jjfx deliver worker-a04066`) or by its
+**bookmark** (`jjfx deliver adam/tally--04-json-output`). The two are the same
+change, and a Worker resolves to the bookmark its Ticket names, exactly as it
+always has.
+
+The bookmark is the **durable** name. A Worker is a reusable slot: the next
+Dispatch takes it back the moment its Run ends, and the Ticket it carried is
+replaced. So the change a Worker delivered is still in the repository - and
+still what its Pull Request is keyed by - while the Worker has moved on:
+
+```
+$ jjfx status | grep a04066
+a04066  default  -  busy  tally--06-blank-lines-crash     # reused for the next Ticket
+$ jjfx deliver adam/tally--04-json-output                 # the change it delivered, by name
+```
+
+That is the whole remedy for a Pull Request that reads `CONFLICTING` after a
+sibling merged and moved trunk under it: re-weld the change by its bookmark, and
+the same weld, check and push run again on the name that survived.
+
+When **no Workspace holds the change** - the Worker that delivered it has been
+reused, so no Workspace's chain contains the bookmark - jjfx creates one for it,
+named `branch-<bookmark>` with every character a Workspace name cannot carry
+folded to `-`, and says so. A Workspace is needed because the weld rewrites a
+working copy, the check runs against it, and a conflict the rebase records is
+only reachable through a Workspace's own chain. A rebase that conflicts is left
+in place and names that Workspace:
+
+```
+$ jjfx rebase adam/tally--04-json-output
+Created Workspace branch-adam-tally--04-json-output to hold adam/tally--04-json-output; remove it with `jjfx rm branch-adam-tally--04-json-output` when you are done
+Error: rebased branch adam/tally--04-json-output onto main, but it has conflicts to resolve: resolve them in Workspace branch-adam-tally--04-json-output (`jjfx resolve branch-adam-tally--04-json-output`), then re-run to push; the rebase is left in place
+```
+
+Re-welding the same change again reuses that Workspace rather than creating
+another, and a name already taken by a Workspace that does *not* hold the change
+is refused by name rather than rebased in. A bookmark that is the mainline is
+refused outright: re-welding trunk onto itself is a no-op, and a landing verb
+never pushes `main`.
+
+`absorb` and `review` stay Worker-only: `absorb` folds a working copy's own edits
+into the commits they belong to, and a change with no Workspace has none, while
+`review` addresses a Pull Request by sending a Run to a Worker, which a bookmark
+cannot name.
+
 ## `[tickets]`
 
 Where `dispatch --all` and orchestration discover Ready Tickets. The source is a

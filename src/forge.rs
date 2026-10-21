@@ -1019,9 +1019,11 @@ fn skip_step(
 /// Stop one target before push when its chain has conflicts, or when the
 /// conflict check itself failed. Pushing a conflicted chain would push broken
 /// commits, and a failed check must not read as "clean". The refusal names the
-/// conflicted commit, so the reason is the surfaced state rather than a silent
-/// exclusion. Returns `true` when the target was stopped (the caller
-/// `continue`s to the next target).
+/// conflicted commit *and* the Workspace it has to be resolved in - a conflict is
+/// recorded in the commit a rebase rewrote, and only a Workspace's own chain
+/// reaches it - so the reason is the surfaced state rather than a silent
+/// exclusion. Returns `true` when the target was stopped (the caller `continue`s
+/// to the next target).
 fn stop_on_conflicts(
     tx: &UnboundedSender<Update>,
     target: &Target,
@@ -1030,9 +1032,10 @@ fn stop_on_conflicts(
 ) -> bool {
     let reason = match check {
         Ok(None) => return false,
-        Ok(Some(commit)) => {
-            format!("conflict in {commit} - resolve it before pushing")
-        }
+        Ok(Some(commit)) => format!(
+            "conflict in {commit} - resolve it in Workspace {} (`jjfx resolve {}`), then re-run to push",
+            target.name, target.name
+        ),
         Err(error) => format!("conflict check failed: {error}"),
     };
     state.active = false;
@@ -1910,8 +1913,12 @@ mod tests {
                 notice: Some(notice),
             } if workspace == "conflicted"
                 && !progress.active()
-                && progress.reason() == Some("conflict in conflicted1 - resolve it before pushing")
-                && notice == "conflict in conflicted1 - resolve it before pushing"
+                && progress.reason()
+                    == Some(
+                        "conflict in conflicted1 - resolve it in Workspace conflicted (`jjfx resolve conflicted`), then re-run to push",
+                    )
+                && notice
+                    == "conflict in conflicted1 - resolve it in Workspace conflicted (`jjfx resolve conflicted`), then re-run to push"
         )));
         assert!(!updates.iter().any(|update| matches!(
             update,
@@ -2022,8 +2029,12 @@ mod tests {
                 notice: Some(notice),
             } if workspace == "feat"
                 && !progress.active()
-                && progress.reason() == Some("conflict in weldconflict - resolve it before pushing")
-                && notice == "conflict in weldconflict - resolve it before pushing"
+                && progress.reason()
+                    == Some(
+                        "conflict in weldconflict - resolve it in Workspace feat (`jjfx resolve feat`), then re-run to push",
+                    )
+                && notice
+                    == "conflict in weldconflict - resolve it in Workspace feat (`jjfx resolve feat`), then re-run to push"
         )));
         assert!(matches!(
             updates.last(),
@@ -2036,7 +2047,8 @@ mod tests {
                 && status(progress, Step::Weld) == Status::Ok
                 && status(progress, Step::Push) == Status::Pending
                 && status(progress, Step::PullRequest) == Status::Pending
-                && notice == "conflict in weldconflict - resolve it before pushing"
+                && notice
+                    == "conflict in weldconflict - resolve it in Workspace feat (`jjfx resolve feat`), then re-run to push"
         ));
     }
 
@@ -2070,7 +2082,8 @@ mod tests {
                 && status(progress, Step::Weld) == Status::Ok
                 && status(progress, Step::Push) == Status::Pending
                 && status(progress, Step::PullRequest) == Status::Pending
-                && notice == "conflict in fixconflict - resolve it before pushing"
+                && notice
+                    == "conflict in fixconflict - resolve it in Workspace feat (`jjfx resolve feat`), then re-run to push"
         ));
     }
 

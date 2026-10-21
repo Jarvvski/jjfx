@@ -359,7 +359,7 @@ fn deliver_refuses_a_worker_with_no_workspace() {
         "the fixture's worker-01 Workspace must exist"
     );
     assert!(
-        stderr(&output).contains("no Workspace directory for worker-99"),
+        stderr(&output).contains("Workspace directory is missing for Worker worker-99"),
         "{}",
         stderr(&output)
     );

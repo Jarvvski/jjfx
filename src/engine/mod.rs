@@ -129,12 +129,11 @@ pub use undo::{MutationCheckpoint, MutationGuard, UndoError, UndoOutcome};
 pub use watchdog::{RunHealth, RunProgress, StuckWindow};
 pub use worker_actions::{
     AbsorbOutcome, AbsorbReport, DismissOutcome, FollowUpExecution, FollowUpOutcome,
-    FollowUpSession, MountOutcome, OpenPullRequestOutcome, PermissionResolution, PullRequestState,
-    RebaseOutcome, ResetOutcome, RunMode, WorkerActionError, WorkerActions, WorkerLogs,
-    WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
+    FollowUpSession, LandingTarget, MountOutcome, OpenPullRequestOutcome, PermissionResolution,
+    PullRequestState, RebaseOutcome, ResetOutcome, RunMode, WorkerActionError, WorkerActions,
+    WorkerLogs, WorkspaceRestoration, WorkspaceRestorationError, WorkspaceRestorationHandle,
 };
 pub use workspace::jj_lib_compat_notice;
-pub(crate) use workspace::worker_path;
 pub use workspace::{
     AdHocWorkspace, AdHocWorkspaceError, AdHocWorkspacePhase, CleanDecision, CleanScope,
     SyncAction, TrunkDrift, TrunkSync, TrunkSyncError, WorkerWorkspace, WorkerWorkspaceError,

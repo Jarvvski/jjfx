@@ -2,7 +2,7 @@
 
 use std::env;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread::{self, JoinHandle};
 
@@ -15,7 +15,8 @@ use crate::engine::{
     AgentSessionResolution, BackgroundRun, BackgroundStart, CompletedRun, DispatchExclusions,
     MutationGuard, MutationKind, PermissionDecision, PermissionRequest, Repository, Reservation,
     ReviewFinding, RunLog, RunSupervisor, RunSupervisorError, TicketBranch, TicketId, WorkerId,
-    WorkerPoolError, WorkerStatus, resolve_agent_session_for_runtime, resolve_ticket_branch,
+    WorkerPoolError, WorkerStatus, WorkspaceAddOutcome, resolve_agent_session_for_runtime,
+    resolve_ticket_branch,
 };
 use crate::jj::PushOutcome;
 
@@ -330,6 +331,64 @@ impl PermissionResolution {
     }
 }
 
+/// The change a landing verb acts on, resolved from the name it was given.
+///
+/// A Worker is a reusable slot: the next Dispatch takes it back the moment its
+/// Run ends, and the Ticket it carried is replaced. The bookmark that Worker
+/// delivered is not reusable - it stays in the repository, and it is the name a
+/// Pull Request is keyed by. A landing verb therefore accepts either name, and
+/// resolves both to the same two things: the change's bookmark, and the
+/// Workspace the change is in.
+///
+/// A Worker's own Workspace is used whenever the Worker still holds the change.
+/// A change no Workspace holds gets one, named after its bookmark, because a
+/// rebase has to rewrite a working copy and a conflict it records is only
+/// reachable through a Workspace's own chain (`jjfx resolve <workspace>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandingTarget {
+    named: Named,
+    workspace: String,
+    path: PathBuf,
+    created: bool,
+}
+
+/// What a landing verb's argument named.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Named {
+    /// A Worker: one the Pool holds, or one whose Workspace is beside the
+    /// repository.
+    Worker(WorkerId),
+    /// A bookmark in the repository.
+    Bookmark(String),
+}
+
+impl LandingTarget {
+    /// Returns the name the operator gave: a Worker's, or a change's bookmark.
+    pub fn named(&self) -> &str {
+        match &self.named {
+            Named::Worker(worker) => worker.as_str(),
+            Named::Bookmark(branch) => branch,
+        }
+    }
+
+    /// Returns the Workspace the change is in.
+    pub fn workspace(&self) -> &str {
+        &self.workspace
+    }
+
+    /// Returns the Workspace's directory.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Whether jjfx created the Workspace for this change, because no Workspace
+    /// held it. A caller says so, so a Workspace that appeared is not a
+    /// surprise.
+    pub const fn was_created(&self) -> bool {
+        self.created
+    }
+}
+
 /// The deep frontend-neutral interface for operational Worker actions.
 #[derive(Debug, Clone)]
 pub struct WorkerActions {
@@ -500,33 +559,39 @@ impl WorkerActions {
         })
     }
 
-    /// Rebases the Worker's bookmark onto `main` and pushes it.
+    /// Rebases a landing target's change onto `main` and pushes it.
     ///
-    /// A rebase can succeed and still record a conflict in the commit it rewrote
-    /// (the normal case once `main` has moved under the Worker). jj refuses to
-    /// push a conflicted commit, so the push is never attempted and the rebase is
-    /// left in place, reported as the state the Workspace is actually in
-    /// ([`WorkerActionError::RebaseConflicted`]) rather than as a push failure
-    /// whose `rollback` implies a rollback happened. The `jj undo` rollback the
-    /// push-failure path uses cannot be trusted here: it undoes the repository's
-    /// *last* operation, which in a shared operation log may belong to another
-    /// Workspace.
-    pub fn rebase(&self, worker: &WorkerId) -> Result<RebaseOutcome, WorkerActionError> {
-        let (branch, workspace) = self.branch_and_workspace(worker)?;
+    /// The target is a Worker's change, or a change named by its bookmark
+    /// ([`Self::landing_target`]). A rebase can succeed and still record a
+    /// conflict in the commit it rewrote (the normal case once `main` has moved
+    /// under the change). jj refuses to push a conflicted commit, so the push is
+    /// never attempted and the rebase is left in place, reported as the state the
+    /// Workspace is actually in ([`WorkerActionError::RebaseConflicted`]) - naming
+    /// the Workspace the conflict has to be resolved in - rather than as a push
+    /// failure whose `rollback` implies a rollback happened. The `jj undo`
+    /// rollback the push-failure path uses cannot be trusted here: it undoes the
+    /// repository's *last* operation, which in a shared operation log may belong
+    /// to another Workspace.
+    pub fn rebase(&self, target: &LandingTarget) -> Result<RebaseOutcome, WorkerActionError> {
+        let branch = self.branch_of(target)?;
+        let workspace = target.path().to_path_buf();
         // A rebase rewrites the working copy, so serialise it with preparation
         // and Reset restoration like every other Workspace operation.
-        let _operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
-            .map_err(|source| WorkerActionError::WorkspaceOperation {
-                worker: worker.clone(),
-                detail: source.to_string(),
-            })?;
+        let _operation = crate::engine::workspace::lock_workspace_operation(
+            &self.repository,
+            target.workspace(),
+        )
+        .map_err(|source| WorkerActionError::WorkspaceOperation {
+            workspace: target.workspace().to_owned(),
+            detail: source.to_string(),
+        })?;
         self.commands
             .rebase(&workspace, &branch)
             .map_err(|detail| WorkerActionError::Command {
-                operation: "rebase Worker bookmark",
+                operation: "rebase bookmark",
                 detail,
             })?;
-        // The rebase moved the Worker's own stack onto `main`; a conflict in that
+        // The rebase moved the change's own stack onto `main`; a conflict in that
         // stack is what jj refuses to push.
         if self
             .commands
@@ -537,8 +602,8 @@ impl WorkerActions {
             })?
         {
             return Err(WorkerActionError::RebaseConflicted {
-                worker: worker.clone(),
                 branch,
+                workspace: target.workspace().to_owned(),
             });
         }
         if let Err(push) = self.commands.push(&workspace, &branch) {
@@ -552,12 +617,16 @@ impl WorkerActions {
         Ok(RebaseOutcome { branch })
     }
 
-    /// Opens the pull request for the Worker's bookmark in the default browser.
+    /// Opens the pull request for the change `name` names in the default browser.
+    ///
+    /// A Worker's name and a bookmark both resolve, and neither needs a
+    /// Workspace: the Pull Request is keyed by the branch, and opening it is a
+    /// browser action rather than a rewrite.
     pub fn open_pull_request(
         &self,
-        worker: &WorkerId,
+        name: &str,
     ) -> Result<OpenPullRequestOutcome, WorkerActionError> {
-        let (branch, _) = self.branch_and_workspace(worker)?;
+        let branch = self.resolve_branch(name)?;
         let Some(repository) = self.persisted_gh_repo()? else {
             return Err(WorkerActionError::RepositoryUnavailable);
         };
@@ -605,7 +674,7 @@ impl WorkerActions {
         // re-dispatch between the read and the fold.
         let _operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
             .map_err(|source| WorkerActionError::WorkspaceOperation {
-                worker: worker.clone(),
+                workspace: worker.as_str().to_owned(),
                 detail: source.to_string(),
             })?;
         let stack_base = self
@@ -688,7 +757,7 @@ impl WorkerActions {
     pub fn reset(&self, worker: &WorkerId) -> Result<ResetOutcome, WorkerActionError> {
         let operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
             .map_err(|source| WorkerActionError::WorkspaceOperation {
-            worker: worker.clone(),
+            workspace: worker.as_str().to_owned(),
             detail: source.to_string(),
         })?;
         let run = self.supervisor.reset_run(&self.repository, worker)?;
@@ -938,6 +1007,223 @@ impl WorkerActions {
         }
     }
 
+    /// Resolves the change a landing verb names, creating the Workspace that
+    /// holds it when no Workspace does.
+    ///
+    /// A Worker is resolved first, and in either spelling (`a04066` as well as
+    /// `worker-a04066`), so the Worker an operator named is never mistaken for a
+    /// bookmark that happens to share its name. Everything else is resolved as a
+    /// bookmark - the durable name of a delivered change, and the only name that
+    /// still works once the Worker that delivered it has been reused for the
+    /// next Ticket.
+    pub fn landing_target(&self, name: &str) -> Result<LandingTarget, WorkerActionError> {
+        if let Some(worker) = self.worker_named(name) {
+            let path = crate::engine::workspace::worker_path(self.repository.root(), &worker);
+            if !path.is_dir() {
+                return Err(WorkerActionError::MissingWorkspace { worker });
+            }
+            return Ok(LandingTarget {
+                named: Named::Worker(worker.clone()),
+                workspace: worker.as_str().to_owned(),
+                path,
+                created: false,
+            });
+        }
+        let branch = self.bookmark_named(name)?;
+        self.workspace_for_branch(&branch)
+    }
+
+    /// The bookmark that names a landing target's change.
+    ///
+    /// A bookmark names itself; a Worker's change is named by the bookmark its
+    /// Ticket carries ([`Self::worker_branch`]). Both are reads, so a name that
+    /// cannot be resolved fails before any Workspace is touched.
+    fn branch_of(&self, target: &LandingTarget) -> Result<String, WorkerActionError> {
+        match &target.named {
+            Named::Worker(worker) => self.worker_branch(worker),
+            Named::Bookmark(branch) => Ok(branch.clone()),
+        }
+    }
+
+    /// The bookmark a landing verb names, read as a bookmark and nothing else.
+    ///
+    /// The read a verb makes when it needs the change's name but not a working
+    /// copy: `open-pr` opens the Pull Request the bookmark is keyed by, so it
+    /// must not create a Workspace just to name it.
+    pub fn resolve_branch(&self, name: &str) -> Result<String, WorkerActionError> {
+        match self.worker_named(name) {
+            Some(worker) => self.worker_branch(&worker),
+            None => self.bookmark_named(name),
+        }
+    }
+
+    /// The Worker `name` names, in either spelling, when one is there.
+    ///
+    /// Three readings, in order: a Worker the Pool holds; a Worker whose
+    /// Workspace exists beside this repository - the reading a delivery has
+    /// always used, so a Worker stays reachable from the shell in a repository
+    /// whose Pool state has not been materialised; and a name in jjfx's own
+    /// `worker-<id>` namespace, which is a Worker's whether or not anything is
+    /// there, so a mistyped Worker id reads as a missing Workspace rather than as
+    /// a name that means nothing.
+    fn worker_named(&self, name: &str) -> Option<WorkerId> {
+        let prefixed = format!("worker-{name}");
+        let snapshot = self.repository.worker_pool().snapshot();
+        if let Some(worker) = snapshot
+            .workers()
+            .iter()
+            .map(|worker| worker.worker_id())
+            .find(|worker| worker.as_str() == name || worker.as_str() == prefixed)
+        {
+            return Some(worker.clone());
+        }
+        if let Some(worker) = [name.to_owned(), prefixed]
+            .into_iter()
+            .filter_map(|candidate| WorkerId::parse(candidate).ok())
+            .find(|worker| {
+                crate::engine::workspace::worker_path(self.repository.root(), worker).is_dir()
+            })
+        {
+            return Some(worker);
+        }
+        WorkerId::parse(name.to_owned())
+            .ok()
+            .filter(|_| name.starts_with("worker-"))
+    }
+
+    /// The bookmark a landing verb names, or a refusal naming what it accepts.
+    fn bookmark_named(&self, name: &str) -> Result<String, WorkerActionError> {
+        let bookmarks =
+            crate::jj::local_bookmark_names(self.repository.root()).map_err(|error| {
+                WorkerActionError::Command {
+                    operation: "list the repository's bookmarks",
+                    detail: error.to_string(),
+                }
+            })?;
+        if bookmarks.iter().any(|bookmark| bookmark == name) {
+            return Ok(name.to_owned());
+        }
+        Err(WorkerActionError::UnknownTarget {
+            name: name.to_owned(),
+        })
+    }
+
+    /// The Workspace holding `branch`, creating one when no Workspace does.
+    fn workspace_for_branch(&self, branch: &str) -> Result<LandingTarget, WorkerActionError> {
+        if self.branch_is_trunk(branch)? {
+            return Err(WorkerActionError::TrunkIsNotAChange {
+                branch: branch.to_owned(),
+            });
+        }
+        if let Some(workspace) = self.workspace_holding(branch)? {
+            let path = self.repository.workspaces().path(&workspace);
+            return Ok(LandingTarget {
+                named: Named::Bookmark(branch.to_owned()),
+                workspace,
+                path,
+                created: false,
+            });
+        }
+        // No Workspace holds the change: the Worker that delivered it has been
+        // reused, and its Workspace now carries the next Ticket. Create one, so
+        // the rebase has a working copy to rewrite and a conflict it records has
+        // somewhere to be resolved.
+        let name = workspace_name_for_branch(branch);
+        match self.repository.workspaces().add(&name, Some(branch)) {
+            Ok(WorkspaceAddOutcome::Created(workspace)) => Ok(LandingTarget {
+                named: Named::Bookmark(branch.to_owned()),
+                workspace: workspace.name().to_owned(),
+                path: workspace.path().to_path_buf(),
+                created: true,
+            }),
+            Ok(WorkspaceAddOutcome::Existing(workspace)) => {
+                Err(WorkerActionError::BranchWorkspaceTaken {
+                    branch: branch.to_owned(),
+                    workspace: workspace.name().to_owned(),
+                })
+            }
+            // `Workspaces::add` reports the default Workspace only for the name
+            // `default`, which `workspace_name_for_branch` never produces: every
+            // name it derives carries the `branch-` prefix.
+            Ok(WorkspaceAddOutcome::Default(_)) => Err(WorkerActionError::BranchWorkspaceTaken {
+                branch: branch.to_owned(),
+                workspace: name,
+            }),
+            Err(error) => Err(WorkerActionError::BranchWorkspace {
+                branch: branch.to_owned(),
+                detail: error.to_string(),
+            }),
+        }
+    }
+
+    /// The Workspace whose own chain contains `branch`, if one does.
+    ///
+    /// The scan is what keeps a Worker's own Workspace in play when the operator
+    /// names the change by bookmark: rebasing there is the same operation, and
+    /// the conflict is then resolvable in the Workspace the Worker is sitting
+    /// in. The repository's `default` Workspace is one of the candidates, so a
+    /// change checked out at the repository root is found there too.
+    fn workspace_holding(&self, branch: &str) -> Result<Option<String>, WorkerActionError> {
+        let bookmark = crate::jj::revset_symbol(branch);
+        let workspaces = crate::jj::workspaces(self.repository.root()).map_err(|error| {
+            WorkerActionError::Command {
+                operation: "list the repository's Workspaces",
+                detail: error.to_string(),
+            }
+        })?;
+        for workspace in workspaces {
+            let revset = format!(
+                "{bookmark} & ::{}@",
+                crate::jj::revset_symbol(&workspace.name)
+            );
+            let raw =
+                crate::jj::read_at_repo(self.repository.root(), &["log", "-r", &revset, "--count"])
+                    .map_err(|error| WorkerActionError::Command {
+                        operation: "find the Workspace holding a bookmark",
+                        detail: error.to_string(),
+                    })?;
+            let count = raw
+                .trim()
+                .parse::<usize>()
+                .map_err(|_| WorkerActionError::Command {
+                    operation: "find the Workspace holding a bookmark",
+                    detail: format!("`jj log --count` reported {raw:?}"),
+                })?;
+            if count > 0 {
+                return Ok(Some(workspace.name));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Whether `branch` is the mainline rather than a change above it.
+    ///
+    /// Re-welding trunk onto itself is a no-op and pushing it would move the
+    /// remote's mainline, so a landing verb refuses it by name. A bookmark that
+    /// has already merged reads the same way, because there is then nothing left
+    /// to re-weld.
+    fn branch_is_trunk(&self, branch: &str) -> Result<bool, WorkerActionError> {
+        let revset = format!(
+            "{} & ::({})",
+            crate::jj::revset_symbol(branch),
+            crate::trunk::as_revset()
+        );
+        let raw =
+            crate::jj::read_at_repo(self.repository.root(), &["log", "-r", &revset, "--count"])
+                .map_err(|error| WorkerActionError::Command {
+                    operation: "read whether a bookmark is the mainline",
+                    detail: error.to_string(),
+                })?;
+        let count = raw
+            .trim()
+            .parse::<usize>()
+            .map_err(|_| WorkerActionError::Command {
+                operation: "read whether a bookmark is the mainline",
+                detail: format!("`jj log --count` reported {raw:?}"),
+            })?;
+        Ok(count > 0)
+    }
+
     /// The Ticket a Worker was reserved for, parsed from its state.
     ///
     /// A Worker that was never reserved for a Ticket has none, which is the same
@@ -988,7 +1274,7 @@ impl WorkerActions {
         // holding it for the whole Run would stop Reset from interrupting it.
         let operation = crate::engine::workspace::lock_worker_operation(&self.repository, worker)
             .map_err(|source| WorkerActionError::WorkspaceOperation {
-            worker: worker.clone(),
+            workspace: worker.as_str().to_owned(),
             detail: source.to_string(),
         })?;
         let snapshot = self.repository.worker_pool().snapshot();
@@ -1729,6 +2015,26 @@ fn log_has_content(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// The Workspace name jjfx creates for a bookmark no Workspace holds.
+///
+/// Deterministic, so re-welding the same change a second time reuses the
+/// Workspace the first one made rather than accumulating them. The `branch-`
+/// prefix keeps the name out of the `worker-<id>` namespace - a Worker's name
+/// must never be a name jjfx derives - and out of the implicit `default` one.
+/// Every character a Workspace name cannot carry is folded to `-`, which is what
+/// turns `adam/tally--04-json-output` into `branch-adam-tally--04-json-output`.
+fn workspace_name_for_branch(branch: &str) -> String {
+    let mut name = String::from("branch-");
+    name.extend(branch.chars().map(|character| {
+        if character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '-') {
+            character
+        } else {
+            '-'
+        }
+    }));
+    name
+}
+
 /// The command for a plain mount shell: an interactive shell with the
 /// scrollback cleared, so a reused tab does not show the previous run.
 fn shell_command() -> Vec<String> {
@@ -1953,9 +2259,18 @@ pub enum WorkerActionError {
     #[error("Worker {worker} has no branch")]
     MissingBranch { worker: WorkerId },
     /// No bookmark in the repository names the Worker's Ticket.
+    ///
+    /// A Worker is reused as soon as its Run ends, so this is also the answer a
+    /// Worker that already delivered a *different* change gives: the refusal says
+    /// plainly that the change it delivered is still reachable by its bookmark,
+    /// and how to act on it, rather than leaving the operator to rediscover that
+    /// through `jj`.
     #[error(
         "no bookmark names Worker {worker}'s Ticket {ticket}: create \
-         `<prefix>/{ticket}-<description>` or re-run the Run that was to deliver it"
+         `<prefix>/{ticket}-<description>`, re-run the Run that was to deliver it, or - if this \
+         Worker already delivered an earlier change and has since been reused - re-weld that \
+         change by its bookmark (`jjfx rebase <bookmark>`; the bookmark is the durable name of a \
+         delivered change, a Worker is not)"
     )]
     BranchNotFound { worker: WorkerId, ticket: String },
     /// More than one bookmark names the Worker's Ticket.
@@ -2008,14 +2323,39 @@ pub enum WorkerActionError {
         state: PullRequestState,
     },
     /// The rebase succeeded but left the bookmark conflicted, so jj will not
-    /// push it. The rebase is deliberately left in place and the state is named,
-    /// rather than reported as a push failure with a rollback that did not happen.
+    /// push it. The rebase is deliberately left in place and the state is named -
+    /// the branch, and the Workspace the conflict has to be resolved in - rather
+    /// than reported as a push failure with a rollback that did not happen.
     #[error(
         "rebased branch {branch} onto main, but it has conflicts to resolve: resolve them in \
-         Worker {worker}'s Workspace (`jj resolve`), then re-run to push; the rebase is left in \
-         place"
+         Workspace {workspace} (`jjfx resolve {workspace}`), then re-run to push; the rebase is \
+         left in place"
     )]
-    RebaseConflicted { worker: WorkerId, branch: String },
+    RebaseConflicted { branch: String, workspace: String },
+    /// The name a landing verb was given is neither a Worker in the Pool nor a
+    /// bookmark in the repository.
+    #[error(
+        "`{name}` names no Worker and no bookmark: name the Worker whose change to act on \
+         (`jjfx rebase worker-<id>`) or the change's bookmark (`jjfx rebase <prefix>/<ticket>-<description>`)"
+    )]
+    UnknownTarget { name: String },
+    /// The named bookmark is the mainline, so there is no change above trunk to
+    /// act on - and a landing verb must never push the mainline.
+    #[error(
+        "bookmark {branch} is the mainline, not a change above it: there is nothing to re-weld"
+    )]
+    TrunkIsNotAChange { branch: String },
+    /// The Workspace jjfx names for a bookmark is already taken by a Workspace
+    /// that does not hold that bookmark, so rebasing there would rewrite a
+    /// different change.
+    #[error(
+        "Workspace {workspace} already exists but does not hold {branch}: rename or remove it \
+         (`jjfx rm {workspace}`) and re-run, or re-weld {branch} from the Workspace it is in"
+    )]
+    BranchWorkspaceTaken { branch: String, workspace: String },
+    /// The Workspace that holds a bookmark could not be created.
+    #[error("cannot create a Workspace to hold {branch}: {detail}")]
+    BranchWorkspace { branch: String, detail: String },
     /// Pushing a rebased bookmark failed after the local operation completed.
     #[error("cannot push rebased branch {branch}: {push}; rollback: {rollback:?}")]
     RebasePush {
@@ -2044,9 +2384,9 @@ pub enum WorkerActionError {
         operation: &'static str,
         detail: String,
     },
-    /// A Worker Workspace operation could not acquire its serialization lock.
-    #[error("cannot lock Workspace operations for Worker {worker}: {detail}")]
-    WorkspaceOperation { worker: WorkerId, detail: String },
+    /// A Workspace operation could not acquire its serialization lock.
+    #[error("cannot lock Workspace operations for {workspace}: {detail}")]
+    WorkspaceOperation { workspace: String, detail: String },
     /// The asynchronous Workspace restoration thread could not start.
     #[error("cannot start Workspace restoration for Worker {worker}: {detail}")]
     RestorationSpawn { worker: WorkerId, detail: String },
@@ -2161,6 +2501,129 @@ mod tests {
             state: PullRequestState::Closed,
         };
         assert!(closed.to_string().contains("is closed"), "{closed}");
+    }
+
+    /// A bookmark folds into a Workspace name jj and a filesystem both accept,
+    /// deterministically - so a second re-weld of the same change reuses the
+    /// Workspace the first one made rather than accumulating one per run.
+    #[test]
+    fn a_bookmark_folds_into_a_deterministic_workspace_name() {
+        let folded = workspace_name_for_branch("adam/tally--04-json-output");
+
+        assert_eq!(folded, "branch-adam-tally--04-json-output");
+        assert_eq!(
+            workspace_name_for_branch("adam/tally--04-json-output"),
+            folded,
+            "the same bookmark is always the same Workspace"
+        );
+        // Out of jjfx's own `worker-<id>` namespace and out of `default`, so a
+        // derived name can never shadow a Worker or the repository root.
+        assert!(workspace_name_for_branch("worker/1").starts_with("branch-"));
+        assert_ne!(workspace_name_for_branch("default"), "default");
+        // Every character a Workspace name cannot carry folds to `-`.
+        assert_eq!(workspace_name_for_branch("a b:c"), "branch-a-b-c");
+        assert_eq!(workspace_name_for_branch("adam/x"), "branch-adam-x");
+    }
+
+    /// A conflicted re-weld is the ticket's whole point: the refusal has to name
+    /// the Workspace the conflict is resolvable in, and the command that does it,
+    /// or an operator is left with a conflicted chain and no way in.
+    #[test]
+    fn the_conflicted_re_weld_refusal_names_the_workspace_and_the_verb() {
+        let error = WorkerActionError::RebaseConflicted {
+            branch: "adam/tally--04-json-output".to_owned(),
+            workspace: "branch-adam-tally--04-json-output".to_owned(),
+        };
+        let message = error.to_string();
+
+        assert!(
+            message.contains("rebased branch adam/tally--04-json-output onto main"),
+            "{message}"
+        );
+        assert!(
+            message.contains("resolve them in Workspace branch-adam-tally--04-json-output"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`jjfx resolve branch-adam-tally--04-json-output`"),
+            "{message}"
+        );
+        assert!(message.contains("left in place"), "{message}");
+    }
+
+    /// A name that is neither a Worker nor a bookmark is refused by naming both
+    /// things a landing verb accepts, so the durable name - the bookmark - is
+    /// discoverable from the refusal itself.
+    #[test]
+    fn the_unknown_name_refusal_names_both_things_a_landing_verb_accepts() {
+        let message = WorkerActionError::UnknownTarget {
+            name: "no-such-change".to_owned(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("`no-such-change` names no Worker and no bookmark"),
+            "{message}"
+        );
+        assert!(message.contains("jjfx rebase worker-<id>"), "{message}");
+        assert!(
+            message.contains("jjfx rebase <prefix>/<ticket>-<description>"),
+            "{message}"
+        );
+    }
+
+    /// A Worker that has been reused for the next Ticket is exactly the case the
+    /// bug was filed for, so its refusal says plainly that the change it
+    /// delivered is still reachable by its bookmark - and how to act on it.
+    #[test]
+    fn a_reused_workers_refusal_says_the_change_is_reachable_by_bookmark() {
+        let message = WorkerActionError::BranchNotFound {
+            worker: WorkerId::parse("worker-a04066").expect("a Worker id"),
+            ticket: "tally--06".to_owned(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("no bookmark names Worker worker-a04066's Ticket tally--06"),
+            "{message}"
+        );
+        assert!(message.contains("reused"), "{message}");
+        assert!(message.contains("jjfx rebase <bookmark>"), "{message}");
+    }
+
+    /// Re-welding trunk onto itself is a no-op, and a landing verb must never
+    /// push the mainline: both are refused by name.
+    #[test]
+    fn a_trunk_bookmark_is_refused_as_a_change() {
+        let message = WorkerActionError::TrunkIsNotAChange {
+            branch: "main".to_owned(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("bookmark main is the mainline"),
+            "{message}"
+        );
+        assert!(message.contains("nothing to re-weld"), "{message}");
+    }
+
+    /// A Workspace name already taken by a Workspace that does *not* hold the
+    /// change is refused rather than rebased in: rewriting a different change in
+    /// a Workspace named for this one is the hazard, and the refusal says which
+    /// Workspace to remove.
+    #[test]
+    fn a_taken_workspace_name_is_refused_by_name() {
+        let message = WorkerActionError::BranchWorkspaceTaken {
+            branch: "adam/x".to_owned(),
+            workspace: "branch-adam-x".to_owned(),
+        }
+        .to_string();
+
+        assert!(
+            message.contains("Workspace branch-adam-x already exists but does not hold adam/x"),
+            "{message}"
+        );
+        assert!(message.contains("jjfx rm branch-adam-x"), "{message}");
     }
 
     /// The body `gh -R Jarvvski/jjfx pr checks 163 --json name,bucket,state`

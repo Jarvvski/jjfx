@@ -123,17 +123,22 @@ pub enum Command {
         worker: String,
     },
     Rebase {
+        /// A Worker's name, or the bookmark of the change to re-weld.
         worker: String,
     },
     Absorb {
         worker: String,
     },
     OpenPullRequest {
+        /// A Worker's name, or the bookmark of the change whose Pull Request to
+        /// open.
         worker: String,
     },
-    /// `deliver <worker>`: the one forge path - weld, check, push, open one
-    /// Pull Request - as a shell verb, so an agent need not run `gh pr create`.
+    /// `deliver <worker|branch>`: the one forge path - weld, check, push, open
+    /// one Pull Request - as a shell verb, so an agent need not run
+    /// `gh pr create`.
     Deliver {
+        /// A Worker's name, or the bookmark of the change to deliver.
         worker: String,
     },
     Resolve {
@@ -490,7 +495,7 @@ pub fn parse(args: &[String]) -> Result<Command> {
         )
         .map(|worker| Command::Mount { worker }),
         "rebase" | "rb" => parse_worker_command(
-            concat!("Usage: ", env!("CARGO_PKG_NAME"), " rebase <worker>"),
+            concat!("Usage: ", env!("CARGO_PKG_NAME"), " rebase <worker|branch>"),
             &args[1..],
         )
         .map(|worker| Command::Rebase { worker }),
@@ -500,12 +505,20 @@ pub fn parse(args: &[String]) -> Result<Command> {
         )
         .map(|worker| Command::Absorb { worker }),
         "open-pr" | "pr" => parse_worker_command(
-            concat!("Usage: ", env!("CARGO_PKG_NAME"), " open-pr <worker>"),
+            concat!(
+                "Usage: ",
+                env!("CARGO_PKG_NAME"),
+                " open-pr <worker|branch>"
+            ),
             &args[1..],
         )
         .map(|worker| Command::OpenPullRequest { worker }),
         "deliver" => parse_worker_command(
-            concat!("Usage: ", env!("CARGO_PKG_NAME"), " deliver <worker>"),
+            concat!(
+                "Usage: ",
+                env!("CARGO_PKG_NAME"),
+                " deliver <worker|branch>"
+            ),
             &args[1..],
         )
         .map(|worker| Command::Deliver { worker }),
@@ -5575,9 +5588,29 @@ fn mount_command(
     Ok(())
 }
 
+/// Rebase and push the change a name identifies - a Worker's, or a bookmark's.
+///
+/// The two are the same operation on the same thing. A Worker is a reusable slot
+/// and the bookmark it delivered is not, so a change whose Worker has already
+/// been reused is re-welded by its bookmark: `jjfx rebase adam/<ticket>-<slug>`.
+/// When no Workspace holds the change, one is created for it and named, because a
+/// rebase has to rewrite a working copy and a conflict it records is only
+/// reachable through a Workspace's own chain.
 fn rebase_command(repository: &Repository, value: &str) -> Result<()> {
-    let worker = normalize_worker(value)?;
-    let outcome = WorkerActions::new(repository.clone()).rebase(&worker)?;
+    let actions = WorkerActions::new(repository.clone());
+    let target = actions.landing_target(value)?;
+    // Reported before the rebase: a Workspace jjfx made is a fact whether or not
+    // the rebase that follows it succeeds, and a conflicted one is exactly when
+    // the operator needs to know where it is.
+    if target.was_created() {
+        eprintln!(
+            "Created Workspace {} to hold {}; remove it with `jjfx rm {}` when you are done",
+            target.workspace(),
+            target.named(),
+            target.workspace()
+        );
+    }
+    let outcome = actions.rebase(&target)?;
     eprintln!("Rebased {}", outcome.branch());
     Ok(())
 }
@@ -5606,9 +5639,14 @@ fn absorb_command(repository: &Repository, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Open the Pull Request a name identifies in the browser - a Worker's, or a
+/// bookmark's.
+///
+/// A Worker's name resolves to the bookmark its Ticket names, and a bookmark
+/// resolves to itself; neither needs a Workspace, because the Pull Request is
+/// keyed by the branch.
 fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
-    let worker = normalize_worker(value)?;
-    let outcome = WorkerActions::new(repository.clone()).open_pull_request(&worker)?;
+    let outcome = WorkerActions::new(repository.clone()).open_pull_request(value)?;
     eprintln!("Opened Pull Request for {}", outcome.branch());
     Ok(())
 }
@@ -5628,13 +5666,22 @@ fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
 /// (`<repo>/.jjfx/config.toml` `[forge] draft`, else the user-global setting). A
 /// PR left a draft is reported, naming the `gh pr ready` that marks it mergeable,
 /// so the landing flow never stalls on a step jjfx never mentions.
+///
+/// The change is named by a Worker or by its bookmark. A Worker is a reusable
+/// slot - the next Dispatch takes it back the moment its Run ends - so a change
+/// whose Worker has been reused is re-welded by its bookmark, which is the
+/// durable name of the change. Naming the bookmark is also how a change is
+/// re-welded after a sibling merged and moved trunk under it: the same delivery,
+/// run again, on the name that survived.
 fn deliver_command(repository: &Repository, value: &str) -> Result<()> {
-    let worker = normalize_worker(value)?;
-    let workspace = crate::engine::worker_path(repository.root(), &worker);
-    if !workspace.is_dir() {
-        bail!(
-            "no Workspace directory for {worker} at {}",
-            workspace.display()
+    let actions = WorkerActions::new(repository.clone());
+    let target = actions.landing_target(value)?;
+    if target.was_created() {
+        eprintln!(
+            "Created Workspace {} to hold {}; remove it with `jjfx rm {}` when you are done",
+            target.workspace(),
+            target.named(),
+            target.workspace()
         );
     }
     // The repository's own `[checks]` and `[forge]` when it sets them, else the
@@ -5647,20 +5694,24 @@ fn deliver_command(repository: &Repository, value: &str) -> Result<()> {
             checks: config.checks_for(repository.root())?,
         },
     );
-    eprintln!("Delivering {worker}: weld, check, push, Pull Request");
+    eprintln!(
+        "Delivering {}: weld, check, push, Pull Request",
+        target.named()
+    );
     let report = forge.deliver(crate::forge::Target::new(
-        worker.as_str().to_owned(),
-        workspace,
+        target.workspace().to_owned(),
+        target.path().to_path_buf(),
     ));
     for notice in report.notices() {
         eprintln!("  {notice}");
     }
     if report.delivered() {
-        eprintln!("Delivered {worker}");
+        eprintln!("Delivered {}", target.named());
         return Ok(());
     }
     bail!(
-        "delivery of {worker} stopped: {}",
+        "delivery of {} stopped: {}",
+        target.named(),
         report
             .reason()
             .unwrap_or("the delivery did not finish cleanly")
@@ -5810,6 +5861,19 @@ fn internal_complete_command(mode: &str) -> Result<()> {
         "workspaces" => {
             for entry in repository.workspaces().snapshot()?.entries() {
                 println!("{}", entry.name());
+            }
+        }
+        // The names a landing verb accepts: every Worker, and every bookmark -
+        // the durable name of a delivered change, and the only name left once
+        // the Worker that delivered it has been reused.
+        "changes" => {
+            for worker in repository.worker_pool().snapshot().workers() {
+                println!("{}", worker.worker_id());
+            }
+            if let Ok(bookmarks) = crate::jj::local_bookmark_names(repository.root()) {
+                for bookmark in bookmarks {
+                    println!("{bookmark}");
+                }
             }
         }
         "idle-workers" | "done-workers" | "failed-workers" | "non-busy-workers" => {
@@ -6112,6 +6176,11 @@ __jjfx_workspaces() {
   workspaces=("${(@f)$(jjfx __complete workspaces 2>/dev/null)}")
   _describe 'workspace' workspaces
 }
+__jjfx_changes() {
+  local -a changes
+  changes=("${(@f)$(jjfx __complete changes 2>/dev/null)}")
+  _describe 'change' changes
+}
 
 _jjfx() {
   local -a commands
@@ -6123,8 +6192,8 @@ _jjfx() {
     'dispatch:Dispatch Tickets' 'send:Send a Follow-up'
     'review:Address review comments' 'mount:Open Worker in kitty'
     'reset:Reset Worker' 'status:Show Pool status' 'logs:Follow Worker log'
-    'rebase:Rebase Worker' 'open-pr:Open Worker Pull Request'
-    'deliver:Deliver Worker change (weld, check, push, PR)'
+    'rebase:Rebase change' 'open-pr:Open change Pull Request'
+    'deliver:Deliver change (weld, check, push, PR)'
     'resolve:Resolve a Workspace conflict'
     'absorb:Fold Worker edits into base commits'
     'wait:Block until Workers reach a condition'
@@ -6138,7 +6207,8 @@ _jjfx() {
         clean) _arguments '--pool[Worker Pool to scope the sweep to]:name:' ;;
         send|s) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' '2:prompt:' ;;
         review|rev) _arguments '--fg[run in foreground]' '--bg[run in background]' '1:worker:__jjfx_non_busy_workers' ;;
-        mount|m|reset|logs|log|rebase|rb|open-pr|pr|deliver|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
+        mount|m|reset|logs|log|absorb|ab) _arguments '1:worker:__jjfx_workers' ;;
+        rebase|rb|open-pr|pr|deliver) _arguments '1:change:__jjfx_changes' ;;
         wait) _arguments '--until[condition to wait for]:condition:(done failed terminal ticket-resolved)' '--timeout[give up after N seconds]:secs:' '--all[wait for every Worker in the pool]' '--json[print machine-readable results]' '--pool[Worker Pool to wait on]:pool:' '*:worker:__jjfx_workers' ;;
         resolve) _arguments '--tool[merge tool]:tool:' '1:worker:__jjfx_workers' ;;
         undo) _arguments '--force[discard later operations]' '1:worker:__jjfx_workers' ;;

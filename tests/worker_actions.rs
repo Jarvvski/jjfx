@@ -348,8 +348,15 @@ fn repository_actions_reject_a_worker_without_a_branch() {
     let worker = grow_one_worker(&repository);
     let actions = WorkerActions::new(repository);
 
-    assert!(actions.rebase(&worker).is_err());
-    assert!(actions.open_pull_request(&worker).is_err());
+    // The Workspace resolves - a Worker is a Workspace whether or not it has
+    // delivered anything - and it is the verb that refuses, on the read, because
+    // there is no bookmark to rewrite.
+    let target = actions
+        .landing_target(worker.as_str())
+        .expect("a Worker's Workspace resolves");
+    let error = actions.rebase(&target).expect_err("no bookmark to rebase");
+    assert!(error.to_string().contains("has no branch"), "{error}");
+    assert!(actions.resolve_branch(worker.as_str()).is_err());
 }
 
 #[test]
@@ -2212,18 +2219,23 @@ fn repository_action_helper() {
     let worker = WorkerId::parse(env::var(HELPER_WORKER).expect("Worker ID")).expect("Worker ID");
     let actions = WorkerActions::new(repository);
     let result = if mode == "repository" {
-        let rebase = actions.rebase(&worker).expect("Rebase should succeed");
+        let rebase = actions
+            .rebase(&actions.landing_target(worker.as_str()).expect("target"))
+            .expect("Rebase should succeed");
         let open = actions
-            .open_pull_request(&worker)
+            .open_pull_request(worker.as_str())
             .expect("Open PR should succeed");
         format!("{}\n{}\n", rebase.branch(), open.branch())
     } else if mode == "rebase" {
-        match actions.rebase(&worker) {
+        match actions
+            .landing_target(worker.as_str())
+            .and_then(|target| actions.rebase(&target))
+        {
             Ok(rebase) => format!("rebased={}\n", rebase.branch()),
             Err(error) => error.to_string(),
         }
     } else if mode == "open-pr" {
-        match actions.open_pull_request(&worker) {
+        match actions.open_pull_request(worker.as_str()) {
             Ok(open) => format!("opened={}\n", open.branch()),
             Err(error) => error.to_string(),
         }
@@ -2242,7 +2254,8 @@ fn repository_action_helper() {
         }
     } else {
         actions
-            .rebase(&worker)
+            .landing_target(worker.as_str())
+            .and_then(|target| actions.rebase(&target))
             .expect_err("Rebase should fail")
             .to_string()
     };

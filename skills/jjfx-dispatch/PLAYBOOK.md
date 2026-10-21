@@ -168,6 +168,7 @@ path, and the command the prompt and the skill now name:
 
 ```sh
 jjfx deliver worker-XXXX      # weld, check, push, open one PR
+jjfx deliver adam/<ticket>    # the same delivery, named by the change's bookmark
 ```
 
 It welds the Worker's chain onto trunk, runs the repository's own check
@@ -185,6 +186,32 @@ Parallel Workers editing the same files **will conflict** at merge time - the
 fixture produced three clean merges and five conflicts out of eight. Rebase the
 survivors onto the new trunk and resolve with `jj resolve` / conflict markers;
 `jj rebase -b adam/<ticket> -d main` shows the conflict as data.
+
+**Re-weld by bookmark, not by Worker.** The moment the first PR merges, trunk
+moves under the others and their Pull Requests read `CONFLICTING` - and by then
+the Worker that delivered one may already have been reused for the next Ticket,
+which is `dogfood-2` finding 07 working as designed. A Worker is a reusable slot;
+**the bookmark is the durable name of the change**, so `rebase`, `deliver` and
+`open-pr` take either:
+
+```sh
+jjfx rebase adam/tally--04-json-output    # re-weld the delivered change by name
+jjfx deliver adam/tally--04-json-output   # the whole path, check included
+```
+
+When no Workspace holds the change, jjfx creates one for it (`branch-<bookmark>`)
+and says so. A conflicted rebase is left in place and names that Workspace, so the
+loop is:
+
+```sh
+jjfx rebase adam/tally--04-json-output            # names the Workspace on conflict
+jjfx resolve branch-adam-tally--04-json-output    # the merge tool runs there
+jjfx rebase adam/tally--04-json-output            # pushes the resolved change
+```
+
+**What jjfx should own:** this used to be "fetch, find the branch, make a
+workspace, rebase it, resolve, push" by hand. **Done:** naming the bookmark does
+all of it. Finding 02.
 
 The merge itself is still the loop's: `gh pr checks <n> -R <owner>/<repo>` then
 `gh pr merge <n> -R <owner>/<repo> --squash` once it is green. jjfx has no merge
@@ -232,4 +259,5 @@ the control plane. The point of jjfx is that it is.
 - [ ] Next round after `wait --until terminal`; a finished Worker is reused automatically.
 - [ ] `resume` named, never bare.
 - [ ] `jjfx deliver worker-XXXX` to land: weld, check, push, one PR (no `gh pr create`).
+- [ ] A PR that conflicts after a sibling merged: re-weld it by bookmark (`jjfx rebase adam/<ticket>`), resolve in the Workspace it names, re-run.
 - [ ] `gh pr checks` + merge on green; expect conflicts from parallel work.

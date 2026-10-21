@@ -803,10 +803,11 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
 
     fn rebase(&self, worker: &str) -> Result<WorkerCommandResult, String> {
         let repository = self.repository()?;
-        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
-        let outcome = crate::engine::WorkerActions::new(repository)
-            .rebase(&worker_id)
+        let actions = crate::engine::WorkerActions::new(repository);
+        let target = actions
+            .landing_target(worker)
             .map_err(|error| error.to_string())?;
+        let outcome = actions.rebase(&target).map_err(|error| error.to_string())?;
         Ok(WorkerCommandResult::Rebased {
             worker: worker.to_owned(),
             branch: outcome.branch().to_owned(),
@@ -815,9 +816,8 @@ impl WorkspaceDispatchAdapter for RealWorkspaceDispatch {
 
     fn open_pull_request(&self, worker: &str) -> Result<WorkerCommandResult, String> {
         let repository = self.repository()?;
-        let worker_id = WorkerId::parse(worker.to_owned()).map_err(|error| error.to_string())?;
         let outcome = crate::engine::WorkerActions::new(repository)
-            .open_pull_request(&worker_id)
+            .open_pull_request(worker)
             .map_err(|error| error.to_string())?;
         Ok(WorkerCommandResult::PullRequestOpened {
             worker: worker.to_owned(),
