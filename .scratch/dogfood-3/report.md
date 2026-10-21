@@ -206,13 +206,18 @@ about the PR that no jjfx verb can act on, and both surfaced only after
 
 | # | Finding | Type |
 |---|---|---|
-| 01 | Every delivered PR is a draft and a repository cannot choose otherwise, so the landing flow stalls at `gh pr merge` | bug |
-| 02 | A delivered PR whose trunk moved cannot be re-welded, and reusing its Worker destroys the only handle to it | bug |
+| 01 | Every delivered PR is a draft and a repository cannot choose otherwise, so the landing flow stalls at `gh pr merge` - **fixed as #184** | bug |
+| 02 | A delivered PR whose trunk moved cannot be re-welded, and reusing its Worker destroys the only handle to it - **fixed as #185** | bug |
 | 03 | jjfx owns the bounded review loop again, sourced from the PR's review threads (the owner's ruling) - **landed as #176** | task |
-| 04 | An opencode Run records no cost, so the `[spend]` cap is inert | bug |
+| 04 | An opencode Run records no cost, so the `[spend]` cap is inert - **fixed as #182** | bug |
 | 05 | A recorded review pass replays forever, so a new review thread is invisible and the loop reports convergence - **fixed as #178, verified live** | bug |
-| 06 | A merged Pull Request is refused as "no pull request found" | bug |
-| 07 | A push jj refused is reported as a harmless skip, and the delivery fails later at the Pull Request | bug |
+| 06 | A merged Pull Request is refused as "no pull request found" - **fixed as #183** | bug |
+| 07 | A push jj refused is reported as a harmless skip, and the delivery fails later at the Pull Request - **fixed as #181** | bug |
+
+All seven are `resolved` on `main`. The drive's findings were worked in the same
+shape as the second drive's twelve: filed from live reproductions, triaged with
+the evidence independently confirmed, then worked in pairs whose files cannot
+collide, each verified under the CI-shaped environment before it landed.
 
 ## 6. Evidence left behind
 
