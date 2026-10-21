@@ -2506,7 +2506,12 @@ fn spend_summary(cost: Option<&PoolCostSnapshot>) -> String {
         return "Spend: record store unavailable".to_owned();
     };
     let total = cost.total();
-    let unpriced = if total.unpriced_runs() > 0 {
+    let unpriced = if total.is_unmeasured() {
+        // Every Run reported no cost, so the total is an absence of data, not a
+        // measurement. Say so rather than let `$0.0000` read as "these Runs were
+        // free".
+        " (no Run reported a cost; the total is not a measurement)".to_owned()
+    } else if total.unpriced_runs() > 0 {
         format!(" ({} without a reported cost)", total.unpriced_runs())
     } else {
         String::new()

@@ -409,7 +409,11 @@ fn pool_cost_line(cost: &PoolCostSnapshot) -> String {
         total.runs(),
         total.tokens_display()
     );
-    if total.unpriced_runs() > 0 {
+    if total.is_unmeasured() {
+        // Every Run reported no cost: the total is an absence of data, not a
+        // measurement, and must not read as "these Runs were free".
+        line.push_str("  (no Run reported a cost; the total is not a measurement)");
+    } else if total.unpriced_runs() > 0 {
         line.push_str(&format!(
             "  ({} Run(s) without a reported cost)",
             total.unpriced_runs()

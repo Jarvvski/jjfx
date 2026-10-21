@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 
 use jjfx::engine::{
     CommitOutcome, DEFAULT_POOL_NAME, DispatchGroupState, Expected, Loaded, PoolCapacity, PoolName,
-    PoolState, Repository, RepositoryError, StateChange, TicketId, WireStatus, WireTimestamp,
-    WorkerId, WorkerState,
+    PoolState, Repository, RepositoryError, RunRecordUsage, SessionBaseline, StateChange, TicketId,
+    WireStatus, WireTimestamp, WorkerId, WorkerState,
 };
 use serde_json::Value;
 use tempfile::TempDir;
@@ -364,15 +364,34 @@ fn session_sidecar_records_reads_and_replaces_worker_sessions() {
 
     // A missing sidecar is an empty read surface, not an error.
     assert_eq!(sessions.session(&worker).expect("read"), None);
+    assert_eq!(sessions.baseline(&worker).expect("read baseline"), None);
 
-    sessions.record(&worker, "ses_one").expect("record");
+    let baseline = SessionBaseline {
+        cost_micro_usd: 1_500,
+        usage: RunRecordUsage {
+            input_tokens: 10,
+            cached_input_tokens: 1,
+            cache_write_input_tokens: 2,
+            output_tokens: 3,
+            reasoning_output_tokens: 4,
+        },
+    };
+    sessions
+        .record(&worker, "ses_one", baseline)
+        .expect("record");
     assert_eq!(
         sessions.session(&worker).expect("read").as_deref(),
         Some("ses_one")
     );
+    assert_eq!(
+        sessions.baseline(&worker).expect("read baseline"),
+        Some(baseline)
+    );
 
     // Each Worker's session is independent.
-    sessions.record(&other, "ses_two").expect("record other");
+    sessions
+        .record(&other, "ses_two", SessionBaseline::default())
+        .expect("record other");
     assert_eq!(
         sessions.session(&worker).expect("read").as_deref(),
         Some("ses_one")
@@ -382,18 +401,28 @@ fn session_sidecar_records_reads_and_replaces_worker_sessions() {
         Some("ses_two")
     );
 
-    // A later Run replaces the Worker's recorded session.
-    sessions.record(&worker, "ses_three").expect("replace");
+    // A later Run replaces the Worker's recorded session and its baseline.
+    sessions
+        .record(&worker, "ses_three", SessionBaseline::default())
+        .expect("replace");
     assert_eq!(
         sessions.session(&worker).expect("read").as_deref(),
         Some("ses_three")
     );
+    assert_eq!(
+        sessions.baseline(&worker).expect("read baseline"),
+        Some(SessionBaseline::default())
+    );
+
+    // Clearing a Worker forgets both the session and its baseline.
+    sessions.clear(&worker).expect("clear");
+    assert_eq!(sessions.session(&worker).expect("read"), None);
+    assert_eq!(sessions.baseline(&worker).expect("read baseline"), None);
 
     // It is jjfx-owned sidecar state, not part of the pool and Worker documents.
     let path = temp.path().join(".jj/pools/default/sessions.json");
     let value: Value =
         serde_json::from_slice(&fs::read(&path).expect("session sidecar")).expect("JSON");
-    assert_eq!(value["sessions"]["worker-01"], "ses_three");
     assert_eq!(value["sessions"]["worker-02"], "ses_two");
     assert!(!temp.path().join(".jj/pools/default/pool.json").exists());
 }

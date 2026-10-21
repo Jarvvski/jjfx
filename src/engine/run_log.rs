@@ -469,6 +469,22 @@ fn opencode_run_totals(path: &Path) -> OpenCodeRunTotals {
     }
 }
 
+/// The token usage one opencode `tokens` object reports.
+///
+/// opencode reports the same `tokens` shape in a `step_finish` part and on a
+/// session, so one reader serves both: a step's own usage and a session's
+/// cumulative usage are normalized the same way.
+pub(crate) fn opencode_usage(tokens: &Value) -> RunUsage {
+    let cache = tokens.get("cache");
+    RunUsage::new(
+        token_count(tokens.get("input")),
+        token_count(tokens.get("output")),
+    )
+    .with_cached_input_tokens(token_count(cache.and_then(|cache| cache.get("read"))))
+    .with_cache_write_input_tokens(token_count(cache.and_then(|cache| cache.get("write"))))
+    .with_reasoning_output_tokens(token_count(tokens.get("reasoning")))
+}
+
 /// Reads a provider token count, treating a missing or non-numeric value as zero.
 fn token_count(value: Option<&Value>) -> u64 {
     value.and_then(Value::as_u64).unwrap_or(0)
@@ -478,7 +494,7 @@ fn token_count(value: Option<&Value>) -> u64 {
 ///
 /// A negative, non-finite or out-of-range value is `None`: it means "no cost
 /// reported", never a reason for the Run to fail.
-fn micro_usd(value: f64) -> Option<u64> {
+pub(crate) fn micro_usd(value: f64) -> Option<u64> {
     if !value.is_finite() || value < 0.0 {
         return None;
     }

@@ -557,15 +557,12 @@ impl RunSupervisor {
         session_id: &str,
     ) -> Result<(), RunSupervisorError> {
         let worker = reservation.worker_id();
-        reservation
-            .repository()
-            .state_store()
-            .sessions()
-            .record(worker, session_id)
-            .map_err(|source| RunSupervisorError::OpenCodeSession {
+        record_run_session(reservation.repository(), worker, session_id).map_err(|reason| {
+            RunSupervisorError::OpenCodeSession {
                 worker: worker.clone(),
-                reason: format!("cannot record the Run's session id: {source}"),
-            })
+                reason,
+            }
+        })
     }
 
     /// Forgets the session recorded for the Worker's previous Run.
@@ -1337,6 +1334,52 @@ fn interrupt_opencode_run(
         return false;
     };
     matches!(api.interrupt_session(&session_id), Ok(true))
+}
+
+/// Records the opencode session a Worker's Run drives, together with the spend
+/// that session already carried when the Run started.
+///
+/// The session's cost and tokens are cumulative, so the baseline is what makes
+/// the Run's own spend recoverable at finalization: a fresh session starts at
+/// zero, and a resumed one carries whatever its earlier Runs spent. Reading the
+/// session here is best-effort - an unreachable daemon records a zero baseline,
+/// which is exact for a fresh session and the only safe default otherwise.
+pub(crate) fn record_run_session(
+    repository: &Repository,
+    worker: &WorkerId,
+    session_id: &str,
+) -> Result<(), String> {
+    let baseline = session_baseline(session_id);
+    repository
+        .state_store()
+        .sessions()
+        .record(worker, session_id, baseline)
+        .map_err(|source| format!("cannot record the Run's session: {source}"))
+}
+
+/// The spend the session already carried, or a zero baseline when it cannot be
+/// read.
+fn session_baseline(session_id: &str) -> crate::engine::SessionBaseline {
+    let Some(session) = crate::engine::OpenCodeApi::new()
+        .get_session(session_id)
+        .ok()
+    else {
+        return crate::engine::SessionBaseline::default();
+    };
+    crate::engine::SessionBaseline {
+        cost_micro_usd: session.cost_micro_usd().unwrap_or(0),
+        usage: session
+            .usage()
+            .map_or_else(crate::engine::RunRecordUsage::default, |usage| {
+                crate::engine::RunRecordUsage {
+                    input_tokens: usage.input_tokens(),
+                    cached_input_tokens: usage.cached_input_tokens(),
+                    cache_write_input_tokens: usage.cache_write_input_tokens(),
+                    output_tokens: usage.output_tokens(),
+                    reasoning_output_tokens: usage.reasoning_output_tokens(),
+                }
+            }),
+    }
 }
 
 /// Delivers a Run's prompt to an opencode session through the daemon API,

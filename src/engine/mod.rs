@@ -114,10 +114,10 @@ pub use state::{
     MutationRecord, MutationRecordRepository, PoolName, PoolState, PoolStateRepository,
     QueueAdmission, QueueItem, QueueItemState, QueueSettlement, QueueState, QueueStateRepository,
     QueuedStep, REPOSITORY_WIDE_MUTATION, REVIEW_STEP_KIND, RunRecord, RunRecordConclusion,
-    RunRecordRepository, RunRecordUsage, SessionState, SessionStateRepository, StackBaseState,
-    StackBaseStateRepository, StateChange, StateError, StateRevision, StateStore, StepKey,
-    SubIssueState, TicketId, UndoState, Versioned, WaitingState, WaitingStateRepository, WireAgent,
-    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
+    RunRecordRepository, RunRecordUsage, SessionBaseline, SessionState, SessionStateRepository,
+    StackBaseState, StackBaseStateRepository, StateChange, StateError, StateRevision, StateStore,
+    StepKey, SubIssueState, TicketId, UndoState, Versioned, WaitingState, WaitingStateRepository,
+    WireAgent, WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerStateRepository,
 };
 pub use ticket::{
     AgentRuntimeQuery, Blocker, DEFAULT_READY_LABEL, DependencyGraph, DiscoveredSubIssue,

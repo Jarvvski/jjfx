@@ -1116,13 +1116,15 @@ impl WorkerActions {
         prompt: &str,
     ) -> bool {
         // Record the session first: a failure here must fall back before the
-        // prompt is sent, so a Run is never delivered twice.
-        if reservation
-            .repository()
-            .state_store()
-            .sessions()
-            .record(reservation.worker_id(), session_id)
-            .is_err()
+        // prompt is sent, so a Run is never delivered twice. The baseline the
+        // session already carried is recorded with it, so the Run's own spend is
+        // recoverable when the session reports its cumulative total.
+        if crate::engine::runtime::record_run_session(
+            reservation.repository(),
+            reservation.worker_id(),
+            session_id,
+        )
+        .is_err()
         {
             return false;
         }

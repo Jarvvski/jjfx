@@ -11,8 +11,8 @@ use crate::engine::{
     AgentRuntime, AgentRuntimeProfile, CommitOutcome, DispatchExclusions, Expected, Loaded,
     PoolCostSnapshot, PoolState, QueueSettlement, Repository, RunConclusion, RunCost, RunHealth,
     RunProgress, RunRecord, RunRecordConclusion, RunRecordUsage, RunResult, RunResultSource,
-    SessionOutcome, StateChange, StateError, StateRevision, StepKey, StuckWindow, WireStatus,
-    WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
+    RunUsage, SessionOutcome, StateChange, StateError, StateRevision, StepKey, StuckWindow,
+    WireStatus, WireTimestamp, WorkerId, WorkerState, WorkerWorkspaceError,
 };
 
 /// Bounded retries for a Reset losing the Worker revision to its own Run's
@@ -509,13 +509,23 @@ impl WorkerPool {
             // The session reports a terminal outcome. A provider terminal event
             // in the Run log carries more detail than the bare outcome, so
             // prefer it when the log has one. opencode reports cost and tokens
-            // per step, so the Run's totals are summed from its own log.
-            RunSessionState::Finished(outcome) => Some(opencode_totals(
-                state,
-                match log_source {
-                    RunResultSource::Provider => log_result,
-                    RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
-                },
+            // per step, so the Run's totals are summed from its own log; a
+            // session-delivered Run writes no log, so its totals come from the
+            // session instead.
+            RunSessionState::Finished {
+                outcome,
+                cost,
+                usage,
+            } => Some(apply_session_totals(
+                opencode_totals(
+                    state,
+                    match log_source {
+                        RunResultSource::Provider => log_result,
+                        RunResultSource::Fallback { .. } => opencode_outcome_result(&outcome),
+                    },
+                ),
+                cost,
+                usage,
             )),
             // No outcome yet, or the session cannot be read. Only a provider
             // terminal event in the Run log proves the Run ended: an *open*
@@ -529,6 +539,10 @@ impl WorkerPool {
     }
 
     /// Consults the session the Worker's opencode Run drives.
+    ///
+    /// A finished session also reports its cumulative cost and tokens; the Run's
+    /// own spend is that total less the baseline recorded when the Run started,
+    /// so a resumed session does not re-count its earlier Runs.
     fn opencode_session_state(&self, worker: &WorkerId, state: &WorkerState) -> RunSessionState {
         let api = crate::engine::OpenCodeApi::new();
         let Some(session_id) = crate::engine::runtime::identify_run_session(
@@ -541,7 +555,25 @@ impl WorkerPool {
         };
         match api.get_session(&session_id) {
             Ok(session) => match session.outcome() {
-                Some(outcome) => RunSessionState::Finished(outcome.clone()),
+                Some(outcome) => {
+                    let baseline = self
+                        .repository
+                        .state_store()
+                        .sessions()
+                        .baseline(worker)
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    RunSessionState::Finished {
+                        outcome: outcome.clone(),
+                        cost: session.cost_micro_usd().map(|cost| {
+                            RunCost::from_micro_usd(cost.saturating_sub(baseline.cost_micro_usd))
+                        }),
+                        usage: session
+                            .usage()
+                            .map(|usage| usage_after_baseline(usage, &baseline.usage)),
+                    }
+                }
                 None => RunSessionState::Running,
             },
             Err(_) => RunSessionState::Unavailable,
@@ -1631,8 +1663,13 @@ fn clear_run_fields(state: &mut WorkerState) {
 enum RunSessionState {
     /// The session has no outcome yet, so its Run is still executing.
     Running,
-    /// The session finished with this outcome.
-    Finished(SessionOutcome),
+    /// The session finished with this outcome, and reported the Run's own cost
+    /// and usage (the session's cumulative totals less the Run's baseline).
+    Finished {
+        outcome: SessionOutcome,
+        cost: Option<RunCost>,
+        usage: Option<RunUsage>,
+    },
     /// The session could not be identified or read.
     Unavailable,
 }
@@ -1694,6 +1731,55 @@ fn opencode_totals(state: &WorkerState, result: RunResult) -> RunResult {
         Some(path) => crate::engine::run_log::with_opencode_totals(result, Path::new(path)),
         None => result,
     }
+}
+
+/// Adds a Run's own session spend to `result` where the Run log reported none.
+///
+/// A session-delivered Run writes no process log, so its cost and tokens come
+/// from the session's cumulative total less the baseline the Run started from.
+/// A Run whose log already carries per-step totals keeps them: the log is the
+/// Run's own record, and adding the session total would double-count it.
+fn apply_session_totals(
+    result: RunResult,
+    cost: Option<RunCost>,
+    usage: Option<RunUsage>,
+) -> RunResult {
+    let mut result = result;
+    if result.cost().is_none()
+        && let Some(cost) = cost
+    {
+        result = result.with_cost(cost);
+    }
+    if result.usage().is_none()
+        && let Some(usage) = usage
+    {
+        result = result.with_usage(usage);
+    }
+    result
+}
+
+/// The token usage a Run added to its session: the session's cumulative usage
+/// less the baseline the Run started from.
+fn usage_after_baseline(usage: &RunUsage, baseline: &RunRecordUsage) -> RunUsage {
+    RunUsage::new(
+        usage.input_tokens().saturating_sub(baseline.input_tokens),
+        usage.output_tokens().saturating_sub(baseline.output_tokens),
+    )
+    .with_cached_input_tokens(
+        usage
+            .cached_input_tokens()
+            .saturating_sub(baseline.cached_input_tokens),
+    )
+    .with_cache_write_input_tokens(
+        usage
+            .cache_write_input_tokens()
+            .saturating_sub(baseline.cache_write_input_tokens),
+    )
+    .with_reasoning_output_tokens(
+        usage
+            .reasoning_output_tokens()
+            .saturating_sub(baseline.reasoning_output_tokens),
+    )
 }
 
 fn apply_run_result(state: &mut WorkerState, result: &RunResult) -> Result<(), WorkerPoolError> {

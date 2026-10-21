@@ -412,6 +412,25 @@ pub struct InUseState {
     pub workers: BTreeSet<WorkerId>,
 }
 
+/// The session spend a Run started from.
+///
+/// opencode reports a session's cost and token usage as a **cumulative** total,
+/// so the spend of one Run delivered through that session is the total at
+/// finalization less the total the session already carried when the Run started.
+/// This is that starting total, recorded alongside the session id. A Run that
+/// started a fresh session begins at zero; one that resumed a session carries
+/// whatever its earlier Runs had already spent, and subtracting it is what keeps
+/// the resumed Run's record from re-counting them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionBaseline {
+    /// Session cost in millionths of one US dollar when the Run started.
+    #[serde(default)]
+    pub cost_micro_usd: u64,
+    /// Session token usage when the Run started.
+    #[serde(default)]
+    pub usage: RunRecordUsage,
+}
+
 /// The Agent Runtime session each Worker's current Run drives.
 ///
 /// This is jjfx-owned state, deliberately kept out of the pool and Worker
@@ -424,6 +443,10 @@ pub struct SessionState {
     /// Session identifier keyed by the Worker whose current Run drives it.
     #[serde(default)]
     pub sessions: BTreeMap<WorkerId, String>,
+    /// The session spend each Worker's Run started from, keyed by Worker. Absent
+    /// for a Run whose session was never read, which reads as a zero baseline.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub baselines: BTreeMap<WorkerId, SessionBaseline>,
 }
 
 /// The commit(s) each Worker's Workspace was stacked on when it was materialised.
@@ -539,7 +562,7 @@ pub struct RunRecord {
 
 /// Token usage normalized across Agent Runtime providers, as persisted in a
 /// [`RunRecord`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunRecordUsage {
     /// Provider-reported input tokens.
     pub input_tokens: u64,
@@ -2962,53 +2985,79 @@ impl SessionStateRepository {
         }
     }
 
-    /// Records the session id `worker`'s current Run drives, replacing any prior one.
+    /// The session spend `worker`'s Run started from, if one was recorded.
+    ///
+    /// Absence means a zero baseline: either no session was recorded, or the
+    /// session's own spend could not be read when the Run started.
+    pub fn baseline(&self, worker: &WorkerId) -> Result<Option<SessionBaseline>, StateError> {
+        match self.load()? {
+            Loaded::Present(versioned) => Ok(versioned.value.baselines.get(worker).copied()),
+            Loaded::Missing => Ok(None),
+        }
+    }
+
+    /// Records the session id `worker`'s current Run drives and the spend that
+    /// session already carried, replacing any prior record.
     pub fn record(
         &self,
         worker: &WorkerId,
         session_id: impl Into<String>,
+        baseline: SessionBaseline,
     ) -> Result<(), StateError> {
         let session_id = session_id.into();
-        self.update(|sessions| {
-            sessions.insert(worker.clone(), session_id.clone()) != Some(session_id)
+        self.update(|sessions, baselines| {
+            let changed = sessions.insert(worker.clone(), session_id.clone()) != Some(session_id);
+            changed | (baselines.insert(worker.clone(), baseline) != Some(baseline))
         })
     }
 
-    /// Forgets the session id recorded for `worker`, if any.
+    /// Forgets the session id and baseline recorded for `worker`, if any.
     ///
     /// A Worker whose current Run drives no session must record none: a stale id
     /// left by a previous Run would let a later reader mistake that Run's
     /// session for this one's - and finish this Worker on an outcome that was
     /// never its own.
     pub fn clear(&self, worker: &WorkerId) -> Result<(), StateError> {
-        self.update(|sessions| sessions.remove(worker).is_some())
+        self.update(|sessions, baselines| {
+            sessions.remove(worker).is_some() | baselines.remove(worker).is_some()
+        })
     }
 
     /// Applies `edit` under the sidecar lock, writing only when it changed
     /// something.
     fn update(
         &self,
-        edit: impl FnOnce(&mut BTreeMap<WorkerId, String>) -> bool,
+        edit: impl FnOnce(
+            &mut BTreeMap<WorkerId, String>,
+            &mut BTreeMap<WorkerId, SessionBaseline>,
+        ) -> bool,
     ) -> Result<(), StateError> {
         let subject = "Worker Sessions";
         with_locks(
             &[ScopedLock::pool(self.directory.join(SESSION_LOCK_NAME))],
             subject,
             || {
-                let mut sessions = match load_state(
+                let state = match load_state(
                     &self.directory.join(SESSION_NAME),
                     subject,
                     &validate_sessions,
                 )? {
-                    Loaded::Present(versioned) => versioned.value.sessions,
-                    Loaded::Missing => BTreeMap::new(),
+                    Loaded::Present(versioned) => versioned.value,
+                    Loaded::Missing => SessionState::default(),
                 };
-                if !edit(&mut sessions) {
+                let SessionState {
+                    mut sessions,
+                    mut baselines,
+                } = state;
+                if !edit(&mut sessions, &mut baselines) {
                     return Ok(());
                 }
                 write_atomic(
                     &self.directory.join(SESSION_NAME),
-                    &SessionState { sessions },
+                    &SessionState {
+                        sessions,
+                        baselines,
+                    },
                     subject,
                 )
             },
