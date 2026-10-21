@@ -153,6 +153,35 @@ A smaller dishonesty sits beside it: a Worker whose PR has already merged is
 refused as `no pull request found`, when the PR is right there and merged. Filed
 as **finding 06**.
 
+**The fix was verified live, not just in tests.** With replay scoped to a single
+invocation (#178), a PR that converged once with no threads was given a review
+thread *with no push*, and the next `jjfx review` read it:
+
+```
+Reviewing worker-348336: Jarvvski/jjfx-drive-3#10 (at most 2 pass(es))
+  pass 1: 1 unresolved review thread(s)
+Review of worker-348336: 2 pass(es), 2 finding(s), stopped on no progress (a round found nothing new or retired nothing)
+  unresolved [none] README.md:60 - The README line and the test should agree on the exact version string.
+Error: review of worker-348336 did not converge (no progress ...): 1 finding(s) need a human
+```
+
+The loop read the thread, sent it, and - because the Worker did not resolve it -
+stopped on the progress rule, escalated the finding with its location, and exited
+non-zero. That is the bound doing its job, and it is the honest answer to the
+question the second drive could not answer. Note that the *earlier* live run
+converged instead, because that Worker chose to resolve its own thread: the
+outcome turns on whether the reviewer's side of the conversation is closed, which
+is exactly what the progress rule measures.
+
+### 3.5 A push jj refused is reported as a harmless skip
+
+The same live pass found a second way for `deliver` to mislead. A Worker's chain
+contained an empty commit with no description - a commit jj refuses to push - and
+`deliver` printed `push: nothing to push` in the same indented shape as its other
+*skip* notices, carried on, and failed two steps later with a `gh` GraphQL error
+about a blank head sha. jj had said exactly what was wrong and jjfx dropped it.
+Filed as **finding 07**.
+
 ---
 
 ## 4. The landing half, judged
@@ -181,8 +210,9 @@ about the PR that no jjfx verb can act on, and both surfaced only after
 | 02 | A delivered PR whose trunk moved cannot be re-welded, and reusing its Worker destroys the only handle to it | bug |
 | 03 | jjfx owns the bounded review loop again, sourced from the PR's review threads (the owner's ruling) - **landed as #176** | task |
 | 04 | An opencode Run records no cost, so the `[spend]` cap is inert | bug |
-| 05 | A recorded review pass replays forever, so a new review thread is invisible and the loop reports convergence | bug |
+| 05 | A recorded review pass replays forever, so a new review thread is invisible and the loop reports convergence - **fixed as #178, verified live** | bug |
 | 06 | A merged Pull Request is refused as "no pull request found" | bug |
+| 07 | A push jj refused is reported as a harmless skip, and the delivery fails later at the Pull Request | bug |
 
 ## 6. Evidence left behind
 
