@@ -1,7 +1,8 @@
 # The third drive: does jjfx own the loop, and does it hold on a clean config?
 
-Status: driven 2026-10-21 - see `report.md`; six findings filed, the loop's
-implementation landed as #176 and was exercised live
+Status: driven 2026-10-21 - see `report.md`; seven findings filed, the loop's
+implementation landed as #176 and its false-convergence bug fixed as #178, both
+verified live
 
 ## Why this exists
 
