@@ -2,16 +2,26 @@
 //!
 //! [`ReviewLoop`] is the bound and `ReplayingReviewer` is the replay seam; this
 //! module is the caller that joins them. Each pass is keyed by the step identity
-//! `review:<ticket>:<dimension>:<pass>`, so a pass already recorded in the pool's
-//! decision log replays rather than reaching the reviewer behind it, and the
-//! pass's disposition is written to the durable queue so an operator can tell a
-//! replay from a pass that ran (ticket 12).
+//! `review:<ticket>:<dimension>:<pass>`, and the pass's disposition is written to
+//! the durable queue so an operator can tell a replay from a pass that ran
+//! (ticket 12).
+//!
+//! Replay has two scopes, and the difference matters. [`RecordedReviewLoop::new`]
+//! reads the pool's durable decision log, so a pass replays across invocations -
+//! the harness seam, whose reviewer is a model and whose decisions do not depend
+//! on state the outside world can move. [`RecordedReviewLoop::per_invocation`]
+//! replays only within the run that owns it: `jjfx review` decides each pass on
+//! the Pull Request's *current* review threads, so a decision must not outlive
+//! the state it saw.
+
+use std::collections::BTreeMap;
+use std::sync::Mutex;
 
 use crate::engine::pool::current_timestamp;
 use crate::engine::queue::WorkQueue;
 use crate::engine::reviewer::{
-    DecisionLog, ReviewLoop, ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest,
-    Reviewer,
+    DecisionLog, DecisionLogError, ReviewLoop, ReviewLoopError, ReviewLoopSummary, ReviewOutcome,
+    ReviewRequest, Reviewer,
 };
 use crate::engine::state::{QueueSettlement, QueuedStep, StepKey};
 
@@ -50,6 +60,43 @@ impl ReviewSubject {
     }
 }
 
+/// A decision log scoped to one invocation.
+///
+/// It replays a decision recorded during the run that owns it and forgets every
+/// decision when that run ends. `jjfx review` drives its loop over one of these
+/// rather than the pool's durable sidecar, because a review pass decides on the
+/// Pull Request's *current* review threads: a decision is only good for the state
+/// it saw, and one replayed by a later invocation would serve a verdict the
+/// threads have since contradicted - a recorded "no findings" that hides a thread
+/// opened afterwards, which the loop would report as convergence.
+///
+/// The interior mutability is genuine shared state, not a borrow-checker dodge:
+/// [`DecisionLog::record`] takes `&self` so a reader and a writer can share the
+/// log, exactly as the durable sidecar does across processes.
+#[derive(Debug, Default)]
+pub struct EphemeralDecisionLog {
+    decisions: Mutex<BTreeMap<StepKey, ReviewOutcome>>,
+}
+
+impl DecisionLog for EphemeralDecisionLog {
+    fn decision(&self, step: &StepKey) -> Result<Option<ReviewOutcome>, DecisionLogError> {
+        let decisions = self
+            .decisions
+            .lock()
+            .map_err(|_| DecisionLogError::new("the invocation's decision log is poisoned"))?;
+        Ok(decisions.get(step).cloned())
+    }
+
+    fn record(&self, step: &StepKey, decision: &ReviewOutcome) -> Result<(), DecisionLogError> {
+        let mut decisions = self
+            .decisions
+            .lock()
+            .map_err(|_| DecisionLogError::new("the invocation's decision log is poisoned"))?;
+        decisions.insert(step.clone(), decision.clone());
+        Ok(())
+    }
+}
+
 /// Drives a bounded review loop through the decision log and the durable queue.
 ///
 /// This is the seam ticket 12 wires: it turns the replay mechanism ticket 09
@@ -61,6 +108,18 @@ pub struct RecordedReviewLoop<S> {
     decisions: S,
     queue: WorkQueue,
     subject: ReviewSubject,
+}
+
+impl RecordedReviewLoop<EphemeralDecisionLog> {
+    /// Creates a driver whose replay is scoped to this invocation.
+    ///
+    /// A pass already decided in this run is replayed; a pass decided by an
+    /// earlier invocation is not. This is the driver `jjfx review` uses, so each
+    /// review reads the Pull Request's review threads as they are *now* rather
+    /// than trusting a verdict recorded when they may have been different.
+    pub fn per_invocation(queue: WorkQueue, subject: ReviewSubject) -> Self {
+        Self::new(EphemeralDecisionLog::default(), queue, subject)
+    }
 }
 
 impl<S: DecisionLog> RecordedReviewLoop<S> {
@@ -267,5 +326,51 @@ mod tests {
             );
             assert_eq!(item.detail.as_deref(), Some(REPLAYED_DETAIL));
         }
+    }
+
+    /// A reviewer that finds nothing and counts how often it is asked.
+    #[derive(Default)]
+    struct CountingReviewer {
+        calls: AtomicUsize,
+    }
+
+    impl Reviewer for CountingReviewer {
+        fn review(&self, _: &ReviewRequest) -> Result<ReviewOutcome, ReviewerError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ReviewOutcome::new(Vec::new(), ReviewCompleteness::Complete))
+        }
+    }
+
+    /// The rule `jjfx review` must hold: a recorded decision must not outlive the
+    /// state it decided on. Two `per_invocation` drivers over the same Repository
+    /// each reach the reviewer, so a pass is never served from an earlier run's
+    /// record - which is what lets a later run see a review thread opened after
+    /// the first.
+    #[test]
+    fn an_invocation_scoped_driver_reaches_the_reviewer_on_every_run() {
+        let (_temp, repository) = repository();
+        let subject = ReviewSubject::new("ENG-1", "threads");
+        let reviewer = CountingReviewer::default();
+
+        for run in 1..=2 {
+            let summary =
+                RecordedReviewLoop::per_invocation(repository.work_queue(), subject.clone())
+                    .run(ReviewLoop::new(3), &reviewer, &request(), |_, _| {
+                        Ok::<(), String>(())
+                    })
+                    .expect("run");
+            assert_eq!(summary.stop(), crate::engine::ReviewStop::Converged);
+            assert_eq!(
+                summary.replayed(),
+                0,
+                "run {run} must not replay a decision from an earlier invocation"
+            );
+        }
+
+        assert_eq!(
+            reviewer.calls.load(Ordering::SeqCst),
+            2,
+            "each invocation must read the reviewer again"
+        );
     }
 }

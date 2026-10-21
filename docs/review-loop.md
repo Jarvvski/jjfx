@@ -113,16 +113,19 @@ unresolved review threads; the harness seam (`RecordedReviewLoop` in
 
 ## Replaying a decided pass
 
-The loop is driven through the pool's decision log
-(`.jj/pools/<name>/decisions.json`). Each pass is keyed by the step identity
-`review:<ticket>:threads:<pass>`, so a pass already recorded is replayed rather
-than reaching `gh` again, and its findings are not re-addressed - they were
-addressed when the decision was first made.
+Each pass is keyed by the step identity `review:<ticket>:threads:<pass>`, and
+replay is scoped to the invocation that made the decision. Within one run a pass
+already decided is not decided again, and its findings are not re-addressed -
+they were addressed when the decision was first made. A pass decided by an
+*earlier* `jjfx review` is not replayed: that decision was made on the Pull
+Request's review threads as they were then, and the reason to ask for another
+review is that they may have changed since. A recorded "no findings" must never
+outlive the state it saw, or the loop would report convergence on a Pull Request
+whose threads have since been opened.
 
 Replay does not change the bound. A replayed pass carries the decision it
 recorded, so the cap and the progress rule see exactly the rounds the first drive
-saw and the loop stops in the same place; a second drive of the same loop
-therefore reaches no `gh` and buys no pass past where the first stopped. An
-operator sees which passes replayed in `jjfx status --json`'s queue, where the
-step's `detail` names the replay. See
-[the durable work queue](work-queue.md#replaying-a-decision).
+saw and the loop stops in the same place. The harness seam (`RecordedReviewLoop`)
+still replays across invocations over the pool's durable decision log, because its
+reviewer is a model and its decisions do not depend on state the outside world can
+move; see [the durable work queue](work-queue.md#replaying-a-decision).

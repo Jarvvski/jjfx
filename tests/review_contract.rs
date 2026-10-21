@@ -8,8 +8,9 @@
 //! findings source (the Pull Request's unresolved review threads), the same bound
 //! (`[review] max_passes`) and the same escalation - and the command must do what
 //! they say: converge without sending when the Pull Request has no unresolved
-//! threads, escalate a stalled round, and refuse a missing forge or Pull Request
-//! by name.
+//! threads, escalate a stalled round, refuse a missing forge or Pull Request by
+//! name, and read the threads as they are *now* on every invocation rather than
+//! replaying a decision recorded when they may have been different.
 #![cfg(unix)]
 
 use std::env;
@@ -337,39 +338,74 @@ fn a_stalled_round_escalates_and_exits_non_zero() {
     );
 }
 
-/// A second drive of the same review replays its recorded pass instead of
-/// reading the threads again: the pass is keyed by
-/// `review:<ticket>:threads:<pass>` in the pool's decision log, so the repeat
-/// costs no `gh` read and the loop stops in the same place.
+/// The rule this bug breaks: a recorded pass must not outlive the review state it
+/// decided on. A review thread opened *after* a converged pass is read by the next
+/// `jjfx review`, so the loop does not report convergence on the replay alone.
 #[test]
-fn a_recorded_pass_replays_without_reading_the_threads_again() {
+fn a_thread_opened_after_a_converged_pass_is_read_by_the_next_review() {
     let fixture = Fixture::new(true);
     fixture.write_jj();
-    let capture = fixture.path().join("graphql-reads");
+    let reads = fixture.path().join("graphql-reads");
+    let threads = fixture.path().join("review-threads.json");
     fixture.write_gh(&format!(
-        "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"baseRefName\":\"main\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"REVIEW_REQUIRED\"}}]' ;;\n  *\"pr checks\"*) printf '[]\\n' ;;\n  *\"api graphql\"*) printf 'read\\n' >> {}; printf '%s\\n' '{{\"data\":{{\"repository\":{{\"pullRequest\":{{\"reviewThreads\":{{\"nodes\":[]}}}}}}}}}}' ;;\nesac\n",
-        capture.display()
+        "#!/bin/sh\ncase \"$*\" in\n  *\"pr list\"*) printf '%s\\n' '[{{\"number\":42,\"url\":\"https://example/pr/42\",\"headRefName\":\"owner/eng-301-action\",\"baseRefName\":\"main\",\"mergeable\":\"MERGEABLE\",\"reviewDecision\":\"REVIEW_REQUIRED\"}}]' ;;\n  *\"pr checks\"*) printf '[]\\n' ;;\n  *\"api graphql\"*) printf 'read\\n' >> {}; cat {} ;;\nesac\n",
+        reads.display(),
+        threads.display()
     ));
+    let capture = fixture.path().join("review-prompt");
+    fixture.write_claude(&capture);
     let worker = fixture.worker();
 
+    // The Pull Request has no review threads yet, so the first drive converges.
+    fs::write(
+        &threads,
+        "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}\n",
+    )
+    .expect("no review threads yet");
     let first = fixture.jjfx(&["review", worker.as_str(), "--fg"]);
     assert!(first.status.success(), "{}", stderr(&first));
+    assert!(
+        stderr(&first).contains("stopped on convergence"),
+        "the first drive converges on a Pull Request with no threads: {}",
+        stderr(&first)
+    );
     assert_eq!(
-        fs::read_to_string(&capture).expect("the first drive reads the threads"),
+        fs::read_to_string(&reads).expect("the first drive reads the threads"),
         "read\n"
     );
 
+    // A reviewer then opens a thread on the same Pull Request, with no push.
+    fs::write(
+        &threads,
+        "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"isResolved\":false,\"path\":\"src/x.rs\",\"startLine\":12,\"line\":14,\"comments\":{\"nodes\":[{\"author\":{\"login\":\"adam\"},\"body\":\"Cap the loop.\"}]}}]}}}}}\n",
+    )
+    .expect("a new review thread");
+
     let second = fixture.jjfx(&["review", worker.as_str(), "--fg"]);
-    assert!(second.status.success(), "{}", stderr(&second));
+    let reported = stderr(&second);
     assert!(
-        stderr(&second).contains("1 pass(es) replayed from the decision log"),
-        "the replay must be named: {}",
-        stderr(&second)
+        !second.status.success(),
+        "the loop must not report success while a thread is open: {reported}"
     );
-    assert_eq!(
-        fs::read_to_string(&capture).expect("the capture survives"),
-        "read\n",
-        "a replayed pass must not read the threads again"
+    assert!(
+        !reported.contains("stopped on convergence"),
+        "a later review must not report convergence on a replayed pass: {reported}"
+    );
+    assert!(
+        reported.contains("did not converge"),
+        "the thread opened after the first drive must escalate: {reported}"
+    );
+    assert!(
+        !reported.contains("replayed from the decision log"),
+        "a later review must not be served from an earlier decision: {reported}"
+    );
+    assert!(
+        fs::read_to_string(&reads)
+            .expect("the capture survives")
+            .lines()
+            .count()
+            > 1,
+        "the second review must read the current threads rather than replay"
     );
 }
 

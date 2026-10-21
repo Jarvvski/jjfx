@@ -4865,8 +4865,10 @@ fn send_command(
 /// Request's unresolved review threads through `gh` ([`ThreadReviewer`]), and a
 /// pass that found something is addressed to the Worker. The bound is
 /// [`ReviewLoop`]'s - `[review] max_passes` and the progress rule - and each pass
-/// is keyed by its step identity and replayed through the pool's decision log
-/// rather than re-sent. Only convergence is success: a loop that stops on the cap,
+/// is keyed by its step identity. Replay is scoped to this invocation
+/// ([`RecordedReviewLoop::per_invocation`]), so every `jjfx review` reads the
+/// threads as they are now rather than trusting a decision recorded when they may
+/// have been different. Only convergence is success: a loop that stops on the cap,
 /// on a stalled round, or on a review it could not read escalates its unresolved
 /// findings and exits non-zero.
 fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result<()> {
@@ -4880,11 +4882,7 @@ fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result
     let request = ReviewRequest::new(target.repository(), target.base(), target.branch())
         .with_number(target.number());
     let subject = ReviewSubject::new(target.ticket(), REVIEW_THREADS_DIMENSION);
-    let loop_driver = RecordedReviewLoop::new(
-        repository.state_store().decisions(),
-        repository.work_queue(),
-        subject,
-    );
+    let loop_driver = RecordedReviewLoop::per_invocation(repository.work_queue(), subject);
     let reviewer = ThreadReviewer::new(crate::engine::GhReviewThreads);
     eprintln!(
         "Reviewing {worker}: {}#{} (at most {} pass(es))",
