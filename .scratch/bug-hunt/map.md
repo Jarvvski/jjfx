@@ -336,6 +336,24 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   built to run concurrent jj operations against one shared operation log, and jj
   attributes an operation to no tool or process, so a lost commit has no
   attribution. Reproduce or rule out; if real, either serialise or report it.
+  **resolved** - reproduced, and jjfx caused it: the rollback `jjfx` ran after a
+  failed push was `jj undo --allow-cross-workspace`, and a repository-wide undo
+  restores every Workspace's working-copy commit, so racing a sibling's own
+  commit left that sibling's change divergent (two commits, one change id) with
+  nothing reported. The rollback is now a plain `jj undo`, which jj refuses to
+  cross Workspaces - so it can only undo this Workspace's operation and reports
+  the refusal otherwise. Harness at
+  [`.scratch/bug-hunt/op-log-harness.sh`](op-log-harness.sh). Ruled out (no
+  divergence under load): a single flagged undo, `lift_all`, `tidy`,
+  `jj op restore`, and `tidy`+`lift_all` together. jjfx still cannot *tell* a
+  Worker its commit diverged or went hidden - filed as 46.
+
+### Filed - 2026-10-21
+
+- [46](issues/46-a-worker-is-never-told-its-commit-diverged.md) - from 44's last
+  acceptance box: jjfx reads the operation log but never reads jj's `divergent()`
+  revset, so a Worker whose commit has diverged or gone hidden is told nothing.
+  44 removed jjfx's own path to causing it; this is the capability to report it.
 
 ### Filed - 2026-10-22
 
@@ -363,5 +381,3 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   reservation fails with `state is missing`, naming neither the pool nor the
   missing document. Reproduced through a test fixture only; whether a product
   path can leave the directory behind is not yet established. **needs-triage**.
-
-

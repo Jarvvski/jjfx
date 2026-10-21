@@ -116,6 +116,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - jjfx deliver's weld drops an empty, undescribed commit from a Worker's chain before pushing: an empty commit is not a change, jj refuses to push it, and `jj rebase --skip-emptied` leaves a commit that was already empty alone, so such a chain now delivers instead of stopping at the push
 - an opencode Run records the cost and tokens its session reports, so the spend cap binds for a pool of opencode Runs instead of reading $0.0000; a Run whose runtime reports no cost is recorded as unpriced, jjfx status says an unmeasured total is not a measurement, and a cap whose window measured nothing reports that it cannot be enforced rather than appearing to be in force.
 - jjfx review refuses a Worker whose pull request has already merged or been closed by naming that state (merged or closed), instead of reporting that no pull request exists; only a branch with no pull request at all still reads as 'no pull request found'
+- a Worker's failed-push rollback no longer undoes a sibling Workspace's operation: `jj undo --allow-cross-workspace` restored every Workspace's working-copy commit, so racing a sibling's own commit left that sibling's change in a divergent head and it could disappear unreported; the rollback is now a plain `jj undo` that only undoes an operation this Workspace made and reports jj's refusal when a concurrent sibling operation is the last one
 
 ## [0.55.0] - 2026-10-16
 
