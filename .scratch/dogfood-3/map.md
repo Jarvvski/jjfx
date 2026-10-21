@@ -1,7 +1,7 @@
 # The third drive: does jjfx own the loop, and does it hold on a clean config?
 
-Status: driven 2026-10-21 - see `report.md`; four findings filed, the loop's
-implementation in flight
+Status: driven 2026-10-21 - see `report.md`; six findings filed, the loop's
+implementation landed as #176 and was exercised live
 
 ## Why this exists
 
