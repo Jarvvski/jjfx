@@ -42,8 +42,8 @@ pub struct Config {
     pub dispatch: DispatchConfig,
     /// How long a Run may make no progress before the list surfaces it as stuck.
     pub watchdog: WatchdogConfig,
-    /// The pass cap for the tool-enforced re-review loop (ADR 0016). jjfx runs
-    /// no reviewer of its own; the cap bounds the loop when the harness drives it.
+    /// The pass cap for the tool-enforced re-review loop (ADR 0016). `jjfx
+    /// review` drives that loop; the cap bounds it.
     pub review: ReviewConfig,
     /// How the cross-workspace migration-order check finds migrations.
     pub migrations: MigrationsConfig,
@@ -792,10 +792,10 @@ impl Default for WatchdogConfig {
 
 /// How far the tool-enforced re-review loop may iterate.
 ///
-/// The bound itself lives in `crate::engine::ReviewLoop`; this is its cap. jjfx
-/// does not run a reviewer of its own - the review verb inlines the pull
-/// request's human comments and failing checks, and drives no loop at all - so
-/// the cap is the ceiling the loop enforces when the harness drives it.
+/// The bound itself lives in `crate::engine::ReviewLoop`; this is its cap.
+/// `jjfx review` drives the loop, reading the Pull Request's unresolved review
+/// threads through `gh` and sending each pass's findings to the Worker, so this
+/// cap is what bounds that command.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ReviewConfig {

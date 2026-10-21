@@ -26,6 +26,7 @@ mod orchestration;
 mod pool;
 mod queue;
 mod review_run;
+mod review_threads;
 mod reviewer;
 mod run_log;
 mod runtime;
@@ -86,6 +87,10 @@ pub use pool::{
 };
 pub use queue::{QueueResolution, WorkQueue};
 pub use review_run::{REPLAYED_DETAIL, RecordedReviewLoop, ReviewSubject};
+pub use review_threads::{
+    GhReviewThreads, REVIEW_THREADS_DIMENSION, ReviewThread, ReviewThreadComment, ReviewThreads,
+    ThreadReviewer,
+};
 pub use reviewer::{
     DecisionLog, DecisionLogError, ReplayingReviewer, ReviewCompleteness, ReviewEscalation,
     ReviewFinding, ReviewLoop, ReviewLoopError, ReviewLoopSummary, ReviewOutcome, ReviewRequest,

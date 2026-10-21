@@ -47,13 +47,14 @@ use crate::engine::{
     DirectDispatchSuccess, DispatchBudget, DispatchDependencyContext, DispatchExclusions,
     FollowUpExecution, FollowUpOutcome, Loaded, LocalTicketReadiness, LocalTickets, OpenCodeApi,
     OpenCodeError, OrchestrationEvent, PoolCapacity, PoolCostSnapshot, PoolName, QueueItemState,
-    REPOSITORY_WIDE_MUTATION, ReadyTicketFilter, ReadyTickets, Repository, RunActivity,
-    RunActivityKind, RunLogError, RunMode, SessionMessage, SpendCap, SpendCapMode, SpendDecision,
-    SpendLimit, SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings, TicketDetails,
-    TicketDiscovery, TicketId, TicketQuery, TicketStatus, TrunkDrift, UndoOutcome, WireAgent,
-    WorkerActions, WorkerId, WorkerLogs, WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot,
-    WorkerStatus, WorkspaceAddOutcome, WorkspaceHookStream, dependency_basis,
-    resolve_ticket_branch,
+    REPOSITORY_WIDE_MUTATION, REVIEW_THREADS_DIMENSION, ReadyTicketFilter, ReadyTickets,
+    RecordedReviewLoop, Repository, ReviewLoop, ReviewLoopSummary, ReviewRequest, ReviewSubject,
+    RunActivity, RunActivityKind, RunLogError, RunMode, SessionMessage, SpendCap, SpendCapMode,
+    SpendDecision, SpendLimit, SpendScope, SpendWindow, StuckWindow, SyncAction, TerminalSettings,
+    ThreadReviewer, TicketDetails, TicketDiscovery, TicketId, TicketQuery, TicketStatus,
+    TrunkDrift, UndoOutcome, WireAgent, WorkerActionError, WorkerActions, WorkerId, WorkerLogs,
+    WorkerPoolError, WorkerPoolSnapshot, WorkerSnapshot, WorkerStatus, WorkspaceAddOutcome,
+    WorkspaceHookStream, dependency_basis, resolve_ticket_branch,
 };
 use crate::migrations::FindingKind;
 use crate::ticket_source::{apply_local_writeback, configured_ticket_query};
@@ -4858,11 +4859,85 @@ fn send_command(
     Ok(())
 }
 
+/// Drive the bounded review loop over a Worker's Pull Request.
+///
+/// This is the caller ADR 0016 left the loop without: each pass reads the Pull
+/// Request's unresolved review threads through `gh` ([`ThreadReviewer`]), and a
+/// pass that found something is addressed to the Worker. The bound is
+/// [`ReviewLoop`]'s - `[review] max_passes` and the progress rule - and each pass
+/// is keyed by its step identity and replayed through the pool's decision log
+/// rather than re-sent. Only convergence is success: a loop that stops on the cap,
+/// on a stalled round, or on a review it could not read escalates its unresolved
+/// findings and exits non-zero.
 fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result<()> {
     let worker = normalize_worker(value)?;
-    let outcome = WorkerActions::new(repository.clone()).review(&worker, mode)?;
-    render_review_outcome(&worker, &outcome);
+    let actions = WorkerActions::new(repository.clone());
+    // A repository with no forge, or a Worker with no Pull Request, is refused
+    // here by name - before the loop can report convergence for a PR that does
+    // not exist.
+    let target = actions.review_target(&worker)?;
+    let config = crate::config::load()?;
+    let request = ReviewRequest::new(target.repository(), target.base(), target.branch())
+        .with_number(target.number());
+    let subject = ReviewSubject::new(target.ticket(), REVIEW_THREADS_DIMENSION);
+    let loop_driver = RecordedReviewLoop::new(
+        repository.state_store().decisions(),
+        repository.work_queue(),
+        subject,
+    );
+    let reviewer = ThreadReviewer::new(crate::engine::GhReviewThreads);
+    eprintln!(
+        "Reviewing {worker}: {}#{} (at most {} pass(es))",
+        target.repository(),
+        target.number(),
+        config.review.max_passes
+    );
+    let summary = loop_driver.run(
+        ReviewLoop::new(config.review.max_passes),
+        &reviewer,
+        &request,
+        |pass, outcome| {
+            eprintln!(
+                "  pass {pass}: {} unresolved review thread(s)",
+                outcome.findings().len()
+            );
+            let sent = actions.address_review(&worker, &target, outcome.findings(), mode)?;
+            render_review_outcome(&worker, &sent);
+            Ok::<(), WorkerActionError>(())
+        },
+    )?;
+    render_review_loop(&worker, &summary);
+    if summary.stop().needs_escalation() {
+        bail!(
+            "review of {worker} did not converge ({}): {} finding(s) need a human",
+            summary.stop().as_str(),
+            summary.unresolved().len()
+        );
+    }
     Ok(())
+}
+
+/// Renders what a bounded review loop did, naming every unresolved finding when
+/// it did not converge.
+fn render_review_loop(worker: &WorkerId, summary: &ReviewLoopSummary) {
+    eprintln!(
+        "Review of {worker}: {} pass(es), {} finding(s), stopped on {}",
+        summary.passes(),
+        summary.findings(),
+        summary.stop().as_str()
+    );
+    if summary.replayed() > 0 {
+        eprintln!(
+            "  {} pass(es) replayed from the decision log",
+            summary.replayed()
+        );
+    }
+    if let Some(reason) = summary.reason() {
+        eprintln!("  {reason}");
+    }
+    for finding in summary.unresolved() {
+        eprintln!("  unresolved {}", finding.summary());
+    }
 }
 
 fn render_review_outcome(worker: &WorkerId, outcome: &FollowUpOutcome) {

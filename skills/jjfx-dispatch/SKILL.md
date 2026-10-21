@@ -105,11 +105,11 @@ jjfx status --json | jq -r '.workers[] | select(.status != "done" and .status !=
 
 ```bash
 jjfx send worker-01 "also update the changelog"   # follow-up prompt (s)
-jjfx review worker-01                             # address its PR review comments (rev)
+jjfx review worker-01                             # bounded loop over its PR review threads (rev)
 jjfx mount worker-01                              # open the Worker in kitty (m)
 ```
 
-`send` obeys the same rule as Dispatch: it refuses a Worker whose Workspace is open, and fails closed when jjfx cannot see the terminal (add `--force`). `review` is exempt - it is how you tell a waiting Worker to address its pull request - so it works even while its Workspace is open.
+`send` obeys the same rule as Dispatch: it refuses a Worker whose Workspace is open, and fails closed when jjfx cannot see the terminal (add `--force`). `review` is exempt - it is how you tell a waiting Worker to address its pull request - so it works even while its Workspace is open. `review` reads the PR's unresolved review threads through `gh`, sends each pass's findings to the Worker, and stops on `[review] max_passes` or on a stalled round; only a pass that finds nothing is success, and any other stop escalates and exits non-zero.
 
 **Done when** the follow-up Run finishes and the Worker reads `idle` or `done` again.
 

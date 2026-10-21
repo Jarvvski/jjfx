@@ -1,19 +1,46 @@
 # The review loop
 
-`jjfx review <worker>` builds a review prompt from the Worker's pull request and
-starts it as a Follow-up Run. The prompt inlines the PR's review state, its
-failing CI checks, and an instruction to fetch and address human review
-comments: the owner is the reviewer for every PR. Nothing else runs - jjfx does
-not ingest an external review bot's findings, and the prompt has no AI-reviewer
-step to act on.
+`jjfx review <worker>` drives the tool-enforced re-review loop over the Worker's
+Pull Request. Each pass reads the Pull Request's **unresolved review threads**
+through `gh`, maps each open thread onto a finding, and - when it found
+something - sends the pass's findings to the Worker to address. A pass that finds
+nothing has nothing to send, so the loop converges and stops. The bound is the
+tool's, not a prompt's: it is `ReviewLoop` in `src/engine/reviewer.rs`, and
+`jjfx review` is its caller.
 
-**No command drives this loop.** `jjfx review` sends one prompt and produces no
-findings, so it has nothing to bound and no pass to record or replay. The bound
-described below is reached only through the harness seam
-(`RecordedReviewLoop` in `src/engine/review_run.rs`); this page is what that
-seam enforces when a harness drives it. Whether `jjfx review` should own a
-reviewer after all is an open question - ADR 0016 cut the only reviewer jjfx had
-- not something the command does today.
+The findings source is named, not inferred. jjfx does not ingest an external
+review bot's findings (ADR 0016 cut that), and it does not dispatch a reviewer
+agent of its own: the reviewer is the Pull Request's own review threads, read
+through `gh`. A repository with no forge, or a Worker with no Pull Request, is
+refused by name rather than silently reporting convergence.
+
+## What the loop reads
+
+Each pass asks `gh` for the Pull Request's review threads and keeps the
+**unresolved** ones. Every open thread becomes one finding carrying the thread's
+severity, file and lines, title, comments and any suggested change.
+
+Three decisions are deliberate, because a thread is not a finding an agent
+produced:
+
+- **Addressing a thread does not resolve it.** Resolution is the reviewer's
+  action - a human or a bot resolves the conversation - not something jjfx or
+  the Worker does. So a pass sends its findings, the Worker pushes its fix, and
+  the threads stay open until the reviewer resolves them. If the next pass sees
+  the same open threads and retires none, the progress rule reads a stall and the
+  loop stops on **no progress** - reported as such, never as a review that
+  passed. That is the honest reading: the Worker's self-report is not
+  verification (ADR 0016).
+- **A plain issue comment is not a finding.** Only a review thread carries an
+  `isResolved` state; a comment has none, so it can never be retired and would
+  make the loop unable to converge. The address prompt still points the Worker at
+  the Pull Request's comments, but the bound counts threads alone.
+- **A Pull Request with no review at all converges on the first pass.** No
+  threads is no findings, which is exactly the empty pass the loop stops on.
+
+A read that failed is **not** "no findings". A `gh` call that cannot read the
+threads produces an *incomplete* pass, and an incomplete pass stops the loop as
+**an unreadable review** and escalates - it never reads as a clean one.
 
 ## Where a fix belongs
 
@@ -59,8 +86,8 @@ belong in an existing commit - a new file, a new test - stays an ordinary edit o
 
 ## The bound
 
-The re-review loop is **review, address, review again**, bounded by `max_passes`
-and by a progress requirement. Three things stop it:
+The re-review loop is **review, address, review again**, bounded by
+`[review] max_passes` and by a progress requirement. Three things stop it:
 
 - **The pass cap.** The loop never runs more reviewer passes than `max_passes`,
   whatever the reviewer reports. This is the hard ceiling.
@@ -71,34 +98,31 @@ and by a progress requirement. Three things stop it:
 - **Convergence.** A pass that produces no findings has nothing to send a
   Worker, so the loop stops early.
 
-Only convergence means the review passed. A loop that stops on the cap or on a
-stalled round has **not** resolved its last round's findings, so it does not
-report success: it escalates them for a human to decide. That is the point of
-the bound - the failure it exists to prevent is a loop that reaches zero
-findings by repetition, spending reviewer compute to learn nothing. The tool
-enforces the bound; the prompt does not.
+Only convergence means the review passed. A loop that stops on the cap, on a
+stalled round, or on a review it could not read has **not** resolved its last
+round's findings, so it does not report success: it escalates them for a human to
+decide, and `jjfx review` exits non-zero. That is the point of the bound - the
+failure it exists to prevent is a loop that reaches zero findings by repetition,
+spending reviewer compute to learn nothing. The tool enforces the bound; the
+prompt does not.
 
 The bound lives in `ReviewLoop` (`src/engine/reviewer.rs`) and is generic over
-whatever supplies each pass's findings. jjfx runs no reviewer of its own, so
-nothing in the binary drives the loop: its only caller is the harness seam
-(`RecordedReviewLoop` in `src/engine/review_run.rs`), and `jjfx review` - which
-sends one prompt and produces no findings - is not that caller. The bound is
-enforced when the harness drives the loop, not by `jjfx review`.
+whatever supplies each pass's findings. `jjfx review` supplies the Pull Request's
+unresolved review threads; the harness seam (`RecordedReviewLoop` in
+`src/engine/review_run.rs`) drives the same bound over any other reviewer.
 
 ## Replaying a decided pass
 
 The loop is driven through the pool's decision log
 (`.jj/pools/<name>/decisions.json`). Each pass is keyed by the step identity
-`review:<ticket>:<dimension>:<pass>`, so a pass already recorded is replayed
-rather than reaching the reviewer again, and its findings are not re-addressed -
-they were addressed when the decision was first made. This applies to a loop the
-harness drives; no command records a review pass, so `jjfx status --json`'s
-queue holds none until one does.
+`review:<ticket>:threads:<pass>`, so a pass already recorded is replayed rather
+than reaching `gh` again, and its findings are not re-addressed - they were
+addressed when the decision was first made.
 
 Replay does not change the bound. A replayed pass carries the decision it
 recorded, so the cap and the progress rule see exactly the rounds the first drive
 saw and the loop stops in the same place; a second drive of the same loop
-therefore reaches no model and buys no pass past where the first stopped. An
+therefore reaches no `gh` and buys no pass past where the first stopped. An
 operator sees which passes replayed in `jjfx status --json`'s queue, where the
 step's `detail` names the replay. See
 [the durable work queue](work-queue.md#replaying-a-decision).
