@@ -336,3 +336,32 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   built to run concurrent jj operations against one shared operation log, and jj
   attributes an operation to no tool or process, so a lost commit has no
   attribution. Reproduce or rule out; if real, either serialise or report it.
+
+### Filed - 2026-10-22
+
+- [47](issues/47-a-cap-fixture-rots-outside-the-rolling-week.md) - found while
+  landing `44` (#188): the spend fixtures (`pool_routing`'s capped-lane case and
+  all eight of `pool_spend`) seed a Run with a hard-coded `completed_at` and rely
+  on a cap refusing, but the default spend window is a rolling seven days - so
+  once the date moved on the Run aged out, the cap stopped refusing, and the
+  fixtures silently stopped describing what they assert. Deterministic, not
+  flaky: 30/30 locally, and CI failed on 2026-10-22 having passed the same commit
+  on 2026-10-21. `main` is red from 2026-10-22 onward. The two surfaces look like
+  different bugs - `pool_routing` fails with `state is missing` (see 48), while
+  `pool_spend` fails with the terminal refusal because its *deliberately failing*
+  `kitten` stub is only meant to be exercised by a held batch. **resolved** - the
+  fixtures now stamp the seeded Run with `support::recent_timestamp()`, which
+  keeps the default rolling week in play; falsified both ways (original fails,
+  original with a fresh timestamp passes, the fix passes: `pool_routing` 11/11,
+  `pool_spend` 8/8 in 2.3s, down from 120s).
+
+- [48](issues/48-a-pool-directory-without-a-document-is-not-materialised.md) -
+  the latent defect 47 uncovered. `materialise` treats "the state *directory*
+  exists" as "the pool is materialised", and that directory also holds Run
+  records and locks - `atomic::open_lock` creates its parents - so a directory
+  without a document is enough to skip provisioning, after which the first
+  reservation fails with `state is missing`, naming neither the pool nor the
+  missing document. Reproduced through a test fixture only; whether a product
+  path can leave the directory behind is not yet established. **needs-triage**.
+
+

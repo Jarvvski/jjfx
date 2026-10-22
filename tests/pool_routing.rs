@@ -153,7 +153,8 @@ impl RoutingFixture {
     }
 
     /// Seeds `pool`'s durable Run records with one Run costing `micro_usd`, so a
-    /// declared cap has already run out without launching anything.
+    /// declared cap has already run out without launching anything. The Run is
+    /// stamped *now*, so it is inside whatever window the cap totals over.
     fn seed_spend(&self, pool: &str, worker: &str, micro_usd: u64) {
         let directory = self.path().join(".jj/pools").join(pool);
         fs::create_dir_all(&directory).expect("pool directory");
@@ -166,7 +167,7 @@ impl RoutingFixture {
                     "worker": worker,
                     "cost_micro_usd": micro_usd,
                     "conclusion": "succeeded",
-                    "completed_at": "2026-10-15T09:00:00Z",
+                    "completed_at": support::recent_timestamp(),
                 })
             ),
         )
@@ -502,7 +503,8 @@ fn an_unqualified_named_dispatch_is_still_refused_when_pools_declare_labels() {
 fn a_capped_lane_is_held_while_other_lanes_dispatch() {
     let fixture = RoutingFixture::new();
     declare_two_lanes(&fixture);
-    // `bugs` declares a cap it has already run out of; `features` has room.
+    // `bugs` declares a cap it has already run out of; `features` has room. The
+    // seeded Run is stamped now, so the default rolling window still counts it.
     fixture.write_repo_config(
         "[pools.bugs]\nlabel = \"bug\"\ncap_usd = 5.0\n\n\
          [pools.features]\nsize = 1\nlabel = \"features\"\n",

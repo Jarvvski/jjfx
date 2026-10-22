@@ -90,6 +90,12 @@ toml = "0.8"
 # depends on, so it adds no new crate to the tree.
 toml_edit = "0.22"
 
+[dev-dependencies]
+# The spend fixtures seed a Run record that has to fall inside the *default*
+# rolling spend window, so they stamp "now" rather than a fixed date that ages
+# out of it and silently stops the cap from refusing (ticket 47).
+jiff = "0.2"
+
 [lints.rust]
 unsafe_code = "forbid"
 unused = { level = "warn", priority = -1 }
