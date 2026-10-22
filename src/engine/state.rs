@@ -1454,6 +1454,39 @@ impl StateStore {
         self.directory().is_dir()
     }
 
+    /// Whether this Worker Pool has a state document.
+    ///
+    /// The document is what materialisation produces, and so the only durable
+    /// mark of a materialised Pool. The state *directory* is not: it also holds
+    /// Run Records, the waiting set, the work queue and its locks, and a lock
+    /// creates its parents, so any one of those - or an in-place destroy, which
+    /// deliberately leaves the directory for the lane to be recreated there -
+    /// can leave `.jj/pools/<name>/` behind with no document in it.
+    pub(crate) fn pool_document_exists(&self) -> bool {
+        self.pool_document().is_file()
+    }
+
+    /// The error for a reservation that found no Pool document.
+    ///
+    /// Names the Pool and the missing document, and the command that creates
+    /// one, rather than a bare `state is missing` that names neither. Reached
+    /// only if a Pool document vanishes between materialisation and the lock
+    /// (or a Dispatch skips materialisation), so the message has to say what is
+    /// absent and how to make it exist.
+    fn missing_pool_document(&self, operation: &'static str) -> StateError {
+        StateError::new(
+            operation,
+            "Worker Pool",
+            format!(
+                "the state document for pool `{pool}` is missing (it has not been \
+                 materialised); run `{program} dispatch --pool {pool}` or \
+                 `{program} pool <N>` to create it",
+                pool = self.pool,
+                program = env!("CARGO_PKG_NAME"),
+            ),
+        )
+    }
+
     /// Removes this Worker Pool's state directory outright.
     ///
     /// For a Pool that is being *removed* rather than destroyed and recreated:
@@ -2245,7 +2278,7 @@ impl StateStore {
             let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
-                    return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                    return Err(self.missing_pool_document("reserve"));
                 }
             };
             let worker_locks = pool
@@ -2257,7 +2290,7 @@ impl StateStore {
                 let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                     Loaded::Present(versioned) => versioned.value,
                     Loaded::Missing => {
-                        return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                        return Err(self.missing_pool_document("reserve"));
                     }
                 };
                 reserve_batch_locked(&self.directory(), &pool, inputs, allow_partial, excluded)
@@ -2290,7 +2323,7 @@ impl StateStore {
             let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                 Loaded::Present(versioned) => versioned.value,
                 Loaded::Missing => {
-                    return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                    return Err(self.missing_pool_document("reserve"));
                 }
             };
             let worker_locks = pool
@@ -2302,7 +2335,7 @@ impl StateStore {
                 let pool = match load_state(&self.pool_document(), pool_subject, &validate_pool)? {
                     Loaded::Present(versioned) => versioned.value,
                     Loaded::Missing => {
-                        return Err(StateError::new("reserve", pool_subject, "state is missing"));
+                        return Err(self.missing_pool_document("reserve"));
                     }
                 };
                 if let Some(requested) = requested
@@ -4154,6 +4187,48 @@ mod tests {
         );
         assert!(message.contains("Worker Pool state"), "{message}");
         assert!(message.contains("jjfx pool"), "{message}");
+    }
+
+    /// Ticket 48: a reservation that finds no Pool document names the Pool and
+    /// the missing document, and says the state has not been materialised -
+    /// never a bare `state is missing` that names neither.
+    #[test]
+    fn reserving_without_pool_state_names_the_pool_and_the_missing_document() {
+        let temp = tempfile::tempdir().expect("temp repository");
+        fs::create_dir(temp.path().join(".jj")).expect("repository marker");
+        let repository = Repository::open(temp.path())
+            .expect("repository")
+            .with_pool(PoolName::parse("bugs").expect("pool name"));
+
+        let error = repository
+            .state_store()
+            .reserve_worker(
+                None,
+                "ENG-1".to_owned(),
+                WireTimestamp::new("2026-10-22T00:00:00Z"),
+                "eng-1".to_owned(),
+                None,
+                &DispatchExclusions::default(),
+            )
+            .expect_err("no Pool state exists yet");
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("state is missing"),
+            "a bare `state is missing` names neither the state nor the fix: {message}"
+        );
+        assert!(
+            message.contains("pool `bugs`"),
+            "the Pool is named: {message}"
+        );
+        assert!(
+            message.contains("document"),
+            "the missing document is named: {message}"
+        );
+        assert!(
+            message.contains("materialised"),
+            "the message says the state was not materialised: {message}"
+        );
     }
 
     /// Ticket 09: a review step's identity is derived from the Ticket, the

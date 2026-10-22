@@ -117,6 +117,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - an opencode Run records the cost and tokens its session reports, so the spend cap binds for a pool of opencode Runs instead of reading $0.0000; a Run whose runtime reports no cost is recorded as unpriced, jjfx status says an unmeasured total is not a measurement, and a cap whose window measured nothing reports that it cannot be enforced rather than appearing to be in force.
 - jjfx review refuses a Worker whose pull request has already merged or been closed by naming that state (merged or closed), instead of reporting that no pull request exists; only a branch with no pull request at all still reads as 'no pull request found'
 - a Worker's failed-push rollback no longer undoes a sibling Workspace's operation: `jj undo --allow-cross-workspace` restored every Workspace's working-copy commit, so racing a sibling's own commit left that sibling's change in a divergent head and it could disappear unreported; the rollback is now a plain `jj undo` that only undoes an operation this Workspace made and reports jj's refusal when a concurrent sibling operation is the last one
+- jjfx dispatch materialises a declared lane whose state directory survives without a pool document - left by an in-place destroy, a lock, or a Run record - instead of skipping provisioning and failing the first reservation with a bare `cannot reserve Worker Pool: state is missing`; and that error now names the pool and the missing document with the command that creates it
 
 ## [0.55.0] - 2026-10-16
 

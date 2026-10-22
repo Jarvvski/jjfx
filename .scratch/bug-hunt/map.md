@@ -379,5 +379,11 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   records and locks - `atomic::open_lock` creates its parents - so a directory
   without a document is enough to skip provisioning, after which the first
   reservation fails with `state is missing`, naming neither the pool nor the
-  missing document. Reproduced through a test fixture only; whether a product
-  path can leave the directory behind is not yet established. **needs-triage**.
+  missing document. **resolved** - reproduced on a product path: the TUI's
+  in-place destroy (`WorkerPool::destroy`, which deliberately leaves the
+  directory) leaves `.jj/pools/<name>/` holding only locks, so the next Dispatch
+  skipped materialisation and failed; `materialise` now keys off the pool
+  *document* (`StateStore::pool_document_exists`), and the residual reservation
+  error names the pool and the missing document. Pool-scoped reads,
+  `pool create`, the CLI `pool destroy`, and the legacy conversion were ruled
+  out as the cause.

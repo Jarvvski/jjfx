@@ -2112,11 +2112,17 @@ fn resize_declared_pool(
 /// Materialises a declared Worker Pool's state on first use.
 ///
 /// A Repository may commit a `[pools.<name>]` declaration while the lane's state
-/// directory does not exist yet; that is normal, not a disagreement (ADR 0013).
+/// document does not exist yet; that is normal, not a disagreement (ADR 0013).
 /// The first Dispatch into such a lane provisions its Workers at the declared
 /// size - exactly as `jjfx pool <N>` does for `default` - so a declaration a
 /// teammate committed works on a fresh clone with nobody provisioning it by
 /// hand. A lane whose state already exists is left alone, so this is idempotent.
+///
+/// The mark of a materialised lane is its **document**, not its directory: the
+/// directory also holds Run Records, the waiting set, the work queue and its
+/// locks, and a lock creates its parents, so a directory can be left behind with
+/// no document in it (ticket 48) - including by the TUI's in-place destroy,
+/// which deliberately leaves the directory for the lane to be recreated there.
 ///
 /// An implicit `default` has no declaration to materialise from, so sizing it
 /// stays `jjfx pool <N>`, unchanged. This is deliberately called from the
@@ -2124,7 +2130,7 @@ fn resize_declared_pool(
 /// `pool list` build the same handles to *read* every Pool, and must keep
 /// reporting a declared-but-unmaterialised lane without creating its state.
 fn materialise_declared_pool(repository: &Repository, user: &Config) -> Result<()> {
-    if repository.state_store().directory_exists() {
+    if repository.state_store().pool_document_exists() {
         return Ok(());
     }
     let Some(declaration) = user
