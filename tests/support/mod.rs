@@ -74,6 +74,16 @@ pub fn hermetic_jj_config_file(dir: &Path) -> PathBuf {
 /// deliberately generous rather than a statement of expected duration.
 use jjfx::test_support::LIVENESS_TIMEOUT;
 
+/// The current instant as a wire timestamp, for a fixture that seeds a Run which
+/// has to fall inside the default rolling spend window.
+///
+/// A fixed date would leave the window as soon as seven days had passed, at
+/// which point the cap stops refusing and the fixture silently stops describing
+/// what it says it describes (ticket 47).
+pub fn recent_timestamp() -> String {
+    jiff::Timestamp::now().to_string()
+}
+
 /// The message Dispatch prints when it refuses to run because the terminal could
 /// not be queried (ADR 0011).
 const TERMINAL_REFUSAL: &str = "cannot determine which Worker Workspaces are open";

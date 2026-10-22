@@ -122,7 +122,8 @@ impl SpendFixture {
     /// Seeds `default`'s durable Run records with one Run costing `micro_usd`.
     ///
     /// The cap is totalled from these records, so this is what puts a pool over
-    /// its cap without launching anything.
+    /// its cap without launching anything. The Run is stamped *now*, so it is
+    /// inside whatever window the cap totals over.
     fn seed_spend(&self, micro_usd: u64) {
         let directory = self.path().join(".jj/pools/default");
         fs::create_dir_all(&directory).expect("pool directory");
@@ -135,7 +136,7 @@ impl SpendFixture {
                     "worker": "worker-01",
                     "cost_micro_usd": micro_usd,
                     "conclusion": "succeeded",
-                    "completed_at": "2026-10-15T09:00:00Z",
+                    "completed_at": support::recent_timestamp(),
                 })
             ),
         )
