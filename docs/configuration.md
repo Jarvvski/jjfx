@@ -819,6 +819,16 @@ directories:` line and in the `orphans` array, and leaves its state in place. It
 is never adopted as a pool and never blocks another one; removing it is the
 operator's call.
 
+A **divergent Workspace commit** is a Worker's change left with two visible
+commits sharing one change id by a concurrent `jj` (another agent's process, a
+repository-wide `jj op restore`, the owner's `jj` in another Workspace). jjfx
+reads it from jj's `divergent()` revset and names it in a `diverged:` line on the
+Worker's row and in the `diverged` array of `status --json`, each entry carrying
+`worker`, `pool`, `change_id` and `copies`. jjfx can tell a commit **diverged**;
+it cannot tell one is **gone** - a commit rewritten or restored out of the
+visible set reads as intact, because jj keeps every Workspace's `@` on a visible
+commit and jjfx has no recorded identity to compare against.
+
 ### Validation is loud
 
 A file that parses but is wrong fails at load, naming the file - the same rule as

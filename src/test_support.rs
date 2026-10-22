@@ -41,6 +41,67 @@ pub fn hermetic_jj_config(auto_track_origin: bool) -> String {
     )
 }
 
+/// Make the Workspace at `workspace_dir`'s working-copy commit **divergent**: two
+/// visible commits sharing one change id, the state a concurrent `jj` leaves
+/// behind (bug-hunt tickets 44 and 46).
+///
+/// Deterministic rather than raced: two operations are derived from the *same*
+/// starting operation (jj's `--at-operation`) and each rewrites the Workspace's
+/// working-copy commit - one change id, two commit ids - then both are integrated
+/// (`jj op integrate`). jj reconciles them into a divergent change, exactly as the
+/// concurrent `undo --allow-cross-workspace` race did, without the flakiness of a
+/// real race. The caller owns the repository and its jj config; this only drives
+/// the operations.
+pub fn diverge_working_copy(workspace_dir: &Path) {
+    let run = |args: &[&str]| -> String {
+        let output = std::process::Command::new("jj")
+            .args(["--config", "signing.behavior=drop"])
+            .args(args)
+            .current_dir(workspace_dir)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    };
+    let start = run(&[
+        "--ignore-working-copy",
+        "op",
+        "log",
+        "--no-graph",
+        "-n",
+        "1",
+        "-T",
+        "id",
+    ]);
+    let start = start.trim().to_owned();
+    let rewrite = |description: &str| -> String {
+        let out = run(&[
+            "--at-operation",
+            &start,
+            "describe",
+            "-m",
+            description,
+            "--no-integrate-operation",
+        ]);
+        out.split_whitespace()
+            .last()
+            .expect("jj prints the uncommitted operation id")
+            .to_owned()
+    };
+    let first = rewrite("a");
+    let second = rewrite("b");
+    run(&["op", "integrate", &first]);
+    run(&["op", "integrate", &second]);
+}
+
 /// The one liveness budget every test waits on concurrent work with.
 ///
 /// This is a guard against a *hang*, not a statement of how long the work is

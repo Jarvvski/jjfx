@@ -2197,6 +2197,45 @@ impl PoolStatus {
     }
 }
 
+/// One Workspace whose own commit has diverged, as `status` reports it.
+///
+/// A concurrent `jj` (another agent's process, a repository-wide `jj op restore`,
+/// the owner's `jj` in another Workspace) can leave a Worker's commit with two
+/// visible heads sharing one change id. jj exposes that as structure - the
+/// `divergent()` revset - and this is the Workspace model's read of it, so a
+/// Worker is told rather than left to read its own history (ticket 46).
+struct DivergedWorkspace {
+    /// The Worker whose Workspace's commit diverged.
+    worker: String,
+    /// The pool the Worker belongs to.
+    pool: String,
+    /// The change id that now has more than one visible commit.
+    change_id: String,
+    /// How many visible commits share the change id.
+    copies: usize,
+}
+
+impl DivergedWorkspace {
+    /// The one-line explanation a `status` row prints: what diverged and how to
+    /// see it. jj attributes a divergence to no tool and no process, so jjfx
+    /// names the result rather than a cause.
+    fn line(&self) -> String {
+        format!(
+            "diverged: change {} has {} visible commits (a concurrent operation left two heads); \
+             inspect with `jj log -r 'divergent()'`",
+            short_change_id(&self.change_id),
+            self.copies
+        )
+    }
+}
+
+/// The short form of a full change id, for a one-line message. jj renders a
+/// short change id as its reverse-hex prefix; a full change id is the reverse-hex
+/// string, so its first twelve characters are exactly that prefix.
+fn short_change_id(change_id: &str) -> &str {
+    change_id.get(..12).unwrap_or(change_id)
+}
+
 /// Everything `status` and `pool list` report: every pool, the Repository-wide
 /// spend their subtotals sit under, the concurrency governor's view, and the
 /// orphan pool directories no pool claims.
@@ -2218,6 +2257,9 @@ struct PoolReport {
     /// Pool directories under `.jj/pools/` that no pool the Repository holds
     /// claims. Reported by name, never adopted.
     orphans: Vec<String>,
+    /// Workspaces whose own commit has diverged, as jj's `divergent()` revset
+    /// reports them, so a Worker is told rather than left to read its history.
+    diverged: Vec<DivergedWorkspace>,
     /// Per-pool snapshot diagnostics, printed before the tables.
     diagnostics: Vec<String>,
     /// Local Ticket writeback failures, reported after the pass.
@@ -2286,6 +2328,7 @@ fn pool_report(
     let mut pools = Vec::new();
     let mut diagnostics = Vec::new();
     let mut failures = Vec::new();
+    let mut diverged = Vec::new();
     for name in &names {
         let scoped = repository.clone().with_pool(name.clone());
         let (snapshot, pool_failures) = reconcile_pass(&scoped, tickets);
@@ -2296,6 +2339,21 @@ fn pool_report(
                 .iter()
                 .map(|diagnostic| diagnostic.message().to_owned()),
         );
+        // A divergent Workspace commit is read from jj's `divergent()` revset, per
+        // Worker. A read that fails is skipped rather than failing `status`: a
+        // Worker with no Workspace yet is the ordinary case, not a hazard.
+        for worker in snapshot.workers() {
+            if let Ok(crate::jj::WorkspaceDivergence::Divergent { change_id, copies }) =
+                crate::jj::workspace_divergence(repository.root(), worker.workspace())
+            {
+                diverged.push(DivergedWorkspace {
+                    worker: worker.worker_id().as_str().to_owned(),
+                    pool: name.as_str().to_owned(),
+                    change_id,
+                    copies,
+                });
+            }
+        }
         let declaration = repo_config.pools.get(name.as_str());
         let cap = declaration
             .map(|declaration| declaration.spend_cap(&config.spend))
@@ -2339,6 +2397,7 @@ fn pool_report(
         running,
         held,
         orphans,
+        diverged,
         diagnostics,
         failures,
     })
@@ -2399,6 +2458,11 @@ fn render_pool_workers(report: &PoolReport, now: Timestamp, watchdog: StuckWindo
     );
     let mut counts = [0usize; 4];
     let mut stuck = 0usize;
+    let diverged: std::collections::HashMap<&str, &DivergedWorkspace> = report
+        .diverged
+        .iter()
+        .map(|entry| (entry.worker.as_str(), entry))
+        .collect();
     for pool in &report.pools {
         for worker in &pool.members {
             let index = match worker.status() {
@@ -2445,6 +2509,12 @@ fn render_pool_workers(report: &PoolReport, now: Timestamp, watchdog: StuckWindo
                 if let Some(log) = worker.log_file().filter(|log| !log.is_empty()) {
                     println!("           log: {log}");
                 }
+            }
+            // A diverged commit is not visible in the Worker's status - it would
+            // read as `busy` or `done` - so name it here rather than let the
+            // Worker discover it by reading its own history.
+            if let Some(entry) = diverged.get(worker.worker_id().as_str()) {
+                println!("           {}", entry.line());
             }
         }
     }
@@ -2553,7 +2623,8 @@ fn short_worker_id(worker_id: &str) -> &str {
 
 /// The Pool status JSON document:
 /// `{"workers": [ ... ], "waiting": [ ... ], "governor": { ... },
-/// "queue": [ ... ], "pools": [ ... ], "orphans": [ ... ]}`.
+/// "queue": [ ... ], "pools": [ ... ], "orphans": [ ... ],
+/// "diverged": [ ... ]}`.
 ///
 /// A top-level object rather than the bare Worker array: the human table prints
 /// state that is not per-Worker (the `Waiting:` line), and a bare array has
@@ -2568,8 +2639,9 @@ fn short_worker_id(worker_id: &str) -> &str {
 /// Repository holds,
 /// including an implicit `default`, with its size and its recorded spend against
 /// its own cap - a subtotal under the Repository-wide total. `orphans` names
-/// pool directories no pool claims. Encoded by hand so the emitted field order
-/// is fixed.
+/// pool directories no pool claims, and `diverged` names the Workers whose
+/// Workspace commit a concurrent operation left divergent. Encoded by hand so the
+/// emitted field order is fixed.
 fn pool_list_json_string(report: &PoolReport, now: Timestamp, watchdog: StuckWindow) -> String {
     let mut out = String::from("{\n  \"workers\": [");
     let mut first = true;
@@ -2639,8 +2711,28 @@ fn pool_list_json_string(report: &PoolReport, now: Timestamp, watchdog: StuckWin
         }
         out.push_str(&json_string(orphan));
     }
+    out.push_str("],\n  \"diverged\": [");
+    for (index, entry) in report.diverged.iter().enumerate() {
+        if index > 0 {
+            out.push_str(", ");
+        }
+        out.push_str(&diverged_json(entry));
+    }
     out.push_str("]\n}");
     out
+}
+
+/// One diverged Workspace, the shape `status --json` emits per `diverged` entry:
+/// the Worker and its pool, the divergent change id, and how many visible commits
+/// share it.
+fn diverged_json(entry: &DivergedWorkspace) -> String {
+    format!(
+        "{{\"worker\": {}, \"pool\": {}, \"change_id\": {}, \"copies\": {}}}",
+        json_string(&entry.worker),
+        json_string(&entry.pool),
+        json_string(&entry.change_id),
+        entry.copies
+    )
 }
 
 /// One held-back Ticket, the shape `status --json` emits per waiting entry: the
@@ -7487,6 +7579,7 @@ mod tests {
             running,
             held,
             orphans: Vec::new(),
+            diverged: Vec::new(),
             diagnostics: Vec::new(),
             failures: Vec::new(),
         }
@@ -7514,6 +7607,108 @@ mod tests {
         let json = pool_list_json_string(&idle, Timestamp::now(), StuckWindow::DEFAULT);
         let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert_eq!(value["waiting"], serde_json::json!([]));
+    }
+
+    /// A diverged Workspace commit is reported as structure - the Worker, its
+    /// pool, the change id and how many visible commits share it - so a Worker is
+    /// told rather than left to read its own history (ticket 46).
+    #[test]
+    fn status_json_carries_a_diverged_workspace_commit() {
+        let mut report = report_with_snapshot(snapshot_with_waiting(&[]));
+        report.diverged.push(DivergedWorkspace {
+            worker: "worker-01".to_owned(),
+            pool: "default".to_owned(),
+            change_id: "abcdefghijklmnopqrstuvwx".to_owned(),
+            copies: 2,
+        });
+
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+
+        assert_eq!(
+            value["diverged"],
+            serde_json::json!([{
+                "worker": "worker-01",
+                "pool": "default",
+                "change_id": "abcdefghijklmnopqrstuvwx",
+                "copies": 2
+            }])
+        );
+    }
+
+    #[test]
+    fn status_json_diverged_is_empty_without_a_divergence() {
+        let report = report_with_snapshot(snapshot_with_waiting(&[]));
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["diverged"], serde_json::json!([]));
+    }
+
+    /// The human line a diverged Worker's row prints, naming the change and how to
+    /// see it - the Worker's status alone cannot show a divergence.
+    #[test]
+    fn a_diverged_workspace_prints_the_change_and_the_revset_that_shows_it() {
+        let entry = DivergedWorkspace {
+            worker: "worker-01".to_owned(),
+            pool: "default".to_owned(),
+            change_id: "abcdefghijklmnopqrstuvwx".to_owned(),
+            copies: 2,
+        };
+        let line = entry.line();
+        assert!(line.contains("abcdefghijkl"), "{line}");
+        assert!(line.contains('2'), "{line}");
+        assert!(line.contains("divergent()"), "{line}");
+    }
+
+    /// End to end: a Worker whose Workspace commit a concurrent operation left
+    /// divergent is reported by `status`, read from jj's `divergent()` revset.
+    #[test]
+    fn status_reports_a_worker_whose_workspace_commit_diverged() {
+        let root = crate::store::test_local_repo("status-diverged");
+        let run = |dir: &std::path::Path, args: &[&str]| {
+            let output = crate::jj::command()
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .expect("jj should be installed");
+            assert!(
+                output.status.success(),
+                "jj {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&root, &["commit", "-m", "seed"]);
+        run(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let workspace = root.with_extension("worker-01");
+        run(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "worker-01",
+                "--no-colocate",
+                &workspace.to_string_lossy(),
+            ],
+        );
+        run(&workspace, &["new", "main", "-m", "work"]);
+        crate::test_support::diverge_working_copy(&workspace);
+        seed_pool(&root, DEFAULT_POOL_NAME, "worker-01");
+
+        let repository = Repository::open(&root).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+        let report = report_for(&repository, &user);
+
+        assert_eq!(report.diverged.len(), 1, "one diverged Workspace");
+        assert_eq!(report.diverged[0].worker, "worker-01");
+        assert_eq!(report.diverged[0].pool, DEFAULT_POOL_NAME);
+        assert_eq!(report.diverged[0].copies, 2);
+        let json = pool_list_json_string(&report, Timestamp::now(), StuckWindow::DEFAULT);
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["diverged"][0]["worker"], "worker-01");
+
+        std::fs::remove_dir_all(&workspace).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 
     /// Seeds `.jj/pools/<pool>/` with a one-Worker idle pool, so a report has

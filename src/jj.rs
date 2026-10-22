@@ -122,6 +122,91 @@ pub fn conflicted_commits(repo_root: &Path, workspace: &str) -> anyhow::Result<V
     Ok(ids)
 }
 
+/// Whether a Workspace's own commit has diverged, read from jj's `divergent()`
+/// revset.
+///
+/// jj's operation log is deliberately lock-free: concurrent `jj` processes each
+/// write their own operation and jj reconciles them on the next command, so a
+/// concurrent operation can leave a Workspace's commit **divergent** - two
+/// commits sharing one change id, only one of which is the head the Workspace
+/// thinks it is. jj exposes that as structure rather than prose: the
+/// `divergent()` revset marks a change id that has more than one visible commit.
+///
+/// jjfx reads it over the Workspace's own chain (the same `trunk..<ws>@` chain
+/// [`conflicted_commits`] walks), so a divergence anywhere in the commit a Worker
+/// made is caught, not only a divergence of `@` itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceDivergence {
+    /// No commit on the Workspace's chain is divergent: every change on it has a
+    /// single visible commit.
+    ///
+    /// A commit that has been rewritten or restored *out* of the visible set
+    /// ("gone" - hidden or abandoned) also reads as this. jj keeps every
+    /// Workspace's `@` on a visible commit, creating a fresh one when the
+    /// recorded commit is abandoned, so a gone commit and one that never existed
+    /// look identical from jj's visible state and jjfx records no identity to
+    /// compare against. jjfx can tell a commit **diverged**; it cannot tell one
+    /// is **gone**.
+    Intact,
+    /// A commit on the Workspace's chain shares its change id with another
+    /// visible commit (jj's `divergent()`): the change has more than one head.
+    Divergent {
+        /// The divergent change id, full form.
+        change_id: String,
+        /// How many visible commits share the change id.
+        copies: usize,
+    },
+}
+
+/// Read whether `workspace`'s own commit has diverged, from jj's `divergent()`
+/// revset intersected with the Workspace's chain.
+///
+/// A jj failure is a typed error, never a silent [`WorkspaceDivergence::Intact`]:
+/// "not divergent" and "jj could not be read" must not look alike. A Workspace
+/// jj does not know is such a failure, not a benign `Intact`.
+pub fn workspace_divergence(
+    repo_root: &Path,
+    workspace: &str,
+) -> anyhow::Result<WorkspaceDivergence> {
+    let trunk = crate::trunk::as_revset();
+    let revset = format!("(({trunk})..{}@) & divergent()", revset_symbol(workspace));
+    let out = read_at_repo(
+        repo_root,
+        &[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\\n\"",
+        ],
+    )?;
+    let Some(change_id) = out.lines().map(str::trim).find(|line| !line.is_empty()) else {
+        return Ok(WorkspaceDivergence::Intact);
+    };
+    let copies = divergent_copies(repo_root, change_id)?;
+    Ok(WorkspaceDivergence::Divergent {
+        change_id: change_id.to_owned(),
+        copies,
+    })
+}
+
+/// How many visible commits share `change_id`, via jj's `divergent()` revset. The
+/// count is jj's own (`--count`), so it is a structured number rather than a
+/// scraped line count.
+fn divergent_copies(repo_root: &Path, change_id: &str) -> anyhow::Result<usize> {
+    let out = read_at_repo(
+        repo_root,
+        &[
+            "log",
+            "-r",
+            &format!("divergent() & change_id({change_id})"),
+            "--count",
+        ],
+    )?;
+    parse_count(&out)
+}
+
 /// Whether any commit matched by `revset` carries an unresolved conflict.
 ///
 /// jj records a conflict in the commit a rebase rewrote and still exits zero, so
@@ -2060,5 +2145,139 @@ mod tests {
         run(&["describe", "-m", "base"]);
         run(&["new", "-m", "change"]);
         std::fs::write(dir.join(name), content).expect("writing the file again");
+    }
+
+    /// Run one jj command in `dir`, returning stdout and stderr together; asserts
+    /// it succeeded.
+    fn jj_capture(dir: &Path, args: &[&str]) -> String {
+        let output = command()
+            .current_dir(dir)
+            .args(args)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        )
+    }
+
+    /// A throwaway repository with a `main` bookmark and a named `ws` Workspace,
+    /// ready for a test to give `ws` work.
+    fn workspace_repo(tag: &str) -> (PathBuf, PathBuf) {
+        let repo = temp_repo(tag);
+        let root = repo.canonicalize().expect("temporary repo canonicalizes");
+        std::fs::write(root.join("seed.txt"), "seed\n").expect("write the seed file");
+        jj(&root, &["commit", "-m", "seed"]);
+        jj(&root, &["bookmark", "create", "main", "-r", "@-"]);
+        let ws = root.with_extension("ws");
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws",
+                "--no-colocate",
+                &ws.to_string_lossy(),
+            ],
+        );
+        (root, ws)
+    }
+
+    /// A throwaway repository whose `ws` Workspace's commit is **divergent**: two
+    /// visible commits sharing one change id, the state a concurrent `jj` leaves
+    /// behind (ticket 44). The divergence is driven by
+    /// [`crate::test_support::diverge_working_copy`], so the recipe has one home.
+    fn divergent_workspace(tag: &str) -> (PathBuf, PathBuf) {
+        let (root, ws) = workspace_repo(tag);
+        jj(&ws, &["new", "main", "-m", "base"]);
+        crate::test_support::diverge_working_copy(&ws);
+        (root, ws)
+    }
+
+    /// A concurrent operation leaves a Workspace's commit divergent - two visible
+    /// commits, one change id - and jjfx reads it from jj's `divergent()` revset
+    /// rather than leaving the Worker to notice by reading its own history.
+    #[test]
+    fn a_divergent_workspace_commit_is_read_from_the_divergent_revset() {
+        let (root, ws) = divergent_workspace("divergent-read");
+
+        let outcome = workspace_divergence(&root, "ws").expect("the divergence read succeeds");
+
+        match outcome {
+            WorkspaceDivergence::Divergent { change_id, copies } => {
+                assert!(!change_id.is_empty(), "the divergent change id is reported");
+                assert_eq!(copies, 2, "two visible commits share the change id");
+            }
+            other => panic!("expected a divergent read, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A Workspace whose chain is not divergent reads as intact, so a clean
+    /// Workspace is never reported as diverged.
+    #[test]
+    fn an_undiverged_workspace_reads_as_intact() {
+        let (root, ws) = workspace_repo("intact-read");
+        jj(&ws, &["new", "main", "-m", "work"]);
+
+        assert_eq!(
+            workspace_divergence(&root, "ws").expect("the divergence read succeeds"),
+            WorkspaceDivergence::Intact
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The documented limit: jjfx can tell a commit **diverged**, not that it is
+    /// **gone**. A commit rewritten out of the visible set - here abandoned from
+    /// another Workspace - reads as intact, because jj keeps `ws@` on a visible
+    /// commit and creates a fresh one, so a gone commit and one that never
+    /// existed are indistinguishable from jj's visible state.
+    #[test]
+    fn a_commit_rewritten_out_of_the_visible_set_reads_as_intact() {
+        let (root, ws) = workspace_repo("gone-read");
+        jj(&ws, &["new", "main", "-m", "work"]);
+        std::fs::write(ws.join("w.txt"), "w\n").expect("write the work file");
+        jj(&ws, &["commit", "-m", "work"]);
+        let gone = jj_capture(&ws, &["log", "-r", "@-", "--no-graph", "-T", "change_id"])
+            .trim()
+            .to_owned();
+
+        jj(&root, &["abandon", &gone]);
+
+        // The commit is genuinely gone: it is no longer a visible commit.
+        let visible = jj_capture(
+            &root,
+            &[
+                "log",
+                "-r",
+                &format!("all() & change_id({gone})"),
+                "--count",
+            ],
+        );
+        assert_eq!(
+            visible.trim(),
+            "0",
+            "the abandoned change must not be a visible commit"
+        );
+        // Yet the Workspace reads as intact - the limit jjfx states rather than
+        // guesses at.
+        assert_eq!(
+            workspace_divergence(&root, "ws").expect("the divergence read succeeds"),
+            WorkspaceDivergence::Intact
+        );
+
+        std::fs::remove_dir_all(&ws).ok();
+        std::fs::remove_dir_all(&root).ok();
     }
 }

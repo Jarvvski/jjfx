@@ -354,6 +354,14 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   acceptance box: jjfx reads the operation log but never reads jj's `divergent()`
   revset, so a Worker whose commit has diverged or gone hidden is told nothing.
   44 removed jjfx's own path to causing it; this is the capability to report it.
+  **resolved** - `jjfx status` now reads divergence from jj's `divergent()` revset
+  over the Workspace's own chain and reports it: a `diverged:` line on the
+  Worker's row and a `diverged` array in `status --json` naming the Worker, its
+  pool, the change id and how many visible commits share it. A commit rewritten
+  out of the visible set reads as intact and jjfx says so - it can tell a commit
+  diverged, not that it is gone. The test drives a real divergence
+  deterministically (two operations from one starting operation, both rewriting
+  the working-copy commit, then integrated) rather than racing.
 
 ### Filed - 2026-10-22
 

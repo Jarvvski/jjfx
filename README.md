@@ -127,7 +127,8 @@ prints alongside the per-Worker rows:
     { "name": "default", "size": 1, "workers": 1, "implicit": true, "spend": 0.0, "cap": null, "window": "week" },
     { "name": "bugs", "size": 2, "workers": 1, "implicit": false, "spend": 1.5, "cap": 5.0, "window": "week" }
   ],
-  "orphans": []
+  "orphans": [],
+  "diverged": []
 }
 ```
 
@@ -145,6 +146,12 @@ Repository holds, including an implicit `default` when no `[pools]` declaration
 names one, with its size and its recorded spend against its own `cap` and
 `window` - a subtotal under the Repository-wide `Spend:` line. `orphans` names
 pool directories no declaration claims, which jjfx reports and never adopts.
+`diverged` names the Workers whose Workspace commit a concurrent `jj` left
+divergent - two visible commits sharing one change id, read from jj's
+`divergent()` revset - each with its `worker`, `pool`, `change_id` and `copies`,
+and is `[]` when nothing diverged. The human table prints the same on the
+Worker's row. A commit rewritten out of the visible set cannot be told from one
+that never existed, so only divergence is reported, not a gone commit.
 
 ## Documentation
 
