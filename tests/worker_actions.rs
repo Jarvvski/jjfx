@@ -833,7 +833,7 @@ fn failed_absorb_push_rolls_back_the_local_operation() {
     );
     assert!(commands[3].starts_with("absorb --into "), "{commands:?}");
     assert_eq!(commands[5], "git push --bookmark owner/eng-301-action");
-    assert_eq!(commands[6], "undo --allow-cross-workspace");
+    assert_eq!(commands[6], "undo");
 }
 
 /// The repository `jjfx absorb` was observed to destroy: `origin` exists but no
@@ -1007,7 +1007,7 @@ fn an_absorb_that_rewrites_the_mainline_is_rolled_back_and_fails() {
         commands[0],
         "bookmark list -T if(remote, \"\", name ++ \"\\n\")"
     );
-    assert_eq!(commands[5], "undo --allow-cross-workspace");
+    assert_eq!(commands[5], "undo");
     assert!(
         !commands
             .iter()
@@ -1072,7 +1072,7 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
             "rebase -b owner/eng-301-action -d main",
             REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
-            "undo --allow-cross-workspace",
+            "undo",
         ]
     );
 }
@@ -1344,7 +1344,7 @@ fn a_push_that_matched_no_bookmark_is_not_reported_as_success() {
     );
     assert_eq!(
         commands.last().map(String::as_str),
-        Some("undo --allow-cross-workspace"),
+        Some("undo"),
         "an unpublished fold must be rolled back: {commands:?}"
     );
 }

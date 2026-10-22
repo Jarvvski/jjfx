@@ -569,9 +569,9 @@ impl WorkerActions {
     /// Workspace is actually in ([`WorkerActionError::RebaseConflicted`]) - naming
     /// the Workspace the conflict has to be resolved in - rather than as a push
     /// failure whose `rollback` implies a rollback happened. The `jj undo`
-    /// rollback the push-failure path uses cannot be trusted here: it undoes the
-    /// repository's *last* operation, which in a shared operation log may belong
-    /// to another Workspace.
+    /// rollback the push-failure path uses would also have nothing to undo here:
+    /// the rebase is the operation it would revert, and reverting it would throw
+    /// away the conflict the Workspace now has to resolve.
     pub fn rebase(&self, target: &LandingTarget) -> Result<RebaseOutcome, WorkerActionError> {
         let branch = self.branch_of(target)?;
         let workspace = target.path().to_path_buf();
@@ -1799,11 +1799,20 @@ impl SystemCommands {
         Ok(report)
     }
 
+    /// Roll a Workspace's own mutation back with `jj undo`.
+    ///
+    /// Deliberately **not** `--allow-cross-workspace`. jj refuses to undo an
+    /// operation performed in another Workspace, and that refusal is the point: a
+    /// repository-wide undo restores the recorded working-copy commit of *every*
+    /// Workspace, so undoing a sibling's operation rewrites the sibling's working
+    /// copy underneath it. Racing that sibling's own `jj commit`, jj reconciles
+    /// the two rewrites into a **divergent** head - two commits sharing one change
+    /// id - and the sibling's change appears to have been swallowed. With the flag
+    /// removed a rollback can only undo an operation created in this Workspace, so
+    /// a concurrent sibling operation makes jj refuse; the refusal is returned and
+    /// surfaced as a failed rollback, never as a silent cross-Workspace rewrite.
     fn undo(self, workspace: &Path) -> Result<(), String> {
-        // `jj op undo` was removed; the command is `jj undo`. jjfx shares one op
-        // log across workspaces, so allow undoing the last operation even when it
-        // was performed in another workspace (jj 0.46 refuses that by default).
-        self.run_status(workspace, "jj", &["undo", "--allow-cross-workspace"])
+        self.run_status(workspace, "jj", &["undo"])
     }
 
     fn open_pull_request(self, repository: &str, branch: &str) -> Result<(), WorkerActionError> {
@@ -2980,6 +2989,69 @@ mod tests {
             report.is_empty(),
             "nothing above the base owns the edited lines, so absorb folds nothing: {report:?}"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A rollback is a plain `jj undo`, so it can only undo an operation created
+    /// in the Worker's own Workspace.
+    ///
+    /// jjfx used to pass `--allow-cross-workspace`, which let a failed push in one
+    /// Workspace undo a sibling Workspace's operation. A repository-wide undo
+    /// restores every Workspace's recorded working-copy commit, so racing the
+    /// sibling's own `jj commit` leaves the sibling's change in a *divergent* head
+    /// (two commits sharing one change id) with nothing reported (ticket 44). The
+    /// refusal is the safe outcome: the sibling's commit is left exactly where it
+    /// was, and the caller surfaces the refusal as a failed rollback.
+    #[test]
+    fn undo_does_not_cross_into_another_workspace() {
+        let root = crate::store::test_local_repo("undo-cross-workspace");
+        jj(&root, &["bookmark", "create", "main", "-r", "@"]);
+        let ws_a = root.with_extension("undo-a");
+        let ws_b = root.with_extension("undo-b");
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws-a",
+                ws_a.to_str().expect("workspace path is UTF-8"),
+            ],
+        );
+        jj(
+            &root,
+            &[
+                "workspace",
+                "add",
+                "--name",
+                "ws-b",
+                ws_b.to_str().expect("workspace path is UTF-8"),
+            ],
+        );
+
+        // The sibling Workspace's operation is now the repository's last.
+        jj(&ws_b, &["new", "main", "-m", "sibling work"]);
+        let sibling = commit_id(&ws_b, "@");
+
+        // A rollback from the other Workspace must refuse rather than undo it.
+        let refused = SystemCommands
+            .undo(&ws_a)
+            .expect_err("a cross-Workspace undo is refused");
+        assert!(
+            refused.contains("performed in workspace"),
+            "the refusal names the Workspace that owns the operation: {refused}"
+        );
+        assert_eq!(
+            commit_id(&ws_b, "@"),
+            sibling,
+            "the sibling's commit is left exactly where it was"
+        );
+
+        // The Workspace that made the operation can still roll it back.
+        SystemCommands
+            .undo(&ws_b)
+            .expect("an undo in the owning Workspace succeeds");
 
         std::fs::remove_dir_all(&root).ok();
     }
