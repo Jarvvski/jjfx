@@ -1135,7 +1135,7 @@ impl WorkerPool {
 
     /// Materialises a declared Pool's state on first use.
     ///
-    /// A declared Pool with no state directory is normal, not a disagreement
+    /// A declared Pool with no state document is normal, not a disagreement
     /// (ADR 0013): `[pools.<name>]` is the source of truth and
     /// `.jj/pools/<name>/` is state, so the first operation that needs the Worker
     /// Pool's document creates it - provisioning the Workers the declaration names,
@@ -1143,12 +1143,17 @@ impl WorkerPool {
     /// committed declaration work on a fresh clone with nobody provisioning the
     /// lane by hand.
     ///
-    /// Idempotent: a Pool whose state directory already exists is left untouched,
-    /// so a second Dispatch never re-provisions it. Provisioning runs outside
-    /// state locks and adoption takes the Worker Pool lock, so this is safe under
-    /// the repository-outermost lock order (ADR 0013).
+    /// Idempotent: a Pool whose state **document** already exists is left
+    /// untouched, so a second Dispatch never re-provisions it. The check is the
+    /// document and not the directory, because the directory also holds Run
+    /// Records, the waiting set, the work queue and its locks - a lock creates
+    /// its parents - so a directory left by a lock, a Run record, or an in-place
+    /// destroy (which deliberately leaves the directory for the lane to be
+    /// recreated there) has no document and must still materialise. Provisioning
+    /// runs outside state locks and adoption takes the Worker Pool lock, so this
+    /// is safe under the repository-outermost lock order (ADR 0013).
     pub fn materialise(&self, capacity: PoolCapacity) -> Result<Vec<WorkerId>, WorkerPoolError> {
-        if self.repository.state_store().directory_exists() {
+        if self.repository.state_store().pool_document_exists() {
             return Ok(Vec::new());
         }
         Ok(self.resize_to(capacity)?.added_workers().to_vec())

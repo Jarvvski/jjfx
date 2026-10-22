@@ -328,6 +328,57 @@ fn a_removed_pool_is_not_resurrected_by_materialisation() {
     );
 }
 
+/// Ticket 48: a lane destroyed **in place** is materialised again on the next
+/// Dispatch.
+///
+/// The TUI's `D` destroy is `WorkerPool::destroy`, which destroys a Pool's state
+/// but deliberately leaves its directory behind so the lane is recreated there
+/// (unlike `jjfx pool destroy`, which removes the directory outright). The
+/// directory that survives holds only locks, so a materialisation keyed off the
+/// *directory* would skip the lane - and the first reservation would then fail
+/// with a bare `state is missing` naming neither the pool nor the document.
+#[test]
+fn a_lane_destroyed_in_place_is_materialised_again() {
+    let fixture = declared_lane();
+    fixture.write_ticket("01-bug.md", &bug_ticket("Fix the crash"));
+
+    // The product path that leaves `.jj/pools/bugs/` with no document. The lane
+    // has not materialised, so the in-place destroy has no Worker to tear down
+    // and touches no Workspace.
+    let repository = jjfx::engine::Repository::open(fixture.path())
+        .expect("repository")
+        .with_pool(jjfx::engine::PoolName::parse("bugs").expect("pool name"));
+    repository
+        .worker_pool()
+        .destroy()
+        .expect("destroy in place");
+
+    assert!(
+        !fixture.pool_state("bugs").join("pool.json").exists(),
+        "an in-place destroy leaves no document"
+    );
+    assert!(
+        fixture.pool_state("bugs").is_dir(),
+        "an in-place destroy leaves the state directory behind"
+    );
+
+    // The next Dispatch must recreate the lane rather than report the missing
+    // document as an unreadable Pool.
+    let output = fixture.jjfx(&["dispatch", "--all", "--pool", "bugs", "--json"]);
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let json: Value = serde_json::from_str(stdout(&output).trim()).expect("a JSON batch");
+    assert_eq!(entry(&json, "widgets--01-bug")["outcome"], "dispatched");
+    assert!(
+        fixture.pool_state("bugs").join("pool.json").exists(),
+        "the lane is materialised again"
+    );
+}
+
 /// Ticket 15: a size edit after the lane materialises must reach the Workers it
 /// holds, not only its declaration. Growing provisions the new Workers and the
 /// declaration is moved to agree, so `status` reports one true size.
