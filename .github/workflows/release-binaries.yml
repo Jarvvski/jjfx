@@ -1,0 +1,75 @@
+name: Release binaries
+
+# Builds the macOS and Linux archives when a version tag is pushed, attaches
+# them (and a Homebrew formula) to that tag's GitHub Release, and updates the
+# Homebrew tap when HOMEBREW_TAP_TOKEN is set.
+#
+# A tag pushed by the Release workflow's GITHUB_TOKEN does not start this
+# workflow: GitHub does not run workflows in response to GITHUB_TOKEN. That
+# workflow builds the same archives and attaches them itself. This file is the
+# path for a tag a person pushes.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  archive:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            target: aarch64-apple-darwin
+          - os: macos-14
+            target: x86_64-apple-darwin
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+      - uses: jdx/mise-action@v2
+        with:
+          # Rustup components live outside mise's cached data directory.
+          cache: false
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the archive
+        run: mise run release ${{ matrix.target }}
+      - name: Upload the archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish archives
+    needs: archive
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Homebrew formula
+        run: packaging/homebrew/formula.sh dist
+      - name: GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: packaging/homebrew/publish-release.sh
+      - name: Homebrew tap
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: packaging/homebrew/publish-tap.sh
