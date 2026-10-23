@@ -106,11 +106,17 @@ gh workflow run release.yml -f dry_run=true
    momo rewrites `Cargo.toml` but never the lock and `cargo publish --locked`
    needs the workspace version entry in sync.
 4. `cargo publish --dry-run --locked`.
-5. `mise run release aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl`.
+5. `mise run release aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl`,
+   then `packaging/homebrew/formula.sh` writes `dist/jjfx.rb` from those
+   archives and their `.sha256` sidecars.
 6. Commit, rebase onto the latest `main`, push the branch, `momo tag`, push the
    tag.
 7. `cargo publish --locked`.
-8. `gh release create` with the archives and `momo notes` as notes.
+8. `gh release create` with the archives, the checksums, the formula, and
+   `momo notes` as notes.
+9. `packaging/homebrew/publish-tap.sh` pushes `Formula/jjfx.rb` to
+   `Jarvvski/homebrew-jjfx` when `HOMEBREW_TAP_TOKEN` is set. Unset, it
+   prints a line and exits 0: the formula is already on the GitHub Release.
 
 Three orderings are deliberate. Archives are built **before** the commit, so a
 failed cross-compile leaves a dirty checkout rather than a tag. The release
@@ -132,6 +138,7 @@ pointing at a crate version that does not exist.
 | Tag push | branch pushed, tag not published | re-dispatch, or `momo tag` and push the tag by hand |
 | `cargo publish` | tag pushed, crate not published | re-dispatch, or publish by hand |
 | `gh release create` | tag and crate published, no release | `gh release create v<version> --notes-file <(momo notes --version <version>) dist/*` |
+| Homebrew tap push | release published, tap unchanged | set `HOMEBREW_TAP_TOKEN` and re-run `packaging/homebrew/publish-tap.sh`, or commit `Formula/jjfx.rb` on the tap by hand |
 
 A crates.io version number can never be reused, so recovery is always
 re-dispatching or running the step by hand - never reusing the version.
@@ -152,6 +159,29 @@ re-dispatching or running the step by hand - never reusing the version.
   workflow touches only `Cargo.toml`, `Cargo.lock`, `CHANGELOG.md` and
   `.momo/version`, so the `workflow`-scope gate on `.github/workflows/` never
   applies.
+- `HOMEBREW_TAP_TOKEN`, optional, as a repository secret. It needs
+  contents write on `Jarvvski/homebrew-jjfx`. Create that public repository
+  once, with one commit on its default branch (a README is enough) so the
+  workflow can clone it. Without the secret, `brew install jarvvski/jjfx/jjfx`
+  has nothing to install; the formula file on the GitHub Release is still
+  there.
+
+  ```bash
+  gh secret set HOMEBREW_TAP_TOKEN < <(printenv HOMEBREW_TAP_TOKEN)
+  ```
+
+## Tag push
+
+`.github/workflows/release-binaries.yml` builds the same three targets on a
+pushed `v*` tag, attaches the archives and `jjfx.rb`, and runs the tap script.
+It does not publish to crates.io and it does not move `main`.
+
+A tag the Release workflow pushes with `GITHUB_TOKEN` does not start that
+workflow: GitHub does not run workflows in response to `GITHUB_TOKEN`. The
+dispatch path above is what attaches the files for a normal release. Pushing
+the tag by hand (or with a token that is allowed to start workflows) is the
+other way to build the binaries, and it refuses to invent a version: the
+archives are named from `Cargo.toml`, which momo has already minted.
 
 ## Local equivalents
 

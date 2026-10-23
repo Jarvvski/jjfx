@@ -102,6 +102,12 @@ jobs:
         if: ${{ !inputs.dry_run }}
         run: mise run release aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-musl
 
+      # The formula only names the archives above, so a failed build never
+      # publishes a formula that points at files this run did not produce.
+      - name: Homebrew formula
+        if: ${{ !inputs.dry_run }}
+        run: packaging/homebrew/formula.sh dist
+
       - name: Commit and tag
         if: ${{ !inputs.dry_run }}
         run: |
@@ -162,4 +168,13 @@ jobs:
           gh release create "v$version" \
             --title "v$version" \
             --notes-file RELEASE_NOTES.md \
-            dist/*.tar.gz dist/*.tar.gz.sha256
+            dist/*.tar.gz dist/*.tar.gz.sha256 dist/jjfx.rb
+
+      # Optional. A repository secret (or one on the `release` environment)
+      # pushes the formula to Jarvvski/homebrew-jjfx. Unset means skip: the
+      # formula is already attached to the GitHub Release above.
+      - name: Publish the Homebrew tap
+        if: ${{ !inputs.dry_run }}
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: packaging/homebrew/publish-tap.sh

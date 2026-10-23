@@ -1,2 +1,8 @@
 /target
 /dist
+# Throwaway repo the demo tape records against (demo/setup.sh).
+/demo/fixture
+/demo/login
+/demo/docs
+/demo/home
+/demo/.env

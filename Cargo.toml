@@ -8,6 +8,7 @@ edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A terminal UI for working with Jujutsu (jj) workspaces and the coding agents editing them"
 repository = "https://github.com/Jarvvski/jjfx"
+homepage = "https://github.com/Jarvvski/jjfx"
 readme = "README.md"
 keywords = ["jujutsu", "jj", "tui", "workspaces", "agents"]
 categories = ["command-line-utilities", "development-tools"]

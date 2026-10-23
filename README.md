@@ -12,6 +12,12 @@
 
 <p align="center">
   <a href="LICENSE"><img alt="License: GPL-3.0-or-later" src="https://img.shields.io/badge/license-GPL--3.0--or--later-blue"></a>
+  <a href="https://crates.io/crates/jjfx"><img alt="crates.io" src="https://img.shields.io/crates/v/jjfx"></a>
+  <a href="https://github.com/Jarvvski/jjfx/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/Jarvvski/jjfx/actions/workflows/ci.yml/badge.svg"></a>
+</p>
+
+<p align="center">
+  <img src="assets/demo.gif" alt="jjfx listing workspaces, opening the commit graph, a diff, and the keybindings" width="800">
 </p>
 
 ---
@@ -22,26 +28,89 @@ diffs, and a **Worker pool** that dispatches tickets to background agents - each
 in its own jj workspace. No switching between your VCS, your terminal, and your
 agents.
 
-## Quickstart
+## Features
 
-### 1. Prerequisites
+- One list of every workspace, grouped by what needs you: needs you, working,
+  ready to forge, idle.
+- The commit graph, inline or full screen, laid out like `jj log`, and the diff
+  for the workspace you have selected.
+- A Worker pool that runs background agents. Each Worker gets its own jj
+  workspace; jjfx will not dispatch into one you have open.
+- The same binary's command surface, for you and for agents: `dispatch`,
+  `status --json`, `deliver`, `review`, and the rest of the table below.
+- A bundled skill, so an agent can drive the pool itself.
+
+## Requirements
 
 - **jj 0.46.0** on your `PATH`. jjfx reads jj's on-disk store directly through
   `jj-lib`, so the two are version-coupled - upgrade them together.
-- **Rust 1.97.1 or newer** - [rustup](https://rustup.rs) is the usual way to
-  get it.
+- **Rust 1.97.1 or newer**, only to build from source.
+  [rustup](https://rustup.rs) is the usual way to get it; this repo's
+  [mise](https://mise.jdx.dev) pin is the version the suite is verified against.
+  The prebuilt archives do not need a Rust toolchain.
 
-### 2. Install
+## Install
+
+### Prebuilt binaries
+
+Each [GitHub Release](https://github.com/Jarvvski/jjfx/releases) ships three
+archives: macOS Apple silicon, macOS Intel, and Linux x86_64 (musl, so it runs
+on glibc too). The archive contains `bin/jjfx`.
+
+```bash
+tag=$(curl -fsSL https://api.github.com/repos/Jarvvski/jjfx/releases/latest \
+  | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p')
+ver=${tag#v}
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64)  target=aarch64-apple-darwin ;;
+  Darwin-x86_64) target=x86_64-apple-darwin ;;
+  Linux-x86_64)  target=x86_64-unknown-linux-musl ;;
+  *) echo "no prebuilt archive for $(uname -s)-$(uname -m); use cargo install" >&2; exit 1 ;;
+esac
+curl -fsSL -o jjfx.tar.gz \
+  "https://github.com/Jarvvski/jjfx/releases/download/${tag}/jjfx-${ver}-${target}.tar.gz"
+tar -xzf jjfx.tar.gz
+mkdir -p "$HOME/.local/bin"
+install bin/jjfx "$HOME/.local/bin/jjfx"
+```
+
+Other machines build from source. Checksums sit next to each archive as
+`.sha256`.
+
+### Homebrew
+
+```bash
+brew install jarvvski/jjfx/jjfx
+```
+
+The formula tracks those release archives. The tap is a one-time setup,
+described in [Releasing](docs/releasing.md).
+
+### cargo install
 
 ```bash
 cargo install jjfx
 ```
 
 That builds and installs the `jjfx` binary into Cargo's bin directory
-(`~/.cargo/bin`). To build from a clone instead, see
+(`~/.cargo/bin`).
+
+### From source
+
+```bash
+git clone https://github.com/Jarvvski/jjfx.git
+cd jjfx
+mise install        # pins Rust 1.97.1 and jj 0.46.0
+mise run install    # release build, installed to ~/.cargo/bin/jjfx
+```
+
+Without mise, `cargo install --path .` builds the same binary from the clone.
+Build tasks and where the code lives are in
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
-### 3. Open the TUI
+## Quickstart
+
+### Open the TUI
 
 From anywhere inside a jj repository:
 
@@ -53,7 +122,7 @@ The workspace list is grouped by what needs you - press `?` for every
 keybinding. Bare `jjfx` prints CLI help rather than claiming the terminal, so
 scripts and shell completion never unexpectedly enter the TUI.
 
-### 4. Put agents to work
+### Put agents to work
 
 jjfx runs background agents as **Workers**, each backed by its own jj workspace:
 
@@ -74,7 +143,7 @@ the same rule; `review` is exempt.
 Run `jjfx colocation enable` first so every Worker gets a working `.git`, which
 tools such as `gh stack` need.
 
-### 5. Let your agent drive the pool
+### Let your agent drive the pool
 
 Install the bundled skill and a coding agent can dispatch, watch, and steer
 Workers itself:
@@ -84,6 +153,33 @@ bunx skills@latest add Jarvvski/jjfx
 ```
 
 See [`skills/jjfx-dispatch`](skills/jjfx-dispatch/SKILL.md) for what it does.
+
+## Keybindings
+
+The home list. `?` opens the same list over whatever view you are in; the
+Worker pool, the diff, and the full-screen graph each have their own.
+
+| Action | Key |
+| --- | --- |
+| Move down / up | `j` / `k`, or the arrows |
+| Go to first / last | `PgUp` / `PgDn` |
+| Open workspace | `enter` |
+| Open in background | `o` |
+| Diff detail | `→` / `l` |
+| Toggle the world graph pane | `w` |
+| Scroll the world pane | `J` / `K` |
+| World graph, full screen | `W` |
+| New workspace | `n` |
+| Delete workspace | `d` |
+| Forge selected / all / default | `f` / `F` / `g` |
+| Resolve conflicts | `C` |
+| Fetch from remote | `u` |
+| Lift onto trunk / lift all | `r` / `R` |
+| Tidy this workspace / abandon junk empties | `t` / `T` |
+| Worker pool | `p` |
+| Fold or expand the idle group | `c` |
+| Toggle this help | `?` |
+| Quit | `q` / `esc` |
 
 ## Command surface
 

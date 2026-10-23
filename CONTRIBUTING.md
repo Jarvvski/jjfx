@@ -62,6 +62,20 @@ Landing rules, Rust conventions, and agent guidance live in
 [`AGENTS.md`](AGENTS.md). It is the project memory for humans and agents alike,
 and it is the authority on how a change lands.
 
+## Demo recording
+
+[`demo/jjfx.tape`](demo/jjfx.tape) is the VHS tape behind
+[`assets/demo.gif`](assets/demo.gif). From a checkout with jj 0.46.0:
+
+```bash
+cargo build --release -p jjfx
+vhs demo/jjfx.tape
+```
+
+[`demo/setup.sh`](demo/setup.sh) builds a throwaway repository under `demo/`
+(gitignored) and the tape records `jjfx tui` against it. Re-run the tape to
+replace the GIF.
+
 ## Releasing
 
 Releases are cut by dispatching the `Release` workflow. The versioning model,
