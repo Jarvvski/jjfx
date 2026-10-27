@@ -1,10 +1,10 @@
 //! The delivery contract agrees across the prompt, `jjfx help`, and the skill.
 //!
-//! The Dispatch prompt tells every Worker that jjfx delivers the change and not
-//! to push or open the Pull Request itself. That claim is only true if a command
-//! performs it, and the three surfaces an agent reads must name the same one -
-//! `jjfx deliver` - while `rebase` and `open-pr` state what they do on their own,
-//! so neither is mistaken for the delivery.
+//! The Dispatch prompt tells every Worker to deliver its own change with
+//! `jjfx deliver`, and not to push or open the Pull Request by hand. The three
+//! surfaces an agent reads must name the same command - `jjfx deliver` - while
+//! `rebase` and `open-pr` state what they do on their own, so neither is mistaken
+//! for the delivery.
 
 use std::ffi::OsStr;
 use std::process::Command;
@@ -63,8 +63,12 @@ fn the_prompt_help_and_skill_name_the_same_delivery_command() {
     let skill = include_str!("../skills/jjfx-dispatch/SKILL.md");
     let playbook = include_str!("../skills/jjfx-dispatch/PLAYBOOK.md");
 
-    // The prompt promises jjfx delivers, and names the command that does it.
-    assert!(prompt.contains("jjfx delivers the change"), "{prompt}");
+    // The prompt names the command that delivers, and the agent as the actor
+    // that runs it.
+    assert!(
+        prompt.contains("Deliver the change yourself"),
+        "the prompt must name the agent as the deliverer: {prompt}"
+    );
     assert!(
         prompt.contains("jjfx deliver"),
         "the prompt must name the delivery verb: {prompt}"

@@ -1,9 +1,10 @@
 //! `jjfx deliver` - the one forge path as a shell verb.
 //!
-//! The Dispatch prompt tells every Worker that jjfx delivers the change (weld,
-//! check, push, open the Pull Request) and not to push or open it itself. No CLI
-//! verb did that: the forge was TUI-only, `rebase` pushed without a PR, and
-//! `open-pr` only opened one that already existed. These cases drive the real
+//! The Dispatch prompt tells every Worker to deliver the change itself with
+//! `jjfx deliver` (weld, check, push, open the Pull Request), rather than pushing
+//! or opening it by hand. The verb exists because nothing else did: the forge was
+//! TUI-only, `rebase` pushed without a PR, and `open-pr` only opened one that
+//! already existed. These cases drive the real
 //! binary against a repository with a local `origin` (no network), so the verb
 //! must weld, run the repository's check, push, and - when a forge is
 //! configured - reach the Pull Request step, from the shell.

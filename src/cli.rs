@@ -5752,9 +5752,9 @@ fn open_pr_command(repository: &Repository, value: &str) -> Result<()> {
 /// Deliver one Worker's change through the one forge path: weld onto trunk, run
 /// the repository's check, push, and open one Pull Request.
 ///
-/// This is the delivery the Dispatch prompt promises ("jjfx delivers the
-/// change"), reachable from the shell so an agent need not run `gh pr create`
-/// itself. It drives the *same* pipeline the TUI's `f` key does (ADR 0016's one
+/// This is the delivery the Dispatch prompt tells the agent to run itself,
+/// reachable from the shell so an agent need not run `gh pr create` itself. It
+/// drives the *same* pipeline the TUI's `f` key does (ADR 0016's one
 /// forge path), so the two cannot disagree about what delivering means. A
 /// repository with no forge - `[forge] pull_requests = false`, or no `origin`
 /// remote to open one against - is a supported path: the Pull Request step does

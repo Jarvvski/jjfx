@@ -115,11 +115,14 @@ fn initial_dispatch_prompt_pins_delivery_obligations_and_supported_overrides() {
     assert!(prompt.contains("AGENTS.md"));
     assert!(prompt.contains("TDD"));
     assert!(prompt.contains("jj describe"));
-    // Delivery is jjfx's job, not a command list the agent must run: the prompt
-    // says jjfx delivers and the agent does not push or open the Pull Request.
-    assert!(prompt.contains("jjfx delivers the change"));
+    // Delivery is the agent's own last step, run with jjfx's verb: the prompt
+    // names the agent as the actor, not a promise that something else delivers.
+    // An agent that read the old promise literally stopped with its change
+    // unpushed and no Pull Request (dogfood-4 finding 09).
+    assert!(prompt.contains("Deliver the change yourself"));
     assert!(prompt.contains("jjfx deliver"));
-    assert!(prompt.contains("Do not push or open the Pull Request yourself"));
+    assert!(prompt.contains("not finished until that command has delivered"));
+    assert!(prompt.contains("do not push or open the Pull Request by hand"));
     assert!(!prompt.contains("jj git push"));
     assert!(!prompt.contains("gh -R"));
     assert!(prompt.contains("Reviewable"));

@@ -154,7 +154,7 @@ impl DispatchPromptBuilder {
     ) -> Result<AgentRuntimeInvocation, DispatchPromptError> {
         let ticket_lower = context.ticket.id().as_str().to_ascii_lowercase();
         let mut system_prompt = format!(
-            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- Name your change's bookmark {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- Describe the change with jj describe; its description becomes the Pull Request body. jjfx delivers the change to {} with `jjfx deliver <worker>`: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens one Pull Request. Do not push or open the Pull Request yourself.\n- Your bookmark, not your Worker, is the durable name of your change: a Worker is reused for the next Ticket the moment your Run ends. If your Pull Request conflicts after a sibling merged and moved trunk under it, re-weld it by name - `jjfx rebase <your bookmark>` rebases it onto trunk and pushes it, and names the Workspace to resolve in (`jjfx resolve <workspace>`) when it conflicts. Never re-weld through a Worker you no longer hold.\n- Use Linear tools to update status only when they are available; never block on their absence.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the change description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
+            "You are an autonomous implementation agent in a jj (Jujutsu VCS) workspace.\n\nCRITICAL RULES:\n- Use jj commands, NEVER git commands.\n- Name your change's bookmark {}/{}-<short-description> (lowercase, hyphens, max 4 words from the Ticket title).\n- Describe the change with jj describe; its description becomes the Pull Request body.\n- Deliver the change yourself, as your last step, with `jjfx deliver <worker>`: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens one Pull Request to {}. Your Run is not finished until that command has delivered the change - do not push or open the Pull Request by hand, because `jjfx deliver` is how you do both.\n- Your bookmark, not your Worker, is the durable name of your change: a Worker is reused for the next Ticket the moment your Run ends. If your Pull Request conflicts after a sibling merged and moved trunk under it, re-weld it by name - `jjfx rebase <your bookmark>` rebases it onto trunk and pushes it, and names the Workspace to resolve in (`jjfx resolve <workspace>`) when it conflicts. Never re-weld through a Worker you no longer hold.\n- Use Linear tools to update status only when they are available; never block on their absence.\n- Do NOT ask questions. Make reasonable decisions and proceed.\n- If you encounter ambiguity, document your assumptions in the change description.\n- Do NOT add any AI attribution to PRs, commits, or comments.",
             context.delivery.branch_prefix,
             ticket_lower,
             context.repository.as_str(),
@@ -202,7 +202,7 @@ impl DispatchPromptBuilder {
             ));
         }
         worker_prompt.push_str(&format!(
-            "3. Derive a bookmark beginning {}/{ticket_lower}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe; its description becomes the Pull Request body.\n8. jjfx delivers the change with `jjfx deliver <worker>`: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens one Pull Request. Do not push or open the Pull Request yourself. Your bookmark is the durable name of the change - a Worker is reused for the next Ticket as soon as your Run ends - so a Pull Request that conflicts after a sibling merged is re-welded by name with `jjfx rebase <your bookmark>`, which rebases and pushes it and names the Workspace to resolve in when it conflicts.\n",
+            "3. Derive a bookmark beginning {}/{ticket_lower}.\n4. Read AGENTS.md, CLAUDE.md, or equivalent repository instructions and the relevant source.\n5. Implement with the repository's TDD workflow, repeating red-green cycles until the acceptance criteria are met.\n6. Run the full lint, type-check, build, and test suite and fix every failure.\n7. Describe the change with jj describe; its description becomes the Pull Request body.\n8. Deliver the change yourself, as your last step, with `jjfx deliver <worker>`: it rebases your bookmark onto trunk, runs the repository's check, pushes it, and opens one Pull Request. Your Run is not finished until that command has delivered the change - do not push or open the Pull Request by hand, because `jjfx deliver` is how you do both. Your bookmark is the durable name of the change - a Worker is reused for the next Ticket as soon as your Run ends - so a Pull Request that conflicts after a sibling merged is re-welded by name with `jjfx rebase <your bookmark>`, which rebases and pushes it and names the Workspace to resolve in when it conflicts.\n",
             context.delivery.branch_prefix,
         ));
         if context.ticket_details.is_some() {
@@ -263,4 +263,49 @@ pub enum DispatchPromptError {
         /// Runtime selected for the invocation.
         runtime: AgentRuntime,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{TicketId, TicketStatus, TicketTitle};
+
+    fn context() -> DispatchPromptContext {
+        DispatchPromptContext::new(
+            AgentRuntime::OpenCode,
+            RepositoryIdentity::parse("owner/repo").expect("a valid repository slug"),
+            Ticket::new(
+                TicketId::parse("ledger--01").expect("a valid ticket id"),
+                TicketTitle::parse("Add a thing").expect("a valid ticket title"),
+                TicketStatus::parse("ready-for-agent").expect("a valid ticket status"),
+            ),
+            DeliveryContract::new("jarvis@example.com", "adam").expect("a valid delivery contract"),
+        )
+    }
+
+    /// The prompt must name the agent as the actor that delivers.
+    ///
+    /// It used to say "jjfx delivers the change", which reads as a promise that
+    /// something else delivers while the agent is told not to push. An agent that
+    /// obeyed stopped with its change unpushed and no Pull Request, and the Run
+    /// was still recorded as a success (drive 4, finding 09).
+    #[test]
+    fn the_prompt_tells_the_agent_to_deliver_its_own_change() {
+        let invocation = DispatchPromptBuilder::new()
+            .initial(context())
+            .expect("a dispatch prompt");
+        let prompt = invocation.delivered_prompt(AgentRuntime::OpenCode);
+        assert!(
+            prompt.contains("Deliver the change yourself"),
+            "the prompt must name the agent as the deliverer: {prompt}"
+        );
+        assert!(
+            prompt.contains("not finished until that command has delivered"),
+            "the prompt must say the Run is incomplete until it delivers: {prompt}"
+        );
+        assert!(
+            !prompt.contains("jjfx delivers the change"),
+            "the prompt must not promise that jjfx delivers on the agent's behalf: {prompt}"
+        );
+    }
 }
