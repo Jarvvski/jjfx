@@ -110,12 +110,15 @@ happen and said nothing.
 
 ## Acceptance Criteria
 
-- [ ] **The prompt names the actor.** Either Dispatch invokes delivery itself once
+- [x] **The prompt names the actor.** Either Dispatch invokes delivery itself once
       the Run ends - which is what the prompt already promises - or the prompt
       tells the agent to run `jjfx deliver <worker>` and says the Run is not
       finished until it does. "jjfx delivers the change" plus "do not push or open
       the Pull Request yourself" is not a decision an agent can make reliably, as
-      four Runs of this drive demonstrate.
+      four Runs of this drive demonstrate. **Done in #198**: the prompt now says
+      "Deliver the change yourself, as your last step … Your Run is not finished
+      until that command has delivered the change", and the help, the skill and
+      the two tests that encoded the old promise were brought along.
 - [ ] **A Run whose change was not delivered does not report a clean success.** A
       `conclusion: succeeded` Run with no push and no Pull Request is
       indistinguishable from a delivered one today; the record, or `jjfx status`,
@@ -127,3 +130,11 @@ happen and said nothing.
 - [ ] **Tests pin both halves.** One that a Run ending with a committed change and
       no delivery is reported as undelivered, naming the command that fixes it;
       one that the Dispatch prompt names the actor that delivers.
+
+## Comments
+
+- 2026-10-27: The prompt half is fixed in #198. The remaining half - a Run whose
+  change was never delivered must not read as a clean success - is a design
+  decision rather than a wording one: it asks whether Dispatch should invoke
+  delivery itself once the Run ends, which is what the old prompt promised. Left
+  for the owner to rule on rather than picked here.

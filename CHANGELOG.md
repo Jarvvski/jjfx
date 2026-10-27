@@ -25,6 +25,12 @@ repository builds and releases.
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
 
+## [Unreleased]
+
+### Fixed
+
+- tell the agent to run `jjfx deliver` itself, instead of promising that jjfx delivers while forbidding the agent from pushing
+
 ## [0.56.0] - 2026-10-27
 
 ### Breaking
