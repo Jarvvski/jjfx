@@ -81,15 +81,32 @@ This is the verb lying about what it did.
 
 ## Acceptance Criteria
 
-- [ ] `jjfx rebase` either fetches the trunk, or detects that the local `main` is
+- [x] `jjfx rebase` either fetches the trunk, or detects that the local `main` is
       behind `main@origin` and refuses with a message naming the fetch - never
-      reports `Rebased` on a rebase it did not perform.
-- [ ] A rebase that rewrites nothing says so, and distinguishes "the branch is
-      already on trunk" from "the trunk I can see is stale".
+      reports `Rebased` on a rebase it did not perform. **Done in #199**: it
+      fetches first (`crate::jj::fetch`, "what advances `trunk()`"), and a fetch
+      that fails refuses with a named error rather than guessing.
+- [x] A rebase that rewrites nothing says so, and distinguishes "the branch is
+      already on trunk" from "the trunk I can see is stale". **Done in #199**:
+      `SystemCommands::push` returns its `PushOutcome` rather than collapsing
+      `Pushed` and `Nothing`, so `RebaseOutcome` knows whether the branch was
+      rewritten - "already on the fetched trunk; nothing to rebase, nothing to
+      push" instead of `Rebased`.
 - [ ] The outcome is observable: after a re-weld, `jjfx status` (or the Worker's
       delivery state, as in [`09`](09-a-run-can-report-success-without-delivering.md))
       shows whether the Pull Request is still conflicting, so a no-op cannot pass
       for a recovery.
-- [ ] A test drives the sequence: a branch whose sibling merged on the remote,
+- [x] A test drives the sequence: a branch whose sibling merged on the remote,
       against a repository whose local trunk has not been fetched, and asserts the
-      operator is told rather than misled.
+      operator is told rather than misled. **Done in #199**, and falsified: with
+      the fetch removed the test fails, leaving `main` on the stale commit.
+
+## Comments
+
+- 2026-10-27: #199 fixes the fetch and the no-op report. Two things are left.
+  The third criterion above is untouched. And `deliver`'s weld has the *same*
+  staleness - it welds onto `trunk()` without fetching, so a delivery after a
+  sibling merged on the forge welds onto a stale trunk and reports `Delivered` -
+  which is the same silent lie one step further along the path. It is noted here
+  rather than folded into #199 because the drive observed it on `rebase`, not on
+  `deliver`.
