@@ -101,6 +101,8 @@ the drive's triage pass.
 | 06 | `resume` requires `--pool` with several pools, and its help does not mention it - and `resume` is the recovery path for interrupted work | issue |
 | 07 | `--help` works on `pool` but not `pool profile`; `status` has no `--pool` while `ticket list` does; `pool profile` says "every Worker" but reaches only `default` | issue |
 | 08 | A Ticket excluded because its status is not the lane's is reported as `blocked`, the same word used for an unresolved `Blocked by:` | issue |
+| 09 | **A Run reports `succeeded` / `check: passed` while its change is never delivered.** The Dispatch prompt promises "jjfx delivers the change" and forbids the agent from pushing, but nothing in Dispatch runs `jjfx deliver` - the only call site is the CLI verb. Ticket 03's agent obeyed and stranded a real, tested change with no push and no PR; ticket 04's agent spent its session reasoning in circles about the same sentence and delivered anyway. One prompt, two outcomes, no record distinguishing them | bug |
+| 10 | **`jjfx rebase` reports `Rebased <branch>` while rebasing nothing**, because it rebases onto the repository's stale local trunk without fetching. After a sibling PR merged on the forge, the prompt-advertised recovery for a conflicting PR silently no-ops: no rebase op, no push, remote head unchanged, PR still conflicting. With the trunk fetched the same command does the right thing and names the conflict, the Workspace and the fix | bug |
 
 Finding `49` in `bug-hunt/` - `jjfx version` refusing to run outside a jj
 repository - was found by unpacking the published `v0.56.0` archive before this
