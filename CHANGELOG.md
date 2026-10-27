@@ -25,7 +25,7 @@ repository builds and releases.
 Sections released before the momo adoption keep the old `(break)`/`(add)`/`(fix)`
 markers on their entries; they are preserved as history and carry no meaning now.
 
-## [Unreleased]
+## [0.56.0] - 2026-10-27
 
 ### Breaking
 
@@ -975,6 +975,7 @@ markers on their entries; they are preserved as history and carry no meaning now
   local `main`/`master`/`trunk` bookmark. Once main is pushed, `trunk()` wins and
   behaviour is unchanged.
 
+[0.56.0]: https://github.com/Jarvvski/jjfx/compare/v0.55.0...v0.56.0
 [0.55.0]: https://github.com/Jarvvski/jjfx/compare/v0.54.0...v0.55.0
 [0.54.0]: https://github.com/Jarvvski/jjfx/compare/v0.53.0...v0.54.0
 [0.53.0]: https://github.com/Jarvvski/jjfx/compare/v0.52.1...v0.53.0

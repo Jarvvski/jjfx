@@ -3,7 +3,7 @@ resolver = "3"
 
 [package]
 name = "jjfx"
-version = "0.55.0"
+version = "0.56.0"
 edition = "2024"
 license = "GPL-3.0-or-later"
 description = "A terminal UI for working with Jujutsu (jj) workspaces and the coding agents editing them"
