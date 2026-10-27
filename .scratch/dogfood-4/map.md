@@ -1,6 +1,6 @@
 # The fourth drive: does the artifact users install hold?
 
-Status: open - running
+Status: open - the execution is complete; eleven findings await triage
 
 ## Why this exists
 
@@ -103,6 +103,7 @@ the drive's triage pass.
 | 08 | A Ticket excluded because its status is not the lane's is reported as `blocked`, the same word used for an unresolved `Blocked by:` | issue |
 | 09 | **A Run reports `succeeded` / `check: passed` while its change is never delivered.** The Dispatch prompt promises "jjfx delivers the change" and forbids the agent from pushing, but nothing in Dispatch runs `jjfx deliver` - the only call site is the CLI verb. Ticket 03's agent obeyed and stranded a real, tested change with no push and no PR; ticket 04's agent spent its session reasoning in circles about the same sentence and delivered anyway. One prompt, two outcomes, no record distinguishing them | bug |
 | 10 | **`jjfx rebase` reports `Rebased <branch>` while rebasing nothing**, because it rebases onto the repository's stale local trunk without fetching. After a sibling PR merged on the forge, the prompt-advertised recovery for a conflicting PR silently no-ops: no rebase op, no push, remote head unchanged, PR still conflicting. With the trunk fetched the same command does the right thing and names the conflict, the Workspace and the fix | bug |
+| 11 | **`jjfx review` takes only a Worker, so a Pull Request cannot be reviewed once its Worker moves on.** `deliver` and `rebase` accept the bookmark - the durable name the prompt describes - but `review` does not, and a reset Worker's branch handle is wiped (`branch_name: null`). Four of the drive's six delivered PRs had their Workers reused before review, and none can be reviewed now. The refusals are poor too: a bookmark argument reports a filename-safety violation naming an identifier the user never typed | bug |
 
 Finding `49` in `bug-hunt/` - `jjfx version` refusing to run outside a jj
 repository - was found by unpacking the published `v0.56.0` archive before this
