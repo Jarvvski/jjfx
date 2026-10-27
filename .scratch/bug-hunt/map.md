@@ -395,3 +395,15 @@ Severity: H high, M medium, L low. Conf: V verified, S sweep, ? suspicion.
   error names the pool and the missing document. Pool-scoped reads,
   `pool create`, the CLI `pool destroy`, and the legacy conversion were ruled
   out as the cause.
+
+### Filed - 2026-10-27
+
+- [49](issues/49-version-refuses-outside-a-repository.md) - found while verifying
+  the `v0.56.0` release: unpacking the published archive into a temporary
+  directory and running it - the first thing anyone does with a fresh download -
+  fails with `not inside a jj repository`, while `jjfx --version` reports the
+  version anywhere. Reproduced on the released `0.56.0` *and* the installed
+  `0.54.0`, so it is long-standing rather than a regression. It matters because
+  `docs/releasing.md` frames `jjfx version` as the diagnostic a bug report uses,
+  and a report often starts outside a repository. **needs-triage**.
+
