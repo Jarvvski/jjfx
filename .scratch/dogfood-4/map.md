@@ -86,6 +86,26 @@ three stay comparable.
    or does something else reintroduce a mismatch - a Worker's `PATH`, the visor
    shell, a `mise` shim?
 
+## Findings
+
+Recorded as the drive goes, each under `issues/`. All are `needs-triage` until
+the drive's triage pass.
+
+| # | Finding | Type |
+|---|---|---|
+| 01 | A repository-declared pool `profile` is ignored, and the lane runs the default runtime - reproduced twice, with two profile names, after a full destroy and re-materialisation. A named pool has no other route to a non-default runtime. A declared `size` is silently inert too | bug |
+| 02 | `[agent] command` is not what runs when a profile is in play, and the mismatch surfaced only as `Failed to authenticate: OAuth session expired` - a credentials message for a configuration problem | bug |
+| 03 | `jjfx pool destroy <name>` edits the repository's committed `.jjfx/config.toml`, removing the declaration and dirtying the working copy | bug |
+| 04 | Destroying a pool orphans the Tickets it claimed: the files stay `claimed`, the queue is gone, and `resume` reports "No unfinished steps recorded" - recovery was five hand edits | bug |
+| 05 | `pool reset <worker>` for a Worker in another pool reports "state is missing" rather than "not in this pool" - the unhelpful-error shape of `bug-hunt/48` | bug |
+| 06 | `resume` requires `--pool` with several pools, and its help does not mention it - and `resume` is the recovery path for interrupted work | issue |
+| 07 | `--help` works on `pool` but not `pool profile`; `status` has no `--pool` while `ticket list` does; `pool profile` says "every Worker" but reaches only `default` | issue |
+| 08 | A Ticket excluded because its status is not the lane's is reported as `blocked`, the same word used for an unresolved `Blocked by:` | issue |
+
+Finding `49` in `bug-hunt/` - `jjfx version` refusing to run outside a jj
+repository - was found by unpacking the published `v0.56.0` archive before this
+drive started, which is the argument for aiming at the released artifact.
+
 ## References
 
 - `../dogfood/` - the first drive, its report and its ten findings
