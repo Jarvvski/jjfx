@@ -5709,7 +5709,17 @@ fn rebase_command(repository: &Repository, value: &str) -> Result<()> {
         );
     }
     let outcome = actions.rebase(&target)?;
-    eprintln!("Rebased {}", outcome.branch());
+    // The trunk was fetched first, so this is the trunk the forge has. A rebase
+    // that rewrote nothing says so, rather than reporting a rebase that did not
+    // happen (drive 4, finding 10).
+    if outcome.rewritten() {
+        eprintln!("Rebased {} onto the fetched trunk", outcome.branch());
+    } else {
+        eprintln!(
+            "{} is already on the fetched trunk; nothing to rebase, nothing to push",
+            outcome.branch()
+        );
+    }
     Ok(())
 }
 

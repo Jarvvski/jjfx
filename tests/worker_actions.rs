@@ -247,6 +247,7 @@ fn rebase_waits_for_the_workspace_operation_lock() {
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
+            "git fetch",
             "rebase -b owner/eng-301-action -d main",
             REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
@@ -409,6 +410,7 @@ fn rebase_and_open_pull_request_resolve_the_prefixed_bookmark_the_agent_created(
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
+            "git fetch",
             "rebase -b owner/eng-301-action -d main",
             REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
@@ -1069,6 +1071,7 @@ fn failed_rebase_push_rolls_back_the_local_operation() {
         jj_operations(&fs::read_to_string(&capture).expect("command capture")),
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
+            "git fetch",
             "rebase -b owner/eng-301-action -d main",
             REBASE_CONFLICT_QUERY,
             "git push --bookmark owner/eng-301-action",
@@ -1143,6 +1146,7 @@ fn a_rebase_that_conflicts_names_the_state_and_never_pushes_or_rolls_back() {
         commands,
         vec![
             "bookmark list -T if(remote, \"\", name ++ \"\\n\")",
+            "git fetch",
             "rebase -b owner/eng-301-action -d main",
             REBASE_CONFLICT_QUERY,
         ],
@@ -2462,7 +2466,20 @@ fn jj_operations(capture: &str) -> Vec<String> {
     jj_subcommands(capture)
         .into_iter()
         .filter(|command| !command.starts_with("log -r remote_bookmarks()"))
+        .map(|command| normalise_jj_operation(&command))
         .collect()
+}
+
+/// Strips the `--repository <root>` a free-function `jj` call carries.
+///
+/// `crate::jj::fetch` runs `jj --repository <root> git fetch`, and the repository
+/// path is invocation noise rather than part of the operation the assertions
+/// name.
+fn normalise_jj_operation(command: &str) -> String {
+    match command.split_once(" git fetch") {
+        Some((prefix, _)) if prefix.starts_with("--repository ") => "git fetch".to_owned(),
+        _ => command.to_owned(),
+    }
 }
 
 /// The read `rebase` makes after the rebase and before the push: whether the

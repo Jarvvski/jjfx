@@ -145,6 +145,35 @@ impl DeliverFixture {
             .expect("jjfx should run")
     }
 
+    /// Runs `jjfx rebase <name>` from the repository root.
+    fn rebase(&self, name: &str) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_jjfx"))
+            .args(["rebase", name])
+            .current_dir(&self.root)
+            .env_remove("JJ_CONFIG")
+            .env("XDG_CONFIG_HOME", self.config_home.path())
+            .output()
+            .expect("jjfx should run")
+    }
+
+    /// The trimmed stdout of one `jj` read, for asserting on repository state.
+    fn jj_out(&self, args: &[&str]) -> String {
+        let output = Command::new("jj")
+            .args(["--config", "signing.behavior=drop"])
+            .current_dir(&self.root)
+            .env_remove("JJ_CONFIG")
+            .env("XDG_CONFIG_HOME", self.config_home.path())
+            .args(args)
+            .output()
+            .expect("jj should be installed");
+        assert!(
+            output.status.success(),
+            "jj {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_owned()
+    }
+
     /// Writes the repository-local settings at `<repo>/.jjfx/config.toml`.
     fn write_repo_config(&self, text: &str) {
         let dir = self.root.join(".jjfx");
@@ -432,4 +461,94 @@ fn deliver_stops_and_names_a_commit_jj_refuses_to_push() {
         !stderr.contains("origin is not a GitHub remote"),
         "the delivery must stop before the Pull Request step: {stderr}"
     );
+}
+
+/// Drive 4's finding 10: a rebase must be onto the trunk the forge has, not the
+/// repository's stale view of it.
+///
+/// A sibling's Pull Request merged on the forge moves `main` there and nowhere
+/// else. The repository has not fetched, so its `main` is behind - and a rebase
+/// against that `main` rewrites nothing, pushes nothing, and reports success on
+/// a Pull Request that is still conflicting.
+#[test]
+fn rebase_fetches_the_trunk_a_sibling_moved_on_the_forge() {
+    let fixture = DeliverFixture::new(false, "true");
+
+    // The sibling's merge: a commit on `main` that exists only on the forge.
+    let sibling = fixture.parent.path().join("sibling");
+    let origin = fixture.origin.to_string_lossy().to_string();
+    let sibling_path = sibling.to_string_lossy().to_string();
+    git_in(
+        fixture.parent.path(),
+        &["clone", "--quiet", &origin, &sibling_path],
+    );
+    fs::write(sibling.join("sibling.txt"), "merged\n").expect("sibling file");
+    git_in(&sibling, &["add", "."]);
+    git_in(
+        &sibling,
+        &[
+            "-c",
+            "user.name=jjfx test",
+            "-c",
+            "user.email=jjfx@example.com",
+            "commit",
+            "-m",
+            "a sibling merged",
+        ],
+    );
+    git_in(&sibling, &["push", "--quiet", "origin", "main"]);
+    let merged = git_out(&sibling, &["rev-parse", "HEAD"]);
+
+    // The repository's view of trunk is stale: it never fetched the merge.
+    assert_ne!(
+        fixture.jj_out(&["log", "-r", "main", "--no-graph", "-T", "commit_id"]),
+        merged,
+        "the fixture must start with a stale trunk, or the test proves nothing"
+    );
+
+    let output = fixture.rebase("adam/eng-1");
+    assert!(
+        output.status.success(),
+        "rebase failed: {}",
+        stderr(&output)
+    );
+    assert_eq!(
+        fixture.jj_out(&["log", "-r", "main", "--no-graph", "-T", "commit_id"]),
+        merged,
+        "the rebase must have fetched the trunk the forge has"
+    );
+    assert!(
+        stderr(&output).contains("onto the fetched trunk"),
+        "the operator must be told what it rebased onto: {}",
+        stderr(&output)
+    );
+}
+
+/// Runs one `git` command in `dir`, asserting it succeeded.
+fn git_in(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git should be installed");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+/// The trimmed stdout of one `git` command in `dir`.
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("git should be installed");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
 }

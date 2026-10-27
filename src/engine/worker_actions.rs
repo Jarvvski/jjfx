@@ -178,12 +178,22 @@ pub enum WorkspaceRestorationError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RebaseOutcome {
     branch: String,
+    rewritten: bool,
 }
 
 impl RebaseOutcome {
     /// Returns the rebased bookmark.
     pub fn branch(&self) -> &str {
         &self.branch
+    }
+
+    /// Whether the rebase rewrote the branch, or found it already on trunk.
+    ///
+    /// A rebase that pushed nothing rewrote nothing, and a verb that reports it
+    /// as a rebase is claiming an operation it did not perform (drive 4,
+    /// finding 10).
+    pub fn rewritten(&self) -> bool {
+        self.rewritten
     }
 }
 
@@ -585,6 +595,17 @@ impl WorkerActions {
             workspace: target.workspace().to_owned(),
             detail: source.to_string(),
         })?;
+        // The trunk this rebases onto is the *remote's*. A sibling's Pull Request
+        // merged on the forge moves `main` there and nowhere else, so a rebase
+        // against the repository's own view of trunk rewrites nothing, pushes
+        // nothing, and reports success on a Pull Request that is still
+        // conflicting (drive 4, finding 10). Fetch first: it is what advances
+        // `main`, and a fetch that fails refuses rather than guessing at a trunk
+        // this repository cannot see.
+        crate::jj::fetch(self.repository.root()).map_err(|source| WorkerActionError::Command {
+            operation: "fetch the trunk before rebasing",
+            detail: source.to_string(),
+        })?;
         self.commands
             .rebase(&workspace, &branch)
             .map_err(|detail| WorkerActionError::Command {
@@ -606,15 +627,23 @@ impl WorkerActions {
                 workspace: target.workspace().to_owned(),
             });
         }
-        if let Err(push) = self.commands.push(&workspace, &branch) {
-            let rollback = self.commands.undo(&workspace).err();
-            return Err(WorkerActionError::RebasePush {
-                branch,
-                push,
-                rollback,
-            });
-        }
-        Ok(RebaseOutcome { branch })
+        // `Pushed` means the rebase moved the branch onto a trunk the remote did
+        // not have; `Nothing` means the remote already had the commit the rebase
+        // produced, so the rebase rewrote nothing and must not be reported as
+        // one.
+        let rewritten = match self.commands.push(&workspace, &branch) {
+            Ok(PushOutcome::Pushed) => true,
+            Ok(PushOutcome::Nothing) => false,
+            Ok(PushOutcome::Failed(push)) | Err(push) => {
+                let rollback = self.commands.undo(&workspace).err();
+                return Err(WorkerActionError::RebasePush {
+                    branch,
+                    push,
+                    rollback,
+                });
+            }
+        };
+        Ok(RebaseOutcome { branch, rewritten })
     }
 
     /// Opens the pull request for the change `name` names in the default browser.
@@ -696,13 +725,16 @@ impl WorkerActions {
         if report.is_empty() {
             return Ok(AbsorbOutcome { branch, report });
         }
-        if let Err(push) = self.commands.push(&workspace, &branch) {
-            let rollback = self.commands.undo(&workspace).err();
-            return Err(WorkerActionError::AbsorbPush {
-                branch,
-                push,
-                rollback,
-            });
+        match self.commands.push(&workspace, &branch) {
+            Ok(PushOutcome::Pushed | PushOutcome::Nothing) => {}
+            Ok(PushOutcome::Failed(push)) | Err(push) => {
+                let rollback = self.commands.undo(&workspace).err();
+                return Err(WorkerActionError::AbsorbPush {
+                    branch,
+                    push,
+                    rollback,
+                });
+            }
         }
         Ok(AbsorbOutcome { branch, report })
     }
@@ -1740,7 +1772,7 @@ impl SystemCommands {
         crate::jj::conflicted(workspace, &revset).map_err(|error| error.to_string())
     }
 
-    fn push(self, workspace: &Path, branch: &str) -> Result<(), String> {
+    fn push(self, workspace: &Path, branch: &str) -> Result<PushOutcome, String> {
         // `jj git push -b <name>` exits zero and pushes nothing both when the
         // bookmark is already published and when the name matches no bookmark,
         // so the exit code alone cannot tell them apart. `push_bookmark`
@@ -1748,10 +1780,12 @@ impl SystemCommands {
         // `Nothing` is a bookmark that is there and already published - the
         // desired state already holds, so the verb succeeds and nothing is
         // rolled back - while a name that matches no bookmark is a failure.
-        match crate::jj::push_bookmark(workspace, branch).map_err(|error| error.to_string())? {
-            PushOutcome::Pushed | PushOutcome::Nothing => Ok(()),
-            PushOutcome::Failed(detail) => Err(detail),
-        }
+        //
+        // The outcome is returned rather than collapsed to a unit because
+        // `Pushed` and `Nothing` are different answers to "did this verb change
+        // anything": a rebase that pushed nothing rewrote nothing, and must not
+        // be reported as a rebase.
+        crate::jj::push_bookmark(workspace, branch).map_err(|error| error.to_string())
     }
 
     /// Runs `jj absorb` and reads what it did from its summary.

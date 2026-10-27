@@ -30,6 +30,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 ### Fixed
 
 - tell the agent to run `jjfx deliver` itself, instead of promising that jjfx delivers while forbidding the agent from pushing
+- fetch the trunk before rebasing, so a re-weld after a sibling merged cannot report a rebase it did not perform
 
 ## [0.56.0] - 2026-10-27
 
