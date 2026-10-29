@@ -563,3 +563,65 @@ fn wait_for_helper_exit(helper: &mut HelperGuard) {
         thread::sleep(Duration::from_millis(10));
     }
 }
+
+/// Drive 4's finding 05: a Worker id is unique across the Repository, so a
+/// Worker-scoped verb resolves the Worker's own Pool rather than assuming the
+/// selected one.
+///
+/// `pool reset worker-x` for a Worker in `features` used to look the id up in
+/// `default`, find nothing, and report a missing *state document* - which reads
+/// as corruption rather than "wrong pool", and names neither the Pool it
+/// searched nor the one the Worker is in.
+#[test]
+fn reset_resolves_the_pool_a_worker_is_in_and_names_the_pools_searched_otherwise() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"]), ("features", &["worker-02"])]);
+    fixture.write_pool_state("features", &[("worker-02", "idle", None)]);
+
+    let reset = fixture.jjfx(&["pool", "reset", "worker-02"]);
+    assert!(
+        reset.status.success(),
+        "resetting a Worker in another Pool must work: {}",
+        String::from_utf8_lossy(&reset.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&reset.stderr);
+    assert!(
+        !stderr.contains("state is missing"),
+        "the Worker exists; the message must not read as corruption: {stderr}"
+    );
+    assert!(stderr.contains("Reset worker-02"), "{stderr}");
+
+    // A Worker in no Pool is refused by name, and the refusal names every Pool
+    // that was searched, so "no such Worker" is distinguishable from "wrong
+    // pool".
+    let missing = fixture.jjfx(&["pool", "reset", "worker-99"]);
+    assert!(!missing.status.success(), "an unknown Worker is refused");
+    let stderr = String::from_utf8_lossy(&missing.stderr);
+    assert!(stderr.contains("worker-99"), "{stderr}");
+    assert!(
+        stderr.contains("searched: default, bugs, features"),
+        "the refusal must name the Pools it searched: {stderr}"
+    );
+}
+
+/// The same resolution applies to `pool remove`, so a Worker is never reported
+/// missing merely because it lives one lane over.
+#[test]
+fn remove_resolves_the_pool_a_worker_is_in() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"]), ("features", &["worker-02"])]);
+    fixture.write_pool_state("features", &[("worker-02", "idle", None)]);
+
+    let removed = fixture.jjfx(&["pool", "remove", "worker-02"]);
+    assert!(
+        removed.status.success(),
+        "removing a Worker in another Pool must work: {}",
+        String::from_utf8_lossy(&removed.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&removed.stderr);
+    assert!(stderr.contains("Removed worker-02"), "{stderr}");
+    assert!(
+        !stderr.contains("state is missing"),
+        "the Worker exists; the message must not read as corruption: {stderr}"
+    );
+}
