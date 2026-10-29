@@ -32,6 +32,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - tell the agent to run `jjfx deliver` itself, instead of promising that jjfx delivers while forbidding the agent from pushing
 - fetch the trunk before rebasing, so a re-weld after a sibling merged cannot report a rebase it did not perform
 - refuse a `review` name no Worker can host with the route back to one, instead of a filename error or a missing branch
+- report a Ticket whose Status is not the lane's as `not-ready` rather than `blocked`, which already means an unresolved Blocker (the `--json` state value changes for those Tickets)
 
 ## [0.56.0] - 2026-10-27
 
