@@ -1,6 +1,6 @@
 # `[agent] command` is not what runs, and the mismatch surfaces as an agent auth error
 
-Status: needs-triage
+Status: ready-for-human
 Type: bug
 Blocked by: none
 
@@ -56,11 +56,33 @@ in the configuration explains why `claude` ran.
 
 - [ ] With `[agent] command = "<runtime>"` set and no profile declared anywhere,
       that command is what runs - or the config is rejected with a message saying
-      a profile must name the runtime.
-- [ ] When a profile *is* in play, `jjfx status` (or the dispatch output) says
+      a profile must name the runtime. **Answered, not implemented, in #204**:
+      `[agent] command` is the *interactive pane* command, and a Run is launched
+      headlessly by jjfx from the pool's profile. The two cannot be one string -
+      the pane runs `opencode`, the Run runs `opencode run --format json ...` -
+      so this criterion's premise does not hold. What was missing is the
+      statement, now in the docs (below), not a code change.
+- [x] When a profile *is* in play, `jjfx status` (or the dispatch output) says
       which runtime will run, so `command` and the profile cannot disagree
-      silently.
+      silently. **Done in #204**: `status` prints `Profile (<pool>): <runtime>`
+      for every pool with a profile, and the profile is now actually applied
+      (finding 01), so the line is truthful.
 - [ ] A Run that fails because its runtime cannot authenticate says which runtime
-      failed, not only that authentication failed.
-- [ ] The docs for `[agent] command` and `[profiles]` state which wins, with a
-      test pinning it.
+      failed, not only that authentication failed. **Open**: the failure text is
+      the agent's own, and jjfx records it verbatim; naming the runtime on the
+      failure line is a separate change.
+- [x] The docs for `[agent] command` and `[profiles]` state which wins, with a
+      test pinning it. **Done in #204**: `[agent]`'s key now says plainly that it
+      does not choose a Run's runtime, a new `### Which runtime runs` section
+      states the resolution order, and
+      `a_declared_pool_profile_is_the_runtime_that_runs` pins that the profile is
+      what decides.
+
+## Comments
+
+- 2026-10-29: #204 documents the precedence and makes `status` truthful. The
+  cost of the gap was real - the drive spent a long detour in agent-auth
+  troubleshooting because the runtime that ran was not the one configured, and
+  nothing said so. The fix is the statement plus the actual application of the
+  profile (finding 01); the "name the runtime on an auth failure" criterion is
+  left open, since the message is the agent's own.

@@ -93,6 +93,28 @@ impl Fixture {
             .expect("jjfx should run")
     }
 
+    /// The user-global `jjfx` config the binary under test reads.
+    fn write_config(&self, content: &str) {
+        let directory = self.config_home.path().join("jjfx");
+        fs::create_dir_all(&directory).expect("config directory");
+        fs::write(directory.join("config.toml"), content).expect("config file");
+    }
+
+    /// The Repository's own `.jjfx/config.toml`, which may declare pools and
+    /// select a Ticket source but may never define a runtime (ADR 0014).
+    fn write_repo_config(&self, content: &str) {
+        let directory = self.path().join(".jjfx");
+        fs::create_dir_all(&directory).expect("repository config directory");
+        fs::write(directory.join("config.toml"), content).expect("repository config file");
+    }
+
+    /// One named Pool's document, or `None` when that lane has no state.
+    fn named_pool_state(&self, pool: &str) -> Option<Value> {
+        let path = self.path().join(".jj/pools").join(pool).join("pool.json");
+        let text = fs::read_to_string(path).ok()?;
+        Some(serde_json::from_str(&text).expect("Pool state is JSON"))
+    }
+
     /// The `default` Pool document, or `None` when no Pool state exists.
     fn pool_state(&self) -> Option<Value> {
         let path = self.path().join(".jj/pools/default/pool.json");
@@ -192,5 +214,69 @@ fn setting_a_profile_leaves_existing_capacity_alone() {
     assert_eq!(
         after["created_at"], before["created_at"],
         "an existing Pool document is edited, not replaced"
+    );
+}
+
+/// Drive 4's finding 01: a Repository that declares a pool `profile` runs that
+/// profile's runtime.
+///
+/// The declaration is a *reference* to a profile the user granted (ADR 0014), and
+/// it used to parse and validate but never take effect - the lane ran the default
+/// runtime while `status` reported the declared profile, which is exactly the
+/// mismatch the drive chased into an agent auth error.
+#[test]
+fn a_declared_pool_profile_is_the_runtime_that_runs() {
+    let fixture = Fixture::new();
+    fixture.write_config(
+        "[tickets]\nsource = \"local\"\n\n[profiles.drive]\nruntime = \"opencode\"\n",
+    );
+    fixture.write_repo_config("[pools.ledger]\nsize = 1\nprofile = \"drive\"\n");
+
+    // A resumption materialises the declared lane without needing Tickets.
+    let resumed = fixture.jjfx(&["resume", "--pool", "ledger"]);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+
+    let pool = fixture
+        .named_pool_state("ledger")
+        .expect("the declared lane is materialised");
+    assert_eq!(
+        pool["agent"], "opencode",
+        "the declared profile's runtime must be the one that runs: {pool}"
+    );
+    assert_eq!(pool["size"], 1, "the declared size is materialised too");
+
+    // And `status` reports the resolved profile, so a mismatch is visible rather
+    // than inferred from a Run's failure.
+    let status = fixture.jjfx(&["status"]);
+    assert!(status.status.success(), "{}", stderr(&status));
+    let stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        stdout.contains("Profile (ledger): opencode"),
+        "status must report the resolved profile: {stdout}"
+    );
+}
+
+/// A pool with no declared profile is left at the runtime an explicit
+/// `pool profile` set, so the declaration never fights the runtime verb.
+///
+/// This also pins the second half of the finding: `[pools.default] size = 1` is
+/// materialised even though `pool profile` created the Pool document first, with
+/// no capacity - the declaration fills what the operator has not set.
+#[test]
+fn an_explicit_pool_profile_is_not_overridden_by_a_declaration_without_one() {
+    let fixture = Fixture::new();
+    fixture.write_config("[tickets]\nsource = \"local\"\n");
+    fixture.write_repo_config("[pools.default]\nsize = 1\n");
+    let set = fixture.jjfx(&["pool", "profile", "codex"]);
+    assert!(set.status.success(), "{}", stderr(&set));
+
+    let resumed = fixture.jjfx(&["resume"]);
+    assert!(resumed.status.success(), "{}", stderr(&resumed));
+
+    let pool = fixture.pool_json();
+    assert_eq!(pool["agent"], "codex", "{pool}");
+    assert_eq!(
+        pool["size"], 1,
+        "a declared size fills an unsized Pool document: {pool}"
     );
 }

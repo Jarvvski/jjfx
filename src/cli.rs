@@ -2118,6 +2118,13 @@ fn resize_declared_pool(
 /// teammate committed works on a fresh clone with nobody provisioning it by
 /// hand. A lane whose state already exists is left alone, so this is idempotent.
 ///
+/// The declaration is also where the lane's **Agent Runtime Profile** comes
+/// from: `[pools.<name>] profile = "fast"` references a profile the user granted
+/// (ADR 0014), and that reference is resolved and applied here. Without this the
+/// declaration parsed and validated but never took effect, so a lane ran the
+/// default runtime while `status` reported the declared profile - the mismatch
+/// the drive chased into an agent auth error (drive 4, finding 01).
+///
 /// The mark of a materialised lane is its **document**, not its directory: the
 /// directory also holds Run Records, the waiting set, the work queue and its
 /// locks, and a lock creates its parents, so a directory can be left behind with
@@ -2130,20 +2137,47 @@ fn resize_declared_pool(
 /// `pool list` build the same handles to *read* every Pool, and must keep
 /// reporting a declared-but-unmaterialised lane without creating its state.
 fn materialise_declared_pool(repository: &Repository, user: &Config) -> Result<()> {
-    if repository.state_store().pool_document_exists() {
-        return Ok(());
-    }
+    let name = repository.selected_pool().as_str().to_owned();
     let Some(declaration) = user
         .repo_config(repository.root())?
         .pools
-        .get(repository.selected_pool().as_str())
+        .get(&name)
         .cloned()
     else {
         return Ok(());
     };
-    let capacity = PoolCapacity::new(declaration.size.unwrap_or(0))?;
-    for worker in repository.worker_pool().materialise(capacity)? {
-        eprintln!("  Created {worker}");
+    let pool = repository.worker_pool();
+    let current = pool.snapshot();
+    let current = current.pool();
+    // The declaration is the Repository's own statement of the lane's shape, so
+    // it is applied wherever the operator has set nothing: a Pool that has never
+    // been sized takes the declared capacity, and one with no profile takes the
+    // profile it references. An explicit `jjfx pool <N>` or `pool profile`
+    // persists its own value and is left alone, so the two never fight (drive 4,
+    // finding 01).
+    if current.is_none_or(|pool| pool.size() == 0) {
+        let capacity = PoolCapacity::new(declaration.size.unwrap_or(0))?;
+        // `resize_to`, not `materialise`: a Pool document an earlier command
+        // created empty (naming a runtime, say) is still unsized, and the
+        // declaration is what fills it.
+        for worker in pool.resize_to(capacity)?.added_workers() {
+            eprintln!("  Created {worker}");
+        }
+    }
+    if current.is_none_or(|pool| pool.profile().is_none())
+        && let Some(profile_name) = declaration.profile.as_deref()
+    {
+        let profile = user
+            .profiles
+            .get(profile_name)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pool `{name}` names Agent Runtime Profile `{profile_name}`, which the \
+                     user config does not define"
+                )
+            })?
+            .profile()?;
+        pool.set_profile(profile)?;
     }
     Ok(())
 }

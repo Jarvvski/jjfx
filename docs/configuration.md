@@ -78,7 +78,7 @@ stuck_after_secs = 1800
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `command` | `"claude"` | The shell command run in a workspace's agent pane. It runs in your login interactive shell as `$SHELL -l -i -c <command>`, so aliases and your `PATH` are available and the value may name an alias such as `cx`. |
+| `command` | `"claude"` | The shell command run in a workspace's agent pane, when you attach to a Worker by hand. It runs in your login interactive shell as `$SHELL -l -i -c <command>`, so aliases and your `PATH` are available and the value may name an alias such as `cx`. **It does not choose a Run's runtime.** A Run is launched by jjfx itself, headlessly, from the Agent Runtime of the pool's [profile](#profiles) - `claude` when the pool has none - so this key and a profile never disagree: they are different commands for different things. See [Which runtime runs](#which-runtime-runs). |
 
 ## `[profiles]`
 
@@ -105,6 +105,24 @@ model = "gpt-5"
 | `runtime` | required | The Agent Runtime: `claude`, `codex`, or `opencode`. |
 | `provider` | unset | The provider identifier the runtime needs alongside the model, e.g. `anthropic`. Requires `model`. |
 | `model` | unset | The model identifier, e.g. `claude-sonnet-4-20250514`. Unset leaves the runtime to pick its own default model. |
+
+### Which runtime runs
+
+A **Run** - the headless process jjfx launches to do a Ticket - runs the Agent
+Runtime its pool's profile names. The pool's profile comes from, in order:
+
+1. `[pools.<name>] profile = "<name>"` in the repository config, when the pool
+   declares one (and the pool has not already been given one);
+2. the profile `jjfx pool profile <runtime>` persisted for the pool;
+3. otherwise `claude`.
+
+`[agent] command` is **not** in that list. It is the command for an interactive
+pane you open by hand, not for a Run, so setting it does not change what a Run
+runs - a fact that is easy to get wrong, because a Run that then fails to
+authenticate reports a credential error while the configuration that chose the
+runtime is elsewhere. `jjfx status` prints `Profile (<pool>): <runtime>` for every
+pool that has a profile, so the runtime in force is visible before a Run starts
+rather than inferred from a failure.
 
 ## `[terminal]`
 
@@ -703,10 +721,13 @@ The declaration is the source of truth and `.jj/pools/<name>/` is state, so a
 declared pool with no state directory is normal, not a disagreement. The first
 Dispatch into such a lane provisions the Workers its `size` names - exactly as
 `jjfx pool <N>` does for `default` - and the lane is created once, never
-re-provisioned by a later Dispatch. That is what makes a committed declaration
-work on a fresh clone with nobody provisioning the lane by hand. An implicit
-`default` has no declaration to materialise from, so sizing it stays
-`jjfx pool <N>`.
+re-provisioned by a later Dispatch. Its `profile` is resolved from the user
+config and applied at the same moment, so a declared lane runs the runtime it
+names. A Pool an operator has already sized or profiled is left alone: the
+declaration fills what is unset, and `jjfx pool <N>` and `jjfx pool profile` are
+the explicit overrides. That is what makes a committed declaration work on a
+fresh clone with nobody provisioning the lane by hand. An implicit `default` has
+no declaration to materialise from, so sizing it stays `jjfx pool <N>`.
 
 ### The implicit `default` pool
 
