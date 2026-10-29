@@ -1,6 +1,6 @@
 # A repository-declared pool profile is ignored, and the lane runs the default runtime
 
-Status: needs-triage
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -85,14 +85,32 @@ silently inert.)
 
 ## Acceptance Criteria
 
-- [ ] A named pool declared with `profile = "<name>"` runs that profile's
+- [x] A named pool declared with `profile = "<name>"` runs that profile's
       runtime, proven by a test that declares a pool referencing a granted
-      profile and asserts the resolved runtime.
-- [ ] `jjfx status` (or `pool list --json`) reports the resolved profile for
+      profile and asserts the resolved runtime. **Done in #204**:
+      `materialise_declared_pool` resolves the referenced profile (ADR 0014) and
+      applies it; `tests/pool_profile.rs` declares `[pools.ledger] profile = "drive"`
+      and asserts the materialised Pool's `agent` is `opencode`.
+- [x] `jjfx status` (or `pool list --json`) reports the resolved profile for
       every pool, so a mismatch is visible rather than inferred from a Run's
-      failure.
-- [ ] A declared size is materialised for a named pool and for `default`, or the
-      declaration is rejected loudly at load rather than ignored.
-- [ ] If a Repository may in fact not select a runtime this way, the docs and
-      ADR 0014 are corrected and the declaration is refused with a message that
-      says so - silence is not an option.
+      failure. **Done in #204** - `status` already printed `Profile (<pool>)`, and
+      the profile is now applied, so the line is truthful; the test asserts it.
+- [x] A declared size is materialised for a named pool and for `default`, or the
+      declaration is rejected loudly at load rather than ignored. **Done in #204**:
+      a declared `size` is applied whenever the Pool is unsized, including the
+      `default` document an earlier command created empty (the second facet).
+- [x] If a Repository may in fact not select a runtime this way, the docs and ADR
+      0014 are corrected and the declaration is refused with a message that says
+      so - silence is not an option. **N/A**: a Repository *may* select among the
+      profiles the user granted - that is ADR 0014's rule, and the code now
+      honours it rather than the docs being wrong.
+
+## Comments
+
+- 2026-10-29: #204 fixes the code to match the documented rule. The declaration
+  was validated (a profile the user config does not define is a load error) and
+  then never applied - the lane ran `claude` while the config named `opencode`.
+  The declaration now fills what the operator has not set: an unsized Pool takes
+  the declared `size`, and a Pool with no profile takes the referenced one. An
+  explicit `jjfx pool <N>` or `pool profile` persists its own value and is not
+  overridden, so the declaration and the verbs do not fight.

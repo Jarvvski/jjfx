@@ -35,6 +35,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - report a Ticket whose Status is not the lane's as `not-ready` rather than `blocked`, which already means an unresolved Blocker (the `--json` state value changes for those Tickets)
 - show `--pool` in `resume`'s command-list entry, and correct the finding that claimed its help page omitted it
 - refuse to destroy a pool that holds claimed Tickets, and release them with `--force`; announce the tracked-file declaration edit before acting
+- run a declared pool `profile`'s runtime and materialise a declared `size` when the pool is unsized, instead of ignoring the declaration
 
 ## [0.56.0] - 2026-10-27
 
