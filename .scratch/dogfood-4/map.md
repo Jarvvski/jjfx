@@ -88,22 +88,22 @@ three stay comparable.
 
 ## Findings
 
-Recorded as the drive goes, each under `issues/`. All are `needs-triage` until
-the drive's triage pass.
+Recorded as the drive goes, each under `issues/`. Triage landed on each; see the
+report's triage table for the fix and the PR.
 
-| # | Finding | Type |
-|---|---|---|
-| 01 | A repository-declared pool `profile` is ignored, and the lane runs the default runtime - reproduced twice, with two profile names, after a full destroy and re-materialisation. A named pool has no other route to a non-default runtime. A declared `size` is silently inert too | bug |
-| 02 | `[agent] command` is not what runs when a profile is in play, and the mismatch surfaced only as `Failed to authenticate: OAuth session expired` - a credentials message for a configuration problem | bug |
-| 03 | `jjfx pool destroy <name>` edits the repository's committed `.jjfx/config.toml`, removing the declaration and dirtying the working copy | bug |
-| 04 | Destroying a pool orphans the Tickets it claimed: the files stay `claimed`, the queue is gone, and `resume` reports "No unfinished steps recorded" - recovery was five hand edits | bug |
-| 05 | `pool reset <worker>` for a Worker in another pool reports "state is missing" rather than "not in this pool" - the unhelpful-error shape of `bug-hunt/48` | bug |
-| 06 | `resume` requires `--pool` with several pools, and its help does not mention it - and `resume` is the recovery path for interrupted work | issue |
-| 07 | `--help` works on `pool` but not `pool profile`; `status` has no `--pool` while `ticket list` does; `pool profile` says "every Worker" but reaches only `default` | issue |
-| 08 | A Ticket excluded because its status is not the lane's is reported as `blocked`, the same word used for an unresolved `Blocked by:` | issue |
-| 09 | **A Run reports `succeeded` / `check: passed` while its change is never delivered.** The Dispatch prompt promises "jjfx delivers the change" and forbids the agent from pushing, but nothing in Dispatch runs `jjfx deliver` - the only call site is the CLI verb. Ticket 03's agent obeyed and stranded a real, tested change with no push and no PR; ticket 04's agent spent its session reasoning in circles about the same sentence and delivered anyway. One prompt, two outcomes, no record distinguishing them | bug |
-| 10 | **`jjfx rebase` reports `Rebased <branch>` while rebasing nothing**, because it rebases onto the repository's stale local trunk without fetching. After a sibling PR merged on the forge, the prompt-advertised recovery for a conflicting PR silently no-ops: no rebase op, no push, remote head unchanged, PR still conflicting. With the trunk fetched the same command does the right thing and names the conflict, the Workspace and the fix | bug |
-| 11 | **`jjfx review` takes only a Worker, so a Pull Request cannot be reviewed once its Worker moves on.** `deliver` and `rebase` accept the bookmark - the durable name the prompt describes - but `review` does not, and a reset Worker's branch handle is wiped (`branch_name: null`). Four of the drive's six delivered PRs had their Workers reused before review, and none can be reviewed now. The refusals are poor too: a bookmark argument reports a filename-safety violation naming an identifier the user never typed | bug |
+| # | Finding | Type | Status |
+|---|---|---|---|
+| 01 | A repository-declared pool `profile` is ignored, and the lane runs the default runtime - reproduced twice, with two profile names, after a full destroy and re-materialisation. A named pool has no other route to a non-default runtime. A declared `size` is silently inert too | bug | resolved |
+| 02 | `[agent] command` is not what runs when a profile is in play, and the mismatch surfaced only as `Failed to authenticate: OAuth session expired` - a credentials message for a configuration problem | bug | ready-for-human |
+| 03 | `jjfx pool destroy <name>` edits the repository's committed `.jjfx/config.toml`, removing the declaration and dirtying the working copy | bug | ready-for-human |
+| 04 | Destroying a pool orphans the Tickets it claimed: the files stay `claimed`, the queue is gone, and `resume` reports "No unfinished steps recorded" - recovery was five hand edits | bug | resolved |
+| 05 | `pool reset <worker>` for a Worker in another pool reports "state is missing" rather than "not in this pool" - the unhelpful-error shape of `bug-hunt/48` | bug | resolved |
+| 06 | `resume` requires `--pool` with several pools, and its help does not mention it - and `resume` is the recovery path for interrupted work | issue | ready-for-human |
+| 07 | `--help` works on `pool` but not `pool profile`; `status` has no `--pool` while `ticket list` does; `pool profile` says "every Worker" but reaches only `default` | issue | resolved |
+| 08 | A Ticket excluded because its status is not the lane's is reported as `blocked`, the same word used for an unresolved `Blocked by:` | issue | resolved |
+| 09 | **A Run reports `succeeded` / `check: passed` while its change is never delivered.** The Dispatch prompt promises "jjfx delivers the change" and forbids the agent from pushing, but nothing in Dispatch runs `jjfx deliver` - the only call site is the CLI verb. Ticket 03's agent obeyed and stranded a real, tested change with no push and no PR; ticket 04's agent spent its session reasoning in circles about the same sentence and delivered anyway. One prompt, two outcomes, no record distinguishing them | bug | ready-for-human |
+| 10 | **`jjfx rebase` reports `Rebased <branch>` while rebasing nothing**, because it rebases onto the repository's stale local trunk without fetching. After a sibling PR merged on the forge, the prompt-advertised recovery for a conflicting PR silently no-ops: no rebase op, no push, remote head unchanged, PR still conflicting. With the trunk fetched the same command does the right thing and names the conflict, the Workspace and the fix | bug | ready-for-human |
+| 11 | **`jjfx review` takes only a Worker, so a Pull Request cannot be reviewed once its Worker moves on.** `deliver` and `rebase` accept the bookmark - the durable name the prompt describes - but `review` does not, and a reset Worker's branch handle is wiped (`branch_name: null`). Four of the drive's six delivered PRs had their Workers reused before review, and none can be reviewed now. The refusals are poor too: a bookmark argument reports a filename-safety violation naming an identifier the user never typed | bug | ready-for-human |
 
 Finding `49` in `bug-hunt/` - `jjfx version` refusing to run outside a jj
 repository - was found by unpacking the published `v0.56.0` archive before this

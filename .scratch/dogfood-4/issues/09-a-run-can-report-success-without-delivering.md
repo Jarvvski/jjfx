@@ -1,6 +1,6 @@
 # A Run reports success while its change is never delivered, because nothing runs the delivery the prompt promises
 
-Status: needs-triage
+Status: ready-for-human
 Type: bug
 Blocked by: none
 

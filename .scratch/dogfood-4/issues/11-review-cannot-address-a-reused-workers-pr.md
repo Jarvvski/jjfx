@@ -1,6 +1,6 @@
 # `jjfx review` takes only a Worker, so a Pull Request cannot be reviewed once its Worker moves on
 
-Status: needs-triage
+Status: ready-for-human
 Type: bug
 Blocked by: none
 
