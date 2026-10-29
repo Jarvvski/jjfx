@@ -206,6 +206,24 @@ impl LocalTickets {
         self.rewrite_status(&ticket, CLAIMED_STATUS)
     }
 
+    /// Returns a claimed Ticket to the ready status.
+    ///
+    /// The inverse of [`Self::claim`]. A claim belongs to the Worker Pool that
+    /// took it, so a Pool that is removed releases the Tickets it held rather
+    /// than leaving them claimed by a queue that no longer exists - a state no
+    /// verb could undo, because the claim and the queue that would release it
+    /// live on opposite sides of the destroy (drive 4, finding 04). A Ticket that
+    /// is not claimed is left alone.
+    pub fn release(&self, id: &str) -> Result<LocalTicketUpdate, LocalTicketError> {
+        let Some(ticket) = self.ticket(id)? else {
+            return Err(self.not_found(id));
+        };
+        if !status_eq(&ticket.status, CLAIMED_STATUS) {
+            return Ok(LocalTicketUpdate::Unchanged);
+        }
+        self.rewrite_status(&ticket, &self.ready_status)
+    }
+
     /// Marks a Ticket as resolved and appends a dated `## Comments` line.
     ///
     /// Idempotent: a Ticket that is already resolved is left untouched, so a
@@ -1682,6 +1700,52 @@ mod tests {
             tickets.claim("widgets--01-ready").expect("claim"),
             LocalTicketUpdate::Unchanged
         );
+    }
+
+    #[test]
+    fn release_returns_a_claimed_ticket_to_the_ready_status() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-ready.md",
+            "# Ready\n\nStatus: claimed\nType: task\n\n## Problem\n\nDo it.\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        let update = tickets.release("widgets--01-ready").expect("release");
+
+        assert_eq!(update, LocalTicketUpdate::Applied);
+        let rewritten = fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-ready.md"))
+            .expect("rewritten file");
+        assert_eq!(
+            rewritten,
+            "# Ready\n\nStatus: ready-for-agent\nType: task\n\n## Problem\n\nDo it.\n"
+        );
+    }
+
+    /// A release is the inverse of a claim, not a general "un-set any status":
+    /// a Ticket that was never claimed - resolved, or still ready - is left
+    /// alone, so a destroy can never downgrade finished work.
+    #[test]
+    fn release_is_a_no_op_on_a_ticket_that_is_not_claimed() {
+        let temporary = TempDir::new().expect("temporary directory");
+        write_ticket(
+            temporary.path(),
+            "widgets",
+            "01-resolved.md",
+            "# Resolved\n\nStatus: resolved\n",
+        );
+        let tickets = LocalTickets::new(temporary.path(), "ready-for-agent", "resolved");
+
+        assert_eq!(
+            tickets.release("widgets--01-resolved").expect("release"),
+            LocalTicketUpdate::Unchanged
+        );
+        let unchanged =
+            fs::read_to_string(ticket_path(temporary.path(), "widgets", "01-resolved.md"))
+                .expect("ticket file");
+        assert_eq!(unchanged, "# Resolved\n\nStatus: resolved\n");
     }
 
     #[test]
