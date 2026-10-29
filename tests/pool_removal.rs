@@ -78,6 +78,21 @@ impl Fixture {
         self.config_home.path().join("jj.toml")
     }
 
+    /// The user-global `jjfx` config the binary under test reads, under the
+    /// fixture's own `XDG_CONFIG_HOME`.
+    fn write_config(&self, content: &str) {
+        let directory = self.config_home.path().join("jjfx");
+        fs::create_dir_all(&directory).expect("config directory");
+        fs::write(directory.join("config.toml"), content).expect("config file");
+    }
+
+    /// Write one local Ticket under `.scratch/<feature>/issues/`.
+    fn write_ticket(&self, feature: &str, file: &str, content: &str) {
+        let directory = self.path().join(".scratch").join(feature).join("issues");
+        fs::create_dir_all(&directory).expect("creating the Ticket directory");
+        fs::write(directory.join(file), content).expect("writing the Ticket");
+    }
+
     fn write_jj_config(&self) {
         fs::write(
             self.jj_config_path(),
@@ -186,6 +201,19 @@ impl Fixture {
             serde_json::to_vec_pretty(&state).expect("Worker state JSON"),
         )
         .expect("writing the Worker state with a live PID");
+    }
+
+    /// Rewrite one field of a Worker's state, mirroring [`Self::record_worker_pid`].
+    fn record_worker_ticket(&self, pool: &str, worker: &str, ticket: &str) {
+        let path = self.pool_state(pool).join(format!("{worker}.json"));
+        let mut state: Value = serde_json::from_slice(&fs::read(&path).expect("Worker state"))
+            .expect("Worker state JSON");
+        state["ticket"] = Value::from(ticket);
+        fs::write(
+            &path,
+            serde_json::to_vec_pretty(&state).expect("Worker state JSON"),
+        )
+        .expect("writing the Worker state with a claimed Ticket");
     }
 
     /// Add a jj Workspace for `worker` at the Worker Workspace path the pool
@@ -441,6 +469,84 @@ fn destroy_force_terminates_a_live_worker_process_group() {
     assert!(!fixture.declares("bugs"));
 }
 
+/// Drive 4's findings 03 and 04: the declaration is announced before anything
+/// moves, and a Pool that holds claimed Tickets refuses until `--force`, which
+/// releases them rather than stranding them.
+///
+/// A claim belongs to the Pool that took it - the Ticket file records it and the
+/// Pool's own queue is what would release it - so removing the Pool without
+/// releasing the Ticket leaves it claimed by a queue that no longer exists, a
+/// state no verb can undo.
+#[test]
+fn destroy_refuses_while_it_holds_claimed_tickets_and_force_releases_them() {
+    let fixture = Fixture::new();
+    fixture.write_config("[tickets]\nsource = \"local\"\n");
+    fixture.declare(&[("bugs", &["worker-01"])]);
+    fixture.write_pool_state("bugs", &[("worker-01", "idle", Some("bugs--01-thing"))]);
+    fixture.record_worker_ticket("bugs", "worker-01", "bugs--01-thing");
+    fixture.write_ticket("bugs", "01-thing.md", "# Thing\n\nStatus: claimed\n");
+    let ticket = fixture.path().join(".scratch/bugs/issues/01-thing.md");
+
+    // Without `--force`, the claimed Ticket refuses the removal by name.
+    let refused = fixture.jjfx(&["pool", "destroy", "bugs"]);
+    assert!(
+        !refused.status.success(),
+        "a claimed Ticket must refuse the removal"
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("bugs--01-thing"), "{stderr}");
+    assert!(stderr.contains("--force"), "{stderr}");
+    assert!(fixture.declares("bugs"), "a refusal removes nothing");
+    assert!(
+        fs::read_to_string(&ticket)
+            .expect("Ticket file")
+            .contains("Status: claimed"),
+        "a refusal releases nothing"
+    );
+
+    // `--force` removes the Pool and releases the claim with it.
+    let forced = fixture.jjfx(&["pool", "destroy", "bugs", "--force"]);
+    assert!(
+        forced.status.success(),
+        "a forced removal must succeed: {}",
+        String::from_utf8_lossy(&forced.stderr)
+    );
+    let released = fs::read_to_string(&ticket).expect("Ticket file");
+    assert!(
+        released.contains("Status: ready-for-agent"),
+        "the claim is released, not stranded: {released}"
+    );
+    // Released means dispatchable again, not merely rewritten: `ticket list`
+    // reads it as ready.
+    let listed = fixture.jjfx(&["ticket", "list"]);
+    assert!(
+        listed.status.success(),
+        "ticket list failed: {}",
+        String::from_utf8_lossy(&listed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&listed.stdout);
+    assert!(stdout.contains("bugs--01-thing"), "{stdout}");
+    assert!(stdout.contains("ready"), "{stdout}");
+    // And `resume` says the Pool is gone, which is a different recovery from
+    // "nothing was ever queued" (drive 4, finding 04, fourth criterion).
+    let resumed = fixture.jjfx(&["resume", "--pool", "bugs"]);
+    assert!(
+        !resumed.status.success(),
+        "a destroyed Pool cannot be resumed"
+    );
+    let stderr = String::from_utf8_lossy(&resumed.stderr);
+    assert!(stderr.contains("no Worker Pool named `bugs`"), "{stderr}");
+    let stderr = String::from_utf8_lossy(&forced.stderr);
+    assert!(
+        stderr.contains("releases"),
+        "the forced path says it releases the claim: {stderr}"
+    );
+    assert!(
+        stderr.contains("tracked file"),
+        "the declaration is announced as a tracked edit: {stderr}"
+    );
+    assert!(!fixture.declares("bugs"));
+}
 /// Waits for the helper to exit on its own, failing rather than hanging.
 ///
 /// The helper blocks on the process group the removal is meant to terminate, so

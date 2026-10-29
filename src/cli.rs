@@ -3052,6 +3052,12 @@ struct PoolRemovalPlan {
     busy: Vec<WorkerId>,
     /// Every Worker in the pool, with its branch and delivery state.
     workers: Vec<PoolRemovalWorker>,
+    /// The Tickets the pool claimed, in Worker order.
+    ///
+    /// A claim belongs to the Pool: the Ticket file records it, and the queue
+    /// that would release it is part of the state a removal destroys, so the two
+    /// are destroyed together and neither can be recovered from the other.
+    claimed: Vec<String>,
 }
 
 impl PoolRemovalPlan {
@@ -3060,6 +3066,15 @@ impl PoolRemovalPlan {
         self.workers
             .iter()
             .filter(|worker| !worker.state.is_delivered())
+    }
+
+    /// The Tickets the Pool claimed, in Worker order.
+    ///
+    /// These are what a removal would strand: the claim lives in the Ticket file
+    /// and the queue that would release it lives in the Pool's state, so the two
+    /// are destroyed together and neither can be recovered from the other.
+    fn claimed(&self) -> &[String] {
+        &self.claimed
     }
 
     /// The report: every Worker, its branch, and whether that branch is pushed
@@ -3077,7 +3092,8 @@ impl PoolRemovalPlan {
     }
 
     /// Refuses the removal unless `force` overrides it, naming what stands in
-    /// the way: a busy Worker, or a branch that is neither pushed nor merged.
+    /// the way: a busy Worker, a Ticket the Pool has claimed, or a branch that is
+    /// neither pushed nor merged.
     fn refuse_unless_forced(&self, name: &str, force: bool) -> Result<()> {
         if force {
             return Ok(());
@@ -3092,6 +3108,15 @@ impl PoolRemovalPlan {
             bail!(
                 "pool `{name}` has busy Workers: {workers}. Wait for them to finish, or \
                  re-run with --force to discard their work"
+            );
+        }
+        let claimed = self.claimed();
+        if !claimed.is_empty() {
+            bail!(
+                "pool `{name}` holds claimed Tickets: {}. Removing it would leave them claimed \
+                 with no queue to release them. Re-run with --force to remove the pool and \
+                 release them",
+                claimed.join(", ")
             );
         }
         let undelivered = self.undelivered().collect::<Vec<_>>();
@@ -3171,7 +3196,16 @@ fn pool_removal_plan(repository: &Repository) -> Result<PoolRemovalPlan> {
             }
         })
         .collect();
-    Ok(PoolRemovalPlan { busy, workers })
+    let claimed = snapshot
+        .workers()
+        .iter()
+        .filter_map(|worker| worker.ticket().map(str::to_owned))
+        .collect();
+    Ok(PoolRemovalPlan {
+        busy,
+        workers,
+        claimed,
+    })
 }
 
 /// The removal, with the user-global config handed in so a test can drive it
@@ -3198,6 +3232,14 @@ fn destroy_pool(repository: &Repository, name: &str, force: bool, user: &Config)
         eprintln!("Pool `{name}` Workers and their branches:");
         eprintln!("{}", plan.report());
     }
+    // The declaration is the Repository's own committed configuration, and it is
+    // the one thing a destroy edits that is not Pool state - so it is announced
+    // with the rest of the plan, before anything moves, rather than reported
+    // afterwards as a side note (drive 4, finding 03).
+    eprintln!(
+        "Removing pool `{name}` also removes its declaration from {}, a tracked file.",
+        repo_config_display(repository)
+    );
     if force {
         let discarded = plan.undelivered().collect::<Vec<_>>();
         if !discarded.is_empty() {
@@ -3223,6 +3265,17 @@ fn destroy_pool(repository: &Repository, name: &str, force: bool, user: &Config)
                     .join(", ")
             );
         }
+        // A claim belongs to the Pool - the queue that would release it is what
+        // this destroy removes - so a forced destroy releases what it holds
+        // rather than stranding the Ticket (drive 4, finding 04).
+        let released = release_claimed_tickets(repository, user, &plan)?;
+        if !released.is_empty() {
+            eprintln!(
+                "warning: --force releases {} claimed Ticket(s): {}",
+                released.len(),
+                released.join(", ")
+            );
+        }
     }
 
     selected
@@ -3234,6 +3287,36 @@ fn destroy_pool(repository: &Repository, name: &str, force: bool, user: &Config)
         repo_config_display(repository)
     );
     Ok(())
+}
+
+/// Releases the local Tickets a Pool claimed, returning the ones it moved.
+///
+/// A no-op unless `[tickets] source = "local"`. A Ticket left claimed by a Pool
+/// that no longer exists is the exact state this exists to prevent, so a failure
+/// to release one is reported loudly rather than swallowed.
+fn release_claimed_tickets(
+    repository: &Repository,
+    user: &Config,
+    plan: &PoolRemovalPlan,
+) -> Result<Vec<String>> {
+    let tickets = user.tickets_for(repository.root())?;
+    if tickets.source != TicketSource::Local {
+        return Ok(Vec::new());
+    }
+    let local = LocalTickets::new(
+        repository.root().join(&tickets.local.root),
+        tickets.local.ready_status.clone(),
+        tickets.local.resolved_status.clone(),
+    );
+    let mut released = Vec::new();
+    for id in plan.claimed() {
+        match local.release(id) {
+            Ok(crate::engine::LocalTicketUpdate::Applied) => released.push(id.to_owned()),
+            Ok(crate::engine::LocalTicketUpdate::Unchanged) => {}
+            Err(error) => eprintln!("local Ticket release failed for {id}: {error}"),
+        }
+    }
+    Ok(released)
 }
 
 fn configured_runtime(repository: &Repository) -> AgentRuntime {
@@ -7172,9 +7255,44 @@ mod tests {
         assert!(error.to_string().contains("ghost"), "{error}");
     }
 
+    /// Drive 4's finding 04: a claim belongs to the Pool that took it.
+    ///
+    /// The Ticket file records the claim and the Pool's queue is what would
+    /// release it, so a removal that does not release it leaves the Ticket
+    /// claimed by a queue that no longer exists - a state no verb can undo.
+    #[test]
+    fn destroy_pool_refuses_while_it_holds_claimed_tickets() {
+        let repo = lifecycle_repo(None);
+        declare_pool_with_state(&repo, "bugs", &[("worker-01", "idle", "bugs--01-thing")]);
+        let repository = Repository::open(repo.path()).expect("repository");
+        let user = toml::from_str::<Config>("").expect("user config");
+
+        let error = destroy_pool(&repository, "bugs", false, &user)
+            .expect_err("a claimed Ticket refuses the removal");
+        let message = error.to_string();
+        assert!(
+            message.contains("bugs--01-thing"),
+            "the refusal must name the Ticket it would strand: {message}"
+        );
+        assert!(
+            message.contains("--force"),
+            "the refusal must name the override: {message}"
+        );
+        assert!(
+            crate::config::repo_config_path(repository.root()).exists(),
+            "a refusal writes nothing"
+        );
+    }
+
     /// The pool state a removal test reads: `[pools.<name>]` declared in the
     /// repo config, with the pool's own state directory under `.jj/pools/`.
-    fn declare_pool_with_state(repo: &tempfile::TempDir, pool: &str, workers: &[(&str, &str)]) {
+    /// Each worker is `(id, status, ticket)` - the Ticket is the claim the worker
+    /// holds, which is what a removal has to release.
+    fn declare_pool_with_state(
+        repo: &tempfile::TempDir,
+        pool: &str,
+        workers: &[(&str, &str, &str)],
+    ) {
         let directory = repo.path().join(".jjfx");
         std::fs::create_dir_all(&directory).expect("creating .jjfx");
         std::fs::write(
@@ -7186,7 +7304,7 @@ mod tests {
         std::fs::create_dir_all(&pool_directory).expect("creating the pool directory");
         let members = workers
             .iter()
-            .map(|(worker, _)| format!("\"{worker}\""))
+            .map(|(worker, _, _)| format!("\"{worker}\""))
             .collect::<Vec<_>>()
             .join(", ");
         std::fs::write(
@@ -7198,13 +7316,13 @@ mod tests {
             ),
         )
         .expect("writing the pool state");
-        for (worker, status) in workers {
+        for (worker, status, ticket) in workers {
             std::fs::write(
                 pool_directory.join(format!("{worker}.json")),
                 format!(
-                    "{{\"agent\":\"claude\",\"branch_name\":\"eng-101\",\"completed_at\":null,\
+                    "{{\"agent\":\"claude\",\"branch_name\":\"{ticket}\",\"completed_at\":null,\
                      \"error\":null,\"exit_code\":null,\"log_file\":null,\"pid\":null,\
-                     \"started_at\":null,\"status\":\"{status}\",\"ticket\":\"ENG-101\"}}"
+                     \"started_at\":null,\"status\":\"{status}\",\"ticket\":\"{ticket}\"}}"
                 ),
             )
             .expect("writing the worker state");
@@ -7219,7 +7337,10 @@ mod tests {
         declare_pool_with_state(
             &repo,
             "bugs",
-            &[("worker-01", "busy"), ("worker-02", "idle")],
+            &[
+                ("worker-01", "busy", "bugs--01-thing"),
+                ("worker-02", "idle", "bugs--02-other"),
+            ],
         );
         let repository = Repository::open(repo.path()).expect("repository");
         let user = toml::from_str::<Config>("").expect("user config");
@@ -7246,6 +7367,7 @@ mod tests {
     #[test]
     fn pool_removal_refuses_undelivered_work_unless_forced() {
         let plan = PoolRemovalPlan {
+            claimed: Vec::new(),
             busy: Vec::new(),
             workers: vec![
                 PoolRemovalWorker {
@@ -7287,6 +7409,7 @@ mod tests {
     #[test]
     fn pool_removal_refuses_an_unreadable_branch_and_says_so() {
         let plan = PoolRemovalPlan {
+            claimed: Vec::new(),
             busy: Vec::new(),
             workers: vec![PoolRemovalWorker {
                 worker: WorkerId::parse("worker-01").expect("worker id"),
@@ -7309,6 +7432,7 @@ mod tests {
     #[test]
     fn pool_removal_allows_delivered_work() {
         let plan = PoolRemovalPlan {
+            claimed: Vec::new(),
             busy: Vec::new(),
             workers: vec![
                 PoolRemovalWorker {
@@ -7333,6 +7457,7 @@ mod tests {
     #[test]
     fn pool_removal_report_enumerates_branches_and_delivery() {
         let plan = PoolRemovalPlan {
+            claimed: Vec::new(),
             busy: Vec::new(),
             workers: vec![
                 PoolRemovalWorker {

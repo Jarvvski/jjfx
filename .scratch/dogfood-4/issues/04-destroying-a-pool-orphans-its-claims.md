@@ -1,6 +1,6 @@
 # Destroying a pool orphans the Tickets it claimed, with no way back
 
-Status: needs-triage
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -45,13 +45,26 @@ repository in a state no command can repair.
 
 ## Acceptance Criteria
 
-- [ ] Destroying a pool that holds claimed Tickets either releases those claims,
+- [x] Destroying a pool that holds claimed Tickets either releases those claims,
       or refuses while they exist and names them, or records the claims somewhere
-      that survives the destroy.
-- [ ] If claims do survive a destroy, a verb releases them - `resume`, a
+      that survives the destroy. **Done in #203**: without `--force` the removal
+      is refused and names every claimed Ticket; with it the claims are released.
+- [x] If claims do survive a destroy, a verb releases them - `resume`, a
       `ticket` subcommand, or an explicit `--force` path that says what it is
-      discarding.
-- [ ] A test drives a claimed Ticket through a pool destroy and asserts the
-      Ticket can be dispatched again afterwards.
-- [ ] `resume` distinguishes "nothing was ever queued" from "the queue is gone",
-      since those need different recoveries.
+      discarding. **Done in #203**: `--force` releases them, saying which, as part
+      of the forced path that already says what it discards.
+- [x] A test drives a claimed Ticket through a pool destroy and asserts the
+      Ticket can be dispatched again afterwards. **Done in #203**: the
+      integration test drives `pool destroy --force` and asserts `ticket list`
+      reads the released Ticket as `ready`.
+- [x] `resume` distinguishes "nothing was ever queued" from "the queue is gone",
+      since those need different recoveries. **Verified in #203**: a destroyed
+      Pool's declaration is gone, so `resume --pool <name>` refuses with "no
+      Worker Pool named `<name>`" rather than materialising an empty Pool and
+      reporting "No unfinished steps recorded" - the two recoveries are distinct.
+
+## Comments
+
+- 2026-10-29: #203 closes this. `--force` is the release path, and it is the same
+  flag that already means "I accept what this discards" - a claim is another
+  thing a destroy discards, so it is released and said so, not stranded.

@@ -1,6 +1,6 @@
 # `jjfx pool destroy <name>` edits the repository's committed configuration
 
-Status: needs-triage
+Status: ready-for-human
 Type: bug
 Blocked by: none
 
@@ -55,14 +55,30 @@ again.
 
 ## Acceptance Criteria
 
-- [ ] `pool destroy` states plainly that it will edit a tracked file, and either
-      requires confirmation for that or does not touch the declaration at all -
-      destroying runtime state and editing repository configuration are
-      different acts.
-- [ ] If it does edit the declaration, the change is reported in the same way a
-      mutation is reported elsewhere, so it cannot be missed.
-- [ ] A test covers destroying a declared pool and asserts what happens to
-      `.jjfx/config.toml`.
+- [x] `pool destroy` states plainly that it will edit a tracked file. **Done in
+      #203**: the removal plan announces the declaration edit - naming the file
+      and that it is tracked - before a single Workspace or state file moves.
+- [ ] ... and either requires confirmation for that or does not touch the
+      declaration at all. **Open, and a decision for the owner.** The
+      announcement is the mechanism taken here; requiring confirmation would mean
+      every `pool destroy <name>` needs `--force`, which changes the common
+      clean-pool case. That trade is the owner's to make, so it is not guessed at.
+- [x] If it does edit the declaration, the change is reported in the same way a
+      mutation is reported elsewhere, so it cannot be missed. **Done in #203** -
+      announced with the rest of the plan, before the removal, rather than as an
+      after-the-fact side note.
+- [x] A test covers destroying a declared pool and asserts what happens to
+      `.jjfx/config.toml`. **Done**: `destroy_pool_removes_the_declaration_but_never_default`
+      (unit) and `destroy_refuses_while_it_holds_claimed_tickets_and_force_releases_them`
+      (integration, asserting the announcement and the file's fate).
 - [ ] Removing the declaration for a pool that is still referenced - by a label,
       by a held Ticket, by a Worker Workspace - is refused rather than silently
-      accepted.
+      accepted. **Partly done in #203**: a Pool holding claimed Tickets is refused
+      by name, and `--force` releases them rather than accepting it silently. A
+      label or a bare Worker Workspace is not separately gated.
+
+## Comments
+
+- 2026-10-29: #203 lands the announcement and the held-Ticket refusal. The
+  confirmation clause and the wider "still referenced" clause are left for a
+  ruling: both would change the shape of an ordinary `pool destroy`.
