@@ -105,6 +105,15 @@ fn notes(key: &str) -> &'static str {
         "dispatch" => {
             "\n--fg blocks until every Run this Dispatch started has finished, inside\nthat one call. `jjfx wait` re-attaches to a Worker any session started, and\ncarries the answer in its exit code.\n\nA Repository with one Worker Pool implies it, so `--pool` is optional. A\nRepository with several requires it: an unqualified Dispatch refuses, naming\nthe pools that exist, rather than choosing one.\n\nThe exception is `--all`, which fans out across the pools that declare a\nrouting label (`[pools.bugs] label = \"bug\"`) and sends each Ticket to the pool\nwhose label it carries. A Ticket matching no pool is reported, not dropped,\nand an explicit `--pool` overrides routing to mean only that lane.\n"
         }
+        "pool list" => {
+            "\n`--pool` narrows the whole view to one lane: its summary row, its Workers, its\nheld Tickets and its share of the total. Without it every Pool is listed, which\nis what lets one `status` describe several.\n"
+        }
+        "status" => {
+            "\n`--pool` narrows the whole view to one lane: its summary row, its Workers, its\nheld Tickets and its share of the total. Without it every Pool is listed, which\nis what lets one `status` describe several.\n"
+        }
+        "pool profile" => {
+            "\n`pool profile` sets the runtime profile of the `default` Pool - the one a\nRepository has without declaring any - and no other. It has no `--pool`, so a\n*named* Pool's runtime comes from its declaration instead: `[pools.<name>]\nprofile = \"<granted-profile>\"` in `<repo>/.jjfx/config.toml`. That profile is\ngranted user-globally under `[profiles]` and applied when the Pool is\nmaterialised, so a Repository selects among the runtimes you have granted\nwithout being able to define one. `jjfx status` prints `Profile (<pool>):\n<runtime>` for every Pool that has a profile.\n"
+        }
         "pool reset" => {
             "\nA Worker id is unique across the Repository, so `<worker>` is the selector:\n`pool reset` finds the Pool that holds the Worker, whichever lane it is in,\nrather than looking only in the selected Pool. An id no Pool holds is refused\nby name, listing the Pools that were searched, so \"no such Worker\" is\ndistinguishable from \"that Worker is in another Pool\".\n"
         }
@@ -194,12 +203,20 @@ pub(crate) const CLEAN_FLAGS: &[Flag] = &[Flag {
     help: "Remove only this Worker Pool's workspaces (default: every workspace)",
 }];
 
-pub(crate) const STATUS_FLAGS: &[Flag] = &[Flag {
-    long: "--json",
-    short: None,
-    value: None,
-    help: "Emit machine-readable JSON",
-}];
+pub(crate) const STATUS_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--json",
+        short: None,
+        value: None,
+        help: "Emit machine-readable JSON",
+    },
+    Flag {
+        long: "--pool",
+        short: None,
+        value: Some("NAME"),
+        help: "Show only this Worker Pool's lane",
+    },
+];
 
 pub(crate) const CHILDREN_FLAGS: &[Flag] = &[Flag {
     long: "--json",
@@ -348,12 +365,20 @@ pub(crate) const UNDO_FLAGS: &[Flag] = &[Flag {
     help: "Discard the later operations a restore would also roll back",
 }];
 
-pub(crate) const POOL_LIST_FLAGS: &[Flag] = &[Flag {
-    long: "--json",
-    short: None,
-    value: None,
-    help: "Emit machine-readable JSON",
-}];
+pub(crate) const POOL_LIST_FLAGS: &[Flag] = &[
+    Flag {
+        long: "--json",
+        short: None,
+        value: None,
+        help: "Emit machine-readable JSON",
+    },
+    Flag {
+        long: "--pool",
+        short: None,
+        value: Some("NAME"),
+        help: "Show only this Worker Pool's lane",
+    },
+];
 
 pub(crate) const POOL_PROFILE_FLAGS: &[Flag] = &[
     Flag {
@@ -594,8 +619,8 @@ const TOP_LEVEL: &[Group] = &[
             },
             Entry {
                 key: "pool list",
-                args: "[--json]",
-                summary: "Show every pool's status",
+                args: "[--json] [--pool NAME]",
+                summary: "Show every pool's status, or one pool's",
             },
             Entry {
                 key: "pool rm",
@@ -610,7 +635,7 @@ const TOP_LEVEL: &[Group] = &[
             Entry {
                 key: "pool profile",
                 args: "<runtime>",
-                summary: "Set runtime profile (--provider/--model)",
+                summary: "Set the default pool's runtime (--provider/--model)",
             },
         ],
     },
@@ -874,7 +899,7 @@ const PAGES: &[CommandHelp] = &[
     CommandHelp {
         key: "pool list",
         summary: "Show every pool, and each pool's Workers",
-        usage: "pool list [--json]",
+        usage: "pool list [--json] [--pool NAME]",
         arguments: &[],
         flags: POOL_LIST_FLAGS,
     },
@@ -900,11 +925,11 @@ const PAGES: &[CommandHelp] = &[
     },
     CommandHelp {
         key: "pool profile",
-        summary: "Set the runtime profile every Worker runs",
+        summary: "Set the `default` Pool's runtime profile",
         usage: "pool profile <claude|codex|opencode> [--provider PROVIDER] [--model MODEL]",
         arguments: &[Argument {
             name: "<claude|codex|opencode>",
-            help: "Agent runtime every Worker runs",
+            help: "Agent runtime the `default` Pool's Runs launch",
         }],
         flags: POOL_PROFILE_FLAGS,
     },
@@ -1108,7 +1133,7 @@ const PAGES: &[CommandHelp] = &[
     CommandHelp {
         key: "status",
         summary: "Show pool status (alias for pool list)",
-        usage: "status [--json]",
+        usage: "status [--json] [--pool NAME]",
         arguments: &[],
         flags: STATUS_FLAGS,
     },

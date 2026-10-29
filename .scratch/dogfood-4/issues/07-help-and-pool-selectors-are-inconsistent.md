@@ -1,6 +1,6 @@
 # Help and pool selectors are inconsistent between commands
 
-Status: needs-triage
+Status: resolved
 Type: issue
 Blocked by: none
 
@@ -55,8 +55,25 @@ inconsistency.)
 
 ## Acceptance Criteria
 
-- [ ] `--help` behaves the same at every command depth, or is refused with a
-      message naming `jjfx help <command>`.
-- [ ] Every pool-scoped verb either takes `--pool` or says in its help which pool
-      it addresses.
-- [ ] `pool profile`'s help states the scope it actually applies to.
+- [x] `--help` behaves the same at every command depth, or is refused with a
+      message naming `jjfx help <command>`. **Done in #206** (the second form):
+      `jjfx pool profile --help` now says `` `--help` is not a flag of `pool
+      profile`; use `jjfx help pool profile` for its help page `` rather than
+      "unknown option". The page form works at every depth already.
+- [x] Every pool-scoped verb either takes `--pool` or says in its help which pool
+      it addresses. **Done in #206**: `status`/`pool list` gained `--pool NAME`,
+      which narrows the whole view - summary row, Workers, held Tickets and the
+      total's share - to one lane, and `pool profile`'s page now says it sets the
+      `default` Pool's runtime and how a *named* Pool's runtime is set instead
+      (its declaration). `pool reset`/`rm` resolve the Worker's own Pool (#205).
+- [x] `pool profile`'s help states the scope it actually applies to. **Done in
+      #206**: the summary is "Set the `default` Pool's runtime profile" and the
+      page explains that a named Pool's runtime comes from
+      `[pools.<name>] profile = "<granted-profile>"`.
+
+## Comments
+
+- 2026-10-29: #206 closes the three. `--help` is refused with the page it should
+  have been, rather than made to work at every depth - `--text --help` is a
+  dispatch whose *value* is the string `--help`, so a blanket "any `--help` means
+  show help" would silently swallow it; the page form is unambiguous.
