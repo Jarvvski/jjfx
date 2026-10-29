@@ -618,7 +618,7 @@ const TOP_LEVEL: &[Group] = &[
             },
             Entry {
                 key: "resume",
-                args: "[<TICKET>...]",
+                args: "[<TICKET>...] [--pool NAME]",
                 summary: "Re-run the queue's unfinished steps (interrupted work)",
             },
             Entry {
