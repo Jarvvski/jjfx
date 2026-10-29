@@ -78,11 +78,27 @@ accept it. The review verb was left behind.
 ## Acceptance Criteria
 
 - [ ] `jjfx review` accepts a bookmark, exactly as `deliver` and `rebase` do - the
-      durable name of the change, which is what survives the Worker.
-- [ ] A Worker that no longer holds its branch is refused in terms of the Pull
+      durable name of the change, which is what survives the Worker. **Open**: the
+      loop's address step launches a Run in the Worker's *own* Workspace
+      (`follow_up` reserves a pool Worker and resumes its session), so a change no
+      Worker holds has nowhere to be reviewed. Reaching it means either extending
+      the Run launcher to an arbitrary Workspace or materialising a pool Worker
+      for the change - a design decision, left to the owner.
+- [x] A Worker that no longer holds its branch is refused in terms of the Pull
       Request, naming the bookmark to review instead, rather than reporting a
-      missing branch.
-- [ ] A non-Worker argument is refused with a message about the argument's form,
+      missing branch. **Done in #200**: the refusal names the change, the
+      bookmark, and `jjfx rebase <bookmark>`.
+- [x] A non-Worker argument is refused with a message about the argument's form,
       not a filename-safety violation naming an identifier the user never typed.
+      **Done in #200**: `normalize_worker` is no longer the first thing `review`
+      does, and both refusals are covered by tests.
 - [ ] A test covers the sequence: a delivered Pull Request, its Worker reused,
-      then reviewed by bookmark.
+      then reviewed by bookmark. **Open**, and dependent on the first criterion:
+      there is no bookmark path to test until one exists.
+
+## Comments
+
+- 2026-10-29: #200 lands the refusals. The first criterion is the substance of
+  this finding - the loop is unreachable exactly when a human reviews, which is
+  the drive's question 3 answered in the negative - and it is left open because it
+  needs a decision about where a review Run runs, not because it is hard to type.

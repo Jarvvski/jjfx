@@ -932,6 +932,33 @@ impl WorkerActions {
         self.address_review(worker, &target, &[], mode)
     }
 
+    /// The Worker a review runs in, resolved from the name an operator gave.
+    ///
+    /// `review` is the one verb that cannot work by bookmark: the loop addresses
+    /// a pass's findings by launching a Run in the Worker's *own* Workspace, so
+    /// the change must still be held by a Worker, and a Worker that has been
+    /// reused holds nothing. The name is resolved exactly as `deliver` and
+    /// `rebase` resolve one - a Worker in either spelling, never mistaken for a
+    /// bookmark that shares its name - and a name that cannot host a review is
+    /// refused in terms of the change and the route back to a Worker, rather
+    /// than reported as a Worker that is missing a branch or as a filename that
+    /// is not safe.
+    pub fn review_worker(&self, name: &str) -> Result<WorkerId, WorkerActionError> {
+        let Some(worker) = self.worker_named(name) else {
+            return Err(WorkerActionError::ReviewNeedsAWorker {
+                name: name.to_owned(),
+            });
+        };
+        // A reused Worker keeps its id but not its Ticket or its branch, which is
+        // exactly when the loop has nowhere to send a pass's findings.
+        if self.worker_branch(&worker).is_err() {
+            return Err(WorkerActionError::ReviewNeedsAWorker {
+                name: name.to_owned(),
+            });
+        }
+        Ok(worker)
+    }
+
     /// Resolves the Pull Request a `review` addresses.
     ///
     /// A repository with no forge, or a Worker with no Pull Request, is refused
@@ -2301,6 +2328,16 @@ pub enum WorkerActionError {
     /// Review and repository actions require a resolved Worker bookmark.
     #[error("Worker {worker} has no branch")]
     MissingBranch { worker: WorkerId },
+    /// `review` addresses findings by launching a Run in a Worker's Workspace,
+    /// so a change no Worker holds cannot be reviewed.
+    #[error(
+        "cannot review {name}: the review loop addresses a pass's findings by launching a Run in \
+         the Worker's own Workspace, so the change must still be held by one. Name a Worker by its \
+         id (`jjfx review a04066`) or its full name (`jjfx review worker-a04066`). A change whose \
+         Worker has been reused is named by its bookmark and re-welded with `jjfx rebase \
+         <bookmark>`; re-dispatching it puts it back in a Worker, where `review` can reach it."
+    )]
+    ReviewNeedsAWorker { name: String },
     /// No bookmark in the repository names the Worker's Ticket.
     ///
     /// A Worker is reused as soon as its Run ends, so this is also the answer a

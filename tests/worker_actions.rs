@@ -2659,3 +2659,56 @@ fn local_repository() -> (TempDir, Repository) {
     let repository = Repository::open(temporary_directory.path()).expect("repository");
     (temporary_directory, repository)
 }
+
+/// Drive 4's finding 11: `review` is the one verb that cannot work by bookmark,
+/// because the loop launches its Runs in the Worker's own Workspace.
+///
+/// A name that is not a Worker must be refused in terms of the change and the
+/// route back to one - not as a filename that is not safe, naming an identifier
+/// the operator never typed.
+#[test]
+fn review_refuses_a_bookmark_argument_with_the_route_back_to_a_worker() {
+    let (_temporary_directory, repository) = local_repository();
+    grow_one_worker(&repository);
+
+    let error = WorkerActions::new(repository)
+        .review_worker("adam/eng-301-action")
+        .expect_err("a bookmark cannot host a review");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("adam/eng-301-action"),
+        "the refusal must name the argument: {message}"
+    );
+    assert!(
+        !message.contains("safe filename"),
+        "the refusal must be about the argument's form, not a filename: {message}"
+    );
+    assert!(
+        message.contains("jjfx rebase <bookmark>"),
+        "the refusal must name the route back to a Worker: {message}"
+    );
+}
+
+/// A Worker that has been reused keeps its id but not its branch, so the loop has
+/// nowhere to send a pass's findings - and `review` must say so in terms of the
+/// change rather than as a Worker that is missing a branch.
+#[test]
+fn review_refuses_a_worker_that_no_longer_holds_its_branch() {
+    let (_temporary_directory, repository) = local_repository();
+    let worker = grow_one_worker(&repository);
+
+    let error = WorkerActions::new(repository)
+        .review_worker(worker.as_str())
+        .expect_err("a Worker with no branch cannot host a review");
+
+    let message = error.to_string();
+    assert!(
+        message.contains("cannot review"),
+        "the refusal must name the review: {message}"
+    );
+    assert!(
+        !message.contains("has no branch"),
+        "the refusal must be about the change, not a missing branch: {message}"
+    );
+}

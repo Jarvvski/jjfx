@@ -4988,8 +4988,12 @@ fn send_command(
 /// on a stalled round, or on a review it could not read escalates its unresolved
 /// findings and exits non-zero.
 fn review_command(repository: &Repository, value: &str, mode: RunMode) -> Result<()> {
-    let worker = normalize_worker(value)?;
     let actions = WorkerActions::new(repository.clone());
+    // Resolved as a Worker, and refused in terms of the change when no Worker
+    // holds it: the loop launches its Runs in the Worker's own Workspace, so a
+    // name that is not a Worker - or a Worker that has been reused - is a
+    // refusal with a route back, not a filename error (drive 4, finding 11).
+    let worker = actions.review_worker(value)?;
     // A repository with no forge, or a Worker with no Pull Request, is refused
     // here by name - before the loop can report convergence for a PR that does
     // not exist.
