@@ -1,6 +1,6 @@
 # `pool reset <worker>` for a Worker in another pool reports "state is missing"
 
-Status: needs-triage
+Status: resolved
 Type: bug
 Blocked by: none
 
@@ -31,11 +31,27 @@ do instead.
 
 ## Acceptance Criteria
 
-- [ ] The error names the pool that was searched and, when the Worker exists
-      elsewhere, the pool it belongs to.
-- [ ] A Worker id that exists in no pool is distinguished from one that exists in
-      another pool.
-- [ ] Whether `pool reset` should accept a `--pool` selector, or infer the pool
+- [x] The error names the pool that was searched and, when the Worker exists
+      elsewhere, the pool it belongs to. **Done in #205**: the Worker is now
+      *found* in whichever Pool holds it, so there is no error to mislead; an id
+      no Pool holds names every Pool that was searched.
+- [x] A Worker id that exists in no pool is distinguished from one that exists in
+      another pool. **Done in #205**: the first is refused by name with the list
+      of Pools searched; the second simply works, and says which Worker it reset.
+- [x] Whether `pool reset` should accept a `--pool` selector, or infer the pool
       from the Worker id (which is unique across the Repository), is decided and
-      documented - today the verb offers neither.
-- [ ] A test covers both cases: an unknown Worker, and a Worker in another pool.
+      documented - today the verb offers neither. **Decided in #205**: infer. A
+      Worker id is unique across the Repository, so the id *is* the selector;
+      `--pool` would be a second way to name the same thing and a way to name it
+      wrongly. Documented on `jjfx help pool reset` and `pool rm`.
+- [x] A test covers both cases: an unknown Worker, and a Worker in another pool.
+      **Done in #205** - `tests/pool_removal.rs` drives both, for `reset` and for
+      `rm`.
+
+## Comments
+
+- 2026-10-29: #205 fixes `pool reset` and its sibling `pool rm`. Both looked the
+  Worker up only in the selected Pool, so a Worker one lane over read as a
+  missing *state document* - corruption, rather than the wrong Pool. The wider
+  pattern is noted but not fixed here: `send`, `logs`, `mount` and `absorb` take
+  a Worker id and are pool-scoped too, and would resolve the same way.

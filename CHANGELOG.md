@@ -36,6 +36,7 @@ markers on their entries; they are preserved as history and carry no meaning now
 - show `--pool` in `resume`'s command-list entry, and correct the finding that claimed its help page omitted it
 - refuse to destroy a pool that holds claimed Tickets, and release them with `--force`; announce the tracked-file declaration edit before acting
 - run a declared pool `profile`'s runtime and materialise a declared `size` when the pool is unsized, instead of ignoring the declaration
+- resolve `pool reset` and `pool rm` against the Pool that holds the Worker, since a Worker id is unique across the Repository
 
 ## [0.56.0] - 2026-10-27
 

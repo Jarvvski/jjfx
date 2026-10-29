@@ -3001,9 +3001,63 @@ fn normalize_worker(value: &str) -> Result<WorkerId> {
     Ok(WorkerId::parse(value)?)
 }
 
+/// The Worker Pool holding `worker`, or `None` when no Pool does.
+///
+/// A Worker id is unique across the Repository - the Pools partition the ids -
+/// so a verb that acts on one Worker does not need a `--pool`: the id *is* the
+/// selector. Looking the id up only in the selected Pool, as `pool reset` and
+/// `pool remove` did, reports a missing state document for a Worker that exists
+/// one lane over, which reads as corruption rather than "wrong pool" (drive 4,
+/// finding 05).
+fn pool_holding_worker(
+    repository: &Repository,
+    config: &Config,
+    worker: &WorkerId,
+) -> Result<Option<PoolName>> {
+    for name in config.pool_names_for(repository.root())? {
+        let scoped = repository.clone().with_pool(name.clone());
+        if scoped
+            .worker_pool()
+            .snapshot()
+            .worker(worker.as_str())
+            .is_some()
+        {
+            return Ok(Some(name));
+        }
+    }
+    Ok(None)
+}
+
+/// Resolves `worker` against every Pool, refusing by name when no Pool holds it.
+///
+/// The refusal names the Pools that were searched, so "no such Worker" is
+/// distinguishable from "that Worker is in another Pool" - which the id resolves
+/// here rather than reporting as a missing document.
+fn repository_worker(
+    repository: &Repository,
+    config: &Config,
+    worker: &WorkerId,
+) -> Result<Repository> {
+    let Some(pool) = pool_holding_worker(repository, config, worker)? else {
+        let pools = config
+            .pool_names_for(repository.root())?
+            .iter()
+            .map(PoolName::as_str)
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "no Worker `{worker}` in this Repository (searched: {pools}). A Worker id is unique \
+             across the Repository, so it is listed by `{PROGRAM} status` if it exists"
+        );
+    };
+    Ok(repository.clone().with_pool(pool))
+}
+
 fn remove_worker_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
-    let resize = repository
+    let config = crate::config::load()?;
+    let scoped = repository_worker(repository, &config, &worker)?;
+    let resize = scoped
         .worker_pool()
         .remove_with_progress(worker.clone(), print_hook_output)?;
     eprintln!(
@@ -3015,7 +3069,9 @@ fn remove_worker_command(repository: &Repository, value: &str) -> Result<()> {
 
 fn reset_worker_command(repository: &Repository, value: &str) -> Result<()> {
     let worker = normalize_worker(value)?;
-    let outcome = WorkerActions::new(repository.clone()).reset(&worker)?;
+    let config = crate::config::load()?;
+    let scoped = repository_worker(repository, &config, &worker)?;
+    let outcome = WorkerActions::new(scoped).reset(&worker)?;
     let _restoration = outcome.into_restoration();
     eprintln!("Reset {worker} to idle");
     Ok(())
