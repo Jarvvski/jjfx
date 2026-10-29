@@ -1,6 +1,6 @@
 # A Ticket whose status does not match the lane is reported as "blocked"
 
-Status: needs-triage
+Status: resolved
 Type: issue
 Blocked by: none
 

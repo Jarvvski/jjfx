@@ -1,6 +1,6 @@
 # `resume` needs `--pool` when several pools exist, but its help does not say so
 
-Status: needs-triage
+Status: ready-for-human
 Type: issue
 Blocked by: none
 

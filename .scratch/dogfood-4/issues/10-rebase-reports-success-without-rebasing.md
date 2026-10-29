@@ -1,6 +1,6 @@
 # `jjfx rebase` reports `Rebased <branch>` while rebasing nothing, on a stale trunk
 
-Status: needs-triage
+Status: ready-for-human
 Type: bug
 Blocked by: none
 
@@ -103,10 +103,14 @@ This is the verb lying about what it did.
 
 ## Comments
 
-- 2026-10-27: #199 fixes the fetch and the no-op report. Two things are left.
-  The third criterion above is untouched. And `deliver`'s weld has the *same*
-  staleness - it welds onto `trunk()` without fetching, so a delivery after a
-  sibling merged on the forge welds onto a stale trunk and reports `Delivered` -
-  which is the same silent lie one step further along the path. It is noted here
-  rather than folded into #199 because the drive observed it on `rebase`, not on
-  `deliver`.
+- 2026-10-27: #199 fixes the fetch and the no-op report. The third criterion
+  above is untouched: after a re-weld, nothing surfaces whether the Pull Request
+  is still conflicting.
+- 2026-10-29: **Correction.** This finding's closing note - that `deliver`'s weld
+  has "the same staleness", welding onto `trunk()` without fetching - is
+  **wrong**, and checking it against the code is what caught it. `deliver` runs
+  the shared `run_pipeline`, whose *first* step is `jj.fetch()`; a fetch that
+  fails aborts the delivery outright with `fetch failed` (`src/forge.rs`). So
+  `deliver` has never had this bug - only `rebase` did, and #199 fixed it. What
+  remains here is the observability criterion, which is a decision about where a
+  re-weld's conflict state surfaces rather than a stale-trunk bug.

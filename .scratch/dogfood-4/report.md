@@ -211,8 +211,10 @@ Worker in another pool reports "state is missing" (finding 05). `resume` require
 
 ## 4. What the drive leaves behind
 
-- **Findings**, all `needs-triage`, under `.scratch/dogfood-4/issues/` (01–11), with
-  the commands and output that produced each.
+- **Findings**, under `.scratch/dogfood-4/issues/` (01–11), with the commands and
+  output that produced each. Their `Status:` fields record where triage landed:
+  `resolved` for 01, 04, 05, 07 and 08; `ready-for-human` for 02, 03, 06, 09, 10
+  and 11, each for a stated decision rather than a missing fix.
 - **The fixture**, `~/Code/personal/jjfx-drive-4` and `Jarvvski/jjfx-drive-4`, left
   with its evidence: `#1`, `#4`, `#5`, `#6` merged; `#2` and `#3` open on a merge
   conflict; ticket 03's change stranded locally with no Pull Request at all; and
@@ -225,3 +227,42 @@ The friction is not in the parts that were built to be clever. It is in the two
 places where jjfx says one thing and does another: a prompt that promises a
 delivery no component performs, and a rebase that reports work it did not do. Both
 cost the drive real work, and neither announced itself.
+
+---
+
+## 5. Triage
+
+Every finding is a ticket, and the fixes landed on `main` through one Pull Request
+each. `mise run check` was green for each; two were falsified (the fix removed to
+confirm the test fails without it).
+
+| Finding | Fix | PR |
+|---|---|---|
+| 09 (prompt half) | The Dispatch prompt names the actor: deliver the change yourself, and the Run is not finished until it has | #198 |
+| 10 | `rebase` fetches the trunk first and refuses on a failed fetch; a rewrite that changed nothing says so | #199 |
+| 11 (refusals) | `review` refuses a name no Worker can host in terms of the change, naming the route back to a Worker | #200 |
+| 08 | A Ticket whose `Status:` is not the lane's reads `not-ready`, distinct from `blocked` | #201 |
+| 06 | `resume`'s command list shows `--pool` - and the finding was **corrected**: its help page never omitted it | #202 |
+| 03 + 04 | `pool destroy` announces the tracked-file declaration edit, refuses while it holds claimed Tickets, and releases them with `--force` | #203 |
+| 01 + 02 | A declared pool `profile` is resolved and applied, a declared `size` is materialised, and the docs state which runtime runs | #204 |
+| 05 | `pool reset`/`rm` resolve the Worker's own Pool, since a Worker id is unique across the Repository | #205 |
+| 07 | `status`/`pool list` take `--pool`; `--help` one level down names `jjfx help <command>`; `pool profile`'s help states its scope | #206 |
+
+Two findings were **partly wrong**, and checking the claim against the released
+binary before fixing it is what caught both: 06 (the help page always listed
+`--pool`) and 10 (which closed by claiming `deliver`'s weld had the same staleness
+- `deliver` fetches first, and always has).
+
+**Left for the owner**, each a decision rather than a fix:
+
+- **09** - whether Dispatch invokes delivery itself once a Run ends, so an
+  undelivered Run cannot read as a clean success.
+- **11** - where a review Run runs, so a change no Worker holds can be reviewed by
+  its bookmark.
+- **10** - where a re-weld's conflict state surfaces, so a no-op cannot pass for a
+  recovery.
+- **03** - whether the tracked-file declaration edit needs confirmation, rather
+  than only an announcement.
+- **02** - naming the runtime on an agent authentication failure.
+- **06** - whether every pool-scoped verb takes `--pool`, or the set that does not
+  is deliberate and stated.
