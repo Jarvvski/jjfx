@@ -3313,6 +3313,14 @@ enum TicketVerdict {
     Ready,
     /// Discovered but not runnable, with the reason a Dispatch would print.
     Blocked(String),
+    /// Not this lane's work: the Ticket's Status is not the one the lane takes.
+    ///
+    /// Distinct from [`Self::Blocked`], which means the Ticket *is* this lane's
+    /// work and is waiting on an unresolved Blocker. Both stop a Dispatch, and an
+    /// operator scanning for "what is blocked" has to tell them apart - a Ticket
+    /// with a Run in flight is `not-ready` too, and is blocked on nothing (drive
+    /// 4, finding 08).
+    NotReady(String),
     /// Resolved: the work is finished, so nothing stops it and nothing is
     /// waiting for it.
     Done,
@@ -3324,6 +3332,7 @@ impl TicketVerdict {
         match self {
             Self::Ready => "ready",
             Self::Blocked(_) => "blocked",
+            Self::NotReady(_) => "not-ready",
             Self::Done => "done",
         }
     }
@@ -3336,7 +3345,7 @@ impl TicketVerdict {
     /// Why the Ticket is not ready, or `None` when it is ready or resolved.
     fn reason(&self) -> Option<&str> {
         match self {
-            Self::Blocked(reason) => Some(reason),
+            Self::Blocked(reason) | Self::NotReady(reason) => Some(reason),
             Self::Ready | Self::Done => None,
         }
     }
@@ -3379,7 +3388,12 @@ impl TicketBacklog {
     /// lane neither took nor diagnosed is resolved - the local source reports no
     /// reason for a finished Ticket, so its absence from both sets is what
     /// "finished" means.
-    fn record(&mut self, readiness: &LocalTicketReadiness, ready: &ReadyTickets) {
+    fn record(
+        &mut self,
+        readiness: &LocalTicketReadiness,
+        ready: &ReadyTickets,
+        expected_status: &TicketStatus,
+    ) {
         let ticket = readiness.ticket();
         let id = ticket.id();
         let verdict = if ready
@@ -3393,7 +3407,19 @@ impl TicketBacklog {
             .iter()
             .find(|diagnostic| diagnostic.subject() == id)
         {
-            TicketVerdict::Blocked(diagnostic.reason().to_owned())
+            // A diagnostic is why the Ready set did not take the Ticket, and its
+            // reason tells the two ways apart: a Status that is not this lane's
+            // means the Ticket is not this lane's work (`not-ready`), while a
+            // Blocker that is not resolved means it *is* this lane's and is
+            // waiting (`blocked`). The vocabulary already uses `blocked` for the
+            // second, so a Ticket waiting on a dependency and a Ticket this lane
+            // does not take are no longer one word (drive 4, finding 08).
+            let reason = diagnostic.reason().to_owned();
+            if ticket.status() != expected_status.as_str() {
+                TicketVerdict::NotReady(reason)
+            } else {
+                TicketVerdict::Blocked(reason)
+            }
         } else {
             TicketVerdict::Done
         };
@@ -3517,7 +3543,7 @@ fn ticket_list_command(
             // Blockers the verdict alone does not carry.
             Some(local) => {
                 for readiness in local.backlog(filter.status().as_str())? {
-                    backlog.record(&readiness, &ready);
+                    backlog.record(&readiness, &ready, filter.status());
                 }
             }
             None => backlog.record_discovery(&ready),
@@ -3558,12 +3584,13 @@ fn render_ticket_backlog(lanes: &[LaneReport<'_>], entries: &[TicketListEntry]) 
     }
     println!("{:<32} {:<16} {:<8} DETAIL", "TICKET", "STATUS", "STATE");
     println!("{:<32} {:<16} {:<8} ------", "------", "------", "-----");
-    let mut counts = [0usize; 3];
+    let mut counts = [0usize; 4];
     for entry in entries {
         counts[match entry.verdict {
             TicketVerdict::Ready => 0,
             TicketVerdict::Blocked(_) => 1,
-            TicketVerdict::Done => 2,
+            TicketVerdict::NotReady(_) => 2,
+            TicketVerdict::Done => 3,
         }] += 1;
         println!(
             "{:<32} {:<16} {:<8} {}",
@@ -3575,11 +3602,12 @@ fn render_ticket_backlog(lanes: &[LaneReport<'_>], entries: &[TicketListEntry]) 
     }
     println!();
     println!(
-        "{} ticket(s): {} ready, {} blocked, {} done",
+        "{} ticket(s): {} ready, {} blocked, {} not-ready, {} done",
         entries.len(),
         counts[0],
         counts[1],
-        counts[2]
+        counts[2],
+        counts[3]
     );
 }
 

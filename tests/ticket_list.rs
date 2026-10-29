@@ -193,6 +193,19 @@ fn ticket_list_prose_reports_every_ticket_with_its_status_and_readiness() {
         "{stdout}"
     );
     assert!(stdout.contains("done"), "{stdout}");
+    // The two ways of failing readiness are distinct words (drive 4, finding
+    // 08). `widgets--01-foundation` is `claimed`, so it is not this lane's work
+    // at all - `not-ready`, not `blocked`, which the vocabulary already uses for
+    // a Ticket that *is* this lane's and waits on an unresolved Blocker, as
+    // `widgets--02-dependent` does above.
+    assert!(
+        stdout.contains("not-ready"),
+        "a Ticket whose Status is not the lane's must not read as blocked: {stdout}"
+    );
+    assert!(
+        stdout.contains("expected status \"ready-for-agent\", found \"claimed\""),
+        "{stdout}"
+    );
 }
 
 #[test]
