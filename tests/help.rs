@@ -7,6 +7,8 @@
 
 use std::process::{Command, Output};
 
+use tempfile::TempDir;
+
 fn help(args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_jjfx"))
         .arg("help")
@@ -111,4 +113,65 @@ fn help_for_review_describes_the_bounded_loop_it_runs() {
         !text.contains("no bounded loop"),
         "the page must not deny the loop it runs: {text}"
     );
+}
+
+/// Drive 4's finding 07: `--help` works on a command *group* (`jjfx pool
+/// --help`) but not one level down, so `jjfx pool profile --help` was refused.
+///
+/// The refusal names the page to read rather than reporting `--help` as an
+/// unknown option, so a reader who has just learned `--help` is told the one
+/// form that works at every depth.
+///
+/// Unlike the `help` tests above, this drives a command that needs a
+/// repository, because discovery runs before the parser, so the fixture
+/// provides one rather than relying on the checkout the test happens to run in.
+#[test]
+fn the_help_flag_one_level_down_names_the_help_page() {
+    let repository = TempDir::new().expect("temporary repository");
+    let status = Command::new("jj")
+        .args([
+            "--config",
+            "signing.behavior=drop",
+            "git",
+            "init",
+            "--no-colocate",
+        ])
+        .arg(repository.path())
+        .status()
+        .expect("jj should be installed");
+    assert!(status.success(), "jj git init");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_jjfx"))
+        .args(["pool", "profile", "--help"])
+        .current_dir(repository.path())
+        .output()
+        .expect("jjfx should run");
+
+    assert!(
+        !output.status.success(),
+        "`--help` is not a flag of `pool profile`"
+    );
+    let text = stderr(&output);
+    assert!(text.contains("jjfx help pool profile"), "{text}");
+    assert!(!text.contains("unknown option"), "{text}");
+}
+
+/// `pool profile`'s help states the scope it actually applies to, and how a
+/// *named* Pool's runtime is set instead.
+#[test]
+fn the_pool_profile_page_states_the_scope_it_applies_to() {
+    let output = help(&["pool", "profile"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("`default` Pool"), "{text}");
+    assert!(text.contains("profile = \"<granted-profile>\""), "{text}");
+}
+
+/// `status` documents the pool selector it now takes.
+#[test]
+fn the_status_page_documents_the_pool_selector() {
+    let output = help(&["status"]);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    assert!(text.contains("--pool"), "{text}");
 }

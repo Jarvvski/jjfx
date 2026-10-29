@@ -94,6 +94,8 @@ pub enum Command {
     },
     Status {
         json: bool,
+        /// Narrow the listing to one Worker Pool, by name.
+        pool: Option<String>,
     },
     /// `children [<session>] [--json]`: a session's child sessions and what
     /// each is doing.
@@ -346,6 +348,8 @@ pub enum PoolCommand {
     },
     List {
         json: bool,
+        /// Narrow the listing to one Worker Pool, by name.
+        pool: Option<String>,
     },
     /// `pool create <name>`: write a `[pools.<name>]` declaration.
     Create(PoolCreateArgs),
@@ -572,6 +576,18 @@ fn reject_unknown_flags(command: &str, flags: &[Flag], args: &[String]) -> Resul
             // is never an unknown flag. The command that accepts it gives it
             // meaning (see `parse_dispatch`).
             None if argument == "-" => {}
+            // `--help` is a page request, not a flag this command takes. Every
+            // command has a page, reached as `jjfx help <command>`; `--help`
+            // works on a command *group* (`jjfx pool --help`) but not one level
+            // down, so a user who has just learned that reasonably tries it here
+            // (drive 4, finding 07). Name the page rather than an unknown option.
+            None if argument == "--help" || argument == "-h" => {
+                bail!(
+                    "`{argument}` is not a flag of `{command}`; use `{program} help {command}` \
+                     for its help page",
+                    program = env!("CARGO_PKG_NAME")
+                );
+            }
             None if argument.starts_with('-') => {
                 bail!("unknown option for {command}: {argument}");
             }
@@ -756,17 +772,39 @@ fn parse_clean(args: &[String]) -> Result<Command> {
     Ok(Command::Clean { pool })
 }
 
-/// Parse the top-level `status` alias, which accepts `--json`.
+/// Parse the top-level `status` alias, which accepts `--json` and `--pool`.
 fn parse_status(args: &[String]) -> Result<Command> {
     reject_unknown_flags("status", STATUS_FLAGS, args)?;
+    let (json, pool) = parse_pool_view("status", args)?;
+    Ok(Command::Status { json, pool })
+}
+
+/// Parse the `--json` / `--pool NAME` pair `status` and `pool list` share.
+///
+/// `--pool` narrows the view to one lane; without it every Pool is listed, which
+/// is what makes one `status` describe several. The flag is offered here because
+/// `status` is the verb an operator watches Runs with, and `ticket list` already
+/// takes it (drive 4, finding 07).
+fn parse_pool_view(command: &str, args: &[String]) -> Result<(bool, Option<String>)> {
     let mut json = false;
-    for argument in args {
-        match argument.as_str() {
+    let mut pool = None;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
             "--json" => json = true,
-            value => bail!("Unknown option for status: {value}"),
+            "--pool" => {
+                let value = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with('-'))
+                    .ok_or_else(|| anyhow::anyhow!("missing value for --pool"))?;
+                pool = Some(value.clone());
+                index += 1;
+            }
+            value => bail!("Unknown option for {command}: {value}"),
         }
+        index += 1;
     }
-    Ok(Command::Status { json })
+    Ok((json, pool))
 }
 
 /// Parse `children [<session>] [--json]`.
@@ -933,19 +971,17 @@ fn parse_resolve(args: &[String]) -> Result<Command> {
 /// Parse `pool list`/`ls`/`status`, which accepts `--json`.
 fn parse_pool_list(args: &[String]) -> Result<Command> {
     reject_unknown_flags("pool list", POOL_LIST_FLAGS, args)?;
-    let mut json = false;
-    for argument in args {
-        match argument.as_str() {
-            "--json" => json = true,
-            value => bail!("Unknown option for pool list: {value}"),
-        }
-    }
-    Ok(PoolCommand::List { json }.into())
+    let (json, pool) = parse_pool_view("pool list", args)?;
+    Ok(PoolCommand::List { json, pool }.into())
 }
 
 fn parse_pool(args: &[String]) -> Result<Command> {
     let Some(subcommand) = args.first().map(String::as_str) else {
-        return Ok(PoolCommand::List { json: false }.into());
+        return Ok(PoolCommand::List {
+            json: false,
+            pool: None,
+        }
+        .into());
     };
     match subcommand {
         "list" | "ls" | "status" => parse_pool_list(&args[1..]),
@@ -1473,7 +1509,9 @@ pub fn run(args: Vec<String>, launch: fn(PathBuf) -> Result<()>, settings: Setti
         Command::List => list_command(&repository(colocate)?)?,
         Command::Remove { force, names } => remove_command(&repository(colocate)?, force, &names)?,
         Command::Clean { pool } => clean_command(&repository(colocate)?, pool.as_deref())?,
-        Command::Status { json } => pool_list_command(&repository(colocate)?, json)?,
+        Command::Status { json, pool } => {
+            pool_list_command(&repository(colocate)?, json, pool.as_deref())?
+        }
         Command::Children { session, json } => crate::children::run(session.as_deref(), json)?,
         Command::Dispatch(args) => {
             dispatch_command(&repository(colocate)?, &args, open_workspaces, tickets)?
@@ -1876,7 +1914,7 @@ fn pool_command(repository: &Repository, command: PoolCommand) -> Result<()> {
         PoolCommand::Resize { size, pool } => {
             resize_pool_command(repository, &size, pool.as_deref())
         }
-        PoolCommand::List { json } => pool_list_command(repository, json),
+        PoolCommand::List { json, pool } => pool_list_command(repository, json, pool.as_deref()),
         PoolCommand::Create(args) => create_pool_command(repository, &args),
         PoolCommand::Destroy { name, force } => {
             destroy_pool_command(repository, name.as_deref(), force)
@@ -2300,7 +2338,7 @@ struct PoolReport {
     failures: Vec<String>,
 }
 
-fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
+fn pool_list_command(repository: &Repository, json: bool, pool: Option<&str>) -> Result<()> {
     warn_when_behind_trunk(repository);
     let config = crate::config::load()?;
     // `status`/`pool list` read Pool state, so they also reconcile local Tickets:
@@ -2309,7 +2347,7 @@ fn pool_list_command(repository: &Repository, json: bool) -> Result<()> {
     // is honoured.
     let tickets = config.tickets_for(repository.root())?;
     let repo_config = config.repo_config(repository.root())?;
-    let report = pool_report(&config, &repo_config, repository, &tickets)?;
+    let report = pool_report(&config, &repo_config, repository, &tickets, pool)?;
     report_writeback_failures(&report.failures);
     // A Repository that neither declares a pool nor has any state is the
     // pre-pools shape: keep the old "no pool yet" guidance unchanged. Once a
@@ -2350,8 +2388,16 @@ fn pool_report(
     repo_config: &RepoConfig,
     repository: &Repository,
     tickets: &TicketsConfig,
+    only: Option<&str>,
 ) -> Result<PoolReport> {
-    let names = config.pool_names_for(repository.root())?;
+    let mut names = config.pool_names_for(repository.root())?;
+    // `--pool` narrows the whole report to one lane: its summary row, its
+    // Workers, its held Tickets and its share of the total. An unknown name is
+    // refused by `resolve_pool`, naming the pools that exist.
+    if let Some(requested) = only {
+        let selected = resolve_pool(&names, Some(requested))?;
+        names.retain(|name| name == &selected);
+    }
     let held: std::collections::BTreeSet<PoolName> = names.iter().cloned().collect();
     let orphans = repository
         .orphan_pool_directories(&held)
@@ -7092,24 +7138,46 @@ mod tests {
     fn status_and_pool_list_accept_json_and_reject_other_options() {
         assert_eq!(
             parse(&args(&["status"])).unwrap(),
-            Command::Status { json: false }
+            Command::Status {
+                json: false,
+                pool: None
+            }
         );
         assert_eq!(
             parse(&args(&["status", "--json"])).unwrap(),
-            Command::Status { json: true }
+            Command::Status {
+                json: true,
+                pool: None
+            }
+        );
+        assert_eq!(
+            parse(&args(&["status", "--pool", "ledger"])).unwrap(),
+            Command::Status {
+                json: false,
+                pool: Some("ledger".to_owned())
+            }
         );
         assert!(parse(&args(&["status", "--wat"])).is_err());
         assert_eq!(
             parse(&args(&["pool", "list"])).unwrap(),
-            Command::Pool(PoolCommand::List { json: false })
+            Command::Pool(PoolCommand::List {
+                json: false,
+                pool: None
+            })
         );
         assert_eq!(
             parse(&args(&["pool", "list", "--json"])).unwrap(),
-            Command::Pool(PoolCommand::List { json: true })
+            Command::Pool(PoolCommand::List {
+                json: true,
+                pool: None
+            })
         );
         assert_eq!(
             parse(&args(&["pool"])).unwrap(),
-            Command::Pool(PoolCommand::List { json: false })
+            Command::Pool(PoolCommand::List {
+                json: false,
+                pool: None
+            })
         );
         assert!(parse(&args(&["pool", "list", "--wat"])).is_err());
     }
@@ -7595,7 +7663,7 @@ mod tests {
         let tickets = user
             .tickets_for(repository.root())
             .expect("the tickets config parses");
-        pool_report(user, &repo_config, repository, &tickets).expect("pool report")
+        pool_report(user, &repo_config, repository, &tickets, None).expect("pool report")
     }
 
     #[test]

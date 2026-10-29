@@ -625,3 +625,33 @@ fn remove_resolves_the_pool_a_worker_is_in() {
         "the Worker exists; the message must not read as corruption: {stderr}"
     );
 }
+
+/// Drive 4's finding 07: `status` takes `--pool`, the selector `ticket list`
+/// already offers, so the verb an operator watches Runs with can be narrowed to
+/// one lane.
+#[test]
+fn status_narrows_to_one_pool_and_refuses_an_unknown_one() {
+    let fixture = Fixture::new();
+    fixture.declare(&[("bugs", &["worker-01"]), ("features", &["worker-02"])]);
+    fixture.write_pool_state("bugs", &[("worker-01", "idle", None)]);
+    fixture.write_pool_state("features", &[("worker-02", "idle", None)]);
+
+    let narrowed = fixture.jjfx(&["status", "--pool", "features"]);
+    assert!(
+        narrowed.status.success(),
+        "{}",
+        String::from_utf8_lossy(&narrowed.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&narrowed.stdout);
+    assert!(stdout.contains("features"), "{stdout}");
+    assert!(
+        !stdout.contains("worker-01"),
+        "the other lane is filtered out: {stdout}"
+    );
+
+    // An unknown name is refused by `resolve_pool`, naming the pools that exist.
+    let unknown = fixture.jjfx(&["status", "--pool", "ghost"]);
+    assert!(!unknown.status.success(), "an unknown pool is refused");
+    let stderr = String::from_utf8_lossy(&unknown.stderr);
+    assert!(stderr.contains("ghost"), "{stderr}");
+}

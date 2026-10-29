@@ -27,6 +27,10 @@ markers on their entries; they are preserved as history and carry no meaning now
 
 ## [Unreleased]
 
+### Added
+
+- give `status`/`pool list` a `--pool` selector, point `--help` one level down at `jjfx help <command>`, and state `pool profile`'s scope in its help
+
 ### Fixed
 
 - tell the agent to run `jjfx deliver` itself, instead of promising that jjfx delivers while forbidding the agent from pushing
