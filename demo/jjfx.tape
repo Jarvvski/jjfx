@@ -1,6 +1,6 @@
 # Record assets/demo.gif from a throwaway jj repo.
 #
-# From the repository root, with jj 0.46.x and VHS
+# From the repository root, with jj 0.47.x and VHS
 # (https://github.com/charmbracelet/vhs) installed:
 #
 #   cargo build --release -p jjfx

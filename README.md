@@ -42,7 +42,7 @@ agents.
 
 ## Requirements
 
-- **jj 0.46.0** on your `PATH`. jjfx reads jj's on-disk store directly through
+- **jj 0.47.1** on your `PATH`. jjfx reads jj's on-disk store directly through
   `jj-lib`, so the two are version-coupled - upgrade them together.
 - **Rust 1.97.1 or newer**, only to build from source.
   [rustup](https://rustup.rs) is the usual way to get it; this repo's
@@ -100,7 +100,7 @@ That builds and installs the `jjfx` binary into Cargo's bin directory
 ```bash
 git clone https://github.com/Jarvvski/jjfx.git
 cd jjfx
-mise install        # pins Rust 1.97.1 and jj 0.46.0
+mise install        # pins Rust 1.97.1 and jj 0.47.1
 mise run install    # release build, installed to ~/.cargo/bin/jjfx
 ```
 

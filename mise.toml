@@ -8,7 +8,7 @@ rust = { version = "1.97.1", components = ["rustfmt", "clippy"] }
 # jj-lib reads the on-disk .jj store directly, so jjfx is version-coupled to the
 # jj binary's store format (ADR 0007). Pin jj to the version jj-lib targets and
 # upgrade them in lockstep.
-jj = "0.46.0"
+jj = "0.47.1"
 # Cross-compilation toolchain for `mise run release`. zig is the C cross-linker
 # cargo-zigbuild drives; together they build Linux (musl/gnu) and both macOS
 # arches from this host without Docker (cross/Docker cannot target apple-darwin).

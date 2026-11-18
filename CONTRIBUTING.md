@@ -5,7 +5,7 @@ the [Quickstart](README.md#quickstart).
 
 ## Prerequisites
 
-- **jj 0.46.0** on your `PATH`. jjfx reads jj's on-disk store directly through
+- **jj 0.47.1** on your `PATH`. jjfx reads jj's on-disk store directly through
   `jj-lib`, so the two are version-coupled - upgrade them together.
 - **Rust 1.97.1**. [mise](https://mise.jdx.dev) pins it for you; a rustup
   toolchain of the same version works too.
@@ -65,7 +65,7 @@ and it is the authority on how a change lands.
 ## Demo recording
 
 [`demo/jjfx.tape`](demo/jjfx.tape) is the VHS tape behind
-[`assets/demo.gif`](assets/demo.gif). From a checkout with jj 0.46.0:
+[`assets/demo.gif`](assets/demo.gif). From a checkout with jj 0.47.1:
 
 ```bash
 cargo build --release -p jjfx

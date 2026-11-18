@@ -4,7 +4,7 @@
 # Run from anywhere:
 #   bash demo/setup.sh
 #
-# Requires jj 0.46.x (jjfx reads jj's store through jj-lib 0.46.0) and a
+# Requires jj 0.47.x (jjfx reads jj's store through jj-lib 0.47.1) and a
 # release build at target/release/jjfx (`cargo build --release -p jjfx`).
 # The fixture is gitignored; re-running this script replaces it.
 set -euo pipefail
@@ -16,13 +16,13 @@ home="$demo/home"
 jj_bin=${JJ:-jj}
 
 if ! command -v "$jj_bin" >/dev/null 2>&1; then
-  echo "error: jj is not on PATH. jjfx is coupled to jj 0.46.0 (mise.toml)." >&2
+  echo "error: jj is not on PATH. jjfx is coupled to jj 0.47.1 (mise.toml)." >&2
   exit 1
 fi
 case "$("$jj_bin" --version)" in
-  "jj 0.46."*) ;;
+  "jj 0.47."*) ;;
   *)
-    echo "error: need jj 0.46.x, found $("$jj_bin" --version)" >&2
+    echo "error: need jj 0.47.x, found $("$jj_bin" --version)" >&2
     exit 1
     ;;
 esac
