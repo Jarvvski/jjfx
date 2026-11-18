@@ -66,13 +66,13 @@ ratatui = "0.29"
 ratatui-textarea = "0.8"
 notify = "8"
 # jj-lib reads the on-disk .jj store directly for the commit graph (ADR 0007),
-# so its version must equal the `jj` mise pin (0.46.0) and upgrade in lockstep.
+# so its version must equal the `jj` mise pin (0.47.1) and upgrade in lockstep.
 # pollster block_on's jj-lib's async RepoLoader inside spawn_blocking (spike 02).
-jj-lib = "0.46.0"
+jj-lib = "0.47.1"
 pollster = "0.4"
 # The DAG column/edge renderer jj's own CLI uses for `jj log`, so the world
-# graph lays out exactly like jj's. Version matches the jj 0.46.0 workspace pin.
-sapling-renderdag = "0.1.0"
+# graph lays out exactly like jj's. Version matches the jj 0.47.1 workspace pin.
+sapling-renderdag = "0.2.0"
 serde = { version = "1", features = ["derive"] }
 # arbitrary_precision preserves exact numeric fidelity when the engine
 # round-trips the persisted wire documents it reads and writes.

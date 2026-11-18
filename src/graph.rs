@@ -6,7 +6,7 @@
 //! layout is built by us from typed commit data.
 //!
 //! jj-lib has no stability guarantee and reads the store format of the installed
-//! `jj`, so its version is locked to the `jj` mise pin (0.46.0) and the two move
+//! `jj`, so its version is locked to the `jj` mise pin (0.47.1) and the two move
 //! in lockstep. The surface used here is deliberately minimal - open, read heads
 //! and bookmarks, walk parents - to keep the migration cost of a `jj` bump small.
 //!
@@ -26,7 +26,7 @@ use jj_lib::default_backend_factories::{
 use jj_lib::object_id::ObjectId;
 use jj_lib::repo::Repo;
 use jj_lib::settings::UserSettings;
-use jj_lib::workspace::Workspace;
+use jj_lib::workspace::{DefaultWorkspaceLoaderFactory, WorkspaceLoaderFactory as _};
 
 /// One commit in the graph, in display form (owned strings, no jj-lib types leak
 /// out of this module).
@@ -99,17 +99,19 @@ pub fn load(repo_root: &Path) -> anyhow::Result<Graph> {
     let home_dir = std::env::var_os("HOME").map(std::path::PathBuf::from);
     let settings = UserSettings::from_config_and_home_dir(StackedConfig::with_defaults(), home_dir)
         .context("build jj settings")?;
-    let workspace = Workspace::load(
-        &settings,
-        repo_root,
-        &default_backend_factories(),
-        &default_working_copy_factories(),
-    )
-    .context("open jj workspace")?;
+    let workspace = DefaultWorkspaceLoaderFactory
+        .create(repo_root)
+        .context("open jj workspace")?
+        .load(
+            &settings,
+            &default_backend_factories(),
+            &default_working_copy_factories(),
+        )
+        .context("open jj workspace")?;
 
     // `load_at_head` is async in jj-lib 0.43; block on it - this whole fn runs on
     // a blocking worker thread (spike 02).
-    let repo = pollster::block_on(workspace.repo_loader().load_at_head())
+    let repo = pollster::block_on(workspace.repo_loader().load_at_head(None))
         .map_err(|e| anyhow!("load repo at head: {e}"))?;
     let view = repo.view();
     let store = repo.store();

@@ -1473,7 +1473,7 @@ impl std::fmt::Display for JjVersion {
 /// dependency it describes.
 const JJ_LIB_TARGET: JjVersion = JjVersion {
     major: 0,
-    minor: 46,
+    minor: 47,
 };
 
 /// A warning when the `jj` on `PATH` does not match [`JJ_LIB_TARGET`], the

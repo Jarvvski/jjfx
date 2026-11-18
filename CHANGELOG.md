@@ -27,6 +27,10 @@ markers on their entries; they are preserved as history and carry no meaning now
 
 ## [Unreleased]
 
+### Breaking
+
+- require jj 0.47.1 and match its jj-lib 0.47.1 and sapling-renderdag 0.2.0, so store reads and the graph layout track the installed jj
+
 ### Added
 
 - give `status`/`pool list` a `--pool` selector, point `--help` one level down at `jjfx help <command>`, and state `pool profile`'s scope in its help

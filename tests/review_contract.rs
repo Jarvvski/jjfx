@@ -224,7 +224,7 @@ impl Fixture {
             concat!(
                 "#!/bin/sh\n",
                 "case \" $* \" in\n",
-                "  *' --version '*) printf 'jj 0.46.0\\n' ;;\n",
+                "  *' --version '*) printf 'jj 0.47.1\\n' ;;\n",
                 "  *' bookmark list '*) printf 'owner/eng-301-action\\n' ;;\n",
                 "esac\n"
             ),
